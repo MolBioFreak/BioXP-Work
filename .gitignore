@@ -1,0 +1,14 @@
+# Exclude raw SSD dumps and massive binaries
+BioXP_SSD_Backup/
+*.dll
+*.exe
+*.sys
+*.mdf
+*.ldf
+
+# Exclude IDE/OS temp files
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
