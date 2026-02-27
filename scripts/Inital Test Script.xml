@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WpfGenBotCommonLib>
+  <experiment>
+    <data name="System Check Test V2" />
+  </experiment>
+  <tips>
+    <T1 id="T50" color="GREEN" />
+    <T2 id="T50" color="GREEN" />
+    <T3 id="T50" color="GREEN" />
+    <T4 id="T200" color="BLUE" />
+  </tips>
+  <reagents>
+    <plate type="1" />
+    <A3 volume="415" id="PCR" />
+    <C3 volume="415" id="PCR" />
+    <E3 volume="415" id="PCR" />
+    <G3 volume="415" id="PCR" />
+    </reagents>
+  <oligos>
+ <A1 volume="0" />
+    <B1 volume="0" />
+    <C1 volume="0" />
+    <D1 volume="0" />
+    <E1 volume="0" />
+    <F1 volume="0" />
+    <G1 volume="0" />
+    <H1 volume="0" />
+    <A2 volume="0" />
+    <B2 volume="0" />
+    <C2 volume="0" />
+    <D2 volume="0" />
+    <E2 volume="0" />
+    <F2 volume="0" />
+    <G2 volume="0" />
+    <H2 volume="0" />
+    <A3 volume="0" />
+    <B3 volume="0" />
+    <C3 volume="0" />
+    <D3 volume="0" />
+    <E3 volume="0" />
+    <F3 volume="0" />
+    <G3 volume="0" />
+    <H3 volume="0" />
+    <A4 volume="0" />
+    <B4 volume="0" />
+    <C4 volume="0" />
+    <D4 volume="0" />
+    <E4 volume="0" />
+    <F4 volume="0" />
+    <G4 volume="0" />
+    <H4 volume="0" />
+    </oligos>
+  <script>
+    <line1 step="1" />
+    <line2 cmd="LED 255 0 0" />
+    <line3 cmd="WAIT 1" />
+    <line4 cmd="LED 0 255 0" />
+    <line5 cmd="WAIT 1" />
+    <line6 cmd="LED 0 0 255" />
+    <line7 cmd="WAIT 1" />
+    <line14 cmd="LED 255 255 255" />
+    <line30 cmd="CC RC 10" />
+    <line40 cmd="CC OC 10" />
+    <line41 step="2" />
+    <line42 cmd="PP PL_OUTPUT" />
+    <line44 cmd="PP PL_REAGENT" />
+    <line50 cmd="TCD DO" />
+    <line60 cmd="SS" />
+    <line70 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line80 cmd="PP PL_POOL" />
+    <line90 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line100 cmd="TCD DC" />
+    <line101 step="3" />
+    <line110 cmd="MC CV_OUTPUT LOC_OC" />
+    <line120 cmd="MC CV_REAGENT LOC_RC" />
+    <line130 cmd="MC CV_OUTPUT LOC_OCS" />
+    <line140 cmd="MC CV_REAGENT LOC_RCS" />
+    <line150 cmd="TCD DO" />
+    <line200 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line201 step="4" />
+    <line210 cmd="PP PL_POOL" />
+    <line220 cmd="MP PL_POOL LOC_MS PRESS" />
+    <line230 cmd="MP PL_POOL LOC_TC PRESS" />
+    <line240 cmd="MP PL_POOL LOC_MS PRESS" />
+    <line250 cmd="MP PL_POOL LOC_TC PRESS" />
+    <line260 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line270 cmd="TCD DC" />
+  </script>
+</WpfGenBotCommonLib>

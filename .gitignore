@@ -1,6 +1,8 @@
 # Exclude raw SSD dumps and massive binaries
 BioXP_SSD_Backup/
+dlls/
 *.dll
+*.dll.deploy
 *.exe
 *.sys
 *.mdf
@@ -12,3 +14,7 @@ BioXP_SSD_Backup/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Exclude large snapshot images from vision system
+scripts/snapshots/
+scripts/Local Served Jobs/
