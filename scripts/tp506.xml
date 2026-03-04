@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WpfGenBotCommonLib>
+  <experiment>
+    <data name="TEMPERATURE VERIFICATION TESTING, THERMAL CYCLER TEST" />
+  </experiment>
+  <tips>
+    <T1 id="T50" color="GREEN" />
+    <T2 id="T50" color="GREEN" />
+    <T3 id="T50" color="GREEN" />
+    <T4 id="T200" color="BLUE" />
+  </tips> 
+    <oligos>
+    <A1 volume="0" />
+    <B1 volume="0" />
+    <C1 volume="0" />
+    <D1 volume="0" />
+    <E1 volume="0" />
+    <F1 volume="0" />
+    <G1 volume="0" />
+    <H1 volume="0" />
+  </oligos>
+   <script>
+    <line10 step="1" />
+    <line20 cmd="LED 255 69 0 " />
+    
+	<line30 cmd="CC RC 10" />
+	<line40 cmd="CC OC 10" />
+	
+    <line100 cmd="TCD DC" />
+    
+    <line110 cmd="SP T10.0 DUR300 R2.5" />
+    <line120 cmd="SP T65.0 DUR120 R2.5" />
+    <line130 cmd="SP T95.0 DUR300 R2.5" />
+	
+	<line140 cmd="SP T10.0 DUR120 R2.5" />
+    
+    <line150 cmd="LED 0 102 0" />
+    
+    <line160 cmd="TCD DO" />
+  </script>
+</WpfGenBotCommonLib>

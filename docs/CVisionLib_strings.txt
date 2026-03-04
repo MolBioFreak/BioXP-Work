@@ -1,0 +1,7154 @@
+!This program cannot be run in DOS mode.
+Rich
+.text
+`.rdata
+@.data
+.rsrc
+@.reloc
+JX* 
+ X(I
+$XJ/8
+ XJXI
+$XJ2
+ X(I
+XJ(F
+XJ(F
+ X(I
+PQVW
+ X	T
+$XJJT
+XJT+
+XJ)J
+0XJT
+klYk
+o@Zi
+o@Zi
+o@Zi
+kl[kV+
+,XJJ
+,XJJ
+XJX*
+,XJJ
+XJX*
+XJX*
+,XJJ
+XJX*
+,XJJ
+XJX*
+ UUU
+ UUU
+ UUU
+%JJT
+XJT*
+XJT*
+ XJT
+$XJT
+,XJJT
+XJT+ 
+,XJT
+(XJT
+ XJT
+$XJT
+,XJJT
+XJT+%
+,XJT
+(XJT
+JJ)O
+,XJ([
+!	@(
+XJ/X
+@Y(!
+?Y(!
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+NlXk
+,XJ([
+ ZXT
+XJXJX*
+XJT*
+ UUU
+ UUU
+ XT*
+ XT*
+JJ)O
+XJ)N
+,XJJ
+5X%J
+4X%J
+3X%J
+,XJ([
+,XJ([
+ XT*
+ ZXT
+ UUU
+ UUU
+XJ*A
+XJ*A
+XJ*A
+XJ	J
+XJ	J
+8XT*
+XJ,-
+XJT++
+_`(@
+ ZXT
+X	T*
+ UUU
+ UUU
+	4O	
+	4O	
+XJ-N
+JJT+
+XJ)M
+ UUU
+f&(%
+f&(%
+X*AL
+Z	X	
+&*A4
+XJ:,
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ)L
+V&(%
+#&($
+XJ)L
+V&(%
+#&($
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ:;
+,XJ([
+,XJ([
+,XJ([
+XJ/e
+,XJJ
+,XJ([
+,XJ([
+,XJ([
+	*Al
+XJ:;
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ:8
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+XJ	3
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+XNlX#
+i@X0
+?ZY2
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+$@(%
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+NlXk
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+NlXk
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+NlXk
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ:;
+,XJ([
+,XJ([
+,XJ([
+XJ/7
+,XJJ
+XJ	Y
+,XJ([
+,XJ([
+,XJ([
+XJ:;
+,XJ([
+,XJ([
+,XJ([
+XJ/V
+,XJJ
+	  N
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+$@(%
+XJ %
+kl( 
+?Y(!
+@Y(!
+?X(!
+@X(!
+8Y(&
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ:6
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+ XT+	
+XT+	
+ZXJ-
+ZXJX
+XJ(K
+XJ,#
+XJ<y
+,XJJ
+,XJ([
+,XJ([
+#J(;
+XJ:G
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+K	(l
+4@(%
+*kl( 
+)l(!
+l#S\U
+?Y(!
+XNli
+(Y(!
+$@4'
+%%ZXl(#
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XJ:G
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+K	(l
+4@(%
+*kl( 
+)l(!
+l#S\U
+?Y(!
+XNli
+(Y(!
+$@4'
+%%ZXl(#
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+XNli
+XNli
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+	Nli
+XNli
+XNli
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+=	(l
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+.@(%
+kl( 
+@Y(!
+?Y(!
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+ UUU
+JXG9
+JXJX
+JXG,0
+0X;u
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+@o@6
+9@Z0
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+9X%Zkl
+%ZklXkl(#
+9X%Zkl
+%ZklXkl(#
+9X%Zkl
+%ZklXkl(#
+9X%Zkl
+%ZklXkl(#
+X%Zkl
+%ZklXkl(#
+X%Zkl
+%ZklXkl(#
+X%Zkl
+%ZklXkl(#
+X%Zkl
+%ZklXkl(#
+%Zkl
+%ZklXkl(#
+%Zkl
+%ZklXkl(#
+%Zkl
+%ZklXkl(#
+%Zkl
+%ZklXkl(#
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+%JXT
+	JXT
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+0X k
+DX /
+LX /
+PX k
+TX /
+\X /
+pX k
+,XJ([
+%Zkl
+%ZklXkl(#
+XJY%Zkl
+ %ZklXkl(#
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+0X;u
+,XJ([
+,XJ([
+,XJ([
+l	l4
+/		l
+l	l6
+JJXT
+FJXT
+BJXT
+DX /
+LX /
+TX /
+\X /
+%Zkl
+%ZklXkl(#
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+[&(%
+$&($
+XJ)J
+XJ)J
+XJ)J
+XJ)J
+JJT*
+JJT*
+XX(W
+XX(W
+JJ){
+XJ)~
+,XJ)|
+,XJ)|
+(XJ)}
+0X.i
+,XJ([
+(XJ)}
+,XJ)|
+,XJ)|
+,XJ)|
+(XJ)}
+,XJ([
+,XJ([
+XJ)~
+t hPs
+Y_^[
+Y_^[
+u#SP
+uHSW
+t5SW
+0h4/
+Y_^[
+u"hT"
+Y_^[
+>csm
+Y__^[
+VhY-
+SVW3
+ntel
+5ineI
+5Genu
+t#=`
+_^[3
+XG(i
+, (d
+3/& 
+J csm
+~4_^
+@_^[]
+;F0u
+QQSVW
+9_0~+
+G,;w0|
+XJ(F
+ XJ,
+ XJ(
+,XJ([
+,XJ([
+,XJ([
+,XJ([
+Edge Map
+bad array new length
+string too long
+C:logfileopencv_error_log.txt
+vector too long
+deque<T> too long
+myImage
+An undetermined exception occurred in SaveImage()
+An undetermined exception occurred in SaveinspectionImage()
+Y800
+grayImage
+binaryImage
+Unknown exception
+bad_weak_ptr
+zbar library unspecified generic error
+unsupported format
+[empty_any]
+pMyVideo
+bad allocation
+>#g/
+=L9o<
+BSJB
+v4.0.30319
+#Strings
+#GUID
+#Blob
+	Pa;	Pa=	Pa?	PaA	Pa
+Tat[]agalara|a
+b$b.b4b>bHbRb\bfbpbzb
+c$c(c2c<cDcIcSc^cfclczc
+d$d.d8dCdMdXdbdldrd|d
+e%e/e9eCeOeYeaekeoeye
+f7fAfKfUf_fjftf~f
+g g?gIgSg_gigsg}g
+h&h0h:hDhNhXhbhlhvh
+i&i-i9iCiOi
+[Vidiui{i
+j$j.j8jBjLjXjbjhjpjzj
+k'k1k9kEkOk[kekokwk
+l(l2l<lFlPlZldlnlxl
+m"m,m6m@mJmTm^mhmrm|m
+n&n0n:nDnNnXnbnlnvn
+o"o(o.o6o<oDoNoVo^ofonovo~o
+p(p2p<pFpPpZpdpnpxp
+q)q/q9qCqIqSqYqmq{q
+r#r1r;rBrMrZrdrnr
+s&s0s6s<sFsPs\sfspsxs~s
+t!t+t3t@tJtTtZtdtlt
+t)u=uCuTu^uduuu
+u0vAvRvWv\v
+w'w1w;wAwKwWwawkwuw
+x+x6xBxLxXx_xix
+y'y1y>y
+WHyLyQyVy[y`y
+z)z0z<zAzMzWzbzlzvz{z
+{ {({6{?{N{W{_{d{
+|(|B|H|S|Z|c|n|
+|!}&}-}C}H}N}T}[}e}o}
+~'~1~6~E~T~Y~g~q~{~
+<Module>
+CppInlineNamespaceAttribute
+vc.cppcli.attributes.?A0x1c71f662
+ClassLEDControl
+CVisionLib
+$ArrayType$$$BY01$$CB_W
+<CppImplementationDetails>
+$ArrayType$$$BY03$$CB_W
+$ArrayType$$$BY0M@$$CB_W
+$ArrayType$$$BY08$$CB_W
+$ArrayType$$$BY06$$CB_W
+$ArrayType$$$BY0BF@$$CB_W
+$ArrayType$$$BY09$$CB_W
+$ArrayType$$$BY04$$CB_W
+$ArrayType$$$BY07$$CB_W
+_EXCEPTION_DISPOSITION
+_SID_NAME_USE
+_ACL_INFORMATION_CLASS
+_AUDIT_EVENT_TYPE
+_ACCESS_REASON_TYPE
+_SECURITY_IMPERSONATION_LEVEL
+_TOKEN_TYPE
+_TOKEN_ELEVATION_TYPE
+_TOKEN_INFORMATION_CLASS
+_MANDATORY_LEVEL
+_SE_IMAGE_SIGNATURE_TYPE
+_SE_LEARNING_MODE_DATA_TYPE
+_HARDWARE_COUNTER_TYPE
+_PROCESS_MITIGATION_POLICY
+_JOBOBJECT_RATE_CONTROL_TOLERANCE
+_JOBOBJECT_RATE_CONTROL_TOLERANCE_INTERVAL
+JOB_OBJECT_NET_RATE_CONTROL_FLAGS
+JOB_OBJECT_IO_RATE_CONTROL_FLAGS
+JOBOBJECT_IO_ATTRIBUTION_CONTROL_FLAGS
+_JOBOBJECTINFOCLASS
+_SERVERSILO_STATE
+_FIRMWARE_TYPE
+_LOGICAL_PROCESSOR_RELATIONSHIP
+_PROCESSOR_CACHE_TYPE
+_CPU_SET_INFORMATION_TYPE
+MEM_EXTENDED_PARAMETER_TYPE
+MEM_SECTION_EXTENDED_PARAMETER_TYPE
+_SharedVirtualDiskSupportType
+_SharedVirtualDiskHandleState
+_SYSTEM_POWER_STATE
+_DEVICE_POWER_STATE
+_MONITOR_DISPLAY_STATE
+_USER_ACTIVITY_PRESENCE
+_POWER_REQUEST_TYPE
+_POWER_MONITOR_REQUEST_TYPE
+_POWER_PLATFORM_ROLE
+_HIBERFILE_BUCKET_SIZE
+IMAGE_AUX_SYMBOL_TYPE
+ARM64_FNPDATA_FLAGS
+ARM64_FNPDATA_CR
+IMPORT_OBJECT_TYPE
+IMPORT_OBJECT_NAME_TYPE
+ReplacesCorHdrNumericDefines
+_RTL_UMS_THREAD_INFO_CLASS
+_RTL_UMS_SCHEDULER_REASON
+_OS_DEPLOYEMENT_STATE_VALUES
+_IMAGE_POLICY_ENTRY_TYPE
+_IMAGE_POLICY_ID
+_HEAP_INFORMATION_CLASS
+_ACTIVATION_CONTEXT_INFO_CLASS
+_CM_SERVICE_NODE_TYPE
+_CM_SERVICE_LOAD_TYPE
+_CM_ERROR_CONTROL_TYPE
+_TAPE_DRIVE_PROBLEM_TYPE
+_TRANSACTION_OUTCOME
+_TRANSACTION_STATE
+_TRANSACTION_INFORMATION_CLASS
+_TRANSACTIONMANAGER_INFORMATION_CLASS
+_RESOURCEMANAGER_INFORMATION_CLASS
+_ENLISTMENT_INFORMATION_CLASS
+_KTMOBJECT_TYPE
+_TP_CALLBACK_PRIORITY
+DPI_AWARENESS
+DPI_HOSTING_BEHAVIOR
+_FINDEX_INFO_LEVELS
+_FINDEX_SEARCH_OPS
+_READ_DIRECTORY_NOTIFY_INFORMATION_CLASS
+_GET_FILEEX_INFO_LEVELS
+_FILE_INFO_BY_HANDLE_CLASS
+_STREAM_INFO_LEVELS
+_THREAD_INFORMATION_CLASS
+_PROCESS_INFORMATION_CLASS
+_PROCESS_MEMORY_EXHAUSTION_TYPE
+_COMPUTER_NAME_FORMAT
+_MEMORY_RESOURCE_NOTIFICATION_TYPE
+OFFER_PRIORITY
+WIN32_MEMORY_INFORMATION_CLASS
+_DEP_SYSTEM_POLICY_TYPE
+_PROC_THREAD_ATTRIBUTE_NUM
+_COPYFILE2_MESSAGE_TYPE
+_COPYFILE2_MESSAGE_ACTION
+_COPYFILE2_COPY_PHASE
+_PRIORITY_HINT
+_FILE_ID_TYPE
+DISPLAYCONFIG_TOPOLOGY_ID
+_DISPLAYCONFIG_COLOR_ENCODING
+DIALOG_CONTROL_DPI_CHANGE_BEHAVIORS
+DIALOG_DPI_CHANGE_BEHAVIORS
+tagPOINTER_INPUT_TYPE
+tagPOINTER_BUTTON_CHANGE_TYPE
+tagFEEDBACK_TYPE
+tagHANDEDNESS
+tagPOINTER_DEVICE_TYPE
+tagPOINTER_DEVICE_CURSOR_TYPE
+tagINPUT_MESSAGE_DEVICE_TYPE
+tagINPUT_MESSAGE_ORIGIN_ID
+tagAR_STATE
+ORIENTATION_PREFERENCE
+SYSNLS_FUNCTION
+SYSGEOTYPE
+SYSGEOCLASS
+_NORM_FORM
+_RPC_HTTP_REDIRECTOR_STAGE
+RPC_ADDRESS_CHANGE_TYPE
+_LRPC_SYSTEM_HANDLE_MARSHAL_DIRECTION
+RpcProxyPerfCounters
+_RPC_NOTIFICATION_TYPES
+_RPC_ASYNC_EVENT
+tagExtendedErrorParamTypes
+tagRpcLocalAddressFormat
+tagRpcCallType
+tagRpcCallClientLocality
+_RPC_NOTIFICATIONS
+ASSOCCLASS
+SHSTOCKICONID
+CertKeyType
+_USER_MARSHAL_CB_TYPE
+_IDL_CS_CONVERT
+_system_handle_t
+tagMEMCTX
+tagCLSCTX
+tagMSHLFLAGS
+tagMSHCTX
+tagDVASPECT
+tagSTGC
+tagSTGMOVE
+tagSTATFLAG
+VARENUM
+tagTYSPEC
+_STORAGE_MEDIA_TYPE
+_STORAGE_BUS_TYPE
+_STORAGE_QUERY_TYPE
+_STORAGE_SET_TYPE
+_STORAGE_PROPERTY_ID
+_STORAGE_PORT_CODE_SET
+_STORAGE_IDENTIFIER_CODE_SET
+_STORAGE_IDENTIFIER_TYPE
+_STORAGE_ID_NAA_FORMAT
+_STORAGE_ASSOCIATION_TYPE
+_STORAGE_RPMB_FRAME_TYPE
+_STORAGE_CRYPTO_ALGORITHM_ID
+_STORAGE_CRYPTO_KEY_SIZE
+_STORAGE_TIER_MEDIA_TYPE
+_STORAGE_TIER_CLASS
+_STORAGE_PROTOCOL_TYPE
+_STORAGE_PROTOCOL_NVME_DATA_TYPE
+_STORAGE_PROTOCOL_ATA_DATA_TYPE
+_STORAGE_PROTOCOL_UFS_DATA_TYPE
+_STORAGE_DEVICE_FORM_FACTOR
+_STORAGE_COMPONENT_HEALTH_STATUS
+_STORAGE_DISK_HEALTH_STATUS
+_STORAGE_DISK_OPERATIONAL_STATUS
+_STORAGE_OPERATIONAL_STATUS_REASON
+_STORAGE_ZONED_DEVICE_TYPES
+_STORAGE_ZONE_TYPES
+_STORAGE_ZONES_ATTRIBUTES
+_STORAGE_ZONE_CONDITION
+_STORAGE_DIAGNOSTIC_LEVEL
+_STORAGE_DIAGNOSTIC_TARGET_TYPE
+_DEVICE_INTERNAL_STATUS_DATA_REQUEST_TYPE
+_DEVICE_INTERNAL_STATUS_DATA_SET
+_WRITE_CACHE_TYPE
+_WRITE_CACHE_ENABLE
+_WRITE_CACHE_CHANGE
+_WRITE_THROUGH
+_DEVICEDUMP_COLLECTION_TYPE
+_STORAGE_POWERUP_REASON_TYPE
+_STORAGE_DEVICE_POWER_CAP_UNITS
+_STORAGE_RPMB_COMMAND_TYPE
+_STORAGE_COUNTER_TYPE
+_STORAGE_ATTRIBUTE_MGMT_ACTION
+_SCM_REGION_FLAG
+_SCM_PD_QUERY_TYPE
+_SCM_PD_PROPERTY_ID
+_SCM_PD_HEALTH_STATUS
+_SCM_PD_OPERATIONAL_STATUS
+_SCM_PD_OPERATIONAL_STATUS_REASON
+_SCM_PD_MEDIA_REINITIALIZATION_STATUS
+_MEDIA_TYPE
+_PARTITION_STYLE
+_DETECTION_TYPE
+_BIN_TYPES
+_ELEMENT_TYPE
+_CHANGER_DEVICE_PROBLEM_TYPE
+_SHRINK_VOLUME_REQUEST_TYPES
+_CSV_CONTROL_OP
+_CSVFS_DISK_CONNECTIVITY
+_STORAGE_RESERVE_ID
+_QUERY_FILE_LAYOUT_FILTER_TYPE
+_FILE_STORAGE_TIER_MEDIA_TYPE
+_FILE_STORAGE_TIER_CLASS
+_REFS_SMR_VOLUME_GC_STATE
+_REFS_SMR_VOLUME_GC_ACTION
+_REFS_SMR_VOLUME_GC_METHOD
+_VIRTUAL_STORAGE_BEHAVIOR_CODE
+_PRINTER_OPTION_FLAGS
+tagREGCLS
+tagCOINITBASE
+tagACTIVATIONTYPE
+tagEXTCONN
+tagSTGTY
+tagSTREAM_SEEK
+tagLOCKTYPE
+tagEOLE_AUTHENTICATION_CAPABILITIES
+tagRPCOPT_PROPERTIES
+tagRPCOPT_SERVER_LOCALITY_VALUES
+tagGLOBALOPT_PROPERTIES
+tagGLOBALOPT_EH_VALUES
+tagGLOBALOPT_RPCTP_VALUES
+tagGLOBALOPT_RO_FLAGS
+tagGLOBALOPT_UNMARSHALING_POLICY_VALUES
+tagDCOM_CALL_STATE
+_APTTYPEQUALIFIER
+_APTTYPE
+_THDTYPE
+CO_MARSHALING_CONTEXT_ATTRIBUTES
+tagSTDMSHLFLAGS
+tagCOWAIT_FLAGS
+CWMO_FLAGS
+AgileReferenceOptions
+tagBIND_FLAGS
+tagMKSYS
+tagMKREDUCE
+tagADVF
+tagTYMED
+tagDATADIR
+tagCALLTYPE
+tagSERVERCALL
+tagPENDINGTYPE
+tagPENDINGMSG
+tagApplicationType
+tagShutdownType
+tagSF_TYPE
+tagTYPEKIND
+tagCALLCONV
+tagFUNCKIND
+tagINVOKEKIND
+tagVARKIND
+tagTYPEFLAGS
+tagFUNCFLAGS
+tagVARFLAGS
+tagDESCKIND
+tagSYSKIND
+tagLIBFLAGS
+tagCHANGEKIND
+tagCOINIT
+tagCOMSD
+tagDISCARDCACHE
+tagOLEGETMONIKER
+tagOLEWHICHMK
+tagUSERCLASSTYPE
+tagOLEMISC
+tagOLECLOSE
+tagOLERENDER
+tagOLEUPDATE
+tagOLELINKBIND
+tagBINDSPEED
+tagOLECONTF
+tagOLEVERBATTRIB
+tagDOMNodeType
+tagXMLEMEM_TYPE
+IEObjectType
+__MIDL_IMonikerProp_0001
+__MIDL_IBindStatusCallback_0001
+__MIDL_IBindStatusCallback_0002
+__MIDL_IBindStatusCallback_0003
+__MIDL_IBindStatusCallback_0004
+__MIDL_IBindStatusCallback_0005
+__MIDL_IBindStatusCallback_0006
+tagBINDSTATUS
+__MIDL_IBindStatusCallbackEx_0001
+__MIDL_IAuthenticateEx_0001
+__MIDL_ICodeInstall_0001
+__MIDL_IUri_0001
+__MIDL_IUri_0002
+tagBINDSTRING
+_tagPI_FLAGS
+_tagOIBDG_FLAGS
+_tagPARSEACTION
+_tagPSUACTION
+_tagQUERYOPTION
+_tagINTERNETFEATURELIST
+__MIDL_IInternetSecurityManager_0001
+__MIDL_IInternetSecurityManager_0002
+__MIDL_IInternetSecurityManager_0003
+tagURLZONE
+tagURLTEMPLATE
+__MIDL_IInternetZoneManager_0001
+__MIDL_IInternetZoneManager_0002
+_URLZONEREG
+__MIDL_IGetBindHandle_0001
+PIDMSI_STATUS_VALUE
+tagREGKIND
+_SC_ACTION_TYPE
+_SC_STATUS_TYPE
+_SC_ENUM_TYPE
+_SC_EVENT_TYPE
+SERVICE_REGISTRY_STATE_TYPE
+SERVICE_DIRECTORY_TYPE
+_WSACOMPLETIONTYPE
+_WSAEcomparator
+_WSAESETSERVICEOP
+$ArrayType$$$BY0BA@$$CB_W
+$ArrayType$$$BY0L@$$CB_W
+$ArrayType$$$BY0BC@$$CB_W
+$ArrayType$$$BY0BB@$$CB_W
+$ArrayType$$$BY0BD@$$CB_W
+$ArrayType$$$BY0P@$$CB_W
+$ArrayType$$$BY0N@$$CB_W
+$ArrayType$$$BY0O@$$CB_W
+_Invoker_strategy
+$ArrayType$$$BY0BJ@$$CBD
+tagUASFLAGS
+tagREADYSTATE
+tagGUIDKIND
+tagCTRLINFO
+tagXFORMCOORDS
+tagPROPPAGESTATUS
+tagPictureAttributes
+tagACTIVATEFLAGS
+tagOLEDCFLAGS
+tagVIEWSTATUS
+tagHITRESULT
+tagDVASPECT2
+tagExtentMode
+tagAspectInfoFlag
+tagPOINTERINACTIVE
+tagPROPBAG2_TYPE
+tagQACONTAINERFLAGS
+_LARGE_INTEGER
+$UnnamedClass$0x1a45bfe4$10$
+<unnamed-type-u>
+ClassesAllowedInStream
+AnnoScope
+tagDOCHOSTUIDBLCLKDispatch
+tagDocHostUIFlagDispatch
+_crt_argv_mode
+_crt_exit_return_mode
+_crt_exit_cleanup_mode
+_crt_app_type
+tagSTRRET_TYPE
+tagPERCEIVED
+tagSHCOLSTATE
+DEVICE_SCALE_FACTOR
+tagSFBS_FLAGS
+$ArrayType$$$BY0BC@$$CBD
+$ArrayType$$$BY0BE@$$CBD
+$ArrayType$$$BY0BG@$$CBD
+$ArrayType$$$BY0BN@$$CBD
+$ArrayType$$$BY0BI@$$CBD
+$ArrayType$$$BY0BA@$$CBD
+$ArrayType$$$BY05$$CB_W
+$ArrayType$$$BY0BG@$$CB_W
+$ArrayType$$$BY0BE@$$CB_W
+$ArrayType$$$BY0CA@$$CB_W
+$ArrayType$$$BY00$$CB_W
+$ArrayType$$$BY0BI@$$CB_W
+$ArrayType$$$BY0BH@$$CBD
+__crt_locale_data_public
+__crt_locale_pointers
+_GUID
+_TP_CALLBACK_ENVIRON_V3
+<unnamed-type-s>
+tagMSG
+HWND__
+_DEVICE_MANAGE_DATA_SET_ATTRIBUTES
+_DEVICE_DATA_SET_RANGE
+_DEVICE_DSM_DEFINITION
+_iobuf
+CCRTAllocator
+CLocalAllocator
+CGlobalAllocator
+CAtlException
+_RTL_CRITICAL_SECTION
+CComCriticalSection
+CComSafeDeleteCriticalSection
+CAtlBaseModule
+HINSTANCE__
+ATLSTRINGRESOURCEIMAGE
+HRSRC__
+tagSAFEARRAY
+IUnknown
+CComPtr<IDispatch>
+IDispatch
+tagVARIANT
+$UnnamedClass$0x1a45bfe4$526$
+$UnnamedClass$0x1a45bfe4$527$
+$UnnamedClass$0x1a45bfe4$528$
+$UnnamedClass$0x1a45bfe4$529$
+CComQIPtr<IUnknown,&IID_IUnknown>
+CComPtr<IUnknown>
+CComBSTR
+IStream
+CComVariant
+CComPtr<IPersistStream>
+_ULARGE_INTEGER
+$UnnamedClass$0x1a45bfe4$12$
+CAtlTransactionManager
+HKEY__
+_SECURITY_ATTRIBUTES
+_ATL_OBJMAP_ENTRY30
+_ATL_OBJMAP_ENTRY110
+CComMultiThreadModel
+CHandle
+CCritSecLock
+CAtlComModule
+_ATL_COM_MODULE70
+CAtlWinModule
+_AtlCreateWndData
+_ATL_WIN_MODULE70
+CAtlReleaseManagedClassFactories
+CAtlModule
+IGlobalInterfaceTable
+_ATL_MODULE70
+CComModuleHelper
+ATL.<AtlImplementationDetails>
+CComModule
+_ATL_REGMAP_ENTRY
+CAtlModuleT<ATL::CComModule>
+CComApartment
+CComSimpleThreadAllocator
+CRegKey
+CExpansionVectorEqualHelper
+CExpansionVector
+CRegParser
+CParseBuffer
+CRegObject
+CComAutoDeleteCriticalSection
+IRegistrarBase
+ITypeLib
+_ATL_CATMAP_ENTRY
+CComPtr<ICatRegister>
+CComPtr<ITypeLib>
+CComPtr<IConnectionPointContainer>
+CComPtr<IConnectionPoint>
+CComPtrBase<IConnectionPoint>
+_NoAddRefReleaseOnCComPtr<IConnectionPoint>
+IConnectionPoint
+CComPtrBase<IConnectionPointContainer>
+_NoAddRefReleaseOnCComPtr<IConnectionPointContainer>
+IConnectionPointContainer
+CComPtrBase<ITypeLib>
+_NoAddRefReleaseOnCComPtr<ITypeLib>
+CComPtrBase<ICatRegister>
+_NoAddRefReleaseOnCComPtr<ICatRegister>
+ICatRegister
+CTempBuffer<unsigned char,256,ATL::CCRTAllocator>
+CTempBuffer<wchar_t,256,ATL::CCRTAllocator>
+CTempBuffer<char,1024,ATL::CCRTAllocator>
+CTempBuffer<wchar_t,1024,ATL::CCRTAllocator>
+CAutoVectorPtr<wchar_t>
+CSimpleMap<wchar_t *,wchar_t *,ATL::CExpansionVectorEqualHelper>
+Wrapper<wchar_t *>
+CAtlAutoThreadModuleT<ATL::CAtlAutoThreadModule,ATL::CComSimpleThreadAllocator,4294967295>
+CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >
+CComPtrBase<IPersistStream>
+IPersistStream
+_NoAddRefReleaseOnCComPtr<IPersistStream>
+CComPtrBase<IUnknown>
+_NoAddRefReleaseOnCComPtr<IUnknown>
+CComPtrBase<IDispatch>
+CAtlSafeAllocBufferManager<ATL::CCRTAllocator>
+ATL._ATL_SAFE_ALLOCA_IMPL
+CAtlSafeAllocBufferNode
+CTraceCategoryEx<524288,0>
+<unnamed-type-TraceCategories>
+CTraceCategoryEx<1,0>
+CTraceCategoryEx<2,0>
+CTraceCategoryEx<4,0>
+CTraceCategoryEx<8,0>
+CTraceCategoryEx<16,0>
+CTraceCategoryEx<32,0>
+CTraceCategoryEx<64,0>
+CTraceCategoryEx<128,0>
+CTraceCategoryEx<256,0>
+CTraceCategoryEx<512,0>
+CTraceCategoryEx<1024,0>
+CTraceCategoryEx<2048,0>
+CTraceCategoryEx<4096,0>
+CTraceCategoryEx<8192,0>
+CTraceCategoryEx<16384,0>
+CTraceCategoryEx<32768,0>
+CTraceCategoryEx<65536,0>
+CTraceCategoryEx<131072,0>
+CTraceCategoryEx<262144,0>
+CTraceCategoryEx<1048576,0>
+CTraceCategoryEx<2097152,0>
+CTraceCategoryEx<4194304,0>
+CComCritSecLock<ATL::CComCriticalSection>
+$_s__RTTIBaseClassArray$_extraBytes_12
+$_s__RTTIBaseClassArray$_extraBytes_8
+$_s__RTTIBaseClassArray$_extraBytes_4
+$_s__RTTIBaseClassArray$_extraBytes_16
+_s__RTTIBaseClassDescriptor
+_s__RTTIClassHierarchyDescriptor
+$_TypeDescriptor$_extraBytes_21
+$_TypeDescriptor$_extraBytes_31
+$_TypeDescriptor$_extraBytes_102
+$_TypeDescriptor$_extraBytes_42
+$_TypeDescriptor$_extraBytes_24
+$_TypeDescriptor$_extraBytes_15
+_s__RTTICompleteObjectLocator
+_AtlAptCreateObjData
+nothrow_t
+_ATL_TERMFUNC_ELEM
+_ATL_INTMAP_ENTRY
+_ATL_OBJMAP_CACHE
+__s_GUID
+tagTLIBATTR
+$ArrayType$$$BY0IA@_W
+$ArrayType$$$BY0BAO@_W
+$ArrayType$$$BY0BAG@_W
+$ArrayType$$$BY0BJ@$$CB_W
+$ArrayType$$$BY0CAM@_W
+$ArrayType$$$BY0CAI@_W
+$ArrayType$$$BY0CA@_W
+_FILETIME
+$ArrayType$$$BY0BAAA@_W
+$ArrayType$$$BY0O@$$CBUkeymap@?1??HKeyFromString@CRegParser@ATL@@KAPAUHKEY__@@PA_W@Z@
+keymap
+ATL.?HKeyFromString@CRegParser@ATL@@$$FKAPAUHKEY__@@PA_W@Z.__l2
+$ArrayType$$$BY0M@QB_W
+_OVERLAPPED
+$UnnamedClass$0x1a45bfe4$173$
+$UnnamedClass$0x1a45bfe4$174$
+$ArrayType$$$BY06Q6AXXZ
+$ArrayType$$$BY0BAE@_W
+$ArrayType$$$BY0BAA@_W
+IAtlAutoThreadModule
+$ArrayType$$$BY0L@Q6AXXZ
+_IMAGE_DOS_HEADER
+_WIN32_FIND_DATAW
+_WIN32_FILE_ATTRIBUTE_DATA
+FILETYPEATTRIBUTEFLAGS
+$ArrayType$$$BY01VCComVariant@ATL@@
+tagCY
+$UnnamedClass$0x1a45bfe4$351$
+$PTMType$QQtagVARIANT@@PATtagCY@@
+$PTMType$PQtagVARIANT@@PATtagCY@@
+$PTMType$QQtagVARIANT@@TtagCY@@
+$PTMType$PQtagVARIANT@@TtagCY@@
+$PTMType$QQtagVARIANT@@PAPAUIDispatch@@
+$PTMType$PQtagVARIANT@@PAPAUIDispatch@@
+$PTMType$QQtagVARIANT@@PAUIDispatch@@
+$PTMType$PQtagVARIANT@@PAUIDispatch@@
+$PTMType$QQtagVARIANT@@PAPAUIUnknown@@
+$PTMType$PQtagVARIANT@@PAPAUIUnknown@@
+$PTMType$QQtagVARIANT@@PAUIUnknown@@
+$PTMType$PQtagVARIANT@@PAUIUnknown@@
+$PTMType$QQtagVARIANT@@PAPA_W
+$PTMType$PQtagVARIANT@@PAPA_W
+$PTMType$QQtagVARIANT@@PA_W
+$PTMType$PQtagVARIANT@@PA_W
+$PTMType$QQtagVARIANT@@PAN
+$PTMType$PQtagVARIANT@@PAN
+$PTMType$QQtagVARIANT@@N
+$PTMType$PQtagVARIANT@@N
+$PTMType$QQtagVARIANT@@PAM
+$PTMType$PQtagVARIANT@@PAM
+$PTMType$QQtagVARIANT@@M
+$PTMType$PQtagVARIANT@@M
+$PTMType$QQtagVARIANT@@PA_K
+$PTMType$PQtagVARIANT@@PA_K
+$PTMType$QQtagVARIANT@@_K
+$PTMType$PQtagVARIANT@@_K
+$PTMType$QQtagVARIANT@@PA_J
+$PTMType$PQtagVARIANT@@PA_J
+$PTMType$QQtagVARIANT@@_J
+$PTMType$PQtagVARIANT@@_J
+$PTMType$QQtagVARIANT@@PAK
+$PTMType$PQtagVARIANT@@PAK
+$PTMType$QQtagVARIANT@@K
+$PTMType$PQtagVARIANT@@K
+$PTMType$QQtagVARIANT@@PAJ
+$PTMType$PQtagVARIANT@@PAJ
+$PTMType$QQtagVARIANT@@J
+$PTMType$PQtagVARIANT@@J
+$PTMType$QQtagVARIANT@@PAI
+$PTMType$PQtagVARIANT@@PAI
+$PTMType$QQtagVARIANT@@I
+$PTMType$PQtagVARIANT@@I
+$PTMType$QQtagVARIANT@@PAH
+$PTMType$PQtagVARIANT@@PAH
+$PTMType$QQtagVARIANT@@H
+$PTMType$PQtagVARIANT@@H
+$PTMType$QQtagVARIANT@@PAG
+$PTMType$PQtagVARIANT@@PAG
+$PTMType$QQtagVARIANT@@G
+$PTMType$PQtagVARIANT@@G
+$PTMType$QQtagVARIANT@@PAF
+$PTMType$PQtagVARIANT@@PAF
+$PTMType$QQtagVARIANT@@F
+$PTMType$PQtagVARIANT@@F
+$PTMType$QQtagVARIANT@@PAE
+$PTMType$PQtagVARIANT@@PAE
+$PTMType$QQtagVARIANT@@PAD
+$PTMType$PQtagVARIANT@@PAD
+$PTMType$QQtagVARIANT@@E
+$PTMType$PQtagVARIANT@@E
+$PTMType$QQtagVARIANT@@D
+$PTMType$PQtagVARIANT@@D
+ISequentialStream
+$ArrayType$$$BY0EA@_W
+tagDISPPARAMS
+tagEXCEPINFO
+IObjectWithSite
+$ArrayType$$$BY0BAF@_W
+_SYSTEMTIME
+CComFakeCriticalSection
+CComAutoCriticalSection
+hash<std::nullptr_t>
+hash<long double>
+hash<double>
+hash<float>
+_nlsversioninfo
+$_s__CatchableTypeArray$_extraBytes_4
+_s__CatchableType
+$ArrayType$$$BY01Q6AXXZ
+_s__ThrowInfo
+CTraceCategory
+_devicemodeW
+$UnnamedClass$0x1a45bfe4$207$
+$UnnamedClass$0x1a45bfe4$208$
+$UnnamedClass$0x1a45bfe4$209$
+$UnnamedClass$0x1a45bfe4$210$
+_devicemodeA
+$UnnamedClass$0x1a45bfe4$203$
+$UnnamedClass$0x1a45bfe4$204$
+$UnnamedClass$0x1a45bfe4$205$
+$UnnamedClass$0x1a45bfe4$206$
+tagTEXTMETRICA
+_Mbstatet
+_stat64i32
+stat
+tagPROPVARIANT
+$UnnamedClass$0x1a45bfe4$534$
+$UnnamedClass$0x1a45bfe4$535$
+$UnnamedClass$0x1a45bfe4$536$
+_DEVICE_MANAGE_DATA_SET_ATTRIBUTES_OUTPUT
+tagRECT
+HDC__
+tagTEXTMETRICW
+_CUSTOM_SYSTEM_EVENT_TRIGGER_CONFIG
+_lldiv_t
+_ldiv_t
+CGrabThread
+ClassFrameGrabber
+$ArrayType$$$BY08$$CBD
+CpuFeatures
+ISA_AVAILABILITY
+float_denorm_style
+float_round_style
+_Uninitialized
+$ArrayType$$$BY0O@$$CBD
+$ArrayType$$$BY0P@$$CBD
+$ArrayType$$$BY0BF@$$CBD
+__clr_placement_new_t
+?A0xb68b8124
+memory_order
+$ArrayType$$$BY0BL@$$CBD
+$ArrayType$$$BY0BM@$$CBD
+$ArrayType$$$BY02$$CBD
+$ArrayType$$$BY02$$CB_W
+$ArrayType$$$BY00$$CBD
+Code
+cv.Error
+DecompTypes
+NormTypes
+CmpTypes
+GemmFlags
+DftFlags
+BorderTypes
+Matx_MatMulOp
+UMatUsageFlags
+$ArrayType$$$BY0EF@$$CBD
+$ArrayType$$$BY0BP@$$CBD
+$ArrayType$$$BY0CN@$$CBD
+$ArrayType$$$BY0CJ@$$CBD
+$ArrayType$$$BY0DD@$$CBD
+$ArrayType$$$BY0N@$$CBD
+$ArrayType$$$BY0CA@$$CBD
+$ArrayType$$$BY0CH@$$CBD
+SortFlags
+CovarFlags
+KmeansFlags
+LineTypes
+HersheyFonts
+ReduceTypes
+RotateFlags
+errc
+io_errc
+error_code
+$ArrayType$$$BY07$$CBD
+$ArrayType$$$BY06$$CBD
+$ArrayType$$$BY0L@$$CBD
+pointer_safety
+$ArrayType$$$BY0FG@$$CBD
+$ArrayType$$$BY0IH@$$CBD
+$ArrayType$$$BY05$$CBD
+$ArrayType$$$BY04$$CBD
+$ArrayType$$$BY0FG@$$CB_W
+$ArrayType$$$BY0IH@$$CB_W
+$ArrayType$$$BY01$$CBD
+_Codecvt_mode
+_Case_sensitive
+$ArrayType$$$BY03$$CBD
+TYPE
+cv.instr
+IMPL
+FLAGS
+CvScalar
+CvSlice
+SolveLPResult
+flann_algorithm_t
+cvflann
+flann_centers_init_t
+flann_log_level_t
+flann_distance_t
+flann_datatype_t
+$ArrayType$$$BY0EE@$$CBD
+$ArrayType$$$BY0M@$$CBD
+_Tree_child
+$ArrayType$$$BY0BB@$$CBD
+$ArrayType$$$BY0CE@$$CBD
+_Vector_iterator<std::_Vector_val<std::_Simple_types<unsigned int> > >
+_Vector_iterator<std::_Vector_val<std::_Simple_types<int> > >
+$ArrayType$$$BY09$$CBD
+ImreadModes
+ImwriteFlags
+ImwritePNGFlags
+ImwritePAMFlags
+VideoCaptureAPIs
+VideoCaptureProperties
+VideoCaptureModes
+VideoWriterProperties
+WindowFlags
+WindowPropertyFlags
+MouseEventTypes
+MouseEventFlags
+QtFontWeights
+QtFontStyles
+QtButtonTypes
+SmoothMethod_c
+MorphShapes_c
+ShapeMatchModes
+CvSize
+CvPoint
+CvPoint2D32f
+MorphTypes
+MorphShapes
+InterpolationFlags
+InterpolationMasks
+DistanceTypes
+DistanceTransformMasks
+ThresholdTypes
+AdaptiveThresholdTypes
+UndistortTypes
+GrabCutClasses
+GrabCutModes
+DistanceTransformLabelTypes
+FloodFillFlags
+ConnectedComponentsTypes
+ConnectedComponentsAlgorithmsTypes
+RetrievalModes
+ContourApproximationModes
+HoughModes
+LineSegmentDetectorModes
+HistCompMethods
+ColorConversionCodes
+RectanglesIntersectTypes
+TemplateMatchModes
+ColormapTypes
+MarkerTypes
+VariableTypes
+cv.ml
+ErrorTypes
+SampleTypes
+InpaintingModes
+FeatureSet
+cv.cuda
+Range
+$ArrayType$$$BY0EG@$$CBD
+$ArrayType$$$BY0CB@$$CBD
+$ArrayType$$$BY0DK@$$CBD
+$ArrayType$$$BY0FL@$$CBD
+$ArrayType$$$BY0DC@$$CBD
+WaveCorrectKind
+cv.detail
+$ArrayType$$$BY0EC@$$CBD
+$ArrayType$$$BY0BO@$$CBD
+$ArrayType$$$BY0CP@$$CBD
+MotionModel
+cv.videostab
+$ArrayType$$$BY0EO@$$CBD
+$ArrayType$$$BY0BD@$$CBD
+_IplImage
+VideoCapture
+zbar_color_e
+zbar
+zbar_symbol_type_e
+zbar_error_e
+zbar_config_e
+CVL_Status
+RotatedRect
+vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >
+$ArrayType$$$BY0DM@$$CBD
+$ArrayType$$$BY0DE@$$CBD
+Ygreater
+_Vector_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >
+Xgreater
+_Zero_then_variadic_args_t
+_One_then_variadic_args_t
+ostreambuf_iterator<wchar_t,std::char_traits<wchar_t> >
+istreambuf_iterator<wchar_t,std::char_traits<wchar_t> >
+_Istreambuf_proxy
+ostreambuf_iterator<char,std::char_traits<char> >
+istreambuf_iterator<char,std::char_traits<char> >
+_Equal_allocators
+_String_const_iterator<std::_String_val<std::_Simple_types<wchar_t> > >
+_String_const_iterator<std::_String_val<std::_Simple_types<char> > >
+<lambda_336b60ed8ece25612a4e239a3ad2963a>
+std.?assign@?$basic_string@_UU?$char_traits@_U@std@@V?$allocator@_U@2@@std@@$$FQAEAAV12@QB_UI@Z.__l2
+<lambda_e8146e699ad3d19085b95d1601c4900f>
+std.?assign@?$basic_string@_SU?$char_traits@_S@std@@V?$allocator@_S@2@@std@@$$FQAEAAV12@QB_SI@Z.__l2
+<lambda_000a440560208bdbd8b15cb5b1a8b6b3>
+std.?push_back@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEX_W@Z.__l2
+<lambda_0504f7258912048d76197aad5a051a15>
+std.?assign@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEAAV12@I_W@Z.__l2
+<lambda_dedddf4a6a87ceff87c95d2861c9e684>
+std.?assign@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEAAV12@QB_WI@Z.__l2
+<lambda_dd3ebc2beb833959bdddd48fc577e8ed>
+std.?append@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEAAV12@I_W@Z.__l2
+<lambda_6f04b3841c6ace20ee4fd1b3dbc592d0>
+std.?push_back@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEXD@Z.__l2
+<lambda_2e531c9f1bfece438b11d7a687d3ac9c>
+std.?assign@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEAAV12@ID@Z.__l2
+<lambda_88acb98cb1d3e807ff08d7ebe077788e>
+std.?assign@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEAAV12@QBDI@Z.__l2
+<lambda_b520e6e7dd2c85f4b83ca9ec1210796f>
+std.?append@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEAAV12@ID@Z.__l2
+<lambda_4c04651f1675f62dd3603168f157397a>
+std.?append@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEAAV12@QBDI@Z.__l2
+<lambda_33207f5e511f75d4236841966d7be680>
+std.?insert@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEAAV12@II_W@Z.__l2
+<lambda_6f15b3f3d520a31cb8e9581fa19a29aa>
+std.?insert@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@$$FQAEAAV12@IID@Z.__l2
+<lambda_81024737dbc355ceadab6de384f2d3f0>
+std.?append@?$basic_string@_WU?$char_traits@_W@std@@V?$allocator@_W@2@@std@@$$FQAEAAV12@QB_WI@Z.__l2
+less<void>
+$ArrayType$$$BY0FF@$$CBD
+$ArrayType$$$BY0FA@$$CBD
+$ArrayType$$$BY0FE@$$CBD
+$ArrayType$$$BY0FC@$$CBD
+$ArrayType$$$BY0FI@$$CBD
+$ArrayType$$$BY0GA@$$CBD
+$ArrayType$$$BY0GI@$$CBD
+$ArrayType$$$BY0FB@$$CBD
+$ArrayType$$$BY0FJ@$$CBD
+$ArrayType$$$BY0FD@$$CBD
+$ArrayType$$$BY0FN@$$CBD
+$ArrayType$$$BY0FM@$$CBD
+$ArrayType$$$BY0FO@$$CBD
+_Value_init_tag
+_Tree_id<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> *>
+integral_constant<bool,1>
+integral_constant<bool,0>
+_List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>
+_Cvtvec
+$ArrayType$$$BY0HJ@$$CBD
+random_access_iterator_tag
+DefaultDeleter<cv::detail::PlaneWarper>
+DefaultDeleter<cv::detail::AffineWarper>
+DefaultDeleter<cv::detail::CylindricalWarper>
+DefaultDeleter<cv::detail::SphericalWarper>
+DefaultDeleter<cv::detail::FisheyeWarper>
+DefaultDeleter<cv::detail::StereographicWarper>
+DefaultDeleter<cv::detail::CompressedRectilinearWarper>
+DefaultDeleter<cv::detail::CompressedRectilinearPortraitWarper>
+DefaultDeleter<cv::detail::PaniniWarper>
+DefaultDeleter<cv::detail::PaniniPortraitWarper>
+DefaultDeleter<cv::detail::MercatorWarper>
+DefaultDeleter<cv::detail::TransverseMercatorWarper>
+_Exact_args_t
+piecewise_construct_t
+_Unused_parameter
+integer_sequence<unsigned int>
+integer_sequence<unsigned int,0>
+__m128
+__m64
+numeric_limits<bool>
+numeric_limits<char>
+numeric_limits<signed char>
+numeric_limits<unsigned char>
+numeric_limits<char16_t>
+numeric_limits<char32_t>
+numeric_limits<wchar_t>
+numeric_limits<short>
+numeric_limits<int>
+numeric_limits<long>
+numeric_limits<__int64>
+numeric_limits<unsigned short>
+numeric_limits<unsigned int>
+numeric_limits<unsigned long>
+numeric_limits<unsigned __int64>
+numeric_limits<float>
+numeric_limits<double>
+numeric_limits<long double>
+exception
+bad_exception
+bad_alloc
+bad_array_new_length
+exception_ptr
+nested_exception
+_Default_allocate_traits
+_Container_base0
+_Fake_allocator
+_Iterator_base0
+_Container_proxy
+_Container_base12
+_Iterator_base12
+_Fake_proxy_ptr_impl
+_Rand_urng_from_func
+basic_string<char,std::char_traits<char>,std::allocator<char> >
+basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >
+String
+PtrOwner
+Point_<float>
+Size_<float>
+Scalar_<double>
+TermCriteria
+Type
+MatAllocator
+_InputArray
+Size_<int>
+UMat
+MatExpr
+_OutputArray
+vector<cv::Mat,std::allocator<cv::Mat> >
+GpuMat
+Allocator
+HostMem
+AllocType
+_InputOutputArray
+Rect_<int>
+MatSize
+MatStep
+SparseMat
+Node
+MatConstIterator
+SparseMatConstIterator
+SparseMatIterator
+FileStorage
+Mode
+FileNodeIterator
+SeqReader
+FileNode
+CvFileNode
+<unnamed-type-data>
+Ptr<cv::Formatted>
+Algorithm
+Flags
+logic_error
+domain_error
+invalid_argument
+length_error
+out_of_range
+runtime_error
+overflow_error
+underflow_error
+range_error
+atomic_flag
+error_category
+error_condition
+_System_error
+system_error
+_System_error_message
+_Generic_error_category
+_Iostream_error_category2
+_System_error_category
+type_info
+bad_cast
+bad_typeid
+__non_rtti_object
+bad_weak_ptr
+_Ref_count_base
+_Facet_base
+_Timevec
+_Locinfo
+_Ctypevec
+lconv
+locale
+_Locimp
+facet
+_Facet_guard
+codecvt_base
+codecvt<char16_t,char,_Mbstatet>
+codecvt<char32_t,char,_Mbstatet>
+codecvt<wchar_t,char,_Mbstatet>
+codecvt<unsigned short,char,_Mbstatet>
+ctype_base
+ctype<char>
+ctype<wchar_t>
+ctype<unsigned short>
+ios_base
+event
+failure
+Init
+_Iosarray
+_Fnarray
+_Ctraits<long double>
+_Ctraits<double>
+_Ctraits<float>
+complex<float>
+complex<double>
+complex<long double>
+basic_ostream<char,std::char_traits<char> >
+_Sentry_base
+sentry
+TickMeter
+NodeDataTls
+CvMat
+$UnnamedClass$0xb68b8124$119$
+$UnnamedClass$0xb68b8124$120$
+CvRect
+CvTermCriteria
+CvPoint3D32f
+CvSize2D32f
+MinProblemSolver
+Function
+BFMatcher
+FLANNException
+empty_any
+cvflann.anyimpl
+base_any_policy
+big_any_policy<enum cvflann::flann_centers_init_t>
+big_any_policy<enum cvflann::flann_algorithm_t>
+big_any_policy<cv::String>
+tuple<>
+map<cv::String,cvflann::any,std::less<cv::String>,std::allocator<std::pair<cv::String const ,cvflann::any> > >
+_Tree_const_iterator<std::_Tree_val<std::_Tree_simple_types<std::pair<cv::String const ,cvflann::any> > > >
+Exception
+DynamicBitset
+UniqueRandom
+Logger
+money_base
+pattern
+time_base
+dateorder
+map<unsigned int,std::vector<unsigned int,std::allocator<unsigned int> >,std::less<unsigned int>,std::allocator<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > >
+LshStats
+cvflann.lsh
+StartStopTimer
+CvFont
+LineSegmentDetector
+LineIterator
+BaseCascadeClassifier
+MaskGenerator
+HOGDescriptor
+DetectionBasedTracker
+Parameters
+IDetector
+ObjectStatus
+ExtObject
+InnerParameters
+TrackedObject
+RotationWarper
+PlaneWarper
+RotationWarperBase<cv::detail::PlaneProjector>
+AffineWarper
+SphericalWarper
+RotationWarperBase<cv::detail::SphericalProjector>
+CylindricalWarper
+Point_<int>
+RotationWarperBase<cv::detail::CylindricalProjector>
+FisheyeWarper
+RotationWarperBase<cv::detail::FisheyeProjector>
+StereographicWarper
+RotationWarperBase<cv::detail::StereographicProjector>
+CompressedRectilinearWarper
+RotationWarperBase<cv::detail::CompressedRectilinearProjector>
+CompressedRectilinearPortraitWarper
+RotationWarperBase<cv::detail::CompressedRectilinearPortraitProjector>
+PaniniWarper
+RotationWarperBase<cv::detail::PaniniProjector>
+PaniniPortraitWarper
+RotationWarperBase<cv::detail::PaniniPortraitProjector>
+MercatorWarper
+RotationWarperBase<cv::detail::MercatorProjector>
+TransverseMercatorWarper
+RotationWarperBase<cv::detail::TransverseMercatorProjector>
+PlaneWarperGpu
+SphericalWarperGpu
+CylindricalWarperGpu
+SphericalPortraitWarper
+RotationWarperBase<cv::detail::SphericalPortraitProjector>
+CylindricalPortraitWarper
+RotationWarperBase<cv::detail::CylindricalPortraitProjector>
+PlanePortraitWarper
+RotationWarperBase<cv::detail::PlanePortraitProjector>
+PlaneProjector
+SphericalProjector
+CylindricalProjector
+FisheyeProjector
+StereographicProjector
+CompressedRectilinearProjector
+CompressedRectilinearPortraitProjector
+PaniniProjector
+PaniniPortraitProjector
+MercatorProjector
+TransverseMercatorProjector
+SphericalPortraitProjector
+CylindricalPortraitProjector
+PlanePortraitProjector
+WarperCreator
+Ptr<cv::detail::RotationWarper>
+FeaturesFinder
+FeaturesMatcher
+AffineBestOf2NearestMatcher
+BestOf2NearestMatcher
+Graph
+Point3_<float>
+Estimator
+HomographyBasedEstimator
+BundleAdjusterBase
+NoBundleAdjuster
+vector<cv::detail::ImageFeatures,std::allocator<cv::detail::ImageFeatures> >
+vector<cv::detail::MatchesInfo,std::allocator<cv::detail::MatchesInfo> >
+vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >
+BundleAdjusterReproj
+BundleAdjusterRay
+BundleAdjusterAffine
+BundleAdjusterAffinePartial
+ExposureCompensator
+BlocksGainCompensator
+SeamFinder
+Blender
+FeatherBlender
+ISparseOptFlowEstimator
+IDenseOptFlowEstimator
+PyrLkOptFlowEstimatorBase
+RansacParams
+IOutlierRejector
+MotionEstimatorBase
+ImageMotionEstimatorBase
+IMotionStabilizer
+MotionFilterBase
+GaussianMotionFilter
+IFrameSource
+ILog
+Mat_<unsigned char>
+Mat_<float>
+Mat_<int>
+InpainterBase
+ColorInpainter
+DeblurerBase
+vector<float,std::allocator<float> >
+WobbleSuppressorBase
+MoreAccurateMotionWobbleSuppressorBase
+StabilizerBase
+InternalError
+UnsupportedError
+InvalidError
+SystemError
+LockingError
+BusyError
+XDisplayError
+XProtoError
+ClosedError
+FormatError
+Decoder
+Handler
+SymbolSet
+Symbol
+Point
+PointIterator
+SymbolIterator
+Image
+ImageScanner
+Video
+Window
+Processor
+blob_
+queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >
+vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >
+Vec<int,4>
+vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >
+Vec<float,3>
+allocator<cv::Vec<float,3> >
+allocator<CVisionLib::blob_>
+deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >
+vector<cv::Ptr<cv::videostab::InpainterBase>,std::allocator<cv::Ptr<cv::videostab::InpainterBase> > >
+Ptr<cv::videostab::InpainterBase>
+vector<cv::videostab::FastMarchingMethod::DXY,std::allocator<cv::videostab::FastMarchingMethod::DXY> >
+vector<cv::Ptr<cv::videostab::IMotionStabilizer>,std::allocator<cv::Ptr<cv::videostab::IMotionStabilizer> > >
+Ptr<cv::videostab::IMotionStabilizer>
+basic_ofstream<char,std::char_traits<char> >
+basic_filebuf<char,std::char_traits<char> >
+_Initfl
+basic_streambuf<char,std::char_traits<char> >
+fpos<_Mbstatet>
+_Narrow_char_traits<char,int>
+basic_ifstream<char,std::char_traits<char> >
+vector<std::pair<int,int>,std::allocator<std::pair<int,int> > >
+list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >
+vector<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >,std::allocator<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > > >
+vector<cv::Rect_<int>,std::allocator<cv::Rect_<int> > >
+vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >
+_Tree_const_iterator<std::_Tree_val<std::_Tree_simple_types<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > > >
+pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >
+LshTable<unsigned char>
+SpeedLevel
+_Tree<std::_Tmap_traits<unsigned int,std::vector<unsigned int,std::allocator<unsigned int> >,std::less<unsigned int>,std::allocator<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > >,0> >
+_Redbl
+_Vector_const_iterator<std::_Vector_val<std::_Simple_types<std::vector<unsigned int,std::allocator<unsigned int> > > > >
+vector<unsigned int,std::allocator<unsigned int> >
+vector<std::vector<unsigned int,std::allocator<unsigned int> >,std::allocator<std::vector<unsigned int,std::allocator<unsigned int> > > >
+time_put<wchar_t,std::ostreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+time_get<wchar_t,std::istreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+time_put<char,std::ostreambuf_iterator<char,std::char_traits<char> > >
+time_get<char,std::istreambuf_iterator<char,std::char_traits<char> > >
+money_put<wchar_t,std::ostreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+money_get<wchar_t,std::istreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+moneypunct<wchar_t,0>
+moneypunct<wchar_t,1>
+_Mpunct<wchar_t>
+money_put<char,std::ostreambuf_iterator<char,std::char_traits<char> > >
+money_get<char,std::istreambuf_iterator<char,std::char_traits<char> > >
+moneypunct<char,0>
+moneypunct<char,1>
+_Mpunct<char>
+_Vector_const_iterator<std::_Vector_val<std::_Simple_types<unsigned int> > >
+pair<cv::String const ,cvflann::any>
+_Tree_unchecked_const_iterator<std::_Tree_val<std::_Tree_simple_types<std::pair<cv::String const ,cvflann::any> > >,std::_Iterator_base0>
+_Tree<std::_Tmap_traits<cv::String,cvflann::any,std::less<cv::String>,std::allocator<std::pair<cv::String const ,cvflann::any> >,0> >
+typed_base_any_policy<cv::String>
+typed_base_any_policy<enum cvflann::flann_algorithm_t>
+typed_base_any_policy<enum cvflann::flann_centers_init_t>
+vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >
+vector<int,std::allocator<int> >
+allocator<std::vector<int,std::allocator<int> > >
+vector<double,std::allocator<double> >
+TLSData<cv::instr::NodeDataTls>
+_Complex_base<long double,_C_ldouble_complex>
+_Complex_base<double,_C_double_complex>
+_Complex_base<float,_C_float_complex>
+basic_iostream<wchar_t,std::char_traits<wchar_t> >
+basic_iostream<char,std::char_traits<char> >
+basic_istream<wchar_t,std::char_traits<wchar_t> >
+basic_istream<char,std::char_traits<char> >
+basic_ostream<wchar_t,std::char_traits<wchar_t> >
+basic_ios<wchar_t,std::char_traits<wchar_t> >
+basic_ios<char,std::char_traits<char> >
+num_put<wchar_t,std::ostreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+num_get<wchar_t,std::istreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >
+numpunct<wchar_t>
+num_put<char,std::ostreambuf_iterator<char,std::char_traits<char> > >
+num_get<char,std::istreambuf_iterator<char,std::char_traits<char> > >
+numpunct<char>
+basic_streambuf<wchar_t,std::char_traits<wchar_t> >
+codecvt<char,char,_Mbstatet>
+_Yarn<wchar_t>
+_Yarn<char>
+_Conditionally_enabled_hash<int,1>
+atomic<long>
+_Atomic_storage<long,4>
+vector<cv::UMat,std::allocator<cv::UMat> >
+allocator<cv::Mat>
+allocator<unsigned int>
+vector<unsigned char,std::allocator<unsigned char> >
+allocator<int>
+basic_string<char32_t,std::char_traits<char32_t>,std::allocator<char32_t> >
+basic_string<char16_t,std::char_traits<char16_t>,std::allocator<char16_t> >
+_Tree_node<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >,void *>
+_Tree_val<std::_Tree_simple_types<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > >
+_Tree_node<std::pair<cv::String const ,cvflann::any>,void *>
+_Tree_val<std::_Tree_simple_types<std::pair<cv::String const ,cvflann::any> > >
+_Compressed_pair<std::allocator<char32_t>,std::_String_val<std::_Simple_types<char32_t> >,1>
+_Compressed_pair<std::allocator<char16_t>,std::_String_val<std::_Simple_types<char16_t> >,1>
+_Compressed_pair<std::allocator<wchar_t>,std::_String_val<std::_Simple_types<wchar_t> >,1>
+_Compressed_pair<std::allocator<char>,std::_String_val<std::_Simple_types<char> >,1>
+_String_val<std::_Simple_types<char32_t> >
+_Bxty
+_String_val<std::_Simple_types<char16_t> >
+_String_val<std::_Simple_types<wchar_t> >
+_String_val<std::_Simple_types<char> >
+_Tidy_guard<std::vector<int,std::allocator<int> > >
+pointer_traits<std::pair<cv::String const ,cvflann::any> const *>
+pointer_traits<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > const *>
+_Tidy_guard<std::vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> > >
+_Vector_const_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >
+_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >
+allocator<CVisionLib::pt_>
+allocator<cv::Ptr<cv::videostab::InpainterBase> >
+allocator<cv::Ptr<cv::videostab::IMotionStabilizer> >
+allocator<cv::detail::CameraParams>
+_Default_allocator_traits<std::allocator<cv::detail::CameraParams> >
+allocator<cv::Rect_<int> >
+allocator<cv::Point_<int> >
+_Tree_unchecked_const_iterator<std::_Tree_val<std::_Tree_simple_types<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > >,std::_Iterator_base0>
+allocator<std::_Tree_node<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >,void *> >
+less<unsigned int>
+allocator<std::vector<unsigned int,std::allocator<unsigned int> > >
+$ArrayType$$$BY0M@_W
+$ArrayType$$$BY0M@D
+_Vector_const_iterator<std::_Vector_val<std::_Simple_types<int> > >
+allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> >
+less<cv::String>
+allocator<double>
+hash<int>
+_Default_allocator_traits<std::allocator<int> >
+allocator<wchar_t>
+allocator<char>
+_Default_allocator_traits<std::allocator<char> >
+_Char_traits<char,int>
+_WChar_traits<wchar_t>
+_Char_traits<wchar_t,unsigned short>
+_String_iterator<std::_String_val<std::_Simple_types<char> > >
+_String_iterator<std::_String_val<std::_Simple_types<wchar_t> > >
+_Deque_unchecked_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >
+allocator<cv::Vec<int,4> >
+_Compressed_pair<std::allocator<CVisionLib::blob_>,std::_Vector_val<std::_Simple_types<CVisionLib::blob_> >,1>
+_Compressed_pair<std::allocator<CVisionLib::pt_>,std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >,1>
+allocator<CVisionLib::pt_ *>
+_Compressed_pair<std::allocator<cv::Ptr<cv::videostab::InpainterBase> >,std::_Vector_val<std::_Simple_types<cv::Ptr<cv::videostab::InpainterBase> > >,1>
+allocator<cv::videostab::FastMarchingMethod::DXY>
+FastMarchingMethod
+_Compressed_pair<std::allocator<cv::Ptr<cv::videostab::IMotionStabilizer> >,std::_Vector_val<std::_Simple_types<cv::Ptr<cv::videostab::IMotionStabilizer> > >,1>
+_Compressed_pair<std::allocator<cv::detail::CameraParams>,std::_Vector_val<std::_Simple_types<cv::detail::CameraParams> >,1>
+CameraParams
+allocator<std::pair<int,int> >
+pair<int,int>
+allocator<std::_List_node<cv::detail::GraphEdge,void *> >
+_List_node<cv::detail::GraphEdge,void *>
+allocator<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > >
+_Compressed_pair<std::allocator<cv::Rect_<int> >,std::_Vector_val<std::_Simple_types<cv::Rect_<int> > >,1>
+allocator<float>
+_Compressed_pair<std::allocator<cv::Point_<int> >,std::_Vector_val<std::_Simple_types<cv::Point_<int> > >,1>
+_Compressed_pair<std::allocator<std::_Tree_node<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >,void *> >,std::_Tree_val<std::_Tree_simple_types<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > >,1>
+_Compressed_pair<std::allocator<std::vector<unsigned int,std::allocator<unsigned int> > >,std::_Vector_val<std::_Simple_types<std::vector<unsigned int,std::allocator<unsigned int> > > >,1>
+_Compressed_pair<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> >,std::_Tree_val<std::_Tree_simple_types<std::pair<cv::String const ,cvflann::any> > >,1>
+_Compressed_pair<std::allocator<double>,std::_Vector_val<std::_Simple_types<double> >,1>
+allocator<cv::UMat>
+_Compressed_pair<std::allocator<unsigned int>,std::_Vector_val<std::_Simple_types<unsigned int> >,1>
+_Vector_val<std::_Simple_types<unsigned int> >
+allocator<unsigned char>
+_Compressed_pair<std::allocator<int>,std::_Vector_val<std::_Simple_types<int> >,1>
+allocator<char32_t>
+allocator<char16_t>
+_Default_allocator_traits<std::allocator<wchar_t> >
+_Char_traits<char32_t,unsigned int>
+_WChar_traits<char16_t>
+_Char_traits<char16_t,unsigned short>
+_Deque_unchecked_const_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >
+_Compressed_pair<std::allocator<cv::Vec<int,4> >,std::_Vector_val<std::_Simple_types<cv::Vec<int,4> > >,1>
+_Compressed_pair<std::allocator<cv::Vec<float,3> >,std::_Vector_val<std::_Simple_types<cv::Vec<float,3> > >,1>
+_Compressed_pair<std::allocator<cv::videostab::FastMarchingMethod::DXY>,std::_Vector_val<std::_Simple_types<cv::videostab::FastMarchingMethod::DXY> >,1>
+_Compressed_pair<std::allocator<std::pair<int,int> >,std::_Vector_val<std::_Simple_types<std::pair<int,int> > >,1>
+_Compressed_pair<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> >,std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,1>
+_Compressed_pair<std::allocator<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > >,std::_Vector_val<std::_Simple_types<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > > >,1>
+_Default_allocator_traits<std::allocator<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > > >
+_Compressed_pair<std::allocator<float>,std::_Vector_val<std::_Simple_types<float> >,1>
+_Compressed_pair<std::allocator<std::vector<int,std::allocator<int> > >,std::_Vector_val<std::_Simple_types<std::vector<int,std::allocator<int> > > >,1>
+_Compressed_pair<std::allocator<cv::UMat>,std::_Vector_val<std::_Simple_types<cv::UMat> >,1>
+_Compressed_pair<std::allocator<cv::Mat>,std::_Vector_val<std::_Simple_types<cv::Mat> >,1>
+_Compressed_pair<std::allocator<unsigned char>,std::_Vector_val<std::_Simple_types<unsigned char> >,1>
+$ArrayType$$$BY0BF@D
+$ArrayType$$$BY0BF@_W
+Vec<unsigned char,3>
+Vec<float,2>
+Vec<double,3>
+Vec<double,4>
+Vec<double,2>
+Vec<float,4>
+Matx<double,4,1>
+Matx<double,4,4>
+Ptr<CvFileStorage>
+Formatted
+Ptr<cv::Formatter>
+Formatter
+CommandLineParser
+Ptr<cv::Feature2D>
+SinglePolicy<cvflann::anyimpl::empty_any>
+_Smanip<__int64>
+_Smanip<int>
+Ptr<cv::cuda::Stream::Impl>
+Ptr<cv::cuda::Event::Impl>
+Ptr<cv::detail::PlaneWarper>
+Ptr<cv::detail::AffineWarper>
+Ptr<cv::detail::CylindricalWarper>
+Ptr<cv::detail::SphericalWarper>
+Ptr<cv::detail::FisheyeWarper>
+Ptr<cv::detail::StereographicWarper>
+Ptr<cv::detail::CompressedRectilinearWarper>
+Ptr<cv::detail::CompressedRectilinearPortraitWarper>
+Ptr<cv::detail::PaniniWarper>
+Ptr<cv::detail::PaniniPortraitWarper>
+Ptr<cv::detail::MercatorWarper>
+Ptr<cv::detail::TransverseMercatorWarper>
+Ptr<cv::detail::FeaturesMatcher>
+Ptr<cv::detail::ExposureCompensator>
+Ptr<cv::detail::Blender>
+Ptr<cv::detail::FeaturesFinder>
+Ptr<cv::detail::BundleAdjusterBase>
+Ptr<cv::WarperCreator>
+Ptr<cv::detail::SeamFinder>
+Ptr<cv::videostab::ImageMotionEstimatorBase>
+Ptr<cv::videostab::MotionEstimatorBase>
+Ptr<cv::videostab::ISparseOptFlowEstimator>
+Ptr<cv::videostab::IOutlierRejector>
+Ptr<cv::videostab::IFrameSource>
+Ptr<cv::videostab::IDenseOptFlowEstimator>
+Ptr<cv::videostab::ILog>
+Ptr<cv::videostab::DeblurerBase>
+Ptr<cv::videostab::MotionFilterBase>
+Ptr<cv::videostab::WobbleSuppressorBase>
+_Vector_val<std::_Simple_types<CVisionLib::blob_> >
+_Default_allocator_traits<std::allocator<CVisionLib::blob_> >
+allocator<std::_Container_proxy>
+_Default_allocator_traits<std::allocator<cv::Ptr<cv::videostab::InpainterBase> > >
+_Default_allocator_traits<std::allocator<cv::Ptr<cv::videostab::IMotionStabilizer> > >
+_Default_allocator_traits<std::allocator<cv::Rect_<int> > >
+_Default_allocator_traits<std::allocator<cv::Point_<int> > >
+_Vector_val<std::_Simple_types<std::vector<unsigned int,std::allocator<unsigned int> > > >
+_Default_allocator_traits<std::allocator<std::vector<unsigned int,std::allocator<unsigned int> > > >
+pair<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> *,bool>
+_Default_allocator_traits<std::allocator<double> >
+_Atomic_padded<long>
+_Default_allocator_traits<std::allocator<unsigned int> >
+_Vector_val<std::_Simple_types<int> >
+_Default_allocator_traits<std::allocator<CVisionLib::pt_> >
+_Compressed_pair<std::less<unsigned int>,std::_Compressed_pair<std::allocator<std::_Tree_node<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >,void *> >,std::_Tree_val<std::_Tree_simple_types<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > > > >,1>,1>
+_Compressed_pair<std::less<cv::String>,std::_Compressed_pair<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> >,std::_Tree_val<std::_Tree_simple_types<std::pair<cv::String const ,cvflann::any> > >,1>,1>
+$ArrayType$$$BY0BL@$$CB_W
+$ArrayType$$$BY0BN@$$CB_W
+_Uninitialized_backout_al<std::allocator<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > > >
+_Tidy_guard<std::vector<unsigned int,std::allocator<unsigned int> > >
+_Tidy_guard<std::vector<cv::Mat,std::allocator<cv::Mat> > >
+_Tidy_guard<std::vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > > >
+_Tree_temp_node<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> > >
+_Alloc_construct_ptr<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> > >
+_Tidy_guard<std::vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> > >
+_Tidy_guard<std::vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > > >
+big_any_policy<cvflann::anyimpl::empty_any>
+typed_base_any_policy<cvflann::anyimpl::empty_any>
+unique_ptr<std::_Facet_base,std::default_delete<std::_Facet_base> >
+_Atomic_storage<unsigned int,4>
+_Vector_val<std::_Simple_types<cv::Vec<int,4> > >
+_Vector_val<std::_Simple_types<cv::Vec<float,3> > >
+_Vector_val<std::_Simple_types<cv::videostab::FastMarchingMethod::DXY> >
+_Vector_val<std::_Simple_types<cv::detail::CameraParams> >
+_Vector_val<std::_Simple_types<std::pair<int,int> > >
+_List_val<std::_List_simple_types<cv::detail::GraphEdge> >
+_Default_allocator_traits<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >
+_Vector_val<std::_Simple_types<std::list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> > > >
+_Vector_val<std::_Simple_types<cv::Rect_<int> > >
+_Vector_val<std::_Simple_types<float> >
+_Vector_val<std::_Simple_types<cv::Point_<int> > >
+_Vector_val<std::_Simple_types<std::vector<int,std::allocator<int> > > >
+_Vector_val<std::_Simple_types<cv::UMat> >
+_Vector_val<std::_Simple_types<cv::Mat> >
+_Tree_temp_node_alloc<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> > >
+_Compressed_pair<std::default_delete<std::_Facet_base>,std::_Facet_base *,1>
+default_delete<std::_Facet_base>
+_Default_allocator_traits<std::allocator<char32_t> >
+_Default_allocator_traits<std::allocator<char16_t> >
+_Default_allocator_traits<std::allocator<cv::Vec<float,3> > >
+_Default_allocator_traits<std::allocator<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> > >
+_Default_allocator_traits<std::allocator<std::vector<int,std::allocator<int> > > >
+_Default_allocator_traits<std::allocator<cv::Mat> >
+_Tidy_guard<std::numpunct<char> >
+_Tidy_guard<std::numpunct<wchar_t> >
+_Tidy_guard<std::_Mpunct<char> >
+_Tidy_guard<std::_Mpunct<wchar_t> >
+Matx<float,3,1>
+Matx<double,3,1>
+Matx<int,4,1>
+Matx<unsigned char,3,1>
+SinglePolicy<char const *>
+_Tree_find_result<std::_Tree_node<std::pair<cv::String const ,cvflann::any>,void *> *>
+tuple<cv::String &&>
+_Default_allocator_traits<std::allocator<cv::UMat> >
+_Atomic_padded<unsigned int>
+_Uninitialized_backout_al<std::allocator<unsigned int> >
+_Uninitialized_backout_al<std::allocator<cv::Mat> >
+_Uninitialized_backout_al<std::allocator<double> >
+_Uninitialized_backout_al<std::allocator<std::vector<int,std::allocator<int> > > >
+_Uninitialized_backout_al<std::allocator<std::vector<unsigned int,std::allocator<unsigned int> > > >
+_Uninitialized_backout_al<std::allocator<cv::Point_<int> > >
+_Uninitialized_backout_al<std::allocator<cv::Rect_<int> > >
+_Uninitialized_backout_al<std::allocator<cv::Ptr<cv::videostab::IMotionStabilizer> > >
+_Uninitialized_backout_al<std::allocator<cv::Ptr<cv::videostab::InpainterBase> > >
+_Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >
+_Uninitialized_backout_al<std::allocator<cv::Vec<float,3> > >
+_Uninitialized_backout_al<std::allocator<int> >
+_Uninitialized_backout_al<std::allocator<cv::detail::CameraParams> >
+_Default_allocator_traits<std::allocator<std::_Container_proxy> >
+PtrOwnerImpl<cv::detail::TransverseMercatorWarper,cv::DefaultDeleter<cv::detail::TransverseMercatorWarper> >
+PtrOwnerImpl<cv::detail::MercatorWarper,cv::DefaultDeleter<cv::detail::MercatorWarper> >
+PtrOwnerImpl<cv::detail::PaniniPortraitWarper,cv::DefaultDeleter<cv::detail::PaniniPortraitWarper> >
+PtrOwnerImpl<cv::detail::PaniniWarper,cv::DefaultDeleter<cv::detail::PaniniWarper> >
+PtrOwnerImpl<cv::detail::CompressedRectilinearPortraitWarper,cv::DefaultDeleter<cv::detail::CompressedRectilinearPortraitWarper> >
+PtrOwnerImpl<cv::detail::CompressedRectilinearWarper,cv::DefaultDeleter<cv::detail::CompressedRectilinearWarper> >
+PtrOwnerImpl<cv::detail::StereographicWarper,cv::DefaultDeleter<cv::detail::StereographicWarper> >
+PtrOwnerImpl<cv::detail::FisheyeWarper,cv::DefaultDeleter<cv::detail::FisheyeWarper> >
+PtrOwnerImpl<cv::detail::SphericalWarper,cv::DefaultDeleter<cv::detail::SphericalWarper> >
+PtrOwnerImpl<cv::detail::CylindricalWarper,cv::DefaultDeleter<cv::detail::CylindricalWarper> >
+PtrOwnerImpl<cv::detail::AffineWarper,cv::DefaultDeleter<cv::detail::AffineWarper> >
+PtrOwnerImpl<cv::detail::PlaneWarper,cv::DefaultDeleter<cv::detail::PlaneWarper> >
+_Rng_from_urng<int,std::_Rand_urng_from_func>
+small_any_policy<char const *>
+typed_base_any_policy<char const *>
+VecReaderProxy<int,1>
+cv.internal
+_Default_allocator_traits<std::allocator<std::_Tree_node<std::pair<unsigned int const ,std::vector<unsigned int,std::allocator<unsigned int> > >,void *> > >
+Matx<float,2,1>
+Matx<double,2,1>
+Matx<float,4,1>
+Feature2D
+_Fmp_t<float,2>
+std._Float_multi_prec
+SinglePolicy<int>
+SinglePolicy<float>
+SinglePolicy<bool>
+SinglePolicy<enum cvflann::flann_algorithm_t>
+SinglePolicy<enum cvflann::flann_centers_init_t>
+SinglePolicy<unsigned int>
+SinglePolicy<cv::String>
+pair<CVisionLib::blob_ *,CVisionLib::blob_ *>
+_Tmap_traits<cv::String,cvflann::any,std::less<cv::String>,std::allocator<std::pair<cv::String const ,cvflann::any> >,0>
+GraphEdge
+_List_node_insert_op2<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >
+_Uninitialized_backout<CVisionLib::pt_ * *>
+small_any_policy<unsigned int>
+typed_base_any_policy<unsigned int>
+small_any_policy<bool>
+typed_base_any_policy<bool>
+small_any_policy<float>
+typed_base_any_policy<float>
+small_any_policy<int>
+typed_base_any_policy<int>
+pair<unsigned int *,unsigned int *>
+_Alloc_construct_ptr<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >
+_Tuple_val<cv::String &&>
+$_s__RTTIBaseClassArray$_extraBytes_24
+$_s__RTTIBaseClassArray$_extraBytes_20
+$_TypeDescriptor$_extraBytes_127
+$_TypeDescriptor$_extraBytes_107
+$_TypeDescriptor$_extraBytes_119
+$_TypeDescriptor$_extraBytes_103
+$_TypeDescriptor$_extraBytes_149
+$_TypeDescriptor$_extraBytes_133
+$_TypeDescriptor$_extraBytes_117
+$_TypeDescriptor$_extraBytes_105
+$_TypeDescriptor$_extraBytes_109
+$_TypeDescriptor$_extraBytes_113
+$_TypeDescriptor$_extraBytes_101
+$_TypeDescriptor$_extraBytes_50
+$_TypeDescriptor$_extraBytes_45
+$_TypeDescriptor$_extraBytes_25
+$_TypeDescriptor$_extraBytes_27
+$_TypeDescriptor$_extraBytes_34
+$_TypeDescriptor$_extraBytes_58
+$_TypeDescriptor$_extraBytes_40
+$_TypeDescriptor$_extraBytes_32
+$_TypeDescriptor$_extraBytes_33
+$_TypeDescriptor$_extraBytes_36
+$_TypeDescriptor$_extraBytes_37
+$_TypeDescriptor$_extraBytes_44
+$_TypeDescriptor$_extraBytes_39
+$_TypeDescriptor$_extraBytes_43
+$_TypeDescriptor$_extraBytes_38
+$_TypeDescriptor$_extraBytes_35
+$_TypeDescriptor$_extraBytes_41
+$_TypeDescriptor$_extraBytes_26
+$_TypeDescriptor$_extraBytes_30
+$_TypeDescriptor$_extraBytes_22
+$_TypeDescriptor$_extraBytes_23
+$_TypeDescriptor$_extraBytes_73
+$_TypeDescriptor$_extraBytes_79
+$_TypeDescriptor$_extraBytes_77
+$_TypeDescriptor$_extraBytes_78
+$_TypeDescriptor$_extraBytes_68
+$_TypeDescriptor$_extraBytes_74
+$_TypeDescriptor$_extraBytes_66
+$_TypeDescriptor$_extraBytes_29
+$_TypeDescriptor$_extraBytes_89
+$_TypeDescriptor$_extraBytes_52
+$_TypeDescriptor$_extraBytes_81
+$_TypeDescriptor$_extraBytes_67
+$_TypeDescriptor$_extraBytes_71
+$_TypeDescriptor$_extraBytes_69
+$_TypeDescriptor$_extraBytes_65
+$_TypeDescriptor$_extraBytes_28
+$_TypeDescriptor$_extraBytes_76
+$_TypeDescriptor$_extraBytes_75
+$_TypeDescriptor$_extraBytes_49
+$_TypeDescriptor$_extraBytes_48
+$_TypeDescriptor$_extraBytes_59
+$_TypeDescriptor$_extraBytes_72
+$_TypeDescriptor$_extraBytes_19
+$_TypeDescriptor$_extraBytes_20
+$_TypeDescriptor$_extraBytes_51
+$_TypeDescriptor$_extraBytes_46
+ImageFeatures
+MatchesInfo
+Ptr<cv::DescriptorMatcher>
+DescriptorMatcher
+DescriptorCollection
+BufferPoolController
+UMatData
+$_TypeDescriptor$_extraBytes_3
+$_TypeDescriptor$_extraBytes_4
+$ArrayType$$$BY02D
+$_TypeDescriptor$_extraBytes_5
+$ArrayType$$$BY02Q6AXXZ
+_Vector_val<std::_Simple_types<double> >
+$ArrayType$$$BY0M@Q6AXXZ
+ProjectorBase
+$ArrayType$$$BY01U?$atomic@I@std@@
+atomic<unsigned int>
+$ArrayType$$$BY0BN@D
+$ArrayType$$$BY0BN@_W
+_Iosb<int>
+_Dummy_enum
+_Fmtflags
+_Iostate
+_Openmode
+_Seekdir
+$ArrayType$$$BY0BL@D
+$ArrayType$$$BY0P@D
+$ArrayType$$$BY0BL@_W
+$ArrayType$$$BY0P@_W
+$ArrayType$$$BY01D
+_Vector_val<std::_Simple_types<unsigned char> >
+$ArrayType$$$BY0BA@Q6AXXZ
+$ArrayType$$$BY08Q6AXXZ
+$ArrayType$$$BY0P@Q6AXXZ
+$ArrayType$$$BY0DBI@D
+$ArrayType$$$BY05D
+$ArrayType$$$BY07D
+$ArrayType$$$BY0EA@D
+TLSDataContainer
+$ArrayType$$$BY03Q6AXXZ
+$_TypeDescriptor$_extraBytes_16
+$ArrayType$$$BY0N@Q6AXXZ
+$ArrayType$$$BY05Q6AXXZ
+$ArrayType$$$BY0CI@D
+$ArrayType$$$BY04Q6AXXZ
+$ArrayType$$$BY04_W
+$ArrayType$$$BY0CA@D
+_Vector_val<std::_Simple_types<cv::Ptr<cv::videostab::IMotionStabilizer> > >
+_Vector_val<std::_Simple_types<cv::Ptr<cv::videostab::InpainterBase> > >
+$ArrayType$$$BY0BA@V?$Point_@H@cv@@
+$ArrayType$$$BY03V?$Point_@H@cv@@
+$ArrayType$$$BY07V?$Point_@H@cv@@
+$ArrayType$$$BY0LE@J
+$ArrayType$$$BY0BAA@J
+$ArrayType$$$BY01PBM
+$ArrayType$$$BY01M
+$ArrayType$$$BY00PBM
+$ArrayType$$$BY03V?$Point_@M@cv@@
+$_s__CatchableTypeArray$_extraBytes_12
+Scanner
+$_s__CatchableTypeArray$_extraBytes_8
+TwoPassStabilizer
+OnePassStabilizer
+WeightingDeblurer
+NullDeblurer
+MotionInpainter
+ConsistentMosaicInpainter
+InpaintingPipeline
+NullInpainter
+NullFrameSource
+LpMotionStabilizer
+MotionStabilizationPipeline
+KeypointBasedMotionEstimator
+ToFileMotionWriter
+MotionEstimatorL1
+MotionEstimatorRansacL2
+TranslationBasedLocalOutlierRejector
+Stitcher
+Status
+MultiBandBlender
+DpSeamFinder
+CostFunction
+ComponentState
+ImagePairLess
+ClosePoints
+pair<unsigned int,unsigned int>
+NoSeamFinder
+NoExposureCompensator
+DisjointSets
+$ArrayType$$$BY09Q6AXXZ
+DeviceInfo
+ComputeMode
+Event
+CreateFlags
+Stream
+SimilarRects
+CvBox2D
+CvHistogram
+CvMoments
+Moments
+SavedIndexParams
+AutotunedIndexParams
+LshIndexParams
+HierarchicalClusteringIndexParams
+LinearIndexParams
+CompositeIndexParams
+KMeansIndexParams
+KDTreeSingleIndexParams
+KDTreeIndexParams
+PooledAllocator
+HammingLUT
+$ArrayType$$$BY0BAA@$$CBE
+IndexHeader
+SearchParams
+UntypedMatrix
+Affine3<double>
+Matx<float,4,4>
+Affine3<float>
+BOWImgDescriptorExtractor
+vector<cv::KeyPoint,std::allocator<cv::KeyPoint> >
+$ArrayType$$$BY0O@Q6AXXZ
+KeyPointsFilter
+cv.flann
+IndexParams
+Mat_<double>
+CvAttrList
+CvSet
+CvSetElem
+CvSeq
+CvMemStorage
+CvSparseNode
+CvSparseMatIterator
+CvMatND
+<unnamed-type-dim>
+CvPoint3D64f
+CvPoint2D64f
+_IplROI
+NodeData
+Mutex
+AutoLock
+_Fmp_t<double,2>
+$_s__CatchableTypeArray$_extraBytes_20
+$ArrayType$$$BY04D
+_Collvec
+_Shared_ptr_spin_lock
+__type_info_node
+__std_type_info_data
+$_s__CatchableTypeArray$_extraBytes_16
+hash<std::error_condition>
+hash<std::error_code>
+$ArrayType$$$BY155$$CBW4memory_order@std@@
+timespec
+_timespec64
+once_flag
+vector<cv::DMatch,std::allocator<cv::DMatch> >
+WriteStructContext
+UMatDataAutoLock
+vector<cv::Range,std::allocator<cv::Range> >
+MatOp
+$ArrayType$$$BY01H
+vector<cv::cuda::GpuMat,std::allocator<cv::cuda::GpuMat> >
+vector<bool,std::allocator<bool> >
+DMatch
+KeyPoint
+Cv32suf
+_fp32Format
+Cv64suf
+_Distance_unknown
+_Basic_container_proxy_ptr12
+_Leave_proxy_unbound
+_Lockit
+_Nontrivial_dummy_type
+__std_exception_data
+vector<std::pair<cv::UMat,unsigned char>,std::allocator<std::pair<cv::UMat,unsigned char> > >
+vector<cv::DetectionROI,std::allocator<cv::DetectionROI> >
+vector<std::vector<cv::DMatch,std::allocator<cv::DMatch> >,std::allocator<std::vector<cv::DMatch,std::allocator<cv::DMatch> > > >
+AutoBuffer<double,136>
+_detail_class
+msclr
+dummy_struct
+lock
+is_not<System::Object,System::Threading::ReaderWriterLock>
+_PinDirection
+_FilterState
+tagAM_SAMPLE_PROPERTY_FLAGS
+AM_SEEKING_SeekingFlags
+AM_SEEKING_SeekingCapabilities
+tagAM_MEDIAEVENT_FLAGS
+__MIDL_IFilterMapper_0001
+__MIDL___MIDL_itf_strmif_0000_0023_0001
+tagQualityMessageType
+__MIDL___MIDL_itf_strmif_0000_0026_0001
+__MIDL___MIDL_itf_strmif_0000_0026_0002
+AM_FILESINK_FLAGS
+_AM_RENSDEREXFLAGS
+AM_STREAM_INFO_FLAGS
+InterleavingMode
+CompressionCaps
+VfwCaptureDialogs
+VfwCompressDialogs
+tagAnalogVideoStandard
+tagTunerInputType
+VideoCopyProtectionType
+tagPhysicalConnectorType
+tagVideoProcAmpProperty
+tagVideoProcAmpFlags
+tagCameraControlProperty
+tagCameraControlFlags
+tagVideoControlFlags
+tagAMTunerSubChannel
+tagAMTunerSignalStrength
+tagAMTunerModeType
+tagAMTunerEventType
+tagTVAudioMode
+tagAMTVAudioEventType
+AMPROPERTY_PIN
+_AMSTREAMSELECTINFOFLAGS
+_AMSTREAMSELECTENABLEFLAGS
+_AMRESCTL_RESERVEFLAGS
+_AM_FILTER_MISC_FLAGS
+_DECIMATION_USAGE
+_AM_PUSHSOURCE_FLAGS
+_DVENCODERRESOLUTION
+_DVENCODERVIDEOFORMAT
+_DVENCODERFORMAT
+_DVDECODERRESOLUTION
+_DVRESOLUTION
+_AM_AUDIO_RENDERER_STAT_PARAM
+_AM_INTF_SEARCH_FLAGS
+AMOVERLAYFX
+VIDEOENCODER_BITRATE_MODE
+_AM_PIN_FLOW_CONTROL_BLOCK_FLAGS
+_AM_GRAPH_CONFIG_RECONNECT_FLAGS
+_REM_FILTER_FLAGS
+_AM_FILTER_FLAGS
+VMRPresentationFlags
+VMRSurfaceAllocationFlags
+VMR_ASPECT_RATIO_MODE
+VMRMixerPrefs
+VMRRenderPrefs
+VMRMode
+__MIDL___MIDL_itf_strmif_0000_0122_0001
+VMRDeinterlacePrefs
+VMRDeinterlaceTech
+tagDVD_DOMAIN
+tagDVD_MENU_ID
+tagDVD_DISC_SIDE
+tagDVD_PREFERRED_DISPLAY_MODE
+tagDVD_FRAMERATE
+tagDVD_NavCmdType
+tagDVD_TIMECODE_FLAGS
+__MIDL___MIDL_itf_strmif_0000_0132_0001
+__MIDL___MIDL_itf_strmif_0000_0132_0002
+__MIDL___MIDL_itf_strmif_0000_0132_0003
+__MIDL___MIDL_itf_strmif_0000_0132_0004
+tagDVD_PARENTAL_LEVEL
+tagDVD_AUDIO_LANG_EXT
+tagDVD_SUBPICTURE_LANG_EXT
+tagDVD_AUDIO_APPMODE
+tagDVD_AUDIO_FORMAT
+tagDVD_KARAOKE_DOWNMIX
+tagDVD_KARAOKE_CONTENTS
+tagDVD_KARAOKE_ASSIGNMENT
+tagDVD_VIDEO_COMPRESSION
+tagDVD_SUBPICTURE_TYPE
+tagDVD_SUBPICTURE_CODING
+tagDVD_TITLE_APPMODE
+DVD_TextStringType
+DVD_TextCharSet
+_AM_DVD_GRAPH_FLAGS
+_AM_DVD_STREAM_FLAGS
+_AM_OVERLAY_NOTIFY_FLAGS
+_tagSND_DEVICE_ERROR
+_tagDVD_ERROR
+_tagDVD_WARNING
+_tagDVD_PB_STOPPED
+lock_when
+?A0xdf568c23
+$UnnamedClass$0xdf568c23$693$
+$UnnamedClass$0xdf568c23$694$
+IEnumMoniker
+ICreateDevEnum
+IPropertyBag
+$UnnamedClass$0xdf568c23$529$
+$UnnamedClass$0xdf568c23$530$
+$UnnamedClass$0xdf568c23$531$
+$UnnamedClass$0xdf568c23$532$
+IMoniker
+IErrorLog
+IBindCtx
+$UnnamedClass$0xdf568c23$537$
+$UnnamedClass$0xdf568c23$538$
+$UnnamedClass$0xdf568c23$539$
+?A0x1c71f662
+vc.cppcli.attributes.?A0x7952207a
+?A0x7952207a
+vc.cppcli.attributes.?A0xa7e53572
+<CrtImplementationDetails>
+ModuleLoadException
+ModuleLoadExceptionHandlerException
+ModuleUninitializer
+OpenMPWithMultipleAppdomainsException
+POWER_SETTING_ALTITUDE
+align_val_t
+__MIDL___MIDL_itf_gchost_0000_0000_0001
+__MIDL___MIDL_itf_gchost_0000_0000_0002
+ValidatorFlags
+__MIDL___MIDL_itf_mscoree_0000_0000_0001
+__MIDL___MIDL_itf_mscoree_0000_0000_0002
+__MIDL___MIDL_itf_mscoree_0000_0000_0003
+__MIDL___MIDL_itf_mscoree_0000_0000_0004
+__MIDL___MIDL_itf_mscoree_0000_0000_0005
+__MIDL___MIDL_itf_mscoree_0000_0009_0001
+__MIDL___MIDL_itf_mscoree_0000_0009_0002
+__MIDL___MIDL_itf_mscoree_0000_0009_0003
+__MIDL___MIDL_itf_mscoree_0000_0011_0001
+ETaskType
+__MIDL___MIDL_itf_mscoree_0000_0020_0001
+__MIDL___MIDL_itf_mscoree_0000_0021_0001
+__MIDL___MIDL_itf_mscoree_0000_0021_0002
+__MIDL___MIDL_itf_mscoree_0000_0028_0001
+__MIDL___MIDL_itf_mscoree_0000_0028_0002
+__MIDL___MIDL_itf_mscoree_0000_0028_0003
+__MIDL___MIDL_itf_mscoree_0000_0028_0004
+__MIDL___MIDL_itf_mscoree_0000_0030_0001
+__MIDL___MIDL_itf_mscoree_0000_0030_0002
+_CLRAssemblyIdentityFlags
+_hostBiningPolicyModifyFlags
+__MIDL___MIDL_itf_mscoree_0000_0040_0001
+_HostApplicationPolicy
+__MIDL___MIDL_itf_mscoree_0000_0045_0001
+__MIDL___MIDL_itf_mscoree_0000_0046_0001
+__MIDL___MIDL_itf_mscoree_0000_0048_0001
+_EVENT_INFO_CLASS
+__vcrt_lock_id
+__scrt_module_type
+__scrt_native_startup_state
+TriBool
+Progress
+DefaultDomain
+LanguageSupport
+gcroot<System::String ^>
+$ArrayType$$$BY0A@P6AHXZ
+ICLRRuntimeHost
+ICorRuntimeHost
+$UnnamedClass$0xa7e53572$321$
+$UnnamedClass$0xa7e53572$322$
+$UnnamedClass$0xa7e53572$323$
+$UnnamedClass$0xa7e53572$324$
+$ArrayType$$$BY00Q6MPBXXZ
+_EVENT_DESCRIPTOR
+$ArrayType$$$BY0A@P6AXXZ
+$UnnamedClass$0xa7e53572$329$
+$UnnamedClass$0xa7e53572$330$
+$UnnamedClass$0xa7e53572$331$
+__crt_fast_encoded_nullptr_t
+_EVENT_DATA_DESCRIPTOR
+$UnnamedClass$0xa7e53572$336$
+$UnnamedClass$0xa7e53572$337$
+?A0xa7e53572
+vc.cppcli.attributes.?A0x4a7435c1
+_AMD64_MXCSR_REG
+$UnnamedClass$0x4a7435c1$32$
+_EXCEPTION_POINTERS
+_ARM64_FPCR_REG
+$UnnamedClass$0x4a7435c1$30$
+?A0x4a7435c1
+_ARM64_FPSR_REG
+$UnnamedClass$0x4a7435c1$31$
+$UnnamedClass$0x4a7435c1$274$
+$UnnamedClass$0x4a7435c1$275$
+vc.cppcli.attributes.?A0x9398b955
+AtExitLock
+$UnnamedClass$0x9398b955$32$
+$UnnamedClass$0x9398b955$30$
+$UnnamedClass$0x9398b955$31$
+$UnnamedClass$0x9398b955$274$
+$UnnamedClass$0x9398b955$275$
+?A0x9398b955
+vc.cppcli.attributes.?A0xfe9c060e
+$UnnamedClass$0xfe9c060e$17$
+$UnnamedClass$0xfe9c060e$15$
+EHExceptionRecord
+EHParameters
+$UnnamedClass$0xfe9c060e$16$
+?A0xfe9c060e
+$UnnamedClass$0xfe9c060e$274$
+$UnnamedClass$0xfe9c060e$275$
+vc.cppcli.attributes.?A0x0fc0d922
+ThisModule
+$UnnamedClass$0x0fc0d922$36$
+$UnnamedClass$0x0fc0d922$320$
+$UnnamedClass$0x0fc0d922$321$
+$UnnamedClass$0x0fc0d922$322$
+$UnnamedClass$0x0fc0d922$323$
+$UnnamedClass$0x0fc0d922$34$
+$UnnamedClass$0x0fc0d922$328$
+$UnnamedClass$0x0fc0d922$329$
+$UnnamedClass$0x0fc0d922$330$
+?A0x0fc0d922
+$UnnamedClass$0x0fc0d922$35$
+$UnnamedClass$0x0fc0d922$278$
+$UnnamedClass$0x0fc0d922$279$
+zbar_image_scanner_s
+zbar_symbol_set_s
+zbar_symbol_s
+zbar_image_s
+KERNEL32.dll
+mscorlib
+System.Data
+System
+System.Drawing
+System.Windows.Forms.DataVisualization
+System.Windows.Forms
+System.Xml
+Attribute
+AttributeUsageAttribute
+AttributeTargets
+CLSCompliantAttribute
+ComVisibleAttribute
+System.Runtime.InteropServices
+AssemblyVersionAttribute
+System.Reflection
+AssemblyCultureAttribute
+AssemblyTrademarkAttribute
+AssemblyCopyrightAttribute
+AssemblyProductAttribute
+AssemblyCompanyAttribute
+AssemblyConfigurationAttribute
+AssemblyDescriptionAttribute
+AssemblyTitleAttribute
+AssemblyAttributesGoHere
+System.Runtime.CompilerServices
+SecurityAction
+System.Security.Permissions
+SecurityPermissionAttribute
+AssemblyAttributesGoHereSM
+CallConvStdcall
+CallConvCdecl
+CallConvThiscall
+IsConst
+UnsafeValueTypeAttribute
+NativeCppClassAttribute
+ValueType
+Object
+Enum
+IsLong
+IsSignUnspecifiedByte
+DecoratedNameAttribute
+IsImplicitlyDereferenced
+IsVolatile
+IDisposable
+Semaphore
+System.Threading
+SuppressMergeCheckAttribute
+Thread
+IsUdtReturn
+IsCopyConstructed
+Int32
+Double
+Int16
+Math
+Marshal
+IntPtr
+TimeSpan
+CompilerMarshalOverride
+WaitHandle
+ThreadStart
+ThreadPriority
+Monitor
+TargetFrameworkAttribute
+System.Runtime.Versioning
+SerializationInfo
+System.Runtime.Serialization
+StreamingContext
+SecurityCriticalAttribute
+System.Security
+Stack
+System.Collections
+EventHandler
+SecuritySafeCriticalAttribute
+EventArgs
+PrePrepareMethodAttribute
+System.Runtime.ConstrainedExecution
+AppDomain
+Guid
+DebuggerStepThroughAttribute
+System.Diagnostics
+ReliabilityContractAttribute
+Consistency
+FixedAddressValueTypeAttribute
+IEnumerator
+GCHandle
+Interlocked
+RuntimeEnvironment
+RuntimeHelpers
+Delegate
+RuntimeTypeHandle
+SecurityRulesAttribute
+SecurityRuleSet
+HandleProcessCorruptedStateExceptionsAttribute
+System.Runtime.ExceptionServices
+OutOfMemoryException
+IsBoxed
+SuppressUnmanagedCodeSecurityAttribute
+ModuleHandle
+RuntimeMethodHandle
+Module
+MarshalAsAttribute
+UnmanagedType
+HRESULT_FROM_WIN32
+ATL._AtlRaiseException
+dwExceptionCode
+dwExceptionFlags
+ATL.CAtlException.{ctor}
+ATL.AtlThrowImpl
+ATL.CComCriticalSection.{ctor}
+ATL.CComCriticalSection.{dtor}
+ATL.CComCriticalSection.Init
+ATL.CComCriticalSection.Term
+ATL.CAtlBaseModule.GetModuleInstance
+ATL.CComPtr<IDispatch>.{ctor}
+ATL.CComQIPtr<IUnknown,&IID_IUnknown>.{ctor}
+ATL.CComPtr<IUnknown>.{dtor}
+ATL.CComBSTR.{ctor}
+ATL.CComBSTR.Copy
+ATL.CComBSTR.!
+value
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@D@ATL@@2QQtagVARIANT@@DQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@E@ATL@@2QQtagVARIANT@@EQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAD@ATL@@2QQtagVARIANT@@PADQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAE@ATL@@2QQtagVARIANT@@PAEQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@F@ATL@@2QQtagVARIANT@@FQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAF@ATL@@2QQtagVARIANT@@PAFQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@G@ATL@@2QQtagVARIANT@@GQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAG@ATL@@2QQtagVARIANT@@PAGQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@H@ATL@@2QQtagVARIANT@@HQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAH@ATL@@2QQtagVARIANT@@PAHQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@I@ATL@@2QQtagVARIANT@@IQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAI@ATL@@2QQtagVARIANT@@PAIQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@J@ATL@@2QQtagVARIANT@@JQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAJ@ATL@@2QQtagVARIANT@@PAJQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@K@ATL@@2QQtagVARIANT@@KQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAK@ATL@@2QQtagVARIANT@@PAKQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@_J@ATL@@2QQtagVARIANT@@_JQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PA_J@ATL@@2QQtagVARIANT@@PA_JQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@_K@ATL@@2QQtagVARIANT@@_KQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PA_K@ATL@@2QQtagVARIANT@@PA_KQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@M@ATL@@2QQtagVARIANT@@MQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAM@ATL@@2QQtagVARIANT@@PAMQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@N@ATL@@2QQtagVARIANT@@NQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAN@ATL@@2QQtagVARIANT@@PANQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PA_W@ATL@@2QQtagVARIANT@@PA_WQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAPA_W@ATL@@2QQtagVARIANT@@PAPA_WQ3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAUIUnknown@@@ATL@@2QQtagVARIANT@@PAUIUnknown@@Q3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAPAUIUnknown@@@ATL@@2QQtagVARIANT@@PAPAUIUnknown@@Q3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAUIDispatch@@@ATL@@2QQtagVARIANT@@PAUIDispatch@@Q3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PAPAUIDispatch@@@ATL@@2QQtagVARIANT@@PAPAUIDispatch@@Q3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@TtagCY@@@ATL@@2QQtagVARIANT@@TtagCY@@Q3@@@YMXXZ
+?A0x1a45bfe4.??__E?pmField@?$CVarTypeInfo@PATtagCY@@@ATL@@2QQtagVARIANT@@PATtagCY@@Q3@@@YMXXZ
+ATL.CComVariant.{ctor}
+varSrc
+ATL.CComVariant.Copy
+pSrc
+ATL.CComVariant.InternalCopy
+ATL.CHandle.{ctor}
+ATL.CHandle.Attach
+ATL.CHandle.Detach
+?A0x1a45bfe4.??__E_AtlComModule@ATL@@YMXXZ
+?A0x1a45bfe4.??__F_AtlComModule@ATL@@YMXXZ
+ATL.CAtlWinModule.{ctor}
+ATL.CAtlWinModule.{dtor}
+ATL.CAtlWinModule.Term
+ATL._ATL_WIN_MODULE70.{ctor}
+ATL._ATL_WIN_MODULE70.{dtor}
+?A0x1a45bfe4.??__E_AtlWinModule@ATL@@YMXXZ
+?A0x1a45bfe4.??__F_AtlWinModule@ATL@@YMXXZ
+ATL.CAtlReleaseManagedClassFactories.{ctor}
+ATL.CAtlReleaseManagedClassFactories.{dtor}
+?A0x1a45bfe4.??__E_AtlReleaseManagedClassFactories@ATL@@YMXXZ
+?A0x1a45bfe4.??__F_AtlReleaseManagedClassFactories@ATL@@YMXXZ
+ATL.CRegKey.{ctor}
+ATL.CRegKey.Detach
+ATL.CRegKey.Attach
+hKey
+ATL.AtlWinModuleTerm
+pWinModule
+hInst
+ATL.AtlWinModuleInit
+ATL.CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >.[]
+nIndex
+ATL.CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >.RemoveAll
+ATL.CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >.GetSize
+ATL.CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >.{ctor}
+ATL.CComPtr<IUnknown>.{ctor}
+ATL.CComPtrBase<IUnknown>.{dtor}
+ATL.CComPtrBase<IDispatch>.{dtor}
+ATL.CComPtrBase<IDispatch>.{ctor}
+ATL.CComPtrBase<IUnknown>.{ctor}
+ATL.CTraceCategoryEx<524288,0>.{ctor}
+pszCategoryName
+ATL.CTraceCategoryEx<1,0>.{ctor}
+ATL.CTraceCategoryEx<2,0>.{ctor}
+ATL.CTraceCategoryEx<4,0>.{ctor}
+ATL.CTraceCategoryEx<8,0>.{ctor}
+ATL.CTraceCategoryEx<16,0>.{ctor}
+ATL.CTraceCategoryEx<32,0>.{ctor}
+ATL.CTraceCategoryEx<64,0>.{ctor}
+ATL.CTraceCategoryEx<128,0>.{ctor}
+ATL.CTraceCategoryEx<256,0>.{ctor}
+ATL.CTraceCategoryEx<512,0>.{ctor}
+ATL.CTraceCategoryEx<1024,0>.{ctor}
+ATL.CTraceCategoryEx<2048,0>.{ctor}
+ATL.CTraceCategoryEx<4096,0>.{ctor}
+ATL.CTraceCategoryEx<8192,0>.{ctor}
+ATL.CTraceCategoryEx<16384,0>.{ctor}
+ATL.CTraceCategoryEx<32768,0>.{ctor}
+ATL.CTraceCategoryEx<65536,0>.{ctor}
+ATL.CTraceCategoryEx<131072,0>.{ctor}
+ATL.CTraceCategoryEx<262144,0>.{ctor}
+ATL.CTraceCategoryEx<1048576,0>.{ctor}
+ATL.CTraceCategoryEx<2097152,0>.{ctor}
+ATL.CTraceCategoryEx<4194304,0>.{ctor}
+ATL.CSimpleArray<unsigned short,ATL::CSimpleArrayEqualHelper<unsigned short> >.{dtor}
+atan2f
+fabsf
+floorf
+sqrtf
+wmemcpy
+std.numeric_limits<int>.max
+std.numeric_limits<float>.max
+_Size
+_Where
+std.exception.{ctor}
+_Message
+__unnamed001
+_Other
+std.exception.{dtor}
+std.exception.what
+std.exception.__vecDelDtor
+std.bad_alloc.{ctor}
+std.bad_alloc.__vecDelDtor
+std.bad_alloc.{dtor}
+std.bad_array_new_length.{ctor}
+std.bad_array_new_length.__vecDelDtor
+std.bad_array_new_length.{dtor}
+std.exception_ptr.{dtor}
+std.exception_ptr.{ctor}
+_Rhs
+std._Throw_bad_array_new_length
+std._Default_allocate_traits._Allocate
+_Bytes
+std._Adjust_manually_vector_aligned
+_Ptr
+std._Convert_size<unsigned int>
+_Len
+std._Container_base0._Orphan_all
+std._Container_base0._Swap_proxy_and_iterators
+std._Container_base0._Alloc_proxy
+std._Iterator_base0._Adopt
+std._Container_proxy.{ctor}
+_Mycont_
+std._Iterator_base12.{ctor}
+_Right
+std._Iterator_base12.=
+std._Iterator_base12._Adopt
+_Parent
+std._Container_base12._Orphan_all
+std._Fake_proxy_ptr_impl.{ctor}
+std._Fake_proxy_ptr_impl._Release
+std._Xlen_string
+floor
+cv.String.{ctor}
+cv.String.{dtor}
+cv.String.c_str
+cv.Scalar_<double>.{ctor}
+cv._InputArray.init
+_flags
+_obj
+cv._InputArray.{ctor}
+cv._InputArray.{dtor}
+cv._OutputArray.{ctor}
+cv._OutputArray.{dtor}
+cv._InputOutputArray.{ctor}
+cv.Mat.{ctor}
+rows
+cols
+type
+cv.Mat.{dtor}
+cv.Mat.clone
+cv.Mat.create
+cv.Mat.()
+cv.Mat.isContinuous
+cv.Mat.type
+cv.Mat.channels
+cv.Mat.=
+cv.MatSize.{ctor}
+cv.MatStep.{ctor}
+cv.MatStep.[]
+cv.SparseMat.{ctor}
+cv.MatConstIterator.{ctor}
+cv.SparseMatConstIterator.{ctor}
+cv.SparseMatIterator.{ctor}
+cv.UMat.{ctor}
+usageFlags
+cv.FileNode.{ctor}
+node
+std.runtime_error.__vecDelDtor
+std.runtime_error.{dtor}
+std.range_error.__vecDelDtor
+std.range_error.{dtor}
+std.range_error.{ctor}
+std.runtime_error.{ctor}
+std._System_error.__vecDelDtor
+std._System_error.{dtor}
+std.system_error.__vecDelDtor
+std.system_error.{dtor}
+std.system_error.{ctor}
+std._System_error.{ctor}
+std.bad_cast.__vecDelDtor
+std.bad_cast.{dtor}
+std.bad_cast.{ctor}
+std.bad_weak_ptr.what
+std.bad_weak_ptr.__vecDelDtor
+std.bad_weak_ptr.{dtor}
+std.bad_weak_ptr.{ctor}
+std.locale.{ctor}
+std._Maklocstr<wchar_t>
+_Cvt
+std.ios_base.failure.__vecDelDtor
+std.ios_base.failure.{dtor}
+std.ios_base.failure.{ctor}
+std._Maklocwcs
+CvMat.{ctor}
+CvScalar.{ctor}
+?A0xb68b8124.cvScalar
+val0
+val1
+val2
+val3
+cvflann.FLANNException.__vecDelDtor
+cvflann.FLANNException.{dtor}
+cvflann.anyimpl.<<
+cvflann.anyimpl.base_any_policy.{dtor}
+cvflann.anyimpl.base_any_policy.__vecDelDtor
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.print
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.print
+cvflann.anyimpl.big_any_policy<cv::String>.print
+cvflann.any.{ctor}
+cvflann.any.assign
+cvflann.any.reset
+std.tuple<>.{ctor}
+cvflann.FLANNException.{ctor}
+cv.Exception.{ctor}
+cv.Exception.__vecDelDtor
+cv.?A0xb68b8124.morphologyDefaultBorderValue
+cv.HOGDescriptor.{ctor}
+cv.HOGDescriptor.{dtor}
+cv.HOGDescriptor.__vecDelDtor
+zbar.Exception.{ctor}
+zbar.Exception.{dtor}
+zbar.Exception.what
+zbar.Exception.__vecDelDtor
+zbar.InternalError.__vecDelDtor
+zbar.InternalError.{dtor}
+zbar.UnsupportedError.__vecDelDtor
+zbar.UnsupportedError.{dtor}
+zbar.InvalidError.__vecDelDtor
+zbar.InvalidError.{dtor}
+zbar.SystemError.__vecDelDtor
+zbar.SystemError.{dtor}
+zbar.LockingError.__vecDelDtor
+zbar.LockingError.{dtor}
+zbar.BusyError.__vecDelDtor
+zbar.BusyError.{dtor}
+zbar.XDisplayError.__vecDelDtor
+zbar.XDisplayError.{dtor}
+zbar.XProtoError.__vecDelDtor
+zbar.XProtoError.{dtor}
+zbar.ClosedError.__vecDelDtor
+zbar.ClosedError.{dtor}
+zbar.FormatError.what
+zbar.InternalError.{ctor}
+zbar.UnsupportedError.{ctor}
+zbar.InvalidError.{ctor}
+zbar.SystemError.{ctor}
+zbar.LockingError.{ctor}
+zbar.BusyError.{ctor}
+zbar.XDisplayError.{ctor}
+zbar.XProtoError.{ctor}
+zbar.ClosedError.{ctor}
+zbar.SymbolSet.{ctor}
+syms
+zbar.SymbolSet.{dtor}
+zbar.SymbolSet.ref
+delta
+zbar.SymbolSet..PBUzbar_symbol_set_s@zbar@@
+zbar.Symbol.Point.{ctor}
+zbar.Symbol.PointIterator.{ctor}
+iter
+zbar.Symbol.{ctor}
+zbar.Symbol.{dtor}
+zbar.Symbol.ref
+zbar.Symbol.get_data
+zbar.Symbol.get_location_size
+zbar.Symbol.get_location_x
+index
+zbar.Symbol.get_location_y
+zbar.Symbol.init
+zbar.SymbolIterator.{ctor}
+zbar.SymbolIterator.{dtor}
+zbar.SymbolIterator.->
+zbar.Image.SymbolIterator.{ctor}
+zbar.Image.{ctor}
+width
+height
+format
+data
+length
+zbar.Image.{dtor}
+zbar.Image..PAUzbar_image_s@zbar@@
+zbar.Image.set_format
+zbar.Image.set_size
+zbar.Image.set_data
+zbar.Image.get_symbols
+zbar.Image.symbol_begin
+zbar.Image._cleanup
+zbar.FormatError.{ctor}
+zbar.FormatError.{dtor}
+zbar.Image.SymbolIterator.{dtor}
+zbar.FormatError.__vecDelDtor
+zbar.ImageScanner.{ctor}
+scanner
+zbar.ImageScanner.{dtor}
+zbar.ImageScanner.set_config
+symbology
+config
+zbar.ImageScanner.scan
+image
+CVisionLib.Xgreater.()
+CVisionLib.Ygreater.()
+?A0xb68b8124.??__Esrc@@YMXXZ
+?A0xb68b8124.??__Esrc_gray@@YMXXZ
+?A0xb68b8124.??__Fsrc_gray@@YMXXZ
+?A0xb68b8124.??__Fsrc@@YMXXZ
+?A0xb68b8124.??__Edst@@YMXXZ
+?A0xb68b8124.??__Edetected_edges@@YMXXZ
+?A0xb68b8124.??__Fdetected_edges@@YMXXZ
+?A0xb68b8124.??__Fdst@@YMXXZ
+__vec_ctor
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.{ctor}
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.{dtor}
+cv._InputOutputArray.{dtor}
+?A0xb68b8124.CalcThresh
+grayIm
+percent
+std._Vector_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >.+
+_Off
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >.[]
+_Pos
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >.size
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >.{dtor}
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >.{ctor}
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >.[]
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >.size
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >.{dtor}
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >.{ctor}
+_Count
+std.allocator<cv::Vec<float,3> >.{ctor}
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.[]
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.size
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.end
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.begin
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.push_back
+_Val
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.emplace_back<struct CVisionLib::blob_ const &>
+<_Val_0>
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Emplace_back_with_unused_capacity<struct CVisionLib::blob_ const &>
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.{dtor}
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.{ctor}
+std.allocator<CVisionLib::blob_>.{ctor}
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.pop
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.push
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.front
+std.queue<CVisionLib::pt_,std::deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> > >.empty
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.{dtor}
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.{ctor}
+std.min<unsigned int>
+_Left
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >.{ctor}
+std.vector<float,std::allocator<float> >.{dtor}
+std.vector<float,std::allocator<float> >.{ctor}
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.push_back
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.emplace_back<class cv::Point_<int> >
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Emplace_back_with_unused_capacity<class cv::Point_<int> >
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.{dtor}
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.{ctor}
+cvflann.anyimpl.big_any_policy<cv::String>.get_value
+cvflann.anyimpl.big_any_policy<cv::String>.move
+dest
+cvflann.anyimpl.big_any_policy<cv::String>.clone
+cvflann.anyimpl.big_any_policy<cv::String>.copy_from_value
+cvflann.anyimpl.big_any_policy<cv::String>.static_delete
+cvflann.anyimpl.typed_base_any_policy<cv::String>.type
+cvflann.anyimpl.typed_base_any_policy<cv::String>.get_size
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.get_value
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.move
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.clone
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.copy_from_value
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.static_delete
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_algorithm_t>.type
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_algorithm_t>.get_size
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.get_value
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.move
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.clone
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.copy_from_value
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.static_delete
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_centers_init_t>.type
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_centers_init_t>.get_size
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >.[]
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >.{dtor}
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >.{ctor}
+std.allocator<std::vector<int,std::allocator<int> > >.{ctor}
+std.vector<cv::Mat,std::allocator<cv::Mat> >.[]
+std.vector<cv::Mat,std::allocator<cv::Mat> >.clear
+std.vector<cv::Mat,std::allocator<cv::Mat> >.{dtor}
+std.vector<cv::Mat,std::allocator<cv::Mat> >.{ctor}
+std.allocator<cv::Mat>.{ctor}
+std.vector<int,std::allocator<int> >.[]
+std.vector<int,std::allocator<int> >.{dtor}
+std.vector<int,std::allocator<int> >.{ctor}
+std.allocator<int>.{ctor}
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >.{dtor}
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >.{ctor}
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.empty
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.size
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.length
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.c_str
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.[]
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.=
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.{dtor}
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.{ctor}
+std._Vector_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >.{ctor}
+cv.String.__delDtor
+std._Compressed_pair<std::allocator<wchar_t>,std::_String_val<std::_Simple_types<wchar_t> >,1>.{dtor}
+std._Compressed_pair<std::allocator<char>,std::_String_val<std::_Simple_types<char> >,1>.{dtor}
+std._String_val<std::_Simple_types<wchar_t> >.{dtor}
+std._String_val<std::_Simple_types<char> >.{dtor}
+std._Tidy_guard<std::vector<int,std::allocator<int> > >.{dtor}
+std.basic_ostream<char,std::char_traits<char> >.sentry.._N
+std.basic_ostream<char,std::char_traits<char> >.sentry.{dtor}
+std.basic_ostream<char,std::char_traits<char> >.sentry.{ctor}
+_Ostr
+std._Tidy_guard<std::vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> > >.{dtor}
+std._Vector_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >.+=
+std._Vector_const_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >.{ctor}
+_Parg
+_Pvector
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >._Tidy
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Tidy
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Getal
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Orphan_range
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Tidy
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Get_data
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Getal
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Tidy
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.push_back
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.pop_front
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.front
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.empty
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >._Getal
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >._Tidy
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >._Buy_raw
+_Newcapacity
+std._Default_allocator_traits<std::allocator<cv::detail::CameraParams> >.select_on_container_copy_construction
+std.vector<float,std::allocator<float> >._Tidy
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Getal
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Orphan_range
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Tidy
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Tidy
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Tidy
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Destroy
+_First
+_Last
+std.vector<int,std::allocator<int> >._Getal
+std.vector<int,std::allocator<int> >._Tidy
+std.vector<int,std::allocator<int> >._Buy_raw
+std._Default_allocator_traits<std::allocator<int> >.select_on_container_copy_construction
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Getal
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Tidy_deallocate
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Tidy_init
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Take_contents
+std._String_val<std::_Simple_types<wchar_t> >._Bxty.{dtor}
+std._String_val<std::_Simple_types<wchar_t> >._Myptr
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Getal
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Tidy_deallocate
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Tidy_init
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.assign
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.assign.<lambda_88acb98cb1d3e807ff08d7ebe077788e>.()
+_New_ptr
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Construct_lv_contents
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Take_contents
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Move_assign
+std._String_val<std::_Simple_types<char> >._Bxty.{dtor}
+std._String_val<std::_Simple_types<char> >._Myptr
+std._Default_allocator_traits<std::allocator<char> >.select_on_container_copy_construction
+std._Narrow_char_traits<char,int>.eof
+std._Narrow_char_traits<char,int>.eq_int_type
+std._Narrow_char_traits<char,int>.length
+std._Char_traits<char,int>.copy
+_First1
+_First2
+std._Char_traits<wchar_t,unsigned short>.copy
+std._Deque_unchecked_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >.*
+std.basic_ostream<char,std::char_traits<char> >._Sentry_base.{dtor}
+std.basic_ostream<char,std::char_traits<char> >._Sentry_base.{ctor}
+std._Vector_const_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >.+=
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >._Getal
+std.vector<cv::Vec<int,4>,std::allocator<cv::Vec<int,4> > >._Destroy
+std.allocator<cv::Vec<int,4> >.deallocate
+std.max<unsigned int>
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Getal
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Destroy
+std.allocator<cv::Vec<float,3> >.deallocate
+std._Compressed_pair<std::allocator<CVisionLib::blob_>,std::_Vector_val<std::_Simple_types<CVisionLib::blob_> >,1>._Get_first
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Destroy
+std.allocator<CVisionLib::blob_>.deallocate
+std._Compressed_pair<std::allocator<CVisionLib::pt_>,std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >,1>._Get_first
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Mysize
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Myoff
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Mapsize
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Map
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Orphan_all
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Getblock
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.pop_back
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Unchecked_begin
+std.allocator<CVisionLib::pt_ *>.deallocate
+std.allocator<CVisionLib::pt_>.deallocate
+std._Compressed_pair<std::allocator<cv::detail::CameraParams>,std::_Vector_val<std::_Simple_types<cv::detail::CameraParams> >,1>._Get_first
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >._Destroy
+std.allocator<cv::detail::CameraParams>.allocate
+std.allocator<cv::detail::CameraParams>.deallocate
+std.list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >._Getal
+std.allocator<std::_List_node<cv::detail::GraphEdge,void *> >.allocate
+std.vector<float,std::allocator<float> >._Getal
+std.vector<float,std::allocator<float> >._Destroy
+std.allocator<float>.deallocate
+std._Compressed_pair<std::allocator<cv::Point_<int> >,std::_Vector_val<std::_Simple_types<cv::Point_<int> > >,1>._Get_first
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Destroy
+std.allocator<cv::Point_<int> >.deallocate
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Getal
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Destroy
+std.allocator<std::vector<int,std::allocator<int> > >.deallocate
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Getal
+std.allocator<cv::Mat>.deallocate
+std._Compressed_pair<std::allocator<int>,std::_Vector_val<std::_Simple_types<int> >,1>._Get_first
+std.vector<int,std::allocator<int> >._Destroy
+std.allocator<int>.allocate
+std.allocator<int>.deallocate
+std._Compressed_pair<std::allocator<wchar_t>,std::_String_val<std::_Simple_types<wchar_t> >,1>._Get_first
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Swap_proxy_and_iterators
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Construct_lv_contents
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >._Memcpy_val_from
+std._String_val<std::_Simple_types<wchar_t> >._Large_string_engaged
+std._Default_allocator_traits<std::allocator<wchar_t> >.select_on_container_copy_construction
+std.allocator<wchar_t>.deallocate
+std._Compressed_pair<std::allocator<char>,std::_String_val<std::_Simple_types<char> >,1>._Get_first
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Swap_proxy_and_iterators
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >.max_size
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Memcpy_val_from
+std._String_val<std::_Simple_types<char> >._Large_string_engaged
+std.allocator<char>.allocate
+std.allocator<char>.deallocate
+std._Narrow_char_traits<char,int>.assign
+std._Char_traits<char,int>.move
+std._WChar_traits<wchar_t>.assign
+std._Deque_unchecked_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >.{ctor}
+std._Deque_unchecked_const_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >.*
+std._Deque_unchecked_const_iterator<std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> > >.{ctor}
+_Pdeque
+std._Vector_const_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >._Verify_offset
+std._Compressed_pair<std::allocator<cv::Vec<int,4> >,std::_Vector_val<std::_Simple_types<cv::Vec<int,4> > >,1>._Get_first
+std._Compressed_pair<std::allocator<cv::Vec<float,3> >,std::_Vector_val<std::_Simple_types<cv::Vec<float,3> > >,1>._Get_first
+std._Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >._Getblock
+std._Compressed_pair<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> >,std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,1>._Get_first
+std._Compressed_pair<std::allocator<float>,std::_Vector_val<std::_Simple_types<float> >,1>._Get_first
+std._Compressed_pair<std::allocator<std::vector<int,std::allocator<int> > >,std::_Vector_val<std::_Simple_types<std::vector<int,std::allocator<int> > > >,1>._Get_first
+std._Compressed_pair<std::allocator<cv::Mat>,std::_Vector_val<std::_Simple_types<cv::Mat> >,1>._Get_first
+std.basic_string<wchar_t,std::char_traits<wchar_t>,std::allocator<wchar_t> >.max_size
+std.allocator<wchar_t>.allocate
+std._Default_allocator_traits<std::allocator<char> >.max_size
+std._Default_allocator_traits<std::allocator<wchar_t> >.max_size
+cv.Vec<unsigned char,3>.{ctor}
+cv.Vec<unsigned char,3>.[]
+cv.Vec<int,4>.{ctor}
+cv.Vec<int,4>.[]
+cv.Vec<float,2>.[]
+cv.Vec<float,3>.{ctor}
+cv.Vec<float,3>.[]
+cv.Vec<double,3>.{ctor}
+cv.Vec<double,4>.{ctor}
+cv.Vec<double,4>.[]
+cv.Point_<int>.{ctor}
+cv.Point_<int>.=
+cv.Point_<float>.{ctor}
+cv.Size_<int>.{ctor}
+_width
+_height
+cv.Size_<int>.=
+cv.Size_<float>.{ctor}
+cv.Rect_<int>.{ctor}
+cv.Scalar_<double>.all
+cv.Ptr<cv::Formatted>.{ctor}
+cv.Ptr<cv::Formatted>.{dtor}
+std.operator<<<struct std::char_traits<char> >
+cv.Ptr<cv::Feature2D>.{ctor}
+cvflann.anyimpl.SinglePolicy<cvflann::anyimpl::empty_any>.get_policy
+std.time_get<char,std::istreambuf_iterator<char,std::char_traits<char> > >._Getvals<wchar_t>
+std.time_get<wchar_t,std::istreambuf_iterator<wchar_t,std::char_traits<wchar_t> > >._Getvals<wchar_t>
+cv.Ptr<cv::cuda::Stream::Impl>.{ctor}
+cv.Ptr<cv::cuda::Event::Impl>.{ctor}
+cv.Ptr<cv::detail::FeaturesMatcher>.{ctor}
+cv.Ptr<cv::detail::ExposureCompensator>.{ctor}
+cv.Ptr<cv::detail::Blender>.{ctor}
+cv.Ptr<cv::detail::FeaturesFinder>.{ctor}
+cv.Ptr<cv::detail::BundleAdjusterBase>.{ctor}
+cv.Ptr<cv::WarperCreator>.{ctor}
+cv.Ptr<cv::detail::SeamFinder>.{ctor}
+cv.Ptr<cv::videostab::ImageMotionEstimatorBase>.{ctor}
+cv.Ptr<cv::videostab::ISparseOptFlowEstimator>.{ctor}
+cv.Ptr<cv::videostab::IOutlierRejector>.{ctor}
+cv.Ptr<cv::videostab::IMotionStabilizer>.{ctor}
+cv.Ptr<cv::videostab::IFrameSource>.{ctor}
+cv.Ptr<cv::videostab::InpainterBase>.{ctor}
+cv.Ptr<cv::videostab::IDenseOptFlowEstimator>.{ctor}
+cv.Ptr<cv::videostab::ILog>.{ctor}
+cv.Ptr<cv::videostab::DeblurerBase>.{ctor}
+cv.Ptr<cv::videostab::MotionFilterBase>.{ctor}
+cv.Ptr<cv::videostab::WobbleSuppressorBase>.{ctor}
+cv._InputArray.{ctor}<class cv::Point_<int> >
+cv.Mat.at<unsigned char>
+cv.Mat.at<float>
+cv._OutputArray.{ctor}<class cv::Vec<float,3> >
+cv._OutputArray.{ctor}<class cv::Vec<int,4> >
+sqrt<int,0>
+cv.Mat.at<class cv::Vec<unsigned char,3> >
+std.sort<class std::_Vector_iterator<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > >,struct CVisionLib::Ygreater>
+_Pred
+std._Get_unwrapped<class std::_Vector_iterator<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > > const &>
+std.sort<class std::_Vector_iterator<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > >,struct CVisionLib::Xgreater>
+cv.Mat.at<class cv::Vec<float,2> >
+std._Compressed_pair<std::allocator<cv::Vec<int,4> >,std::_Vector_val<std::_Simple_types<cv::Vec<int,4> > >,1>.{ctor}<>
+std._Compressed_pair<std::allocator<cv::Vec<float,3> >,std::_Vector_val<std::_Simple_types<cv::Vec<float,3> > >,1>.{ctor}<class std::allocator<class cv::Vec<float,3> > const &>
+__unnamed000
+_Val1
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Construct_n_copies_of_ty<struct std::_Value_init_tag>
+std.addressof<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > >
+std.forward<struct CVisionLib::blob_ const &>
+_Arg
+std._Unfancy<struct CVisionLib::blob_>
+std._Default_allocator_traits<std::allocator<CVisionLib::blob_> >.construct<struct CVisionLib::blob_,struct CVisionLib::blob_ const &>
+<_Args_0>
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Emplace_reallocate<struct CVisionLib::blob_ const &>
+_Whereptr
+std._Compressed_pair<std::allocator<CVisionLib::blob_>,std::_Vector_val<std::_Simple_types<CVisionLib::blob_> >,1>.{ctor}<class std::allocator<struct CVisionLib::blob_> const &>
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Construct_n_copies_of_ty<struct std::_Value_init_tag>
+std.allocator<std::_Container_proxy>.{ctor}<struct CVisionLib::pt_>
+std.exchange<struct std::_Container_proxy *,std::nullptr_t>
+_New_val
+std._Delete_plain_internal<class std::allocator<struct std::_Container_proxy> >
+std._Compressed_pair<std::allocator<CVisionLib::pt_>,std::_Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >,1>.{ctor}<>
+std._Container_base12._Alloc_proxy<class std::allocator<struct std::_Container_proxy> >
+std._Compressed_pair<std::allocator<cv::detail::CameraParams>,std::_Vector_val<std::_Simple_types<cv::detail::CameraParams> >,1>.{ctor}<class std::allocator<struct cv::detail::CameraParams> >
+std.vector<cv::detail::CameraParams,std::allocator<cv::detail::CameraParams> >._Ucopy<struct cv::detail::CameraParams *>
+_Dest
+std._Compressed_pair<std::allocator<float>,std::_Vector_val<std::_Simple_types<float> >,1>.{ctor}<>
+std.move<class cv::Point_<int> &>
+std.forward<class cv::Point_<int> >
+std._Unfancy<class cv::Point_<int> >
+std._Default_allocator_traits<std::allocator<cv::Point_<int> > >.construct<class cv::Point_<int>,class cv::Point_<int> >
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Emplace_reallocate<class cv::Point_<int> >
+std._Compressed_pair<std::allocator<cv::Point_<int> >,std::_Vector_val<std::_Simple_types<cv::Point_<int> > >,1>.{ctor}<>
+std._Compressed_pair<std::allocator<std::vector<int,std::allocator<int> > >,std::_Vector_val<std::_Simple_types<std::vector<int,std::allocator<int> > > >,1>.{ctor}<class std::allocator<class std::vector<int,class std::allocator<int> > > const &>
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Construct_n_copies_of_ty<class std::vector<int,class std::allocator<int> > >
+std._Compressed_pair<std::allocator<cv::Mat>,std::_Vector_val<std::_Simple_types<cv::Mat> >,1>.{ctor}<class std::allocator<class cv::Mat> const &>
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Construct_n_copies_of_ty<struct std::_Value_init_tag>
+std.forward<int const &>
+std._Unfancy<int>
+std._Default_allocator_traits<std::allocator<int> >.construct<int,int const &>
+std._Compressed_pair<std::allocator<int>,std::_Vector_val<std::_Simple_types<int> >,1>.{ctor}<class std::allocator<int> >
+std.vector<int,std::allocator<int> >._Ucopy<int *>
+std._Compressed_pair<std::allocator<int>,std::_Vector_val<std::_Simple_types<int> >,1>.{ctor}<class std::allocator<int> const &>
+std.vector<int,std::allocator<int> >._Construct_n_copies_of_ty<int>
+std._Compressed_pair<std::allocator<int>,std::_Vector_val<std::_Simple_types<int> >,1>.{ctor}<>
+std.move<class std::allocator<wchar_t> &>
+std._Compressed_pair<std::allocator<wchar_t>,std::_String_val<std::_Simple_types<wchar_t> >,1>.{ctor}<class std::allocator<wchar_t> >
+std.addressof<class std::basic_string<char,struct std::char_traits<char>,class std::allocator<char> > >
+std.move<class std::allocator<char> &>
+std._Compressed_pair<std::allocator<char>,std::_String_val<std::_Simple_types<char> >,1>.{ctor}<class std::allocator<char> >
+std._Compressed_pair<std::allocator<char>,std::_String_val<std::_Simple_types<char> >,1>.{ctor}<>
+std.allocator<CVisionLib::pt_ *>.{ctor}<struct CVisionLib::pt_>
+std._Destroy_in_place<struct CVisionLib::pt_ *>
+_Obj
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Emplace_back_internal<struct CVisionLib::pt_ const &>
+<_Vals_0>
+std._Unfancy<struct CVisionLib::pt_>
+std._Default_allocator_traits<std::allocator<CVisionLib::pt_> >.destroy<struct CVisionLib::pt_>
+std._Construct_in_place<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,struct std::_List_node<struct cv::detail::GraphEdge,void *> * &>
+std._List_node<cv::detail::GraphEdge,void *>._Freenode0<class std::allocator<struct std::_List_node<struct cv::detail::GraphEdge,void *> > >
+std._Destroy_range<class std::allocator<class cv::Mat> >
+std._Destroy_in_place<wchar_t *>
+std._Construct_in_place<wchar_t *,wchar_t * &>
+std._Unfancy<wchar_t>
+std._Destroy_in_place<char *>
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Reallocate_for<class <lambda_88acb98cb1d3e807ff08d7ebe077788e>,char const *>
+_New_size
+std._Construct_in_place<char *,char * const &>
+std._Unfancy<char>
+std._Construct_in_place<char *,char * &>
+std._Pocma<class std::allocator<char> >
+std._Destroy_range<class std::allocator<class cv::Vec<int,4> > >
+std._Deallocate<8,0>
+std._Destroy_range<class std::allocator<class cv::Vec<float,3> > >
+std._Destroy_range<class std::allocator<struct CVisionLib::blob_> >
+std.addressof<class std::_Deque_val<struct std::_Deque_simple_types<struct CVisionLib::pt_> > >
+std._Destroy_range<class std::allocator<struct cv::detail::CameraParams> >
+std._Get_size_of_n<144>
+std._Allocate<8,struct std::_Default_allocate_traits,0>
+std._Get_size_of_n<20>
+std._Destroy_range<class std::allocator<float> >
+std._Destroy_range<class std::allocator<class cv::Point_<int> > >
+std._Destroy_range<class std::allocator<class std::vector<int,class std::allocator<int> > > >
+std._Destroy_range<class std::allocator<int> >
+std._Get_size_of_n<4>
+std.addressof<class std::_String_val<struct std::_Simple_types<wchar_t> > >
+std._Construct_in_place<wchar_t *,wchar_t * const &>
+std.addressof<class std::_String_val<struct std::_Simple_types<wchar_t> > const >
+std.addressof<class std::_String_val<struct std::_Simple_types<char> > >
+std.addressof<class std::_String_val<struct std::_Simple_types<char> > const >
+std._Get_size_of_n<1>
+std._Get_size_of_n<8>
+std._Get_size_of_n<2>
+std._Tidy_guard<std::vector<cv::Mat,std::allocator<cv::Mat> > >.{dtor}
+std._Tidy_guard<std::vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > > >.{dtor}
+std._Tidy_guard<std::vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> > >.{dtor}
+std._Tidy_guard<std::vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > > >.{dtor}
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.print
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.get_value
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.move
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.clone
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.copy_from_value
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.static_delete
+cvflann.anyimpl.typed_base_any_policy<cvflann::anyimpl::empty_any>.type
+cvflann.anyimpl.typed_base_any_policy<cvflann::anyimpl::empty_any>.get_size
+std.allocator<std::_Container_proxy>.allocate
+std._Vector_iterator<std::_Vector_val<std::_Simple_types<CVisionLib::blob_> > >._Unwrapped
+std._Vector_val<std::_Simple_types<cv::Vec<int,4> > >.{ctor}
+std.allocator<cv::Vec<int,4> >.{ctor}
+std._Vector_val<std::_Simple_types<cv::Vec<float,3> > >.{ctor}
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Buy_nonzero
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Ufill
+__unnamed002
+std._Vector_val<std::_Simple_types<CVisionLib::blob_> >.{ctor}
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Xlength
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Change_array
+_Newvec
+_Newsize
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Buy_nonzero
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Calculate_growth
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Umove_if_noexcept
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Umove
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Ufill
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.max_size
+std.allocator<CVisionLib::blob_>.allocate
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Growmap
+std._Deque_val<std::_Deque_simple_types<CVisionLib::pt_> >.{ctor}
+std.allocator<CVisionLib::pt_>.allocate
+std.allocator<CVisionLib::pt_>.{ctor}
+std._Vector_val<std::_Simple_types<cv::detail::CameraParams> >.{ctor}
+std._List_val<std::_List_simple_types<cv::detail::GraphEdge> >.{ctor}
+std._Default_allocator_traits<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.deallocate
+std._Vector_val<std::_Simple_types<float> >.{ctor}
+std.allocator<float>.{ctor}
+std._Vector_val<std::_Simple_types<cv::Point_<int> > >.{ctor}
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Xlength
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Change_array
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Calculate_growth
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Umove_if_noexcept
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Umove
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.max_size
+std.allocator<cv::Point_<int> >.allocate
+std.allocator<cv::Point_<int> >.{ctor}
+std._Vector_val<std::_Simple_types<std::vector<int,std::allocator<int> > > >.{ctor}
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Buy_nonzero
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Ufill
+std._Vector_val<std::_Simple_types<cv::Mat> >.{ctor}
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Buy_nonzero
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Ufill
+std._Vector_val<std::_Simple_types<int> >.{ctor}
+std.vector<int,std::allocator<int> >._Xlength
+std.vector<int,std::allocator<int> >._Buy_nonzero
+std.vector<int,std::allocator<int> >._Ufill
+std.vector<int,std::allocator<int> >.max_size
+std._String_val<std::_Simple_types<wchar_t> >.{ctor}
+std.basic_string<char,std::char_traits<char>,std::allocator<char> >._Calculate_growth
+_Requested
+std._String_val<std::_Simple_types<char> >.{ctor}
+std.allocator<char>.{ctor}
+std._Container_base12.{ctor}
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Xlength
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >._Buy_raw
+std.vector<cv::Vec<float,3>,std::allocator<cv::Vec<float,3> > >.max_size
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Buy_raw
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >._Umove_if_noexcept1
+__unnamed003
+std.vector<CVisionLib::blob_,std::allocator<CVisionLib::blob_> >.capacity
+std._Default_allocator_traits<std::allocator<CVisionLib::blob_> >.max_size
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >._Xlen
+std.deque<CVisionLib::pt_,std::allocator<CVisionLib::pt_> >.max_size
+std.allocator<CVisionLib::pt_ *>.allocate
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >._Umove_if_noexcept1
+std.vector<cv::Point_<int>,std::allocator<cv::Point_<int> > >.capacity
+std._Default_allocator_traits<std::allocator<cv::Point_<int> > >.max_size
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Xlength
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >._Buy_raw
+std.vector<std::vector<int,std::allocator<int> >,std::allocator<std::vector<int,std::allocator<int> > > >.max_size
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Xlength
+std.vector<cv::Mat,std::allocator<cv::Mat> >._Buy_raw
+std.vector<cv::Mat,std::allocator<cv::Mat> >.max_size
+std._Default_allocator_traits<std::allocator<int> >.max_size
+std._String_val<std::_Simple_types<wchar_t> >._Bxty.{ctor}
+_Old
+_Max
+std._String_val<std::_Simple_types<char> >._Bxty.{ctor}
+std._Default_allocator_traits<std::allocator<cv::Vec<float,3> > >.max_size
+std.allocator<cv::Vec<float,3> >.allocate
+std._Default_allocator_traits<std::allocator<CVisionLib::pt_> >.max_size
+std.list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >._Unchecked_end
+std.list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >._Unchecked_begin
+std._Default_allocator_traits<std::allocator<std::vector<int,std::allocator<int> > > >.max_size
+std.allocator<std::vector<int,std::allocator<int> > >.allocate
+std._Default_allocator_traits<std::allocator<cv::Mat> >.max_size
+std.allocator<cv::Mat>.allocate
+std._List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>.{ctor}
+_Pnode
+_Plist
+cv.Matx<float,3,1>.{ctor}
+vals
+cv.Matx<double,3,1>.{ctor}
+cv.Matx<double,4,1>.{ctor}
+cv.Ptr<cv::Formatted>.release
+?A0xb68b8124.??__E?policy@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@Uempty_any@anyimpl@cvflann@@@23@A@@YMXXZ
+cv.Matx<int,4,1>.{ctor}
+cv.Matx<unsigned char,3,1>.{ctor}
+std._Is_all_bits_zero<int>
+std._Maklocstr<char>
+std._Adl_verify_range<class std::_Vector_iterator<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > >,class std::_Vector_iterator<class std::_Vector_val<struct std::_Simple_types<struct CVisionLib::blob_> > > >
+std._Pass_fn<struct CVisionLib::Ygreater,0>
+std._Sort_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+_Ideal
+std._Pass_fn<struct CVisionLib::Xgreater,0>
+std._Sort_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std.forward<class std::allocator<class cv::Vec<float,3> > const &>
+std._Voidify_iter<struct CVisionLib::blob_ *>
+std.forward<class std::allocator<struct CVisionLib::blob_> const &>
+std._Deallocate_plain<class std::allocator<struct std::_Container_proxy> >
+std._Unfancy<struct std::_Container_proxy>
+std._Construct_in_place<struct std::_Container_proxy,struct std::_Container_base12 *>
+std.forward<class std::allocator<struct cv::detail::CameraParams> >
+std._Uninitialized_copy<struct cv::detail::CameraParams *,class std::allocator<struct cv::detail::CameraParams> >
+std._Get_unwrapped<struct cv::detail::CameraParams * const &>
+std._Voidify_iter<class cv::Point_<int> *>
+std.forward<class std::allocator<class std::vector<int,class std::allocator<int> > > const &>
+std.forward<class std::allocator<class cv::Mat> const &>
+std._Voidify_iter<int *>
+std.forward<class std::allocator<int> >
+std._Uninitialized_copy<int *,class std::allocator<int> >
+std._Get_unwrapped<int * const &>
+std.forward<class std::allocator<int> const &>
+std.forward<class std::allocator<wchar_t> >
+std.forward<class std::allocator<char> >
+std.forward<struct CVisionLib::pt_ const &>
+std._Default_allocator_traits<std::allocator<CVisionLib::pt_> >.construct<struct CVisionLib::pt_,struct CVisionLib::pt_ const &>
+std.addressof<struct std::_List_node<struct cv::detail::GraphEdge,void *> *>
+std._Voidify_iter<struct std::_List_node<struct cv::detail::GraphEdge,void *> * *>
+std.forward<struct std::_List_node<struct cv::detail::GraphEdge,void *> * &>
+std._List_node<cv::detail::GraphEdge,void *>._Freenode<class std::allocator<struct std::_List_node<struct cv::detail::GraphEdge,void *> > >
+std._Destroy_in_place<struct std::_List_node<struct cv::detail::GraphEdge,void *> *>
+std._Unfancy<class cv::Mat>
+std._Default_allocator_traits<std::allocator<cv::Mat> >.destroy<class cv::Mat>
+std.addressof<wchar_t *>
+std._Voidify_iter<wchar_t * *>
+std.forward<wchar_t * &>
+std.addressof<char *>
+std._Voidify_iter<char * *>
+std.forward<char * const &>
+std.forward<char * &>
+std._Unfancy<struct cv::detail::CameraParams>
+std._Default_allocator_traits<std::allocator<cv::detail::CameraParams> >.destroy<struct cv::detail::CameraParams>
+std._Allocate_manually_vector_aligned<struct std::_Default_allocate_traits>
+std._Unfancy<class std::vector<int,class std::allocator<int> > >
+std._Default_allocator_traits<std::allocator<std::vector<int,std::allocator<int> > > >.destroy<class std::vector<int,class std::allocator<int> > >
+std.forward<wchar_t * const &>
+std._Uninitialized_value_construct_n<class std::allocator<class cv::Vec<float,3> > >
+std._Uninitialized_move<struct CVisionLib::blob_ *,class std::allocator<struct CVisionLib::blob_> >
+std._Get_unwrapped<struct CVisionLib::blob_ * const &>
+std._Uninitialized_value_construct_n<class std::allocator<struct CVisionLib::blob_> >
+std._Get_size_of_n<32>
+std.uninitialized_copy<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Get_unwrapped<struct CVisionLib::pt_ * * const &>
+std._Idl_distance<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Get_unwrapped_n<struct CVisionLib::pt_ * * &,int>
+std._Uninitialized_value_construct_n_unchecked1<struct CVisionLib::pt_ * *,unsigned int>
+_UFirst
+std._Destroy_range<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Uninitialized_move<class cv::Point_<int> *,class std::allocator<class cv::Point_<int> > >
+std._Get_unwrapped<class cv::Point_<int> * const &>
+std._Get_size_of_n<12>
+std._Uninitialized_fill_n<class std::allocator<class std::vector<int,class std::allocator<int> > > >
+std._Uninitialized_value_construct_n<class std::allocator<class cv::Mat> >
+std._Uninitialized_fill_n<class std::allocator<int> >
+std._Uninitialized_copy<class cv::Point_<int> *,class std::allocator<class cv::Point_<int> > >
+std._Get_size_of_n<56>
+?A0xb68b8124.??__F?policy@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@Uempty_any@anyimpl@cvflann@@@23@A@@YMXXZ
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<cvflann::anyimpl::empty_any>.{ctor}
+cvflann.anyimpl.base_any_policy.{ctor}
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.{dtor}
+cv.Mat.__delDtor
+cv.detail.CameraParams.__delDtor
+std.vector<int,std::allocator<int> >.__delDtor
+cvflann.anyimpl.big_any_policy<cvflann::anyimpl::empty_any>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<cvflann::anyimpl::empty_any>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<cvflann::anyimpl::empty_any>.__vecDelDtor
+cv.detail.CameraParams.{dtor}
+std._Uninitialized_backout_al<std::allocator<cv::Mat> >._Release
+std._Uninitialized_backout_al<std::allocator<cv::Mat> >.{dtor}
+std._Uninitialized_backout_al<std::allocator<cv::Mat> >.{ctor}
+_Al_
+std._Uninitialized_backout_al<std::allocator<std::vector<int,std::allocator<int> > > >._Release
+std._Uninitialized_backout_al<std::allocator<std::vector<int,std::allocator<int> > > >.{dtor}
+std._Uninitialized_backout_al<std::allocator<std::vector<int,std::allocator<int> > > >.{ctor}
+std._Uninitialized_backout_al<std::allocator<cv::Point_<int> > >._Release
+std._Uninitialized_backout_al<std::allocator<cv::Point_<int> > >.{dtor}
+std._Uninitialized_backout_al<std::allocator<cv::Point_<int> > >.{ctor}
+std._Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >._Release
+std._Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >.{dtor}
+std._Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >.{ctor}
+std._Uninitialized_backout_al<std::allocator<cv::Vec<float,3> > >._Release
+std._Uninitialized_backout_al<std::allocator<cv::Vec<float,3> > >.{dtor}
+std._Uninitialized_backout_al<std::allocator<cv::Vec<float,3> > >.{ctor}
+std._Uninitialized_backout_al<std::allocator<int> >._Release
+std._Uninitialized_backout_al<std::allocator<int> >.{dtor}
+std._Uninitialized_backout_al<std::allocator<int> >.{ctor}
+std._Uninitialized_backout_al<std::allocator<cv::detail::CameraParams> >._Release
+std._Uninitialized_backout_al<std::allocator<cv::detail::CameraParams> >.{dtor}
+std._Uninitialized_backout_al<std::allocator<cv::detail::CameraParams> >.{ctor}
+std._Default_allocator_traits<std::allocator<std::_Container_proxy> >.deallocate
+cvflann.anyimpl.small_any_policy<char const *>.print
+cvflann.anyimpl.small_any_policy<char const *>.get_value
+cvflann.anyimpl.small_any_policy<char const *>.move
+cvflann.anyimpl.small_any_policy<char const *>.clone
+cvflann.anyimpl.small_any_policy<char const *>.copy_from_value
+cvflann.anyimpl.small_any_policy<char const *>.static_delete
+cvflann.anyimpl.typed_base_any_policy<char const *>.type
+cvflann.anyimpl.typed_base_any_policy<char const *>.get_size
+?A0xb68b8124.??__E?policy@?$SinglePolicy@PBD@anyimpl@cvflann@@0U?$small_any_policy@PBD@23@A@@YMXXZ
+std._Insertion_sort_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std._Make_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std._Sort_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std._Partition_by_median_guess_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std._Insertion_sort_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std._Make_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std._Sort_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std._Partition_by_median_guess_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std.addressof<struct std::_Container_proxy>
+std._Voidify_iter<struct std::_Container_proxy *>
+std.forward<struct std::_Container_base12 *>
+std._Uninitialized_backout_al<std::allocator<cv::detail::CameraParams> >._Emplace_back<struct cv::detail::CameraParams &>
+std._Copy_memmove<int *,int *>
+std._To_address<int *>
+std._Uninitialized_backout_al<std::allocator<int> >._Emplace_back<int &>
+std._Voidify_iter<struct CVisionLib::pt_ *>
+std.addressof<struct cv::detail::GraphEdge>
+std._Default_allocator_traits<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.destroy<struct cv::detail::GraphEdge>
+std._Uninitialized_backout_al<std::allocator<cv::Vec<float,3> > >._Emplace_back<>
+std.move<struct CVisionLib::blob_ &>
+std._Copy_memmove<struct CVisionLib::blob_ *,struct CVisionLib::blob_ *>
+std._To_address<struct CVisionLib::blob_ *>
+std._Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >._Emplace_back<struct CVisionLib::blob_>
+std._Uninitialized_backout_al<std::allocator<CVisionLib::blob_> >._Emplace_back<>
+std._Adl_verify_range<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Uninitialized_copy_unchecked<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Seek_wrapped<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+_UIt
+std._Zero_range<struct CVisionLib::pt_ * *>
+std._To_address<struct CVisionLib::pt_ * *>
+std._Uninitialized_backout_al<std::allocator<cv::Point_<int> > >._Emplace_back<class cv::Point_<int> >
+std._Uninitialized_backout_al<std::allocator<std::vector<int,std::allocator<int> > > >._Emplace_back<class std::vector<int,class std::allocator<int> > const &>
+std._Uninitialized_backout_al<std::allocator<cv::Mat> >._Emplace_back<>
+std._Fill_zero_memset<int *>
+std._Uninitialized_backout_al<std::allocator<int> >._Emplace_back<int const &>
+std._Uninitialized_backout_al<std::allocator<cv::Point_<int> > >._Emplace_back<class cv::Point_<int> &>
+?A0xb68b8124.??__F?policy@?$SinglePolicy@PBD@anyimpl@cvflann@@0U?$small_any_policy@PBD@23@A@@YMXXZ
+cvflann.anyimpl.small_any_policy<char const *>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<char const *>.{ctor}
+cvflann.anyimpl.small_any_policy<char const *>.{dtor}
+std.tuple<cv::String &&>.{ctor}
+cvflann.anyimpl.small_any_policy<char const *>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<char const *>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<char const *>.__vecDelDtor
+std._List_node_insert_op2<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.{dtor}
+std._List_node_insert_op2<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.{ctor}
+std._Uninitialized_backout<CVisionLib::pt_ * *>._Release
+std._Uninitialized_backout<CVisionLib::pt_ * *>.{dtor}
+std._Uninitialized_backout<CVisionLib::pt_ * *>.{ctor}
+cvflann.anyimpl.small_any_policy<unsigned int>.print
+cvflann.anyimpl.small_any_policy<unsigned int>.get_value
+cvflann.anyimpl.small_any_policy<unsigned int>.move
+cvflann.anyimpl.small_any_policy<unsigned int>.clone
+cvflann.anyimpl.small_any_policy<unsigned int>.copy_from_value
+cvflann.anyimpl.small_any_policy<unsigned int>.static_delete
+cvflann.anyimpl.typed_base_any_policy<unsigned int>.type
+cvflann.anyimpl.typed_base_any_policy<unsigned int>.get_size
+cvflann.anyimpl.small_any_policy<bool>.print
+cvflann.anyimpl.small_any_policy<bool>.get_value
+cvflann.anyimpl.small_any_policy<bool>.move
+cvflann.anyimpl.small_any_policy<bool>.clone
+cvflann.anyimpl.small_any_policy<bool>.copy_from_value
+cvflann.anyimpl.small_any_policy<bool>.static_delete
+cvflann.anyimpl.typed_base_any_policy<bool>.type
+cvflann.anyimpl.typed_base_any_policy<bool>.get_size
+cvflann.anyimpl.small_any_policy<float>.print
+cvflann.anyimpl.small_any_policy<float>.get_value
+cvflann.anyimpl.small_any_policy<float>.move
+cvflann.anyimpl.small_any_policy<float>.clone
+cvflann.anyimpl.small_any_policy<float>.copy_from_value
+cvflann.anyimpl.small_any_policy<float>.static_delete
+cvflann.anyimpl.typed_base_any_policy<float>.type
+cvflann.anyimpl.typed_base_any_policy<float>.get_size
+cvflann.anyimpl.small_any_policy<int>.print
+cvflann.anyimpl.small_any_policy<int>.get_value
+cvflann.anyimpl.small_any_policy<int>.move
+cvflann.anyimpl.small_any_policy<int>.clone
+cvflann.anyimpl.small_any_policy<int>.copy_from_value
+cvflann.anyimpl.small_any_policy<int>.static_delete
+cvflann.anyimpl.typed_base_any_policy<int>.type
+cvflann.anyimpl.typed_base_any_policy<int>.get_size
+std._List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>.==
+std._List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>.++
+std._List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>.*
+std.list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >.{ctor}
+std._Default_allocator_traits<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.select_on_container_copy_construction
+?A0xb68b8124.??__E?policy@?$SinglePolicy@H@anyimpl@cvflann@@0U?$small_any_policy@H@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@M@anyimpl@cvflann@@0U?$small_any_policy@M@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@_N@anyimpl@cvflann@@0U?$small_any_policy@_N@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_algorithm_t@cvflann@@@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_centers_init_t@cvflann@@@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@I@anyimpl@cvflann@@0U?$small_any_policy@I@23@A@@YMXXZ
+?A0xb68b8124.??__E?policy@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0U?$big_any_policy@VString@cv@@@23@A@@YMXXZ
+std._Move_backward_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::blob_ *>
+std._Pop_heap_hole_by_index<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Ygreater>
+_Hole
+_Bottom
+std._Pop_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std._Prev_iter<struct CVisionLib::blob_ *>
+std._Guess_median_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+_Mid
+std._Next_iter<struct CVisionLib::blob_ *>
+std.iter_swap<struct CVisionLib::blob_ *,struct CVisionLib::blob_ *>
+std.pair<CVisionLib::blob_ *,CVisionLib::blob_ *>.{ctor}<struct CVisionLib::blob_ * &,struct CVisionLib::blob_ * &,0>
+_Val2
+std._Pop_heap_hole_by_index<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Xgreater>
+std._Pop_heap_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std._Guess_median_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std.forward<struct cv::detail::CameraParams &>
+std._Default_allocator_traits<std::allocator<cv::detail::CameraParams> >.construct<struct cv::detail::CameraParams,struct cv::detail::CameraParams &>
+std.forward<int &>
+std._Default_allocator_traits<std::allocator<int> >.construct<int,int &>
+std._Unfancy<class cv::Vec<float,3> >
+std._Default_allocator_traits<std::allocator<cv::Vec<float,3> > >.construct<class cv::Vec<float,3> >
+std.forward<struct CVisionLib::blob_>
+std._Default_allocator_traits<std::allocator<CVisionLib::blob_> >.construct<struct CVisionLib::blob_,struct CVisionLib::blob_>
+std._Default_allocator_traits<std::allocator<CVisionLib::blob_> >.construct<struct CVisionLib::blob_>
+std._Copy_memmove<struct CVisionLib::pt_ * *,struct CVisionLib::pt_ * *>
+std._Uninitialized_backout<CVisionLib::pt_ * *>._Emplace_back<struct CVisionLib::pt_ * &>
+std.forward<struct CVisionLib::pt_ * *>
+std.forward<class std::vector<int,class std::allocator<int> > const &>
+std._Default_allocator_traits<std::allocator<std::vector<int,std::allocator<int> > > >.construct<class std::vector<int,class std::allocator<int> >,class std::vector<int,class std::allocator<int> > const &>
+std._Default_allocator_traits<std::allocator<cv::Mat> >.construct<class cv::Mat>
+std._List_node_insert_op2<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >._Append_range_unchecked<class std::_List_unchecked_const_iterator<class std::_List_val<struct std::_List_simple_types<struct cv::detail::GraphEdge> >,struct std::_Iterator_base0>,class std::_List_unchecked_const_iterator<class std::_List_val<struct std::_List_simple_types<struct cv::detail::GraphEdge> >,struct std::_Iterator_base0> >
+std.forward<class cv::Point_<int> &>
+std._Default_allocator_traits<std::allocator<cv::Point_<int> > >.construct<class cv::Point_<int>,class cv::Point_<int> &>
+std._Construct_in_place<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,struct std::_List_node<struct cv::detail::GraphEdge,void *> *>
+std.exchange<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,struct std::_List_node<struct cv::detail::GraphEdge,void *> * &>
+std._Compressed_pair<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> >,std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,1>.{ctor}<class std::allocator<struct std::_List_node<struct cv::detail::GraphEdge,void *> > >
+std.list<cv::detail::GraphEdge,std::allocator<cv::detail::GraphEdge> >._Construct_range_unchecked<class std::_List_unchecked_const_iterator<class std::_List_val<struct std::_List_simple_types<struct cv::detail::GraphEdge> >,struct std::_Iterator_base0> >
+?A0xb68b8124.??__F?policy@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0U?$big_any_policy@VString@cv@@@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@I@anyimpl@cvflann@@0U?$small_any_policy@I@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_centers_init_t@cvflann@@@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_algorithm_t@cvflann@@@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@_N@anyimpl@cvflann@@0U?$small_any_policy@_N@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@M@anyimpl@cvflann@@0U?$small_any_policy@M@23@A@@YMXXZ
+?A0xb68b8124.??__F?policy@?$SinglePolicy@H@anyimpl@cvflann@@0U?$small_any_policy@H@23@A@@YMXXZ
+cvflann.anyimpl.small_any_policy<int>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<int>.{ctor}
+cvflann.anyimpl.small_any_policy<int>.{dtor}
+cvflann.anyimpl.small_any_policy<float>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<float>.{ctor}
+cvflann.anyimpl.small_any_policy<float>.{dtor}
+cvflann.anyimpl.small_any_policy<bool>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<bool>.{ctor}
+cvflann.anyimpl.small_any_policy<bool>.{dtor}
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_algorithm_t>.{ctor}
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.{dtor}
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_centers_init_t>.{ctor}
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.{dtor}
+cvflann.anyimpl.small_any_policy<unsigned int>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<unsigned int>.{ctor}
+cvflann.anyimpl.small_any_policy<unsigned int>.{dtor}
+cvflann.anyimpl.big_any_policy<cv::String>.{ctor}
+cvflann.anyimpl.typed_base_any_policy<cv::String>.{ctor}
+cvflann.anyimpl.big_any_policy<cv::String>.{dtor}
+cvflann.anyimpl.small_any_policy<int>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<int>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<int>.__vecDelDtor
+cvflann.anyimpl.small_any_policy<float>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<float>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<float>.__vecDelDtor
+cvflann.anyimpl.small_any_policy<bool>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<bool>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<bool>.__vecDelDtor
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_algorithm_t>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_algorithm_t>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_algorithm_t>.__vecDelDtor
+cvflann.anyimpl.big_any_policy<enum cvflann::flann_centers_init_t>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_centers_init_t>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<enum cvflann::flann_centers_init_t>.__vecDelDtor
+cvflann.anyimpl.small_any_policy<unsigned int>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<unsigned int>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<unsigned int>.__vecDelDtor
+cvflann.anyimpl.big_any_policy<cv::String>.__vecDelDtor
+cvflann.anyimpl.typed_base_any_policy<cv::String>.{dtor}
+cvflann.anyimpl.typed_base_any_policy<cv::String>.__vecDelDtor
+std._Alloc_construct_ptr<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.{dtor}
+std._Alloc_construct_ptr<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >._Allocate
+std._Alloc_construct_ptr<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.{ctor}
+std._List_unchecked_const_iterator<std::_List_val<std::_List_simple_types<cv::detail::GraphEdge> >,std::_Iterator_base0>.!=
+std.allocator<std::_List_node<cv::detail::GraphEdge,void *> >.deallocate
+std._Copy_backward_memmove<struct CVisionLib::blob_ *,struct CVisionLib::blob_ *>
+std._Push_heap_by_index<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Ygreater>
+_Top
+std._Pop_heap_hole_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Ygreater>
+std._Med3_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Ygreater>
+std.swap<struct CVisionLib::blob_,0>
+std.forward<struct CVisionLib::blob_ * &>
+std._Push_heap_by_index<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Xgreater>
+std._Pop_heap_hole_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::blob_,struct CVisionLib::Xgreater>
+std._Med3_unchecked<struct CVisionLib::blob_ *,struct CVisionLib::Xgreater>
+std._Voidify_iter<struct cv::detail::CameraParams *>
+std._Voidify_iter<class cv::Vec<float,3> *>
+std.forward<struct CVisionLib::pt_ * &>
+std._Construct_in_place<struct CVisionLib::pt_ *,struct CVisionLib::pt_ * &>
+std._Voidify_iter<class std::vector<int,class std::allocator<int> > *>
+std._Voidify_iter<class cv::Mat *>
+std._Default_allocator_traits<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >.construct<struct cv::detail::GraphEdge,struct cv::detail::GraphEdge const &>
+std.exchange<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,struct std::_List_node<struct cv::detail::GraphEdge,void *> *>
+std.forward<struct std::_List_node<struct cv::detail::GraphEdge,void *> *>
+std.forward<class std::allocator<struct std::_List_node<struct cv::detail::GraphEdge,void *> > >
+std._List_node_insert_op2<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >._Attach_head<struct std::_List_simple_types<struct cv::detail::GraphEdge> >
+_List_data
+std._Alloc_construct_ptr<std::allocator<std::_List_node<cv::detail::GraphEdge,void *> > >._Release
+std.addressof<struct CVisionLib::pt_ *>
+std._Voidify_iter<struct CVisionLib::pt_ * *>
+std._Voidify_iter<struct cv::detail::GraphEdge *>
+std.forward<struct cv::detail::GraphEdge const &>
+std._Construct_in_place<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,struct std::_List_node<struct cv::detail::GraphEdge,void *> * const &>
+std.exchange<unsigned int,unsigned int>
+std.exchange<struct std::_List_node<struct cv::detail::GraphEdge,void *> *,std::nullptr_t>
+std.forward<struct std::_List_node<struct cv::detail::GraphEdge,void *> * const &>
+delete
+?A0xdf568c23.??__E?policy@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@Uempty_any@anyimpl@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@Uempty_any@anyimpl@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@PBD@anyimpl@cvflann@@0U?$small_any_policy@PBD@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@PBD@anyimpl@cvflann@@0U?$small_any_policy@PBD@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@H@anyimpl@cvflann@@0U?$small_any_policy@H@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@M@anyimpl@cvflann@@0U?$small_any_policy@M@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@_N@anyimpl@cvflann@@0U?$small_any_policy@_N@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_algorithm_t@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_centers_init_t@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@I@anyimpl@cvflann@@0U?$small_any_policy@I@23@A@@YMXXZ
+?A0xdf568c23.??__E?policy@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0U?$big_any_policy@VString@cv@@@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0U?$big_any_policy@VString@cv@@@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@I@anyimpl@cvflann@@0U?$small_any_policy@I@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_centers_init_t@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_algorithm_t@cvflann@@@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@_N@anyimpl@cvflann@@0U?$small_any_policy@_N@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@M@anyimpl@cvflann@@0U?$small_any_policy@M@23@A@@YMXXZ
+?A0xdf568c23.??__F?policy@?$SinglePolicy@H@anyimpl@cvflann@@0U?$small_any_policy@H@23@A@@YMXXZ
+<CrtImplementationDetails>.ThrowNestedModuleLoadException
+innerException
+nestedException
+<CrtImplementationDetails>.ThrowModuleLoadException
+errorMessage
+<CrtImplementationDetails>.RegisterModuleUninitializer
+handler
+<CrtImplementationDetails>.FromGUID
+guid
+__get_default_appdomain
+ppUnk
+__release_appdomain
+<CrtImplementationDetails>.GetDefaultDomain
+<CrtImplementationDetails>.DoCallBackInDefaultDomain
+function
+cookie
+__scrt_is_safe_for_managed_code
+<CrtImplementationDetails>.DefaultDomain.DoNothing
+<CrtImplementationDetails>.DefaultDomain.HasPerProcess
+<CrtImplementationDetails>.DefaultDomain.HasNative
+<CrtImplementationDetails>.DefaultDomain.NeedsInitialization
+<CrtImplementationDetails>.DefaultDomain.NeedsUninitialization
+<CrtImplementationDetails>.DefaultDomain.Initialize
+?A0xa7e53572.??__E?Initialized@CurrentDomain@<CrtImplementationDetails>@@$$Q2HA@@YMXXZ
+?A0xa7e53572.??__E?Uninitialized@CurrentDomain@<CrtImplementationDetails>@@$$Q2HA@@YMXXZ
+?A0xa7e53572.??__E?IsDefaultDomain@CurrentDomain@<CrtImplementationDetails>@@$$Q2_NA@@YMXXZ
+?A0xa7e53572.??__E?InitializedVtables@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A@@YMXXZ
+?A0xa7e53572.??__E?InitializedNative@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A@@YMXXZ
+?A0xa7e53572.??__E?InitializedPerProcess@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A@@YMXXZ
+?A0xa7e53572.??__E?InitializedPerAppDomain@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A@@YMXXZ
+<CrtImplementationDetails>.LanguageSupport.InitializeVtables
+<CrtImplementationDetails>.LanguageSupport.InitializeDefaultAppDomain
+<CrtImplementationDetails>.LanguageSupport.InitializeNative
+<CrtImplementationDetails>.LanguageSupport.InitializePerProcess
+<CrtImplementationDetails>.LanguageSupport.InitializePerAppDomain
+<CrtImplementationDetails>.LanguageSupport.InitializeUninitializer
+<CrtImplementationDetails>.LanguageSupport._Initialize
+<CrtImplementationDetails>.LanguageSupport.UninitializeAppDomain
+<CrtImplementationDetails>.LanguageSupport._UninitializeDefaultDomain
+<CrtImplementationDetails>.LanguageSupport.UninitializeDefaultDomain
+<CrtImplementationDetails>.LanguageSupport.DomainUnload
+<CrtImplementationDetails>.LanguageSupport.Cleanup
+<CrtImplementationDetails>.LanguageSupport.{ctor}
+<CrtImplementationDetails>.LanguageSupport.{dtor}
+<CrtImplementationDetails>.LanguageSupport.Initialize
+.cctor
+gcroot<System::String ^>..P$AAVString@System@@
+gcroot<System::String ^>.=
+gcroot<System::String ^>.{dtor}
+gcroot<System::String ^>.{ctor}
+___CxxCallUnwindDtor
+pDtor
+pThis
+___CxxCallUnwindDelDtor
+___CxxCallUnwindVecDtor
+pVecDtor
+size
+count
+<CrtImplementationDetails>.AtExitLock._handle
+<CrtImplementationDetails>.AtExitLock._lock_Construct
+<CrtImplementationDetails>.AtExitLock._lock_Set
+<CrtImplementationDetails>.AtExitLock._lock_Get
+<CrtImplementationDetails>.AtExitLock._lock_Destruct
+<CrtImplementationDetails>.AtExitLock.IsInitialized
+<CrtImplementationDetails>.AtExitLock.AddRef
+<CrtImplementationDetails>.AtExitLock.RemoveRef
+<CrtImplementationDetails>.AtExitLock.Enter
+<CrtImplementationDetails>.AtExitLock.Exit
+?A0x9398b955.__global_lock
+?A0x9398b955.__global_unlock
+?A0x9398b955.__alloc_global_lock
+?A0x9398b955.__dealloc_global_lock
+_atexit_helper
+func
+__pexit_list_size
+__ponexitend_e
+__ponexitbegin_e
+_exit_callback
+_initatexit_m
+_onexit_m
+_Function
+_atexit_m
+_initatexit_app_domain
+_app_exit_callback
+_onexit_m_appdomain
+_atexit_m_appdomain
+DecodePointer
+EncodePointer
+__ehvec_dtor
+destructor
+?A0xfe9c060e.ArrayUnwindFilter
+pExPtrs
+__ArrayUnwind
+_initterm_e
+pfbegin
+pfend
+_initterm
+<CrtImplementationDetails>.ThisModule.Handle
+_initterm_m
+<CrtImplementationDetails>.ThisModule.ResolveMethod<void const * __clrcall(void)>
+methodToken
+ATL._AtlInitializeCriticalSectionEx
+ATL.CAtlComModule.{ctor}
+ATL.CAtlComModule.{dtor}
+ATL.CAtlComModule.Term
+SMI_SetValue
+SMI_SetGPIOValue
+SMI_GetGPIOValue
+SMI_DestoryDeviceObject
+SMI_CreateDeviceObject
+UnregisterClassW
+VariantCopy
+SysAllocStringByteLen
+SysStringByteLen
+DeleteCriticalSection
+GetLastError
+_CxxThrowException
+RaiseException
+free
+fprintf
+cv.String.=
+cv.detail.PtrOwner.incRef
+cv.detail.PtrOwner.decRef
+cv.Mat.release
+cv.SparseMat.addref
+cv.UMat.addref
+std._Locinfo._Getcvt
+std._Locinfo._W_Getdays
+std._Locinfo._W_Getmonths
+std.ios_base.good
+std.ios_base.flags
+std.ios_base.width
+std.basic_ostream<char,std::char_traits<char> >.<<
+std.basic_ios<char,std::char_traits<char> >.fill
+std.basic_ios<char,std::char_traits<char> >.rdbuf
+std.basic_ios<char,std::char_traits<char> >.setstate
+std.basic_ostream<char,std::char_traits<char> >.flush
+std.basic_ostream<char,std::char_traits<char> >._Osfx
+std.basic_ios<char,std::char_traits<char> >.tie
+std.basic_streambuf<char,std::char_traits<char> >.sputc
+std.basic_streambuf<char,std::char_traits<char> >.sputn
+cv.detail.CameraParams.{ctor}
+std.uncaught_exception
+cv.Laplacian
+cv.GaussianBlur
+cv.split
+cv.HoughLines
+cv.erode
+cv.dilate
+cv.equalizeHist
+cv.matchTemplate
+_sleep
+cv.minMaxLoc
+cv.compareHist
+cv.medianBlur
+cv.HoughLinesP
+cv.Canny
+cv.inRange
+cv.HoughCircles
+cv.calcHist
+new[]
+__CxxUnregisterExceptionObject
+__CxxQueryExceptionSize
+__CxxDetectRethrow
+__CxxRegisterExceptionObject
+__CxxExceptionFilter
+cv.imwrite
+cv.RotatedRect.points
+cv.minAreaRect
+cv.waitKey
+cv.imshow
+cv.mean
+cv.imread
+cv.cvtColor
+cvCloneImage
+cvReleaseImage
+zbar_scan_image
+zbar_image_scanner_destroy
+zbar_image_scanner_create
+zbar_image_get_symbols
+zbar_image_set_data
+zbar_image_set_size
+zbar_image_set_format
+zbar_image_ref
+zbar_image_set_userdata
+zbar_image_create
+zbar_symbol_set_first_symbol
+zbar_symbol_get_data
+zbar_symbol_get_type
+zbar_symbol_get_data_length
+zbar_symbol_ref
+zbar_symbol_get_loc_x
+zbar_symbol_get_loc_y
+zbar_symbol_get_loc_size
+zbar_symbol_set_ref
+zbar_image_scanner_set_config
+_zbar_error_string
+fopen
+fclose
+cv.Exception.{dtor}
+cv.cvarrToMat
+std._Xbad_alloc
+calloc
+_Mbrtowc
+cv.noArray
+cv.UMat.{dtor}
+cv.UMat.copySize
+cv.Mat.copyTo
+cv.fastFree
+cv.String.deallocate
+cv.String.allocate
+std._Xlength_error
+_invalid_parameter_noinfo_noreturn
+__ExceptionPtrCopy
+__ExceptionPtrDestroy
+delete[]
+__std_exception_destroy
+__std_exception_copy
+memmove
+cv.resize
+cv.destroyWindow
+SetWindowPos
+FindWindowW
+cv.namedWindow
+cv.circle
+_IplImage.{ctor}
+cvCopy
+cv.VideoCapture.{ctor}
+_getFiberPtrId
+_cexit
+Sleep
+abort
+__security_init_cookie
+__FrameUnwindFilter
+__current_exception_context
+terminate
+__current_exception
+??_C@_13HADIAKP@?$AAS@
+??_C@_13LHMFKAAD@?$AAM@
+??_C@_13MKMNOPIJ@?$AAD@
+??_C@_13OPKGLAFF@?$AAB@
+??_C@_17LLMMEOJD@?$AAV?$AAa?$AAl@
+??_C@_1BI@JFAIJMHL@?$AAF?$AAo?$AAr?$AAc?$AAe?$AAR?$AAe?$AAm?$AAo?$AAv?$AAe@
+??_C@_1BC@GCKHIPE@?$AAN?$AAo?$AAR?$AAe?$AAm?$AAo?$AAv?$AAe@
+??_C@_1O@JDLOHAN@?$AAD?$AAe?$AAl?$AAe?$AAt?$AAe@
+??_C@_1CA@ONGMEOAB@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAG?$AAe?$AAn?$AAe?$AAr?$AAa?$AAl@
+??_C@_1BI@MAFGHOEE@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAC?$AAO?$AAM@
+??_C@_1BG@FPLJJEMF@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAQ?$AAI@
+??_C@_1CE@NIAEAIDK@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAR?$AAe?$AAg?$AAi?$AAs?$AAt?$AAr@
+??_C@_1CC@BNHGJFNK@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAR?$AAe?$AAf?$AAc?$AAo?$AAu?$AAn@
+??_C@_1CE@NAJDPMNB@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAW?$AAi?$AAn?$AAd?$AAo?$AAw?$AAi@
+??_C@_1CC@IMNJGBED@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAC?$AAo?$AAn?$AAt?$AAr?$AAo?$AAl@
+??_C@_1CA@OMOMONMN@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAH?$AAo?$AAs?$AAt?$AAi?$AAn?$AAg@
+??_C@_1CC@JNJJDOOH@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAD?$AAB?$AAC?$AAl?$AAi?$AAe?$AAn@
+??_C@_1CG@MNMMIOOI@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAD?$AAB?$AAP?$AAr?$AAo?$AAv?$AAi@
+??_C@_1BO@EFPHNHHN@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAS?$AAn?$AAa?$AAp?$AAi?$AAn@
+??_C@_1CA@DMHPIODO@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAN?$AAo?$AAt?$AAI?$AAm?$AAp?$AAl@
+??_C@_1CG@KFEEMCDH@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAA?$AAl?$AAl?$AAo?$AAc?$AAa?$AAt@
+??_C@_1CE@IMMADNAP@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAE?$AAx?$AAc?$AAe?$AAp?$AAt?$AAi@
+??_C@_1BK@NCJHOFCL@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAT?$AAi?$AAm?$AAe@
+??_C@_1BM@GIKLHLFD@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAC?$AAa?$AAc?$AAh?$AAe@
+??_C@_1CA@PBPHANCD@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAS?$AAt?$AAe?$AAn?$AAc?$AAi?$AAl@
+??_C@_1BO@GMLILNDJ@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAS?$AAt?$AAr?$AAi?$AAn?$AAg@
+??_C@_1BI@OKDLCIEM@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAM?$AAa?$AAp@
+??_C@_1BK@DMHCKHHD@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAU?$AAt?$AAi?$AAl@
+??_C@_1CC@DMMBNCFG@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAS?$AAe?$AAc?$AAu?$AAr?$AAi?$AAt@
+??_C@_1BK@OPAPOCAL@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAS?$AAy?$AAn?$AAc@
+??_C@_1BM@FHAEDBFK@?$AAa?$AAt?$AAl?$AAT?$AAr?$AAa?$AAc?$AAe?$AAI?$AAS?$AAA?$AAP?$AAI@
+ATL.szDelete
+ATL.szNoRemove
+ATL.szForceRemove
+ATL.szValToken
+ATL.szBinaryVal
+ATL.szDwordVal
+ATL.multiszStringVal
+ATL.szStringVal
+ATL.chEquals
+ATL.chQuote
+ATL.chLeftBracket
+ATL.chRightBracket
+ATL.chDirSep
+ATL._pAtlAutoThreadModule
+ATL._pModule
+ATL.<AtlImplementationDetails>.ComModuleInitialized
+ATL.<AtlImplementationDetails>.ComModuleHelper
+ATL.<AtlImplementationDetails>.DllModuleInitialized
+_pAtlReleaseManagedClassFactories
+ATL._AtlReleaseManagedClassFactories
+ATL.?A0x1a45bfe4._AtlReleaseManagedClassFactories$initializer$
+ATL._pAtlModule
+ATL._AtlWinModule
+ATL.?A0x1a45bfe4._AtlWinModule$initializer$
+ATL._AtlComModule
+ATL.?A0x1a45bfe4._AtlComModule$initializer$
+ATL._AtlRegisterPerUser
+ATL._pPerfUnRegFunc
+ATL._pPerfRegFunc
+__pobjMapEntryLast
+__pobjMapEntryFirst
+IID_IAxWinAmbientDispatchEx
+IID_IAxWinHostWindowLic
+IID_IDocHostUIHandlerDispatch
+IID_IInternalConnection
+IID_IAxWinAmbientDispatch
+IID_IAxWinHostWindow
+IID_IRegistrar
+CLSID_Registrar
+LIBID_ATLLib
+?pmField@?$CVarTypeInfo@PATtagCY@@@ATL@@2QQtagVARIANT@@PATtagCY@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PATtagCY@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@TtagCY@@@ATL@@2QQtagVARIANT@@TtagCY@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@TtagCY@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAPAUIDispatch@@@ATL@@2QQtagVARIANT@@PAPAUIDispatch@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAPAUIDispatch@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAUIDispatch@@@ATL@@2QQtagVARIANT@@PAUIDispatch@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAUIDispatch@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAPAUIUnknown@@@ATL@@2QQtagVARIANT@@PAPAUIUnknown@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAPAUIUnknown@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAUIUnknown@@@ATL@@2QQtagVARIANT@@PAUIUnknown@@Q3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAUIUnknown@@@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAPA_W@ATL@@2QQtagVARIANT@@PAPA_WQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAPA_W@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PA_W@ATL@@2QQtagVARIANT@@PA_WQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PA_W@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAN@ATL@@2QQtagVARIANT@@PANQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAN@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@N@ATL@@2QQtagVARIANT@@NQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@N@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAM@ATL@@2QQtagVARIANT@@PAMQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAM@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@M@ATL@@2QQtagVARIANT@@MQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@M@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PA_K@ATL@@2QQtagVARIANT@@PA_KQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PA_K@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@_K@ATL@@2QQtagVARIANT@@_KQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@_K@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PA_J@ATL@@2QQtagVARIANT@@PA_JQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PA_J@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@_J@ATL@@2QQtagVARIANT@@_JQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@_J@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAK@ATL@@2QQtagVARIANT@@PAKQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAK@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@K@ATL@@2QQtagVARIANT@@KQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@K@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAJ@ATL@@2QQtagVARIANT@@PAJQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAJ@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@J@ATL@@2QQtagVARIANT@@JQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@J@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAI@ATL@@2QQtagVARIANT@@PAIQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAI@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@I@ATL@@2QQtagVARIANT@@IQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@I@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAH@ATL@@2QQtagVARIANT@@PAHQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAH@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@H@ATL@@2QQtagVARIANT@@HQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@H@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAG@ATL@@2QQtagVARIANT@@PAGQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAG@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@G@ATL@@2QQtagVARIANT@@GQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@G@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAF@ATL@@2QQtagVARIANT@@PAFQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAF@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@F@ATL@@2QQtagVARIANT@@FQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@F@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAE@ATL@@2QQtagVARIANT@@PAEQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAE@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@PAD@ATL@@2QQtagVARIANT@@PADQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@PAD@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@E@ATL@@2QQtagVARIANT@@EQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@E@ATL@@2P6MXXZA
+?pmField@?$CVarTypeInfo@D@ATL@@2QQtagVARIANT@@DQ3@
+?A0x1a45bfe4.?pmField$initializer$@?$CVarTypeInfo@D@ATL@@2P6MXXZA
+?m_bInitFailed@CAtlBaseModule@ATL@@2_NA
+_CTA1?AVCAtlException@ATL@@
+_CT??_R0?AVCAtlException@ATL@@@84
+??_R0?AVCAtlException@ATL@@@8
+_TI1?AVCAtlException@ATL@@
+ATL.atlTraceISAPI
+ATL.atlTraceSync
+ATL.atlTraceSecurity
+ATL.atlTraceUtil
+ATL.atlTraceMap
+ATL.atlTraceString
+ATL.atlTraceStencil
+ATL.atlTraceCache
+ATL.atlTraceTime
+ATL.atlTraceException
+ATL.atlTraceAllocation
+ATL.atlTraceNotImpl
+ATL.atlTraceSnapin
+ATL.atlTraceDBProvider
+ATL.atlTraceDBClient
+ATL.atlTraceHosting
+ATL.atlTraceControls
+ATL.atlTraceWindowing
+ATL.atlTraceRefcount
+ATL.atlTraceRegistrar
+ATL.atlTraceQI
+ATL.atlTraceCOM
+ATL.atlTraceGeneral
+??_C@_08BOPJINP@Edge?5Map@
+??_C@_0BC@EOODALEL@Unknown?5exception@
+??_C@_0BF@KINCDENJ@bad?5array?5new?5length@
+??_C@_0BA@JFNIOLAK@string?5too?5long@
+??_C@_00CNPNBAHC@@
+??_C@_0N@FJHHFFAF@bad_weak_ptr@
+??_C@_0M@LLFGKPEG@?$FLempty_any?$FN@
+??_C@_0CH@ILAGBJPG@zbar?5library?5unspecified?5generi@
+??_C@_0BD@NKJFFLKL@unsupported?5format@
+??_C@_07DHLODKHN@myImage@
+??_C@_04MCGMKGHF@Y800@
+??_C@_0DC@KIGCFDFO@An?5undetermined?5exception?5occur@
+??_C@_01MCMALHOG@a@
+??_C@_0BO@GMGMADMC@C?3logfileopencv_error_log?4txt@
+??_C@_03OFAPEBGM@?$CFs?6@
+??_C@_0DM@JHBNENME@An?5undetermined?5exception?5occur@
+??_C@_09LNHGMHH@grayImage@
+??_C@_0M@OHBEPLPC@binaryImage@
+??_C@_0BA@FOIKENOD@vector?5too?5long@
+??_C@_1BK@MHIKGOKE@?$AA?3?$AAA?$AAM?$AA?3?$AAa?$AAm?$AA?3?$AAP?$AAM?$AA?3?$AAp?$AAm@
+??_C@_0BC@KBDMBKEH@deque?$DMT?$DO?5too?5long@
+??_R2?$small_any_policy@PBD@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@PBD@anyimpl@cvflann@@8
+??_R2FormatError@zbar@@8
+??_R2ClosedError@zbar@@8
+??_R2XProtoError@zbar@@8
+??_R2XDisplayError@zbar@@8
+??_R2BusyError@zbar@@8
+??_R2LockingError@zbar@@8
+??_R2SystemError@zbar@@8
+??_R2InvalidError@zbar@@8
+??_R2UnsupportedError@zbar@@8
+??_R2InternalError@zbar@@8
+??_R2Exception@zbar@@8
+??_R2HOGDescriptor@cv@@8
+??_R2?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R2?$small_any_policy@_N@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@_N@anyimpl@cvflann@@8
+??_R2?$small_any_policy@M@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@M@anyimpl@cvflann@@8
+??_R2?$small_any_policy@I@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@I@anyimpl@cvflann@@8
+??_R2?$small_any_policy@H@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@H@anyimpl@cvflann@@8
+??_R2?$big_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R2?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R2?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R2?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R2base_any_policy@anyimpl@cvflann@@8
+??_R2FLANNException@cvflann@@8
+??_R2failure@ios_base@std@@8
+??_R2bad_weak_ptr@std@@8
+??_R2bad_cast@std@@8
+??_R2system_error@std@@8
+??_R2_System_error@std@@8
+??_R2range_error@std@@8
+??_R2runtime_error@std@@8
+??_R2Exception@cv@@8
+??_R2bad_array_new_length@std@@8
+??_R2bad_alloc@std@@8
+??_R2exception@std@@8
+??_R1A@?0A@EA@?$small_any_policy@PBD@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@PBD@anyimpl@cvflann@@8
+??_R1A@?0A@EA@FormatError@zbar@@8
+??_R1A@?0A@EA@ClosedError@zbar@@8
+??_R1A@?0A@EA@XProtoError@zbar@@8
+??_R1A@?0A@EA@XDisplayError@zbar@@8
+??_R1A@?0A@EA@BusyError@zbar@@8
+??_R1A@?0A@EA@LockingError@zbar@@8
+??_R1A@?0A@EA@SystemError@zbar@@8
+??_R1A@?0A@EA@InvalidError@zbar@@8
+??_R1A@?0A@EA@UnsupportedError@zbar@@8
+??_R1A@?0A@EA@InternalError@zbar@@8
+??_R1A@?0A@EA@Exception@zbar@@8
+??_R1A@?0A@EA@HOGDescriptor@cv@@8
+??_R1A@?0A@EA@?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$small_any_policy@_N@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@_N@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$small_any_policy@M@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@M@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$small_any_policy@I@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@I@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$small_any_policy@H@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@H@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$big_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R1A@?0A@EA@base_any_policy@anyimpl@cvflann@@8
+??_R1A@?0A@EA@FLANNException@cvflann@@8
+??_R1A@?0A@EA@failure@ios_base@std@@8
+??_R1A@?0A@EA@bad_weak_ptr@std@@8
+??_R1A@?0A@EA@bad_cast@std@@8
+??_R1A@?0A@EA@system_error@std@@8
+??_R1A@?0A@EA@_System_error@std@@8
+??_R1A@?0A@EA@range_error@std@@8
+??_R1A@?0A@EA@runtime_error@std@@8
+??_R1A@?0A@EA@Exception@cv@@8
+??_R1A@?0A@EA@bad_array_new_length@std@@8
+??_R1A@?0A@EA@bad_alloc@std@@8
+??_R1A@?0A@EA@exception@std@@8
+??_R3?$typed_base_any_policy@PBD@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@PBD@anyimpl@cvflann@@@8
+??_R3?$small_any_policy@PBD@anyimpl@cvflann@@8
+??_R0?AU?$small_any_policy@PBD@anyimpl@cvflann@@@8
+??_R3FormatError@zbar@@8
+??_R3ClosedError@zbar@@8
+??_R3XProtoError@zbar@@8
+??_R3XDisplayError@zbar@@8
+??_R3BusyError@zbar@@8
+??_R3LockingError@zbar@@8
+??_R3SystemError@zbar@@8
+??_R3InvalidError@zbar@@8
+??_R3UnsupportedError@zbar@@8
+??_R3InternalError@zbar@@8
+??_R3Exception@zbar@@8
+??_R3HOGDescriptor@cv@@8
+??_R0?AUHOGDescriptor@cv@@@8
+??_R3?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@@8
+??_R3?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@_N@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@_N@anyimpl@cvflann@@@8
+??_R3?$small_any_policy@_N@anyimpl@cvflann@@8
+??_R0?AU?$small_any_policy@_N@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@M@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@M@anyimpl@cvflann@@@8
+??_R3?$small_any_policy@M@anyimpl@cvflann@@8
+??_R0?AU?$small_any_policy@M@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@I@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@I@anyimpl@cvflann@@@8
+??_R3?$small_any_policy@I@anyimpl@cvflann@@8
+??_R0?AU?$small_any_policy@I@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@H@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@H@anyimpl@cvflann@@@8
+??_R3?$small_any_policy@H@anyimpl@cvflann@@8
+??_R0?AU?$small_any_policy@H@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@@8
+??_R3?$big_any_policy@VString@cv@@@anyimpl@cvflann@@8
+??_R0?AU?$big_any_policy@VString@cv@@@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@@8
+??_R3?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@@8
+??_R3?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@@8
+??_R3?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@8
+??_R0?AU?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@@8
+??_R3base_any_policy@anyimpl@cvflann@@8
+??_R0?AUbase_any_policy@anyimpl@cvflann@@@8
+??_R3FLANNException@cvflann@@8
+??_R3failure@ios_base@std@@8
+??_R3bad_weak_ptr@std@@8
+??_R3bad_cast@std@@8
+??_R3system_error@std@@8
+??_R3_System_error@std@@8
+??_R3range_error@std@@8
+??_R3runtime_error@std@@8
+??_R3Exception@cv@@8
+??_R3bad_array_new_length@std@@8
+??_R3bad_alloc@std@@8
+??_R3exception@std@@8
+??_R4?$typed_base_any_policy@I@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@_N@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@M@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@H@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@PBD@anyimpl@cvflann@@6B@
+??_R4?$small_any_policy@PBD@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@6B@
+??_R4FormatError@zbar@@6B@
+??_R4ClosedError@zbar@@6B@
+??_R4XProtoError@zbar@@6B@
+??_R4XDisplayError@zbar@@6B@
+??_R4BusyError@zbar@@6B@
+??_R4LockingError@zbar@@6B@
+??_R4SystemError@zbar@@6B@
+??_R4InvalidError@zbar@@6B@
+??_R4UnsupportedError@zbar@@6B@
+??_R4InternalError@zbar@@6B@
+??_R4Exception@zbar@@6B@
+??_R4HOGDescriptor@cv@@6B@
+??_R4?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@6B@
+??_R4?$small_any_policy@_N@anyimpl@cvflann@@6B@
+??_R4?$small_any_policy@M@anyimpl@cvflann@@6B@
+??_R4?$small_any_policy@I@anyimpl@cvflann@@6B@
+??_R4?$small_any_policy@H@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@6B@
+??_R4?$big_any_policy@VString@cv@@@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@6B@
+??_R4?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@6B@
+??_R4?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@6B@
+??_R4?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@6B@
+??_R4base_any_policy@anyimpl@cvflann@@6B@
+??_R4FLANNException@cvflann@@6B@
+??_R4failure@ios_base@std@@6B@
+??_R4bad_weak_ptr@std@@6B@
+??_R4bad_cast@std@@6B@
+??_R4system_error@std@@6B@
+??_R4_System_error@std@@6B@
+??_R4range_error@std@@6B@
+??_R4runtime_error@std@@6B@
+??_R4Exception@cv@@6B@
+??_R4bad_array_new_length@std@@6B@
+??_R4bad_alloc@std@@6B@
+??_R4exception@std@@6B@
+??_7?$big_any_policy@VString@cv@@@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@6B@
+??_7?$small_any_policy@I@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@I@anyimpl@cvflann@@6B@
+??_7?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@6B@
+??_7?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@6B@
+??_7?$small_any_policy@_N@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@_N@anyimpl@cvflann@@6B@
+??_7?$small_any_policy@M@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@M@anyimpl@cvflann@@6B@
+??_7?$small_any_policy@H@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@H@anyimpl@cvflann@@6B@
+?policy@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0U?$big_any_policy@VString@cv@@@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@VString@cv@@@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@I@anyimpl@cvflann@@0U?$small_any_policy@I@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@I@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_centers_init_t@cvflann@@@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@W4flann_algorithm_t@cvflann@@@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@_N@anyimpl@cvflann@@0U?$small_any_policy@_N@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@_N@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@M@anyimpl@cvflann@@0U?$small_any_policy@M@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@M@anyimpl@cvflann@@0P6MXXZA
+?policy@?$SinglePolicy@H@anyimpl@cvflann@@0U?$small_any_policy@H@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@H@anyimpl@cvflann@@0P6MXXZA
+??_R0H@8
+??_R0M@8
+??_R0_N@8
+??_R0I@8
+??_7?$small_any_policy@PBD@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@PBD@anyimpl@cvflann@@6B@
+?policy@?$SinglePolicy@PBD@anyimpl@cvflann@@0U?$small_any_policy@PBD@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@PBD@anyimpl@cvflann@@0P6MXXZA
+??_R0PBD@8
+??_7?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@6B@
+??_7?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@6B@
+?policy@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0U?$big_any_policy@Uempty_any@anyimpl@cvflann@@@23@A
+?A0xb68b8124.?policy$initializer$@?$SinglePolicy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@0P6MXXZA
+??_R0?AW4flann_centers_init_t@cvflann@@@8
+??_R0?AW4flann_algorithm_t@cvflann@@@8
+??_R0?AVString@cv@@@8
+window_name
+kernel_size
+ratio
+lowThreshold
+edgeThresh
+detected_edges
+?A0xb68b8124.detected_edges$initializer$
+?A0xb68b8124.dst$initializer$
+src_gray
+?A0xb68b8124.src_gray$initializer$
+?A0xb68b8124.src$initializer$
+??_7FormatError@zbar@@6B@
+_CTA3?AVFormatError@zbar@@
+_CT??_R0?AVFormatError@zbar@@@8??0FormatError@zbar@@$$FQAE@ABV01@@Z16
+??_R0?AVFormatError@zbar@@@8
+_TI3?AVFormatError@zbar@@
+_CT??_R0?AVException@zbar@@@8??0Exception@zbar@@$$FQAE@ABV01@@Z16
+??_R0?AVClosedError@zbar@@@8
+??_R0?AVXProtoError@zbar@@@8
+??_R0?AVXDisplayError@zbar@@@8
+??_R0?AVBusyError@zbar@@@8
+??_R0?AVLockingError@zbar@@@8
+??_R0?AVSystemError@zbar@@@8
+??_R0?AVInvalidError@zbar@@@8
+??_R0?AVUnsupportedError@zbar@@@8
+??_R0?AVException@zbar@@@8
+??_R0?AVInternalError@zbar@@@8
+??_7ClosedError@zbar@@6B@
+??_7XProtoError@zbar@@6B@
+??_7XDisplayError@zbar@@6B@
+??_7BusyError@zbar@@6B@
+??_7LockingError@zbar@@6B@
+??_7SystemError@zbar@@6B@
+??_7InvalidError@zbar@@6B@
+??_7UnsupportedError@zbar@@6B@
+??_7InternalError@zbar@@6B@
+??_7Exception@zbar@@6B@
+??_7HOGDescriptor@cv@@6B@
+??_7Exception@cv@@6B@
+??_R0?AVException@cv@@@8
+??_R0?AVFLANNException@cvflann@@@8
+??_R0?AUempty_any@anyimpl@cvflann@@@8
+??_7base_any_policy@anyimpl@cvflann@@6B@
+??_7FLANNException@cvflann@@6B@
+??_R0?AVfailure@ios_base@std@@@8
+??_7failure@ios_base@std@@6B@
+??_R0?AVbad_weak_ptr@std@@@8
+??_7bad_weak_ptr@std@@6B@
+??_R0?AVbad_cast@std@@@8
+??_7bad_cast@std@@6B@
+??_R0?AV_System_error@std@@@8
+??_R0?AVsystem_error@std@@@8
+??_7system_error@std@@6B@
+??_7_System_error@std@@6B@
+??_R0?AVruntime_error@std@@@8
+??_R0?AVrange_error@std@@@8
+??_7range_error@std@@6B@
+??_7runtime_error@std@@6B@
+std.?A0xb68b8124._Fake_alloc
+std.?A0xb68b8124.piecewise_construct
+_CTA3?AVbad_array_new_length@std@@
+_CT??_R0?AVexception@std@@@8??0exception@std@@$$FQAE@ABV01@@Z12
+_CT??_R0?AVbad_alloc@std@@@8??0bad_alloc@std@@$$FQAE@ABV01@@Z12
+_CT??_R0?AVbad_array_new_length@std@@@8??0bad_array_new_length@std@@$$FQAE@ABV01@@Z12
+??_R0?AVexception@std@@@8
+??_R0?AVbad_alloc@std@@@8
+??_R0?AVbad_array_new_length@std@@@8
+_TI3?AVbad_array_new_length@std@@
+??_7bad_array_new_length@std@@6B@
+??_7bad_alloc@std@@6B@
+??_7exception@std@@6B@
+?_OptionsStorage@?1??__local_stdio_printf_options@@YAPA_KXZ@4_KA
+__unep@?_cleanup@Image@zbar@@$$FKAXPAUzbar_image_s@2@@Z
+??_C@_07HHNICHD@MyVideo@
+??_C@_1BA@OBCAELKH@?$AAM?$AAy?$AAV?$AAi?$AAd?$AAe?$AAo@
+std.?A0xdf568c23._Fake_alloc
+std.?A0xdf568c23.piecewise_construct
+IID_IAMFilterGraphCallback
+__@@_PchSym_@00@UyrlckDCAAzkkUxerhrlmoryUivovzhvUhgwzucOlyq@4B2008FD98C1DD4
+_GUID_cb2f6723_ab3a_11d2_9c40_00c04fa30a3e
+?InitializedPerProcess@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A
+?A0xa7e53572.?InitializedPerProcess$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+_GUID_cb2f6722_ab3a_11d2_9c40_00c04fa30a3e
+_GUID_90f1a06c_7712_4762_86b5_7a5eba6bdb02
+_GUID_90f1a06e_7712_4762_86b5_7a5eba6bdb02
+?Uninitialized@CurrentDomain@<CrtImplementationDetails>@@$$Q2HA
+?InitializedPerAppDomain@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A
+?Entered@DefaultDomain@<CrtImplementationDetails>@@2_NA
+?hasNative@DefaultDomain@<CrtImplementationDetails>@@0W4TriBool@2@A
+?InitializedPerProcess@DefaultDomain@<CrtImplementationDetails>@@2_NA
+?Count@AllDomains@<CrtImplementationDetails>@@2HA
+?Initialized@CurrentDomain@<CrtImplementationDetails>@@$$Q2HA
+?InitializedNative@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A
+?InitializedNativeFromCCTOR@DefaultDomain@<CrtImplementationDetails>@@2_NA
+?IsDefaultDomain@CurrentDomain@<CrtImplementationDetails>@@$$Q2_NA
+?InitializedVtables@CurrentDomain@<CrtImplementationDetails>@@$$Q2W4Progress@2@A
+?InitializedNative@DefaultDomain@<CrtImplementationDetails>@@2_NA
+?hasPerProcess@DefaultDomain@<CrtImplementationDetails>@@0W4TriBool@2@A
+__xc_mp_z
+__xi_vt_z
+?A0xa7e53572.?IsDefaultDomain$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+__xc_ma_a
+__xc_ma_z
+?A0xa7e53572.?Initialized$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+?A0xa7e53572.?InitializedPerAppDomain$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+__xi_vt_a
+?A0xa7e53572.?InitializedNative$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+__xc_mp_a
+?A0xa7e53572.?InitializedVtables$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+?A0xa7e53572.?Uninitialized$initializer$@CurrentDomain@<CrtImplementationDetails>@@$$Q2P6MXXZA
+__unep@?DoNothing@DefaultDomain@<CrtImplementationDetails>@@$$FCGJPAX@Z
+__unep@?_UninitializeDefaultDomain@LanguageSupport@<CrtImplementationDetails>@@$$FCGJPAX@Z
+?A0x9398b955.__onexitbegin_m
+?A0x9398b955.__exit_list_size
+__onexitend_app_domain
+?_lock@AtExitLock@<CrtImplementationDetails>@@$$Q0PAXA
+?_ref_count@AtExitLock@<CrtImplementationDetails>@@$$Q0HA
+?A0x9398b955.__onexitend_m
+__exit_list_size_app_domain
+__onexitbegin_app_domain
+__ImageBase
+ATL._AtlBaseModule
+??_7type_info@@6B@
+__xi_z
+__scrt_current_native_startup_state
+__scrt_native_startup_lock
+__xc_a
+__xi_a
+__scrt_native_dllmain_reason
+__xc_z
+.ctor
+led1On
+led1Off
+led2On
+led2Off
+led3On
+led3Off
+value__
+~CGrabThread
+FrameGrabberThread
+GetSingleFrame
+setGain
+gain
+setAutoGain
+setExposure
+expo
+setAutoExposure
+setBackLight
+blight
+StartFrameGrabberThread
+StopFrameGrabberThread
+isOpened
+GetFrame
+frame
+Dispose
+m_bShowImage
+m_cap
+m_image
+m_image_lock
+m_histohack
+m_semaphore_frame_request
+m_semaphore_frame_ready
+m_running
+m_stopped
+m_exposure
+m_gain
+~ClassFrameGrabber
+start
+stop
+CapturingSingleFrame
+ScanBarcode
+SaveImage
+fname
+SaveinspectionImage
+compareImages
+fname1
+fname2
+getTrayColor
+inHSV
+emptyPipetteCount
+holeR
+missingTps
+thre1
+tiptype
+sfname
+thre
+blacktip
+checkNotch
+clungTps
+reduceSize
+CamCalibration
+locateCover
+corner
+xPos
+yPos
+cDif
+xDif
+yDif
+othereLines1
+highFound
+locateStripArrow
+checkPoolPlate
+templateImage
+checkPurificationStation
+checkOutputPlate
+threshhold
+pixelcount
+cornerOutputPlate
+checkTrough
+threshold
+checkLabel
+WriteLogFile
+szString
+inspectStrip
+threLow
+threHigh
+equalize
+findCircle
+radius
+findStripHandle
+RoiWidthDelta
+checkBioSecurityCover
+adjustFocus
+matchPattern
+match_method
+getBarcodeString
+ShowImage
+HideImage
+labelSealSecurityCheck
+savename
+setBacklight
+cornerDetection
+thre2
+cnthre1
+cnthre2
+HSVtoRGBcvScalar
+GetBlobs
+blobs
+AverageFilterArray
+array
+CapturingThread
+m_grabframes
+m_led
+m_cpThread
+m_barcodestring
+<MarshalCopy>
+<MarshalDestroy>
+_safe_true
+_safe_false
+dummy_string
+_object
+~lock
+is_locked
+op_Implicit
+acquire
+_timeout
+try_acquire
+release
+m_object
+m_locked
+info
+context
+message
+Nested
+get_NestedException
+set_NestedException
+__set_formal
+ToString
+GetObjectData
+formatString
+<backing_store>NestedException
+NestedException
+AddHandler
+SingletonDomainUnload
+source
+arguments
+_ModuleUninitializer
+CompareTo
+op_Inequality
+StringToHGlobalAnsi
+ToPointer
+KeepAlive
+Finalize
+SuppressFinalize
+Atan2
+Floor
+Sqrt
+GetExceptionPointers
+GetExceptionCode
+WaitOne
+Release
+Start
+set_IsBackground
+set_Priority
+set_Name
+Exit
+TryEnter
+GetExceptionForHR
+Increment
+Decrement
+Exchange
+CompareExchange
+Enter
+Empty
+GetRuntimeInterfaceAsIntPtr
+Alloc
+Free
+op_Explicit
+get_Target
+set_Target
+ThrowExceptionForHR
+GetHRForException
+GetObjectForIUnknown
+PrepareDelegate
+PrepareConstrainedRegions
+AddValue
+GetValue
+Format
+Invoke
+GetType
+get_Message
+get_InnerException
+IsDefaultAppDomain
+get_CurrentDomain
+get_Id
+add_ProcessExit
+add_DomainUnload
+GetTypeFromHandle
+GetEnumerator
+Push
+MoveNext
+get_Current
+FromIntPtr
+ToIntPtr
+AllocHGlobal
+FreeHGlobal
+ReAllocHGlobal
+ResolveMethodHandle
+GetFunctionPointer
+get_Module
+get_ModuleHandle
+CVisionLib.dll
+:D:x
+ Q q
+ q	 q	
+ Y Y
+ Y Y
+ Y Y
+ U q
+ Y Y
+ Y Y
+0 Y Y
+L Y Y
+ Y Y
+T Y Y
+ Y Y
+ Y Y
+\ Y Y
+ U q
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+t Y Y
+ Y Y
+ M q
+ M q
+ U }
+ Y Y
+ Y Y
+ Y Y
+P Y Y
+P Y Y
+ Y Y
+ Y Y
+h Y Y
+` Y Y
+t Y Y
+| Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+$ Y Y
+` Y Y
+` Y Y
+` Y Y
+ Y u
+` Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+h Y Y
+h Y Y
+ Y u
+ Y Y
+ Y Y
+l Y Y
+ Y Y
+ Y Y
+ Y Y
+p Y Y
+l Y Y
+h Y Y
+ Q	 Y	
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ U }
+ Y Y
+ } }
+ Y Y
+ Y Y
+ U }
+ Y	 Y Y
+ U }
+	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+$ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+h Y Y
+\ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+| Y Y
+x Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+8 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Q }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+| Y Y
+ U }
+| Y Y
+ Y Y
+ Y Y
+d Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+t Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+x Y Y
+t Y Y
+| Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+		 }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Q }
+ Y	 }
+ Y	 }
+ Y Y
+ Y Y
+d Y Y
+ Y Y
+@ } }
+ Y Y
+@ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+8 Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+D Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ U	 Y Y
+ Y u
+ Y Y
+ U }
+ Y u
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ U }
+ Y Y
+ } }
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+, Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+D Y Y
+ U }
+D Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y u
+ Y	$
+ Y Y
+\ Y Y
+ Y	 Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Q	 Y Y
+ Y u
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+( Y Y
+ U }
+ Y Y
+ U }
+( Y Y
+ Y Y
+ Y Y
+( Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y	 Y Y
+ U }
+	 Y Y
+ U }
+ Y Y
+ U	 Y Y
+$ Y Y
+ Y Y
+4 Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+P Y Y
+ Y Y
+ Y Y
+P Y	
+ U }
+\ Y Y
+` Y Y
+\ Y	
+ U }
+l Y Y
+ Y Y
+ Y Y
+l Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+8 Y Y
+ Y Y
+8 Y Y
+ U }
+D Y Y
+ U }
+D Y Y
+ Y Y
+ Y Y
+D Y	
+ Y Y
+D Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+$ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+( Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ U }
+ Y Y
+ U }
+\ Y Y
+ U }
+l Y Y
+ U }
+ Y Y
+ U }
+8 Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Q	 }
+ Q	 }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+4 Y Y
+4 } }
+ Y Y
+ Q }
+ Y u
+  Y Y
+ Y Y
+ Y Y
+0 Y Y
+4 Y Y
+h Y Y
+l Y Y
+p Y Y
+t Y Y
+x Y Y
+| Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Q }
+ Y Y
+ Y Y
+ Y Y
+, Y Y
+ Y Y
+ Y	 }
+ Y Y
+ } }
+ Y Y
+0 Y Y
+ Y Y
+ } }
+L Y Y
+ } }
+P Y Y
+ Y Y
+ Q } }
+ Y Y
+ } }
+ Y Y
+@ Y Y
+ } }
+p Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+ Y Y
+ Y	 }
+ Q }
+D Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ Y Y
+ Q } }
+x Y Y
+ } }
+ Q } }
+| Y Y
+ } }
+| Y Y
+4 Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+P Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+, Y Y
+( Y Y
+0 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 Y	
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+8 Y Y
+@ Y Y
+\ Y Y
+` Y	
+P Y Y
+l Y Y
+T Y Y
+ Y Y
+@ Y Y
+ Y	 Y	
+ U	 Y Y
+@ Y	
+ Y Y
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+X Y Y
+ Y Y
+ Y Y
+ Y	 }
+` Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 }
+ U	 Y Y
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Q	 }
+ Y Y
+ U	 Y Y
+ Y Y
+4 Y	
+ U }
+ Y Y
+ Y Y
+ Q	 }
+ U	 Y Y
+ U	 Y Y
+ Q	 }
+ Y Y
+ Q	 Y	 Y	 Y	
+ Y Y
+ U }
+ Y Y
+ Q	 }
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Q	 }
+ U }
+\ Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ Q	 }
+ Y Y
+ U }
+8 Y Y
+ Q	 }
+ Y Y
+8 Y	
+ Y Y
+ U }
+ Y Y
+ U }
+ Y Y
+ U }
+\ Y Y
+ U }
+ Y Y
+ U }
+8 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Q }
+ Q }
+ } }
+ Q } }
+P Y Y
+P Y Y
+ Y Y
+ Q }
+ Q }
+ Q } }
+ Y Y
+ Y Y
+ Y Y
+ Q }
+ Q }
+ Y Y
+ Q }
+8 Y Y
+ Q }
+ Q }
+ Y Y
+ Y Y
+ Q }
+ Y Y
+ Y Y
+ Q }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+  Y Y
+l Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+P Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Q } }
+ Y Y
+ Y Y
+\ Y Y
+ Q } }
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+( Y Y
+, Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+t Y Y
+ Y Y
+ Y Y
+x Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ U	 Y Y
+ Y Y
+ U }
+ Y Y
+ U }
+p Y Y
+4 Y Y
+ } }
+h Y Y
+ } }
+ Q }
+ Y Y
+ Q }
+D Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Q } }
+ Q }
+ Y Y
+ Y Y
+ Q }
+ Y Y
+` } }
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+t Y Y
+ Y Y
+ Y Y
+p Y Y
+ Y Y
+ Y Y
+| Y Y
+ Y Y
+ Y Y
+x Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+\ Y Y
+` Y	
+ } }
+ Q }
+ } }
+ Q }
+\ Y Y
+` } }
+ Q } }
+ Q } }
+ Y Y
+` Y Y
+ Q }
+ Y Y
+ Q	 }
+	 } }
+` } }
+ Q }
+ Y Y
+ Y Y
+ Q q
+ M q
+ M q
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ q	 q	
+ Y Y
+ Y Y
+ Q q
+ q	 q	 q		
+ Q q
+ Q q
+ Q q
+ M q
+ Y u
+ M q	
+ q	 q	 q	
+ Y q	
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+$ Y Y
+ U }
+$ Y Y
+ U u
+ Y Y
+  Y Y
+ Y Y
+ U }
+$ Y Y
+ Y Y
+$ Y Y
+ Y Y
+ Y Y
+ Y u
+ U }
+$ Y Y
+ U }
+$ Y Y
+P Y Y
+ q	!
+ Y Y
+ Y Y
+ Y u
+ Y u
+ Y u
+ Y u
+ Y Y
+ Y u
+ Q }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ U }
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Q q
+ Q q
+ Y u
+ Y u
+ Y Y
+ Y Y
+ Y u
+ Y u
+ M q	
+ Y Y
+ Y Y
+ q	 q
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+p q	
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y u
+ Y Y
+ Y		
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y		
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y		 Y	 Y		
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ } }
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+	 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ } }
+ } }
+ Y Y
+ Y	 Y	 Y	 Y		 Y	 Y	
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ Y Y
+ } }
+ Y Y
+ } }
+ Y Y
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ } }
+ Y Y
+ } }
+ Y Y
+ } }
+ } }
+ Y		 Y	 Y	
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+` Y Y
+ Y u
+ Y u
+ Y u
+ Y u
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ } }
+ } }
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y		 Y	 Y	
+ Y Y
+ Y		 Y	 Y		
+ Y	 Y		
+P Y Y
+ Y Y
+ Y Y
+d Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y	 Y	 Y	
+ Y Y
+ Y		
+ Y Y
+ Y Y
+ Y	 Y	
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+	 Y Y
+ Y Y
+	 Y u
+ Y Y
+	 Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+	 Y Y
+	 Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+0 Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+P Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+$ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y Y
+ Y u
+ Y Y
+ Y Y
+ Y Y
+ M q
+ M q
+ M q
+ M q
+ Y Y
+ Y Y
+ Y Y
+AllowMultiple
+	Microsoft
+CVisionLib
+Copyright (c) Microsoft 2013
+1.0.*
+SkipVerification
+.NETFramework,Version=v4.5
+FrameworkDisplayName
+.NET Framework 4.5
+System.Security.Permissions.SecurityPermissionAttribute, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089
+UnmanagedCode
+System.Security.Permissions.SecurityPermissionAttribute, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089
+SkipVerification
+RSDSzB(
+C:\BioXp3200App\GenBotApp\Release\CVisionLib.pdb
+.text$di
+.text$mn
+.text$x
+.text$yd
+.idata$5
+.00cfg
+.CRT$XCA
+.CRT$XCL
+.CRT$XCZ
+.CRT$XIA
+.CRT$XIZ
+.CRT$XPA
+.CRT$XPZ
+.CRT$XTA
+.CRT$XTZ
+.CRTMA$XCA
+.CRTMA$XCC
+.CRTMA$XCZ
+.CRTMP$XCA
+.CRTMP$XCU
+.CRTMP$XCZ
+.CRTVT$XCA
+.CRTVT$XCZ
+.rdata
+.rdata$CastGuardVftablesA
+.rdata$CastGuardVftablesC
+.rdata$ilfixup
+.rdata$r
+.rdata$sxdata
+.rdata$zzzdbg
+.rtc$IAA
+.rtc$IZZ
+.rtc$TAA
+.rtc$TZZ
+.xdata$x
+ATL$__a
+ATL$__z
+.idata$2
+.idata$3
+.idata$4
+.idata$6
+.data
+.data$r
+.data$rs
+.bss
+.rsrc$01
+.rsrc$02
+?what@Exception@cv@@UBEPBDXZ
+??0MatSize@cv@@QAE@PAH@Z
+??0MatStep@cv@@QAE@XZ
+??AMatStep@cv@@QBEABIH@Z
+??AMatStep@cv@@QAEAAIH@Z
+?copySize@Mat@cv@@QAEXABV12@@Z
+?deallocate@Mat@cv@@QAEXXZ
+?deallocate@String@cv@@AAEXXZ
+opencv_core320.dll
+?setSVMDetector@HOGDescriptor@cv@@UAEXABV_InputArray@2@@Z
+?read@HOGDescriptor@cv@@UAE_NAAVFileNode@2@@Z
+?write@HOGDescriptor@cv@@UBEXAAVFileStorage@2@ABVString@2@@Z
+?load@HOGDescriptor@cv@@UAE_NABVString@2@0@Z
+?save@HOGDescriptor@cv@@UBEXABVString@2@0@Z
+?copyTo@HOGDescriptor@cv@@UBEXAAU12@@Z
+?compute@HOGDescriptor@cv@@UBEXABV_InputArray@2@AAV?$vector@MV?$allocator@M@std@@@std@@V?$Size_@H@2@2ABV?$vector@V?$Point_@H@cv@@V?$allocator@V?$Point_@H@cv@@@std@@@5@@Z
+?detect@HOGDescriptor@cv@@UBEXABVMat@2@AAV?$vector@V?$Point_@H@cv@@V?$allocator@V?$Point_@H@cv@@@std@@@std@@NV?$Size_@H@2@2ABV45@@Z
+?detect@HOGDescriptor@cv@@UBEXABVMat@2@AAV?$vector@V?$Point_@H@cv@@V?$allocator@V?$Point_@H@cv@@@std@@@std@@AAV?$vector@NV?$allocator@N@std@@@5@NV?$Size_@H@2@3ABV45@@Z
+?detectMultiScale@HOGDescriptor@cv@@UBEXABV_InputArray@2@AAV?$vector@V?$Rect_@H@cv@@V?$allocator@V?$Rect_@H@cv@@@std@@@std@@NV?$Size_@H@2@2NN_N@Z
+?detectMultiScale@HOGDescriptor@cv@@UBEXABV_InputArray@2@AAV?$vector@V?$Rect_@H@cv@@V?$allocator@V?$Rect_@H@cv@@@std@@@std@@AAV?$vector@NV?$allocator@N@std@@@5@NV?$Size_@H@2@3NN_N@Z
+?computeGradient@HOGDescriptor@cv@@UBEXABVMat@2@AAV32@1V?$Size_@H@2@2@Z
+?detectROI@HOGDescriptor@cv@@UBEXABVMat@2@ABV?$vector@V?$Point_@H@cv@@V?$allocator@V?$Point_@H@cv@@@std@@@std@@AAV45@AAV?$vector@NV?$allocator@N@std@@@5@NV?$Size_@H@2@4@Z
+?detectMultiScaleROI@HOGDescriptor@cv@@UBEXABVMat@2@AAV?$vector@V?$Rect_@H@cv@@V?$allocator@V?$Rect_@H@cv@@@std@@@std@@AAV?$vector@UDetectionROI@cv@@V?$allocator@UDetectionROI@cv@@@std@@@5@NH@Z
+opencv_objdetect320.dll
+InitializeCriticalSectionEx
+DecodePointer
+KERNEL32.dll
+__CxxFrameHandler3
+_purecall
+__std_exception_copy
+__std_exception_destroy
+_CxxThrowException
+__std_type_info_destroy_list
+__current_exception
+__current_exception_context
+memset
+_except_handler4_common
+memmove
+VCRUNTIME140.dll
+__stdio_common_vfprintf
+_initterm
+_initterm_e
+_seh_filter_dll
+_configure_narrow_argv
+_initialize_narrow_environment
+_initialize_onexit_table
+_register_onexit_function
+_execute_onexit_table
+_crt_atexit
+_crt_at_quick_exit
+_cexit
+terminate
+free
+_invalid_parameter_noinfo
+_errno
+_recalloc
+api-ms-win-crt-stdio-l1-1-0.dll
+api-ms-win-crt-runtime-l1-1-0.dll
+api-ms-win-crt-heap-l1-1-0.dll
+UnhandledExceptionFilter
+SetUnhandledExceptionFilter
+GetCurrentProcess
+TerminateProcess
+IsProcessorFeaturePresent
+QueryPerformanceCounter
+GetCurrentProcessId
+GetCurrentThreadId
+GetSystemTimeAsFileTime
+DisableThreadLibraryCalls
+InitializeSListHead
+IsDebuggerPresent
+GetStartupInfoW
+GetModuleHandleW
+OutputDebugStringW
+RaiseException
+GetLastError
+EnterCriticalSection
+LeaveCriticalSection
+DeleteCriticalSection
+?allocate@String@cv@@AAEPADI@Z
+?fastFree@cv@@YAXPAX@Z
+??0Mat@cv@@QAE@ABV01@ABV?$Rect_@H@1@@Z
+?copySize@UMat@cv@@QAEXABV12@@Z
+??1Exception@cv@@UAE@XZ
+cvReleaseImage
+?create@Mat@cv@@QAEXHPBHH@Z
+?cvarrToMat@cv@@YA?AVMat@1@PBX_N1HPAV?$AutoBuffer@N$0II@@1@@Z
+?inRange@cv@@YAXABV_InputArray@1@00ABV_OutputArray@1@@Z
+??4Mat@cv@@QAEAAV01@ABV?$Scalar_@N@1@@Z
+?copyTo@Mat@cv@@QBEXABV_OutputArray@2@@Z
+??1UMat@cv@@QAE@XZ
+cvCloneImage
+?noArray@cv@@YAABV_InputOutputArray@1@XZ
+?mean@cv@@YA?AV?$Scalar_@N@1@ABV_InputArray@1@0@Z
+?minMaxLoc@cv@@YAXABV_InputArray@1@PAN1PAV?$Point_@H@1@20@Z
+?points@RotatedRect@cv@@QBEXQAV?$Point_@M@2@@Z
+?split@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@@Z
+??0_IplImage@@QAE@ABVMat@cv@@@Z
+cvCopy
+?cvtColor@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@HH@Z
+?Canny@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@NNH_N@Z
+?HoughLines@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@NNHNNNN@Z
+?calcHist@cv@@YAXPBVMat@1@HPBHABV_InputArray@1@ABV_OutputArray@1@H1PAPBM_N5@Z
+?medianBlur@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@H@Z
+?compareHist@cv@@YANABV_InputArray@1@0H@Z
+?matchTemplate@cv@@YAXABV_InputArray@1@0ABV_OutputArray@1@H0@Z
+?dilate@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@0V?$Point_@H@1@HHABV?$Scalar_@N@1@@Z
+?erode@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@0V?$Point_@H@1@HHABV?$Scalar_@N@1@@Z
+?HoughLinesP@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@NNHNN@Z
+?equalizeHist@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@@Z
+?GaussianBlur@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@V?$Size_@H@1@NNH@Z
+?Laplacian@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@HHNNH@Z
+?minAreaRect@cv@@YA?AVRotatedRect@1@ABV_InputArray@1@@Z
+?HoughCircles@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@HNNNNHH@Z
+?resize@cv@@YAXABV_InputArray@1@ABV_OutputArray@1@V?$Size_@H@1@NNH@Z
+?circle@cv@@YAXABV_InputOutputArray@1@V?$Point_@H@1@HABV?$Scalar_@N@1@HHH@Z
+opencv_imgproc320.dll
+?imshow@cv@@YAXABVString@1@ABV_InputArray@1@@Z
+?waitKey@cv@@YAHH@Z
+?namedWindow@cv@@YAXABVString@1@H@Z
+?destroyWindow@cv@@YAXABVString@1@@Z
+opencv_highgui320.dll
+??0CameraParams@detail@cv@@QAE@ABU012@@Z
+opencv_stitching320.dll
+?imread@cv@@YA?AVMat@1@ABVString@1@H@Z
+?imwrite@cv@@YA_NABVString@1@ABV_InputArray@1@ABV?$vector@HV?$allocator@H@std@@@std@@@Z
+opencv_imgcodecs320.dll
+??0VideoCapture@cv@@QAE@H@Z
+opencv_videoio320.dll
+zbar_symbol_set_ref
+zbar_symbol_ref
+zbar_symbol_get_loc_size
+zbar_symbol_get_loc_x
+zbar_symbol_get_loc_y
+zbar_image_ref
+zbar_image_set_size
+zbar_image_scanner_create
+zbar_image_scanner_destroy
+zbar_image_scanner_set_config
+zbar_scan_image
+zbar_image_set_data
+zbar_image_get_symbols
+zbar_image_set_format
+zbar_image_create
+zbar_image_set_userdata
+zbar_symbol_get_type
+zbar_symbol_get_data
+zbar_symbol_get_data_length
+zbar_symbol_set_first_symbol
+_zbar_error_string
+libzbar-0.dll
+Sleep
+UnregisterClassW
+FindWindowW
+SetWindowPos
+USER32.dll
+OLEAUT32.dll
+SMI_CreateDeviceObject
+SMI_DestoryDeviceObject
+SMI_GetGPIOValue
+SMI_SetGPIOValue
+SMI_SetValue
+SMIUtility.dll
+?__ExceptionPtrDestroy@@YAXPAX@Z
+?__ExceptionPtrCopy@@YAXPAXPBX@Z
+?_Xlength_error@std@@YAXPBD@Z
+_Mbrtowc
+?_Xbad_alloc@std@@YAXXZ
+?_Getcvt@_Locinfo@std@@QBE?AU_Cvtvec@@XZ
+?_W_Getdays@_Locinfo@std@@QBEPBGXZ
+?_W_Getmonths@_Locinfo@std@@QBEPBGXZ
+?width@ios_base@std@@QBE_JXZ
+?flags@ios_base@std@@QBEHXZ
+?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ
+?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEDXZ
+?sputc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEHD@Z
+?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAE_JPBD_J@Z
+?width@ios_base@std@@QAE_J_J@Z
+?setstate@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEXH_N@Z
+?good@ios_base@std@@QBE_NXZ
+?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ
+?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ
+?uncaught_exception@std@@YA_NXZ
+?_Osfx@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEXXZ
+??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@H@Z
+??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@M@Z
+??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@_N@Z
+??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@I@Z
+MSVCP140.dll
+__CxxQueryExceptionSize
+__CxxExceptionFilter
+__CxxRegisterExceptionObject
+__CxxDetectRethrow
+__CxxUnregisterExceptionObject
+__FrameUnwindFilter
+_invalid_parameter_noinfo_noreturn
+calloc
+fopen
+fclose
+_sleep
+abort
+_callnewh
+malloc
+_CorDllMain
+mscoree.dll
+.?AVCAtlException@ATL@@
+.?AVexception@std@@
+.?AVbad_alloc@std@@
+.?AVbad_array_new_length@std@@
+.?AVruntime_error@std@@
+.?AVrange_error@std@@
+.?AV_System_error@std@@
+.?AVsystem_error@std@@
+.?AVbad_cast@std@@
+.?AVbad_weak_ptr@std@@
+.?AVfailure@ios_base@std@@
+.?AVException@cv@@
+.?AVFLANNException@cvflann@@
+.?AVException@zbar@@
+.?AVInternalError@zbar@@
+.?AVUnsupportedError@zbar@@
+.?AVInvalidError@zbar@@
+.?AVSystemError@zbar@@
+.?AVLockingError@zbar@@
+.?AVBusyError@zbar@@
+.?AVXDisplayError@zbar@@
+.?AVXProtoError@zbar@@
+.?AVClosedError@zbar@@
+.?AVFormatError@zbar@@
+.?AUempty_any@anyimpl@cvflann@@
+.PBD
+.?AW4flann_algorithm_t@cvflann@@
+.?AW4flann_centers_init_t@cvflann@@
+.?AVString@cv@@
+.?AUbase_any_policy@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@PBD@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@H@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@M@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@_N@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@I@anyimpl@cvflann@@
+.?AU?$typed_base_any_policy@VString@cv@@@anyimpl@cvflann@@
+.?AU?$big_any_policy@Uempty_any@anyimpl@cvflann@@@anyimpl@cvflann@@
+.?AU?$small_any_policy@PBD@anyimpl@cvflann@@
+.?AU?$small_any_policy@H@anyimpl@cvflann@@
+.?AU?$small_any_policy@M@anyimpl@cvflann@@
+.?AU?$small_any_policy@_N@anyimpl@cvflann@@
+.?AU?$big_any_policy@W4flann_algorithm_t@cvflann@@@anyimpl@cvflann@@
+.?AU?$big_any_policy@W4flann_centers_init_t@cvflann@@@anyimpl@cvflann@@
+.?AU?$small_any_policy@I@anyimpl@cvflann@@
+.?AU?$big_any_policy@VString@cv@@@anyimpl@cvflann@@
+.?AUHOGDescriptor@cv@@
+.?AVtype_info@@
+wwwwww
+wwwwww
+wwwwww
+wwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+wwwwwwwwwwwwww
+<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level='asInvoker' uiAccess='false' />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
+73=3C3I3O3U3[3a3g3m3s3y3
+4f9l9r9x9~9
+>e?k?q?w?}?
+5^6}6W7"8[8Z9`9f9l9r9x9~9
+:!:':-:3:9:?:E:K:Q:W:]:c:i:o:u:{:
+;&;5;e;l;s;
+050Q0v3
+7&8Q8~9
+=.>~>
+0V2u7
+>+?W?
+030_0
+1;1g1
+2C2o2
+3:3d3
+*0j4
+1Z122
+6;<;B;H;N;T;Z;`;f;l;r;x;~;
+<v<|<
+="=(=.=4=:=@=F=L=R=X=^=d=j=p=v=|=
+>C>f>
+>B?H?N?
+1 1&1
+2:3e3k3
+7V8\8b8h8n8t8z8
+8*9D9J9P9V9\9b9h9
+:":(:.:4:::@:F:L:R:X:^:d:j:p:v:|:
+;$;*;0;6;<;B;H;N;T;Z;`;f;l;r;x;~;
+<#<)</<5<;<A<G<M<S<Y<_<e<k<q<w<}<
+=%=+=1=7===C=I=O=U=[=a=g=m=s=y=
+>%>+>1>7>=>C>I>O>U>[>a>g>m>s>y>
+?!?'?-?D?\?
+0 0&0,02080>0D0J0P0V0\0b0h0n0t0z0
+1"1(1.141:1@1F1L1R1X1^1d1j1p1v1|1
+12282L2d2
+2:3@3T3l3
+3B4H4\4t4
+4J5P5V5\5b5h5n5t5z5
+6"6(6.646:6@6F6L6R6X6^6d6j6p6v6|6
+7$7*70767<7B7H7N7T7Z7`7f7l7r7x7~7
+8 8&8,82888>8D8J8P8V8\8b8h8n8t8z8
+9"9G9e9
+=&>,>2>8>>>D>J>P>V>\>b>w>
+?V?\?b?h?n?t?z?
+0$0@0
+1$1@1
+2$2@2
+353M3e3
+464c4}4
+4"5(5.5C5[5s5
+5"6(6.6~6
+6*7P7e7}7
+8$8*80868<8B8H8N8T8Z8`8f8l8r8x8~8
+9 9&9,92989>9D9J9P9V9\9b9h9n9t9z9
+:":(:.:4:::@:F:L:R:X:^:d:j:p:v:|:
+;$;*;0;6;<;B;H;N;T;Z;`;f;l;r;x;~;
+=$=*=0=6=<=B=H=N=T=Z=`=f=l=r=x=~=
+=^>d>j>p>v>|>
+?$?*?0?A?H?N?T?Z?`?f?l?r?x?~?
+n<t<
+=%=+=1=B=[=|=
+>8>I>Z>q>
+0V0^0
+0A1S1
+2O2i2
+3$3+32393@3H3P3X3d3m3r3x3
+4#4*41484?4F4N4V4^4i4n4t4~4
+5%5-585=5C5M5w5
+6I6R6c6o6{6
+9 9&989B9
+:@:S:
+;?;I;|;
+;C<L<Q<d<x<}<
+</=4=a=f=|=
+>	>$>1>6>V>f>k>y>
+0=0F0O0]0f0
+>#>)>/>5>;>A>G>M>S>Y>_>e>k>
+2=3m3N4}4/5P5
+787>7
+768<8B8f8
+8)9A9
+:$;3;
+< <6<
+>%>+>1>7>=>C>I>O>U>[>a>g>m>s>y>
+>??E?K?Q?W?]?c?i?o?u?{?
+0$0*00060<0B0H0N0T0Z0`0f0l0r0x0~0
+1`1f1l1r1x1~1
+2 2&2,22282>2D2J2|2
+5"5B5b5
+6"6B6b6
+@3D3L3
+8@9x:|:
+:<<@<H<
+8 8$8(8<8L8P8T8l8p8t8
+9(989<9@9X9\9`9d9h9|9
+:$:(:,:D:H:L:P:T:X:l:|:
+;0;4;8;<;P;`;d;h;
+< <$<(<<<L<P<T<l<p<t<x<
+=,=<=@=D=\=`=d=h=|=
+>,>0>4>L>P>T>X>l>|>
+? ?8?<?@?T?d?h?l?
+0 0$080H0L0P0h0l0p0
+1,10141L1P1T1h1x1|1
+2 282<2@2D2X2h2l2p2
+3(3,30343H3X3\3`3x3|3
+4 4$484H4L4P4h4l4
+4$9@9P9X9`9l9
+:$:8:@:D:H:P:X:`:t:|:
+; ;@;`;l;
+2L2P2
+3 3(3,30383<3@3L3P3T3`3d3h3l3p3t3x3|3
+4 4$4(4044484@4D4H4T4X4\4
+5 5$5(5,585<5@5D5H5L5P5T5X5\5`5d5h5l5p5t5x5|5
+6 6$6(6,6064686<6@6D6H6L6P6T6X6\6`6d6h6
+7 7$7(7,7074787<7@7D7H7L7P7T7X7\7`7d7h7l7p7t7x7|7
+8 8$8(8P8T8X8\8`8d8h8l8p8t8x8|8
+p7t7x7|7
+:(:H:h:
+;$;L;l;
+<4<X<x<
+=@=l=x=
+00|0
+1$2`2
