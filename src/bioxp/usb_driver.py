@@ -329,6 +329,13 @@ class BioXpTester:
             "updated_ms": int(time.time() * 1000),
             "arm_seq": 0,
         }
+        self._motion_latch_override = {
+            "enabled": False,
+            "reason": "startup",
+            "note": "auto-lock mode",
+            "updated_ms": int(time.time() * 1000),
+            "seq": 0,
+        }
         self._motion_last_strict_init = None
         self._connect()
         self._led_state_cache = self.load_led_state()
@@ -886,6 +893,79 @@ class BioXpTester:
             "error_code": None if len(errors) == 0 else int(errors[0]["code"]),
             "error_count": len(errors),
             "errors": errors,
+        }
+
+    def motor_validate_step_test(self, board_id, steps, test_out, motor=0, axis_label=None, rail_24v=None):
+        axis = axis_label
+        if axis is None:
+            key = self.motor_axis_key_for_channel(board_id, motor=motor)
+            p = self.motor_axis_preset(key) if key is not None else None
+            if isinstance(p, dict):
+                axis = str(p.get("label", key)).upper()
+            elif key is not None:
+                axis = str(key).upper()
+            else:
+                axis = f"0x{int(board_id):02X}:{int(motor)}"
+        rail = rail_24v if isinstance(rail_24v, dict) else self.motor_query_24v_sensor()
+        probe = {
+            "axis": str(axis),
+            "step_cmd": int(steps),
+            "switch_before": test_out.get("pre_switches", {}) if isinstance(test_out, dict) else {},
+            "switch_after": test_out.get("post_switches", {}) if isinstance(test_out, dict) else {},
+            "test": test_out if isinstance(test_out, dict) else {},
+        }
+        val = self._validate_axis_micro_motion_probe(probe, rail_24v=rail)
+        return {"axis": str(axis), "probe": probe, "validation": val, "rail_24v": rail}
+
+    def motor_validate_oneway_move(
+        self,
+        *,
+        axis,
+        step_cmd,
+        pre_switches,
+        post_switches,
+        move_ack,
+        wait_row,
+        delta,
+        rail_24v=None,
+    ):
+        errors = []
+        axis_label = str(axis) if axis is not None else None
+        fwd_ok = self._tmcl_success(move_ack)
+        if not fwd_ok:
+            errors.append(self._motion_error_entry("ACK_FWD_FAIL", axis=axis_label))
+        wait_ok = bool(isinstance(wait_row, dict) and wait_row.get("stopped") is True)
+        if not wait_ok:
+            errors.append(self._motion_error_entry("WAIT_FWD_TIMEOUT", axis=axis_label))
+        if fwd_ok and isinstance(delta, int) and int(delta) == 0:
+            errors.append(self._motion_error_entry("ACK_SUCCESS_NO_DELTA_FWD", axis=axis_label))
+
+        pre_left = None if not isinstance(pre_switches, dict) else pre_switches.get("left_state")
+        pre_right = None if not isinstance(pre_switches, dict) else pre_switches.get("right_state")
+        post_left = None if not isinstance(post_switches, dict) else post_switches.get("left_state")
+        post_right = None if not isinstance(post_switches, dict) else post_switches.get("right_state")
+        if isinstance(step_cmd, int):
+            if pre_left == 0 and pre_right == 1 and int(step_cmd) > 0 and post_left == 0:
+                if isinstance(delta, int) and int(delta) != 0:
+                    errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis_label))
+                else:
+                    errors.append(self._motion_error_entry("ESCAPE_SWITCH_NOT_CLEARED", axis=axis_label))
+            if pre_right == 0 and pre_left == 1 and int(step_cmd) < 0 and post_right == 0:
+                if isinstance(delta, int) and int(delta) != 0:
+                    errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis_label))
+                else:
+                    errors.append(self._motion_error_entry("ESCAPE_SWITCH_NOT_CLEARED", axis=axis_label))
+
+        rail = rail_24v if isinstance(rail_24v, dict) else self.motor_query_24v_sensor()
+        if isinstance(rail, dict) and rail.get("no24v") is True:
+            errors.append(self._motion_error_entry("NO_24V_DURING_PROBE", axis=axis_label, detail=f"raw={rail.get('raw')}"))
+
+        return {
+            "ok": len(errors) == 0,
+            "error_code": None if len(errors) == 0 else int(errors[0]["code"]),
+            "error_count": len(errors),
+            "errors": errors,
+            "rail_24v": rail,
         }
 
     def _axis_micro_motion_probe(self, axis_key, step_mag=600, speed=260, acc=120):
@@ -1862,6 +1942,29 @@ class BioXpTester:
     def motion_arm_state(self):
         return dict(self._motion_arm) if isinstance(self._motion_arm, dict) else {"armed": False}
 
+    def motion_latch_override_state(self):
+        if isinstance(self._motion_latch_override, dict):
+            return dict(self._motion_latch_override)
+        return {"enabled": False, "reason": "unset", "note": None, "updated_ms": None, "seq": 0}
+
+    def motion_latch_override_set(self, enabled, reason="manual"):
+        target_enabled = bool(enabled)
+        prev_seq = 0
+        if isinstance(self._motion_latch_override, dict):
+            prev_seq = int(self._motion_latch_override.get("seq", 0) or 0)
+        # Enabled = diagnostic unlock mode; disabled = default lock mode.
+        wr = self.latch_oem(False if target_enabled else True)
+        note = "diagnostic_unlocked" if target_enabled else "auto_lock"
+        self._motion_latch_override = {
+            "enabled": bool(target_enabled),
+            "reason": str(reason),
+            "note": note,
+            "updated_ms": int(time.time() * 1000),
+            "seq": prev_seq + 1,
+        }
+        live = self.motion_gate_live_snapshot()
+        return {"state": dict(self._motion_latch_override), "write": wr, "gate": live}
+
     def motion_last_strict_init_report(self):
         return self._motion_last_strict_init
 
@@ -1884,6 +1987,8 @@ class BioXpTester:
         door = self._safe_int(None if not isinstance(io, dict) else io.get(1))
         solenoid = self._safe_int(None if not isinstance(io, dict) else io.get(2))
         latch = self._safe_int(None if not isinstance(io, dict) else io.get(3))
+        ov = self.motion_latch_override_state()
+        ov_enabled = bool(ov.get("enabled"))
         io_ok = (door is not None) and (solenoid is not None) and (latch is not None)
         checks = {"rail_ok": rail.get("no24v") is False, "io_read_ok": io_ok}
         error_keys = [k for k, v in checks.items() if v is not True]
@@ -1894,8 +1999,9 @@ class BioXpTester:
             checks.update(
                 {
                     "door_closed": door == 1,
-                    "latch_closed": latch == 1,
-                    "solenoid_locked": solenoid == 1,
+                    "latch_closed": True if ov_enabled else (latch == 1),
+                    "solenoid_locked": True if ov_enabled else (solenoid == 1),
+                    "latch_override_active": ov_enabled,
                 }
             )
             error_keys.extend(
@@ -1911,6 +2017,7 @@ class BioXpTester:
             "door_sensor": door,
             "solenoid_state": solenoid,
             "latch_sensor": latch,
+            "latch_override": ov,
             "checks": checks,
             "error_keys": error_keys,
             "ok": len(error_keys) == 0,
@@ -5891,6 +5998,16 @@ def _print_motor_step_result(label, out):
         f" mid(L={mid_sw.get('left_state')} R={mid_sw.get('right_state')})"
         f" post(L={post_sw.get('left_state')} R={post_sw.get('right_state')})"
     )
+    val = out.get("validation", {}) if isinstance(out.get("validation"), dict) else None
+    if isinstance(val, dict):
+        if val.get("ok") is True:
+            print("  validation: PASS")
+        else:
+            first = val.get("errors", [{}])[0] if isinstance(val.get("errors"), list) else {}
+            print(
+                f"  validation: FAIL code={val.get('error_code')} "
+                f"key={first.get('key')} detail={first.get('detail')}"
+            )
 
 
 def _print_motor_prep_ops(prep):
@@ -5949,9 +6066,14 @@ def _print_motion_interlock(inter):
 
 def _print_motion_gate_status(tester, refresh=True, snapshot=None):
     st = tester.motion_arm_state()
+    ov = tester.motion_latch_override_state()
     print(
         f"motion arm: armed={st.get('armed')} reason={st.get('reason')} "
         f"note={st.get('note')} seq={st.get('arm_seq')}"
+    )
+    print(
+        f"latch override: enabled={ov.get('enabled')} "
+        f"reason={ov.get('reason')} note={ov.get('note')} seq={ov.get('seq')}"
     )
     live = snapshot if isinstance(snapshot, dict) else None
     if live is None and bool(refresh):
@@ -5972,6 +6094,7 @@ def _print_motion_gate_status(tester, refresh=True, snapshot=None):
         f" door_closed={checks.get('door_closed')}"
         f" latch_closed={checks.get('latch_closed')}"
         f" solenoid_locked={checks.get('solenoid_locked')}"
+        f" latch_override_active={checks.get('latch_override_active')}"
     )
 
 
@@ -6301,9 +6424,17 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
     def _prepare_for_motion(force_interlock=False):
         nonlocal interlock_ready
         if is_gantry_axis:
+            ov = tester.motion_latch_override_state()
+            ov_enabled = bool(ov.get("enabled"))
             if force_interlock or not interlock_ready:
-                inter = tester.motor_prepare_motion_interlock(force_lock=True)
+                inter = tester.motor_prepare_motion_interlock(force_lock=not ov_enabled)
                 _print_motion_interlock(inter)
+                if ov_enabled:
+                    unl = tester.latch_oem(False)
+                    print(
+                        f"  latch override unlock: ack={fmt_resp(unl.get('ack'))} "
+                        f"snapshot={unl.get('snapshot')}"
+                    )
                 interlock_ready = True
             else:
                 rail = tester.motor_query_24v_sensor()
@@ -6357,6 +6488,27 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
             _print_motion_gate_status(tester, refresh=False, snapshot=live)
             return False
         return True
+
+    def _handle_runtime_motion_validation(op_label, validation):
+        if not isinstance(validation, dict):
+            return True
+        if validation.get("ok") is True:
+            return True
+        first = validation.get("errors", [{}])[0] if isinstance(validation.get("errors"), list) else {}
+        print(
+            f"{op_label}: FAIL error_code={validation.get('error_code')} "
+            f"key={first.get('key')} detail={first.get('detail')}"
+        )
+        if is_gantry_axis:
+            st = tester.motion_disarm(
+                reason="runtime_motion_fault",
+                note=f"{axis_name}:{first.get('key')}:{validation.get('error_code')}",
+            )
+            print(
+                f"motion arm disarmed: armed={st.get('armed')} "
+                f"reason={st.get('reason')} note={st.get('note')} seq={st.get('arm_seq')}"
+            )
+        return False
 
     while True:
         print("\n----------------------------------------")
@@ -6421,7 +6573,16 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 continue
             _prepare_for_motion()
             out = tester.motor_step_test(board, steps=nudge_steps, motor=motor, wait_timeout_s=4.0)
+            vrow = tester.motor_validate_step_test(
+                board,
+                steps=nudge_steps,
+                test_out=out,
+                motor=motor,
+                axis_label=axis_name,
+            )
+            out["validation"] = vrow.get("validation")
             _print_motor_step_result(f"{label} nudge", out)
+            _handle_runtime_motion_validation(f"{label} nudge", out.get("validation"))
         elif ans == "4":
             pin = input("absolute position: ").strip()
             try:
@@ -6529,6 +6690,7 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 continue
             _prepare_for_motion()
             pre = tester.motor_get_position(board, motor=motor)
+            pre_sw = tester.motor_get_switches(board, motor=motor)
             mv = tester.motor_move_relative(board, steps, motor=motor)
             wt = tester.motor_wait_stopped(board, motor=motor, timeout_s=8.0)
             post = tester.motor_get_position(board, motor=motor)
@@ -6542,6 +6704,16 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 f"pre={pre.get('position')} post={post.get('position')} delta={delta} "
                 f"switches(L={sw.get('left_state')} R={sw.get('right_state')})"
             )
+            v = tester.motor_validate_oneway_move(
+                axis=axis_name,
+                step_cmd=int(steps),
+                pre_switches=pre_sw,
+                post_switches=sw,
+                move_ack=mv.get("ack"),
+                wait_row=wt,
+                delta=delta,
+            )
+            _handle_runtime_motion_validation("jog hold", v)
         elif ans == "10":
             din = input("direction (+/- , blank=+): ").strip()
             sin = input(f"steps (blank={visible_steps}): ").strip()
@@ -6604,6 +6776,16 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                     )
             if out.get("suggested_dir") in ("+", "-"):
                 print(f"  hint: active switch suggests trying direction '{out.get('suggested_dir')}'")
+            v = tester.motor_validate_oneway_move(
+                axis=axis_name,
+                step_cmd=int(steps),
+                pre_switches=out.get("pre_switches", {}),
+                post_switches=out.get("post_switches", {}),
+                move_ack=out.get("move", {}).get("ack") if isinstance(out.get("move"), dict) else None,
+                wait_row=out.get("wait", {}),
+                delta=out.get("delta"),
+            )
+            _handle_runtime_motion_validation("visible probe", v)
         elif ans == "11":
             din = input("direction (+/- , blank=+): ").strip()
             sin = input(f"steps (blank={visible_steps}): ").strip()
@@ -6660,6 +6842,16 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                         f"status={ev.get('status')}({ev.get('status_str')}) "
                         f"cmd={ev.get('cmd')} value={ev.get('value')}"
                     )
+            v = tester.motor_validate_oneway_move(
+                axis=axis_name,
+                step_cmd=int(steps),
+                pre_switches=out.get("pre_switches", {}),
+                post_switches=out.get("post_switches", {}),
+                move_ack=out.get("move", {}).get("ack") if isinstance(out.get("move"), dict) else None,
+                wait_row=out.get("wait", {}),
+                delta=out.get("delta"),
+            )
+            _handle_runtime_motion_validation("force probe", v)
         elif ans == "12":
             rows = tester.motor_probe_axis_params(
                 board,
@@ -7078,6 +7270,7 @@ def run_motor_experimental_menu(tester):
         print("  2. MOTION ARM STATUS (live sensors)")
         print("  3. DISARM XYZ MOTION GATE")
         print("  4. SHOW LAST STRICT INIT REPORT")
+        print("  5. DECK LATCH OVERRIDE TOGGLE (diagnostic unlock mode)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -7104,6 +7297,18 @@ def run_motor_experimental_menu(tester):
         elif ans == "4":
             out = tester.motion_last_strict_init_report()
             _print_strict_startup_report(out)
+        elif ans == "5":
+            cur = tester.motion_latch_override_state()
+            enable = not bool(cur.get("enabled"))
+            out = tester.motion_latch_override_set(enable, reason="experimental_toggle")
+            st = out.get("state", {})
+            wr = out.get("write", {})
+            mode = "ENABLED (diagnostic unlock)" if st.get("enabled") else "DISABLED (auto-lock)"
+            print(
+                f"deck latch override {mode}: ack={fmt_resp(wr.get('ack'))} "
+                f"snapshot={wr.get('snapshot')}"
+            )
+            _print_motion_gate_status(tester, refresh=False, snapshot=out.get("gate"))
         else:
             print("Invalid.")
 
