@@ -238,6 +238,11 @@ class BioXpTester:
         "ESCAPE_SWITCH_NOT_CLEARED": 9107,
         "REPORTED_MOVE_SWITCH_MISMATCH": 9108,
         "NO_24V_DURING_PROBE": 9109,
+        "STRICT_INIT_FAILED": 9201,
+        "STRICT_HOMING_FAILED": 9202,
+        "MOTION_NOT_ARMED": 9203,
+        "MOTION_SENSOR_GATE_FAILED": 9204,
+        "MOTION_GATE_IO_UNAVAILABLE": 9205,
     }
     MOTION_ERROR_TEXT = {
         "AXIS_PROBE_ERROR": "Axis probe returned an internal error.",
@@ -250,6 +255,11 @@ class BioXpTester:
         "ESCAPE_SWITCH_NOT_CLEARED": "Move away from active limit did not clear that limit.",
         "REPORTED_MOVE_SWITCH_MISMATCH": "Driver reported position delta but active limit did not clear.",
         "NO_24V_DURING_PROBE": "24V sensor reported NO_24V during motion probe.",
+        "STRICT_INIT_FAILED": "Strict startup init failed one or more gate checks.",
+        "STRICT_HOMING_FAILED": "Strict startup init failed during full homing.",
+        "MOTION_NOT_ARMED": "XYZ motion blocked because strict startup arm is not active.",
+        "MOTION_SENSOR_GATE_FAILED": "XYZ motion blocked by live sensor gate mismatch.",
+        "MOTION_GATE_IO_UNAVAILABLE": "XYZ motion blocked because deck IO gate signals were unreadable.",
     }
     VIDIOC_G_CTRL = 0xC008561B
     VIDIOC_S_CTRL = 0xC008561C
@@ -312,6 +322,14 @@ class BioXpTester:
         self._led_state_cache = None
         self._libc = ctypes.CDLL(None, use_errno=True)
         self.UVCIOC_CTRL_QUERY = self._build_uvc_ioctl_query()
+        self._motion_arm = {
+            "armed": False,
+            "reason": "startup",
+            "note": "strict init not yet run",
+            "updated_ms": int(time.time() * 1000),
+            "arm_seq": 0,
+        }
+        self._motion_last_strict_init = None
         self._connect()
         self._led_state_cache = self.load_led_state()
 
@@ -655,26 +673,35 @@ class BioXpTester:
             fw_hex = "-".join(f"{b:02X}" for b in ack["raw"][9:13])
         return {"board": int(board_id), "ack": ack, "fw_hex": fw_hex}
 
-    def io_snapshot(self, board_id=BOARD_DECK):
+    def io_snapshot(self, board_id=BOARD_DECK, retries_per_channel=3):
         # cmd15 types: 0=24V, 1=door sensor, 2=solenoid state, 3=latch sensor
         vals = {}
+        bid = int(board_id)
         self.drain(max_reads=8, timeout_ms=6)
         for ch in (0, 1, 2, 3):
-            r = self.send_tmcl_retry(
-                board_id,
-                15,
-                ch,
-                0,
-                0,
-                attempts=2,
-                wait_reply=True,
-                write_timeout_ms=45,
-                read_timeout_ms=40,
-                max_reads=16,
-                strict_match=True,
-            )
-            vals[ch] = None if r is None else r["value"]
-            time.sleep(0.006)
+            ack = None
+            for i in range(max(1, int(retries_per_channel))):
+                ack = self._send_motor(
+                    bid,
+                    15,
+                    int(ch),
+                    0,
+                    0,
+                    attempts=2,
+                    wait_reply=True,
+                    write_timeout_ms=55,
+                    read_timeout_ms=70,
+                    max_reads=18,
+                    strict_match=True,
+                )
+                if ack is not None:
+                    break
+                if i == 0 and bid in self.MOTOR_RECOVERY_BOARDS:
+                    # If IO polling collides with recent traffic, refresh board wake once.
+                    self.activate_boards(expect_reply=False)
+                    time.sleep(0.04)
+            vals[ch] = None if ack is None else ack.get("value")
+            time.sleep(0.01)
         return vals
 
     def deck_io_query_type(self, io_type):
@@ -1824,6 +1851,237 @@ class BioXpTester:
         # In OEM ClassDeckBoard.queryVoltage: non-zero means No24V.
         no24v = None if raw is None else bool(int(raw) != 0)
         return {"ack": ack, "raw": raw, "no24v": no24v}
+
+    @staticmethod
+    def _safe_int(value):
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def motion_arm_state(self):
+        return dict(self._motion_arm) if isinstance(self._motion_arm, dict) else {"armed": False}
+
+    def motion_last_strict_init_report(self):
+        return self._motion_last_strict_init
+
+    def motion_disarm(self, reason="manual", note=None):
+        prev_seq = 0
+        if isinstance(self._motion_arm, dict):
+            prev_seq = int(self._motion_arm.get("arm_seq", 0) or 0)
+        self._motion_arm = {
+            "armed": False,
+            "reason": str(reason),
+            "note": None if note is None else str(note),
+            "updated_ms": int(time.time() * 1000),
+            "arm_seq": prev_seq + 1,
+        }
+        return dict(self._motion_arm)
+
+    def motion_gate_live_snapshot(self):
+        io = self.io_snapshot(self.BOARD_DECK)
+        rail = self.motor_query_24v_sensor()
+        door = self._safe_int(None if not isinstance(io, dict) else io.get(1))
+        solenoid = self._safe_int(None if not isinstance(io, dict) else io.get(2))
+        latch = self._safe_int(None if not isinstance(io, dict) else io.get(3))
+        io_ok = (door is not None) and (solenoid is not None) and (latch is not None)
+        checks = {"rail_ok": rail.get("no24v") is False, "io_read_ok": io_ok}
+        error_keys = [k for k, v in checks.items() if v is not True]
+        if not io_ok:
+            checks.update({"door_closed": None, "latch_closed": None, "solenoid_locked": None})
+            error_keys.append("io_unavailable")
+        else:
+            checks.update(
+                {
+                    "door_closed": door == 1,
+                    "latch_closed": latch == 1,
+                    "solenoid_locked": solenoid == 1,
+                }
+            )
+            error_keys.extend(
+                [
+                    k
+                    for k in ("door_closed", "latch_closed", "solenoid_locked")
+                    if checks.get(k) is not True
+                ]
+            )
+        return {
+            "io": io,
+            "rail_24v": rail,
+            "door_sensor": door,
+            "solenoid_state": solenoid,
+            "latch_sensor": latch,
+            "checks": checks,
+            "error_keys": error_keys,
+            "ok": len(error_keys) == 0,
+        }
+
+    def motion_gate_assert_live(self, auto_disarm=True):
+        snap = self.motion_gate_live_snapshot()
+        if (
+            bool(auto_disarm)
+            and bool(isinstance(self._motion_arm, dict) and self._motion_arm.get("armed"))
+            and not bool(snap.get("ok"))
+        ):
+            self.motion_disarm(reason="sensor_gate_failed", note=",".join(snap.get("error_keys", [])))
+        return snap
+
+    def motion_arm_strict_startup(self, run_homing=True):
+        """
+        Strict startup gate for gantry motion:
+        - reconnect + board activate
+        - enforce deck lock path and verify deck IO/24V sensors
+        - interlock wake sequence
+        - full OEM-like startup homing
+        """
+        t0 = time.time()
+        checks = []
+        fail_names = []
+
+        def _ack_text(ack):
+            if ack is None:
+                return "no response"
+            try:
+                status = int(ack.get("status", -1))
+            except Exception:
+                status = -1
+            return TMCL_STATUS.get(status, f"?({status})")
+
+        def add_check(name, ok, detail=None, critical=True):
+            nonlocal fail_names
+            row = {"name": str(name), "ok": bool(ok), "critical": bool(critical)}
+            if detail is not None:
+                row["detail"] = detail
+            checks.append(row)
+            if not bool(ok) and bool(critical):
+                fail_names.append(str(name))
+
+        self.reconnect()
+        board_status = self.activate_boards(expect_reply=True)
+        board_expect = (self.BOARD_HEAD, self.BOARD_DECK, self.BOARD_THERMAL)
+        board_ok = all(self._tmcl_success(board_status.get(bid)) for bid in board_expect)
+        add_check("board_activate", board_ok, detail={bid: _ack_text(board_status.get(bid)) for bid in board_expect})
+
+        pre_gate = self.motion_gate_live_snapshot()
+        add_check("pre_gate_live", pre_gate.get("ok"), detail=pre_gate.get("error_keys"))
+
+        lock = self.latch_oem(True)
+        add_check("lock_cmd_ack", self._tmcl_success(lock.get("ack")), detail=_ack_text(lock.get("ack")))
+        time.sleep(0.12)
+
+        post_lock_gate = self.motion_gate_live_snapshot()
+        add_check("post_lock_gate_live", post_lock_gate.get("ok"), detail=post_lock_gate.get("error_keys"))
+
+        interlock = self.motor_prepare_motion_interlock(force_lock=True)
+        inter_rail = interlock.get("rail_24v", {}) if isinstance(interlock, dict) else {}
+        add_check("interlock_24v", inter_rail.get("no24v") is False, detail=f"raw={inter_rail.get('raw')}")
+        latch_ack = None
+        if isinstance(interlock, dict) and isinstance(interlock.get("latch"), dict):
+            latch_ack = interlock["latch"].get("ack")
+        add_check("interlock_latch_ack", self._tmcl_success(latch_ack), detail=_ack_text(latch_ack))
+
+        homing = None
+        if bool(run_homing):
+            homing = self.motor_startup_homing_mimic()
+
+            def _home_check(label, row):
+                if not isinstance(row, dict):
+                    add_check(f"home_{label}", False, detail="missing")
+                    return
+                move_ok = self._tmcl_success(row.get("move_left", {}).get("ack"))
+                wait_ok = bool(row.get("wait", {}).get("stopped") is True)
+                stop_ok = self._tmcl_success(row.get("stop", {}).get("ack"))
+                set_ok = self._tmcl_success(row.get("sethome_final", {}).get("ack"))
+                hs = row.get("home_after", {}).get("value")
+                hs_ok = hs == 0
+                ok = bool(move_ok and wait_ok and stop_ok and set_ok and hs_ok)
+                add_check(
+                    f"home_{label}",
+                    ok,
+                    detail={
+                        "move": _ack_text(row.get("move_left", {}).get("ack")),
+                        "wait": row.get("wait", {}).get("stopped"),
+                        "stop": _ack_text(row.get("stop", {}).get("ack")),
+                        "set_home": _ack_text(row.get("sethome_final", {}).get("ack")),
+                        "home_after": hs,
+                    },
+                )
+
+            _home_check("Z", homing.get("z_home"))
+            _home_check("G", homing.get("g_home"))
+            _home_check("X", homing.get("x_home"))
+            _home_check("Y", homing.get("y_home"))
+            door_row = homing.get("door_home")
+            if not isinstance(door_row, dict):
+                add_check("home_DOOR", False, detail="missing", critical=False)
+            else:
+                move_ok = self._tmcl_success(door_row.get("move_left", {}).get("ack"))
+                wait_ok = bool(door_row.get("wait", {}).get("stopped") is True)
+                stop_ok = self._tmcl_success(door_row.get("stop", {}).get("ack"))
+                set_ok = self._tmcl_success(door_row.get("sethome_final", {}).get("ack"))
+                hs = door_row.get("home_after", {}).get("value")
+                hs_ok = hs == 0
+                add_check(
+                    "home_DOOR",
+                    bool(move_ok and wait_ok and stop_ok and set_ok and hs_ok),
+                    detail={
+                        "move": _ack_text(door_row.get("move_left", {}).get("ack")),
+                        "wait": door_row.get("wait", {}).get("stopped"),
+                        "stop": _ack_text(door_row.get("stop", {}).get("ack")),
+                        "set_home": _ack_text(door_row.get("sethome_final", {}).get("ack")),
+                        "home_after": hs,
+                        "advisory_only": True,
+                    },
+                    critical=False,
+                )
+            add_check(
+                "x_after_home_move6000",
+                bool(
+                    self._tmcl_success(homing.get("x_move_6000", {}).get("ack"))
+                    and homing.get("x_wait", {}).get("stopped") is True
+                ),
+                detail={
+                    "move": _ack_text(homing.get("x_move_6000", {}).get("ack")),
+                    "wait": homing.get("x_wait", {}).get("stopped"),
+                },
+            )
+
+        final_gate = self.motion_gate_live_snapshot()
+        add_check("final_gate_live", final_gate.get("ok"), detail=final_gate.get("error_keys"))
+
+        ok = all(bool(c.get("ok")) for c in checks if bool(c.get("critical", True)))
+        error_code = None
+        if not ok:
+            if any(name.startswith("home_") or name.startswith("x_after_home") for name in fail_names):
+                error_code = int(self.MOTION_ERROR_CODES.get("STRICT_HOMING_FAILED"))
+            else:
+                error_code = int(self.MOTION_ERROR_CODES.get("STRICT_INIT_FAILED"))
+
+        prev_seq = int(self._motion_arm.get("arm_seq", 0) or 0) if isinstance(self._motion_arm, dict) else 0
+        self._motion_arm = {
+            "armed": bool(ok),
+            "reason": "strict_init_pass" if ok else "strict_init_fail",
+            "note": None if ok else ",".join(fail_names[:4]),
+            "updated_ms": int(time.time() * 1000),
+            "arm_seq": prev_seq + 1,
+        }
+
+        report = {
+            "ok": bool(ok),
+            "error_code": error_code,
+            "board_status": board_status,
+            "pre_gate": pre_gate,
+            "lock": lock,
+            "post_lock_gate": post_lock_gate,
+            "interlock": interlock,
+            "homing": homing,
+            "final_gate": final_gate,
+            "checks": checks,
+            "arm_state": dict(self._motion_arm),
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+        self._motion_last_strict_init = report
+        return report
 
     def motor_query_motor_stop(self, board_id, motor=0):
         """
@@ -5689,6 +5947,83 @@ def _print_motion_interlock(inter):
         )
 
 
+def _print_motion_gate_status(tester, refresh=True, snapshot=None):
+    st = tester.motion_arm_state()
+    print(
+        f"motion arm: armed={st.get('armed')} reason={st.get('reason')} "
+        f"note={st.get('note')} seq={st.get('arm_seq')}"
+    )
+    live = snapshot if isinstance(snapshot, dict) else None
+    if live is None and bool(refresh):
+        live = tester.motion_gate_assert_live(auto_disarm=bool(st.get("armed")))
+    if not isinstance(live, dict):
+        return
+    rail = live.get("rail_24v", {})
+    checks = live.get("checks", {})
+    print(
+        f"  live gate: ok={live.get('ok')} errors={live.get('error_keys')} "
+        f"24V_raw={rail.get('raw')} no24v={rail.get('no24v')}"
+    )
+    print(f"  live io: {live.get('io')}")
+    print(
+        "  checks:"
+        f" rail_ok={checks.get('rail_ok')}"
+        f" io_read_ok={checks.get('io_read_ok')}"
+        f" door_closed={checks.get('door_closed')}"
+        f" latch_closed={checks.get('latch_closed')}"
+        f" solenoid_locked={checks.get('solenoid_locked')}"
+    )
+
+
+def _print_strict_startup_report(out):
+    if not isinstance(out, dict):
+        print("No strict startup report.")
+        return
+    print(
+        f"strict startup init: ok={out.get('ok')} "
+        f"error_code={out.get('error_code')} "
+        f"time={out.get('elapsed_ms')}ms"
+    )
+    st = out.get("board_status", {})
+    print(
+        "board status:"
+        f" HEAD={fmt_resp(st.get(BioXpTester.BOARD_HEAD))}"
+        f" DECK={fmt_resp(st.get(BioXpTester.BOARD_DECK))}"
+        f" THERMAL={fmt_resp(st.get(BioXpTester.BOARD_THERMAL))}"
+    )
+    for key in ("pre_gate", "post_lock_gate", "final_gate"):
+        g = out.get(key, {})
+        rail = g.get("rail_24v", {})
+        print(
+            f"  {key}: ok={g.get('ok')} errors={g.get('error_keys')} "
+            f"io={g.get('io')} 24V_raw={rail.get('raw')} no24v={rail.get('no24v')}"
+        )
+    print("checks:")
+    for row in out.get("checks", []):
+        if row.get("ok"):
+            tag = "PASS"
+        elif bool(row.get("critical", True)):
+            tag = "FAIL"
+        else:
+            tag = "WARN"
+        print(f"  {tag} {row.get('name')}: {row.get('detail')}")
+    h = out.get("homing")
+    if isinstance(h, dict):
+        for label, key in (("Z", "z_home"), ("G", "g_home"), ("X", "x_home"), ("Y", "y_home"), ("DOOR", "door_home")):
+            hr = h.get(key, {})
+            print(
+                f"  home {label}: move={fmt_resp(hr.get('move_left', {}).get('ack'))} "
+                f"wait={hr.get('wait', {}).get('stopped')} "
+                f"set={fmt_resp(hr.get('sethome_final', {}).get('ack'))} "
+                f"home_after={hr.get('home_after', {}).get('value')}"
+            )
+    arm = out.get("arm_state", {})
+    print(
+        f"arm state: armed={arm.get('armed')} reason={arm.get('reason')} "
+        f"note={arm.get('note')} seq={arm.get('arm_seq')}"
+    )
+
+
 def _print_driver_diag_summary(out):
     if not isinstance(out, dict):
         print("No driver diagnostic output.")
@@ -5947,7 +6282,15 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
     nudge_steps = _motor_steps_default(label)
     visible_steps = _motor_visible_steps_default(label)
     home_speed = _motor_home_speed_default(label)
-    is_gantry_axis = str(label).upper() in ("X", "Y", "Z")
+    axis_name = str(label).upper()
+    is_gantry_axis = (
+        axis_name in ("X", "Y", "Z")
+        or (int(board), int(motor)) in (
+            (int(tester.BOARD_DECK), 0),
+            (int(tester.BOARD_HEAD), 0),
+            (int(tester.BOARD_HEAD), 1),
+        )
+    )
     norms = tester.motor_speed_acc_norms_for_channel(board, motor=motor)
     interlock_ready = False
     if is_gantry_axis:
@@ -5990,6 +6333,30 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
         )
         _print_motor_prep_ops(prep)
         return prep
+
+    def _require_gantry_motion_gate(op_label):
+        if not is_gantry_axis:
+            return True
+        st = tester.motion_arm_state()
+        if not bool(st.get("armed")):
+            code = int(tester.MOTION_ERROR_CODES.get("MOTION_NOT_ARMED", 9203))
+            print(
+                f"{op_label}: blocked error_code={code} "
+                f"reason={st.get('reason')} note={st.get('note')}"
+            )
+            _print_motion_gate_status(tester, refresh=True)
+            return False
+        live = tester.motion_gate_assert_live(auto_disarm=True)
+        if not bool(live.get("ok")):
+            code_key = "MOTION_GATE_IO_UNAVAILABLE" if "io_unavailable" in set(live.get("error_keys", [])) else "MOTION_SENSOR_GATE_FAILED"
+            code = int(tester.MOTION_ERROR_CODES.get(code_key, 9204))
+            print(
+                f"{op_label}: blocked error_code={code} "
+                f"sensor_errors={','.join(live.get('error_keys', []))}"
+            )
+            _print_motion_gate_status(tester, refresh=False, snapshot=live)
+            return False
+        return True
 
     while True:
         print("\n----------------------------------------")
@@ -6046,9 +6413,12 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 f"state={rail_state} ack={fmt_resp(rail.get('ack'))}"
             )
             _print_motor_axis_status(tester, label, board, motor)
+            _print_motion_gate_status(tester, refresh=True)
         elif ans == "2":
             _prepare_for_motion()
         elif ans == "3":
+            if not _require_gantry_motion_gate("nudge"):
+                continue
             _prepare_for_motion()
             out = tester.motor_step_test(board, steps=nudge_steps, motor=motor, wait_timeout_s=4.0)
             _print_motor_step_result(f"{label} nudge", out)
@@ -6058,6 +6428,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 pos = int(pin)
             except ValueError:
                 print("Invalid position.")
+                continue
+            if not _require_gantry_motion_gate("move abs"):
                 continue
             _prepare_for_motion()
             mv = tester.motor_move_absolute(board, pos, motor=motor)
@@ -6073,6 +6445,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 steps = int(sin)
             except ValueError:
                 print("Invalid steps.")
+                continue
+            if not _require_gantry_motion_gate("move rel"):
                 continue
             _prepare_for_motion()
             mv = tester.motor_move_relative(board, steps, motor=motor)
@@ -6127,6 +6501,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
             r = tester.motor_stop(board, motor=motor)
             print(f"STOP: ack={fmt_resp(r.get('ack'))}")
         elif ans == "8":
+            if not _require_gantry_motion_gate("home search"):
+                continue
             _prepare_for_motion()
             timeout_s = 12.0
             if str(label).upper() in ("GRIPPER", "THERMAL_DOOR"):
@@ -6149,6 +6525,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 print("Invalid steps.")
                 continue
             steps = abs(int(steps)) * sign
+            if not _require_gantry_motion_gate("jog hold"):
+                continue
             _prepare_for_motion()
             pre = tester.motor_get_position(board, motor=motor)
             mv = tester.motor_move_relative(board, steps, motor=motor)
@@ -6174,6 +6552,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 print("Invalid steps.")
                 continue
             steps = abs(int(steps)) * sign
+            if not _require_gantry_motion_gate("visible probe"):
+                continue
             _prepare_for_motion()
             if is_gantry_axis:
                 quiet_speed = min(int(speed), 320)
@@ -6234,6 +6614,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 print("Invalid steps.")
                 continue
             steps = abs(int(steps)) * sign
+            if not _require_gantry_motion_gate("force probe"):
+                continue
             _prepare_for_motion()
             dr = tester.motor_set_axis_param(board, 12, 1, motor=motor)
             dl = tester.motor_set_axis_param(board, 13, 1, motor=motor)
@@ -6342,6 +6724,7 @@ def run_motor_function_menu(tester):
             for k in ("x", "y", "z", "door", "g"):
                 p = tester.motor_function_preset(k)
                 _print_motor_axis_status(tester, p["label"], p["board"], p["motor"])
+            _print_motion_gate_status(tester, refresh=True)
             continue
         else:
             print("Invalid.")
@@ -6686,6 +7069,45 @@ def run_thermal_door_menu(tester):
             print("Invalid.")
 
 
+def run_motor_experimental_menu(tester):
+    while True:
+        print("\n----------------------------------------")
+        print(" EXPERIMENTAL CHANGES")
+        print("----------------------------------------")
+        print("  1. STRICT STARTUP MOTION INIT (sensor-gated + full homing)")
+        print("  2. MOTION ARM STATUS (live sensors)")
+        print("  3. DISARM XYZ MOTION GATE")
+        print("  4. SHOW LAST STRICT INIT REPORT")
+        print("  b. Back")
+        print("  q. Quit")
+
+        ans = input("\n[EXPERIMENTAL] > ").strip().lower()
+        if ans == "":
+            continue
+        if ans == "b":
+            return
+        if ans == "q":
+            sys.exit(0)
+
+        if ans == "1":
+            print("Running strict startup motion init...")
+            out = tester.motion_arm_strict_startup(run_homing=True)
+            _print_strict_startup_report(out)
+        elif ans == "2":
+            _print_motion_gate_status(tester, refresh=True)
+        elif ans == "3":
+            st = tester.motion_disarm(reason="manual")
+            print(
+                f"motion arm disarmed: armed={st.get('armed')} "
+                f"reason={st.get('reason')} note={st.get('note')} seq={st.get('arm_seq')}"
+            )
+        elif ans == "4":
+            out = tester.motion_last_strict_init_report()
+            _print_strict_startup_report(out)
+        else:
+            print("Invalid.")
+
+
 def run_motor_menu(tester):
     while True:
         print("\n----------------------------------------")
@@ -6706,6 +7128,7 @@ def run_motor_menu(tester):
         print("  13. RESTORE OEM XYZ PROFILE + QUIET PROBE")
         print("  14. HARD RESET / PANIC OFF (HEAD+DECK)")
         print("  15. QUICK RELIABILITY SMOKE (X/Y/Z)")
+        print("  16. EXPERIMENTAL CHANGES")
         print("  b. Back")
         print("  q. Quit")
 
@@ -6737,6 +7160,7 @@ def run_motor_menu(tester):
             for key in ("x", "z", "door"):
                 p = tester.motor_function_preset(key)
                 _print_motor_axis_status(tester, p["label"], p["board"], p["motor"])
+            _print_motion_gate_status(tester, refresh=True)
         elif ans == "5":
             print("Running enable for X/Y/Z...")
             out = tester.motor_enable_sequence(conservative=True)
@@ -6987,6 +7411,8 @@ def run_motor_menu(tester):
                 print("Quick reliability smoke: PASS")
             else:
                 print("Quick reliability smoke: FAIL (run hard reset 14, then retest)")
+        elif ans == "16":
+            run_motor_experimental_menu(tester)
         else:
             print("Invalid.")
 
