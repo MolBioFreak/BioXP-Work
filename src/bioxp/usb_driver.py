@@ -227,8 +227,6 @@ class BioXpTester:
     MOTOR_MIN_CMD_GAP_S = 0.045
     MOTOR_POST_RECOVER_GAP_S = 0.100
     MOTOR_RECOVERY_BOARDS = (BOARD_HEAD, BOARD_DECK)
-    # On this unit, deck travel is what must be blocked until head Z-lift is raised.
-    MOTOR_HEAD_CLEARANCE_AXES = ((BOARD_DECK, 0),)
     MOTOR_HEAD_CLEARANCE_AXIS_KEY = "z"
     # This unit clears the head lock by moving Z negative from the current/home slot.
     MOTOR_HEAD_CLEARANCE_SIGN_BY_AXIS = {
@@ -2366,10 +2364,6 @@ class BioXpTester:
             return None
         return cls.MOTOR_SPEED_ACC_NORMS.get(key)
 
-    @classmethod
-    def motor_requires_head_clearance(cls, board_id, motor=0):
-        return (int(board_id), int(motor)) in cls.MOTOR_HEAD_CLEARANCE_AXES
-
     def motor_head_clearance_axis_key(self):
         key = str(os.environ.get("BIOXP_CLEAR_LOCK_AXIS", "")).strip().lower()
         if key == "":
@@ -2597,13 +2591,6 @@ class BioXpTester:
             "lift_ok": bool(lift_ok),
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
-
-    def _motor_preflight_head_clearance(self, board_id, motor=0):
-        if not self.motor_requires_head_clearance(board_id, motor=motor):
-            return {"required": False, "ok": True}
-        row = self.motor_ensure_head_clearance()
-        row["required"] = True
-        return row
 
     def motor_normalize_speed_acc(self, board_id, motor=0, speed=None, acc=None):
         axis_key = self.motor_axis_key_for_channel(board_id, motor=motor)
@@ -2876,19 +2863,6 @@ class BioXpTester:
 
     def motor_move_relative(self, board_id, steps, motor=0):
         # cmd 4 type 1 = move to relative position (OEM MovetoRelPosition).
-        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
-        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
-            return {
-                "board": int(board_id),
-                "motor": int(motor),
-                "steps": int(steps),
-                "pre_stop": None,
-                "ack": None,
-                "ok": False,
-                "blocked": True,
-                "block_reason": "head_clearance_failed",
-                "head_clearance": clearance,
-            }
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
         time.sleep(0.001)
         ack = self._send_motor(
@@ -2911,24 +2885,10 @@ class BioXpTester:
             "pre_stop": pre_stop,
             "ack": ack,
             "ok": self._tmcl_success(ack),
-            "head_clearance": clearance,
         }
 
     def motor_move_absolute(self, board_id, position, motor=0):
         # cmd 4 type 0 = move to absolute position (OEM moveToAbs).
-        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
-        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
-            return {
-                "board": int(board_id),
-                "motor": int(motor),
-                "position": int(position),
-                "pre_stop": None,
-                "ack": None,
-                "ok": False,
-                "blocked": True,
-                "block_reason": "head_clearance_failed",
-                "head_clearance": clearance,
-            }
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
         time.sleep(0.001)
         ack = self._send_motor(
@@ -2951,24 +2911,11 @@ class BioXpTester:
             "pre_stop": pre_stop,
             "ack": ack,
             "ok": self._tmcl_success(ack),
-            "head_clearance": clearance,
         }
 
     def motor_move_left(self, board_id, speed=250, motor=0):
         # OEM ClassMotor.MoveLeft uses cmd=2 with positive speed payload.
         vel = max(1, abs(int(speed)))
-        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
-        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
-            return {
-                "board": int(board_id),
-                "motor": int(motor),
-                "speed": vel,
-                "ack": None,
-                "ok": False,
-                "blocked": True,
-                "block_reason": "head_clearance_failed",
-                "head_clearance": clearance,
-            }
         ack = self._send_motor(
             int(board_id),
             2,
@@ -2988,7 +2935,6 @@ class BioXpTester:
             "speed": vel,
             "ack": ack,
             "ok": self._tmcl_success(ack),
-            "head_clearance": clearance,
         }
 
     def motor_query_home_switch(self, board_id, motor=0):
@@ -3508,19 +3454,6 @@ class BioXpTester:
         if vel == 0:
             return self.motor_stop(board_id, motor=motor)
         cmd = 1 if int(velocity) > 0 else 2  # ROR / ROL
-        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
-        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
-            return {
-                "board": int(board_id),
-                "motor": int(motor),
-                "cmd": cmd,
-                "velocity": int(velocity),
-                "ack": None,
-                "ok": False,
-                "blocked": True,
-                "block_reason": "head_clearance_failed",
-                "head_clearance": clearance,
-            }
         ack = self._send_motor(
             int(board_id),
             cmd,
@@ -3541,7 +3474,6 @@ class BioXpTester:
             "velocity": int(velocity),
             "ack": ack,
             "ok": self._tmcl_success(ack),
-            "head_clearance": clearance,
         }
 
     def motor_stop(self, board_id, motor=0):
