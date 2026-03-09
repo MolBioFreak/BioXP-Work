@@ -1,0 +1,430 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WpfGenBotCommonLib>
+  <experiment>
+    <data name="Assembly LIFETEST Vx" ZoneSize="8"/>
+<!-- Christine modify volume for EC transfers, substrate for OSOS2 and reagent configuration pause 3 min after EC-->
+	<!-- KL: search all changes with KL 170406 -->  
+</experiment>
+  <tips>
+    <T1 id="T50" color="GREEN" />
+    <T2 id="T50" color="GREEN" />
+    <T3 id="T50" color="GREEN" />
+    <T4 id="T200" color="BLUE" />
+  </tips> 
+    <strip1 color="X">
+    <A1 volume="144" id="AMP" />
+    <C1 volume="144" id="AMP" />
+    <E1 volume="144" id="AMP" />
+    <G1 volume="144" id="AMP" />
+  </strip1>
+  <reagents>
+    <plate type="1" />
+    <A1 volume="0" id="ETOH" />
+    <C1 volume="0" id="ETOH" />
+    <E1 volume="0" id="ETOH" />
+    <G1 volume="0" id="ETOH" />
+	<!-- large volume reagent block only differenc is PCR vol == 450 not 250 --> 
+    <A3 volume="450" id="PCR" />
+    <C3 volume="450" id="PCR" />
+    <E3 volume="450" id="PCR" />
+    <G3 volume="450" id="PCR" />
+    <B3 volume="20" id="ECF1" />
+    <D3 volume="20" id="ECF1" />
+    <F3 volume="20" id="ECF1" />
+    <H3 volume="20" id="ECF1" />
+    <B4 volume="500" id="EB" />
+    <D4 volume="500" id="EB" />
+    <F4 volume="500" id="EB" />
+    <H4 volume="500" id="EB" />
+    <A6 volume="500" id="TRIS" />
+    <C6 volume="500" id="TRIS" />
+    <E6 volume="500" id="TRIS" />
+    <G6 volume="500" id="TRIS" />
+    <A10 volume="0" id="WASTE" />
+    <B10 volume="0" id="WASTE" />
+    <C10 volume="0" id="WASTE" />
+    <D10 volume="0" id="WASTE" />
+    <E10 volume="0" id="WASTE" />
+    <F10 volume="0" id="WASTE" />
+    <G10 volume="0" id="WASTE" />
+    <H10 volume="0" id="WASTE" />
+    <A11 volume="0" id="WASTE" />
+    <C11 volume="0" id="WASTE" />
+    <E11 volume="0" id="WASTE" />
+    <G11 volume="0" id="WASTE" />
+  </reagents>
+  <oligos>
+    <A1 volume="0" />
+    <B1 volume="0" />
+    <C1 volume="0" />
+    <D1 volume="0" />
+    <E1 volume="0" />
+    <F1 volume="0" />
+    <G1 volume="0" />
+    <H1 volume="0" />
+    <A2 volume="0" />
+    <B2 volume="0" />
+    <C2 volume="0" />
+    <D2 volume="0" />
+    <E2 volume="0" />
+    <F2 volume="0" />
+    <G2 volume="0" />
+    <H2 volume="0" />
+    <A3 volume="0" />
+    <B3 volume="0" />
+    <C3 volume="0" />
+    <D3 volume="0" />
+    <E3 volume="0" />
+    <F3 volume="0" />
+    <G3 volume="0" />
+    <H3 volume="0" />
+    <A4 volume="0" />
+    <B4 volume="0" />
+    <C4 volume="0" />
+    <D4 volume="0" />
+    <E4 volume="0" />
+    <F4 volume="0" />
+    <G4 volume="0" />
+    <H4 volume="0" />
+    </oligos>
+  <script>
+	<!-- lets start in the first rohmboid --> 
+    <line10 step="1" />
+	
+	<!-- lights to a pleasing level for the run emperically dertermined -->
+    <line20 cmd="LED 102 178 255" />
+	
+    <!-- Only the Reagent Chiller now -->
+    <line30 cmd="CC RC 10" />
+	
+	<!-- Press the plates for the job into the holders -->
+    <line40 cmd="PP PL_OUTPUT" />
+    <line50 cmd="PP PL_REAGENT" />
+	
+    <!-- At this point we can pause for the delay start -->
+    <line110 cmd="DELAYPOINT" />
+	
+	<!-- seperate the seals in the Oligo Vault -->
+    <line120 cmd="SS" />
+	
+	<!-- Store the biosecurity cover to expose the pool plate -->
+    <line130 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line140 cmd="PP PL_POOL" />
+	
+	<!--  load some 200 tips and pre-pierce the PCR wells and toss the tips -->
+	<line141 cmd="FP PL_REAGENT ML /MLPCR FP /R T200 /NTY" />  
+	
+	<!-- Reconstitute PCR Primers in column 9-10-11-12 -->
+	<!-- NOTE: Katie style with one pre-mix for wetting the tip beforee the accurate draw on the transfer... -->
+	<!-- After resuspending then transfer this fluid to column 1-2-3-4 and resuspend the Oligos there -->
+	<!-- Then eject the tips - Repeat until zone is complete.  -->
+	
+	<!--  Start with the A row of 9 --> 
+	<!-- just for this first one do some extra mixing before the first draw to get the material mixed --> 
+	<line150 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 PL_POOL ML /WLA9 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line160 cmd="MT PL_POOL ML /WLA9 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLA1 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+ 
+    <!--  Repeat for the B row of 9 -->
+    <line170 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB9 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line180 cmd="MT PL_POOL ML /WLB9 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLB1 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!--  Start with the A row of 10 -->
+	<line190 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLA10 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line200 cmd="MT PL_POOL ML /WLA10 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLA2 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+ 	<!--  Repeat with the B row of 10 -->
+	<line210 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB10 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line220 cmd="MT PL_POOL ML /WLB10 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLB2 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!--  Start with the A row of 11 -->
+	<line230 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLA11 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line240 cmd="MT PL_POOL ML /WLA11 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLA3 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+ 	<!--  Repeat with the B row of 11 -->
+	<line250 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB11 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line260 cmd="MT PL_POOL ML /WLB11 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLB3 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!--  Start with the A row of 12 -->
+	<line270 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLA12 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line280 cmd="MT PL_POOL ML /WLA12 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLA4 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+ 	<!--  Repeat with the B row of 12 -->
+	<line290 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB12 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 T50 /NTN" />
+    <line300 cmd="MT PL_POOL ML /WLB12 VL /VL26 AP /AA0 /AD500 /AS10 /AC0 PL_POOL ML /WLB4 DP /DC0 /DS30 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!-- restore the BioSecurity cover  close the TC and cover the chiller--> 
+    <line310 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line320 cmd="TCD DC" />
+    <line330 cmd="MC CV_REAGENT LOC_RC" />
+	
+    <line400 step="2" />
+	
+    <!-- OSOS 1 thermal cycling  -->
+    <line410 cmd="SP T98.0 DUR60 R2.5" />
+    <line420 cmd="LOOP 10" />
+    <line430 cmd="SP T97.0 DUR30 R2.5" />
+    <line440 cmd="DWELL 15" />
+    <line450 cmd="SP T72.0 DUR45 R2.5" />    
+    <line460 cmd="DWELL 15" />    
+    <line470 cmd="SP T55.0 DUR60 R2.5" />    
+    <line480 cmd="LOOP" />
+    <line490 cmd="LOOP 20" />
+    <line500 cmd="SP T98.0 DUR30 R2.5" />
+    <line510 cmd="SP T72.0 DUR240 R2.5" />
+    <line520 cmd="SP T60.0 DUR360 R2.5" />
+    <line530 cmd="LOOP" />
+    <line540 cmd="SP T72.0 DUR300 R2.5" />
+    <!-- Steps for denature/anneal -->
+    <line550 cmd="SP T98.0 DUR120 R2.5" />
+    <line560 cmd="SP T85.0 DUR120 R2.0" />
+    <line570 cmd="SP T25.0 DUR120 R0.1" />
+    <!-- Slower ramp rate to minimize the fan sound -->
+	<!-- KL 170406: changing this hold to 4C to minimize Mimulus activity while liquid handling is happening -->
+    <line580 cmd="SP T4.0 DUR10 R0.5" />
+	
+    <!-- store the chiller cover / open the TC and remove the BioSecurity cover -->
+    <line590 cmd="MC CV_REAGENT LOC_RCS" />
+    <line600 cmd="TCD DO" />
+    <line610 cmd="MC CV_BIOSECURITY LOC_BSCS" /> 
+    <line620 cmd="PP PL_POOL" />
+	
+	<!-- Adjust for loss of fluid based on thermal cycling column 1-2-3-4 -->		
+    <line630 cmd="LA PL_POOL Z1 7" />
+    <line640 cmd="LA PL_POOL Z2 7" />
+    <line650 cmd="LA PL_POOL Z3 7" />
+    <line660 cmd="LA PL_POOL Z4 7" />
+	
+    <!-- Compound the Error corection - NOTE uses 200 tips so make sure you eject these before continuing! )  -->
+	<!-- ratio here is 20->5 for each colum of 8 so for 32 wells this is 160->20 -->  
+	<!-- NOTE all reagent plates have enough ECF for 32wells so only 160->20 --> 
+    <line670 cmd="FP PL_REAGENT ML /MLECF1 T200 /NTN" />
+    <!-- KL: changing this line to match the one from my script - NO AIR GAPS ALLOWED! Among other things -->
+	<line680 cmd="MT PL_REAGENT ML /MLTRIS VL /VL160 AP /AA0 /AD500 /AS50 /AC0 PL_REAGENT ML /MLECF1 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 T200 /NTY" />
+    <line690 cmd="ET" />
+	
+	<!-- New EC ammount is 21ul with 4ul of OSOS result, defined and tested by PD -->
+	<!-- Transfer error corection to column 9-10-11-12 Then transfer the OSOS1 result from column 1-2-3-4 to column 9-10-11-12 -->
+	<!-- Then eject the tips - repeat until complete.  -->
+	
+	<!-- Start with the A row of 9 -->
+	<!-- KL 170406: re-synchronizing the move of OSOS1 to EC with the transfer script -->
+	<line700 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLA9 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line710 cmd="MT PL_POOL ML /WLA1 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLA9 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	<!-- Repeat for the B row of 9 -->
+	<line730 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLB9 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line740 cmd="MT PL_POOL ML /WLB1 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLB9 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+
+	
+	<!-- Start with the A row of 10 -->
+	<line750 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLA10 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line760 cmd="MT PL_POOL ML /WLA2 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLA10 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	<!-- Repeat for the B row of 10 -->
+	<line770 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLB10 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line780 cmd="MT PL_POOL ML /WLB2 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLB10 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	<!-- Start with the A row of 11 -->
+	<line790 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLA11 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line800 cmd="MT PL_POOL ML /WLA3 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLA11 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	<!-- Repeat for the B row of 11 -->
+	<line810 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLB11 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line820 cmd="MT PL_POOL ML /WLB3 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLB11 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	
+	<!-- Start with the A row of 12 -->
+	<line830 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLA12 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line840 cmd="MT PL_POOL ML /WLA4 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLA12 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+	<!-- Repeat for the B row of 12 -->
+	<line850 cmd="MT PL_REAGENT ML /MLECF1 VL /VL21 AP /AA0 /AD500 /AS50 /AC0 PL_POOL ML /WLB12 DP /DC0 /DS20 /DD500 MO /AA5 /AS30 /AD500 /DS30 /DD500 /RC0 T50 /NTN" />
+	<line860 cmd="MT PL_POOL ML /WLB4 VL /VL5 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AD500 /AS30 /AC0 PL_POOL ML /WLB12 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC10 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+   	<line870 cmd="ET" />
+	
+    <line880 step="3" />
+	
+    <line890 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line900 cmd="TCD DC" />
+    <line910 cmd="MC CV_REAGENT LOC_RC" />
+	
+    <!-- Thermal Cycle steps for Error correction -->
+    <line920 cmd="SP T50.0 DUR3600 R2.5" />
+    <line921 cmd="SP T95.0 DUR120 R2.5" />
+    <line930 cmd="SP T10.0 DUR60 R.5" />
+
+	<!-- store the chiller cover / open the TC and remove the BioSecurity cover -->
+	<!-- remove line 971-974 for official scripts -->
+    <line940 cmd="MC CV_REAGENT LOC_RCS" />
+    <line950 cmd="TCD DO" />
+    <line960 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line970 cmd="PP PL_POOL" />
+	
+	<!-- Transfer  PCR mix into column 5 of Pool Plate -->
+	<!-- Use new tips all primers are custom now -->
+    <!-- KL: May as well update to the same MT used in OSOS1 -->
+	<!-- GM: note she changes the volume of master mix to 26 from 22.5 for OSOS2 -->
+	
+	<!-- Start with the A/B row of 5 -->
+	<line980 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 PL_POOL ML /WLA5 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line990 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB5 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!-- Repeat for the A/B row of 6 -->
+	<line1000 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 PL_POOL ML /WLA6 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1010 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB6 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!-- Repeat for the  A/B row of 7 -->
+	<line1020 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 PL_POOL ML /WLA7 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1030 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB7 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+
+	<!-- Repeat for the A/B row of 8 -->
+	<line1040 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC5 PL_POOL ML /WLA8 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1050 cmd="MT PL_REAGENT ML /MLPCR VL /VL26 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC1 PL_POOL ML /WLB8 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC5 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	
+		
+    <!-- Transfer PCR1 result from column 9 to column 5 of POOL plate -->
+    <!-- KL: same here, update to the same style as the EC transfer -->
+	<!-- Start with the 9 to 5 -->
+	<line1060 cmd="MT PL_POOL ML /WLA9 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLA5 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+	<line1070 cmd="MT PL_POOL ML /WLB9 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLB5 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+    <!-- KL 170406: someone missed a vol here, WLB10 is still 2.5, so changing to 3 -->
+	<!-- Continue with the 10 to 6 -->
+	<line1080 cmd="MT PL_POOL ML /WLA10 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLA6 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+	<line1090 cmd="MT PL_POOL ML /WLB10 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLB6 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+    	
+	<!-- Continue with the 11 to 7 -->
+	<line1100 cmd="MT PL_POOL ML /WLA11 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLA7 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+	<line1110 cmd="MT PL_POOL ML /WLB11 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLB7 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+    	
+	<!-- Continue with the 12 to 8 -->
+	<line1120 cmd="MT PL_POOL ML /WLA12 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLA8 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+	<line1130 cmd="MT PL_POOL ML /WLB12 VL /VL3 DB /AA0 /AS30 /DS30 /RC2 AP /AA0 /AS10 /AC0 PL_POOL ML /WLB8 MO /AA0 /AS50 /AD100 /DS100 /DD100 /RC2 DB /AA0 /AS30 /DS30 /RC1 T50 /NTY" />
+	
+    <line1150 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line1160 cmd="TCD DC" />
+    <line1170 cmd="MC CV_REAGENT LOC_RC" />
+	
+    <!-- OSOS 2 thermal cycling  -->
+    <line1180 cmd="SP T98.0 DUR60 R2.5" />
+    <line1190 cmd="LOOP 10" />
+    <line1200 cmd="SP T97.0 DUR30 R2.5" />
+    <line1210 cmd="DWELL 15" />
+    <line1220 cmd="SP T72.0 DUR45 R2.5" />    
+    <line1230 cmd="DWELL 15" />    
+    <line1240 cmd="SP T55.0 DUR60 R2.5" />    
+    <line1250 cmd="LOOP" />
+    <line1260 cmd="LOOP 20" />
+    <line1270 cmd="SP T98.0 DUR30 R2.5" />
+    <line1280 cmd="SP T72.0 DUR240 R2.5" />
+    <line1290 cmd="SP T65.0 DUR360 R2.5" />
+    <line1300 cmd="LOOP" />
+    <line1310 cmd="SP T72.0 DUR300 R2.5" />
+    <!-- Slower ramp rate to minimize the fan sound -->
+    <line1320 cmd="SP T20.0 DUR10 R.5" />
+	
+	<!-- store the chiller cover / open the TC and remove the BioSecurity cover -->
+    <line1340 cmd="MC CV_REAGENT LOC_RCS" />
+    <line1350 cmd="TCD DO" />
+    <line1360 cmd="MC CV_BIOSECURITY LOC_BSCS" /> 
+    <line1370 cmd="PP PL_POOL" />
+	
+    <!-- Adjust for loss of fluid in column 5-6-7-8 to be 23.5! (this is a Katie approved number 1/24/2017)-->	
+    <line1380 cmd="LA PL_POOL Z5 5" />
+    <line1390 cmd="LA PL_POOL Z6 5" />	
+    <line1400 cmd="LA PL_POOL Z7 5" />	
+    <line1410 cmd="LA PL_POOL Z8 5" />	
+	
+    <!-- Purification with AMPure   -->
+	<line1420 step="4" />	
+	
+    <!-- SA with 4x200 tips  -->
+    <line1430 cmd="SA AMP T200" />
+    <line1440 cmd="ET" />
+	
+	<!-- Transfer AMP to column 5-6-7-8 -->
+    <!-- NOTE need to adjust the AMP ammount based on the volume remaining in PCR2 result  .7 X 20ul == 14ul (though now we have 23.5)-->
+    <line1450 cmd="ST AMP AO A10 S10 D2000 PL_POOL Z5 DAO S10 D1000 MO AO A0 S20 D1000 DAO S50 D1000 RC1 DBO AO S20 DO S20 RC5 V14 T50 NTY" />
+    <line1460 cmd="ST AMP AO A10 S10 D2000 PL_POOL Z6 DAO S10 D1000 MO AO A0 S20 D1000 DAO S50 D1000 RC1 DBO AO S20 DO S20 RC5 V14 T50 NTY" />
+    <line1470 cmd="ST AMP AO A10 S10 D2000 PL_POOL Z7 DAO S10 D1000 MO AO A0 S20 D1000 DAO S50 D1000 RC1 DBO AO S20 DO S20 RC5 V14 T50 NTY" />
+    <line1480 cmd="ST AMP AO A10 S10 D2000 PL_POOL Z8 DAO S10 D1000 MO AO A0 S20 D1000 DAO S50 D1000 RC1 DBO AO S20 DO S20 RC5 V14 T50 NTY" />
+    <line1490 cmd="ET" />
+	
+    <line1500 cmd="WAIT 300" />
+	
+    <!-- Store ETOH in the first row of the reagent plate -->
+    <line1510 cmd="MC CV_BIOSECURITY LOC_TC" />
+	
+	<!-- stage ETOH into the Output plate column 9-10-11-12 for the Zone wash process -->	
+	<line1522 cmd="MT TROUGH ML /WLA1 VL /VL160 AP /AA1 /AC10 /AS50 /AD500 /AC2 PL_OUTPUT ML /ZN9 DP /DC10 /DS50 /DD500 T200 /NTN" />
+  	<line1524 cmd="MT TROUGH ML /WLA1 VL /VL160 AP /AA1 /AC10 /AS50 /AD500 /AC2 PL_OUTPUT ML /ZN10 DP /DC10 /DS50 /DD500 T200 /NTN" />
+  	<line1526 cmd="MT TROUGH ML /WLA1 VL /VL160 AP /AA1 /AC10 /AS50 /AD500 /AC2 PL_OUTPUT ML /ZN11 DP /DC10 /DS50 /DD500 T200 /NTN" />
+  	<line1528 cmd="MT TROUGH ML /WLA1 VL /VL160 AP /AA1 /AC10 /AS50 /AD500 /AC2 PL_OUTPUT ML /ZN12 DP /DC10 /DS50 /DD500 T200 /NTN" />
+    <line1529 cmd="TT ETOH V4320 T200 AM0 MR0 DM0 MR0" />
+    <line1530 cmd="ET" />
+	
+    <line1540 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line1550 cmd="PP PL_POOL" />
+    <line1560 cmd="MP PL_POOL LOC_MS PRESS" />
+
+    <!-- pause for the magnets to work -->
+	<line1570 cmd="WAIT 60" />
+	
+	<!-- zone wash process for column 5-6-7-8 in Pool Plate -->		
+	<line1610 cmd="ZW PL_POOL Z5 PL_OUTPUT Z9 V120 T200 W10 DM0 MR5 AMP" /> 
+	<line1620 cmd="ZW PL_POOL Z6 PL_OUTPUT Z10 V120 T200 W10 DM0 MR5 AMP" /> 
+	<line1630 cmd="ZW PL_POOL Z7 PL_OUTPUT Z11 V120 T200 W10 DM0 MR5 AMP" /> 
+	<line1640 cmd="ZW PL_POOL Z8 PL_OUTPUT Z12 V120 T200 W10 DM0 MR5 AMP" /> 
+	
+	<!-- Standard Wash process for colum 5-6-7-8 on Pool Plate --> 
+    <line1650 cmd="SW ETOH PL_POOL Z5 V120 T200 W10 DM0 MR5 AMP" />
+    <line1660 cmd="SW ETOH PL_POOL Z6 V120 T200 W10 DM0 MR5 AMP" />	
+    <line1670 cmd="SW ETOH PL_POOL Z7 V120 T200 W10 DM0 MR5 AMP" />	
+	<line1680 cmd="SW ETOH PL_POOL Z8 V120 T200 W10 DM0 MR5 AMP" />
+	
+    <line1690 cmd="MP PL_POOL LOC_TC PRESS" />
+		
+	<!-- Mix elution buffer and waste the first 50ul of the fluid -->		
+	<!--  load some 200 tips and pre-pierce the EB wells and Keep the tips now! -->
+	<line1691 cmd="FP PL_REAGENT ML /MLEB FP /R T200 /NTN" />  
+		<!-- 
+		The thing here is to asperate 50ul of EB and send this to the waste wells then kick off the tips.
+		This is done to try to resolve the short EB transfer to the rest of the process GM 6/22/2017
+		-->
+	<line1692 cmd="MT PL_REAGENT ML /MLEB VL /VL50 AP /AA0 /AD500 /AS60 /AC0 MO /AA0 /AS60 /AD500 /DS60 /DD500 /RC5 DB /AA0 /AS60 /DS60 /RC3 PL_REAGENT ML /MLWASTE DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC0 T200 /NTY" />
+	
+	<!-- re-elute the beads in colum 5-6-7-8 of Pool Plate -->
+    <line1700 cmd="RT EB MO RC0 PL_POOL Z5 DAO S100 D1000 MO AO S300 D100 DAO S400 D250 RC25 DBO RC5 V50 T50 NTY" />
+    <line1710 cmd="RT EB MO RC0 PL_POOL Z6 DAO S100 D1000 MO AO S300 D100 DAO S400 D250 RC25 DBO RC5 V50 T50 NTY" />
+    <line1720 cmd="RT EB MO RC0 PL_POOL Z7 DAO S100 D1000 MO AO S300 D100 DAO S400 D250 RC25 DBO RC5 V50 T50 NTY" />
+    <line1730 cmd="RT EB MO RC0 PL_POOL Z8 DAO S100 D1000 MO AO S300 D100 DAO S400 D250 RC25 DBO RC5 V50 T50 NTY" />
+    <line1740 cmd="ET" />
+	
+    <line1750 cmd="WAIT 120" />
+    <line1760 cmd="MP PL_POOL LOC_MS PRESS" />
+    <line1770 cmd="WAIT 60" />
+	
+	<!-- transfer the product from colum 5-6-7-8 of Pool Plate to Column 1-2-3-4 of Output Plate -->
+	<line1780 cmd="MT PL_POOL ML /ZN5 VL /VL45 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 PL_OUTPUT ML /ZN1 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1790 cmd="MT PL_POOL ML /ZN6 VL /VL45 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 PL_OUTPUT ML /ZN2 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1800 cmd="MT PL_POOL ML /ZN7 VL /VL45 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 PL_OUTPUT ML /ZN3 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 T50 /NTY" />
+	<line1810 cmd="MT PL_POOL ML /ZN8 VL /VL45 AP /AA0 /AD500 /AS30 /AC0 MO /AA0 /AS30 /AD500 /DS30 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 PL_OUTPUT ML /ZN4 DP /DC0 /DS50 /DD500 MO /AA0 /AS30 /AD500 /DS50 /DD500 /RC0 DB /AA0 /AS30 /DS30 /RC2 T50 /NTN" />
+
+	<!-- clean up the Output Plate ETOH left over from the wash. --> 
+	<!-- Keep the tips from the transfer and use them to remove waste from wells - overaspirate to full 50 for this -->
+	<line1820 cmd="MT PL_OUTPUT ML /ZN9 VL /VL50 AP /AA5 /AS30 /AD0 PL_REAGENT ML /MLWASTE DP /DS50 /DD500 T50 /NTN" />
+	<line1830 cmd="MT PL_OUTPUT ML /ZN10 VL /VL50 AP /AA5 /AS30 /AD0 PL_REAGENT ML /MLWASTE DP /DS50 /DD500 T50 /NTN" />
+	<line1840 cmd="MT PL_OUTPUT ML /ZN11 VL /VL50 AP /AA5 /AS30 /AD0 PL_REAGENT ML /MLWASTE DP /DS50 /DD500 T50 /NTN" />	
+	<line1850 cmd="MT PL_OUTPUT ML /ZN12 VL /VL50 AP /AA5 /AS30 /AD0 PL_REAGENT ML /MLWASTE DP /DS50 /DD500 T50 /NTY" />	
+	
+    <line1860 cmd="MP PL_POOL LOC_TC PRESS" />
+    <line1870 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line1880 cmd="TCD DC" />
+    <line1890 cmd="MC CV_REAGENT LOC_RC" />
+	
+	<!-- Hold at 10C -->
+	<line1900 cmd="SP T10.0 DUR10 R.5" />
+	
+    <line1910 cmd="LED 0 200 0" />
+  </script>
+</WpfGenBotCommonLib>

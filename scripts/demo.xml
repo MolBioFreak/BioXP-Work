@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WpfGenBotCommonLib>
+  <experiment>
+    <data name="System Demo V4" />
+  </experiment>
+  <tips>
+    <T1 id="T50" color="GREEN" />
+    <T2 id="T50" color="GREEN" />
+    <T3 id="T50" color="GREEN" />
+    <T4 id="T200" color="BLUE" />
+  </tips>
+  <reagents>
+    <plate type="1" />
+    <A3 volume="415" id="PCR" />
+    <C3 volume="415" id="PCR" />
+    <E3 volume="415" id="PCR" />
+    <G3 volume="415" id="PCR" />
+    </reagents>
+  <oligos>
+ <A1 volume="0" />
+    <B1 volume="0" />
+    <C1 volume="0" />
+    <D1 volume="0" />
+    <E1 volume="0" />
+    <F1 volume="0" />
+    <G1 volume="0" />
+    <H1 volume="0" />
+    <A2 volume="0" />
+    <B2 volume="0" />
+    <C2 volume="0" />
+    <D2 volume="0" />
+    <E2 volume="0" />
+    <F2 volume="0" />
+    <G2 volume="0" />
+    <H2 volume="0" />
+    <A3 volume="0" />
+    <B3 volume="0" />
+    <C3 volume="0" />
+    <D3 volume="0" />
+    <E3 volume="0" />
+    <F3 volume="0" />
+    <G3 volume="0" />
+    <H3 volume="0" />
+    <A4 volume="0" />
+    <B4 volume="0" />
+    <C4 volume="0" />
+    <D4 volume="0" />
+    <E4 volume="0" />
+    <F4 volume="0" />
+    <G4 volume="0" />
+    <H4 volume="0" />
+    </oligos>
+  <script>
+    <line1 step="1" />
+    <line2 cmd="LED 255 0 0" />
+    <line3 cmd="WAIT 1" />
+    <line4 cmd="LED 0 255 0" />
+    <line5 cmd="WAIT 1" />
+    <line6 cmd="LED 0 0 255" />
+    <line7 cmd="WAIT 1" />
+    <line14 cmd="LED 255 255 255" />
+    <line20 cmd="DELAYPOINT" />
+    <line41 step="2" />
+    <line42 cmd="PP PL_OUTPUT" />
+    <line43 cmd="LED 255 255 0" />    
+    <line44 cmd="PP PL_REAGENT" />
+    <line45 cmd="LED 255 51 255" />
+    <line50 cmd="TCD DO" />
+    <line51 cmd="LED 255 128 0" />
+    <line70 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line71 cmd="LED 0 255 255" />
+    <line80 cmd="PP PL_POOL" />
+    <line81 cmd="LED 255 0 255" />
+    <line85 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line86 cmd="LED 175 208 255" />
+    <line91 cmd="TCD DC" />
+    <line92 cmd="LED 255 0 0" />
+    <line93 cmd="WAIT 1" />
+    <line94 cmd="LED 0 0 255" />
+    <line95 cmd="WAIT 1" />  
+    <line96 cmd="LED 255 0 0" />
+    <line97 cmd="WAIT 1" />
+    <line98 cmd="LED 0 0 255" />
+    <line99 cmd="WAIT 1" />    
+    <line100 cmd="LED 255 255 255" /> 
+    <line101 step="3" />
+    <line110 cmd="MC CV_OUTPUT LOC_OC" />
+    <line111 cmd="LED 255 204 64" />
+    <line120 cmd="MC CV_REAGENT LOC_RC" />
+    <line121 cmd="LED 153 51 255" />    
+    <line130 cmd="MC CV_OUTPUT LOC_OCS" />
+    <line131 cmd="LED 255 0 127" />
+    <line140 cmd="MC CV_REAGENT LOC_RCS" />
+    <line150 cmd="TCD DO" />
+    <line200 cmd="MC CV_BIOSECURITY LOC_BSCS" />
+    <line201 step="4" />
+    <line202 cmd="LED 255 0 0" />
+    <line203 cmd="WAIT 1" />
+    <line204 cmd="LED 0 0 255" />
+    <line205 cmd="WAIT 1" />  
+    <line206 cmd="LED 255 0 0" />
+    <line207 cmd="WAIT 1" />
+    <line208 cmd="LED 0 0 255" />
+    <line209 cmd="WAIT 1" />    
+    <line210 cmd="LED 25 255 55" />     
+    <line215 cmd="PP PL_POOL" />
+    <line220 cmd="MP PL_POOL LOC_MS PRESS" />
+    <line221 cmd="LED 0 255 0" />
+    <line222 cmd="WAIT 1" />  
+    <line223 cmd="LED 255 255 255" />
+    <line230 cmd="MP PL_POOL LOC_TC PRESS" />
+    <line231 cmd="LED 90 255 199" />
+    <line232 cmd="WAIT 1" />  
+    <line233 cmd="LED 255 255 255" />    
+    <line240 cmd="MP PL_POOL LOC_MS PRESS" />
+    <line241 cmd="LED 0 255 155" />
+    <line242 cmd="WAIT 1" />  
+    <line243 cmd="LED 255 255 255" />    
+    <line250 cmd="MP PL_OUTPUT LOC_TC PRESS" />
+    <line251 cmd="LED 125 155 0" />
+    <line252 cmd="WAIT 1" />  
+    <line253 cmd="MC CV_BIOSECURITY LOC_TC" />
+    <line254 cmd="LED 255 255 255" />    
+    <line270 cmd="TCD DC" />
+    <line271 cmd="LED 0 255 0" /> 
+  </script>
+</WpfGenBotCommonLib>
