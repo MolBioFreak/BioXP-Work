@@ -9,6 +9,10 @@ The canonical runtime source is:
 
 All operational behavior described here is derived from that script.
 
+For external orchestration systems, the supported HTTP wrapper is:
+
+- `src/bioxp/api.py`
+
 ## Documentation Map
 1. `ARCHITECTURE_AND_CONTROL_PLANE.md`
    - End-to-end system architecture

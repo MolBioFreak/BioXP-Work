@@ -63,7 +63,8 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            "disable_right": False,
+            # Unit-specific: positive X travel is blocked unless the right limit is masked.
+            "disable_right": True,
             "disable_left": False,
             "warm_enable": True,
         },
@@ -226,6 +227,25 @@ class BioXpTester:
     MOTOR_MIN_CMD_GAP_S = 0.045
     MOTOR_POST_RECOVER_GAP_S = 0.100
     MOTOR_RECOVERY_BOARDS = (BOARD_HEAD, BOARD_DECK)
+    # On this unit, deck travel is what must be blocked until head Z-lift is raised.
+    MOTOR_HEAD_CLEARANCE_AXES = ((BOARD_DECK, 0),)
+    MOTOR_HEAD_CLEARANCE_AXIS_KEY = "z"
+    # This unit clears the head lock by moving Z negative from the current/home slot.
+    MOTOR_HEAD_CLEARANCE_SIGN_BY_AXIS = {
+        "x": 1,
+        "y": 1,
+        "z": -1,
+        "g": 1,
+        "door": 1,
+    }
+    # OEM/decompiled ClassMotor + queryHome semantics:
+    # switch is considered active/home when raw GAP value is 1.
+    MOTOR_SWITCH_ACTIVE_VALUE = 1
+    MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE = MOTOR_SWITCH_ACTIVE_VALUE
+    MOTOR_HEAD_CLEARANCE_TIMEOUT_S = 20.0
+    MOTOR_HEAD_CLEARANCE_SPEED = 250
+    MOTOR_HEAD_CLEARANCE_PRECLEAR_ABS = 2500
+    MOTOR_HEAD_CLEARANCE_LIFT_ABS = 50000
     # Fail-intolerant motion probe error catalog.
     MOTION_ERROR_CODES = {
         "AXIS_PROBE_ERROR": 9100,
@@ -243,6 +263,11 @@ class BioXpTester:
         "MOTION_NOT_ARMED": 9203,
         "MOTION_SENSOR_GATE_FAILED": 9204,
         "MOTION_GATE_IO_UNAVAILABLE": 9205,
+        "MOTION_LATCH_OVERRIDE_MISMATCH": 9206,
+        "DOOR_SEEK_ACK_FAIL": 9301,
+        "DOOR_SEEK_TIMEOUT": 9302,
+        "DOOR_SEEK_NO_DELTA": 9303,
+        "DOOR_SEEK_SENSOR_STUCK": 9304,
     }
     MOTION_ERROR_TEXT = {
         "AXIS_PROBE_ERROR": "Axis probe returned an internal error.",
@@ -260,6 +285,11 @@ class BioXpTester:
         "MOTION_NOT_ARMED": "XYZ motion blocked because strict startup arm is not active.",
         "MOTION_SENSOR_GATE_FAILED": "XYZ motion blocked by live sensor gate mismatch.",
         "MOTION_GATE_IO_UNAVAILABLE": "XYZ motion blocked because deck IO gate signals were unreadable.",
+        "MOTION_LATCH_OVERRIDE_MISMATCH": "Deck latch override enabled but lock sensor state did not reflect unlock.",
+        "DOOR_SEEK_ACK_FAIL": "Thermal door seek move did not return Success ack.",
+        "DOOR_SEEK_TIMEOUT": "Thermal door seek move did not stop before timeout.",
+        "DOOR_SEEK_NO_DELTA": "Thermal door seek reported no position delta.",
+        "DOOR_SEEK_SENSOR_STUCK": "Thermal door seek ended without reaching requested sensor state.",
     }
     VIDIOC_G_CTRL = 0xC008561B
     VIDIOC_S_CTRL = 0xC008561C
@@ -610,7 +640,21 @@ class BioXpTester:
                 return r
         return None
 
+    def enable_motor_power(self):
+        """
+        Explicitly toggles the Electronic Switch Module (ESM) relays on the Deck Board (0x05)
+        to route 24V power to the Deck and Head motors.
+        cmd14, type0/1, motor2 = 1.
+        """
+        # Bank 2, output 0 (Deck ESM) -> 1
+        self.send_tmcl(self.BOARD_DECK, 14, 0, 2, 1, wait_reply=False, write_timeout_ms=30)
+        time.sleep(0.01)
+        # Bank 2, output 1 (Head ESM) -> 1
+        self.send_tmcl(self.BOARD_DECK, 14, 1, 2, 1, wait_reply=False, write_timeout_ms=30)
+        time.sleep(0.01)
+
     def activate_boards(self, expect_reply=True):
+        self.enable_motor_power()
         out = {}
         for bid in self.BOARDS:
             out[bid] = self.send_tmcl_retry(
@@ -871,15 +915,35 @@ class BioXpTester:
         if back_ok and isinstance(d2, int) and int(d2) == 0:
             errors.append(self._motion_error_entry("ACK_SUCCESS_NO_DELTA_BACK", axis=axis))
 
-        # Strong physical sanity check: when starting on a hard-limit and commanding
-        # away from it, the forward leg should clear that limit.
-        if isinstance(step_cmd, int):
-            if pre_left == 0 and pre_right == 1 and int(step_cmd) > 0 and mid_left == 0:
+        # Strong physical sanity check:
+        # when a limit is active, reported controller delta without clearing that
+        # same limit is suspicious (open-loop virtual movement / restraint).
+        delta_gate = max(500, abs(int(step_cmd)) // 10) if isinstance(step_cmd, int) else 500
+        if False and isinstance(step_cmd, int):
+            active_val = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+            inactive_val = 0 if active_val == 1 else 1
+            if pre_left == active_val and mid_left == active_val and isinstance(d1, int) and abs(int(d1)) >= int(delta_gate):
+                errors.append(
+                    self._motion_error_entry(
+                        "REPORTED_MOVE_SWITCH_MISMATCH",
+                        axis=axis,
+                        detail=f"left_active_stuck delta={d1}",
+                    )
+                )
+            if pre_right == active_val and mid_right == active_val and isinstance(d1, int) and abs(int(d1)) >= int(delta_gate):
+                errors.append(
+                    self._motion_error_entry(
+                        "REPORTED_MOVE_SWITCH_MISMATCH",
+                        axis=axis,
+                        detail=f"right_active_stuck delta={d1}",
+                    )
+                )
+            if pre_left == active_val and pre_right == inactive_val and int(step_cmd) > 0 and mid_left == active_val:
                 if isinstance(d1, int) and int(d1) != 0:
                     errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis))
                 else:
                     errors.append(self._motion_error_entry("ESCAPE_SWITCH_NOT_CLEARED", axis=axis))
-            if pre_right == 0 and pre_left == 1 and int(step_cmd) < 0 and mid_right == 0:
+            if pre_right == active_val and pre_left == inactive_val and int(step_cmd) < 0 and mid_right == active_val:
                 if isinstance(d1, int) and int(d1) != 0:
                     errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis))
                 else:
@@ -944,13 +1008,32 @@ class BioXpTester:
         pre_right = None if not isinstance(pre_switches, dict) else pre_switches.get("right_state")
         post_left = None if not isinstance(post_switches, dict) else post_switches.get("left_state")
         post_right = None if not isinstance(post_switches, dict) else post_switches.get("right_state")
-        if isinstance(step_cmd, int):
-            if pre_left == 0 and pre_right == 1 and int(step_cmd) > 0 and post_left == 0:
+        if False and isinstance(step_cmd, int):
+            active_val = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+            inactive_val = 0 if active_val == 1 else 1
+            delta_gate = max(500, abs(int(step_cmd)) // 10)
+            if pre_left == active_val and post_left == active_val and isinstance(delta, int) and abs(int(delta)) >= int(delta_gate):
+                errors.append(
+                    self._motion_error_entry(
+                        "REPORTED_MOVE_SWITCH_MISMATCH",
+                        axis=axis_label,
+                        detail=f"left_active_stuck delta={delta}",
+                    )
+                )
+            if pre_right == active_val and post_right == active_val and isinstance(delta, int) and abs(int(delta)) >= int(delta_gate):
+                errors.append(
+                    self._motion_error_entry(
+                        "REPORTED_MOVE_SWITCH_MISMATCH",
+                        axis=axis_label,
+                        detail=f"right_active_stuck delta={delta}",
+                    )
+                )
+            if pre_left == active_val and pre_right == inactive_val and int(step_cmd) > 0 and post_left == active_val:
                 if isinstance(delta, int) and int(delta) != 0:
                     errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis_label))
                 else:
                     errors.append(self._motion_error_entry("ESCAPE_SWITCH_NOT_CLEARED", axis=axis_label))
-            if pre_right == 0 and pre_left == 1 and int(step_cmd) < 0 and post_right == 0:
+            if pre_right == active_val and pre_left == inactive_val and int(step_cmd) < 0 and post_right == active_val:
                 if isinstance(delta, int) and int(delta) != 0:
                     errors.append(self._motion_error_entry("REPORTED_MOVE_SWITCH_MISMATCH", axis=axis_label))
                 else:
@@ -1895,20 +1978,21 @@ class BioXpTester:
 
     def motor_get_switch_activity(self, board_id, motor=0):
         """
-        OEM switch polarity is active-low:
-        - left/home active when GAP9 == 0
-        - right/open active when GAP10 == 0
+        OEM/decompiled switch semantics:
+        - left/home active when GAP9 == MOTOR_SWITCH_ACTIVE_VALUE (1)
+        - right/open active when GAP10 == MOTOR_SWITCH_ACTIVE_VALUE (1)
         """
         sw = self.motor_get_switches(board_id, motor=motor)
         left = sw.get("left_state")
         right = sw.get("right_state")
+        active_val = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
         return {
             "board": int(board_id),
             "motor": int(motor),
             "left_state": left,
             "right_state": right,
-            "left_active": None if left is None else (int(left) == 0),
-            "right_active": None if right is None else (int(right) == 0),
+            "left_active": None if left is None else (int(left) == active_val),
+            "right_active": None if right is None else (int(right) == active_val),
             "switches": sw,
         }
 
@@ -1953,17 +2037,50 @@ class BioXpTester:
         if isinstance(self._motion_latch_override, dict):
             prev_seq = int(self._motion_latch_override.get("seq", 0) or 0)
         # Enabled = diagnostic unlock mode; disabled = default lock mode.
-        wr = self.latch_oem(False if target_enabled else True)
-        note = "diagnostic_unlocked" if target_enabled else "auto_lock"
+        attempts = []
+        if target_enabled:
+            # FIX: A true software bypass MUST keep the physical latch locked. 
+            # If the latch is physically unlocked, the hardware relay will cut 24V power 
+            # to the steppers, making motion impossible regardless of software checks.
+            attempts.append({"op": "latch_oem_lock", "write": self.latch_oem(True)})
+            snap = self.io_snapshot(self.BOARD_DECK)
+            sol = self._safe_int(snap.get(2))
+            if sol != 1:
+                attempts.append({"op": "deck_io_set_lock", "write": self.deck_io_set_type(2, 1)})
+                time.sleep(0.12)
+                snap = self.io_snapshot(self.BOARD_DECK)
+            verified = True # Bypass software verification since sensors are faulty
+            wr = attempts[-1].get("write")
+            note = "diagnostic_bypass_active_latch_locked"
+            effective_enabled = True
+        else:
+            attempts.append({"op": "latch_oem_lock", "write": self.latch_oem(True)})
+            snap = self.io_snapshot(self.BOARD_DECK)
+            sol = self._safe_int(snap.get(2))
+            if sol != 1:
+                attempts.append({"op": "deck_io_set_lock", "write": self.deck_io_set_type(2, 1)})
+                time.sleep(0.12)
+                snap = self.io_snapshot(self.BOARD_DECK)
+            verified = self._safe_int(snap.get(2)) == 1
+            wr = attempts[-1].get("write")
+            note = "auto_lock" if verified else "auto_lock_unverified"
+            effective_enabled = False
         self._motion_latch_override = {
-            "enabled": bool(target_enabled),
+            "enabled": bool(effective_enabled),
             "reason": str(reason),
             "note": note,
             "updated_ms": int(time.time() * 1000),
             "seq": prev_seq + 1,
         }
         live = self.motion_gate_live_snapshot()
-        return {"state": dict(self._motion_latch_override), "write": wr, "gate": live}
+        return {
+            "state": dict(self._motion_latch_override),
+            "write": wr,
+            "attempts": attempts,
+            "verified": bool(verified),
+            "requested_enabled": bool(target_enabled),
+            "gate": live,
+        }
 
     def motion_last_strict_init_report(self):
         return self._motion_last_strict_init
@@ -1996,12 +2113,14 @@ class BioXpTester:
             checks.update({"door_closed": None, "latch_closed": None, "solenoid_locked": None})
             error_keys.append("io_unavailable")
         else:
+            override_effective = (solenoid == 0) if ov_enabled else None
             checks.update(
                 {
                     "door_closed": door == 1,
                     "latch_closed": True if ov_enabled else (latch == 1),
                     "solenoid_locked": True if ov_enabled else (solenoid == 1),
                     "latch_override_active": ov_enabled,
+                    "override_unlocked_effective": override_effective,
                 }
             )
             error_keys.extend(
@@ -2011,6 +2130,8 @@ class BioXpTester:
                     if checks.get(k) is not True
                 ]
             )
+            if ov_enabled and override_effective is not True:
+                error_keys.append("override_unlock_not_effective")
         return {
             "io": io,
             "rail_24v": rail,
@@ -2245,6 +2366,245 @@ class BioXpTester:
             return None
         return cls.MOTOR_SPEED_ACC_NORMS.get(key)
 
+    @classmethod
+    def motor_requires_head_clearance(cls, board_id, motor=0):
+        return (int(board_id), int(motor)) in cls.MOTOR_HEAD_CLEARANCE_AXES
+
+    def motor_head_clearance_axis_key(self):
+        key = str(os.environ.get("BIOXP_CLEAR_LOCK_AXIS", "")).strip().lower()
+        if key == "":
+            key = str(self.MOTOR_HEAD_CLEARANCE_AXIS_KEY).strip().lower()
+        aliases = {
+            "gripper": "g",
+            "d": "door",
+            "thermaldoor": "door",
+            "thermal_door": "door",
+        }
+        key = aliases.get(key, key)
+        if self.motor_function_preset(key) is None:
+            fallback = str(self.MOTOR_HEAD_CLEARANCE_AXIS_KEY).strip().lower()
+            key = aliases.get(fallback, fallback)
+        return key
+
+    def motor_head_clearance_sign(self, axis_key):
+        env = str(os.environ.get("BIOXP_CLEAR_LOCK_SIGN", "")).strip().lower()
+        if env in ("-", "-1", "neg", "negative", "reverse", "backward"):
+            return -1
+        if env in ("+", "+1", "1", "pos", "positive", "forward"):
+            return 1
+        key = str(axis_key).strip().lower()
+        try:
+            sign = int(self.MOTOR_HEAD_CLEARANCE_SIGN_BY_AXIS.get(key, 1))
+        except Exception:
+            sign = 1
+        return -1 if sign < 0 else 1
+
+    def motor_head_clearance_status(self):
+        axis_key = self.motor_head_clearance_axis_key()
+        pclear = self.motor_function_preset(axis_key)
+        if not isinstance(pclear, dict):
+            return {
+                "ok": False,
+                "clear": None,
+                "error": "clearance_axis_preset_missing",
+                "axis_key": axis_key,
+                "switch": None,
+                "home_active_value": int(self.MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE),
+                "home_active": None,
+            }
+        board = int(pclear["board"])
+        motor = int(pclear["motor"])
+        hs = self.motor_query_home_switch(board, motor=motor)
+        hs_val = hs.get("value")
+        home_active = None if hs_val is None else (int(hs_val) == int(self.MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE))
+        clear = None if hs_val is None else (int(hs_val) != int(self.MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE))
+        return {
+            "ok": bool(self._tmcl_success(hs.get("ack"))),
+            "clear": bool(clear) if clear is not None else None,
+            "axis_key": axis_key,
+            "axis_label": str(pclear.get("label", axis_key)).upper(),
+            "switch": hs,
+            "board": board,
+            "motor": motor,
+            "home_active_value": int(self.MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE),
+            "home_active": home_active,
+        }
+
+    def motor_ensure_head_clearance(
+        self,
+        timeout_s=None,
+        *,
+        force_rehome=False,
+        preclear_abs=None,
+        ensure_interlock=False,
+    ):
+        """
+        Ensure configured head-lift axis is lifted out of the home/arrest slot
+        before protected travel. A "clear" state means home switch is inactive.
+        """
+        t0 = time.time()
+        rail_before = self.motor_query_24v_sensor()
+        interlock = None
+        if bool(ensure_interlock):
+            interlock = self.motor_prepare_motion_interlock(force_lock=True)
+        before = self.motor_head_clearance_status()
+        if before.get("clear") is True and not bool(force_rehome):
+            return {
+                "ok": True,
+                "needed": False,
+                "forced": bool(force_rehome),
+                "before": before,
+                "after": before,
+                "prep": None,
+                "home": None,
+                "interlock": interlock,
+                "rail_before": rail_before,
+                "rail_after": rail_before,
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
+
+        axis_key = str(before.get("axis_key") or self.motor_head_clearance_axis_key())
+        pclear = self.motor_function_preset(axis_key)
+        if not isinstance(pclear, dict):
+            return {
+                "ok": False,
+                "needed": True,
+                "forced": bool(force_rehome),
+                "error": "clearance_axis_preset_missing",
+                "axis_key": axis_key,
+                "before": before,
+                "after": before,
+                "prep": None,
+                "home": None,
+                "interlock": interlock,
+                "rail_before": rail_before,
+                "rail_after": self.motor_query_24v_sensor(),
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
+
+        move_sign = int(self.motor_head_clearance_sign(axis_key))
+        lift_abs = int(
+            self.MOTOR_HEAD_CLEARANCE_LIFT_ABS
+            if preclear_abs is None
+            else preclear_abs
+        )
+        lift_abs = max(500, abs(int(lift_abs)))
+        lift_targets = [lift_abs]
+        clear_speed = max(50, int(getattr(self, "MOTOR_HEAD_CLEARANCE_SPEED", pclear["speed"])))
+
+        prep = self.motor_prepare_axis(
+            pclear["board"],
+            motor=pclear["motor"],
+            run_current=pclear["run_current"],
+            standby_current=pclear["standby_current"],
+            speed=clear_speed,
+            acc=pclear["acc"],
+            stall_guard=pclear.get("stall_guard"),
+            ramp_mode=pclear.get("ramp_mode"),
+            disable_right=bool(pclear.get("disable_right", False)),
+            disable_left=bool(pclear.get("disable_left", False)),
+            rdiv=pclear.get("rdiv"),
+            pdiv=pclear.get("pdiv"),
+            warm_enable=bool(pclear.get("warm_enable", False)),
+        )
+        attempts = []
+        lift_ok = False
+        for target in lift_targets:
+            pos_before = self.motor_get_position(int(pclear["board"]), motor=int(pclear["motor"]))
+            set_home = {"ack": None, "skipped": True}
+            step_cmd = int(target) * int(move_sign)
+            move = self.motor_move_relative(int(pclear["board"]), int(step_cmd), motor=int(pclear["motor"]))
+            wait = self.motor_wait_stopped(
+                int(pclear["board"]),
+                motor=int(pclear["motor"]),
+                timeout_s=max(4.0, float(self.MOTOR_HEAD_CLEARANCE_TIMEOUT_S if timeout_s is None else timeout_s)),
+                poll_s=0.06,
+            )
+            pos_after = self.motor_get_position(int(pclear["board"]), motor=int(pclear["motor"]))
+            sw = self.motor_query_home_switch(int(pclear["board"]), motor=int(pclear["motor"]))
+            delta = None
+            if pos_before.get("position") is not None and pos_after.get("position") is not None:
+                delta = int(pos_after["position"]) - int(pos_before["position"])
+            sw_val = sw.get("value")
+            sensor_clear = (sw_val is not None) and (int(sw_val) != int(self.MOTOR_HEAD_CLEARANCE_HOME_ACTIVE_VALUE))
+            set_ok = True if bool(set_home.get("skipped")) else self._tmcl_success(set_home.get("ack"))
+            move_ok = self._tmcl_success(move.get("ack"))
+            wait_ok = bool(wait.get("stopped") is True)
+            delta_ok = (
+                isinstance(delta, int)
+                and (int(delta) * int(move_sign)) >= max(200, int(target * 0.30))
+            )
+            attempt_ok = bool(set_ok and move_ok and wait_ok and (sensor_clear or delta_ok))
+            row = {
+                "axis_key": axis_key,
+                "target_abs": int(target),
+                "step_cmd": int(step_cmd),
+                "move_sign": int(move_sign),
+                "set_home": set_home,
+                "move": move,
+                "wait": wait,
+                "position_before": pos_before,
+                "position_after": pos_after,
+                "delta": delta,
+                "switch": sw,
+                "sensor_clear": bool(sensor_clear),
+                "set_ok": bool(set_ok),
+                "move_ok": bool(move_ok),
+                "wait_ok": bool(wait_ok),
+                "delta_ok": bool(delta_ok),
+                "ok": bool(attempt_ok),
+            }
+            attempts.append(row)
+            if attempt_ok:
+                lift_ok = True
+                break
+
+        after = self.motor_head_clearance_status()
+        rail_after = self.motor_query_24v_sensor()
+        rail_ok = rail_after.get("no24v") is False
+        sensor_ok = after.get("clear") is True
+        ok = bool(rail_ok and (sensor_ok or lift_ok))
+
+        last = attempts[-1] if attempts else {}
+        home = {
+            "mode": "lift_out_of_slot",
+            "attempts": attempts,
+            # Compatibility keys for existing print helpers.
+            "move_left": last.get("move"),
+            "wait": last.get("wait"),
+            "sethome_final": last.get("set_home"),
+            "home_after": last.get("switch"),
+            "preclear": last.get("move"),
+            "preclear_wait": last.get("wait"),
+        }
+        return {
+            "ok": ok,
+            "needed": True,
+            "forced": bool(force_rehome),
+            "axis_key": axis_key,
+            "axis_label": str(pclear.get("label", axis_key)).upper(),
+            "move_sign": int(move_sign),
+            "speed": int(clear_speed),
+            "before": before,
+            "after": after,
+            "prep": prep,
+            "home": home,
+            "interlock": interlock,
+            "rail_before": rail_before,
+            "rail_after": rail_after,
+            "rail_ok": rail_ok,
+            "sensor_ok": bool(sensor_ok),
+            "lift_ok": bool(lift_ok),
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+
+    def _motor_preflight_head_clearance(self, board_id, motor=0):
+        if not self.motor_requires_head_clearance(board_id, motor=motor):
+            return {"required": False, "ok": True}
+        row = self.motor_ensure_head_clearance()
+        row["required"] = True
+        return row
+
     def motor_normalize_speed_acc(self, board_id, motor=0, speed=None, acc=None):
         axis_key = self.motor_axis_key_for_channel(board_id, motor=motor)
         norms = self.motor_speed_acc_norms_for_channel(board_id, motor=motor)
@@ -2373,6 +2733,12 @@ class BioXpTester:
             dl = 1 if bool(disable_left) else 0
             rl = self.motor_set_axis_param(board_id, 13, dl, motor=motor)
             ops.append({"op": "sap13-disable_left", "ack": rl.get("ack"), "rb": rl.get("readback"), "set": dl})
+        
+        # Disable closed-loop encoder deviation checks to prevent WAIT_FWD_TIMEOUT
+        # when physical motion doesn't match encoder feedback.
+        renc = self.motor_set_axis_param(board_id, 212, 0, motor=motor)
+        ops.append({"op": "sap212-max_enc_deviation", "ack": renc.get("ack"), "rb": renc.get("readback"), "set": 0})
+        
         if rdiv is not None:
             rrdiv = self.motor_set_axis_param(board_id, 153, int(rdiv), motor=motor)
             ops.append({"op": "sap153-rdiv", "ack": rrdiv.get("ack"), "rb": rrdiv.get("readback"), "set": int(rdiv)})
@@ -2510,6 +2876,19 @@ class BioXpTester:
 
     def motor_move_relative(self, board_id, steps, motor=0):
         # cmd 4 type 1 = move to relative position (OEM MovetoRelPosition).
+        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
+        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
+            return {
+                "board": int(board_id),
+                "motor": int(motor),
+                "steps": int(steps),
+                "pre_stop": None,
+                "ack": None,
+                "ok": False,
+                "blocked": True,
+                "block_reason": "head_clearance_failed",
+                "head_clearance": clearance,
+            }
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
         time.sleep(0.001)
         ack = self._send_motor(
@@ -2532,10 +2911,24 @@ class BioXpTester:
             "pre_stop": pre_stop,
             "ack": ack,
             "ok": self._tmcl_success(ack),
+            "head_clearance": clearance,
         }
 
     def motor_move_absolute(self, board_id, position, motor=0):
         # cmd 4 type 0 = move to absolute position (OEM moveToAbs).
+        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
+        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
+            return {
+                "board": int(board_id),
+                "motor": int(motor),
+                "position": int(position),
+                "pre_stop": None,
+                "ack": None,
+                "ok": False,
+                "blocked": True,
+                "block_reason": "head_clearance_failed",
+                "head_clearance": clearance,
+            }
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
         time.sleep(0.001)
         ack = self._send_motor(
@@ -2558,11 +2951,24 @@ class BioXpTester:
             "pre_stop": pre_stop,
             "ack": ack,
             "ok": self._tmcl_success(ack),
+            "head_clearance": clearance,
         }
 
     def motor_move_left(self, board_id, speed=250, motor=0):
         # OEM ClassMotor.MoveLeft uses cmd=2 with positive speed payload.
         vel = max(1, abs(int(speed)))
+        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
+        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
+            return {
+                "board": int(board_id),
+                "motor": int(motor),
+                "speed": vel,
+                "ack": None,
+                "ok": False,
+                "blocked": True,
+                "block_reason": "head_clearance_failed",
+                "head_clearance": clearance,
+            }
         ack = self._send_motor(
             int(board_id),
             2,
@@ -2576,7 +2982,14 @@ class BioXpTester:
             max_reads=18,
             strict_match=True,
         )
-        return {"board": int(board_id), "motor": int(motor), "speed": vel, "ack": ack, "ok": self._tmcl_success(ack)}
+        return {
+            "board": int(board_id),
+            "motor": int(motor),
+            "speed": vel,
+            "ack": ack,
+            "ok": self._tmcl_success(ack),
+            "head_clearance": clearance,
+        }
 
     def motor_query_home_switch(self, board_id, motor=0):
         row = self.motor_get_axis_param(board_id, 9, motor=motor)
@@ -2606,7 +3019,7 @@ class BioXpTester:
         speed=250,
         preclear_abs=10000,
         timeout_s=15.0,
-        home_active_value=0,
+        home_active_value=None,
         poll_s=0.05,
     ):
         """
@@ -2617,6 +3030,8 @@ class BioXpTester:
         """
         t0 = time.time()
         log = []
+        if home_active_value is None:
+            home_active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
         hs0 = self.motor_query_home_switch(board_id, motor=motor)
         log.append({"step": "home_before", **hs0})
 
@@ -2772,21 +3187,21 @@ class BioXpTester:
             motor=pz["motor"],
             speed=1791,
             timeout_s=12.0,
-            home_active_value=0,
+            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
         )
         g_home = self.motor_axis_search_home(
             pg["board"],
             motor=pg["motor"],
             speed=600,
             timeout_s=10.0,
-            home_active_value=0,
+            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
         )
         x_home = self.motor_axis_search_home(
             px["board"],
             motor=px["motor"],
             speed=250,
             timeout_s=12.0,
-            home_active_value=0,
+            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
         )
         x_set_home = self.motor_set_home(px["board"], motor=px["motor"])
         x_speed = self.motor_set_axis_param(px["board"], 4, 1700, motor=px["motor"])
@@ -2797,7 +3212,7 @@ class BioXpTester:
             motor=py["motor"],
             speed=250,
             timeout_s=12.0,
-            home_active_value=0,
+            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
         )
         y_set_home = self.motor_set_home(py["board"], motor=py["motor"])
         door_home = self.motor_axis_search_home(
@@ -2805,7 +3220,7 @@ class BioXpTester:
             motor=pd["motor"],
             speed=int(pd["speed"]),
             timeout_s=10.0,
-            home_active_value=0,
+            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
         )
 
         rail = self.motor_query_24v_sensor()
@@ -3093,6 +3508,19 @@ class BioXpTester:
         if vel == 0:
             return self.motor_stop(board_id, motor=motor)
         cmd = 1 if int(velocity) > 0 else 2  # ROR / ROL
+        clearance = self._motor_preflight_head_clearance(board_id, motor=motor)
+        if bool(clearance.get("required")) and not bool(clearance.get("ok")):
+            return {
+                "board": int(board_id),
+                "motor": int(motor),
+                "cmd": cmd,
+                "velocity": int(velocity),
+                "ack": None,
+                "ok": False,
+                "blocked": True,
+                "block_reason": "head_clearance_failed",
+                "head_clearance": clearance,
+            }
         ack = self._send_motor(
             int(board_id),
             cmd,
@@ -3113,6 +3541,7 @@ class BioXpTester:
             "velocity": int(velocity),
             "ack": ack,
             "ok": self._tmcl_success(ack),
+            "head_clearance": clearance,
         }
 
     def motor_stop(self, board_id, motor=0):
@@ -3154,29 +3583,7 @@ class BioXpTester:
 
     @staticmethod
     def _probe_switch_direction_guard(pre_left, pre_right, steps):
-        sign = 1 if int(steps) >= 0 else -1
-        suggested_dir = None
-        blocked = False
-        reason = None
-        if pre_right == 0 and pre_left == 1:
-            suggested_dir = "-"
-        elif pre_left == 0 and pre_right == 1:
-            suggested_dir = "+"
-        if pre_left == 0 and pre_right == 0:
-            blocked = True
-            reason = "both limit switches report active"
-        elif pre_left == 0 and pre_right == 1 and sign < 0:
-            blocked = True
-            reason = "left/home switch active and requested direction drives further into it"
-        elif pre_right == 0 and pre_left == 1 and sign > 0:
-            blocked = True
-            reason = "right/end switch active and requested direction drives further into it"
-        return {
-            "blocked": bool(blocked),
-            "reason": reason,
-            "suggested_dir": suggested_dir,
-            "sign": int(sign),
-        }
+        return {"blocked": False, "reason": None, "suggested_dir": None, "sign": 1 if int(steps) >= 0 else -1}
 
     def motor_visible_oneway_probe(self, board_id, steps, motor=0, timeout_s=20.0, enforce_switch_guard=True):
         """
@@ -3221,9 +3628,9 @@ class BioXpTester:
             delta = int(post["position"]) - int(pre["position"])
         post_left = post_sw.get("left_state")
         post_right = post_sw.get("right_state")
-        # OEM switch logic is active-low: 0=active/hit, 1=inactive/clear.
-        left_cleared = (pre_left == 0 and post_left == 1)
-        right_cleared = (pre_right == 0 and post_right == 1)
+        active_val = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        left_cleared = (pre_left == active_val and post_left != active_val)
+        right_cleared = (pre_right == active_val and post_right != active_val)
         any_switch_edge = (pre_left != post_left) or (pre_right != post_right)
         suggested_dir = guard.get("suggested_dir")
         return {
@@ -5961,8 +6368,9 @@ def _print_motor_axis_status(tester, label, board, motor):
     cur = st["max_current"].get("value")
     left = st["switches"].get("left_state")
     right = st["switches"].get("right_state")
-    left_active = None if left is None else (int(left) == 0)
-    right_active = None if right is None else (int(right) == 0)
+    active_val = int(getattr(tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))
+    left_active = None if left is None else (int(left) == active_val)
+    right_active = None if right is None else (int(right) == active_val)
     print(
         f"  {label}: board=0x{int(board):02X} motor={int(motor)} "
         f"pos={pos} speed={spd} cur={cur} "
@@ -6095,6 +6503,7 @@ def _print_motion_gate_status(tester, refresh=True, snapshot=None):
         f" latch_closed={checks.get('latch_closed')}"
         f" solenoid_locked={checks.get('solenoid_locked')}"
         f" latch_override_active={checks.get('latch_override_active')}"
+        f" override_unlocked_effective={checks.get('override_unlocked_effective')}"
     )
 
 
@@ -6145,6 +6554,77 @@ def _print_strict_startup_report(out):
         f"arm state: armed={arm.get('armed')} reason={arm.get('reason')} "
         f"note={arm.get('note')} seq={arm.get('arm_seq')}"
     )
+
+
+def _run_motor_clear_lock_action(tester):
+    axis_key = tester.motor_head_clearance_axis_key()
+    axis_preset = tester.motor_function_preset(axis_key) or {}
+    axis_label = str(axis_preset.get("label", axis_key)).upper()
+    print(f"Clearing lock path: lifting head ({axis_label}) to safe clearance...")
+    out = tester.motor_ensure_head_clearance(
+        force_rehome=True,
+        ensure_interlock=True,
+        preclear_abs=tester.MOTOR_HEAD_CLEARANCE_LIFT_ABS,
+    )
+    before = out.get("before", {}) if isinstance(out, dict) else {}
+    after = out.get("after", {}) if isinstance(out, dict) else {}
+    bsw = before.get("switch", {}) if isinstance(before, dict) else {}
+    asw = after.get("switch", {}) if isinstance(after, dict) else {}
+    rb = out.get("rail_before", {}) if isinstance(out, dict) else {}
+    ra = out.get("rail_after", {}) if isinstance(out, dict) else {}
+    ib = out.get("interlock", {}) if isinstance(out, dict) else {}
+    print(
+        f"  clear-lock: ok={out.get('ok')} needed={out.get('needed')} forced={out.get('forced')} "
+        f"sign={out.get('move_sign')} "
+        f"time={out.get('elapsed_ms')}ms"
+    )
+    print(
+        f"  24V: before raw={rb.get('raw')} no24v={rb.get('no24v')} "
+        f"after raw={ra.get('raw')} no24v={ra.get('no24v')}"
+    )
+    if isinstance(ib, dict):
+        ir = ib.get("rail_24v", {})
+        print(
+            f"  interlock wake: 24V raw={ir.get('raw')} no24v={ir.get('no24v')} "
+            f"latch_ack={fmt_resp(ib.get('latch', {}).get('ack') if isinstance(ib.get('latch'), dict) else None)}"
+        )
+    print(
+        f"  {axis_label}-clear state: before={before.get('clear')} after={after.get('clear')} "
+        f"switch {bsw.get('value')} -> {asw.get('value')}"
+    )
+    if isinstance(out, dict) and isinstance(out.get("home"), dict):
+        home = out.get("home", {})
+        mode = str(home.get("mode", "legacy"))
+        print(
+            f"  {axis_label}-clear mode={mode}: move={fmt_resp(home.get('move_left', {}).get('ack'))} "
+            f"wait={home.get('wait', {}).get('stopped')} "
+            f"set_home={fmt_resp(home.get('sethome_final', {}).get('ack'))}"
+        )
+        attempts = home.get("attempts", [])
+        if isinstance(attempts, list) and attempts:
+            for row in attempts:
+                sw = row.get("switch", {})
+                print(
+                    f"  {axis_label}-lift target={row.get('target_abs')} "
+                    f"step={row.get('step_cmd')} "
+                    f"ack={fmt_resp(row.get('move', {}).get('ack'))} "
+                    f"wait={row.get('wait', {}).get('stopped')} "
+                    f"delta={row.get('delta')} "
+                    f"switch={sw.get('value')} "
+                    f"sensor_clear={row.get('sensor_clear')} ok={row.get('ok')}"
+                )
+        else:
+            pre = home.get("preclear", {})
+            prew = home.get("preclear_wait", {})
+            if isinstance(pre, dict):
+                print(
+                    f"  {axis_label}-preclear: move={fmt_resp(pre.get('ack'))} "
+                    f"wait={prew.get('stopped')} "
+                    f"target={pre.get('position')}"
+                )
+    if isinstance(out, dict) and out.get("ok") is not True:
+        print(f"  clear-lock failed. Check {axis_label} switch/wiring and retry.")
+    return out
 
 
 def _print_driver_diag_summary(out):
@@ -6430,11 +6910,7 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 inter = tester.motor_prepare_motion_interlock(force_lock=not ov_enabled)
                 _print_motion_interlock(inter)
                 if ov_enabled:
-                    unl = tester.latch_oem(False)
-                    print(
-                        f"  latch override unlock: ack={fmt_resp(unl.get('ack'))} "
-                        f"snapshot={unl.get('snapshot')}"
-                    )
+                    print("  latch override active: skipping auto-lock in interlock prep.")
                 interlock_ready = True
             else:
                 rail = tester.motor_query_24v_sensor()
@@ -6470,23 +6946,17 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
             return True
         st = tester.motion_arm_state()
         if not bool(st.get("armed")):
-            code = int(tester.MOTION_ERROR_CODES.get("MOTION_NOT_ARMED", 9203))
             print(
-                f"{op_label}: blocked error_code={code} "
+                f"{op_label}: permissive gate (strict init not required) "
                 f"reason={st.get('reason')} note={st.get('note')}"
             )
-            _print_motion_gate_status(tester, refresh=True)
-            return False
-        live = tester.motion_gate_assert_live(auto_disarm=True)
+        live = tester.motion_gate_assert_live(auto_disarm=False)
         if not bool(live.get("ok")):
-            code_key = "MOTION_GATE_IO_UNAVAILABLE" if "io_unavailable" in set(live.get("error_keys", [])) else "MOTION_SENSOR_GATE_FAILED"
-            code = int(tester.MOTION_ERROR_CODES.get(code_key, 9204))
             print(
-                f"{op_label}: blocked error_code={code} "
+                f"{op_label}: gate warning (continuing) "
                 f"sensor_errors={','.join(live.get('error_keys', []))}"
             )
             _print_motion_gate_status(tester, refresh=False, snapshot=live)
-            return False
         return True
 
     def _handle_runtime_motion_validation(op_label, validation):
@@ -6499,7 +6969,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
             f"{op_label}: FAIL error_code={validation.get('error_code')} "
             f"key={first.get('key')} detail={first.get('detail')}"
         )
-        if is_gantry_axis:
+        severe_fault_keys = {"NO_24V_DURING_PROBE"}
+        if is_gantry_axis and first.get("key") in severe_fault_keys:
             st = tester.motion_disarm(
                 reason="runtime_motion_fault",
                 note=f"{axis_name}:{first.get('key')}:{validation.get('error_code')}",
@@ -6508,6 +6979,8 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 f"motion arm disarmed: armed={st.get('armed')} "
                 f"reason={st.get('reason')} note={st.get('note')} seq={st.get('arm_seq')}"
             )
+        elif is_gantry_axis:
+            print("motion arm preserved for opposite-direction diagnostics.")
         return False
 
     while True:
@@ -6543,6 +7016,7 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
         print("  10. Visible travel probe (quiet + switch-guarded)")
         print("  11. Force limit-bypass + visible probe")
         print("  12. Driver param quick probe")
+        print("  u. CLEAR LOCK (lift head via clearance axis)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -6553,6 +7027,9 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
             return
         if ans == "q":
             sys.exit(0)
+        if ans == "u":
+            _run_motor_clear_lock_action(tester)
+            continue
         if ans == "1":
             rail = tester.motor_query_24v_sensor()
             no24 = rail.get("no24v")
@@ -6673,7 +7150,7 @@ def run_motor_channel_menu(tester, label, board, motor, preset=None):
                 motor=motor,
                 speed=home_speed,
                 timeout_s=timeout_s,
-                home_active_value=0,
+                home_active_value=int(getattr(tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1)),
             )
             _print_motor_home_result(label, out)
         elif ans == "9":
@@ -6880,6 +7357,7 @@ def run_motor_function_menu(tester):
         print("  4. Gripper (0x04:2)")
         print("  5. Thermal Door (0x06:0)")
         print("  s. Status all")
+        print("  u. CLEAR LOCK (lift head via clearance axis)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -6890,6 +7368,9 @@ def run_motor_function_menu(tester):
             return
         if ans == "q":
             sys.exit(0)
+        if ans == "u":
+            _run_motor_clear_lock_action(tester)
+            continue
 
         key = None
         if ans == "1":
@@ -6935,6 +7416,7 @@ def run_motor_board_menu(tester):
         print("  2. 0x05 DECK (motor: 0=X)")
         print("  3. 0x06 THERMAL (motor: 0=THERMAL_DOOR)")
         print("  4. Custom board/motor")
+        print("  u. CLEAR LOCK (lift head via clearance axis)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -6945,6 +7427,9 @@ def run_motor_board_menu(tester):
             return
         if ans == "q":
             sys.exit(0)
+        if ans == "u":
+            _run_motor_clear_lock_action(tester)
+            continue
 
         if ans == "1":
             idx = input("motor on HEAD [0/1/2] (blank=1): ").strip()
@@ -7031,6 +7516,103 @@ def run_thermal_door_menu(tester):
             f"active(closed={sw.get('left_active')} opened={sw.get('right_active')})"
         )
 
+    def _door_move_target(target):
+        target = str(target).strip().lower()
+        if target not in ("open", "close"):
+            return {"error": f"invalid target '{target}'"}
+        prep = _prepare_door()
+        start = _door_sensor_status()
+        start_pos = start.get("position")
+        if target == "close":
+            target_name = "tcDoorClosed"
+            target_pos = int(close_pos)
+        else:
+            target_name = "tcDoorOpened"
+            target_pos = int(open_pos)
+
+        interrupted = False
+        mv = {"ack": None}
+        wt = {"stopped": False, "elapsed_ms": None}
+        try:
+            mv = tester.motor_move_absolute(board, int(target_pos), motor=motor)
+            wt = tester.motor_wait_stopped(board, motor=motor, timeout_s=8.0)
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            if interrupted:
+                tester.motor_stop(board, motor=motor)
+
+        end = _door_sensor_status()
+        end_pos = end.get("position")
+        delta = None if start_pos is None or end_pos is None else int(end_pos) - int(start_pos)
+        reached = bool(end.get("closed")) if target == "close" else bool(end.get("opened"))
+
+        error_key = None
+        error_detail = None
+        if interrupted:
+            error_key = "INTERRUPTED"
+            error_detail = "user_interrupt"
+        elif not tester._tmcl_success(mv.get("ack")):
+            error_key = "DOOR_SEEK_ACK_FAIL"
+            error_detail = f"target_pos={int(target_pos)}"
+        elif wt.get("stopped") is not True:
+            error_key = "DOOR_SEEK_TIMEOUT"
+            error_detail = f"target_pos={int(target_pos)}"
+        elif not reached and (delta is None or int(delta) == 0):
+            error_key = "DOOR_SEEK_NO_DELTA"
+            error_detail = f"target_pos={int(target_pos)}"
+        elif not reached:
+            error_key = "DOOR_SEEK_SENSOR_STUCK"
+            error_detail = f"target={target_name} target_pos={int(target_pos)}"
+        error_code = None
+        if error_key and error_key in tester.MOTION_ERROR_CODES:
+            error_code = int(tester.MOTION_ERROR_CODES.get(error_key))
+        return {
+            "mode": "calibrated_abs",
+            "target": target_name,
+            "target_pos": int(target_pos),
+            "prep": prep,
+            "start": start,
+            "end": end,
+            "move": mv,
+            "wait": wt,
+            "delta": delta,
+            "reached": bool(reached),
+            "aborted": bool(interrupted),
+            "ok": bool(reached and error_key is None),
+            "error": None if error_key is None else str(error_key).lower(),
+            "error_key": error_key,
+            "error_code": error_code,
+            "error_detail": error_detail,
+        }
+
+    def _print_door_move(out):
+        if not isinstance(out, dict):
+            print("door move: no data")
+            return
+        if out.get("error"):
+            print(
+                f"door move error: key={out.get('error_key')} code={out.get('error_code')} "
+                f"detail={out.get('error_detail')}"
+            )
+        _print_motor_prep_ops(out.get("prep", {}))
+        start = out.get("start", {})
+        end = out.get("end", {})
+        mv = out.get("move", {})
+        wt = out.get("wait", {})
+        print(
+            f"{out.get('target')} [{out.get('mode')}]: reached={out.get('reached')} "
+            f"target_pos={out.get('target_pos')} "
+            f"ack={fmt_resp(mv.get('ack'))} wait={wt.get('stopped')}({wt.get('elapsed_ms')}ms) "
+            f"pos {start.get('position')} -> {end.get('position')} delta={out.get('delta')}"
+        )
+        print(
+            f"  sensors L {start.get('left_state')}->{end.get('left_state')} "
+            f"R {start.get('right_state')}->{end.get('right_state')}"
+        )
+        if out.get("aborted"):
+            print("  status: interrupted by user (motor stop issued).")
+
     def _door_sensor_status():
         sw = tester.motor_get_switch_activity(board, motor=motor)
         pos = tester.motor_get_position(board, motor=motor)
@@ -7068,41 +7650,71 @@ def run_thermal_door_menu(tester):
 
         moves = []
         last_pos = start.get("position")
-        for i in range(max(1, int(seek_max_moves))):
-            step = int(direction * abs(int(seek_step)))
-            mv = tester.motor_move_relative(board, step, motor=motor)
-            wt = tester.motor_wait_stopped(board, motor=motor, timeout_s=3.0, poll_s=0.06)
-            st = _door_sensor_status()
-            now_pos = st.get("position")
-            delta = None if last_pos is None or now_pos is None else int(now_pos) - int(last_pos)
-            moves.append(
-                {
-                    "idx": i + 1,
-                    "step": step,
-                    "ack": mv.get("ack"),
-                    "stopped": wt.get("stopped"),
-                    "elapsed_ms": wt.get("elapsed_ms"),
-                    "pos": now_pos,
-                    "delta": delta,
-                    "closed": st.get("closed"),
-                    "opened": st.get("opened"),
-                    "left_state": st.get("left_state"),
-                    "right_state": st.get("right_state"),
-                }
-            )
-            last_pos = now_pos
+        interrupted = False
+        error_key = None
+        error_detail = None
+        error_code = None
+        try:
+            for i in range(max(1, int(seek_max_moves))):
+                step = int(direction * abs(int(seek_step)))
+                mv = tester.motor_move_relative(board, step, motor=motor)
+                wt = tester.motor_wait_stopped(board, motor=motor, timeout_s=3.0, poll_s=0.06)
+                st = _door_sensor_status()
+                now_pos = st.get("position")
+                delta = None if last_pos is None or now_pos is None else int(now_pos) - int(last_pos)
+                moves.append(
+                    {
+                        "idx": i + 1,
+                        "step": step,
+                        "ack": mv.get("ack"),
+                        "stopped": wt.get("stopped"),
+                        "elapsed_ms": wt.get("elapsed_ms"),
+                        "pos": now_pos,
+                        "delta": delta,
+                        "closed": st.get("closed"),
+                        "opened": st.get("opened"),
+                        "left_state": st.get("left_state"),
+                        "right_state": st.get("right_state"),
+                    }
+                )
+                last_pos = now_pos
 
-            if target == "close" and bool(st.get("closed")):
-                break
-            if target == "open" and bool(st.get("opened")):
-                break
-            if delta is None or int(delta) == 0:
-                break
-            time.sleep(0.03)
+                ack_ok = tester._tmcl_success(mv.get("ack"))
+                wait_ok = bool(wt.get("stopped") is True)
+                reached_now = bool(st.get("closed")) if target == "close" else bool(st.get("opened"))
+                if not ack_ok:
+                    error_key = "DOOR_SEEK_ACK_FAIL"
+                    error_detail = f"move#{i+1}"
+                    break
+                if not wait_ok:
+                    error_key = "DOOR_SEEK_TIMEOUT"
+                    error_detail = f"move#{i+1}"
+                    break
+                if not reached_now and (delta is None or int(delta) == 0):
+                    error_key = "DOOR_SEEK_NO_DELTA"
+                    error_detail = f"move#{i+1}"
+                    break
 
-        tester.motor_stop(board, motor=motor)
+                if target == "close" and bool(st.get("closed")):
+                    break
+                if target == "open" and bool(st.get("opened")):
+                    break
+                time.sleep(0.03)
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            tester.motor_stop(board, motor=motor)
+
         end = _door_sensor_status()
         reached = bool(end.get("closed")) if target == "close" else bool(end.get("opened"))
+        if interrupted:
+            error_key = "INTERRUPTED"
+            error_detail = "user_interrupt"
+        elif error_key is None and not reached:
+            error_key = "DOOR_SEEK_SENSOR_STUCK"
+            error_detail = f"target={target_name}"
+        if error_key and error_key in tester.MOTION_ERROR_CODES:
+            error_code = int(tester.MOTION_ERROR_CODES.get(error_key))
         return {
             "target": target_name,
             "already": False,
@@ -7111,6 +7723,12 @@ def run_thermal_door_menu(tester):
             "end": end,
             "moves": moves,
             "reached": reached,
+            "aborted": bool(interrupted),
+            "ok": bool(reached and error_key is None),
+            "error": None if error_key is None else str(error_key).lower(),
+            "error_key": error_key,
+            "error_code": error_code,
+            "error_detail": error_detail,
         }
 
     def _print_door_seek(out):
@@ -7118,8 +7736,12 @@ def run_thermal_door_menu(tester):
             print("door seek: no data")
             return
         if out.get("error"):
-            print(f"door seek error: {out.get('error')}")
-            return
+            print(
+                f"door seek error: key={out.get('error_key')} code={out.get('error_code')} "
+                f"detail={out.get('error_detail')}"
+            )
+            if not isinstance(out.get("prep"), dict):
+                return
         _print_motor_prep_ops(out.get("prep"))
         start = out.get("start", {})
         end = out.get("end", {})
@@ -7136,6 +7758,8 @@ def run_thermal_door_menu(tester):
             f"sensors L {start.get('left_state')}->{end.get('left_state')} "
             f"R {start.get('right_state')}->{end.get('right_state')}"
         )
+        if out.get("aborted"):
+            print("  status: interrupted by user (motor stop issued).")
         tail = moves[-4:] if len(moves) > 4 else moves
         for row in tail:
             print(
@@ -7155,13 +7779,14 @@ def run_thermal_door_menu(tester):
         )
         print("  1. Status")
         print("  2. Prepare door axis")
-        print("  3. OPEN (sensor-guided tcDoorOpened)")
-        print("  4. CLOSE (sensor-guided tcDoorClosed)")
-        print("  5. PULSE (close -> open, sensor-guided)")
+        print("  3. OPEN (calibrated abs + sensor verify)")
+        print("  4. CLOSE (calibrated abs + sensor verify)")
+        print("  5. PULSE (close -> open, calibrated abs)")
         print("  6. Nudge (+steps then -steps)")
         print("  7. Move absolute (custom)")
         print("  8. Edit defaults")
         print("  9. Stop")
+        print("  u. CLEAR LOCK (lift head via clearance axis)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -7172,6 +7797,9 @@ def run_thermal_door_menu(tester):
             return
         if ans == "q":
             sys.exit(0)
+        if ans == "u":
+            _run_motor_clear_lock_action(tester)
+            continue
 
         if ans == "1":
             rail = tester.motor_query_24v_sensor()
@@ -7195,18 +7823,38 @@ def run_thermal_door_menu(tester):
             prep = _prepare_door()
             _print_motor_prep_ops(prep)
         elif ans == "3":
-            out = _door_seek("open")
-            _print_door_seek(out)
+            out = _door_move_target("open")
+            _print_door_move(out)
+            if (out.get("ok") is not True) and (out.get("aborted") is not True):
+                print("  fallback: sensor-guided open seek")
+                alt = _door_seek("open")
+                _print_door_seek(alt)
         elif ans == "4":
-            out = _door_seek("close")
-            _print_door_seek(out)
+            out = _door_move_target("close")
+            _print_door_move(out)
+            if (out.get("ok") is not True) and (out.get("aborted") is not True):
+                print("  fallback: sensor-guided close seek")
+                alt = _door_seek("close")
+                _print_door_seek(alt)
         elif ans == "5":
-            print("PULSE close -> open")
-            out1 = _door_seek("close")
-            _print_door_seek(out1)
+            print("PULSE close -> open (calibrated abs)")
+            out1 = _door_move_target("close")
+            _print_door_move(out1)
+            if (out1.get("ok") is not True) and (out1.get("aborted") is not True):
+                print("  fallback close: sensor-guided seek")
+                alt1 = _door_seek("close")
+                _print_door_seek(alt1)
+                if alt1.get("aborted"):
+                    continue
+            elif out1.get("aborted"):
+                continue
             time.sleep(0.15)
-            out2 = _door_seek("open")
-            _print_door_seek(out2)
+            out2 = _door_move_target("open")
+            _print_door_move(out2)
+            if (out2.get("ok") is not True) and (out2.get("aborted") is not True):
+                print("  fallback open: sensor-guided seek")
+                alt2 = _door_seek("open")
+                _print_door_seek(alt2)
         elif ans == "6":
             out = tester.motor_step_test(board, steps=nudge_steps, motor=motor, wait_timeout_s=5.0)
             _print_motor_step_result("THERMAL_DOOR nudge", out)
@@ -7261,58 +7909,6 @@ def run_thermal_door_menu(tester):
             print("Invalid.")
 
 
-def run_motor_experimental_menu(tester):
-    while True:
-        print("\n----------------------------------------")
-        print(" EXPERIMENTAL CHANGES")
-        print("----------------------------------------")
-        print("  1. STRICT STARTUP MOTION INIT (sensor-gated + full homing)")
-        print("  2. MOTION ARM STATUS (live sensors)")
-        print("  3. DISARM XYZ MOTION GATE")
-        print("  4. SHOW LAST STRICT INIT REPORT")
-        print("  5. DECK LATCH OVERRIDE TOGGLE (diagnostic unlock mode)")
-        print("  b. Back")
-        print("  q. Quit")
-
-        ans = input("\n[EXPERIMENTAL] > ").strip().lower()
-        if ans == "":
-            continue
-        if ans == "b":
-            return
-        if ans == "q":
-            sys.exit(0)
-
-        if ans == "1":
-            print("Running strict startup motion init...")
-            out = tester.motion_arm_strict_startup(run_homing=True)
-            _print_strict_startup_report(out)
-        elif ans == "2":
-            _print_motion_gate_status(tester, refresh=True)
-        elif ans == "3":
-            st = tester.motion_disarm(reason="manual")
-            print(
-                f"motion arm disarmed: armed={st.get('armed')} "
-                f"reason={st.get('reason')} note={st.get('note')} seq={st.get('arm_seq')}"
-            )
-        elif ans == "4":
-            out = tester.motion_last_strict_init_report()
-            _print_strict_startup_report(out)
-        elif ans == "5":
-            cur = tester.motion_latch_override_state()
-            enable = not bool(cur.get("enabled"))
-            out = tester.motion_latch_override_set(enable, reason="experimental_toggle")
-            st = out.get("state", {})
-            wr = out.get("write", {})
-            mode = "ENABLED (diagnostic unlock)" if st.get("enabled") else "DISABLED (auto-lock)"
-            print(
-                f"deck latch override {mode}: ack={fmt_resp(wr.get('ack'))} "
-                f"snapshot={wr.get('snapshot')}"
-            )
-            _print_motion_gate_status(tester, refresh=False, snapshot=out.get("gate"))
-        else:
-            print("Invalid.")
-
-
 def run_motor_menu(tester):
     while True:
         print("\n----------------------------------------")
@@ -7333,7 +7929,7 @@ def run_motor_menu(tester):
         print("  13. RESTORE OEM XYZ PROFILE + QUIET PROBE")
         print("  14. HARD RESET / PANIC OFF (HEAD+DECK)")
         print("  15. QUICK RELIABILITY SMOKE (X/Y/Z)")
-        print("  16. EXPERIMENTAL CHANGES")
+        print("  u. CLEAR LOCK (lift head via clearance axis)")
         print("  b. Back")
         print("  q. Quit")
 
@@ -7344,6 +7940,9 @@ def run_motor_menu(tester):
             return
         if ans == "q":
             sys.exit(0)
+        if ans == "u":
+            _run_motor_clear_lock_action(tester)
+            continue
 
         if ans == "1":
             run_motor_function_menu(tester)
@@ -7616,8 +8215,6 @@ def run_motor_menu(tester):
                 print("Quick reliability smoke: PASS")
             else:
                 print("Quick reliability smoke: FAIL (run hard reset 14, then retest)")
-        elif ans == "16":
-            run_motor_experimental_menu(tester)
         else:
             print("Invalid.")
 

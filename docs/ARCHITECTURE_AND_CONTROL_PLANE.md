@@ -121,5 +121,6 @@ This architecture exists to preserve OEM behavior where useful while improving L
 
 ## 9. Boundaries and Non-Goals
 - Camera SMI LED path from Windows vision DLLs is not directly callable in this Linux runtime.
-- `src/bioxp/can_driver.py` and `src/bioxp/api.py` are not the active hardware control runtime.
+- `src/bioxp/can_driver.py` is not the active hardware control runtime.
+- `src/bioxp/api.py` is an integration wrapper over the canonical USB runtime, not a separate control implementation.
 - Primary operator/runtime truth remains `src/bioxp/usb_driver.py`.

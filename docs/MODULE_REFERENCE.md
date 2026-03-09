@@ -51,18 +51,22 @@ Current limitation:
 - not the active production control path in this repo
 
 ## 4. `src/bioxp/api.py`
-Status: Prototype API wrapper.
+Status: Active API wrapper around the canonical USB runtime.
 
 Purpose:
-- FastAPI surface around `BioXpCanDriver`
-- simple HTTP endpoints for status/move/aspirate/dispense/thermal
+- FastAPI surface around `BioXpTester`
+- BMS-safe HTTP entrypoint for motion, thermal, chiller, camera, and lock-clearance actions
 
 Current limitation:
-- routes call legacy `can_driver.py`, not `usb_driver.py`
-- should be treated as a separate prototype, not current operator control plane
+- liquid handling routes are not exported yet and return `501`
+- runtime availability still depends on direct USB access and hardware presence
 
 ## 5. `src/bioxp/__init__.py`
-Status: package marker.
+Status: package export surface.
+
+Purpose:
+- exports `BioXpTester` as the primary runtime class
+- preserves legacy `can_driver` symbols as optional compatibility imports
 
 ## 6. Scripts Directory (`scripts/`)
 Purpose:
@@ -85,7 +89,8 @@ Historical reverse-engineering inputs include:
 For active hardware control and operations:
 
 - use `src/bioxp/usb_driver.py`
+- use `src/bioxp/api.py` when integrating external orchestration systems such as BMS
 
 For reference only:
 
-- `can_driver.py`, `api.py`, `diagnostic_24v.py`
+- `can_driver.py`, `diagnostic_24v.py`

@@ -34,6 +34,12 @@ Legacy standalone diagnostic:
 sudo .venv/bin/python src/bioxp/diagnostic_24v.py
 ```
 
+API wrapper for external systems such as BMS:
+
+```bash
+PYTHONPATH=src .venv/bin/uvicorn bioxp.api:app --host 0.0.0.0 --port 8000
+```
+
 ## Documentation
 Central documentation hub:
 
