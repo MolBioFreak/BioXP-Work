@@ -14,7 +14,10 @@ dlls/
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+.pytest_cache/
 
 # Exclude large snapshot images from vision system
 scripts/snapshots/
 scripts/Local Served Jobs/
+output/
