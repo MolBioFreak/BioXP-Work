@@ -111,6 +111,10 @@ class MotionHardResetRequest(BaseModel):
     rounds: int = Field(2, ge=1, le=5)
 
 
+class MotionArmStartupRequest(BaseModel):
+    run_homing: bool = True
+
+
 class ThermalRequest(BaseModel):
     bank: ThermalBankName = Field(..., description="nest, lid, or pedestal")
     target_temp_c: float = Field(..., ge=0.0, le=120.0)
@@ -1216,6 +1220,16 @@ async def motion_power_diag():
         "Motion driver power diagnostic",
         lambda: tester.motor_driver_power_diag(axis_keys=("x", "y", "z", "g", "door")),
         timeout_s=45.0,
+    )
+
+
+@app.post("/motion/arm/strict_startup")
+async def motion_arm_strict_startup(req: MotionArmStartupRequest):
+    tester = _get_tester()
+    return await _run_blocking(
+        "Motion strict startup",
+        lambda: tester.motion_arm_strict_startup(run_homing=bool(req.run_homing)),
+        timeout_s=180.0 if bool(req.run_homing) else 90.0,
     )
 
 
