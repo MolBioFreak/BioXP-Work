@@ -209,6 +209,76 @@ def _axis_preset(tester: BioXpTester, axis: AxisName):
     return out
 
 
+def _switch_activity_from_switches(tester: BioXpTester, board: int, motor: int, switches: Optional[dict]) -> dict:
+    left = None
+    right = None
+    if isinstance(switches, dict):
+        left = switches.get("left_state")
+        right = switches.get("right_state")
+    active_val = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
+    return {
+        "board": int(board),
+        "motor": int(motor),
+        "left_state": left,
+        "right_state": right,
+        "left_active": None if left is None else (int(left) == active_val),
+        "right_active": None if right is None else (int(right) == active_val),
+        "switches": switches,
+    }
+
+
+def _axis_status_payload(tester: BioXpTester, axis: AxisName, *, include_current: bool = True) -> dict:
+    preset = _axis_preset(tester, axis)
+    board = int(preset["board"])
+    motor = int(preset["motor"])
+    switches = tester.motor_get_switches(board, motor=motor)
+    status = {
+        "board": board,
+        "motor": motor,
+        "position": tester.motor_get_position(board, motor=motor),
+        "speed": tester.motor_get_speed(board, motor=motor),
+        "switches": switches,
+    }
+    if include_current:
+        status["max_current"] = tester.motor_get_axis_param(board, 6, motor=motor)
+    return {
+        "axis": axis.value,
+        "preset": preset,
+        "status": status,
+        "switch_activity": _switch_activity_from_switches(tester, board, motor, switches),
+    }
+
+
+def _parse_axes_csv(axes_csv: str) -> list[AxisName]:
+    parsed: list[AxisName] = []
+    seen: set[AxisName] = set()
+    for raw in str(axes_csv).split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        try:
+            axis = AxisName(token)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Unknown axis '{token}'.") from exc
+        if axis in seen:
+            continue
+        parsed.append(axis)
+        seen.add(axis)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="At least one axis must be requested.")
+    return parsed
+
+
+def _axis_status_batch_payload(tester: BioXpTester, axes: list[AxisName]) -> dict:
+    rows = {}
+    for axis in axes:
+        rows[axis.value] = _axis_status_payload(tester, axis, include_current=False)
+    return {
+        "axes": [axis.value for axis in axes],
+        "rows": rows,
+    }
+
+
 def _position_value(row: Optional[dict]) -> Optional[int]:
     if not isinstance(row, dict):
         return None
@@ -1088,16 +1158,21 @@ async def reconnect_runtime():
 @app.get("/motion/axis/{axis}/status")
 async def axis_status(axis: AxisName):
     tester = _get_tester()
-    preset = _axis_preset(tester, axis)
     return await _run_blocking(
         f"Axis {axis.value} status",
-        lambda: {
-        "axis": axis.value,
-        "preset": preset,
-        "status": tester.motor_axis_status(preset["board"], motor=preset["motor"]),
-        "switch_activity": tester.motor_get_switch_activity(preset["board"], motor=preset["motor"]),
-        },
+        lambda: _axis_status_payload(tester, axis, include_current=True),
         timeout_s=20.0,
+    )
+
+
+@app.get("/motion/axes/status")
+async def axes_status(axes: str = Query("x,y,z", description="Comma-separated axis names, e.g. x,y,z")):
+    tester = _get_tester()
+    requested_axes = _parse_axes_csv(axes)
+    return await _run_blocking(
+        "Axes status",
+        lambda: _axis_status_batch_payload(tester, requested_axes),
+        timeout_s=max(20.0, 5.0 * float(len(requested_axes))),
     )
 
 
