@@ -112,7 +112,7 @@ class MotionHardResetRequest(BaseModel):
 
 
 class MotionArmStartupRequest(BaseModel):
-    run_homing: bool = True
+    run_homing: bool = False
 
 
 class ThermalRequest(BaseModel):
@@ -604,7 +604,19 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName):
     board_status = tester.activate_boards(expect_reply=True)
     interlock = None
     if axis is not AxisName.THERMAL_DOOR:
-        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        arm_state = tester.motion_arm_state()
+        live_gate = tester.motion_gate_live_snapshot()
+        if bool(arm_state.get("armed")) and bool(live_gate.get("ok")):
+            interlock = {
+                "reused": True,
+                "armed": True,
+                "reason": arm_state.get("reason"),
+                "note": "strict-arm live gate reused; skipping interlock wake",
+                "live_gate": live_gate,
+                "elapsed_ms": 0,
+            }
+        else:
+            interlock = tester.motor_prepare_motion_interlock(force_lock=True)
     prep = tester.motor_prepare_axis(
         preset["board"],
         motor=preset["motor"],
