@@ -609,7 +609,7 @@ def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int]
 
 def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared: bool = False):
     preset = _axis_preset(tester, axis)
-    board_status = tester.activate_boards(expect_reply=True)
+    board_status = None
     interlock = None
     prep = None
     if axis is not AxisName.THERMAL_DOOR:
@@ -635,7 +635,17 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared:
                     "elapsed_ms": 0,
                 }
         else:
+            board_status = tester.activate_boards(expect_reply=True)
             interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+    if board_status is None:
+        if bool(reuse_prepared and axis is not AxisName.THERMAL_DOOR and prep is not None):
+            board_status = {
+                "reused": True,
+                "armed": True,
+                "note": "strict-arm prepared session reused; board activation skipped",
+            }
+        else:
+            board_status = tester.activate_boards(expect_reply=True)
     if prep is None:
         prep = tester.motor_prepare_axis(
             preset["board"],
