@@ -93,6 +93,7 @@ class MoveRelativeRequest(BaseModel):
     axis: AxisName
     steps: int = Field(..., description="Relative target in motor steps")
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
+    reuse_prepared: bool = False
 
 
 class MoveAbsoluteRequest(BaseModel):
@@ -510,8 +511,15 @@ def _guarded_home_search(
     }
 
 
-def _execute_relative_move(tester: BioXpTester, axis: AxisName, steps: int, wait_timeout_s: float) -> dict:
-    preset, board_status, interlock, prep = _prepare_motion_axis(tester, axis)
+def _execute_relative_move(
+    tester: BioXpTester,
+    axis: AxisName,
+    steps: int,
+    wait_timeout_s: float,
+    *,
+    reuse_prepared: bool = False,
+) -> dict:
+    preset, board_status, interlock, prep = _prepare_motion_axis(tester, axis, reuse_prepared=reuse_prepared)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_direction(axis, steps, switch_before, preset)
@@ -599,14 +607,16 @@ def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int]
     }
 
 
-def _prepare_motion_axis(tester: BioXpTester, axis: AxisName):
+def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared: bool = False):
     preset = _axis_preset(tester, axis)
     board_status = tester.activate_boards(expect_reply=True)
     interlock = None
+    prep = None
     if axis is not AxisName.THERMAL_DOOR:
         arm_state = tester.motion_arm_state()
         live_gate = tester.motion_gate_live_snapshot()
-        if bool(arm_state.get("armed")) and bool(live_gate.get("ok")):
+        armed_and_live = bool(arm_state.get("armed")) and bool(live_gate.get("ok"))
+        if armed_and_live:
             interlock = {
                 "reused": True,
                 "armed": True,
@@ -615,23 +625,33 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName):
                 "live_gate": live_gate,
                 "elapsed_ms": 0,
             }
+            if bool(reuse_prepared):
+                prep = {
+                    "reused": True,
+                    "armed": True,
+                    "reason": arm_state.get("reason"),
+                    "note": "strict-arm prepared profile reused; skipping axis prep",
+                    "preset": preset,
+                    "elapsed_ms": 0,
+                }
         else:
             interlock = tester.motor_prepare_motion_interlock(force_lock=True)
-    prep = tester.motor_prepare_axis(
-        preset["board"],
-        motor=preset["motor"],
-        run_current=preset["run_current"],
-        standby_current=preset["standby_current"],
-        speed=preset["speed"],
-        acc=preset["acc"],
-        stall_guard=preset.get("stall_guard"),
-        ramp_mode=preset.get("ramp_mode"),
-        disable_right=bool(preset.get("disable_right", False)),
-        disable_left=bool(preset.get("disable_left", False)),
-        rdiv=preset.get("rdiv"),
-        pdiv=preset.get("pdiv"),
-        warm_enable=bool(preset.get("warm_enable", False)),
-    )
+    if prep is None:
+        prep = tester.motor_prepare_axis(
+            preset["board"],
+            motor=preset["motor"],
+            run_current=preset["run_current"],
+            standby_current=preset["standby_current"],
+            speed=preset["speed"],
+            acc=preset["acc"],
+            stall_guard=preset.get("stall_guard"),
+            ramp_mode=preset.get("ramp_mode"),
+            disable_right=bool(preset.get("disable_right", False)),
+            disable_left=bool(preset.get("disable_left", False)),
+            rdiv=preset.get("rdiv"),
+            pdiv=preset.get("pdiv"),
+            warm_enable=bool(preset.get("warm_enable", False)),
+        )
     return preset, board_status, interlock, prep
 
 
@@ -1339,7 +1359,13 @@ async def move_axis_relative(req: MoveRelativeRequest):
     tester = _get_tester()
     return await _run_blocking(
         f"Axis {req.axis.value} relative move",
-        lambda: _execute_relative_move(tester, req.axis, req.steps, req.wait_timeout_s),
+        lambda: _execute_relative_move(
+            tester,
+            req.axis,
+            req.steps,
+            req.wait_timeout_s,
+            reuse_prepared=bool(req.reuse_prepared),
+        ),
         timeout_s=max(25.0, req.wait_timeout_s + 10.0),
     )
 
