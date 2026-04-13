@@ -7,6 +7,7 @@ class BoardAssy(IntEnum):
     THERMAL_CONTROLLER = 0x05  # Example ID based on CAN topology
     CHILLER_BOARD = 0x07       # Derived from ClassChillerBoard init
     MOTOR_CONTROLLER = 0x03    # Example ID for Gantry
+    PIPETTE_CONTROLLER = 0x09  # Derived placeholder for the pipette CAN node
 
 class MotorAxis(IntEnum):
     X = 0
@@ -26,11 +27,10 @@ class BioXpCanDriver:
         
     def _send_packet(self, board_id: int, command: list):
         """
-        Base wrapper for broadcasting a packet. 
+        Base wrapper for broadcasting a packet.
         The BioXP DLLs use a segmented multipart 8-byte structure.
         """
-        # Truncate/Pad to 8 bytes standard CAN frame
-        payload = (command + [0]*(8-len(command)))[:8]
+        payload = (command + [0] * (8 - len(command)))[:8]
         msg = can.Message(
             arbitration_id=board_id,
             data=payload,
@@ -39,8 +39,34 @@ class BioXpCanDriver:
         try:
             self.bus.send(msg)
             print(f"[CAN TX] ID: {hex(board_id)} | Data: {[hex(b) for b in payload]}")
+            return {
+                "ok": True,
+                "board_id": int(board_id),
+                "payload": payload,
+            }
         except can.CanError as e:
             print(f"CAN Bus Error: {e}")
+            return {
+                "ok": False,
+                "board_id": int(board_id),
+                "payload": payload,
+                "error": str(e),
+            }
+
+    def _send_ascii_packet(self, board_id: int, ascii_command: str):
+        encoded = str(ascii_command).encode('ascii')
+        if len(encoded) > 8:
+            raise ValueError(f"ASCII pipette command exceeds 8-byte frame budget: {ascii_command!r}")
+        return {
+            **self._send_packet(board_id, list(encoded)),
+            "ascii_command": str(ascii_command),
+            "length": len(encoded),
+        }
+
+    def close(self):
+        shutdown = getattr(self.bus, 'shutdown', None)
+        if callable(shutdown):
+            shutdown()
 
     # ==========================================
     # THERMAL CONTROL SYSTEM (ClassThermalControl)
@@ -79,30 +105,39 @@ class BioXpCanDriver:
     # ==========================================
     # PIPETTE SYSTEM (ClassPipette)
     # ==========================================
+    @staticmethod
+    def _format_pipette_volume(volume_ul: float) -> str:
+        volume_ul = float(volume_ul)
+        if volume_ul >= 100.0:
+            return f"{round(volume_ul):.0f}"
+        return f"{volume_ul:.1f}"
+
+    def pipette_initialize(self, pressure_profile='1R'):
+        return self._send_ascii_packet(BoardAssy.PIPETTE_CONTROLLER, f"INIT,{str(pressure_profile).upper()}")
+
+    def pipette_load_tip(self):
+        return self._send_ascii_packet(BoardAssy.PIPETTE_CONTROLLER, "TIP,LD")
+
+    def pipette_eject_tip(self):
+        return self._send_ascii_packet(BoardAssy.PIPETTE_CONTROLLER, "TIP,EJ")
+
     def aspirate(self, volume_ul: float, tip_pressure_profile='1R'):
         """
         Reverse Engineered from `ClassPipette.Aspirate(double volume)`.
-        The DLL completely bypassing stepper math and pushes 
-        an ASCII formatted string over the CAN bus to the pipette firmware.
+        The DLL bypasses stepper math and pushes an ASCII formatted string
+        over the CAN bus to the pipette firmware.
         """
-        # Applying the exact rounding logic found in the DLL 
-        # (Though we can enhance it since we operate in Python!)
-        if volume_ul >= 100.0:
-            volume_ul = round(volume_ul)
-            formatted_vol = f"{volume_ul:.0f}"
-        else:
-            # The hardcoded 0.1uL limit from ToString("F1")
-            formatted_vol = f"{volume_ul:.1f}"
-            
-        # The firmware expects commands like "P50.0,1R"
-        ascii_command = f"P{formatted_vol},{tip_pressure_profile}"
-        
-        # Convert string to bytes and send (Implementation of segmentation needed for >8 byte strings)
-        # Assuming the first byte is an action header (e.g. 0x01 for Aspirate String)
-        cmd_bytes = ascii_command.encode('ascii')
-        
-        print(f"Pipette Command String format: {ascii_command} | Bytes: {cmd_bytes}")
-        # self._send_string(BoardAssy.PIPETTE_CONTROLLER, cmd_bytes)
+        formatted_vol = self._format_pipette_volume(volume_ul)
+        ascii_command = f"P{formatted_vol},{str(tip_pressure_profile).upper()}"
+        return self._send_ascii_packet(BoardAssy.PIPETTE_CONTROLLER, ascii_command)
+
+    def dispense(self, volume_ul: float, tip_pressure_profile='1R', blow_out=False):
+        formatted_vol = self._format_pipette_volume(volume_ul)
+        ascii_command = f"D{formatted_vol},{str(tip_pressure_profile).upper()}"
+        result = self._send_ascii_packet(BoardAssy.PIPETTE_CONTROLLER, ascii_command)
+        if blow_out:
+            result["blow_out"] = True
+        return result
 
     # ==========================================
     # GANTRY MOTORS (ClassMotor)

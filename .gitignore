@@ -21,3 +21,6 @@ __pycache__/
 scripts/snapshots/
 scripts/Local Served Jobs/
 output/
+
+# Local agent/planning scratch files
+.hermes/

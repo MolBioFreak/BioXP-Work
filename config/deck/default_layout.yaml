@@ -1,0 +1,161 @@
+{
+  "deck_id": "bioxp-default",
+  "version": 1,
+  "capabilities": {
+    "motion": true,
+    "pipette": true,
+    "inspection": true,
+    "barcode": {
+      "enabled": false,
+      "reason": "scanner_not_integrated"
+    }
+  },
+  "slots": [
+    {
+      "slot_id": "reagent_plate",
+      "display_name": "Reagent Plate Slot",
+      "origin": {
+        "x": 120.0,
+        "y": 40.0,
+        "z": 5.0
+      },
+      "aliases": [
+        "reagent_slot"
+      ],
+      "labware": {
+        "labware_id": "plate_96_generic",
+        "kind": "microplate_96",
+        "display_name": "Generic 96 Well Plate",
+        "wells": {
+          "A1": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "A2": {
+            "x": 9.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "B1": {
+            "x": 0.0,
+            "y": 9.0,
+            "z": 0.0
+          },
+          "B2": {
+            "x": 9.0,
+            "y": 9.0,
+            "z": 0.0
+          }
+        }
+      }
+    },
+    {
+      "slot_id": "mag_plate",
+      "display_name": "Magnetic Plate Slot",
+      "origin": {
+        "x": 260.0,
+        "y": 40.0,
+        "z": 5.0
+      },
+      "aliases": [
+        "mag_slot"
+      ],
+      "labware": {
+        "labware_id": "plate_96_generic",
+        "kind": "microplate_96",
+        "display_name": "Generic 96 Well Plate",
+        "wells": {
+          "A1": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "A2": {
+            "x": 9.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "B1": {
+            "x": 0.0,
+            "y": 9.0,
+            "z": 0.0
+          },
+          "B2": {
+            "x": 9.0,
+            "y": 9.0,
+            "z": 0.0
+          }
+        }
+      }
+    },
+    {
+      "slot_id": "waste_station",
+      "display_name": "Waste Station",
+      "origin": {
+        "x": 390.0,
+        "y": 90.0,
+        "z": 10.0
+      },
+      "aliases": [
+        "waste_slot"
+      ]
+    }
+  ],
+  "locations": [
+    {
+      "location_id": "reagent_rack",
+      "display_name": "Reagent Rack",
+      "slot": "reagent_plate",
+      "aliases": [
+        "reagents",
+        "reagent_rack_location"
+      ],
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "location_id": "reagent_pickup",
+      "display_name": "Reagent Pickup",
+      "slot": "reagent_plate",
+      "aliases": [
+        "reagent"
+      ],
+      "position": {
+        "x": 3.0,
+        "y": 4.0,
+        "z": 12.5
+      }
+    },
+    {
+      "location_id": "magnetic_station",
+      "display_name": "Magnetic Station",
+      "slot": "mag_plate",
+      "aliases": [
+        "magnet",
+        "magnetic_station_location"
+      ],
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "location_id": "waste_drop",
+      "display_name": "Waste Drop",
+      "slot": "waste_station",
+      "aliases": [
+        "waste"
+      ],
+      "position": {
+        "x": 25.0,
+        "y": 15.0,
+        "z": 30.0
+      }
+    }
+  ]
+}

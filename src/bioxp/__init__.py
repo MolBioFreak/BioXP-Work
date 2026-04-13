@@ -1,11 +1,7 @@
-from .usb_driver import BioXpTester
+from __future__ import annotations
 
-try:
-    from .can_driver import BioXpCanDriver, BoardAssy, MotorAxis
-except Exception:  # pragma: no cover - legacy optional dependency surface
-    BioXpCanDriver = None
-    BoardAssy = None
-    MotorAxis = None
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "BioXpTester",
@@ -13,3 +9,15 @@ __all__ = [
     "BoardAssy",
     "MotorAxis",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BioXpTester":
+        return import_module(".usb_driver", __name__).BioXpTester
+    if name in {"BioXpCanDriver", "BoardAssy", "MotorAxis"}:
+        try:
+            module = import_module(".can_driver", __name__)
+        except Exception:  # pragma: no cover - legacy optional dependency surface
+            return None
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

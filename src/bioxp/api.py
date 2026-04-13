@@ -7,7 +7,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -15,12 +15,65 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
 
+from .domain.capabilities import CapabilityRegistry
+from .domain.deck import load_deck_layout
+from .pipette import (
+    PipetteAspirateCommand,
+    PipetteDispenseCommand,
+    PipetteInitCommand,
+    PipetteMixCommand,
+    PipetteTipAction,
+    PipetteTipCommand,
+    build_default_pipette_transport,
+)
+from .services.artifact_service import create_motion_validation_bundle
+from .services.motion_service import (
+    AbsoluteMoveCommand,
+    HomeAxisCommand,
+    RelativeMoveCommand,
+    dry_run_motion_response as service_dry_run_motion_response,
+    run_absolute_motion_command,
+    run_home_axis_command,
+    run_relative_motion_command,
+)
+from .services.pipette_service import (
+    run_pipette_aspirate_command,
+    run_pipette_dispense_command,
+    run_pipette_init_command,
+    run_pipette_mix_command,
+    run_pipette_status,
+    run_pipette_tip_command,
+)
+from .services.protocol_service import (
+    create_protocol_job,
+    get_protocol_job,
+    list_protocol_jobs,
+    review_protocol_job,
+    compile_protocol_source,
+)
+from .services.reference_service import (
+    MarkAxisDesyncedCommand,
+    MarkAxisReferencedCommand,
+    ReferenceStateStore,
+)
+from .services.vision_service import (
+    run_barcode_read_command,
+    run_inspection_command,
+)
 from .usb_driver import BioXpTester
+from .vision.barcode import BarcodeReadCommand
+from .vision.inspection import InspectionCommand
 
 _tester: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
+_reference_state_store = ReferenceStateStore()
+_pipette_transport = build_default_pipette_transport()
+try:
+    _vision_capabilities = load_deck_layout().capabilities
+except Exception:
+    _vision_capabilities = CapabilityRegistry.from_config({"inspection": True, "barcode": False})
 _camera_stream_state = {
     "active": False,
     "device": None,
@@ -38,7 +91,9 @@ _camera_stream_state = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    global _tester, _startup_error
+    global _tester, _startup_error, _pipette_transport
+    _reference_state_store.reset()
+    _pipette_transport = build_default_pipette_transport()
     try:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
         _tester = BioXpTester(alt=alt)
@@ -51,6 +106,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _tester = None
+        close_fn = getattr(_pipette_transport, "close", None)
+        if callable(close_fn):
+            close_fn()
+        _pipette_transport = build_default_pipette_transport()
+        _reference_state_store.reset()
 
 
 app = FastAPI(
@@ -68,6 +128,14 @@ def _get_tester() -> BioXpTester:
             detail=_startup_error or "BioXP USB runtime not available.",
         )
     return _tester
+
+
+def _get_pipette_transport():
+    return _pipette_transport
+
+
+def _get_vision_capabilities() -> CapabilityRegistry:
+    return _vision_capabilities
 
 
 class AxisName(str, Enum):
@@ -89,23 +157,67 @@ class ChillerBankName(str, Enum):
     OC = "oc"
 
 
-class MoveRelativeRequest(BaseModel):
+class MotionArtifactRequest(BaseModel):
+    capture_bundle: bool = Field(
+        False,
+        description=(
+            "If true, write a supervised validation bundle under "
+            "/mnt/BioModStack/bms_results/bioxp_validation/."
+        ),
+    )
+    dry_run_bundle: bool = Field(
+        False,
+        description=(
+            "If true with capture_bundle, skip hardware I/O and only materialize the validation bundle."
+        ),
+    )
+    operator_note: Optional[str] = Field(
+        None,
+        max_length=2000,
+        description="Optional operator note to include in the validation bundle metadata.",
+    )
+    snapshot_refs: list[str] = Field(
+        default_factory=list,
+        description="Existing snapshot/image references to attach to the validation bundle.",
+    )
+
+
+class MoveRelativeRequest(MotionArtifactRequest):
     axis: AxisName
     steps: int = Field(..., description="Relative target in motor steps")
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
-    reuse_prepared: bool = False
+    reuse_prepared: bool = Field(
+        False,
+        description=(
+            "Debug-only compatibility flag. Ignored unless "
+            "BIOXP_ENABLE_PREP_REUSE_DEBUG=1 and strict-arm/live state is healthy."
+        ),
+    )
 
 
-class MoveAbsoluteRequest(BaseModel):
+class MoveAbsoluteRequest(MotionArtifactRequest):
     axis: AxisName
     position_steps: int = Field(..., description="Absolute target in motor steps")
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
 
 
-class HomeAxisRequest(BaseModel):
+class HomeAxisRequest(MotionArtifactRequest):
     axis: AxisName
     speed: Optional[int] = Field(None, gt=0)
     timeout_s: float = Field(15.0, gt=0.1, le=90.0)
+
+
+class ReferenceMarkRequest(BaseModel):
+    axis: AxisName
+    position_steps: int = Field(0, description="Controller position to treat as the trusted reference origin.")
+    source: str = Field("manual", max_length=120)
+    note: Optional[str] = Field(None, max_length=2000)
+
+
+class ReferenceDesyncRequest(BaseModel):
+    axis: AxisName
+    reason: str = Field(..., min_length=1, max_length=2000)
+    source: str = Field("manual", max_length=120)
 
 
 class MotionHardResetRequest(BaseModel):
@@ -114,6 +226,32 @@ class MotionHardResetRequest(BaseModel):
 
 class MotionArmStartupRequest(BaseModel):
     run_homing: bool = False
+
+
+class PipetteInitRequest(BaseModel):
+    pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
+    prime_volume_ul: Optional[float] = Field(None, gt=0.0, le=1000.0)
+
+
+class PipetteTipRequest(BaseModel):
+    action: PipetteTipAction
+
+
+class PipetteAspirateRequest(BaseModel):
+    volume_ul: float = Field(..., gt=0.0, le=1000.0)
+    pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
+
+
+class PipetteDispenseRequest(BaseModel):
+    volume_ul: float = Field(..., gt=0.0, le=1000.0)
+    pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
+    blow_out: bool = False
+
+
+class PipetteMixRequest(BaseModel):
+    volume_ul: float = Field(..., gt=0.0, le=1000.0)
+    cycles: int = Field(..., ge=1, le=50)
+    pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
 
 
 class ThermalRequest(BaseModel):
@@ -144,6 +282,35 @@ class CameraControlRequest(BaseModel):
     device: str = Field("/dev/video0", description="Preferred V4L2 device")
     cid: int = Field(..., ge=0)
     value: int = Field(..., description="Raw V4L2 control value")
+
+
+class InspectionRequest(BaseModel):
+    device: str = Field("/dev/video0", description="Preferred V4L2 device")
+    location_id: Optional[str] = Field(None, max_length=120)
+    requested_checks: list[str] = Field(default_factory=list)
+    include_image_data: bool = True
+
+
+class BarcodeReadRequest(BaseModel):
+    device: str = Field("/dev/video0", description="Preferred V4L2 device")
+    location_id: Optional[str] = Field(None, max_length=120)
+    symbologies: list[str] = Field(default_factory=list)
+    include_image_data: bool = False
+
+
+class ProtocolCompileRequest(BaseModel):
+    source_type: str = Field("native", pattern=r"^(native|oem_xml)$")
+    document: Optional[dict[str, Any]] = None
+    xml_path: Optional[str] = None
+
+
+class ProtocolExecuteRequest(ProtocolCompileRequest):
+    dry_run: bool = True
+
+
+class ProtocolReviewRequest(BaseModel):
+    reviewer: str = Field("operator", min_length=1, max_length=120)
+    note: Optional[str] = Field(None, max_length=4000)
 
 
 class LedRgbRequest(BaseModel):
@@ -202,6 +369,7 @@ _DEFAULT_MOTION_SPEED = 100
 _DEFAULT_MOTION_ACC = 50
 _MOTION_NO_DELTA_TIMEOUT_S = 2.0
 _MOTION_HOME_PRECLEAR_STEPS = 500
+_MOTION_PREP_REUSE_DEBUG_ENV = "BIOXP_ENABLE_PREP_REUSE_DEBUG"
 
 
 def _axis_preset(tester: BioXpTester, axis: AxisName):
@@ -304,6 +472,75 @@ def _position_delta(before: Optional[dict], after: Optional[dict]) -> Optional[i
     if left is None or right is None:
         return None
     return int(right) - int(left)
+
+
+def _env_flag(name: str) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _dry_run_motion_response(command: str, axis: AxisName, **kwargs) -> dict:
+    return service_dry_run_motion_response(command, axis, **kwargs)
+
+
+def _motion_truth_payload() -> dict:
+    return {
+        "evidence_level": "controller_only",
+        "controller_reported_position": True,
+        "controller_reported_switches": True,
+        "physical_motion_confirmed": False,
+        "independent_evidence_required": True,
+        "summary": (
+            "Controller-reported motion only. Capture paired images and/or an operator note "
+            "before treating this as confirmed physical displacement."
+        ),
+        "recommended_next_evidence": [
+            "capture before/after images",
+            "record operator confirmation",
+        ],
+    }
+
+
+def _motion_prep_policy(
+    *,
+    axis: AxisName,
+    reuse_requested: bool,
+    armed_and_live: bool,
+    debug_flag_enabled: bool,
+    reuse_used: bool,
+    interlock_reused: bool,
+) -> dict:
+    if axis is AxisName.THERMAL_DOOR:
+        note = "Thermal door axis always uses fresh prep."
+    elif reuse_used:
+        note = (
+            f"Prepared axis reuse allowed by debug flag {_MOTION_PREP_REUSE_DEBUG_ENV}=1; "
+            "board activation still executed."
+        )
+    elif reuse_requested and not debug_flag_enabled:
+        note = (
+            f"reuse_prepared was requested but ignored because {_MOTION_PREP_REUSE_DEBUG_ENV}=1 "
+            "is not enabled."
+        )
+    elif reuse_requested and not armed_and_live:
+        note = "reuse_prepared was requested but ignored because strict-arm/live state is not healthy."
+    elif interlock_reused:
+        note = "Strict-arm/live gate reused only for interlock wake; board activation and axis prep still ran."
+    else:
+        note = "Fresh board activation and axis prep executed."
+    return {
+        "axis": axis.value,
+        "reuse_requested": bool(reuse_requested),
+        "armed_and_live": bool(armed_and_live),
+        "debug_flag_required": True,
+        "debug_flag_enabled": bool(debug_flag_enabled),
+        "reuse_allowed": bool(reuse_requested and debug_flag_enabled and armed_and_live and axis is not AxisName.THERMAL_DOOR),
+        "reuse_used": bool(reuse_used),
+        "interlock_reused": bool(interlock_reused),
+        "board_activation_skipped": False,
+        "axis_prep_skipped": bool(reuse_used),
+        "note": note,
+    }
 
 
 def _guard_direction(axis: AxisName, steps: int, switch_activity: Optional[dict], preset: Optional[dict] = None) -> None:
@@ -519,7 +756,7 @@ def _execute_relative_move(
     *,
     reuse_prepared: bool = False,
 ) -> dict:
-    preset, board_status, interlock, prep = _prepare_motion_axis(tester, axis, reuse_prepared=reuse_prepared)
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, reuse_prepared=reuse_prepared)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_direction(axis, steps, switch_before, preset)
@@ -536,6 +773,8 @@ def _execute_relative_move(
         "board_status": board_status,
         "interlock": interlock,
         "prep": prep,
+        "prep_policy": prep_policy,
+        "motion_truth": _motion_truth_payload(),
         "motion_profile": {
             "speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
@@ -552,7 +791,7 @@ def _execute_relative_move(
 
 
 def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: int, wait_timeout_s: float) -> dict:
-    preset, board_status, interlock, prep = _prepare_motion_axis(tester, axis)
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_absolute_target(axis, position_before, position_steps, switch_before, preset)
@@ -569,6 +808,8 @@ def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: 
         "board_status": board_status,
         "interlock": interlock,
         "prep": prep,
+        "prep_policy": prep_policy,
+        "motion_truth": _motion_truth_payload(),
         "motion_profile": {
             "speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
@@ -586,7 +827,7 @@ def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: 
 
 
 def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int], timeout_s: float) -> dict:
-    preset, board_status, interlock, prep = _prepare_motion_axis(tester, axis)
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis)
     home = _guarded_home_search(
         tester,
         preset,
@@ -598,6 +839,8 @@ def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int]
         "board_status": board_status,
         "interlock": interlock,
         "prep": prep,
+        "prep_policy": prep_policy,
+        "motion_truth": _motion_truth_payload(),
         "motion_profile": {
             "speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
@@ -612,6 +855,12 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared:
     board_status = None
     interlock = None
     prep = None
+    arm_state = {}
+    live_gate = {}
+    armed_and_live = False
+    interlock_reused = False
+    debug_flag_enabled = _env_flag(_MOTION_PREP_REUSE_DEBUG_ENV)
+    reuse_requested = bool(reuse_prepared and axis is not AxisName.THERMAL_DOOR)
     if axis is not AxisName.THERMAL_DOOR:
         arm_state = tester.motion_arm_state()
         live_gate = tester.motion_gate_live_snapshot()
@@ -625,44 +874,51 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared:
                 "live_gate": live_gate,
                 "elapsed_ms": 0,
             }
-            if bool(reuse_prepared):
-                prep = {
-                    "reused": True,
-                    "armed": True,
-                    "reason": arm_state.get("reason"),
-                    "note": "strict-arm prepared profile reused; skipping axis prep",
-                    "preset": preset,
-                    "elapsed_ms": 0,
-                }
+            interlock_reused = True
         else:
             board_status = tester.activate_boards(expect_reply=True)
             interlock = tester.motor_prepare_motion_interlock(force_lock=True)
     if board_status is None:
-        if bool(reuse_prepared and axis is not AxisName.THERMAL_DOOR and prep is not None):
-            board_status = {
+        board_status = tester.activate_boards(expect_reply=True)
+    reuse_used = bool(reuse_requested and armed_and_live and debug_flag_enabled)
+    if prep is None:
+        if reuse_used:
+            prep = {
                 "reused": True,
                 "armed": True,
-                "note": "strict-arm prepared session reused; board activation skipped",
+                "reason": arm_state.get("reason"),
+                "note": (
+                    f"strict-arm prepared profile reused for debug compatibility; "
+                    f"board activation still executed because {_MOTION_PREP_REUSE_DEBUG_ENV}=1"
+                ),
+                "preset": preset,
+                "elapsed_ms": 0,
             }
         else:
-            board_status = tester.activate_boards(expect_reply=True)
-    if prep is None:
-        prep = tester.motor_prepare_axis(
-            preset["board"],
-            motor=preset["motor"],
-            run_current=preset["run_current"],
-            standby_current=preset["standby_current"],
-            speed=preset["speed"],
-            acc=preset["acc"],
-            stall_guard=preset.get("stall_guard"),
-            ramp_mode=preset.get("ramp_mode"),
-            disable_right=bool(preset.get("disable_right", False)),
-            disable_left=bool(preset.get("disable_left", False)),
-            rdiv=preset.get("rdiv"),
-            pdiv=preset.get("pdiv"),
-            warm_enable=bool(preset.get("warm_enable", False)),
-        )
-    return preset, board_status, interlock, prep
+            prep = tester.motor_prepare_axis(
+                preset["board"],
+                motor=preset["motor"],
+                run_current=preset["run_current"],
+                standby_current=preset["standby_current"],
+                speed=preset["speed"],
+                acc=preset["acc"],
+                stall_guard=preset.get("stall_guard"),
+                ramp_mode=preset.get("ramp_mode"),
+                disable_right=bool(preset.get("disable_right", False)),
+                disable_left=bool(preset.get("disable_left", False)),
+                rdiv=preset.get("rdiv"),
+                pdiv=preset.get("pdiv"),
+                warm_enable=bool(preset.get("warm_enable", False)),
+            )
+    prep_policy = _motion_prep_policy(
+        axis=axis,
+        reuse_requested=reuse_requested,
+        armed_and_live=armed_and_live,
+        debug_flag_enabled=debug_flag_enabled,
+        reuse_used=reuse_used,
+        interlock_reused=interlock_reused,
+    )
+    return preset, board_status, interlock, prep, prep_policy
 
 
 def _status_payload() -> dict:
@@ -1268,21 +1524,43 @@ async def motion_power_diag():
 @app.post("/motion/arm/strict_startup")
 async def motion_arm_strict_startup(req: MotionArmStartupRequest):
     tester = _get_tester()
-    return await _run_blocking(
+    response = await _run_blocking(
         "Motion strict startup",
         lambda: tester.motion_arm_strict_startup(run_homing=bool(req.run_homing)),
         timeout_s=180.0 if bool(req.run_homing) else 90.0,
     )
+    if bool(req.run_homing) and bool(response.get("ok")):
+        for axis in AxisName:
+            _reference_state_store.mark_referenced(
+                MarkAxisReferencedCommand(
+                    axis=axis,
+                    position_steps=0,
+                    source="motion_arm_strict_startup",
+                    note="Reference refreshed after strict startup homing sequence.",
+                    motion_kind="strict_startup_home",
+                )
+            )
+    return response
 
 
 @app.post("/motion/hard_reset")
 async def motion_hard_reset(req: MotionHardResetRequest):
     tester = _get_tester()
-    return await _run_blocking(
+    response = await _run_blocking(
         "Motion hard reset",
         lambda: tester.motor_hard_reset(rounds=req.rounds),
         timeout_s=max(45.0, 20.0 * float(req.rounds)),
     )
+    for axis in AxisName:
+        _reference_state_store.mark_desynced(
+            MarkAxisDesyncedCommand(
+                axis=axis,
+                reason="Motion hard reset executed; reference must be re-established.",
+                source="motion_hard_reset",
+                motion_kind="hard_reset",
+            )
+        )
+    return response
 
 
 @app.post("/motion/clear_lock")
@@ -1366,37 +1644,83 @@ async def led_rgb(req: LedRgbRequest):
 
 @app.post("/motion/axis/relative")
 async def move_axis_relative(req: MoveRelativeRequest):
-    tester = _get_tester()
-    return await _run_blocking(
-        f"Axis {req.axis.value} relative move",
-        lambda: _execute_relative_move(
-            tester,
-            req.axis,
-            req.steps,
-            req.wait_timeout_s,
-            reuse_prepared=bool(req.reuse_prepared),
-        ),
-        timeout_s=max(25.0, req.wait_timeout_s + 10.0),
+    response = await run_relative_motion_command(
+        RelativeMoveCommand.from_request(req),
+        get_tester=_get_tester,
+        run_blocking=_run_blocking,
+        execute_relative_move=_execute_relative_move,
+        dry_run_response_factory=_dry_run_motion_response,
     )
+    if not bool(response.get("dry_run")):
+        _reference_state_store.record_motion(req.axis, "relative")
+    return response
 
 
 @app.post("/motion/axis/absolute")
 async def move_axis_absolute(req: MoveAbsoluteRequest):
-    tester = _get_tester()
-    return await _run_blocking(
-        f"Axis {req.axis.value} absolute move",
-        lambda: _execute_absolute_move(tester, req.axis, req.position_steps, req.wait_timeout_s),
-        timeout_s=max(35.0, req.wait_timeout_s + 10.0),
+    response = await run_absolute_motion_command(
+        AbsoluteMoveCommand.from_request(req),
+        get_tester=_get_tester,
+        run_blocking=_run_blocking,
+        execute_absolute_move=_execute_absolute_move,
+        dry_run_response_factory=_dry_run_motion_response,
     )
+    if not bool(response.get("dry_run")):
+        _reference_state_store.record_motion(req.axis, "absolute")
+    return response
 
 
 @app.post("/motion/axis/home")
 async def home_axis(req: HomeAxisRequest):
-    tester = _get_tester()
-    return await _run_blocking(
-        f"Axis {req.axis.value} home",
-        lambda: _execute_home_axis(tester, req.axis, req.speed, req.timeout_s),
-        timeout_s=max(35.0, req.timeout_s + 10.0),
+    response = await run_home_axis_command(
+        HomeAxisCommand.from_request(req),
+        get_tester=_get_tester,
+        run_blocking=_run_blocking,
+        execute_home_axis=_execute_home_axis,
+        dry_run_response_factory=_dry_run_motion_response,
+    )
+    if not bool(response.get("dry_run")):
+        _reference_state_store.mark_referenced(
+            MarkAxisReferencedCommand(
+                axis=req.axis,
+                position_steps=0,
+                source="home_axis",
+                note="Axis homed via API route.",
+                motion_kind="home",
+            )
+        )
+    return response
+
+
+@app.get("/motion/reference/status")
+async def motion_reference_status(
+    axes: str = Query("x,y,z,g,door", description="Comma-separated axes to inspect reference state for."),
+):
+    return _reference_state_store.snapshot(_parse_axes_csv(axes))
+
+
+@app.post("/motion/reference/mark_referenced")
+async def motion_reference_mark_referenced(req: ReferenceMarkRequest):
+    return _reference_state_store.mark_referenced(
+        MarkAxisReferencedCommand(
+            axis=req.axis,
+            position_steps=req.position_steps,
+            source=req.source,
+            note=req.note,
+            motion_kind="manual_reference",
+        )
+    )
+
+
+@app.post("/motion/reference/mark_desynced")
+async def motion_reference_mark_desynced(req: ReferenceDesyncRequest):
+    return _reference_state_store.mark_desynced(
+        MarkAxisDesyncedCommand(
+            axis=req.axis,
+            reason=req.reason,
+            source=req.source,
+            motion_kind="manual_desync",
+        )
     )
 
 
@@ -1572,6 +1896,26 @@ async def camera_snapshot(req: CameraSnapshotRequest):
     return await _run_blocking("Camera snapshot", lambda: _camera_snapshot_with_data(tester, req.device), timeout_s=20.0)
 
 
+@app.post("/vision/inspect")
+async def vision_inspect(req: InspectionRequest):
+    return await run_inspection_command(
+        InspectionCommand.from_request(req),
+        get_capabilities=_get_vision_capabilities,
+        capture_snapshot=lambda device: _camera_snapshot_with_data(_get_tester(), device),
+        run_blocking=_run_blocking,
+    )
+
+
+@app.post("/vision/barcode/read")
+async def vision_barcode_read(req: BarcodeReadRequest):
+    return await run_barcode_read_command(
+        BarcodeReadCommand.from_request(req),
+        get_capabilities=_get_vision_capabilities,
+        capture_snapshot=lambda device: _camera_snapshot_with_data(_get_tester(), device),
+        run_blocking=_run_blocking,
+    )
+
+
 @app.post("/camera/stream_health")
 async def camera_stream_health(req: CameraHealthRequest):
     tester = _get_tester()
@@ -1635,17 +1979,99 @@ async def camera_mjpeg(
     )
 
 
+@app.get("/liquid/status")
+async def liquid_status():
+    return await run_pipette_status(
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+    )
+
+
+@app.post("/liquid/init")
+async def liquid_init(req: PipetteInitRequest):
+    return await run_pipette_init_command(
+        PipetteInitCommand.from_request(req),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+    )
+
+
+@app.post("/liquid/tip")
+async def liquid_tip(req: PipetteTipRequest):
+    return await run_pipette_tip_command(
+        PipetteTipCommand.from_request(req),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+    )
+
+
 @app.post("/liquid/aspirate")
-async def aspirate_not_available():
-    raise HTTPException(
-        status_code=501,
-        detail="Liquid handling is not exported through the canonical USB runtime API yet.",
+async def liquid_aspirate(req: PipetteAspirateRequest):
+    return await run_pipette_aspirate_command(
+        PipetteAspirateCommand.from_request(req),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
     )
 
 
 @app.post("/liquid/dispense")
-async def dispense_not_available():
-    raise HTTPException(
-        status_code=501,
-        detail="Liquid handling is not exported through the canonical USB runtime API yet.",
+async def liquid_dispense(req: PipetteDispenseRequest):
+    return await run_pipette_dispense_command(
+        PipetteDispenseCommand.from_request(req),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
     )
+
+
+@app.post("/liquid/mix")
+async def liquid_mix(req: PipetteMixRequest):
+    return await run_pipette_mix_command(
+        PipetteMixCommand.from_request(req),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+    )
+
+
+@app.post("/protocol/compile")
+async def protocol_compile(req: ProtocolCompileRequest):
+    compiled = compile_protocol_source(req.model_dump(exclude_none=True))
+    return compiled.to_payload()
+
+
+@app.post("/protocol/execute")
+async def protocol_execute(req: ProtocolExecuteRequest):
+    return await run_in_threadpool(
+        create_protocol_job,
+        req.model_dump(exclude_none=True),
+        dry_run=bool(req.dry_run),
+    )
+
+
+@app.get("/protocol/jobs")
+async def protocol_jobs(limit: int = Query(20, ge=1, le=100)):
+    return {
+        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit),
+    }
+
+
+@app.get("/protocol/jobs/{job_id}")
+async def protocol_job_detail(job_id: str):
+    try:
+        return await run_in_threadpool(get_protocol_job, job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/protocol/jobs/{job_id}/review")
+async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
+    try:
+        return await run_in_threadpool(
+            review_protocol_job,
+            job_id,
+            reviewer=req.reviewer,
+            note=req.note,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
