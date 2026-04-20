@@ -1,7 +1,10 @@
 import asyncio
+import fcntl
 import importlib
 import sys
 import types
+
+import pytest
 
 from src.bioxp.services.reference_service import (
     MarkAxisDesyncedCommand,
@@ -67,6 +70,216 @@ def test_reference_state_store_reset_clears_rows():
     store.reset()
 
     assert store.snapshot(["x"])["rows"]["x"]["state"] == "unknown"
+
+
+
+def test_reference_state_file_lock_propagates_inner_exceptions(tmp_path):
+    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with store._state_file_lock(fcntl.LOCK_EX):
+            raise RuntimeError("boom")
+
+
+
+def test_reference_state_store_reset_clears_persisted_rows(tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    store = ReferenceStateStore(state_path=state_path)
+    store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+
+    store.reset()
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+    assert reloaded.snapshot(["x"])["rows"]["x"]["state"] == "unknown"
+
+
+
+def test_reference_state_store_persist_failure_is_best_effort(monkeypatch, tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    store = ReferenceStateStore(state_path=state_path)
+
+    monkeypatch.setattr(type(state_path), "write_text", lambda self, text, *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+
+    row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+
+    assert row["state"] == "referenced"
+    assert row["persisted"] is False
+    assert store.snapshot(["x"])["rows"]["x"]["state"] == "referenced"
+    assert not state_path.exists()
+
+
+
+def test_reference_state_store_keeps_in_memory_updates_after_persist_failure(monkeypatch, tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    state_path.write_text(
+        '{"rows": {"x": {"axis": "x", "state": "desynced", "source": "stale", "note": "old", "updated_at": "2026-01-01T00:00:00+00:00"}}}'
+    )
+    store = ReferenceStateStore(state_path=state_path)
+
+    monkeypatch.setattr(type(state_path), "write_text", lambda self, text, *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+
+    row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+    snapshot = store.snapshot(["x"])
+
+    assert row["state"] == "referenced"
+    assert snapshot["rows"]["x"]["state"] == "referenced"
+    assert snapshot["rows"]["x"]["source"] == "manual"
+
+
+
+def test_reference_state_store_persists_rows_to_disk(tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    store = ReferenceStateStore(state_path=state_path)
+    row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="startup_home"))
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+
+    assert row["persisted"] is True
+    assert reloaded.snapshot(["x"])["rows"]["x"]["state"] == "referenced"
+    assert reloaded.snapshot(["x"])["rows"]["x"]["source"] == "startup_home"
+
+
+
+def test_reference_state_persists_across_api_lifespan_restart(monkeypatch, tmp_path):
+    api = load_api(monkeypatch)
+    state_path = tmp_path / "reference-state.json"
+    store = ReferenceStateStore(state_path=state_path)
+    store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+
+    monkeypatch.setattr(api, "_reference_state_store", store)
+    monkeypatch.setattr(api, "BioXpTester", lambda alt=1: object())
+    monkeypatch.setattr(api, "build_default_pipette_transport", lambda: types.SimpleNamespace(close=lambda: None))
+
+    async def exercise_lifespan():
+        async with api.lifespan(None):
+            assert api._reference_state_store.snapshot(["x"])["rows"]["x"]["state"] == "referenced"
+
+    asyncio.run(exercise_lifespan())
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+    assert reloaded.snapshot(["x"])["rows"]["x"]["state"] == "referenced"
+
+
+
+def test_reference_state_store_ignores_invalid_persisted_rows(tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    state_path.write_text('{"rows": {"x": {"axis": "x", "state": "bogus"}}}')
+
+    store = ReferenceStateStore(state_path=state_path)
+
+    assert store.snapshot(["x"])["rows"]["x"]["state"] == "unknown"
+
+
+
+def test_reference_state_store_merges_interleaved_writers(tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    store_a = ReferenceStateStore(state_path=state_path)
+    store_b = ReferenceStateStore(state_path=state_path)
+
+    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+    store_b.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=10, source="manual"))
+
+    snapshot_a = store_a.snapshot(["x", "y"])
+    snapshot_b = store_b.snapshot(["x", "y"])
+    reloaded = ReferenceStateStore(state_path=state_path)
+    persisted = reloaded.snapshot(["x", "y"])
+
+    for snapshot in (snapshot_a, snapshot_b, persisted):
+        assert snapshot["rows"]["x"]["state"] == "referenced"
+        assert snapshot["rows"]["y"]["state"] == "referenced"
+
+
+
+def test_reference_state_store_merges_dirty_recovery_with_new_disk_rows(monkeypatch, tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    original_write_text = type(state_path).write_text
+    failure_count = {"remaining": 1}
+
+    def flaky_write_text(self, text, *args, **kwargs):
+        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
+            failure_count["remaining"] -= 1
+            raise OSError("disk full")
+        return original_write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
+
+    store_a = ReferenceStateStore(state_path=state_path)
+    store_b = ReferenceStateStore(state_path=state_path)
+
+    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+    store_b.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=10, source="manual"))
+    store_a.record_motion("z", "jog")
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+    persisted = reloaded.snapshot(["x", "y", "z"])
+
+    assert persisted["rows"]["x"]["state"] == "referenced"
+    assert persisted["rows"]["y"]["state"] == "referenced"
+    assert persisted["rows"]["z"]["last_motion_kind"] == "jog"
+
+
+
+def test_reference_state_store_dirty_recovery_prefers_newer_same_axis_disk_row(monkeypatch, tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    original_write_text = type(state_path).write_text
+    failure_count = {"remaining": 1}
+
+    def flaky_write_text(self, text, *args, **kwargs):
+        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
+            failure_count["remaining"] -= 1
+            raise OSError("disk full")
+        return original_write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
+
+    store_a = ReferenceStateStore(state_path=state_path)
+    store_b = ReferenceStateStore(state_path=state_path)
+
+    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+    store_b.mark_desynced(MarkAxisDesyncedCommand(axis="x", reason="belt slip", source="operator"))
+    row = store_a.record_motion("x", "jog")
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+    persisted = reloaded.snapshot(["x"])
+
+    assert row["persisted"] is True
+    assert persisted["rows"]["x"]["state"] == "desynced"
+    assert persisted["rows"]["x"]["note"] == "belt slip"
+    assert persisted["rows"]["x"]["last_motion_kind"] == "jog"
+
+
+
+def test_reference_state_store_failed_reset_recovery_preserves_disk_rows(monkeypatch, tmp_path):
+    state_path = tmp_path / "reference-state.json"
+    original_write_text = type(state_path).write_text
+
+    seed = ReferenceStateStore(state_path=state_path)
+    seed.mark_referenced(MarkAxisReferencedCommand(axis="legacy", position_steps=5, source="manual"))
+
+    failure_count = {"remaining": 1}
+
+    def flaky_write_text(self, text, *args, **kwargs):
+        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
+            failure_count["remaining"] -= 1
+            raise OSError("disk full")
+        return original_write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
+
+    store_a = ReferenceStateStore(state_path=state_path)
+    store_b = ReferenceStateStore(state_path=state_path)
+
+    store_a.reset()
+    store_b.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=10, source="manual"))
+    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
+
+    reloaded = ReferenceStateStore(state_path=state_path)
+    persisted = reloaded.snapshot(["legacy", "x", "y"])
+
+    assert persisted["rows"]["legacy"]["state"] == "referenced"
+    assert persisted["rows"]["x"]["state"] == "referenced"
+    assert persisted["rows"]["y"]["state"] == "referenced"
+
 
 
 def test_reference_routes_delegate_to_store(monkeypatch):

@@ -68,7 +68,24 @@ _tester: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
-_reference_state_store = ReferenceStateStore()
+
+
+def _default_reference_state_path() -> str:
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    if xdg_state_home:
+        base_dir = xdg_state_home
+    else:
+        home_dir = os.path.expanduser("~")
+        if home_dir and home_dir != "~" and os.path.isabs(home_dir):
+            base_dir = os.path.join(home_dir, ".local", "state")
+        else:
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".state"))
+    return os.path.join(base_dir, "bioxp", "reference-state.json")
+
+
+_reference_state_store = ReferenceStateStore(
+    state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
+)
 _pipette_transport = build_default_pipette_transport()
 try:
     _vision_capabilities = load_deck_layout().capabilities
@@ -92,7 +109,6 @@ _camera_stream_state = {
 async def lifespan(app: FastAPI):
     del app
     global _tester, _startup_error, _pipette_transport
-    _reference_state_store.reset()
     _pipette_transport = build_default_pipette_transport()
     try:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
@@ -110,7 +126,6 @@ async def lifespan(app: FastAPI):
         if callable(close_fn):
             close_fn()
         _pipette_transport = build_default_pipette_transport()
-        _reference_state_store.reset()
 
 
 app = FastAPI(

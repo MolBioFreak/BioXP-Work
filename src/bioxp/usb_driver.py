@@ -407,23 +407,60 @@ class BioXpTester:
             custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
         )
 
-    def reconnect(self):
+    def _disconnect(self, dev=None, *, hard_reset=False):
+        if dev is None:
+            dev = self.dev
+        if dev is self.dev:
+            self.ep_out = None
+            self.ep_in = None
+            self.dev = None
+        if dev is None:
+            return None
         try:
-            usb.util.release_interface(self.dev, 0)
+            usb.util.release_interface(dev, 0)
         except Exception:
             pass
         try:
-            self.dev.reset()
+            usb.util.dispose_resources(dev)
         except Exception:
             pass
-        time.sleep(0.12)
-        self._connect()
+        if hard_reset:
+            try:
+                dev.reset()
+            except Exception:
+                pass
+        return dev
+
+    def _reset_transport_recovery_state(self):
         self._chiller_noresp_streak = 0
         self._chiller_last_tx_ts = 0.0
         self._thermal_noresp_streak = 0
         self._thermal_last_tx_ts = 0.0
         self._motor_last_tx_ts = {int(bid): 0.0 for bid in self.MOTOR_BOARDS}
         self._motor_noresp_streak = {int(bid): 0 for bid in self.MOTOR_BOARDS}
+
+    def reconnect(self, *, hard_reset=False):
+        attempts = [True] if bool(hard_reset) else [False, True]
+        last_exc = None
+        recovery_dev = self.dev
+        for idx, use_hard_reset in enumerate(attempts):
+            try:
+                disconnect_target = self.dev if self.dev is not None else recovery_dev
+                recovery_dev = self._disconnect(disconnect_target, hard_reset=use_hard_reset)
+                if use_hard_reset:
+                    time.sleep(0.12)
+                elif idx > 0:
+                    time.sleep(0.05)
+                self._connect()
+                recovery_dev = self.dev
+                self._reset_transport_recovery_state()
+                return
+            except Exception as exc:
+                last_exc = exc
+                if self.dev is not None:
+                    recovery_dev = self.dev
+        if last_exc is not None:
+            raise last_exc
 
     @staticmethod
     def _default_led_state_path():
@@ -3321,7 +3358,7 @@ class BioXpTester:
         rows = []
         recovered = False
         for idx in range(rounds):
-            self.reconnect()
+            self.reconnect(hard_reset=True)
             time.sleep(0.10)
             self.drain(max_reads=20, timeout_ms=4)
 
@@ -4402,7 +4439,7 @@ class BioXpTester:
         rows = []
         recovered = False
         for idx in range(rounds):
-            self.reconnect()
+            self.reconnect(hard_reset=True)
             time.sleep(0.10)
             self.drain(max_reads=20, timeout_ms=4)
 
@@ -4810,7 +4847,7 @@ class BioXpTester:
         rows = []
         recovered = False
         for idx in range(rounds):
-            self.reconnect()
+            self.reconnect(hard_reset=True)
             time.sleep(0.10)
             self.drain(max_reads=20, timeout_ms=4)
 
