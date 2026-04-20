@@ -841,14 +841,57 @@ def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: 
     }
 
 
+def _unwrap_oem_home_payload(home_payload: object) -> dict:
+    if isinstance(home_payload, dict) and isinstance(home_payload.get("home"), dict):
+        return home_payload["home"]
+    if isinstance(home_payload, dict):
+        return home_payload
+    return {}
+
+
+def _validate_oem_home_request_speed(tester: BioXpTester, axis: AxisName, speed: Optional[int]) -> Optional[int]:
+    if speed is None:
+        return None
+    effective_speed = int(speed)
+    profile = tester._motion_oem_axis_profile(axis.value)
+    max_home_speed = int(profile.get("home_speed", profile.get("speed", 250)))
+    if effective_speed < 1 or effective_speed > max_home_speed:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Axis {axis.value} home speed must be between 1 and {max_home_speed} "
+                f"steps/s to stay within the OEM homing profile."
+            ),
+        )
+    return effective_speed
+
+
+def _ensure_oem_home_succeeded(tester: BioXpTester, axis: AxisName, home_payload: object) -> None:
+    home = _unwrap_oem_home_payload(home_payload)
+    if home.get("ok") is True:
+        return
+    home_after = home.get("home_after")
+    home_state = None
+    if isinstance(home_after, dict):
+        home_state = home_after.get("value")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Axis {axis.value} OEM homing did not confirm the home switch after motion; "
+            f"reported home_after={home_state!r}. Refusing to mark the axis homed."
+        ),
+    )
+
+
 def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int], timeout_s: float) -> dict:
     preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis)
-    home = _guarded_home_search(
-        tester,
-        preset,
-        speed=preset["speed"] if speed is None else min(int(speed), _DEFAULT_MOTION_SPEED),
+    effective_speed = _validate_oem_home_request_speed(tester, axis, speed)
+    home = tester.motor_oem_home_axis(
+        axis.value,
+        speed=effective_speed,
         timeout_s=min(float(timeout_s), 20.0),
     )
+    _ensure_oem_home_succeeded(tester, axis, home)
     return {
         "axis": axis.value,
         "board_status": board_status,
@@ -857,9 +900,11 @@ def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int]
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
         "motion_profile": {
-            "speed": int(preset["speed"]),
+            "requested_speed": effective_speed,
+            "preset_speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
             "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
+            "vendor_path": "oem_home_axis",
         },
         "home": home,
     }
@@ -880,19 +925,14 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared:
         arm_state = tester.motion_arm_state()
         live_gate = tester.motion_gate_live_snapshot()
         armed_and_live = bool(arm_state.get("armed")) and bool(live_gate.get("ok"))
-        if armed_and_live:
-            interlock = {
-                "reused": True,
-                "armed": True,
-                "reason": arm_state.get("reason"),
-                "note": "strict-arm live gate reused; skipping interlock wake",
-                "live_gate": live_gate,
-                "elapsed_ms": 0,
-            }
-            interlock_reused = True
-        else:
-            board_status = tester.activate_boards(expect_reply=True)
-            interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        board_status = tester.activate_boards(expect_reply=True)
+        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        if isinstance(interlock, dict):
+            interlock.setdefault("armed", bool(arm_state.get("armed")))
+            interlock.setdefault("reason", arm_state.get("reason"))
+            interlock["reused"] = False
+            interlock["note"] = "Fresh interlock wake executed before motion to mirror OEM XYZ enable behavior."
+            interlock["live_gate_before"] = live_gate
     if board_status is None:
         board_status = tester.activate_boards(expect_reply=True)
     reuse_used = bool(reuse_requested and armed_and_live and debug_flag_enabled)
@@ -936,9 +976,52 @@ def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared:
     return preset, board_status, interlock, prep, prep_policy
 
 
+def _hardware_connected_from_board_status(board_status: Any) -> bool:
+    return bool(isinstance(board_status, dict) and any(reply is not None for reply in board_status.values()))
+
+
+
+def _passive_board_status(tester: BioXpTester) -> Any:
+    board_status = tester.activate_boards(expect_reply=True)
+    if _hardware_connected_from_board_status(board_status):
+        return board_status
+    retry_board_status = tester.activate_boards(expect_reply=True)
+    if _hardware_connected_from_board_status(retry_board_status):
+        return retry_board_status
+    return retry_board_status
+
+
+
+def _dedicated_chiller_status_payload(tester: BioXpTester, board_status: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(board_status, dict):
+        return None
+    chiller_board = getattr(tester, "BOARD_CHILLER", 0x07)
+    if board_status.get(chiller_board) is not None:
+        return None
+
+    try:
+        activate = tester.chiller_activate()
+    except Exception as exc:
+        activate = {"ack": None, "ok": False, "error": str(exc)}
+
+    try:
+        firmware = tester.chiller_query_firmware()
+    except Exception as exc:
+        firmware = {"ack": None, "ok": False, "fw_hex": None, "error": str(exc)}
+
+    return {
+        "alive": bool(activate.get("ok") or firmware.get("ok")),
+        "activate": activate,
+        "firmware": firmware,
+        "note": "Dedicated chiller probe; board_status[7] from activate_boards is advisory.",
+    }
+
+
+
 def _status_payload() -> dict:
     runtime_available = _tester is not None
     board_status = None
+    chiller_status = None
     deck_io_snapshot = None
     status_error = None
     hardware_connected = False
@@ -946,17 +1029,15 @@ def _status_payload() -> dict:
 
     if runtime_available:
         try:
-            board_status = _tester.activate_boards(expect_reply=True)
-            if all(reply is None for reply in board_status.values()):
-                _tester.reconnect()
-                board_status = _tester.activate_boards(expect_reply=True)
-            hardware_connected = any(reply is not None for reply in board_status.values())
+            board_status = _passive_board_status(_tester)
+            hardware_connected = _hardware_connected_from_board_status(board_status)
             status = "ok" if hardware_connected else "degraded"
             if hardware_connected:
                 try:
                     deck_io_snapshot = _tester.io_snapshot(_tester.BOARD_DECK)
                 except Exception as exc:
                     status_error = f"deck IO snapshot unavailable: {exc}"
+            chiller_status = _dedicated_chiller_status_payload(_tester, board_status)
         except Exception as exc:
             status_error = str(exc)
 
@@ -968,20 +1049,20 @@ def _status_payload() -> dict:
         "startup_error": _startup_error,
         "status_error": status_error,
         "board_status": board_status,
+        "chiller_status": chiller_status,
         "deck_io_snapshot": deck_io_snapshot,
     }
 
 
 def _motion_power_status_payload(tester: BioXpTester) -> dict:
-    board_status = tester.activate_boards(expect_reply=True)
-    if all(reply is None for reply in board_status.values()):
-        tester.reconnect()
-        board_status = tester.activate_boards(expect_reply=True)
-    hardware_connected = any(reply is not None for reply in board_status.values())
+    board_status = _passive_board_status(tester)
+    hardware_connected = _hardware_connected_from_board_status(board_status)
+    chiller_status = _dedicated_chiller_status_payload(tester, board_status)
     deck_io_snapshot = tester.io_snapshot(tester.BOARD_DECK) if hardware_connected else None
     return {
         "hardware_connected": hardware_connected,
         "board_status": board_status,
+        "chiller_status": chiller_status,
         "deck_io_snapshot": deck_io_snapshot,
         "rail_24v": tester.motor_query_24v_sensor(),
         "motion_arm": tester.motion_arm_state(),

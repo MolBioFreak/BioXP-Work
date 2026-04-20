@@ -81,18 +81,20 @@ def test_prepare_motion_axis_ignores_reuse_without_debug_flag(monkeypatch):
 
     assert tester.activate_boards_calls == 1
     assert tester.prepare_axis_calls == 1
-    assert tester.prepare_interlock_calls == 0
+    assert tester.prepare_interlock_calls == 1
     assert board_status["5"]["ok"] is True
-    assert interlock["reused"] is True
+    assert interlock["ok"] is True
+    assert interlock["force_lock"] is True
     assert prep["ok"] is True
     assert policy["reuse_requested"] is True
     assert policy["reuse_allowed"] is False
     assert policy["reuse_used"] is False
+    assert policy["interlock_reused"] is False
     assert policy["board_activation_skipped"] is False
     assert policy["axis_prep_skipped"] is False
 
 
-def test_prepare_motion_axis_allows_debug_reuse_but_still_activates_boards(monkeypatch):
+def test_prepare_motion_axis_allows_debug_reuse_but_still_runs_fresh_interlock_wake(monkeypatch):
     monkeypatch.setenv("BIOXP_ENABLE_PREP_REUSE_DEBUG", "1")
     api = load_api(monkeypatch)
     tester = FakeTester(armed=True, live=True)
@@ -105,13 +107,15 @@ def test_prepare_motion_axis_allows_debug_reuse_but_still_activates_boards(monke
 
     assert tester.activate_boards_calls == 1
     assert tester.prepare_axis_calls == 0
-    assert tester.prepare_interlock_calls == 0
+    assert tester.prepare_interlock_calls == 1
     assert board_status["5"]["ok"] is True
-    assert interlock["reused"] is True
+    assert interlock["ok"] is True
+    assert interlock["force_lock"] is True
     assert prep["reused"] is True
     assert policy["reuse_requested"] is True
     assert policy["reuse_allowed"] is True
     assert policy["reuse_used"] is True
+    assert policy["interlock_reused"] is False
     assert policy["board_activation_skipped"] is False
     assert policy["axis_prep_skipped"] is True
 

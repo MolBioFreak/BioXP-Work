@@ -2247,56 +2247,46 @@ class BioXpTester:
         if bool(run_homing):
             homing = self.motor_startup_homing_mimic()
 
-            def _home_check(label, row):
+            def _unwrap_home_row(row):
                 if not isinstance(row, dict):
-                    add_check(f"home_{label}", False, detail="missing")
+                    return None
+                inner = row.get("home")
+                return inner if isinstance(inner, dict) else row
+
+            def _home_check(label, row, *, critical=True):
+                raw = _unwrap_home_row(row)
+                if not isinstance(raw, dict):
+                    add_check(f"home_{label}", False, detail="missing", critical=critical)
                     return
-                move_ok = self._tmcl_success(row.get("move_left", {}).get("ack"))
-                wait_ok = bool(row.get("wait", {}).get("stopped") is True)
-                stop_ok = self._tmcl_success(row.get("stop", {}).get("ack"))
-                set_ok = self._tmcl_success(row.get("sethome_final", {}).get("ack"))
-                hs = row.get("home_after", {}).get("value")
+                move = raw.get("move_left", {})
+                wait = raw.get("wait", {})
+                stop = raw.get("stop", {})
+                set_home = raw.get("sethome_final") or raw.get("set_home") or {}
+                hs = raw.get("home_after", {}).get("value")
+                move_ok = self._tmcl_success(move.get("ack"))
+                wait_ok = bool(wait.get("stopped") is True)
+                stop_ok = self._tmcl_success(stop.get("ack"))
+                set_ok = self._tmcl_success(set_home.get("ack"))
                 hs_ok = hs == 0
                 ok = bool(move_ok and wait_ok and stop_ok and set_ok and hs_ok)
                 add_check(
                     f"home_{label}",
                     ok,
                     detail={
-                        "move": _ack_text(row.get("move_left", {}).get("ack")),
-                        "wait": row.get("wait", {}).get("stopped"),
-                        "stop": _ack_text(row.get("stop", {}).get("ack")),
-                        "set_home": _ack_text(row.get("sethome_final", {}).get("ack")),
+                        "move": _ack_text(move.get("ack")),
+                        "wait": wait.get("stopped"),
+                        "stop": _ack_text(stop.get("ack")),
+                        "set_home": _ack_text(set_home.get("ack")),
                         "home_after": hs,
                     },
+                    critical=critical,
                 )
 
             _home_check("Z", homing.get("z_home"))
             _home_check("G", homing.get("g_home"))
             _home_check("X", homing.get("x_home"))
             _home_check("Y", homing.get("y_home"))
-            door_row = homing.get("door_home")
-            if not isinstance(door_row, dict):
-                add_check("home_DOOR", False, detail="missing", critical=False)
-            else:
-                move_ok = self._tmcl_success(door_row.get("move_left", {}).get("ack"))
-                wait_ok = bool(door_row.get("wait", {}).get("stopped") is True)
-                stop_ok = self._tmcl_success(door_row.get("stop", {}).get("ack"))
-                set_ok = self._tmcl_success(door_row.get("sethome_final", {}).get("ack"))
-                hs = door_row.get("home_after", {}).get("value")
-                hs_ok = hs == 0
-                add_check(
-                    "home_DOOR",
-                    bool(move_ok and wait_ok and stop_ok and set_ok and hs_ok),
-                    detail={
-                        "move": _ack_text(door_row.get("move_left", {}).get("ack")),
-                        "wait": door_row.get("wait", {}).get("stopped"),
-                        "stop": _ack_text(door_row.get("stop", {}).get("ack")),
-                        "set_home": _ack_text(door_row.get("sethome_final", {}).get("ack")),
-                        "home_after": hs,
-                        "advisory_only": True,
-                    },
-                    critical=False,
-                )
+            _home_check("DOOR", homing.get("door_home"), critical=False)
             add_check(
                 "x_after_home_move6000",
                 bool(
@@ -3068,143 +3058,202 @@ class BioXpTester:
             "log_tail": log[-20:],
         }
 
+    def _motion_oem_gripper_version(self):
+        raw = str(os.environ.get("BIOXP_GRIPPER_VERSION", "0")).strip()
+        try:
+            return 1 if int(raw) == 1 else 0
+        except Exception:
+            return 0
+
+    def _motion_oem_axis_profile(self, axis_key, *, startup=False):
+        key = str(axis_key).strip().lower()
+        preset = dict(self.motor_function_preset(key))
+        if key == "x":
+            preset.update({"home_speed": 250 if startup else 500, "run_current": 31, "stall_guard": 16})
+            return preset
+        if key == "y":
+            preset.update({"home_speed": 250 if startup else 500, "run_current": 31, "stall_guard": 16})
+            return preset
+        if key == "z":
+            preset.update({"home_speed": 1791, "run_current": 31})
+            return preset
+        if key == "g":
+            gv = self._motion_oem_gripper_version()
+            if gv == 1:
+                preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": 31, "home_speed": 200, "restore_current": 10})
+            else:
+                preset.update({"speed": 600, "acc": 5, "stall_guard": 5, "run_current": 31, "home_speed": 600, "restore_current": None})
+            return preset
+        if key == "door":
+            preset.update({"home_speed": int(preset.get("speed", 600)), "stall_guard_param": 205})
+            return preset
+        raise ValueError(f"Unknown OEM home axis: {axis_key}")
+
+    def motor_oem_initialize_without_motion(self):
+        prep = {}
+        for axis_key in ("x", "y", "z", "g", "door"):
+            preset = self._motion_oem_axis_profile(axis_key)
+            prep[axis_key] = self.motor_prepare_axis(
+                preset["board"],
+                motor=preset["motor"],
+                run_current=preset.get("run_current"),
+                standby_current=preset.get("standby_current"),
+                speed=preset.get("speed"),
+                acc=preset.get("acc"),
+                stall_guard=preset.get("stall_guard"),
+                ramp_mode=preset.get("ramp_mode"),
+                disable_right=bool(preset.get("disable_right", False)),
+                disable_left=bool(preset.get("disable_left", False)),
+                rdiv=preset.get("rdiv"),
+                pdiv=preset.get("pdiv"),
+                warm_enable=bool(preset.get("warm_enable", False)),
+            )
+        return prep
+
+    def motor_oem_go_home(self, axis_key, *, speed, rehome, timeout_s=20.0):
+        preset = self._motion_oem_axis_profile(axis_key)
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        position_before = self.motor_get_position(board, motor=motor)
+        home_before = self.motor_query_home_switch(board, motor=motor)
+        rehome_move = None
+        rehome_wait = None
+        if bool(rehome) or home_before.get("value") == active_value:
+            rehome_move = self.motor_move_absolute(board, 10000, motor=motor)
+            rehome_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 10.0))
+            time.sleep(0.50)
+        move_left = self.motor_move_left(board, speed=int(speed), motor=motor)
+        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=max(2.0, float(timeout_s)))
+        home_hit = None
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            home_hit = self.motor_query_home_switch(board, motor=motor)
+            if home_hit.get("value") == active_value:
+                break
+            time.sleep(0.05)
+        stop = self.motor_stop(board, motor=motor)
+        position_after = self.motor_get_position(board, motor=motor)
+        sethome = self.motor_set_home(board, motor=motor)
+        home_after = self.motor_query_home_switch(board, motor=motor)
+        return {
+            "axis": str(axis_key).strip().lower(),
+            "board": board,
+            "motor": motor,
+            "speed": int(speed),
+            "rehome": bool(rehome),
+            "position_before": position_before,
+            "position_after": position_after,
+            "home_before": home_before,
+            "home_hit": home_hit,
+            "home_after": home_after,
+            "rehome_move": rehome_move,
+            "rehome_wait": rehome_wait,
+            "move_left": move_left,
+            "wait": wait,
+            "stop": stop,
+            "set_home": sethome,
+            "ok": home_after.get("value") == active_value if isinstance(home_after, dict) else True,
+        }
+
+    def motor_oem_door_search_home(self, *, timeout_s=20.0):
+        preset = self._motion_oem_axis_profile("door")
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        threshold = int(preset.get("stall_guard", 6))
+        home_before = self.motor_query_home_switch(board, motor=motor)
+        preclear_threshold = None
+        preclear_move = None
+        preclear_wait = None
+        if home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
+            preclear_threshold = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold + 2, motor=motor)
+            preclear_move = self.motor_move_absolute(board, 1000, motor=motor)
+            preclear_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 8.0))
+        threshold_restore = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold, motor=motor)
+        move_left = self.motor_move_left(board, speed=int(preset.get("home_speed", preset.get("speed", 600))), motor=motor)
+        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=max(2.0, float(timeout_s)))
+        stop = self.motor_stop(board, motor=motor)
+        sethome = self.motor_set_home(board, motor=motor)
+        home_after = self.motor_query_home_switch(board, motor=motor)
+        switches_after = self.motor_get_switch_activity(board, motor=motor)
+        return {
+            "axis": "door",
+            "board": board,
+            "motor": motor,
+            "speed": int(preset.get("home_speed", preset.get("speed", 600))),
+            "home_before": home_before,
+            "preclear_threshold": preclear_threshold,
+            "preclear_move": preclear_move,
+            "preclear_wait": preclear_wait,
+            "threshold_restore": threshold_restore,
+            "move_left": move_left,
+            "wait": wait,
+            "stop": stop,
+            "set_home": sethome,
+            "home_after": home_after,
+            "switches_after": switches_after,
+            "ok": home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else True,
+        }
+
+    def motor_oem_home_axis(self, axis_key, *, speed=None, timeout_s=20.0, startup=False):
+        preset = self._motion_oem_axis_profile(axis_key, startup=bool(startup))
+        prepare = self.motor_prepare_axis(
+            preset["board"],
+            motor=preset["motor"],
+            run_current=preset.get("run_current"),
+            standby_current=preset.get("standby_current"),
+            speed=preset.get("speed"),
+            acc=preset.get("acc"),
+            stall_guard=preset.get("stall_guard"),
+            ramp_mode=preset.get("ramp_mode"),
+            disable_right=bool(preset.get("disable_right", False)),
+            disable_left=bool(preset.get("disable_left", False)),
+            rdiv=preset.get("rdiv"),
+            pdiv=preset.get("pdiv"),
+            warm_enable=bool(preset.get("warm_enable", False)),
+        )
+        effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
+        if str(axis_key).strip().lower() == "door":
+            home = self.motor_oem_door_search_home(timeout_s=timeout_s)
+        else:
+            home = self.motor_oem_go_home(axis_key, speed=effective_speed, rehome=not bool(startup), timeout_s=timeout_s)
+        restore_current = None
+        if str(axis_key).strip().lower() == "g" and preset.get("restore_current") is not None:
+            restore_current = self.motor_set_axis_param(preset["board"], 6, int(preset["restore_current"]), motor=preset["motor"])
+        return {
+            "axis": str(axis_key).strip().lower(),
+            "startup": bool(startup),
+            "prepare": prepare,
+            "home": home,
+            "restore_current": restore_current,
+        }
+
     def motor_startup_homing_mimic(self):
         """
-        Approximate ControlInterface.initializeMotors startup homing:
-        Z home -> gripper prep/home -> X home+setHome+move 6000 -> Y home+setHome -> door home.
+        Recreate the OEM initializeMotors startup order from the decompiled vendor code:
+        Z home -> gripper +10000 then home -> X home/setHome/setSpeed/move6000 -> Y home/setHome -> door home.
         """
         t0 = time.time()
         self.reconnect()
         board_status = self.activate_boards(expect_reply=True)
+        prep = self.motor_oem_initialize_without_motion()
 
-        px = self.motor_function_preset("x")
-        py = self.motor_function_preset("y")
-        pz = self.motor_function_preset("z")
-        pg = self.motor_function_preset("g")
-        pd = self.motor_function_preset("door")
+        pg = self._motion_oem_axis_profile("g", startup=True)
+        px = self._motion_oem_axis_profile("x", startup=True)
+        py = self._motion_oem_axis_profile("y", startup=True)
 
-        prep = {
-            "x": self.motor_prepare_axis(
-                px["board"],
-                motor=px["motor"],
-                run_current=px["run_current"],
-                standby_current=px["standby_current"],
-                speed=px["speed"],
-                acc=px["acc"],
-                stall_guard=px.get("stall_guard"),
-                ramp_mode=px.get("ramp_mode"),
-                disable_right=bool(px.get("disable_right", False)),
-                disable_left=bool(px.get("disable_left", False)),
-                rdiv=px.get("rdiv"),
-                pdiv=px.get("pdiv"),
-                warm_enable=bool(px.get("warm_enable", False)),
-            ),
-            "y": self.motor_prepare_axis(
-                py["board"],
-                motor=py["motor"],
-                run_current=py["run_current"],
-                standby_current=py["standby_current"],
-                speed=py["speed"],
-                acc=py["acc"],
-                stall_guard=py.get("stall_guard"),
-                ramp_mode=py.get("ramp_mode"),
-                disable_right=bool(py.get("disable_right", False)),
-                disable_left=bool(py.get("disable_left", False)),
-                rdiv=py.get("rdiv"),
-                pdiv=py.get("pdiv"),
-                warm_enable=bool(py.get("warm_enable", False)),
-            ),
-            "z": self.motor_prepare_axis(
-                pz["board"],
-                motor=pz["motor"],
-                run_current=pz["run_current"],
-                standby_current=pz["standby_current"],
-                speed=pz["speed"],
-                acc=pz["acc"],
-                stall_guard=pz.get("stall_guard"),
-                ramp_mode=pz.get("ramp_mode"),
-                disable_right=bool(pz.get("disable_right", False)),
-                disable_left=bool(pz.get("disable_left", False)),
-                rdiv=pz.get("rdiv"),
-                pdiv=pz.get("pdiv"),
-                warm_enable=bool(pz.get("warm_enable", False)),
-            ),
-            "g": self.motor_prepare_axis(
-                pg["board"],
-                motor=pg["motor"],
-                run_current=pg["run_current"],
-                standby_current=pg["standby_current"],
-                speed=pg["speed"],
-                acc=pg["acc"],
-                stall_guard=pg.get("stall_guard"),
-                ramp_mode=pg.get("ramp_mode"),
-                disable_right=bool(pg.get("disable_right", False)),
-                disable_left=bool(pg.get("disable_left", False)),
-                rdiv=pg.get("rdiv"),
-                pdiv=pg.get("pdiv"),
-                warm_enable=bool(pg.get("warm_enable", False)),
-            ),
-            "door": self.motor_prepare_axis(
-                pd["board"],
-                motor=pd["motor"],
-                run_current=pd["run_current"],
-                standby_current=pd["standby_current"],
-                speed=pd["speed"],
-                acc=pd["acc"],
-                stall_guard=pd.get("stall_guard"),
-                ramp_mode=pd.get("ramp_mode"),
-                disable_right=bool(pd.get("disable_right", False)),
-                disable_left=bool(pd.get("disable_left", False)),
-                rdiv=pd.get("rdiv"),
-                pdiv=pd.get("pdiv"),
-                warm_enable=bool(pd.get("warm_enable", False)),
-            ),
-        }
-
-        # OEM initializeMotors bumps gripper positive before homing.
         g_pre_move = self.motor_move_relative(pg["board"], 10000, motor=pg["motor"])
         g_pre_wait = self.motor_wait_stopped(pg["board"], motor=pg["motor"], timeout_s=10.0)
-
-        z_home = self.motor_axis_search_home(
-            pz["board"],
-            motor=pz["motor"],
-            speed=1791,
-            timeout_s=12.0,
-            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
-        )
-        g_home = self.motor_axis_search_home(
-            pg["board"],
-            motor=pg["motor"],
-            speed=600,
-            timeout_s=10.0,
-            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
-        )
-        x_home = self.motor_axis_search_home(
-            px["board"],
-            motor=px["motor"],
-            speed=250,
-            timeout_s=12.0,
-            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
-        )
+        z_home = self.motor_oem_home_axis("z", startup=True)
+        g_home = self.motor_oem_home_axis("g", startup=True)
+        x_home = self.motor_oem_home_axis("x", startup=True)
         x_set_home = self.motor_set_home(px["board"], motor=px["motor"])
         x_speed = self.motor_set_axis_param(px["board"], 4, 1700, motor=px["motor"])
         x_move_6000 = self.motor_move_absolute(px["board"], 6000, motor=px["motor"])
         x_wait = self.motor_wait_stopped(px["board"], motor=px["motor"], timeout_s=8.0)
-        y_home = self.motor_axis_search_home(
-            py["board"],
-            motor=py["motor"],
-            speed=250,
-            timeout_s=12.0,
-            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
-        )
+        y_home = self.motor_oem_home_axis("y", startup=True)
         y_set_home = self.motor_set_home(py["board"], motor=py["motor"])
-        door_home = self.motor_axis_search_home(
-            pd["board"],
-            motor=pd["motor"],
-            speed=int(pd["speed"]),
-            timeout_s=10.0,
-            home_active_value=int(self.MOTOR_SWITCH_ACTIVE_VALUE),
-        )
+        door_home = self.motor_oem_home_axis("door", startup=True)
 
         rail = self.motor_query_24v_sensor()
         return {
