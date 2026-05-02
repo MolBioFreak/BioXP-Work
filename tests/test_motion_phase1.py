@@ -10,6 +10,8 @@ class FakeTester:
         self.activate_boards_calls = 0
         self.prepare_axis_calls = 0
         self.prepare_interlock_calls = 0
+        self.current_values = {}
+        self.current_ops = []
 
     def motor_function_preset(self, axis: str):
         return {
@@ -52,6 +54,33 @@ class FakeTester:
 
     def motor_move_relative(self, board: int, steps: int, motor: int = 0):
         return {"ok": True, "board": board, "motor": motor, "steps": steps}
+
+    def motor_get_axis_param(self, board: int, param: int, motor: int = 0):
+        self.current_ops.append(("get", board, param, motor))
+        return {
+            "ok": True,
+            "board": board,
+            "param": param,
+            "motor": motor,
+            "value": self.current_values.get((board, param, motor), 0),
+            "debug_extra": "should be trimmed from operator payload",
+        }
+
+    def motor_set_axis_param(self, board: int, param: int, value: int, motor: int = 0):
+        self.current_ops.append(("set", board, param, motor, value))
+        self.current_values[(board, param, motor)] = value
+        return {
+            "ok": True,
+            "board": board,
+            "param": param,
+            "motor": motor,
+            "set_value": value,
+            "ack": {"board": board, "cmd": 5, "status": 100, "status_str": "OK", "value": value, "extra": "trim"},
+        }
+
+    def motor_get_speed(self, board: int, motor: int = 0):
+        self.current_ops.append(("speed", board, motor))
+        return {"ok": True, "board": board, "motor": motor, "speed": 0}
 
 
 def load_api(monkeypatch):
@@ -149,3 +178,46 @@ def test_relative_move_response_exposes_truth_metadata(monkeypatch):
     assert result["motion_truth"]["evidence_level"] == "controller_only"
     assert result["motion_truth"]["independent_evidence_required"] is True
     assert result["motion_truth"]["physical_motion_confirmed"] is False
+
+
+def test_set_motion_axis_currents_caps_standby_and_does_not_move(monkeypatch):
+    api = load_api(monkeypatch)
+    tester = FakeTester()
+
+    result = api._set_motion_axis_currents(
+        tester,
+        [api.AxisName.X],
+        run_current=20,
+        standby_current=31,
+    )
+
+    assert result["ok"] is True
+    assert result["motion_commanded"] is False
+    assert result["axes"]["x"]["requested"] == {"run_current_param6": 20, "standby_current_param7": 31}
+    assert result["axes"]["x"]["applied"] == {"run_current_param6": 20, "standby_current_param7": 20}
+    assert result["axes"]["x"]["after"]["param6"]["value"] == 20
+    assert result["axes"]["x"]["after"]["param7"]["value"] == 20
+    assert "debug_extra" not in result["axes"]["x"]["before"]["param6"]
+    assert "extra" not in result["axes"]["x"]["writes"]["param6"]["ack"]
+    assert tester.current_ops == [
+        ("get", 5, 6, 0),
+        ("get", 5, 7, 0),
+        ("set", 5, 7, 0, 20),
+        ("set", 5, 6, 0, 20),
+        ("get", 5, 6, 0),
+        ("get", 5, 7, 0),
+        ("speed", 5, 0),
+    ]
+
+
+def test_set_motion_axis_currents_rejects_non_gantry_axes(monkeypatch):
+    api = load_api(monkeypatch)
+    tester = FakeTester()
+
+    try:
+        api._set_motion_axis_currents(tester, [api.AxisName.GRIPPER], run_current=20, standby_current=20)
+    except api.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "gantry x/y/z" in str(exc.detail)
+    else:
+        raise AssertionError("expected non-gantry axis rejection")

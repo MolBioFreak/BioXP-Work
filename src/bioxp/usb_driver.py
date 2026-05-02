@@ -227,6 +227,7 @@ class BioXpTester:
     MOTOR_MIN_CMD_GAP_S = 0.045
     MOTOR_POST_RECOVER_GAP_S = 0.100
     MOTOR_RECOVERY_BOARDS = (BOARD_HEAD, BOARD_DECK)
+    RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
     MOTOR_HEAD_CLEARANCE_AXIS_KEY = "z"
     # This unit clears the head lock by moving Z negative from the current/home slot.
     MOTOR_HEAD_CLEARANCE_SIGN_BY_AXIS = {
@@ -407,6 +408,26 @@ class BioXpTester:
             custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
         )
 
+    @classmethod
+    def _build_reset_provenance(cls, *, subsystem, source, reset_scope, **extra):
+        payload = {
+            "schema_version": cls.RESET_PROVENANCE_SCHEMA_VERSION,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "subsystem": str(subsystem),
+            "source": str(source),
+            "reset_scope": str(reset_scope),
+            "software_recovery": bool(extra.pop("software_recovery", True)),
+            "hardware_component_fault_proven": bool(extra.pop("hardware_component_fault_proven", False)),
+        }
+        payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _device_label(dev):
+        if dev is None:
+            return None
+        return getattr(dev, "label", None) or repr(dev)
+
     def _disconnect(self, dev=None, *, hard_reset=False):
         if dev is None:
             dev = self.dev
@@ -441,12 +462,21 @@ class BioXpTester:
 
     def reconnect(self, *, hard_reset=False):
         attempts = [True] if bool(hard_reset) else [False, True]
+        attempt_rows = []
         last_exc = None
         recovery_dev = self.dev
         for idx, use_hard_reset in enumerate(attempts):
+            attempt = {
+                "index": idx + 1,
+                "hard_reset": bool(use_hard_reset),
+                "disconnect_target": self._device_label(self.dev if self.dev is not None else recovery_dev),
+                "ok": False,
+            }
+            attempt_rows.append(attempt)
             try:
                 disconnect_target = self.dev if self.dev is not None else recovery_dev
                 recovery_dev = self._disconnect(disconnect_target, hard_reset=use_hard_reset)
+                attempt["disconnect_ok"] = True
                 if use_hard_reset:
                     time.sleep(0.12)
                 elif idx > 0:
@@ -454,12 +484,35 @@ class BioXpTester:
                 self._connect()
                 recovery_dev = self.dev
                 self._reset_transport_recovery_state()
-                return
+                attempt.update({"ok": True, "connected_device": self._device_label(self.dev)})
+                provenance = self._build_reset_provenance(
+                    subsystem="usb_runtime",
+                    source="BioXpTester.reconnect",
+                    reset_scope="usb_rebind_and_optional_device_reset",
+                    requested_hard_reset=bool(hard_reset),
+                    hardware_usb_reset_performed=any(bool(row.get("hard_reset")) for row in attempt_rows),
+                    attempts=attempt_rows,
+                    transport_recovery_state_reset=True,
+                )
+                self._last_usb_reconnect_provenance = provenance
+                return {"ok": True, "reset_provenance": provenance, "attempts": attempt_rows}
             except Exception as exc:
+                attempt["error"] = str(exc)
                 last_exc = exc
                 if self.dev is not None:
                     recovery_dev = self.dev
         if last_exc is not None:
+            provenance = self._build_reset_provenance(
+                subsystem="usb_runtime",
+                source="BioXpTester.reconnect",
+                reset_scope="usb_rebind_and_optional_device_reset",
+                requested_hard_reset=bool(hard_reset),
+                hardware_usb_reset_performed=any(bool(row.get("hard_reset")) for row in attempt_rows),
+                attempts=attempt_rows,
+                transport_recovery_state_reset=False,
+                final_error=str(last_exc),
+            )
+            self._last_usb_reconnect_provenance = provenance
             raise last_exc
 
     @staticmethod

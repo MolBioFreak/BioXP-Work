@@ -22,6 +22,7 @@ from .pipette import (
     PipetteDispenseCommand,
     PipetteInitCommand,
     PipetteMixCommand,
+    PipettePreflightError,
     PipetteTipAction,
     PipetteTipCommand,
     build_default_pipette_transport,
@@ -45,6 +46,7 @@ from .services.pipette_service import (
     run_pipette_tip_command,
 )
 from .services.protocol_service import (
+    ProtocolLiveContractError,
     create_protocol_job,
     get_protocol_job,
     list_protocol_jobs,
@@ -103,6 +105,21 @@ _camera_stream_state = {
     "last_frame_at": None,
     "last_error": None,
 }
+RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
+
+
+def _reset_provenance(*, subsystem: str, source: str, reset_scope: str, **extra: Any) -> dict[str, Any]:
+    payload = {
+        "schema_version": RESET_PROVENANCE_SCHEMA_VERSION,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "subsystem": subsystem,
+        "source": source,
+        "reset_scope": reset_scope,
+        "software_recovery": bool(extra.pop("software_recovery", True)),
+        "hardware_component_fault_proven": bool(extra.pop("hardware_component_fault_proven", False)),
+    }
+    payload.update(extra)
+    return payload
 
 
 @asynccontextmanager
@@ -161,7 +178,38 @@ class AxisName(str, Enum):
     THERMAL_DOOR = "door"
 
 
+_LIQUID_REQUIRED_REFERENCE_AXES = (AxisName.X, AxisName.Y, AxisName.Z)
+
+
+def _liquid_reference_preflight(operation: str, command: Any | None = None) -> dict[str, Any]:
+    snapshot = _reference_state_store.snapshot(_LIQUID_REQUIRED_REFERENCE_AXES)
+    rows = snapshot.get("rows", {}) if isinstance(snapshot, dict) else {}
+    missing_axes = []
+    for axis in _LIQUID_REQUIRED_REFERENCE_AXES:
+        axis_key = axis.value
+        row = rows.get(axis_key, {}) if isinstance(rows, dict) else {}
+        if not isinstance(row, dict) or row.get("state") != "referenced":
+            missing_axes.append(axis_key)
+    requested = command.to_payload() if hasattr(command, "to_payload") else None
+    payload = {
+        "ok": not missing_axes,
+        "operation": str(operation),
+        "required_reference_axes": [axis.value for axis in _LIQUID_REQUIRED_REFERENCE_AXES],
+        "missing_reference_axes": missing_axes,
+        "reference_snapshot": snapshot,
+        "hardware_truth_required": True,
+        "requested": requested,
+    }
+    if missing_axes:
+        raise PipettePreflightError(
+            "Liquid operation requires referenced x/y/z axes before hardware pipetting.",
+            details=payload,
+        )
+    return payload
+
+
 class ThermalBankName(str, Enum):
+
     NEST = "nest"
     LID = "lid"
     PEDESTAL = "pedestal"
@@ -243,6 +291,19 @@ class MotionArmStartupRequest(BaseModel):
     run_homing: bool = False
 
 
+class MotionAxisCurrentRequest(BaseModel):
+    axes: list[AxisName] = Field(default_factory=lambda: [AxisName.X, AxisName.Y, AxisName.Z])
+    run_current: int = Field(31, ge=0, le=31)
+    standby_current: int = Field(31, ge=0, le=31)
+
+
+class LiquidLocationRequest(BaseModel):
+    location_id: str = Field(..., min_length=1, max_length=120)
+    well_id: Optional[str] = Field(None, max_length=120)
+    plate_name: Optional[str] = Field(None, max_length=120)
+    z_offset_steps: Optional[int] = None
+
+
 class PipetteInitRequest(BaseModel):
     pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
     prime_volume_ul: Optional[float] = Field(None, gt=0.0, le=1000.0)
@@ -250,23 +311,47 @@ class PipetteInitRequest(BaseModel):
 
 class PipetteTipRequest(BaseModel):
     action: PipetteTipAction
+    tip_id: Optional[str] = Field(None, max_length=120)
+    operator: Optional[str] = Field(None, max_length=120)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipetteAspirateRequest(BaseModel):
     volume_ul: float = Field(..., gt=0.0, le=1000.0)
     pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
+    source: Optional[LiquidLocationRequest] = None
+    liquid_class: Optional[str] = Field(None, max_length=120)
+    tip_id: Optional[str] = Field(None, max_length=120)
+    air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
+    operator: Optional[str] = Field(None, max_length=120)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipetteDispenseRequest(BaseModel):
     volume_ul: float = Field(..., gt=0.0, le=1000.0)
     pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
     blow_out: bool = False
+    destination: Optional[LiquidLocationRequest] = None
+    dest: Optional[LiquidLocationRequest] = None
+    liquid_class: Optional[str] = Field(None, max_length=120)
+    tip_id: Optional[str] = Field(None, max_length=120)
+    air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
+    operator: Optional[str] = Field(None, max_length=120)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipetteMixRequest(BaseModel):
     volume_ul: float = Field(..., gt=0.0, le=1000.0)
     cycles: int = Field(..., ge=1, le=50)
     pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
+    location: Optional[LiquidLocationRequest] = None
+    source: Optional[LiquidLocationRequest] = None
+    destination: Optional[LiquidLocationRequest] = None
+    dest: Optional[LiquidLocationRequest] = None
+    liquid_class: Optional[str] = Field(None, max_length=120)
+    tip_id: Optional[str] = Field(None, max_length=120)
+    operator: Optional[str] = Field(None, max_length=120)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ThermalRequest(BaseModel):
@@ -321,6 +406,17 @@ class ProtocolCompileRequest(BaseModel):
 
 class ProtocolExecuteRequest(ProtocolCompileRequest):
     dry_run: bool = True
+    live_execution: Optional[dict[str, Any]] = Field(
+        None,
+        description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
+    )
+    live_execution_ack: bool = Field(False, description="Explicit operator acknowledgement for dry_run=false live protocol execution.")
+    operator_id: Optional[str] = Field(None, max_length=120)
+    physical_console_verified: bool = Field(False)
+    deck_manifest: Optional[dict[str, Any]] = None
+    preflight: Optional[dict[str, Any]] = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    snapshot_refs: list[str] = Field(default_factory=list)
 
 
 class ProtocolReviewRequest(BaseModel):
@@ -910,6 +1006,83 @@ def _execute_home_axis(tester: BioXpTester, axis: AxisName, speed: Optional[int]
     }
 
 
+def _current_param_row(row: dict | None) -> dict | None:
+    if not isinstance(row, dict):
+        return row
+    out = {k: row.get(k) for k in ("board", "param", "motor", "value", "set_value", "ok") if k in row}
+    ack = row.get("ack")
+    if isinstance(ack, dict):
+        out["ack"] = {k: ack.get(k) for k in ("board", "cmd", "status", "status_str", "value") if k in ack}
+    rb = row.get("readback")
+    if isinstance(rb, dict):
+        out["readback"] = {k: rb.get(k) for k in ("board", "param", "motor", "value") if k in rb}
+        rb_ack = rb.get("ack")
+        if isinstance(rb_ack, dict):
+            out["readback"]["ack"] = {
+                k: rb_ack.get(k) for k in ("board", "cmd", "status", "status_str", "value") if k in rb_ack
+            }
+    return out
+
+
+def _set_motion_axis_currents(
+    tester: BioXpTester,
+    axes: list[AxisName],
+    *,
+    run_current: int,
+    standby_current: int,
+) -> dict:
+    allowed = {AxisName.X, AxisName.Y, AxisName.Z}
+    normalized = [AxisName(axis) for axis in axes]
+    invalid = [axis.value for axis in normalized if axis not in allowed]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"current set route is restricted to gantry x/y/z; invalid={invalid}")
+    run = max(0, min(31, int(run_current)))
+    standby = max(0, min(run, int(standby_current)))
+    rows = {}
+    all_ok = True
+    for axis in normalized:
+        preset = _axis_preset(tester, axis)
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        before6 = tester.motor_get_axis_param(board, 6, motor=motor)
+        before7 = tester.motor_get_axis_param(board, 7, motor=motor)
+        # Write standby first; live testing showed writing param 7 can drag param 6 down.
+        # Re-assert run current after standby so requested run/standby pairs survive readback.
+        write7 = tester.motor_set_axis_param(board, 7, standby, motor=motor)
+        write6 = tester.motor_set_axis_param(board, 6, run, motor=motor)
+        after6 = tester.motor_get_axis_param(board, 6, motor=motor)
+        after7 = tester.motor_get_axis_param(board, 7, motor=motor)
+        speed = tester.motor_get_speed(board, motor=motor)
+        ok = (
+            bool(write6.get("ok"))
+            and bool(write7.get("ok"))
+            and after6.get("value") == run
+            and after7.get("value") == standby
+        )
+        all_ok = all_ok and ok
+        rows[axis.value] = {
+            "label": preset.get("label"),
+            "board": board,
+            "motor": motor,
+            "requested": {"run_current_param6": int(run_current), "standby_current_param7": int(standby_current)},
+            "applied": {"run_current_param6": run, "standby_current_param7": standby},
+            "before": {"param6": _current_param_row(before6), "param7": _current_param_row(before7)},
+            "writes": {"param6": _current_param_row(write6), "param7": _current_param_row(write7)},
+            "after": {"param6": _current_param_row(after6), "param7": _current_param_row(after7)},
+            "speed": speed,
+            "ok": ok,
+        }
+    return {
+        "ok": bool(all_ok),
+        "axes": rows,
+        "current_param_bounds": (
+            "0..31 controller-accepted range; controller returned Invalid value for 37 during live testing; "
+            "standby is capped at run_current; no movement is commanded."
+        ),
+        "motion_commanded": False,
+    }
+
+
 def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared: bool = False):
     preset = _axis_preset(tester, axis)
     board_status = None
@@ -1228,6 +1401,18 @@ def _camera_reset_local(preferred: str) -> dict:
         "lock_released": lock_released,
         "survivors": survivors,
         "errors": errors,
+        "reset_provenance": _reset_provenance(
+            subsystem="camera",
+            source="camera_reset_local",
+            reset_scope="ffmpeg_process_and_stream_lock",
+            requested_device=preferred,
+            resolved_device=device,
+            hardware_usb_reset_performed=False,
+            killed_pids=killed,
+            lock_released=lock_released,
+            survivor_count=len(survivors),
+            errors=errors,
+        ),
     }
 
 
@@ -1614,6 +1799,21 @@ async def motion_power_diag():
         "Motion driver power diagnostic",
         lambda: tester.motor_driver_power_diag(axis_keys=("x", "y", "z", "g", "door")),
         timeout_s=45.0,
+    )
+
+
+@app.post("/motion/axes/current")
+async def motion_axes_current(req: MotionAxisCurrentRequest):
+    tester = _get_tester()
+    return await _run_blocking(
+        "Set gantry motor currents",
+        lambda: _set_motion_axis_currents(
+            tester,
+            req.axes,
+            run_current=req.run_current,
+            standby_current=req.standby_current,
+        ),
+        timeout_s=25.0,
     )
 
 
@@ -2107,6 +2307,7 @@ async def liquid_aspirate(req: PipetteAspirateRequest):
         PipetteAspirateCommand.from_request(req),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
+        preflight=_liquid_reference_preflight,
     )
 
 
@@ -2116,6 +2317,7 @@ async def liquid_dispense(req: PipetteDispenseRequest):
         PipetteDispenseCommand.from_request(req),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
+        preflight=_liquid_reference_preflight,
     )
 
 
@@ -2125,6 +2327,7 @@ async def liquid_mix(req: PipetteMixRequest):
         PipetteMixCommand.from_request(req),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
+        preflight=_liquid_reference_preflight,
     )
 
 
@@ -2136,11 +2339,16 @@ async def protocol_compile(req: ProtocolCompileRequest):
 
 @app.post("/protocol/execute")
 async def protocol_execute(req: ProtocolExecuteRequest):
-    return await run_in_threadpool(
-        create_protocol_job,
-        req.model_dump(exclude_none=True),
-        dry_run=bool(req.dry_run),
-    )
+    try:
+        return await run_in_threadpool(
+            create_protocol_job,
+            req.model_dump(exclude_none=True),
+            dry_run=bool(req.dry_run),
+        )
+    except ProtocolLiveContractError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/protocol/jobs")

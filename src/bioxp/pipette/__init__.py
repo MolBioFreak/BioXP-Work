@@ -1,4 +1,5 @@
 from .models import (
+    LiquidLocation,
     PipetteAspirateCommand,
     PipetteCommandError,
     PipetteDispenseCommand,
@@ -6,6 +7,8 @@ from .models import (
     PipetteInitCommand,
     PipetteMixCommand,
     PipetteNotReadyError,
+    PipetteOperationContext,
+    PipettePreflightError,
     PipetteTipAction,
     PipetteTipCommand,
     PipetteTipStateError,
@@ -15,6 +18,7 @@ from .models import (
 from .transport import CanPipetteTransport, PipetteTransport, build_default_pipette_transport
 
 __all__ = [
+    "LiquidLocation",
     "PipetteAspirateCommand",
     "PipetteCommandError",
     "PipetteDispenseCommand",
@@ -22,6 +26,8 @@ __all__ = [
     "PipetteInitCommand",
     "PipetteMixCommand",
     "PipetteNotReadyError",
+    "PipetteOperationContext",
+    "PipettePreflightError",
     "PipetteTipAction",
     "PipetteTipCommand",
     "PipetteTipStateError",
