@@ -10,6 +10,8 @@ from enum import Enum
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+
+from .oem_compat.api import router as oem_compat_router
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -151,6 +153,7 @@ app = FastAPI(
     version="0.3.0",
     lifespan=lifespan,
 )
+app.include_router(oem_compat_router)
 
 
 def _get_tester() -> BioXpTester:
