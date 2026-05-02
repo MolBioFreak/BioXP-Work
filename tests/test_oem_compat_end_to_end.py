@@ -47,9 +47,8 @@ def test_initialize_motors_without_motion_emits_oem_ordered_params():
     assert names[:4] == ["wait_for_board", "turn_off_heater", "set_chiller_pwm", "set_chiller_rates"]
 
     x_ops = [op for op in trace.operations if op.axis == "x" and op.name.startswith("set_")]
-    assert [(op.name, op.value) for op in x_ops[:5]] == [
-        ("set_max_speed", 1700),
-        ("set_max_acc", 350),
+    assert [(op.name, op.value) for op in x_ops[:4]] == [
+        ("set_speed_acc", {"speed": 1700, "acc": 350}),
         ("set_run_current", 31),
         ("set_standby_current", 10),
         ("set_stall_guard", 16),
@@ -74,9 +73,9 @@ def test_startup_homing_trace_preserves_oem_axis_sequence_and_x_offset_move():
         ("home_axis", "z", 1791),
         ("home_axis", "g", 200),
         ("home_axis", "x", 250),
-        ("home_axis", "y", 500),
-        ("home_axis", "door", 600),
+        ("home_axis", "y", 250),
     ]
+    assert ("door_search_home", "door", {"speed": 600, "stall_guard": 6}) in compact
     assert ("set_home", "x", 0) in compact
     assert ("set_max_speed", "x", 1700) in compact
     assert ("move_absolute", "x", 6000) in compact

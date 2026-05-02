@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from .frames import OemCommandFrame, OemReplyFrame
 from .transport import DryRunTransport
 
-
-# TMCL/OEM command numbers used by the current Linux driver and OEM ClassMotor.
 CMD_ROR = 1
 CMD_ROL = 2
 CMD_MST = 3
@@ -14,6 +12,7 @@ CMD_MVP = 4
 CMD_SAP = 5
 CMD_GAP = 6
 CMD_RFS = 13
+CMD_QUERY_STOP = 138
 
 MVP_ABS = 0
 MVP_REL = 1
@@ -37,6 +36,10 @@ PARAM_PDIV = 154
 PARAM_STALL_GUARD_THRESHOLD = 205
 
 
+def _clamp_current(current: int) -> int:
+    return max(0, min(31, int(current)))
+
+
 @dataclass
 class Motor:
     board_id: int
@@ -44,7 +47,7 @@ class Motor:
     transport: DryRunTransport
     label: str = ""
 
-    def _send(self, command: int, cmd_type: int, value: int, message: str) -> OemReplyFrame:
+    def _send(self, command: int, cmd_type: int, value: int, message: str, *, timeout_ms: int = 60000) -> OemReplyFrame:
         frame = OemCommandFrame.tmcl(
             self.board_id,
             command,
@@ -52,8 +55,15 @@ class Motor:
             self.motor,
             value,
             message=message,
+            timeout_ms=timeout_ms,
         )
         return self.transport.transmit(frame)
+
+    def move_right(self, speed: int = 200) -> OemReplyFrame:
+        return self._send(CMD_ROR, 0, speed, f"{self.label}.ROR({speed})")
+
+    def move_left(self, speed: int = 200) -> OemReplyFrame:
+        return self._send(CMD_ROL, 0, speed, f"{self.label}.ROL({speed})")
 
     def set_axis_param(self, param: int, value: int) -> OemReplyFrame:
         return self._send(CMD_SAP, int(param), int(value), f"{self.label}.SAP{param}={value}")
@@ -68,10 +78,10 @@ class Motor:
         return self.set_axis_param(PARAM_MAX_ACC, acc)
 
     def set_max_current(self, current: int) -> OemReplyFrame:
-        return self.set_axis_param(PARAM_RUN_CURRENT, current)
+        return self.set_axis_param(PARAM_RUN_CURRENT, _clamp_current(current))
 
     def set_standby_current(self, current: int) -> OemReplyFrame:
-        return self.set_axis_param(PARAM_STANDBY_CURRENT, current)
+        return self.set_axis_param(PARAM_STANDBY_CURRENT, _clamp_current(current))
 
     def read_max_current(self) -> OemReplyFrame:
         return self.get_axis_param(PARAM_RUN_CURRENT)
@@ -79,12 +89,25 @@ class Motor:
     def set_stall_guard_threshold(self, threshold: int) -> OemReplyFrame:
         return self.set_axis_param(PARAM_STALL_GUARD_THRESHOLD, threshold)
 
+    def disable_right_limit_switch(self) -> list[OemReplyFrame]:
+        # OEM ClassMotor sends this twice; first with short timeout.
+        return [
+            self._send(CMD_SAP, PARAM_DISABLE_RIGHT_SWITCH, 1, f"{self.label}.disable_right", timeout_ms=1000),
+            self._send(CMD_SAP, PARAM_DISABLE_RIGHT_SWITCH, 1, f"{self.label}.disable_right"),
+        ]
+
+    def disable_left_limit_switch(self) -> list[OemReplyFrame]:
+        return [
+            self._send(CMD_SAP, PARAM_DISABLE_LEFT_SWITCH, 1, f"{self.label}.disable_left", timeout_ms=1000),
+            self._send(CMD_SAP, PARAM_DISABLE_LEFT_SWITCH, 1, f"{self.label}.disable_left"),
+        ]
+
     def set_limits(self, *, disable_right: bool | None = None, disable_left: bool | None = None) -> list[OemReplyFrame]:
         replies: list[OemReplyFrame] = []
-        if disable_right is not None:
-            replies.append(self.set_axis_param(PARAM_DISABLE_RIGHT_SWITCH, 1 if disable_right else 0))
-        if disable_left is not None:
-            replies.append(self.set_axis_param(PARAM_DISABLE_LEFT_SWITCH, 1 if disable_left else 0))
+        if disable_right:
+            replies.extend(self.disable_right_limit_switch())
+        if disable_left:
+            replies.extend(self.disable_left_limit_switch())
         return replies
 
     def set_rdiv(self, value: int) -> OemReplyFrame:
@@ -100,19 +123,24 @@ class Motor:
         return self._send(CMD_MVP, MVP_REL, int(steps), f"{self.label}.MVP_REL({steps})")
 
     def move_absolute(self, position: int) -> OemReplyFrame:
-        return self._send(CMD_MVP, MVP_ABS, int(position), f"{self.label}.MVP_ABS({position})")
+        return self._send(CMD_MVP, MVP_ABS, max(0, int(position)), f"{self.label}.MVP_ABS({position})")
 
     def move_home(self, speed: int | None = None) -> OemReplyFrame:
-        # OEM home methods configure speed first and then search home.
+        # Board axisSearchHome uses moveLeft after setting speed; ClassMotor.MoveHome is MVP ABS 0.
         if speed is not None:
             self.set_max_speed(int(speed))
-        return self._send(CMD_RFS, RFS_SEARCH_HOME, 0, f"{self.label}.RFS_SEARCH_HOME")
+        return self.move_left(speed or 200)
+
+    def move_to_home_position(self) -> OemReplyFrame:
+        return self._send(CMD_MVP, MVP_ABS, 0, f"{self.label}.MoveHome")
 
     def set_home(self) -> OemReplyFrame:
-        return self._send(CMD_RFS, RFS_SET_HOME, 0, f"{self.label}.RFS_SET_HOME")
+        # OEM ClassMotor.setHome payload is SAP param 1, not RFS.
+        return self._send(CMD_SAP, 1, 0, f"{self.label}.SET_HOME")
 
-    def stop(self) -> OemReplyFrame:
-        return self._send(CMD_MST, 0, 0, f"{self.label}.MST")
+    def stop(self) -> list[OemReplyFrame]:
+        # OEM StopMotor sends twice and checks the second response.
+        return [self._send(CMD_MST, 0, 0, f"{self.label}.MST"), self._send(CMD_MST, 0, 0, f"{self.label}.MST")]
 
     def query_actual_position(self) -> OemReplyFrame:
         return self.get_axis_param(PARAM_ACTUAL_POSITION)
@@ -128,3 +156,8 @@ class Motor:
 
     def query_right_switch_status(self) -> OemReplyFrame:
         return self.get_axis_param(PARAM_RIGHT_SWITCH)
+
+    def query_motor_stop(self, axis: int = -1) -> OemReplyFrame:
+        value = 1 << self.motor if axis == -1 else 0
+        motor = self.motor if axis == -1 else int(axis)
+        return self._send(CMD_QUERY_STOP, 0, value, f"{self.label}.QUERY_STOP(axis={axis})")
