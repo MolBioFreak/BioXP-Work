@@ -58,6 +58,7 @@ def _write_startup_artifact(path: Path, *, report, frames) -> dict[str, Any]:
     replay = ReplayTransport.from_file(path)
     for frame in frames:
         replay.transmit(frame)
+    replay.assert_complete()
     return {"artifact_path": str(path), "replay_ok": replay.position == len(frames)}
 
 

@@ -142,6 +142,10 @@ class ReplayTransport(DryRunTransport):
         self.frames.append(frame)
         return OemReplyFrame(category=frame.category, status=100, synthetic=True)
 
+    def assert_complete(self) -> None:
+        if self.position != len(self.expected):
+            raise ReplayMismatch(f"Replay has {len(self.expected) - self.position} unconsumed expected frame(s)")
+
 
 READ_ONLY_TMCL_COMMANDS = {6, 138}
 

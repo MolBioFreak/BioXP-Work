@@ -188,3 +188,23 @@ def test_live_transport_fails_closed_on_ambiguous_reply(tmp_path):
 
     with pytest.raises(AmbiguousReply):
         transport.transmit(frame)
+
+
+def test_replay_transport_assert_complete_rejects_unconsumed_expected_frames(tmp_path):
+    import json
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import ReplayMismatch, ReplayTransport, _frame_to_json
+
+    first = OemCommandFrame.tmcl(5, 6, 1, 0, 0)
+    second = OemCommandFrame.tmcl(5, 6, 3, 0, 0)
+    path = tmp_path / "trace.json"
+    path.write_text(json.dumps({"frames": [_frame_to_json(first), _frame_to_json(second)]}))
+
+    replay = ReplayTransport.from_file(path)
+    replay.transmit(first)
+
+    with pytest.raises(ReplayMismatch, match="unconsumed"):
+        replay.assert_complete()
+
+    replay.transmit(second)
+    replay.assert_complete()

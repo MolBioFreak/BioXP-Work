@@ -25,6 +25,7 @@ Phase1 objective is transport and reply compliance: command/reply correlation, a
   - requires explicit operator acknowledgement before adapter use
   - requires an artifact root before adapter use
   - uses the same strict reply matcher, so ambiguous/non-success/no-match replies do not report success
+- Added `ReplayTransport.assert_complete()` so recorded traces must be fully consumed, not just prefix-matched.
 
 ## Current shadow read whitelist
 
@@ -39,7 +40,7 @@ Validated with:
 
 ```text
 python3 -m pytest tests/test_oem_compat_transport.py tests/test_oem_compat_api.py tests/test_oem_oracle_extractor.py tests/test_oem_binding_loader.py -q
-31 passed in 0.24s
+32 passed in 0.24s
 ```
 
 Compile check:
