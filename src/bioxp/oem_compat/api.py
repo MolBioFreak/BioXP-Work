@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .control_lib import BioXPControlLib
 from .scripts import OemScript
-from .transport import ReplayTransport, _frame_to_json
+from .transport import ReplayTransport, SafetyContractViolation, assert_transport_safety, _frame_to_json
 
 router = APIRouter(prefix="/oem-compat", tags=["BioXP OEM compatibility dry-run"])
 
@@ -65,6 +65,14 @@ def _write_startup_artifact(path: Path, *, report, frames) -> dict[str, Any]:
 def startup_dry_run(request: StartupDryRunRequest) -> dict[str, Any]:
     control = BioXPControlLib.dry_run()
     report = control.startup(run_homing=request.run_homing)
+    try:
+        assert_transport_safety(
+            mode=report.mode,
+            opened_usb=control.transport.opened_usb,
+            physical_motion=report.physical_motion,
+        )
+    except SafetyContractViolation as exc:
+        raise HTTPException(status_code=500, detail=f"OEM compatibility safety contract violation: {exc}") from exc
     body = {
         "ok": report.ok,
         "mode": report.mode,

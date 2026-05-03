@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 
 def test_oem_compat_api_startup_dry_run_exposes_trace_without_physical_motion():
@@ -19,6 +20,33 @@ def test_oem_compat_api_startup_dry_run_exposes_trace_without_physical_motion():
     assert body["trace_names"] == ["initialize_motors_without_motion", "startup_homing"]
     assert body["frame_count"] > 30
     assert body["opened_usb"] is False
+
+
+def test_oem_compat_api_startup_dry_run_fails_closed_on_safety_violation(monkeypatch):
+    from fastapi import FastAPI
+    import src.bioxp.oem_compat.api as oem_api
+
+    class UnsafeControl:
+        transport = SimpleNamespace(frames=[], opened_usb=False)
+
+        def startup(self, *, run_homing: bool):
+            return SimpleNamespace(
+                ok=True,
+                mode="dry_run",
+                physical_motion=True,
+                trace_names=[],
+                traces=[],
+            )
+
+    monkeypatch.setattr(oem_api.BioXPControlLib, "dry_run", classmethod(lambda cls: UnsafeControl()))
+    app = FastAPI()
+    app.include_router(oem_api.router)
+    client = TestClient(app)
+
+    resp = client.post("/oem-compat/startup/dry-run", json={"run_homing": False})
+
+    assert resp.status_code == 500
+    assert "safety contract" in resp.json()["detail"]
 
 
 def test_oem_compat_api_script_translate_dry_run_accepts_oem_xml():

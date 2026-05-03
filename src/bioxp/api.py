@@ -64,7 +64,22 @@ from .services.vision_service import (
     run_barcode_read_command,
     run_inspection_command,
 )
-from .usb_driver import BioXpTester
+try:
+    from .usb_driver import BioXpTester
+except ModuleNotFoundError as exc:
+    if exc.name != "usb":
+        raise
+    _usb_driver_import_error = exc
+
+    class BioXpTester:  # type: ignore[no-redef]
+        THERMAL_BANK_NEST = 0
+        THERMAL_BANK_LID = 1
+        CHILLER_BANK_RC = 0
+        CHILLER_BANK_OC = 1
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError(f"BioXP USB runtime dependency unavailable: {_usb_driver_import_error}") from _usb_driver_import_error
+
 from .vision.barcode import BarcodeReadCommand
 from .vision.inspection import InspectionCommand
 
