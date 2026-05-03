@@ -282,6 +282,32 @@ class BioXpStartupHardware:
             "errors": errors,
         }
 
+    def startup_homing_stepwise(self, *, mode: str = "shadow", step: str = "plan", execute: bool = False) -> dict:
+        tester = self.tester
+        steps = [
+            {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
+            {"step": "gripper-clear", "oem_anchor": "initializeMotors: setGripperCurrent(31); MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "g-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
+            {"step": "x-park-6000", "oem_anchor": "initializeMotors: setHome(X); setSpeed(X,1700); moveX(6000)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
+            {"step": "y-home", "oem_anchor": "initializeMotors: MotorY.axisSearchHome(speed=250)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
+            {"step": "door-home", "oem_anchor": "initializeMotors: ThermalDoor.doorSearchHome(...) / queryHome closed", "axis": "door", "board": int(tester.BOARD_THERMAL), "motor": 0, "requires_operator_observation": True},
+            {"step": "y-set-home", "oem_anchor": "initializeMotors: setHome(Y)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
+        ]
+        selected = str(step).strip().lower()
+        if selected in {"plan", "full", "all", ""}:
+            return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "steps": steps, "live_policy": "single_step_only_operator_ack_HOME", "monolithic_homing_blocked": True}
+        matches = [row for row in steps if row["step"] == selected]
+        if not matches:
+            return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "error": f"unknown_homing_step:{selected}", "allowed_steps": [row["step"] for row in steps]}
+        pre = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+        row = dict(matches[0])
+        if not bool(execute):
+            return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "planned only; no axis/home/move command issued"}
+        if selected == "z-home":
+            return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "error": "z_home_predicate_unresolved_gap9_vs_gap10", "refusal": "live Z home blocked until predicate matrix is resolved from source/physical observation"}
+        return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "error": "live_step_execution_not_enabled_for_this_step", "refusal": "scaffold installed; enable one step only after prior step proof and operator observation"}
+
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:
         return {"ok": False, "required": True, "available": False, "skipped": True, "blocks_ready": True, "reason": "pipette ACK/readback parity gate not yet proven"}
 

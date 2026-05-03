@@ -29,6 +29,8 @@ class OEMRuntimeCommandHandlers:
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
+        if bool(params.get("run_stepwise_homing", False)):
+            return self._handle_stepwise_homing_stage(command, params)
         if bool(params.get("run_initialize_motion", False)) or bool(params.get("initialize_motion_only", False)):
             return self._handle_initialize_motion_stage(command, params)
         if bool(params.get("run_initial_check", False)) or bool(params.get("initial_check_only", False)):
@@ -217,6 +219,40 @@ class OEMRuntimeCommandHandlers:
             "artifact_path": artifact_path,
             "blockers": ([] if ok else ["initializeMotion_diagnostic_failed"]) + [
                 "home_predicates_unproven",
+                "pipette_gate_unproven",
+                "vision_gate_unproven",
+                "parkGantry_gate_unproven",
+            ],
+        }
+
+    def _handle_stepwise_homing_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
+        step = str(params.get("homing_step", "plan")).strip().lower()
+        program = self._startup_program()
+        if program is None or not hasattr(program, "hardware"):
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["stepwise_homing_provider_not_bound"]}
+        hardware = program.hardware
+        if not hasattr(hardware, "startup_homing_stepwise"):
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["startup_homing_stepwise_method_unavailable"]}
+        if command.mode == "live" and command.operator_ack != "HOME":
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_stepwise_homing"]}
+        if command.mode == "live" and step in {"plan", "full", "all"}:
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["live_stepwise_homing_requires_single_homing_step"]}
+        result = hardware.startup_homing_stepwise(mode=("live" if command.mode == "live" else "shadow"), step=step, execute=command.mode == "live")
+        artifact_path = self._write_stage_artifact(command, f"runtime_stepwise_homing_{step}.json", {"command": command.to_dict(), "stepwise_homing": result})
+        ok = bool(result.get("ok"))
+        return {
+            "ok": ok,
+            "ready": False,
+            "state": "stepwise_homing_step_complete" if ok and command.mode == "live" else ("stepwise_homing_plan_ready" if ok else "failed_closed"),
+            "command": command.name,
+            "stage": "startupHomingStepwise",
+            "mode": "live" if command.mode == "live" else "shadow",
+            "homing_step": step,
+            "stepwise_homing": result,
+            "artifact_path": artifact_path,
+            "blockers": ([] if ok else ["stepwise_homing_stage_failed"]) + [
+                "physical_observation_required_for_each_live_step",
+                "z_home_predicate_unresolved_gap9_vs_gap10",
                 "pipette_gate_unproven",
                 "vision_gate_unproven",
                 "parkGantry_gate_unproven",
