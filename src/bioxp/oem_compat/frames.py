@@ -5,6 +5,22 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+TMCL_STATUS = {
+    100: "Success",
+    1: "Wrong checksum",
+    2: "Invalid command",
+    3: "Wrong type",
+    4: "Invalid value",
+    5: "EEPROM locked",
+    6: "Command not available",
+    7: "Busy",
+    128: "Target position reached",
+    129: "Not initialized",
+    130: "Stall guard detected",
+    132: "Door/Latch sensor changed",
+}
+
+
 class TrafficCategory(str, Enum):
     MOTION = "motion"
     CANOPEN_UIM = "canopen_uim"
@@ -101,6 +117,53 @@ class OemReplyFrame:
     payload: bytes = b""
     status: int | None = None
     synthetic: bool = False
+    board_id: int | None = None
+    command: int | None = None
+    value: int | None = None
+    status_str: str | None = None
+
+    @classmethod
+    def from_tmcl_response(cls, raw: bytes | bytearray | list[int]) -> "OemReplyFrame":
+        data = bytes(raw)
+        if len(data) < 13:
+            raise ValueError(f"TMCL response too short: {len(data)} bytes")
+        board_id = data[6]
+        status = data[7]
+        command = data[8]
+        value = struct.unpack(">i", data[9:13])[0]
+        category = OemCommandFrame(sidh=board_id, sidl=0, cmd=b"").category
+        return cls(
+            category=category,
+            payload=data,
+            status=status,
+            synthetic=False,
+            board_id=board_id,
+            command=command,
+            value=value,
+            status_str=TMCL_STATUS.get(status, f"?({status})"),
+        )
+
+    def matches_command(self, frame: OemCommandFrame) -> bool:
+        return self.board_id == frame.sidh and (frame.command is None or self.command == frame.command)
+
+
+def demux_tmcl_responses(
+    raw_responses: list[bytes | bytearray | list[int]],
+    *,
+    expected_board_id: int,
+    expected_command: int,
+) -> tuple[OemReplyFrame | None, list[OemReplyFrame]]:
+    """Separate the first strict matching TMCL reply from asynchronous bus events."""
+
+    reply: OemReplyFrame | None = None
+    events: list[OemReplyFrame] = []
+    for raw in raw_responses:
+        parsed = OemReplyFrame.from_tmcl_response(raw)
+        if reply is None and parsed.board_id == int(expected_board_id) and parsed.command == int(expected_command):
+            reply = parsed
+        else:
+            events.append(parsed)
+    return reply, events
 
 
 def build_oem_motor_payload(command: int, cmd_type: int, motor: int, value: int) -> bytes:

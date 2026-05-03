@@ -15,6 +15,22 @@ class ReplayMismatch(RuntimeError):
     pass
 
 
+class ReplyMismatch(RuntimeError):
+    pass
+
+
+class SafetyContractViolation(RuntimeError):
+    pass
+
+
+def assert_transport_safety(*, mode: str, opened_usb: bool, physical_motion: bool) -> None:
+    mode_text = str(mode)
+    if mode_text == "dry_run" and opened_usb:
+        raise SafetyContractViolation("dry_run transport must not open USB")
+    if mode_text in {"dry_run", "shadow"} and physical_motion:
+        raise SafetyContractViolation(f"{mode_text} transport must not report physical motion")
+
+
 @dataclass
 class DryRunTransport:
     require_configured_replies: bool = False
@@ -25,7 +41,10 @@ class DryRunTransport:
     def transmit(self, frame: OemCommandFrame) -> OemReplyFrame:
         self.frames.append(frame)
         if frame in self.configured_replies:
-            return self.configured_replies[frame]
+            reply = self.configured_replies[frame]
+            if not reply.matches_command(frame):
+                raise ReplyMismatch(f"Configured reply does not match {frame!r}: {reply!r}")
+            return reply
         if self.require_configured_replies:
             raise MissingDryRunReply(f"No dry-run reply configured for {frame!r}")
         return OemReplyFrame(category=frame.category, status=100, synthetic=True)
