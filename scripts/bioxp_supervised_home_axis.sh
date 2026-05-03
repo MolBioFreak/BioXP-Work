@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bioxp_supervised_home_axis.sh <x|y|z|g|door> [--timeout SEC] [--speed STEPS_PER_S] [--base-url URL] [--log-root DIR]
+  bioxp_supervised_home_axis.sh <x|y|z|g|door> [--timeout SEC] [--speed STEPS_PER_S] [--base-url URL] [--log-root DIR] [--yes]
 
 What it does:
   - captures pre-home status/power/latch/axis snapshots
@@ -30,6 +30,7 @@ TIMEOUT_S="${BIOXP_HOME_TIMEOUT_S:-20.0}"
 LOG_ROOT="${BIOXP_LOG_ROOT:-/tmp/bioxp-live-runs}"
 AXIS=""
 SPEED=""
+ASSUME_YES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       LOG_ROOT="$2"
       shift 2
       ;;
+    --yes|-y)
+      ASSUME_YES=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -69,6 +74,17 @@ if [[ -z "$AXIS" ]]; then
   echo "Missing axis." >&2
   usage >&2
   exit 2
+fi
+
+if [[ "$ASSUME_YES" -ne 1 ]]; then
+  echo "About to command a LIVE BioXP OEM-style home: axis=${AXIS}, base=${BASE_URL}"
+  echo "Operator must be physically watching the robot with stop/power access."
+  printf 'Type HOME to proceed: '
+  read -r reply
+  if [[ "$reply" != "HOME" ]]; then
+    echo "Aborted."
+    exit 1
+  fi
 fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
