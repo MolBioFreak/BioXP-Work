@@ -5,6 +5,7 @@ import sys
 import types
 
 import pytest
+from fastapi import HTTPException
 
 from src.bioxp.services.reference_service import (
     MarkAxisDesyncedCommand,
@@ -322,28 +323,20 @@ def test_reference_routes_delegate_to_store(monkeypatch):
     assert calls[2][0] == "mark_desynced"
 
 
-def test_motion_arm_strict_startup_marks_axes_referenced_when_homing_runs(monkeypatch):
+def test_motion_arm_strict_startup_rejects_monolithic_homing(monkeypatch):
     api = load_api(monkeypatch)
-    recorded = []
 
     async def fake_run_blocking(label, func, timeout_s=30.0):
-        del label, timeout_s
-        return {"ok": True, "homing": {"x_home": {"ok": True}}}
-
-    class FakeStore:
-        def mark_referenced(self, command):
-            recorded.append(command)
-            return {"ok": True}
+        raise AssertionError("run_homing=True must be rejected before dispatch")
 
     monkeypatch.setattr(api, "_run_blocking", fake_run_blocking)
     monkeypatch.setattr(api, "_get_tester", lambda: object())
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
 
-    result = asyncio.run(api.motion_arm_strict_startup(api.MotionArmStartupRequest(run_homing=True)))
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.motion_arm_strict_startup(api.MotionArmStartupRequest(run_homing=True)))
 
-    assert result["ok"] is True
-    assert {command.axis for command in recorded} == set(api.AxisName)
-    assert all(command.source == "motion_arm_strict_startup" for command in recorded)
+    assert exc_info.value.status_code == 409
+    assert "Monolithic strict_startup run_homing is disabled" in str(exc_info.value.detail)
 
 
 def test_motion_hard_reset_marks_all_axes_desynced(monkeypatch):

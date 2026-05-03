@@ -108,7 +108,7 @@ def test_motor_startup_homing_mimic_uses_oem_initialize_sequence(monkeypatch):
     monkeypatch.setattr(
         tester,
         "motor_wait_stopped",
-        lambda board_id, motor=0, timeout_s=4.0, poll_s=0.06: sequence.append(("wait", board_id, motor, timeout_s)) or {"stopped": True},
+        lambda board_id, motor=0, timeout_s=4.0, poll_s=0.06, require_seen_nonzero=False: sequence.append(("wait", board_id, motor, timeout_s, require_seen_nonzero)) or {"stopped": True},
     )
     monkeypatch.setattr(
         tester,
@@ -130,14 +130,23 @@ def test_motor_startup_homing_mimic_uses_oem_initialize_sequence(monkeypatch):
 
     tester.motor_startup_homing_mimic()
 
-    assert sequence[:2] == ["reconnect", "init_without_motion"]
-    assert ("g_pre_move", tester.BOARD_HEAD, 2, 10000) in sequence
-    assert ("home", "z", {"startup": True}) in sequence
-    assert ("home", "g", {"startup": True}) in sequence
-    assert ("home", "x", {"startup": True}) in sequence
-    assert ("move_abs", tester.BOARD_DECK, 6000, 0) in sequence
-    assert ("home", "y", {"startup": True}) in sequence
-    assert ("home", "door", {"startup": True}) in sequence
+    expected = [
+        "reconnect",
+        "init_without_motion",
+        ("home", "z", {"startup": True}),
+        ("g_pre_move", tester.BOARD_HEAD, 2, 10000),
+        ("wait", tester.BOARD_HEAD, 2, 10.0, True),
+        ("home", "g", {"startup": True}),
+        ("home", "x", {"startup": True}),
+        ("set_home", tester.BOARD_DECK, 0),
+        ("sap", tester.BOARD_DECK, 4, 1700, 0),
+        ("move_abs", tester.BOARD_DECK, 6000, 0),
+        ("wait", tester.BOARD_DECK, 0, 8.0, True),
+        ("home", "y", {"startup": True}),
+        ("home", "door", {"startup": True}),
+        ("set_home", tester.BOARD_HEAD, 0),
+    ]
+    assert sequence == expected
 
 
 

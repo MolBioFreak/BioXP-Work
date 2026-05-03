@@ -12,6 +12,9 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_compat.api import router as oem_compat_router
+from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, FakeStartupHardware
+from .oem_startup_types import OemDoorEventRequest, OemStartupRequest, OemSwitchAuditRequest
+from .oem_switch_audit import FakeSwitchAuditHardware, run_switch_audit
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -87,6 +90,7 @@ _tester: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
+_oem_startup_program: Optional[OEMStartupProgram] = None
 
 
 def _default_reference_state_path() -> str:
@@ -180,8 +184,121 @@ def _get_tester() -> BioXpTester:
     return _tester
 
 
+def _get_oem_startup_program(*, dry_safe: bool = True) -> OEMStartupProgram:
+    global _oem_startup_program
+    base = os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE") or "/tmp/bioxp-live-runs"
+    if _oem_startup_program is None:
+        if dry_safe or _tester is None:
+            hardware = FakeStartupHardware(door_closed=False, latch_closed=False)
+        else:
+            hardware = BioXpStartupHardware(_get_tester)
+        _oem_startup_program = OEMStartupProgram(hardware=hardware, artifact_base=base)
+    return _oem_startup_program
+
+
+class _BioXpSwitchAuditHardware:
+    def __init__(self, tester: BioXpTester):
+        self.tester = tester
+        self.move_calls: list[dict] = []
+
+    def switch_snapshot(self, axis: str) -> dict:
+        preset = self.tester._motion_oem_axis_profile(axis) if hasattr(self.tester, "_motion_oem_axis_profile") else None
+        if not isinstance(preset, dict):
+            return FakeSwitchAuditHardware().switch_snapshot(axis)
+        board = int(preset.get("board", 0))
+        motor = int(preset.get("motor", 0))
+        def safe(fn, default=None):
+            try:
+                return fn()
+            except Exception as exc:
+                return {"error": str(exc)} if default is None else default
+        return {
+            "axis": axis,
+            "board": board,
+            "motor": motor,
+            "position": safe(lambda: self.tester.motor_get_position(board, motor=motor)),
+            "speed": safe(lambda: self.tester.motor_get_speed(board, motor=motor)),
+            "gap9_left": safe(lambda: self.tester.motor_get_axis_param(board, 9, motor=motor)) if hasattr(self.tester, "motor_get_axis_param") else {},
+            "gap10_right": safe(lambda: self.tester.motor_get_axis_param(board, 10, motor=motor)) if hasattr(self.tester, "motor_get_axis_param") else {},
+            "home_query": safe(lambda: self.tester.motor_query_home_switch(board, motor=motor)),
+            "switch_masks": {},
+            "current_params": {},
+            "oem_profile": preset,
+        }
+
+
 def _get_pipette_transport():
     return _pipette_transport
+
+
+@app.post("/oem/startup/request")
+async def oem_startup_request(req: OemStartupRequest):
+    request_payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    if request_payload.get("mode") == "live" and request_payload.get("operator_ack") != "INITIALIZE":
+        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE required for live OEM startup")
+    if request_payload.get("mode") == "live" and not request_payload.get("artifact_root"):
+        raise HTTPException(status_code=409, detail="artifact_root required for live OEM startup")
+    program = _get_oem_startup_program(dry_safe=request_payload.get("mode") != "live")
+    status = program.request_startup(request_payload)
+    if status.get("failed_closed") and request_payload.get("mode") == "live":
+        raise HTTPException(status_code=409, detail=status.get("failure_reason") or "OEM startup failed closed")
+    return {
+        "ok": bool(status.get("ok", True)),
+        "session_id": status.get("session_id"),
+        "status": status.get("state"),
+        "state": status.get("state"),
+        "mode": status.get("mode"),
+        "queued": bool(status.get("queued", False)),
+        "artifact_root": status.get("artifact_root"),
+        "startup_status_url": f"/oem/startup/status/{status.get('session_id')}",
+        "source_anchors": list((status.get("source_anchors") or {}).values()),
+    }
+
+
+@app.get("/oem/startup/status/latest")
+async def oem_startup_status_latest():
+    return _get_oem_startup_program().status()
+
+
+@app.get("/oem/startup/status/{session_id}")
+async def oem_startup_status(session_id: str):
+    status = _get_oem_startup_program().status(session_id)
+    if status.get("state") == "none":
+        raise HTTPException(status_code=404, detail="startup session not found")
+    return status
+
+
+@app.post("/oem/startup/door_event")
+async def oem_startup_door_event(req: OemDoorEventRequest):
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    try:
+        return _get_oem_startup_program().door_event(
+            payload.get("session_id"),
+            door_closed=bool(payload.get("door_closed")),
+            latch_closed=bool(payload.get("latch_closed")),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/oem/initial_check")
+async def oem_initial_check():
+    program = _get_oem_startup_program(dry_safe=_tester is None)
+    if hasattr(program.hardware, "initial_check"):
+        return program.hardware.initial_check(mode="shadow" if _tester is not None else "dry_run")
+    raise HTTPException(status_code=503, detail="OEM initialCheck provider unavailable")
+
+
+@app.post("/oem/switch_audit")
+async def oem_switch_audit(req: OemSwitchAuditRequest):
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    mode = payload.get("mode", "status")
+    artifact_root = payload.get("artifact_root") or os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE")
+    hardware = FakeSwitchAuditHardware() if (_tester is None or mode == "status") else _BioXpSwitchAuditHardware(_get_tester())
+    result = run_switch_audit(hardware, axes=payload.get("axes") or ["x", "y", "z", "g", "door"], mode=mode, artifact_root=artifact_root)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
 
 
 def _get_vision_capabilities() -> CapabilityRegistry:
@@ -313,6 +430,11 @@ class MotionHardResetRequest(BaseModel):
 
 class MotionArmStartupRequest(BaseModel):
     run_homing: bool = False
+
+
+class OemStartupStepRequest(BaseModel):
+    step: str = Field(..., pattern=r"^(z-home|gripper-clear|gripper-home|x-home|x-park-6000|y-home|door-home|y-set-home)$")
+    timeout_s: float = Field(25.0, gt=0.1, le=90.0)
 
 
 class MotionAxisCurrentRequest(BaseModel):
@@ -714,12 +836,15 @@ def _wait_for_motion_with_guardrails(
     *,
     no_delta_timeout_s: float = _MOTION_NO_DELTA_TIMEOUT_S,
     poll_s: float = 0.10,
+    require_seen_nonzero: bool = True,
 ) -> dict:
     started = time.monotonic()
     deadline = started + max(0.5, float(timeout_s))
     position_row = tester.motor_get_position(board, motor=motor)
     last_position = _position_value(position_row)
     last_progress_at = started
+    seen_nonzero = False
+    polls = 0
     log_tail = []
 
     while True:
@@ -729,6 +854,9 @@ def _wait_for_motion_with_guardrails(
         now = time.monotonic()
         speed = _speed_value(speed_row)
         position = _position_value(position_row)
+        polls += 1
+        if isinstance(speed, int) and speed != 0:
+            seen_nonzero = True
 
         if position is not None and last_position is None:
             last_position = position
@@ -741,12 +869,27 @@ def _wait_for_motion_with_guardrails(
         if len(log_tail) > 20:
             log_tail = log_tail[-20:]
 
-        if speed == 0:
+        if speed == 0 and polls >= 3:
+            if bool(require_seen_nonzero) and not seen_nonzero:
+                stop = tester.motor_stop(board, motor=motor)
+                return {
+                    "ok": False,
+                    "stopped": False,
+                    "error": "motion command produced no nonzero speed before reporting stopped; treating as ambiguous/no physical motion.",
+                    "elapsed_ms": int((now - started) * 1000),
+                    "last_speed": speed,
+                    "seen_nonzero": seen_nonzero,
+                    "position_after": position_row,
+                    "switch_activity_after": switch_row,
+                    "stop": stop,
+                    "log_tail": log_tail,
+                }
             return {
                 "ok": True,
                 "stopped": True,
                 "elapsed_ms": int((now - started) * 1000),
                 "last_speed": speed,
+                "seen_nonzero": seen_nonzero,
                 "position_after": position_row,
                 "switch_activity_after": switch_row,
                 "log_tail": log_tail,
@@ -763,6 +906,7 @@ def _wait_for_motion_with_guardrails(
                 else "motion timed out before the motor reported stop; motion aborted.",
                 "elapsed_ms": int((now - started) * 1000),
                 "last_speed": speed,
+                "seen_nonzero": seen_nonzero,
                 "position_after": position_row,
                 "switch_activity_after": switch_row,
                 "stop": stop,
@@ -1874,23 +2018,20 @@ async def motion_axes_current(req: MotionAxisCurrentRequest):
 
 @app.post("/motion/arm/strict_startup")
 async def motion_arm_strict_startup(req: MotionArmStartupRequest):
+    if bool(req.run_homing):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Monolithic strict_startup run_homing is disabled after live testing showed wrong/hidden motion "
+                "and USB-busy emergency-stop failure. Use scripts/bioxp_supervised_oem_startup_homing_stepwise.sh."
+            ),
+        )
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
-        lambda: tester.motion_arm_strict_startup(run_homing=bool(req.run_homing)),
-        timeout_s=180.0 if bool(req.run_homing) else 90.0,
+        lambda: tester.motion_arm_strict_startup(run_homing=False),
+        timeout_s=90.0,
     )
-    if bool(req.run_homing) and bool(response.get("ok")):
-        for axis in AxisName:
-            _reference_state_store.mark_referenced(
-                MarkAxisReferencedCommand(
-                    axis=axis,
-                    position_steps=0,
-                    source="motion_arm_strict_startup",
-                    note="Reference refreshed after strict startup homing sequence.",
-                    motion_kind="strict_startup_home",
-                )
-            )
     return response
 
 
@@ -1990,6 +2131,88 @@ async def led_rgb(req: LedRgbRequest):
             reconnect_first=bool(req.reconnect_first),
         ),
         timeout_s=20.0,
+    )
+
+
+def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) -> dict:
+    step = str(step).strip().lower()
+    t0 = time.monotonic()
+    arm_state = tester.motion_arm_state()
+    live_gate = tester.motion_gate_live_snapshot()
+    if not (bool(arm_state.get("armed")) and bool(live_gate.get("ok"))):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "strict startup arm/live gate is not green; run no-homing strict startup first", "arm_state": arm_state, "live_gate": live_gate},
+        )
+    board_status = tester.activate_boards(expect_reply=True)
+    interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+    # Keep each supervised step source-shaped to ClassControlInterface.initializeMotors().
+    if step == "z-home":
+        result = tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s)
+    elif step == "gripper-clear":
+        preset = tester._motion_oem_axis_profile("g", startup=True)
+        set_current = tester.motor_set_axis_param(preset["board"], 6, 31, motor=preset["motor"])
+        move = tester.motor_move_relative(preset["board"], 10000, motor=preset["motor"])
+        wait = tester.motor_wait_stopped(
+            preset["board"],
+            motor=preset["motor"],
+            timeout_s=min(float(timeout_s), 12.0),
+            require_seen_nonzero=True,
+        )
+        result = {"set_gripper_current_31": set_current, "move_steps_10000": move, "wait": wait}
+        if not (move.get("ok") and wait.get("stopped") is True):
+            raise HTTPException(status_code=409, detail=f"OEM gripper clear failed/ambiguous: {wait}")
+    elif step == "gripper-home":
+        result = tester.motor_oem_home_axis("g", startup=True, timeout_s=timeout_s)
+    elif step == "x-home":
+        result = tester.motor_oem_home_axis("x", startup=True, timeout_s=timeout_s)
+    elif step == "x-park-6000":
+        preset = tester._motion_oem_axis_profile("x", startup=True)
+        sethome = tester.motor_set_home(preset["board"], motor=preset["motor"])
+        set_speed = tester.motor_set_axis_param(preset["board"], 4, 1700, motor=preset["motor"])
+        time.sleep(0.04)
+        move = tester.motor_move_absolute(preset["board"], 6000, motor=preset["motor"])
+        wait = tester.motor_wait_stopped(
+            preset["board"],
+            motor=preset["motor"],
+            timeout_s=min(float(timeout_s), 12.0),
+            require_seen_nonzero=True,
+        )
+        result = {"set_home_x": sethome, "set_speed_1700": set_speed, "move_x_6000": move, "wait": wait}
+        if not (move.get("ok") and wait.get("stopped") is True):
+            raise HTTPException(status_code=409, detail=f"OEM X park failed/ambiguous: {wait}")
+    elif step == "y-home":
+        result = tester.motor_oem_home_axis("y", startup=True, timeout_s=timeout_s)
+    elif step == "door-home":
+        result = tester.motor_oem_home_axis("door", startup=True, timeout_s=timeout_s)
+    elif step == "y-set-home":
+        preset = tester._motion_oem_axis_profile("y", startup=True)
+        result = tester.motor_set_home(preset["board"], motor=preset["motor"])
+    else:
+        raise HTTPException(status_code=422, detail=f"Unknown OEM startup step: {step}")
+    if step in {"z-home", "gripper-home", "x-home", "y-home", "door-home"}:
+        _ensure_oem_home_succeeded(tester, AxisName("g" if step == "gripper-home" else "door" if step == "door-home" else step.split("-")[0]), result)
+    return {
+        "ok": True,
+        "step": step,
+        "board_status": board_status,
+        "interlock": interlock,
+        "arm_state": arm_state,
+        "live_gate": live_gate,
+        "result": result,
+        "motion_truth": _motion_truth_payload(),
+        "oem_reference": "ClassControlInterface.initializeMotors lines 3348-3391",
+        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+    }
+
+
+@app.post("/motion/oem/startup_step")
+async def motion_oem_startup_step(req: OemStartupStepRequest):
+    tester = _get_tester()
+    return await _run_blocking(
+        f"OEM startup homing step {req.step}",
+        lambda: _execute_oem_startup_step(tester, req.step, req.timeout_s),
+        timeout_s=min(max(float(req.timeout_s) + 10.0, 15.0), 120.0),
     )
 
 

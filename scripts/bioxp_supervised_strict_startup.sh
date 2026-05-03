@@ -123,6 +123,13 @@ echo "RUN_HOMING=${RUN_HOMING}"
 echo "AXES=${AXES}"
 echo "RUN_DIR=${RUN_DIR}"
 
+if [[ "$RUN_HOMING" -eq 1 ]]; then
+  echo
+  echo "DISABLED: monolithic --homing is blocked after live testing showed it can wedge USB and hide wrong motion."
+  echo "Use ./scripts/bioxp_supervised_oem_startup_homing_stepwise.sh instead; it logs and confirms each physical step."
+  exit 2
+fi
+
 call_get "status_before" "/status"
 call_get "power_before" "/motion/power/status"
 call_get "latch_before" "/latch/status"
