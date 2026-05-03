@@ -17,6 +17,16 @@ class VisionResult:
         "preserve_raw_frame": True,
     })
 
+    def to_payload(self) -> dict:
+        return {
+            "operation": self.operation,
+            "oem_method": self.oem_method,
+            "status": self.status,
+            "reason": self.reason,
+            "location_id": self.location_id,
+            "artifact_contract": dict(self.artifact_contract),
+        }
+
 
 class VisionFacade:
     @classmethod

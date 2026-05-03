@@ -109,6 +109,38 @@ def test_oem_compat_api_import_protocol_dry_run_applies_virtual_state_without_mo
     assert body["job"]["virtual_state"]["materials"]["AMP"]["wash_count"] == 10
 
 
+def test_oem_compat_api_import_protocol_live_request_fails_closed_with_proof_ladder():
+    from fastapi import FastAPI
+    from src.bioxp.oem_compat.api import router
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    xml = """
+    <WpfGenBotCommonLib>
+      <experiment><data name="ApiLiveGate" /></experiment>
+      <script>
+        <line1 cmd="ST AMP PL_POOL Z5 V14 T50 NTY" />
+      </script>
+    </WpfGenBotCommonLib>
+    """
+
+    resp = client.post(
+        "/oem-compat/protocols/import/dry-run",
+        json={"xml": xml, "source_name": "api-live.xml", "requested_mode": "live"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["job"]["mode"] == "live"
+    assert body["job"]["artifact"]["fail_closed"] is True
+    assert body["job"]["physical_motion"] is False
+    assert "operator_ack required for live mode" in body["job"]["preflight_errors"]
+    assert "live transport validation not complete" in body["job"]["proof_ladder"]["blockers"]
+
+
 def test_main_bioxp_api_includes_oem_compat_dry_run_router_without_touching_usb(monkeypatch):
     import src.bioxp.api as api
 

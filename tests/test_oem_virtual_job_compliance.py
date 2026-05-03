@@ -88,14 +88,16 @@ def test_control_lib_dry_run_job_executes_imported_protocol_into_virtual_state()
     assert result.mode == "dry_run"
     assert result.executed is False
     assert result.physical_motion is False
-    assert result.lifecycle == ["created", "preflighted", "planned", "state_applied", "complete"]
+    assert result.lifecycle == ["created", "preflighted", "script_interpreted", "planned", "state_applied", "proof_gated", "complete"]
     assert result.action_count == imported.coverage.supported_command_count
     assert result.unsupported_action_count == 0
     assert result.review_required_count == 1  # DELAYPOINT remains explicit operator review gate.
     assert result.source_path.endswith("lifetest.xml")
     assert result.virtual_state.actions_applied == result.action_count
     assert result.virtual_state.materials["AMP"].last_operation in {"zone_wash", "standard_wash", "material_transfer", "material_agitate"}
-    assert result.artifact["compliance_gate"] == "initial_oem_testing"
+    assert result.artifact["compliance_gate"] == "runtime_parity_pipeline"
+    assert result.artifact["execution_plan"]["step_count"] >= result.action_count
+    assert result.artifact["proof_ladder"]["dry_run_clean"] is True
     assert result.artifact["unsupported_action_count"] == 0
     assert result.artifact["opened_usb"] is False
     assert result.artifact["physical_motion"] is False

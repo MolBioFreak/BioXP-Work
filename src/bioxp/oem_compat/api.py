@@ -29,6 +29,9 @@ class ScriptTranslateRequest(BaseModel):
 class ProtocolImportDryRunRequest(BaseModel):
     xml: str
     source_name: str = "inline-oem-protocol.xml"
+    requested_mode: str = "dry_run"
+    operator_ack: str | None = None
+    artifact_root: str | None = None
 
 
 def _trace_to_dict(trace) -> dict[str, Any]:
@@ -159,7 +162,13 @@ def protocol_import_dry_run(request: ProtocolImportDryRunRequest) -> dict[str, A
     finally:
         temp_path.unlink(missing_ok=True)
 
-    job = BioXPControlLib.dry_run().execute_protocol(imported.document, source_path=source_name)
+    job = BioXPControlLib.dry_run().execute_protocol(
+        imported.document,
+        source_path=source_name,
+        requested_mode=request.requested_mode,
+        operator_ack=request.operator_ack,
+        artifact_root=request.artifact_root,
+    )
     return {
         "ok": job.ok,
         "mode": job.mode,

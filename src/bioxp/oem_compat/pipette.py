@@ -13,6 +13,17 @@ class PipettePlan:
     ack_policy: str = "ack_and_status_readback_required"
     preflight: dict = field(default_factory=dict)
 
+    def to_payload(self) -> dict:
+        return {
+            "operation": self.operation,
+            "command_ascii": self.command_ascii,
+            "status": self.status,
+            "executed": self.executed,
+            "requires_readback": self.requires_readback,
+            "ack_policy": self.ack_policy,
+            "preflight": dict(self.preflight),
+        }
+
 
 @dataclass
 class PipetteController:
@@ -75,6 +86,27 @@ class PipetteController:
 
     def detect_fluid(self) -> PipettePlan:
         return self._plan("detect_fluid", "BR")
+
+    def macro_plan(
+        self,
+        *,
+        semantic_action: str,
+        material_id=None,
+        volume_ul=None,
+        source=None,
+        destination=None,
+    ) -> PipettePlan:
+        operation = f"macro_{semantic_action}"
+        command_ascii = f"OEM-MACRO {semantic_action}"
+        return self._plan(
+            operation,
+            command_ascii,
+            material_id=material_id,
+            volume_ul=volume_ul,
+            source=source,
+            destination=destination,
+            oem_semantic_action=semantic_action,
+        )
 
     def enable_pressure_stream(self, enabled: bool) -> PipettePlan:
         return self._plan("enable_pressure_stream", "o0,1R" if enabled else "o0,0R")
