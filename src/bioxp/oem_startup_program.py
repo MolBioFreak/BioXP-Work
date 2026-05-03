@@ -183,10 +183,49 @@ class BioXpStartupHardware:
         tester = self.tester
         if hasattr(tester, "oem_initial_check"):
             return tester.oem_initial_check(mode=mode)
+        sequence = ["backend_ready"]
+        live = mode == "live"
+        led_white = {"skipped": True, "reason": "shadow_mode"}
+        deactivate = {"skipped": True, "reason": "shadow_mode"}
+        activate = {"skipped": True, "reason": "shadow_mode"}
+        if live:
+            if hasattr(tester, "strip_set_rgb"):
+                led_white = tester.strip_set_rgb(255, 255, 255)
+            else:
+                led_white = {"ok": False, "error": "strip_set_rgb_unavailable"}
+            sequence.append("led_white")
         snap = tester.io_snapshot(tester.BOARD_DECK)
+        sequence.append("door_latch_before")
         door_closed = bool(snap.get(1))
         latch_closed = bool(snap.get(3))
-        return {"ok": door_closed and latch_closed, "source_anchor": SOURCE_ANCHORS["initialCheck"], "door_latch": {"door_closed": door_closed, "latch_closed": latch_closed, "snapshot": snap}, "checks": [{"name": "door_latch", "ok": door_closed and latch_closed}]}
+        final_snap = snap
+        if live:
+            if hasattr(tester, "deactivate_boards"):
+                deactivate = tester.deactivate_boards()
+            else:
+                deactivate = {"ok": False, "error": "deactivate_boards_unavailable"}
+            sequence.append("deactivate_boards")
+            if hasattr(tester, "activate_boards"):
+                activate = tester.activate_boards()
+            else:
+                activate = {"ok": False, "error": "activate_boards_unavailable"}
+            sequence.append("activate_boards")
+            final_snap = tester.io_snapshot(tester.BOARD_DECK)
+            door_closed = bool(final_snap.get(1))
+            latch_closed = bool(final_snap.get(3))
+        sequence.append("door_latch_final")
+        ok = door_closed and latch_closed
+        return {
+            "ok": ok,
+            "mode": mode,
+            "sequence": sequence,
+            "source_anchor": SOURCE_ANCHORS["initialCheck"],
+            "led_white": led_white,
+            "deactivate_boards": deactivate,
+            "activate_boards": activate,
+            "door_latch": {"door_closed": door_closed, "latch_closed": latch_closed, "snapshot": final_snap, "before_snapshot": snap},
+            "checks": [{"name": "door_latch", "ok": ok}],
+        }
 
     def configure_without_motion(self, *, mode: str = "shadow") -> dict:
         tester = self.tester
