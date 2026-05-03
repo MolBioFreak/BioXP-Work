@@ -237,6 +237,51 @@ class BioXpStartupHardware:
             return tester.motor_oem_initialize_without_motion()
         return {"ok": True, "physical_motion": False, "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"], "skipped_live_write": mode != "live"}
 
+    def initialize_motion_diagnostic(self, *, mode: str = "shadow", run_homing: bool = False) -> dict:
+        tester = self.tester
+        axes = {"x": (tester.BOARD_DECK, 0), "y": (tester.BOARD_HEAD, 0), "z": (tester.BOARD_HEAD, 1), "g": (tester.BOARD_HEAD, 2), "door": (tester.BOARD_THERMAL, 0)}
+        rows = {}
+        errors = []
+        if bool(run_homing):
+            return {"ok": False, "physical_motion": False, "state": "failed_closed", "error": "run_homing_not_allowed_in_diagnostic"}
+        for axis, (board, motor) in axes.items():
+            try:
+                rows[axis] = {
+                    "board": int(board),
+                    "motor": int(motor),
+                    "position": tester.motor_get_position(board, motor=motor),
+                    "speed": tester.motor_get_speed(board, motor=motor),
+                    "switches": tester.motor_get_switch_activity(board, motor=motor),
+                }
+            except Exception as exc:
+                rows[axis] = {"board": int(board), "motor": int(motor), "error": str(exc)}
+                errors.append(f"{axis}_snapshot_failed")
+        rail_24v = None
+        try:
+            rail_24v = tester.motor_query_24v_sensor()
+        except Exception as exc:
+            rail_24v = {"error": str(exc)}
+            errors.append("rail_24v_snapshot_failed")
+        latch = None
+        try:
+            snap = tester.io_snapshot(tester.BOARD_DECK)
+            latch = {"snapshot": snap, "door_closed": bool(snap.get(1)), "latch_closed": bool(snap.get(3))}
+        except Exception as exc:
+            latch = {"error": str(exc)}
+            errors.append("latch_snapshot_failed")
+        return {
+            "ok": len(errors) == 0,
+            "mode": mode,
+            "physical_motion": False,
+            "run_homing": False,
+            "source_anchor": SOURCE_ANCHORS["initializeMotion"],
+            "initialize_without_motion_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"],
+            "axis_snapshots": rows,
+            "rail_24v": rail_24v,
+            "latch": latch,
+            "errors": errors,
+        }
+
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:
         return {"ok": False, "required": True, "available": False, "skipped": True, "blocks_ready": True, "reason": "pipette ACK/readback parity gate not yet proven"}
 

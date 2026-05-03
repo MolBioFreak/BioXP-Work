@@ -91,6 +91,50 @@ def test_runtime_initial_check_live_writes_artifact(tmp_path):
     assert (root / "runtime_initial_check.json").exists()
 
 
+def test_runtime_initialize_motion_diagnostic_runs_after_initial_check_and_blocks_homing(tmp_path):
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    calls = []
+
+    class Hardware:
+        def initial_check(self, *, mode="shadow"):
+            calls.append(("initial", mode))
+            return {"ok": True, "door_latch": {"door_closed": True, "latch_closed": True}}
+
+        def initialize_motion_diagnostic(self, *, mode="shadow", run_homing=False):
+            calls.append(("motion", mode, run_homing))
+            return {"ok": True, "physical_motion": False, "axis_snapshots": {"z": {"switches": {"left_state": 0, "right_state": 1}}}}
+
+    class Program:
+        hardware = Hardware()
+
+    root = tmp_path / "artifact"
+    store = OEMRuntimeStore(tmp_path / "store")
+    worker = OEMRuntimeWorker(store=store, handlers=OEMRuntimeCommandHandlers(startup_program=Program()).handlers())
+    worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(root), params={"run_initial_check": True, "run_initialize_motion": True, "run_homing": False}))
+    result = worker.run_next_for_tests()
+    assert result["ok"] is True
+    assert result["result"]["state"] == "initialize_motion_diagnostic_complete"
+    assert result["result"]["ready"] is False
+    assert calls == [("initial", "live"), ("motion", "live", False)]
+    assert (root / "runtime_initialize_motion.json").exists()
+    assert "home_predicates_unproven" in result["result"]["blockers"]
+
+
+def test_runtime_initialize_motion_rejects_run_homing_true_before_touching_provider(tmp_path):
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    def factory():
+        raise AssertionError("provider must not be opened when run_homing true is rejected")
+
+    store = OEMRuntimeStore(tmp_path)
+    worker = OEMRuntimeWorker(store=store, handlers=OEMRuntimeCommandHandlers(startup_program_factory=factory).handlers())
+    worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(tmp_path / "artifact"), params={"run_initialize_motion": True, "run_homing": True}))
+    result = worker.run_next_for_tests()
+    assert result["ok"] is False
+    assert "run_homing_true_rejected_by_initializeMotion_diagnostic_stage" in result["result"]["blockers"]
+
+
 def test_worker_fails_closed_when_handler_missing(tmp_path):
     store = OEMRuntimeStore(tmp_path)
     worker = OEMRuntimeWorker(store=store, handlers={})

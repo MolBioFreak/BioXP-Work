@@ -29,6 +29,8 @@ class OEMRuntimeCommandHandlers:
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
+        if bool(params.get("run_initialize_motion", False)) or bool(params.get("initialize_motion_only", False)):
+            return self._handle_initialize_motion_stage(command, params)
         if bool(params.get("run_initial_check", False)) or bool(params.get("initial_check_only", False)):
             return self._handle_initial_check_stage(command, params)
         if not bool(params.get("delegate_to_startup_program", False)):
@@ -68,6 +70,17 @@ class OEMRuntimeCommandHandlers:
             return {"ok": bool(ran.get("ok", True)), "ready": bool(status.get("ready", False)), "state": status.get("state"), "startup": status, "worker_run": ran}
         return {"ok": True, "ready": False, "state": session.get("state"), "startup": session}
 
+    def _write_stage_artifact(self, command: OEMRuntimeCommand, filename: str, payload: dict[str, Any]) -> str | None:
+        if not command.artifact_root:
+            return None
+        root = Path(command.artifact_root)
+        root.mkdir(parents=True, exist_ok=True)
+        artifact_path = root / filename
+        tmp = artifact_path.with_suffix(artifact_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        tmp.replace(artifact_path)
+        return str(artifact_path)
+
     def _handle_initial_check_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         if command.mode == "live" and command.operator_ack != "INITIALIZE":
             return {
@@ -100,14 +113,7 @@ class OEMRuntimeCommandHandlers:
             }
         mode = "live" if command.mode == "live" else "shadow"
         result = hardware.initial_check(mode=mode)
-        artifact_path = None
-        if command.artifact_root:
-            root = Path(command.artifact_root)
-            root.mkdir(parents=True, exist_ok=True)
-            artifact_path = root / "runtime_initial_check.json"
-            tmp = artifact_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"command": command.to_dict(), "initial_check": result}, indent=2, sort_keys=True))
-            tmp.replace(artifact_path)
+        artifact_path = self._write_stage_artifact(command, "runtime_initial_check.json", {"command": command.to_dict(), "initial_check": result})
         ok = bool(result.get("ok"))
         door_latch = result.get("door_latch") or {}
         blockers: list[str] = []
@@ -125,6 +131,91 @@ class OEMRuntimeCommandHandlers:
             "artifact_path": str(artifact_path) if artifact_path else None,
             "blockers": blockers + [
                 "initializeMotion_not_executed_from_runtime_worker",
+                "home_predicates_unproven",
+                "pipette_gate_unproven",
+                "vision_gate_unproven",
+                "parkGantry_gate_unproven",
+            ],
+        }
+
+    def _handle_initialize_motion_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
+        if bool(params.get("run_homing", False)):
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "initializeMotion",
+                "blockers": ["run_homing_true_rejected_by_initializeMotion_diagnostic_stage"],
+            }
+        if command.mode == "live" and command.operator_ack != "INITIALIZE":
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "initializeMotion",
+                "blockers": ["operator_ack_INITIALIZE_required_for_live_initializeMotion"],
+            }
+        program = self._startup_program()
+        if program is None or not hasattr(program, "hardware"):
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "initializeMotion",
+                "blockers": ["initializeMotion_provider_not_bound"],
+            }
+        hardware = program.hardware
+        mode = "live" if command.mode == "live" else "shadow"
+        initial_result = None
+        if bool(params.get("run_initial_check", False)):
+            if not hasattr(hardware, "initial_check"):
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "initializeMotion",
+                    "blockers": ["initialCheck_method_unavailable"],
+                }
+            initial_result = hardware.initial_check(mode=mode)
+            if not bool(initial_result.get("ok")):
+                self._write_stage_artifact(command, "runtime_initialize_motion.json", {"command": command.to_dict(), "initial_check": initial_result, "initialize_motion": None})
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "initializeMotion",
+                    "mode": mode,
+                    "initial_check": initial_result,
+                    "blockers": ["initialCheck_failed_before_initializeMotion"],
+                }
+        if not hasattr(hardware, "initialize_motion_diagnostic"):
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "initializeMotion",
+                "blockers": ["initializeMotion_diagnostic_method_unavailable"],
+            }
+        diagnostic = hardware.initialize_motion_diagnostic(mode=mode, run_homing=False)
+        artifact_path = self._write_stage_artifact(command, "runtime_initialize_motion.json", {"command": command.to_dict(), "initial_check": initial_result, "initialize_motion": diagnostic})
+        ok = bool(diagnostic.get("ok"))
+        return {
+            "ok": ok,
+            "ready": False,
+            "state": "initialize_motion_diagnostic_complete" if ok else "failed_closed",
+            "command": command.name,
+            "stage": "initializeMotion",
+            "mode": mode,
+            "initial_check": initial_result,
+            "initialize_motion": diagnostic,
+            "artifact_path": artifact_path,
+            "blockers": ([] if ok else ["initializeMotion_diagnostic_failed"]) + [
                 "home_predicates_unproven",
                 "pipette_gate_unproven",
                 "vision_gate_unproven",
