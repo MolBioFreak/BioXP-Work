@@ -215,6 +215,10 @@ class BioXpStartupHardware:
             latch_closed = bool(final_snap.get(3))
         sequence.append("door_latch_final")
         ok = door_closed and latch_closed
+        if live:
+            write_checks = [led_white, deactivate, activate]
+            writes_ok = all(isinstance(item, dict) and item.get("ok", "error" not in item) is not False and "error" not in item for item in write_checks)
+            ok = ok and writes_ok
         return {
             "ok": ok,
             "mode": mode,
