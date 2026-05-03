@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .control_lib import BioXPControlLib
 from .scripts import OemScript
+from .boards import axis_profile_matrix
 from .transport import ReplayTransport, SafetyContractViolation, assert_transport_safety, _frame_to_json
 
 router = APIRouter(prefix="/oem-compat", tags=["BioXP OEM compatibility dry-run"])
@@ -60,6 +61,45 @@ def _write_startup_artifact(path: Path, *, report, frames) -> dict[str, Any]:
         replay.transmit(frame)
     replay.assert_complete()
     return {"artifact_path": str(path), "replay_ok": replay.position == len(frames)}
+
+
+@router.get("/capabilities/test-prep")
+def capability_matrix_test_prep() -> dict[str, Any]:
+    """Machine-readable handoff for BMS/thin-control test prep surfaces."""
+    return {
+        "schema_version": "bioxp.oem_compat.capability_matrix.v1",
+        "robot_hardware_assumption": "functional_under_oem",
+        "truth_source": "robot_local_oem_compat_layer",
+        "bms_role": "thin_operator_surface",
+        "capabilities": {
+            "motion": {
+                "prep_ready": True,
+                "axis_profile_matrix": axis_profile_matrix(),
+                "truth_model": "controller_readback_plus_artifacts; physical_observation_optional_field_not_implied",
+            },
+            "deck_semantics": {
+                "prep_ready": True,
+                "position_table_module": "src.bioxp.oem_compat.position_table",
+                "semantic_actions": ["moveTo"],
+            },
+            "oem_xml_jobs": {
+                "prep_ready": True,
+                "supported_verbs_include": ["MT", "FP"],
+                "dry_run_required_before_live": True,
+                "artifact_bundle_required_for_live": True,
+            },
+            "pipette": {
+                "prep_ready": True,
+                "ack_readback_required": True,
+                "fail_closed_without_reference_tip_deck_pressure_state": True,
+            },
+            "vision": {
+                "prep_ready": True,
+                "artifacted_failures": True,
+                "transport_health_distinct_from_inspection_semantics": True,
+            },
+        },
+    }
 
 
 @router.post("/startup/dry-run")

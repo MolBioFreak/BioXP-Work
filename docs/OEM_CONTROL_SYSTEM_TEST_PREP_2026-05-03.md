@@ -63,6 +63,24 @@ Dry-run plans still never report hardware execution.
 - confidence/raw-frame preservation requirements
 - location ID passthrough for test artifacts
 
+## Phase7/BMS thin-control prep advanced
+
+Added a machine-readable test-prep capability matrix endpoint:
+
+```text
+GET /oem-compat/capabilities/test-prep
+```
+
+It exposes:
+- robot hardware assumption: `functional_under_oem`
+- truth source: `robot_local_oem_compat_layer`
+- BMS role: `thin_operator_surface`
+- motion/deck/OEM XML/pipette/vision prep readiness
+- axis profile matrix for BMS display or test-run gating
+- MT/FP support declaration for OEM XML jobs
+- pipette ACK/readback requirement
+- artifacted vision failure semantics
+
 ## Verification
 
 Targeted prep suite:
