@@ -12,6 +12,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_compat.api import router as oem_compat_router
+from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, FakeStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import FakeSwitchAuditHardware, run_switch_audit
@@ -157,8 +158,13 @@ async def lifespan(app: FastAPI):
         _startup_error = str(exc)
         print(f"[WARN] BioXP USB runtime unavailable: {_startup_error}")
     try:
+        configure_oem_runtime(startup_program_factory=lambda: _get_oem_startup_program(dry_safe=True), autostart=True)
+    except Exception as exc:
+        print(f"[WARN] BioXP OEM runtime unavailable: {exc}")
+    try:
         yield
     finally:
+        shutdown_oem_runtime()
         _tester = None
         close_fn = getattr(_pipette_transport, "close", None)
         if callable(close_fn):
@@ -173,6 +179,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(oem_compat_router)
+app.include_router(oem_runtime_router)
 
 
 def _get_tester() -> BioXpTester:
