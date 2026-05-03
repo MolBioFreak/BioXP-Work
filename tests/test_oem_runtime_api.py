@@ -24,6 +24,15 @@ def test_runtime_api_rejects_live_without_ack(tmp_path, monkeypatch):
     assert resp.status_code == 409
 
 
+def test_runtime_api_rejects_unknown_generic_command_with_409(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
+    oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
+    client = TestClient(app)
+    resp = client.post("/oem/runtime/commands/enqueue", json={"name": "homeEverything", "mode": "dry_run"})
+    assert resp.status_code == 409
+    assert "unknown OEM runtime command" in resp.json()["detail"]
+
+
 def test_runtime_api_door_event_queues_initialize_system(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)

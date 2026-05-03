@@ -109,7 +109,10 @@ def runtime_worker_status():
 
 @router.post("/commands/enqueue")
 def runtime_commands_enqueue(req: GenericCommandRequest):
-    OEMCommandName.validate(req.name)
+    try:
+        OEMCommandName.validate(req.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _enqueue(req.name, req)
 
 
