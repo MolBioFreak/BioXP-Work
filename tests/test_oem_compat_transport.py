@@ -98,3 +98,53 @@ def test_transport_safety_contract_blocks_dry_run_usb_and_shadow_motion():
         assert_transport_safety(mode="dry_run", opened_usb=True, physical_motion=False)
     with pytest.raises(SafetyContractViolation):
         assert_transport_safety(mode="shadow", opened_usb=True, physical_motion=True)
+
+
+def test_strict_tmcl_reply_matching_rejects_ambiguous_duplicate_replies():
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import AmbiguousReply, match_tmcl_reply
+
+    frame = OemCommandFrame.tmcl(5, 6, 4, 0, 0)
+    first = bytes([0, 0, 0, 0, 0, 0, 5, 100, 6, 0, 0, 0, 31, 0])
+    duplicate = bytes([0, 0, 0, 0, 0, 0, 5, 100, 6, 0, 0, 0, 32, 0])
+
+    with pytest.raises(AmbiguousReply):
+        match_tmcl_reply([first, duplicate], expected=frame)
+
+
+def test_strict_tmcl_reply_matching_rejects_non_success_status():
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import ReplyMismatch, match_tmcl_reply
+
+    frame = OemCommandFrame.tmcl(5, 5, 4, 0, 37)
+    invalid_value = bytes([0, 0, 0, 0, 0, 0, 5, 4, 5, 0, 0, 0, 37, 0])
+
+    with pytest.raises(ReplyMismatch, match="Invalid value"):
+        match_tmcl_reply([invalid_value], expected=frame)
+
+
+def test_shadow_transport_allows_query_frames_and_blocks_mutating_frames():
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import MutatingCommandBlocked, ShadowTransport
+
+    class FakeStatusAdapter:
+        def __init__(self):
+            self.frames = []
+
+        def transmit(self, frame):
+            self.frames.append(frame)
+            return [bytes([0, 0, 0, 0, 0, 0, frame.sidh, 100, frame.command, 0, 0, 0, 12, 0])]
+
+    adapter = FakeStatusAdapter()
+    transport = ShadowTransport(adapter=adapter)
+    query = OemCommandFrame.tmcl(5, 6, 1, 0, 0)
+    reply = transport.transmit(query)
+
+    assert transport.opened_usb is True
+    assert reply.value == 12
+    assert adapter.frames == [query]
+
+    mutating = OemCommandFrame.tmcl(5, 5, 4, 0, 1700)
+    with pytest.raises(MutatingCommandBlocked):
+        transport.transmit(mutating)
+    assert adapter.frames == [query]

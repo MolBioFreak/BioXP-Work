@@ -19,6 +19,14 @@ class ReplyMismatch(RuntimeError):
     pass
 
 
+class AmbiguousReply(ReplyMismatch):
+    pass
+
+
+class MutatingCommandBlocked(RuntimeError):
+    pass
+
+
 class SafetyContractViolation(RuntimeError):
     pass
 
@@ -29,6 +37,30 @@ def assert_transport_safety(*, mode: str, opened_usb: bool, physical_motion: boo
         raise SafetyContractViolation("dry_run transport must not open USB")
     if mode_text in {"dry_run", "shadow"} and physical_motion:
         raise SafetyContractViolation(f"{mode_text} transport must not report physical motion")
+
+
+def match_tmcl_reply(
+    raw_responses: list[bytes | bytearray | list[int]],
+    *,
+    expected: OemCommandFrame,
+    require_success: bool = True,
+) -> OemReplyFrame:
+    matches = [
+        reply
+        for reply in (OemReplyFrame.from_tmcl_response(raw) for raw in raw_responses)
+        if reply.matches_command(expected)
+    ]
+    if not matches:
+        raise ReplyMismatch(f"No matching reply for board={expected.sidh} command={expected.command}")
+    if len(matches) > 1:
+        raise AmbiguousReply(f"Ambiguous replies for board={expected.sidh} command={expected.command}: {len(matches)} matches")
+    reply = matches[0]
+    if require_success and reply.status != 100:
+        raise ReplyMismatch(
+            f"Non-success reply for board={expected.sidh} command={expected.command}: "
+            f"{reply.status} {reply.status_str}"
+        )
+    return reply
 
 
 @dataclass
@@ -105,3 +137,29 @@ class ReplayTransport(DryRunTransport):
         self.position += 1
         self.frames.append(frame)
         return OemReplyFrame(category=frame.category, status=100, synthetic=True)
+
+
+READ_ONLY_TMCL_COMMANDS = {6, 138}
+
+
+@dataclass
+class ShadowTransport:
+    """Status/query-only transport for correlating live replies without motion.
+
+    The adapter is the live robot/USB seam. Shadow mode may open USB for reads,
+    but it must reject mutating TMCL frames before they reach that adapter.
+    """
+
+    adapter: object
+    frames: list[OemCommandFrame] = field(default_factory=list)
+    opened_usb: bool = True
+    mode: str = "shadow"
+
+    def transmit(self, frame: OemCommandFrame) -> OemReplyFrame:
+        if frame.command not in READ_ONLY_TMCL_COMMANDS:
+            raise MutatingCommandBlocked(f"Shadow mode blocks mutating command {frame.command} for {frame!r}")
+        raw_responses = self.adapter.transmit(frame)
+        reply = match_tmcl_reply(raw_responses, expected=frame)
+        self.frames.append(frame)
+        assert_transport_safety(mode=self.mode, opened_usb=self.opened_usb, physical_motion=False)
+        return reply
