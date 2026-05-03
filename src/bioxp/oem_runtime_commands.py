@@ -8,8 +8,14 @@ from .oem_runtime_types import OEMRuntimeCommand
 
 
 class OEMRuntimeCommandHandlers:
-    def __init__(self, *, startup_program=None):
+    def __init__(self, *, startup_program=None, startup_program_factory=None):
         self.startup_program = startup_program
+        self.startup_program_factory = startup_program_factory
+
+    def _startup_program(self):
+        if self.startup_program is None and self.startup_program_factory is not None:
+            self.startup_program = self.startup_program_factory()
+        return self.startup_program
 
     def handlers(self) -> dict[str, Any]:
         return {
@@ -42,7 +48,8 @@ class OEMRuntimeCommandHandlers:
                     "parkGantry_gate_unproven",
                 ],
             }
-        if self.startup_program is None:
+        program = self._startup_program()
+        if program is None:
             return {"ok": False, "ready": False, "state": "failed_closed", "blockers": ["startup_program_not_bound"]}
         req = {
             "mode": command.mode,
@@ -52,12 +59,12 @@ class OEMRuntimeCommandHandlers:
             "run_homing": bool(params.get("run_homing", False)),
             "run_post_home": bool(params.get("run_post_home", True)),
         }
-        session = self.startup_program.request_startup(req)
+        session = program.request_startup(req)
         if session.get("state") == "waiting_for_door_close":
             return {"ok": True, "ready": False, "state": "waiting_for_door_close", "startup": session}
-        if hasattr(self.startup_program, "run_next_worker_command"):
-            ran = self.startup_program.run_next_worker_command()
-            status = self.startup_program.status(session.get("session_id"))
+        if hasattr(program, "run_next_worker_command"):
+            ran = program.run_next_worker_command()
+            status = program.status(session.get("session_id"))
             return {"ok": bool(ran.get("ok", True)), "ready": bool(status.get("ready", False)), "state": status.get("state"), "startup": status, "worker_run": ran}
         return {"ok": True, "ready": False, "state": session.get("state"), "startup": session}
 
@@ -71,7 +78,8 @@ class OEMRuntimeCommandHandlers:
                 "stage": "initialCheck",
                 "blockers": ["operator_ack_INITIALIZE_required_for_live_initialCheck"],
             }
-        if self.startup_program is None or not hasattr(self.startup_program, "hardware"):
+        program = self._startup_program()
+        if program is None or not hasattr(program, "hardware"):
             return {
                 "ok": False,
                 "ready": False,
@@ -80,7 +88,7 @@ class OEMRuntimeCommandHandlers:
                 "stage": "initialCheck",
                 "blockers": ["initialCheck_provider_not_bound"],
             }
-        hardware = self.startup_program.hardware
+        hardware = program.hardware
         if not hasattr(hardware, "initial_check"):
             return {
                 "ok": False,

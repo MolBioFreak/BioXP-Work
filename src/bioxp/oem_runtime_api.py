@@ -48,8 +48,9 @@ def configure_runtime(*, startup_program_factory=None, store_root: str | None = 
     global _store, _worker, _events, _status, _startup_program_factory
     _startup_program_factory = startup_program_factory
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
-    startup_program = startup_program_factory() if startup_program_factory else None
-    handlers = OEMRuntimeCommandHandlers(startup_program=startup_program)
+    # Do not call startup_program_factory during API startup: on robot it may open USB.
+    # Runtime commands call it lazily only when an initialCheck/startup substage is explicitly requested.
+    handlers = OEMRuntimeCommandHandlers(startup_program=None, startup_program_factory=startup_program_factory)
     from .oem_runtime_worker import OEMRuntimeWorker
     _worker = OEMRuntimeWorker(store=_store, handlers=handlers.handlers(), autostart=autostart)
     _events = OEMRuntimeEventRouter(store=_store, worker=_worker)

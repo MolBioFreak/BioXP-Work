@@ -16,6 +16,17 @@ def test_runtime_api_status_and_command_enqueue(tmp_path, monkeypatch):
     assert resp.json()["queued"] is True
 
 
+def test_runtime_configure_does_not_call_startup_factory_until_command_needs_it(tmp_path):
+    calls = []
+
+    def factory():
+        calls.append("called")
+        raise AssertionError("factory must be lazy at API startup")
+
+    oem_runtime_api.configure_runtime(startup_program_factory=factory, store_root=str(tmp_path), autostart=False)
+    assert calls == []
+
+
 def test_runtime_api_rejects_live_without_ack(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
