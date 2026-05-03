@@ -43,6 +43,40 @@ AXIS_PROFILES: dict[str, AxisProfile] = {
     "door": AxisProfile("door", "THERMAL_DOOR", BOARD_THERMAL, 0, 600, 200, 20, 10, 6, True, True),
 }
 
+OEM_HOME_PROFILES = {
+    "x": {"startup_home_speed": 250, "manual_home_speed": 500, "home_method": "goHome"},
+    "y": {"startup_home_speed": 250, "manual_home_speed": 500, "home_method": "goHome"},
+    "z": {"startup_home_speed": 1791, "manual_home_speed": 1791, "home_method": "goHome"},
+    "g": {"startup_home_speed": 200, "manual_home_speed": 200, "gripper_version_1_home_speed": 200, "gripper_default_home_speed": 600, "home_method": "goHome"},
+    "door": {"startup_home_speed": 600, "manual_home_speed": 600, "home_method": "doorSearchHome"},
+}
+
+OEM_SOURCE_ANCHOR = "BioXPControlLib/ClassControlInterface.cs initializeMotors, initializeMotorsWithoutMotion, btnHome*_Click"
+
+
+def axis_profile_matrix() -> dict[str, dict]:
+    """Return source-anchored motor profile data used by the test handoff matrix."""
+    rows: dict[str, dict] = {}
+    for key, profile in AXIS_PROFILES.items():
+        rows[key] = {
+            "key": key,
+            "label": profile.label,
+            "board_id": profile.board_id,
+            "motor": profile.motor,
+            "speed": profile.speed,
+            "acc": profile.acc,
+            "run_current": profile.run_current,
+            "standby_current": profile.standby_current,
+            "stall_guard": profile.stall_guard,
+            "disable_right": profile.disable_right,
+            "disable_left": profile.disable_left,
+            "rdiv": profile.rdiv,
+            "pdiv": profile.pdiv,
+            **OEM_HOME_PROFILES[key],
+            "source_anchor": OEM_SOURCE_ANCHOR,
+        }
+    return rows
+
 ALIASES = {"gripper": "g", "thermaldoor": "door", "thermal_door": "door", "d": "door"}
 
 

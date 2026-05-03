@@ -50,6 +50,7 @@ class TranslatedCommand:
     raw: str
     args: tuple[str, ...] = ()
     supported: bool = True
+    metadata: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,58 @@ class OemScriptTranslator:
 
     def translate(self, script: OemScript) -> TranslatedScript:
         return TranslatedScript([self.translate_command(c) for c in script.commands])
+
+    @staticmethod
+    def _flag_value(args: tuple[str, ...], flag: str) -> str | None:
+        flag = flag.upper()
+        for token in args:
+            if token.upper().startswith(flag):
+                return token[len(flag) :]
+        return None
+
+    @classmethod
+    def _liquid_transfer_metadata(cls, args: tuple[str, ...]) -> dict[str, object]:
+        # OEM MT commands are structured token streams. For prep/test handoff we
+        # retain the full token stream while extracting the source/destination
+        # plate-location/well and volume needed by semantic dry-runs.
+        location_positions = [idx for idx, token in enumerate(args) if token.upper().startswith("PL_") or token.upper() == "TROUGH"]
+        source_idx = location_positions[0] if location_positions else None
+        dest_idx = location_positions[1] if len(location_positions) > 1 else None
+
+        def location_at(idx: int | None) -> tuple[str | None, str | None]:
+            if idx is None:
+                return None, None
+            location_id = args[idx]
+            well_id = None
+            for token in args[idx + 1 : idx + 5]:
+                if token.upper().startswith("/WL") or token.upper().startswith("/ML") or token.upper().startswith("/ZN"):
+                    well_id = token[1:]
+                    break
+            return location_id, well_id
+
+        src_loc, src_well = location_at(source_idx)
+        dst_loc, dst_well = location_at(dest_idx)
+        volume_text = cls._flag_value(args, "/VL")
+        return {
+            "semantic_action": "liquid_transfer",
+            "source_location_id": src_loc,
+            "source_well_id": src_well,
+            "dest_location_id": dst_loc,
+            "dest_well_id": dst_well,
+            "volume_ul": None if volume_text is None else float(volume_text),
+            "requires_ack_readback": True,
+            "raw_tokens": list(args),
+        }
+
+    @classmethod
+    def _fluid_prep_metadata(cls, args: tuple[str, ...]) -> dict[str, object]:
+        return {
+            "semantic_action": "fluid_prep",
+            "location_id": args[0] if args else None,
+            "well_id": cls._flag_value(args, "/ML") or cls._flag_value(args, "/WL") or cls._flag_value(args, "/ZN"),
+            "requires_ack_readback": True,
+            "raw_tokens": list(args),
+        }
 
     def translate_command(self, cmd: OemScriptCommand) -> TranslatedCommand:
         verb = cmd.verb.upper()
@@ -83,6 +136,10 @@ class OemScriptTranslator:
             return TranslatedCommand(cmd.index, "sp", cmd.raw, cmd.args)
         if verb == "STEP":
             return TranslatedCommand(cmd.index, "step", cmd.raw, cmd.args)
-        if verb in {"FP", "LA", "MC", "MP", "MT", "SA", "DWELL", "LOOP"}:
+        if verb == "MT":
+            return TranslatedCommand(cmd.index, "liquid_transfer", cmd.raw, cmd.args, metadata=self._liquid_transfer_metadata(cmd.args))
+        if verb == "FP":
+            return TranslatedCommand(cmd.index, "fluid_prep", cmd.raw, cmd.args, metadata=self._fluid_prep_metadata(cmd.args))
+        if verb in {"LA", "MC", "MP", "SA", "DWELL", "LOOP"}:
             return TranslatedCommand(cmd.index, verb.lower(), cmd.raw, cmd.args)
         return TranslatedCommand(cmd.index, "unsupported", cmd.raw, cmd.args, supported=False)

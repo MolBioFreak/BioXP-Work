@@ -42,11 +42,13 @@ def test_import_lifetest_xml_reports_unsupported_verbs_and_preserves_step_tracea
     assert imported.document.protocol_id == "oem-assembly-lifetest-vx"
     assert [stage.stage_id for stage in imported.document.stages] == ["step-01", "step-02", "step-03", "step-04"]
     assert imported.coverage.command_nodes_total == 178
-    assert imported.coverage.supported_command_count == 95
-    assert imported.coverage.unsupported_command_count == 83
-    assert imported.coverage.unsupported_verbs["MT"] == 62
-    assert imported.coverage.unsupported_verbs["FP"] == 3
-    assert 0.5 < imported.coverage.coverage_ratio < 0.6
+    assert imported.coverage.supported_command_count == 160
+    assert imported.coverage.unsupported_command_count == 18
+    assert imported.coverage.supported_verbs["MT"] == 62
+    assert imported.coverage.supported_verbs["FP"] == 3
+    assert "MT" not in imported.coverage.unsupported_verbs
+    assert "FP" not in imported.coverage.unsupported_verbs
+    assert 0.89 < imported.coverage.coverage_ratio < 0.90
 
     thermal_action = next(
         action
@@ -69,8 +71,9 @@ def test_generate_oem_fixture_coverage_report_aggregates_fixture_counts() -> Non
 
     assert report["file_count"] == 2
     assert report["aggregate"]["command_nodes_total"] == 246
-    assert report["aggregate"]["supported_command_count"] == 163
-    assert report["aggregate"]["unsupported_command_count"] == 83
-    assert report["aggregate"]["unsupported_verbs"]["MT"] == 62
+    assert report["aggregate"]["supported_command_count"] == 228
+    assert report["aggregate"]["unsupported_command_count"] == 18
+    assert report["aggregate"]["supported_verbs"]["MT"] == 62
+    assert report["aggregate"]["supported_verbs"]["FP"] == 3
     assert report["aggregate"]["supported_verbs"]["LED"] == 34
     assert report["files"][0]["coverage"]["coverage_ratio"] == 1.0

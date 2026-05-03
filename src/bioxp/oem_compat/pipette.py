@@ -10,6 +10,8 @@ class PipettePlan:
     status: str = "planned"
     executed: bool = False
     requires_readback: bool = True
+    ack_policy: str = "ack_and_status_readback_required"
+    preflight: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -22,8 +24,25 @@ class PipetteController:
     def dry_run(cls) -> "PipetteController":
         return cls()
 
-    def _plan(self, operation: str, command_ascii: str, *, requires_readback: bool = True) -> PipettePlan:
-        p = PipettePlan(operation=operation, command_ascii=command_ascii, requires_readback=requires_readback)
+    def _default_preflight(self, **extra) -> dict:
+        payload = {
+            "requires_reference_axes": ["x", "y", "z"],
+            "requires_tip_state": True,
+            "requires_deck_state": True,
+            "requires_pressure_state": True,
+            "fail_closed_without_readback": True,
+        }
+        payload.update({k: v for k, v in extra.items() if v is not None})
+        return payload
+
+    def _plan(self, operation: str, command_ascii: str, *, requires_readback: bool = True, **preflight) -> PipettePlan:
+        p = PipettePlan(
+            operation=operation,
+            command_ascii=command_ascii,
+            requires_readback=requires_readback,
+            ack_policy="ack_and_status_readback_required" if requires_readback else "no_readback_required",
+            preflight=self._default_preflight(**preflight),
+        )
         self.plans.append(p)
         return p
 
@@ -45,11 +64,11 @@ class PipetteController:
     def query_error_log(self, n: int = 0) -> PipettePlan:
         return self._plan("query_error_log", f"?E{int(n)}")
 
-    def aspirate(self, volume: float = 0, *_args, **_kwargs) -> PipettePlan:
-        return self._plan("aspirate", f"P{volume},1R")
+    def aspirate(self, volume: float = 0, *_args, **kwargs) -> PipettePlan:
+        return self._plan("aspirate", f"P{volume},1R", source=kwargs.get("source"))
 
-    def dispense(self, volume: float = 0, *_args, **_kwargs) -> PipettePlan:
-        return self._plan("dispense", f"D{volume},1R")
+    def dispense(self, volume: float = 0, *_args, **kwargs) -> PipettePlan:
+        return self._plan("dispense", f"D{volume},1R", destination=kwargs.get("destination") or kwargs.get("dest"))
 
     def mix_all(self, count: int = 1, vol: float = 0, vigorous: int = 100) -> PipettePlan:
         return self._plan("mix_all", f"M{vol},{count},{vigorous}R")

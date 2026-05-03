@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 
 from .models import ProtocolAction, ProtocolActionKind, ProtocolDocument, ProtocolStage
 from .validators import infer_required_capability
+from ..oem_compat.scripts import OemScriptCommand, OemScriptTranslator
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,8 @@ SUPPORTED_OEM_VERBS = frozenset(
         "LA",
         "ET",
         "MP",
+        "MT",
+        "FP",
     }
 )
 
@@ -299,6 +302,26 @@ def _compile_supported_action(
         kind = ProtocolActionKind.TIP_EJECT
         params = {}
         description = "Eject current tip set"
+    elif verb == "FP":
+        translated = OemScriptTranslator().translate_command(
+            OemScriptCommand(script_position - 1, verb, raw_cmd, tuple(args), node.tag)
+        )
+        kind = ProtocolActionKind.PIPETTE_INIT
+        params = {
+            "semantic_action": "fluid_prep",
+            **dict(translated.metadata or {}),
+        }
+        description = "OEM fluid preparation command"
+    elif verb == "MT":
+        translated = OemScriptTranslator().translate_command(
+            OemScriptCommand(script_position - 1, verb, raw_cmd, tuple(args), node.tag)
+        )
+        kind = ProtocolActionKind.PIPETTE_ASPIRATE
+        params = {
+            "semantic_action": "liquid_transfer",
+            **dict(translated.metadata or {}),
+        }
+        description = "OEM liquid transfer command"
     elif verb == "MP" and len(args) >= 2:
         kind = ProtocolActionKind.PLATE_MOVE
         params = {
