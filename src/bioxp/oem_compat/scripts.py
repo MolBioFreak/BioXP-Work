@@ -116,6 +116,24 @@ class OemScriptTranslator:
             "raw_tokens": list(args),
         }
 
+    @classmethod
+    def _macro_metadata(cls, verb: str, args: tuple[str, ...]) -> dict[str, object]:
+        semantic = {
+            "RT": "re_elute",
+            "SA": "material_agitate",
+            "ST": "material_transfer",
+            "SW": "standard_wash",
+            "TT": "trough_stage",
+            "ZW": "zone_wash",
+        }[verb]
+        return {
+            "semantic_action": semantic,
+            "macro_verb": verb,
+            "requires_virtual_bioxp_state": True,
+            "requires_ack_readback": True,
+            "raw_tokens": list(args),
+        }
+
     def translate_command(self, cmd: OemScriptCommand) -> TranslatedCommand:
         verb = cmd.verb.upper()
         if verb == "LED":
@@ -140,6 +158,8 @@ class OemScriptTranslator:
             return TranslatedCommand(cmd.index, "liquid_transfer", cmd.raw, cmd.args, metadata=self._liquid_transfer_metadata(cmd.args))
         if verb == "FP":
             return TranslatedCommand(cmd.index, "fluid_prep", cmd.raw, cmd.args, metadata=self._fluid_prep_metadata(cmd.args))
-        if verb in {"LA", "MC", "MP", "SA", "DWELL", "LOOP"}:
+        if verb in {"RT", "SA", "ST", "SW", "TT", "ZW"}:
+            return TranslatedCommand(cmd.index, verb.lower(), cmd.raw, cmd.args, metadata=self._macro_metadata(verb, cmd.args))
+        if verb in {"LA", "MC", "MP", "DWELL", "LOOP"}:
             return TranslatedCommand(cmd.index, verb.lower(), cmd.raw, cmd.args)
         return TranslatedCommand(cmd.index, "unsupported", cmd.raw, cmd.args, supported=False)

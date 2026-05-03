@@ -76,6 +76,39 @@ def test_oem_compat_api_script_translate_dry_run_accepts_oem_xml():
     assert all(a["status"] == "planned" for a in body["actions"])
 
 
+def test_oem_compat_api_import_protocol_dry_run_applies_virtual_state_without_motion():
+    from fastapi import FastAPI
+    from src.bioxp.oem_compat.api import router
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    xml = """
+    <WpfGenBotCommonLib>
+      <experiment><data name="ApiDryRun" /></experiment>
+      <script>
+        <step step="1" />
+        <line1 cmd="ST AMP PL_POOL Z5 V14 T50 NTY" />
+        <line2 cmd="ZW PL_POOL Z5 PL_OUTPUT Z9 V120 W10 MR5 DM2 T200 AMP" />
+      </script>
+    </WpfGenBotCommonLib>
+    """
+
+    resp = client.post("/oem-compat/protocols/import/dry-run", json={"xml": xml, "source_name": "api-dry.xml"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["coverage"]["unsupported_command_count"] == 0
+    assert body["job"]["mode"] == "dry_run"
+    assert body["job"]["executed"] is False
+    assert body["job"]["physical_motion"] is False
+    assert body["job"]["artifact"]["opened_usb"] is False
+    assert body["job"]["virtual_state"]["materials"]["AMP"]["location_id"] == "PL_POOL"
+    assert body["job"]["virtual_state"]["materials"]["AMP"]["wash_count"] == 10
+
+
 def test_main_bioxp_api_includes_oem_compat_dry_run_router_without_touching_usb(monkeypatch):
     import src.bioxp.api as api
 

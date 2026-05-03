@@ -36,19 +36,20 @@ def test_import_demo_xml_maps_supported_subset_with_source_traceability() -> Non
     assert delaypoint.pause_message == "OEM delay point reached"
 
 
-def test_import_lifetest_xml_reports_unsupported_verbs_and_preserves_step_traceability() -> None:
+def test_import_lifetest_xml_supports_purification_macros_and_preserves_step_traceability() -> None:
     imported = import_oem_xml_protocol(LIFETEST_XML)
 
     assert imported.document.protocol_id == "oem-assembly-lifetest-vx"
     assert [stage.stage_id for stage in imported.document.stages] == ["step-01", "step-02", "step-03", "step-04"]
     assert imported.coverage.command_nodes_total == 178
-    assert imported.coverage.supported_command_count == 160
-    assert imported.coverage.unsupported_command_count == 18
+    assert imported.coverage.supported_command_count == 178
+    assert imported.coverage.unsupported_command_count == 0
     assert imported.coverage.supported_verbs["MT"] == 62
     assert imported.coverage.supported_verbs["FP"] == 3
-    assert "MT" not in imported.coverage.unsupported_verbs
-    assert "FP" not in imported.coverage.unsupported_verbs
-    assert 0.89 < imported.coverage.coverage_ratio < 0.90
+    for verb in ("RT", "SA", "ST", "SW", "TT", "ZW"):
+        assert verb in imported.coverage.supported_verbs
+    assert imported.coverage.unsupported_verbs == {}
+    assert imported.coverage.coverage_ratio == 1.0
 
     thermal_action = next(
         action
@@ -60,10 +61,14 @@ def test_import_lifetest_xml_reports_unsupported_verbs_and_preserves_step_tracea
     assert thermal_action.params["duration_s"] == 60.0
     assert thermal_action.metadata["source_node"]["step"] == "2"
 
-    unsupported = imported.coverage.unsupported_commands[0]
-    assert unsupported.reason == "unsupported_oem_verb"
-    assert unsupported.source_node["source_file"] == "lifetest.xml"
-    assert unsupported.verb in imported.coverage.unsupported_verbs
+    standard_wash = next(
+        action
+        for stage in imported.document.stages
+        for action in stage.actions
+        if action.metadata.get("oem_verb") == "SW"
+    )
+    assert standard_wash.params["semantic_action"] == "standard_wash"
+    assert standard_wash.params["requires_virtual_bioxp_state"] is True
 
 
 def test_generate_oem_fixture_coverage_report_aggregates_fixture_counts() -> None:
@@ -71,8 +76,8 @@ def test_generate_oem_fixture_coverage_report_aggregates_fixture_counts() -> Non
 
     assert report["file_count"] == 2
     assert report["aggregate"]["command_nodes_total"] == 246
-    assert report["aggregate"]["supported_command_count"] == 228
-    assert report["aggregate"]["unsupported_command_count"] == 18
+    assert report["aggregate"]["supported_command_count"] == 246
+    assert report["aggregate"]["unsupported_command_count"] == 0
     assert report["aggregate"]["supported_verbs"]["MT"] == 62
     assert report["aggregate"]["supported_verbs"]["FP"] == 3
     assert report["aggregate"]["supported_verbs"]["LED"] == 34

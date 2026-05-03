@@ -83,8 +83,9 @@ def test_oem_xml_import_now_compiles_lifetest_mt_fp_for_dry_run_testing():
     assert imported.coverage.unsupported_verbs.get("FP", 0) == 0
     assert imported.coverage.supported_verbs["MT"] == 62
     assert imported.coverage.supported_verbs["FP"] == 3
-    assert imported.coverage.supported_command_count == 160
-    assert imported.coverage.unsupported_command_count == 18
+    assert imported.coverage.supported_command_count == 178
+    assert imported.coverage.unsupported_command_count == 0
+    assert imported.coverage.unsupported_verbs == {}
     mt_action = next(
         action
         for stage in imported.document.stages

@@ -96,6 +96,12 @@ SUPPORTED_OEM_VERBS = frozenset(
         "MP",
         "MT",
         "FP",
+        "RT",
+        "SA",
+        "ST",
+        "SW",
+        "TT",
+        "ZW",
     }
 )
 
@@ -134,6 +140,195 @@ def _prefixed_value(tokens: Iterable[str], prefix: str) -> str | None:
     for token in tokens:
         if token.startswith(prefix):
             return token[len(prefix) :]
+    return None
+
+
+_TIP_OPTIONS = {"NTY", "NTN", "KT", "ST", "FLY", "FLN", "TH"}
+
+
+def _is_location_token(token: str) -> bool:
+    text = str(token).upper()
+    return text.startswith("PL_") or text == "TROUGH"
+
+
+def _find_location(args: list[str], *, start: int = 0) -> tuple[int | None, str | None, str | None]:
+    for idx in range(start, len(args)):
+        if _is_location_token(args[idx]):
+            zone = args[idx + 1] if idx + 1 < len(args) and args[idx + 1].upper().startswith("Z") else None
+            return idx, args[idx], zone
+    return None, None, None
+
+
+def _prefixed_number(token: str, prefixes: tuple[str, ...]) -> tuple[str, float | int] | None:
+    upper = str(token).upper()
+    for prefix in prefixes:
+        if upper.startswith(prefix) and len(upper) > len(prefix):
+            raw_value = upper[len(prefix) :]
+            try:
+                value = float(raw_value)
+            except ValueError:
+                continue
+            if value.is_integer():
+                return prefix, int(value)
+            return prefix, value
+    return None
+
+
+def _option_values(tokens: list[str]) -> dict[str, float | int]:
+    values: dict[str, float | int] = {}
+    for token in tokens:
+        parsed = _prefixed_number(token, ("DUR", "AM", "MR", "DM", "RC", "A", "S", "D", "W", "V"))
+        if parsed is not None:
+            key, value = parsed
+            values[key] = value
+    return values
+
+
+def _segment_after(
+    args: list[str],
+    marker: str,
+    *,
+    start: int = 0,
+    end_markers: set[str] | None = None,
+    last: bool = False,
+) -> list[str]:
+    marker = marker.upper()
+    matches = [idx for idx in range(start, len(args)) if args[idx].upper() == marker]
+    if not matches:
+        return []
+    idx = matches[-1] if last else matches[0]
+    out: list[str] = []
+    end_markers = {m.upper() for m in (end_markers or set())}
+    for token in args[idx + 1 :]:
+        upper = token.upper()
+        if upper in end_markers:
+            break
+        if upper.startswith("V") or upper in _TIP_OPTIONS or upper in {"T50", "T200"}:
+            break
+        out.append(token)
+    return out
+
+
+def _tip_type(args: list[str]) -> str | None:
+    for token in args:
+        upper = token.upper()
+        if upper in {"T50", "T200"}:
+            return upper
+    return None
+
+
+def _tip_option(args: list[str]) -> str | None:
+    for token in args:
+        upper = token.upper()
+        if upper in _TIP_OPTIONS:
+            return upper
+    return None
+
+
+def _macro_base(verb: str, args: list[str], semantic_action: str) -> dict[str, Any]:
+    return {
+        "semantic_action": semantic_action,
+        "macro_verb": verb,
+        "raw_tokens": list(args),
+        "requires_virtual_bioxp_state": True,
+        "requires_ack_readback": True,
+    }
+
+
+def _compile_oem_macro_params(verb: str, args: list[str]) -> dict[str, Any] | None:
+    verb = verb.upper()
+    volume = _as_float(_prefixed_value(args, "V"))
+    tip_type = _tip_type(args)
+    tip_option = _tip_option(args)
+
+    if verb == "SA" and len(args) >= 2:
+        return {
+            **_macro_base(verb, args, "material_agitate"),
+            "material_id": args[0],
+            "tip_type": tip_type or args[1],
+            "repeat_count": _as_int(_prefixed_value(args, "RC")),
+        }
+
+    if verb == "ST" and args:
+        loc_idx, dest_loc, dest_zone = _find_location(args)
+        after_loc = 0 if loc_idx is None else loc_idx + 1
+        return {
+            **_macro_base(verb, args, "material_transfer"),
+            "material_id": args[0],
+            "dest_location_id": dest_loc,
+            "dest_zone": dest_zone,
+            "volume_ul": volume,
+            "tip_type": tip_type,
+            "tip_option": tip_option,
+            "option_groups": {
+                "AO": _option_values(_segment_after(args, "AO", end_markers={"PL_POOL", "PL_OUTPUT", "TROUGH"})),
+                "DAO": _option_values(_segment_after(args, "DAO", start=after_loc, end_markers={"MO", "DBO"})),
+                "MO": _option_values(_segment_after(args, "MO", start=after_loc, end_markers={"DBO"}, last=True)),
+                "DBO": _option_values(_segment_after(args, "DBO", start=after_loc)),
+            },
+        }
+
+    if verb == "TT" and args:
+        scalar_options = _option_values(args)
+        scalar_options.pop("V", None)
+        return {
+            **_macro_base(verb, args, "trough_stage"),
+            "material_id": args[0],
+            "volume_ul": volume,
+            "tip_type": tip_type,
+            "scalar_options": scalar_options,
+        }
+
+    if verb == "ZW" and len(args) >= 4:
+        first_idx, target_loc, target_zone = _find_location(args)
+        _second_idx, source_loc, source_zone = _find_location(args, start=(first_idx or 0) + 1)
+        return {
+            **_macro_base(verb, args, "zone_wash"),
+            "target_location_id": target_loc,
+            "target_zone": target_zone,
+            "source_location_id": source_loc,
+            "source_zone": source_zone,
+            "volume_ul": volume,
+            "tip_type": tip_type,
+            "wash_count": _as_int(_prefixed_value(args, "W")),
+            "mix_repeat": _as_int(_prefixed_value(args, "MR")),
+            "delay_or_mix_delay": _as_int(_prefixed_value(args, "DM")),
+            "material_id": args[-1],
+        }
+
+    if verb == "SW" and len(args) >= 4:
+        _loc_idx, target_loc, target_zone = _find_location(args, start=1)
+        return {
+            **_macro_base(verb, args, "standard_wash"),
+            "wash_material_id": args[0],
+            "target_location_id": target_loc,
+            "target_zone": target_zone,
+            "volume_ul": volume,
+            "tip_type": tip_type,
+            "wash_count": _as_int(_prefixed_value(args, "W")),
+            "mix_repeat": _as_int(_prefixed_value(args, "MR")),
+            "delay_or_mix_delay": _as_int(_prefixed_value(args, "DM")),
+            "material_id": args[-1],
+        }
+
+    if verb == "RT" and args:
+        loc_idx, target_loc, target_zone = _find_location(args)
+        after_loc = 0 if loc_idx is None else loc_idx + 1
+        return {
+            **_macro_base(verb, args, "re_elute"),
+            "material_id": args[0],
+            "target_location_id": target_loc,
+            "target_zone": target_zone,
+            "volume_ul": volume,
+            "tip_type": tip_type,
+            "tip_option": tip_option,
+            "option_groups": {
+                "DAO": _option_values(_segment_after(args, "DAO", start=after_loc, end_markers={"MO", "DBO"})),
+                "MO": _option_values(_segment_after(args, "MO", start=after_loc, end_markers={"DBO"}, last=True)),
+                "DBO": _option_values(_segment_after(args, "DBO", start=after_loc)),
+            },
+        }
+
     return None
 
 
@@ -322,6 +517,18 @@ def _compile_supported_action(
             **dict(translated.metadata or {}),
         }
         description = "OEM liquid transfer command"
+    elif verb in {"RT", "SA", "ST", "SW", "TT", "ZW"}:
+        macro_params = _compile_oem_macro_params(verb, list(args))
+        if macro_params is None:
+            return None
+        if verb in {"SA", "SW", "ZW"}:
+            kind = ProtocolActionKind.PIPETTE_MIX
+        elif verb in {"RT", "ST", "TT"}:
+            kind = ProtocolActionKind.PIPETTE_ASPIRATE
+        else:
+            kind = ProtocolActionKind.PIPETTE_DISPENSE
+        params = macro_params
+        description = f"OEM {macro_params['semantic_action']} macro ({verb})"
     elif verb == "MP" and len(args) >= 2:
         kind = ProtocolActionKind.PLATE_MOVE
         params = {

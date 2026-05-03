@@ -15,6 +15,8 @@ def test_oem_compat_capability_matrix_exposes_test_prep_truth():
     assert body["bms_role"] == "thin_operator_surface"
     assert body["capabilities"]["motion"]["prep_ready"] is True
     assert body["capabilities"]["deck_semantics"]["prep_ready"] is True
-    assert body["capabilities"]["oem_xml_jobs"]["supported_verbs_include"] == ["MT", "FP"]
+    assert body["capabilities"]["oem_xml_jobs"]["supported_verbs_include"] == ["MT", "FP", "RT", "SA", "ST", "SW", "TT", "ZW"]
+    assert body["capabilities"]["oem_xml_jobs"]["zero_unsupported_corpus_gate"] is True
+    assert body["capabilities"]["oem_xml_jobs"]["virtual_state_dry_run_endpoint"] == "/oem-compat/protocols/import/dry-run"
     assert body["capabilities"]["pipette"]["ack_readback_required"] is True
     assert body["capabilities"]["vision"]["artifacted_failures"] is True

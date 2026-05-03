@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from tempfile import gettempdir
+from tempfile import NamedTemporaryFile, gettempdir
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .control_lib import BioXPControlLib
 from .scripts import OemScript
+from ..protocols.oem_xml_import import import_oem_xml_protocol
 from .boards import axis_profile_matrix
 from .transport import ReplayTransport, SafetyContractViolation, assert_transport_safety, _frame_to_json
 
@@ -23,6 +24,11 @@ class StartupDryRunRequest(BaseModel):
 
 class ScriptTranslateRequest(BaseModel):
     xml: str
+
+
+class ProtocolImportDryRunRequest(BaseModel):
+    xml: str
+    source_name: str = "inline-oem-protocol.xml"
 
 
 def _trace_to_dict(trace) -> dict[str, Any]:
@@ -84,7 +90,9 @@ def capability_matrix_test_prep() -> dict[str, Any]:
             },
             "oem_xml_jobs": {
                 "prep_ready": True,
-                "supported_verbs_include": ["MT", "FP"],
+                "supported_verbs_include": ["MT", "FP", "RT", "SA", "ST", "SW", "TT", "ZW"],
+                "zero_unsupported_corpus_gate": True,
+                "virtual_state_dry_run_endpoint": "/oem-compat/protocols/import/dry-run",
                 "dry_run_required_before_live": True,
                 "artifact_bundle_required_for_live": True,
             },
@@ -134,3 +142,29 @@ def script_translate_dry_run(request: ScriptTranslateRequest) -> dict[str, Any]:
     script = OemScript.from_text(request.xml)
     result = control.execute_script(script)
     return {"mode": result.mode, "executed": result.executed, "actions": [asdict(a) for a in result.actions]}
+
+
+@router.post("/protocols/import/dry-run")
+def protocol_import_dry_run(request: ProtocolImportDryRunRequest) -> dict[str, Any]:
+    source_name = Path(request.source_name).name or "inline-oem-protocol.xml"
+    if not source_name.lower().endswith(".xml"):
+        source_name = f"{source_name}.xml"
+    with NamedTemporaryFile("w", suffix=f"-{source_name}", prefix="bioxp-oem-import-", delete=False) as handle:
+        temp_path = Path(handle.name)
+        handle.write(request.xml)
+    try:
+        imported = import_oem_xml_protocol(temp_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"OEM XML import failed: {exc}") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    job = BioXPControlLib.dry_run().execute_protocol(imported.document, source_path=source_name)
+    return {
+        "ok": job.ok,
+        "mode": job.mode,
+        "coverage": imported.coverage.to_payload(),
+        "protocol_id": imported.document.protocol_id,
+        "source_name": source_name,
+        "job": job.to_payload(),
+    }
