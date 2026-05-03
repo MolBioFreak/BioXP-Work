@@ -25,6 +25,25 @@ curl -s -X POST http://127.0.0.1:8080/oem-compat/startup/dry-run \
   -d '{"run_homing": true}'
 ```
 
+Validated workstation smoke result on this branch:
+
+```json
+{
+  "ok": true,
+  "mode": "dry_run",
+  "physical_motion": false,
+  "opened_usb": false,
+  "frame_count": 70,
+  "trace_names": ["initialize_motors_without_motion", "startup_homing"]
+}
+```
+
+Push-button workstation readiness report:
+
+```bash
+python3 scripts/oem_compat_workstation_readiness.py --output /tmp/bioxp_oem_compat_readiness.json
+```
+
 Safety rules:
 
 - no `/dev/bus/usb` mount in this image/profile
