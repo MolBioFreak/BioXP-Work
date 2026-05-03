@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_compat.api import router as oem_compat_router
 from pydantic import BaseModel, Field
@@ -186,6 +186,12 @@ def _get_pipette_transport():
 
 def _get_vision_capabilities() -> CapabilityRegistry:
     return _vision_capabilities
+
+
+def _require_local_maintenance_client(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(status_code=403, detail="USB maintenance endpoints are localhost-only")
 
 
 class AxisName(str, Enum):
@@ -1754,6 +1760,37 @@ async def reconnect_runtime():
         "message": "USB runtime reconnect requested.",
         **(await _run_blocking("BioXP status", _status_payload, timeout_s=20.0)),
     }
+
+
+@app.post("/maintenance/usb/release")
+async def maintenance_usb_release(request: Request):
+    _require_local_maintenance_client(request)
+    global _tester, _startup_error
+    async with _tester_lock:
+        tester = _tester
+        if tester is not None:
+            disconnect = getattr(tester, "_disconnect", None)
+            if callable(disconnect):
+                await asyncio.wait_for(run_in_threadpool(disconnect), timeout=20.0)
+        _tester = None
+        _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
+    return {"ok": True, "mode": "maintenance", "usb_owner": "released", "message": _startup_error}
+
+
+@app.post("/maintenance/usb/reconnect")
+async def maintenance_usb_reconnect(request: Request):
+    _require_local_maintenance_client(request)
+    global _tester, _startup_error
+    async with _tester_lock:
+        try:
+            alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
+            _tester = await asyncio.wait_for(run_in_threadpool(lambda: BioXpTester(alt=alt)), timeout=20.0)
+            _startup_error = None
+        except Exception as exc:
+            _tester = None
+            _startup_error = str(exc)
+            raise HTTPException(status_code=503, detail=_startup_error) from exc
+    return {"ok": True, "mode": "maintenance", "usb_owner": "service", "message": "USB runtime reconnected."}
 
 
 @app.get("/motion/axis/{axis}/status")

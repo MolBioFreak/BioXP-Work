@@ -90,3 +90,71 @@ def test_main_bioxp_api_includes_oem_compat_dry_run_router_without_touching_usb(
     assert body["physical_motion"] is False
     assert body["trace_names"] == ["initialize_motors_without_motion"]
     assert body["opened_usb"] is False
+
+
+def test_maintenance_usb_release_is_localhost_only_and_disconnects_owned_runtime(monkeypatch):
+    import src.bioxp.api as api
+
+    class FakeTester:
+        def __init__(self):
+            self.disconnected = False
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    fake = FakeTester()
+    monkeypatch.setattr(api, "_tester", fake)
+    monkeypatch.setattr(api, "_startup_error", None)
+    client = TestClient(api.app)
+
+    resp = client.post("/maintenance/usb/release")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["mode"] == "maintenance"
+    assert body["usb_owner"] == "released"
+    assert fake.disconnected is True
+    assert api._tester is None
+    assert "manually released" in api._startup_error
+
+
+def test_maintenance_usb_guard_rejects_non_local_clients():
+    from types import SimpleNamespace
+    import pytest
+    from fastapi import HTTPException
+    import src.bioxp.api as api
+
+    request = SimpleNamespace(client=SimpleNamespace(host="10.0.0.20"))
+
+    with pytest.raises(HTTPException) as excinfo:
+        api._require_local_maintenance_client(request)
+    assert excinfo.value.status_code == 403
+    assert "localhost-only" in excinfo.value.detail
+
+
+def test_maintenance_usb_reconnect_is_localhost_only_and_recreates_runtime(monkeypatch):
+    import src.bioxp.api as api
+
+    created = []
+
+    class FakeTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            created.append(alt)
+
+    monkeypatch.setattr(api, "BioXpTester", FakeTester)
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_startup_error", "released")
+    client = TestClient(api.app)
+
+    resp = client.post("/maintenance/usb/reconnect")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["mode"] == "maintenance"
+    assert body["usb_owner"] == "service"
+    assert created == [1]
+    assert isinstance(api._tester, FakeTester)
+    assert api._startup_error is None

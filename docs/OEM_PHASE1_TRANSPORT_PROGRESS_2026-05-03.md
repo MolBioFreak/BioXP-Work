@@ -26,6 +26,10 @@ Phase1 objective is transport and reply compliance: command/reply correlation, a
   - requires an artifact root before adapter use
   - uses the same strict reply matcher, so ambiguous/non-success/no-match replies do not report success
 - Added `ReplayTransport.assert_complete()` so recorded traces must be fully consumed, not just prefix-matched.
+- Added robot-local USB ownership maintenance routes in the main API:
+  - `POST /maintenance/usb/release` disconnects the service-owned tester and marks runtime manually released
+  - `POST /maintenance/usb/reconnect` recreates the service-owned tester
+  - both routes are localhost-only via request-client host guard
 
 ## Current shadow read whitelist
 
@@ -40,7 +44,7 @@ Validated with:
 
 ```text
 python3 -m pytest tests/test_oem_compat_transport.py tests/test_oem_compat_api.py tests/test_oem_oracle_extractor.py tests/test_oem_binding_loader.py -q
-32 passed in 0.24s
+35 passed in 0.25s
 ```
 
 Compile check:
