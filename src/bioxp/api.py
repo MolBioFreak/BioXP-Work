@@ -158,7 +158,7 @@ async def lifespan(app: FastAPI):
         _startup_error = str(exc)
         print(f"[WARN] BioXP USB runtime unavailable: {_startup_error}")
     try:
-        configure_oem_runtime(startup_program_factory=lambda: _get_oem_startup_program(dry_safe=True), autostart=True)
+        configure_oem_runtime(autostart=True)
     except Exception as exc:
         print(f"[WARN] BioXP OEM runtime unavailable: {exc}")
     try:

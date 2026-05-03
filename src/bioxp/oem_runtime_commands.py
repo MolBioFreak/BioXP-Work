@@ -21,6 +21,23 @@ class OEMRuntimeCommandHandlers:
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
+        if not bool(params.get("delegate_to_startup_program", False)):
+            return {
+                "ok": True,
+                "ready": False,
+                "state": "diagnostic_complete",
+                "command": command.name,
+                "source_shape": "BioXPMainWindow.motion_thread_process consumed initializeSystem; full initializeSystem body remains staged/fail-closed",
+                "implemented_runtime_layer": ["queue_consume", "gantry_available_bracket", "command_history", "durable_state"],
+                "blockers": [
+                    "live_initialCheck_not_requested",
+                    "initializeMotion_not_executed_from_runtime_worker",
+                    "home_predicates_unproven",
+                    "pipette_gate_unproven",
+                    "vision_gate_unproven",
+                    "parkGantry_gate_unproven",
+                ],
+            }
         if self.startup_program is None:
             return {"ok": False, "ready": False, "state": "failed_closed", "blockers": ["startup_program_not_bound"]}
         req = {
