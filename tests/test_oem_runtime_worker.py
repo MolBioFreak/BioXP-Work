@@ -162,6 +162,21 @@ def test_runtime_stepwise_homing_plan_and_live_gates(tmp_path):
     result = worker.run_next_for_tests()
     assert result["ok"] is False
     assert "operator_ack_HOME_required_for_live_stepwise_homing" in result["result"]["blockers"]
+    assert calls == [("shadow", "plan", False)]
+
+
+def test_runtime_stepwise_homing_live_bad_ack_rejects_before_provider_open(tmp_path):
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    def factory():
+        raise AssertionError("provider must not open before HOME ack is validated")
+
+    store = OEMRuntimeStore(tmp_path)
+    worker = OEMRuntimeWorker(store=store, handlers=OEMRuntimeCommandHandlers(startup_program_factory=factory).handlers())
+    worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(tmp_path / "artifact"), params={"run_stepwise_homing": True, "homing_step": "z-home"}))
+    result = worker.run_next_for_tests()
+    assert result["ok"] is False
+    assert "operator_ack_HOME_required_for_live_stepwise_homing" in result["result"]["blockers"]
 
 
 def test_worker_fails_closed_when_handler_missing(tmp_path):

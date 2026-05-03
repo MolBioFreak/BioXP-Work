@@ -227,16 +227,16 @@ class OEMRuntimeCommandHandlers:
 
     def _handle_stepwise_homing_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         step = str(params.get("homing_step", "plan")).strip().lower()
+        if command.mode == "live" and command.operator_ack != "HOME":
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_stepwise_homing"]}
+        if command.mode == "live" and step in {"plan", "full", "all"}:
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["live_stepwise_homing_requires_single_homing_step"]}
         program = self._startup_program()
         if program is None or not hasattr(program, "hardware"):
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["stepwise_homing_provider_not_bound"]}
         hardware = program.hardware
         if not hasattr(hardware, "startup_homing_stepwise"):
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["startup_homing_stepwise_method_unavailable"]}
-        if command.mode == "live" and command.operator_ack != "HOME":
-            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_stepwise_homing"]}
-        if command.mode == "live" and step in {"plan", "full", "all"}:
-            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["live_stepwise_homing_requires_single_homing_step"]}
         result = hardware.startup_homing_stepwise(mode=("live" if command.mode == "live" else "shadow"), step=step, execute=command.mode == "live")
         artifact_path = self._write_stage_artifact(command, f"runtime_stepwise_homing_{step}.json", {"command": command.to_dict(), "stepwise_homing": result})
         ok = bool(result.get("ok"))
