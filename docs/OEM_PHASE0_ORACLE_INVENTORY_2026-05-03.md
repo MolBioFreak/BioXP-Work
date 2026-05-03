@@ -78,13 +78,20 @@ Current binding contents:
 - schema: `bioxp-oem-binding-v1`
 - source: `ClassBioXPSettings.m_positionTable`
 - section `position_table`: available
+- section `calibration_reference`: available from `calreference.xml.deploy`
+- section `process_time`: available from `ProcessTime.xml.deploy`
+- section `motion_constants`: available from `DefaultParameters.cs`
 - section `vision_calibration`: not_extracted, explicit reason
 - section `pipette_calibration`: not_extracted, explicit reason
 
 Validated facts from the generated binding:
 
 - 29 source-backed default PositionTable entries extracted
-- example entries:
+- 30 source-backed process-time command estimates extracted
+- 26 source-backed DefaultParameters motion/process constants extracted
+- 2 source-backed part-number calibration reference tables extracted
+- fluid reference offsets extracted: `FLUID_TC_OFFSET=5178`, `FLUID_RC_OFFSET=5300`, `FLUID_STRIP_OFFSET=9200`
+- example PositionTable entries:
   - `LOC_MS`: Magnetic Tray, x=25743, y=9399, zLow=81553, zDelta=37400, zHigh=44153
   - `LOC_OC`: Output Tray, x=25791, y=42538, zLow=96188, zDelta=31150, zHigh=65038
   - `LOC_TC`: Pool Tray, x=67300, y=9225, zLow=72894, zDelta=35000, zHigh=37894
@@ -106,6 +113,9 @@ Pure/read-only, no hardware calls:
 - `src/bioxp/oem_compat/oracle_extractor.py`
   - `extract_location_id_enum(path)`
   - `extract_position_table(class_bioxp_settings_path, location_id_by_ordinal)`
+  - `extract_calibration_reference(path)`
+  - `extract_process_time(path)`
+  - `extract_default_parameters(path)`
   - `write_position_table_binding(...)`
 
 ## Tests added

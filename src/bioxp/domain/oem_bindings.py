@@ -12,6 +12,7 @@ OEM_BINDING_SCHEMA = "bioxp-oem-binding-v1"
 _ALLOWED_SECTIONS = {
     "position_table",
     "motion_constants",
+    "calibration_reference",
     "vision_calibration",
     "pipette_calibration",
     "process_time",

@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from src.bioxp.domain.oem_bindings import OEM_BINDING_SCHEMA
 
@@ -14,6 +15,7 @@ _POSITION_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _FIELD_RE = re.compile(r"(?P<key>name|x|y|zLow|zHigh|zDelta|inc_factor)\s*=\s*(?P<value>\"[^\"]*\"|-?\d+)")
+_CONST_RE = re.compile(r"public\s+const\s+(?:int|double)\s+(?P<name>[A-Z0-9_]+)\s*=\s*(?P<value>-?\d+(?:\.\d+)?)\s*;")
 
 
 def extract_location_id_enum(path: str | Path) -> dict[int, str]:
@@ -81,6 +83,71 @@ def extract_position_table(
     return entries
 
 
+def _coerce_xml_scalar(value: str) -> int | float | str:
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def extract_calibration_reference(path: str | Path) -> dict[str, Any]:
+    """Extract deploy-time calreference.xml fluid/part-number offsets."""
+
+    root = ET.parse(path).getroot()
+    if root.tag != "CalibrationReferences":
+        raise ValueError(f"Expected CalibrationReferences root in {path}, got {root.tag}")
+    part_numbers: dict[str, dict[str, int | float | str]] = {}
+    fluid_reference: dict[str, int | float | str] = {}
+    for child in root:
+        if child.tag.startswith("PartNumber_"):
+            params = child.find("Parameters")
+            if params is not None:
+                part_numbers[child.tag] = {
+                    key: _coerce_xml_scalar(value)
+                    for key, value in params.attrib.items()
+                }
+        elif child.tag == "FluidReference":
+            ref = child.find("ref_location")
+            if ref is not None:
+                fluid_reference = {
+                    key: _coerce_xml_scalar(value)
+                    for key, value in ref.attrib.items()
+                }
+    return {"part_numbers": part_numbers, "fluid_reference": fluid_reference}
+
+
+def extract_process_time(path: str | Path) -> dict[str, float]:
+    """Extract OEM ProcessTime.xml command timing estimates in seconds."""
+
+    root = ET.parse(path).getroot()
+    process_time = root.find("processTime")
+    if process_time is None:
+        raise ValueError(f"Could not find processTime element in {path}")
+    timings: dict[str, float] = {}
+    for child in process_time:
+        if "process" in child.attrib:
+            timings[child.tag] = float(child.attrib["process"])
+    if not timings:
+        raise ValueError(f"No process timings extracted from {path}")
+    return timings
+
+
+def extract_default_parameters(path: str | Path) -> dict[str, int | float]:
+    """Extract numeric public const values from BioXPCommonLib.DefaultParameters."""
+
+    source = Path(path).read_text(encoding="utf-8", errors="replace")
+    constants: dict[str, int | float] = {}
+    for match in _CONST_RE.finditer(source):
+        raw_value = match.group("value")
+        constants[match.group("name")] = float(raw_value) if "." in raw_value else int(raw_value)
+    if not constants:
+        raise ValueError(f"No DefaultParameters constants extracted from {path}")
+    return constants
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -94,12 +161,50 @@ def write_position_table_binding(
     class_bioxp_settings_path: str | Path,
     location_id_path: str | Path,
     output_path: str | Path,
+    calreference_path: str | Path | None = None,
+    process_time_path: str | Path | None = None,
+    default_parameters_path: str | Path | None = None,
 ) -> None:
-    """Write initial OEM binding JSON for the source-backed default PositionTable."""
+    """Write initial OEM binding JSON for source-backed OEM config data."""
 
     settings_path = Path(class_bioxp_settings_path)
     enum_path = Path(location_id_path)
     entries = extract_position_table(settings_path, extract_location_id_enum(enum_path))
+    sections: dict[str, Any] = {
+        "position_table": {
+            "status": "available",
+            "source_key": "ClassBioXPSettings.m_positionTable",
+            "entries": entries,
+        },
+        "vision_calibration": {
+            "status": "not_extracted",
+            "reason": "InspectionSettings.xml was referenced by OEM code but not found as a standalone SSD-backup file in phase-0 inventory",
+            "source_key": "InspectionSettings.xml",
+        },
+        "pipette_calibration": {
+            "status": "not_extracted",
+            "reason": "Pipette constants require ClassPipette/ClassPipetteCollection extraction in a later phase",
+            "source_key": "ClassPipetteCollection/ClassPipette",
+        },
+    }
+    if calreference_path is not None:
+        sections["calibration_reference"] = {
+            "status": "available",
+            "source_key": "calreference.xml.deploy",
+            **extract_calibration_reference(calreference_path),
+        }
+    if process_time_path is not None:
+        sections["process_time"] = {
+            "status": "available",
+            "source_key": "ProcessTime.xml.deploy",
+            "commands": extract_process_time(process_time_path),
+        }
+    if default_parameters_path is not None:
+        sections["motion_constants"] = {
+            "status": "available",
+            "source_key": "DefaultParameters.cs",
+            "constants": extract_default_parameters(default_parameters_path),
+        }
     payload = {
         "schema": OEM_BINDING_SCHEMA,
         "source": {
@@ -108,23 +213,7 @@ def write_position_table_binding(
             "source_key": "ClassBioXPSettings.m_positionTable",
             "source_hash": _sha256(settings_path),
         },
-        "sections": {
-            "position_table": {
-                "status": "available",
-                "source_key": "ClassBioXPSettings.m_positionTable",
-                "entries": entries,
-            },
-            "vision_calibration": {
-                "status": "not_extracted",
-                "reason": "InspectionSettings.xml was referenced by OEM code but not found as a standalone SSD-backup file in phase-0 inventory",
-                "source_key": "InspectionSettings.xml",
-            },
-            "pipette_calibration": {
-                "status": "not_extracted",
-                "reason": "Pipette constants require ClassPipette/ClassPipetteCollection extraction in a later phase",
-                "source_key": "ClassPipetteCollection/ClassPipette",
-            },
-        },
+        "sections": sections,
     }
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)

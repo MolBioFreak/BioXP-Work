@@ -1,6 +1,74 @@
 {
   "schema": "bioxp-oem-binding-v1",
   "sections": {
+    "calibration_reference": {
+      "fluid_reference": {
+        "FLUID_RC_OFFSET": 5300,
+        "FLUID_STRIP_OFFSET": 9200,
+        "FLUID_TC_OFFSET": 5178,
+        "REVERSION": 0
+      },
+      "part_numbers": {
+        "PartNumber_50010-01": {
+          "MAGNETIC_SEPARATION": 28956,
+          "OUTPUT_CHILLER": 20646,
+          "PARK": 123138,
+          "REAGENT_CHILLER": 32816,
+          "STRIP_WELL": 4296,
+          "THERMAL_CYCLER": 24900,
+          "TIP_TRAY1": -9972,
+          "TIP_TRAY2": -10726,
+          "TIP_TRAY3": -12517,
+          "TIP_TRAY4": -13031
+        },
+        "PartNumber_50010-01A": {
+          "MAGNETIC_SEPARATION": 74215,
+          "OUTPUT_CHILLER": 67663,
+          "PARK": 121092,
+          "REAGENT_CHILLER": 66212,
+          "STRIP_WELL": 53073,
+          "THERMAL_CYCLER": 74055,
+          "TIP_TRAY1": -10983,
+          "TIP_TRAY2": -10474,
+          "TIP_TRAY3": -14823,
+          "TIP_TRAY4": -14568
+        }
+      },
+      "source_key": "calreference.xml.deploy",
+      "status": "available"
+    },
+    "motion_constants": {
+      "constants": {
+        "CHILLER_COOL_RATE": -0.025,
+        "FAST_ACC_MIN_STEPS": 10000,
+        "GRIPPER_SAFE_MOVE_HEIGHT": 18000,
+        "G_MOTOR_ACCELERATION": 5,
+        "G_MOTOR_ACCELERATION_NEW": 20,
+        "G_MOTOR_HOLD_CURRENT": 10,
+        "G_MOTOR_HOME_VELOCITY_NEW": 200,
+        "G_MOTOR_MAX_CURRENT": 31,
+        "G_MOTOR_STALL_GUARD_THRESHOLD": 5,
+        "G_MOTOR_STALL_GUARD_THRESHOLD1": 20,
+        "G_MOTOR_VELOCITY": 600,
+        "G_MOTOR_VELOCITY_NEW": 1500,
+        "OVERPRESS": 4030,
+        "PSUDO_Z_HOME_HEIGH": 500,
+        "PSUDO_Z_HOME_LOW": 65000,
+        "X_MOTOR_ACCELERATION": 350,
+        "X_MOTOR_ACCELERATION_LONG": 400,
+        "X_MOTOR_STALL_GUARD_THRESHOLD": 16,
+        "X_MOTOR_VELOCITY": 1700,
+        "Y_MOTOR_ACCELERATION": 400,
+        "Y_MOTOR_ACCELERATION_LONG": 750,
+        "Y_MOTOR_STALL_GUARD_THRESHOLD": 16,
+        "Y_MOTOR_VELOCITY": 1800,
+        "Z_MOTOR_ACCELERATION": 576,
+        "Z_MOTOR_ACCELERATION_LIQUID_DETECTION": 176,
+        "Z_MOTOR_VELOCITY": 1791
+      },
+      "source_key": "DefaultParameters.cs",
+      "status": "available"
+    },
     "pipette_calibration": {
       "reason": "Pipette constants require ClassPipette/ClassPipetteCollection extraction in a later phase",
       "source_key": "ClassPipetteCollection/ClassPipette",
@@ -290,6 +358,42 @@
         }
       },
       "source_key": "ClassBioXPSettings.m_positionTable",
+      "status": "available"
+    },
+    "process_time": {
+      "commands": {
+        "ampmix": 222.727,
+        "catch": 18.266,
+        "cc": 0.045,
+        "dclose": 17.11,
+        "delaypoint": 600.333,
+        "dopen": 19.013,
+        "dsa": 8.091,
+        "ejt": 2.974,
+        "empty": 24.134,
+        "fon": 0.001,
+        "iniPipette": 5.945,
+        "la": 0.001,
+        "ldtip": 13.508,
+        "led": 0.109,
+        "masp": 10.417,
+        "mmix": 1.338,
+        "mov": 7.12,
+        "mr": 2.094,
+        "ms": 2.715,
+        "mw": 4.52,
+        "park": 5.403,
+        "pressp": 0.34,
+        "release": 17.801,
+        "rmb": 13.809,
+        "sp": 2.548,
+        "splid": 30.347,
+        "step": 0.001,
+        "tm": 24.116,
+        "wait": 62.502,
+        "wiggley": 5.79
+      },
+      "source_key": "ProcessTime.xml.deploy",
       "status": "available"
     },
     "vision_calibration": {
