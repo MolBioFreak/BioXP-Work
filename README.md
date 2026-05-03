@@ -59,16 +59,23 @@ Current grounding from the repo docs and live runtime surfaces:
 
 ## Reliability note
 
-The current reliability picture is still unresolved. Live evidence currently includes repeatable camera/UVC control-query failures plus historically suspicious USB reset behavior around the Novo adapter, but this repo does not treat that as a closed "bad componentry" verdict.
+The current reliability picture should not be framed as a proven bad-component verdict. The robot is treated as functional under OEM control; current native-Linux work is about completing OEM-compatible control semantics, transport ownership, and BMS/runtime truth alignment.
 
-The current runtime intentionally performs reconnect and recovery work such as:
+Historical Linux-side evidence included camera/UVC control-query failures and suspicious USB reset behavior around the Novo adapter. That evidence remains useful for transport/recovery diagnostics, but the current documentation posture is:
+
+- do not present the robot as generally broken hardware
+- separate native-Linux implementation gaps from OEM-proven mechanical/electrical function
+- describe Linux issues as transport/recovery/OEM-parity work unless a new, isolated live test proves a component fault
+- keep BMS as a thin operator/proxy surface; robot-local runtime and artifacts own hardware truth
+
+The runtime still performs reconnect and recovery work such as:
 
 - `set_configuration()`
 - `claim_interface()`
 - reconnect flows that can call `dev.reset()`
 - camera recovery paths that can release owners or force USB re-enumeration
 
-So repeated resets, reconnect churn, or camera-control failures may reflect some combination of transport instability, recovery behavior, permission/driver issues, and hardware weakness. Novo USB/CAN remains a serious suspect, but software reconnect/reset behavior is still a major confounder. Until those signals are cleanly separated and correlated with physical inspection, describe the problem as unresolved transport/recovery instability rather than proven blanket hardware failure.
+So repeated resets, reconnect churn, or camera-control failures may reflect transport instability, recovery behavior, permission/driver issues, or other Linux-stack parity gaps. They should not be summarized as blanket hardware failure unless a new isolated test proves the specific component fault while controlling for software ownership/recovery effects.
 
 ## Running the stack
 
