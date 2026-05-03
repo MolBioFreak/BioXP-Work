@@ -4,8 +4,9 @@ import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from src.bioxp.domain.oem_bindings import OEM_BINDING_SCHEMA
 
@@ -148,6 +149,43 @@ def extract_default_parameters(path: str | Path) -> dict[str, int | float]:
     return constants
 
 
+def extract_script_corpus(paths: Iterable[str | Path]) -> dict[str, Any]:
+    """Count OEM XML cmd-attribute verbs across standalone script files."""
+
+    total_verbs: Counter[str] = Counter()
+    files: dict[str, Any] = {}
+    command_count = 0
+    for raw_path in paths:
+        path = Path(raw_path)
+        root = ET.parse(path).getroot()
+        file_verbs: Counter[str] = Counter()
+        file_commands = 0
+        for elem in root.iter():
+            raw_cmd = elem.attrib.get("cmd")
+            if not raw_cmd:
+                continue
+            parts = raw_cmd.strip().split()
+            if not parts:
+                continue
+            verb = parts[0].upper()
+            file_verbs[verb] += 1
+            total_verbs[verb] += 1
+            file_commands += 1
+            command_count += 1
+        files[path.name] = {
+            "source_path": str(path),
+            "root_tag": root.tag,
+            "command_count": file_commands,
+            "verbs": dict(sorted(file_verbs.items())),
+        }
+    return {
+        "file_count": len(files),
+        "command_count": command_count,
+        "verbs": dict(sorted(total_verbs.items())),
+        "files": files,
+    }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -164,6 +202,7 @@ def write_position_table_binding(
     calreference_path: str | Path | None = None,
     process_time_path: str | Path | None = None,
     default_parameters_path: str | Path | None = None,
+    script_paths: Iterable[str | Path] | None = None,
 ) -> None:
     """Write initial OEM binding JSON for source-backed OEM config data."""
 
@@ -204,6 +243,12 @@ def write_position_table_binding(
             "status": "available",
             "source_key": "DefaultParameters.cs",
             "constants": extract_default_parameters(default_parameters_path),
+        }
+    if script_paths is not None:
+        sections["script_corpus"] = {
+            "status": "available",
+            "source_key": "Scripts/*.xml",
+            **extract_script_corpus(script_paths),
         }
     payload = {
         "schema": OEM_BINDING_SCHEMA,

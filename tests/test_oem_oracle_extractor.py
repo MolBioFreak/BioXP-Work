@@ -6,6 +6,7 @@ from src.bioxp.oem_compat.oracle_extractor import (
     extract_location_id_enum,
     extract_position_table,
     extract_process_time,
+    extract_script_corpus,
     write_position_table_binding,
 )
 
@@ -147,18 +148,40 @@ public static class DefaultParameters
     assert constants["PSUDO_Z_HOME_LOW"] == 65000
 
 
+def test_extract_script_corpus_counts_cmd_attribute_verbs(tmp_path):
+    script_a = tmp_path / "demo.xml"
+    script_b = tmp_path / "lifetest.xml"
+    script_a.write_text(
+        """<WpfGenBotCommonLib><script><line cmd=\"MT PL_REAGENT A1\" /><line cmd=\"WAIT 5\" /></script></WpfGenBotCommonLib>""",
+        encoding="utf-8",
+    )
+    script_b.write_text(
+        """<WpfGenBotCommonLib><script><line cmd=\"MT PL_OUTPUT B2\" /><line cmd=\"LA\" /></script></WpfGenBotCommonLib>""",
+        encoding="utf-8",
+    )
+
+    corpus = extract_script_corpus([script_a, script_b])
+
+    assert corpus["file_count"] == 2
+    assert corpus["command_count"] == 4
+    assert corpus["verbs"] == {"LA": 1, "MT": 2, "WAIT": 1}
+    assert corpus["files"]["demo.xml"]["verbs"] == {"MT": 1, "WAIT": 1}
+
+
 def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
     enum_path = tmp_path / "locationID.cs"
     source_path = tmp_path / "ClassBioXPSettings.cs"
     cal_path = tmp_path / "calreference.xml.deploy"
     process_path = tmp_path / "ProcessTime.xml.deploy"
     default_path = tmp_path / "DefaultParameters.cs"
+    script_path = tmp_path / "demo.xml"
     output_path = tmp_path / "binding.json"
     enum_path.write_text(LOCATION_ENUM, encoding="utf-8")
     source_path.write_text(POSITION_TABLE, encoding="utf-8")
     cal_path.write_text("<CalibrationReferences><FluidReference><ref_location FLUID_TC_OFFSET=\"5178\" /></FluidReference></CalibrationReferences>", encoding="utf-8")
     process_path.write_text("<BioXPCommonLib><processTime><mov process=\"7.12\" /></processTime></BioXPCommonLib>", encoding="utf-8")
     default_path.write_text("public const int X_MOTOR_VELOCITY = 1700;", encoding="utf-8")
+    script_path.write_text("<WpfGenBotCommonLib><line cmd=\"MT PL_REAGENT A1\" /></WpfGenBotCommonLib>", encoding="utf-8")
 
     write_position_table_binding(
         class_bioxp_settings_path=source_path,
@@ -167,6 +190,7 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
         calreference_path=cal_path,
         process_time_path=process_path,
         default_parameters_path=default_path,
+        script_paths=[script_path],
     )
 
     text = output_path.read_text(encoding="utf-8")
@@ -175,5 +199,7 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
     assert '"calibration_reference"' in text
     assert '"process_time"' in text
     assert '"motion_constants"' in text
+    assert '"script_corpus"' in text
+    assert '"MT": 1' in text
     assert '"LOC_MS"' in text
     assert '"source_type": "decompiled_csharp"' in text

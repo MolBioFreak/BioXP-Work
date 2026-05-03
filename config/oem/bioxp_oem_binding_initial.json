@@ -396,6 +396,130 @@
       "source_key": "ProcessTime.xml.deploy",
       "status": "available"
     },
+    "script_corpus": {
+      "command_count": 2933,
+      "file_count": 5,
+      "files": {
+        "Inital Test Script.xml": {
+          "command_count": 30,
+          "root_tag": "WpfGenBotCommonLib",
+          "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/Inital Test Script.xml",
+          "verbs": {
+            "CC": 2,
+            "LED": 4,
+            "MC": 8,
+            "MP": 4,
+            "PP": 4,
+            "SS": 1,
+            "TCD": 4,
+            "WAIT": 3
+          }
+        },
+        "TP015 48 HOUR SYSTEM BURN-IN.xml": {
+          "command_count": 2647,
+          "root_tag": "WpfGenBotCommonLib",
+          "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/TP015 48 HOUR SYSTEM BURN-IN.xml",
+          "verbs": {
+            "CC": 2,
+            "DELAYPOINT": 1,
+            "DWELL": 92,
+            "ET": 25,
+            "LED": 4,
+            "LOOP": 92,
+            "MC": 452,
+            "MP": 18,
+            "MT": 1389,
+            "PP": 80,
+            "SP": 323,
+            "SW": 4,
+            "TCD": 156,
+            "TT": 1,
+            "WAIT": 4,
+            "ZW": 4
+          }
+        },
+        "demo.xml": {
+          "command_count": 68,
+          "root_tag": "WpfGenBotCommonLib",
+          "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/demo.xml",
+          "verbs": {
+            "DELAYPOINT": 1,
+            "LED": 32,
+            "MC": 8,
+            "MP": 4,
+            "PP": 4,
+            "TCD": 4,
+            "WAIT": 15
+          }
+        },
+        "lifetest.xml": {
+          "command_count": 178,
+          "root_tag": "WpfGenBotCommonLib",
+          "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/lifetest.xml",
+          "verbs": {
+            "CC": 1,
+            "DELAYPOINT": 1,
+            "DWELL": 4,
+            "ET": 6,
+            "FP": 3,
+            "LA": 8,
+            "LED": 2,
+            "LOOP": 8,
+            "MC": 17,
+            "MP": 4,
+            "MT": 62,
+            "PP": 7,
+            "RT": 4,
+            "SA": 1,
+            "SP": 25,
+            "SS": 1,
+            "ST": 4,
+            "SW": 4,
+            "TCD": 7,
+            "TT": 1,
+            "WAIT": 4,
+            "ZW": 4
+          }
+        },
+        "tp506.xml": {
+          "command_count": 10,
+          "root_tag": "WpfGenBotCommonLib",
+          "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/tp506.xml",
+          "verbs": {
+            "CC": 2,
+            "LED": 2,
+            "SP": 4,
+            "TCD": 2
+          }
+        }
+      },
+      "source_key": "Scripts/*.xml",
+      "status": "available",
+      "verbs": {
+        "CC": 7,
+        "DELAYPOINT": 3,
+        "DWELL": 96,
+        "ET": 31,
+        "FP": 3,
+        "LA": 8,
+        "LED": 44,
+        "LOOP": 100,
+        "MC": 485,
+        "MP": 30,
+        "MT": 1451,
+        "PP": 95,
+        "RT": 4,
+        "SA": 1,
+        "SP": 352,
+        "SS": 2,
+        "ST": 4,
+        "SW": 8,
+        "TCD": 173,
+        "TT": 2,
+        "WAIT": 26,
+        "ZW": 8
+      }
+    },
     "vision_calibration": {
       "reason": "InspectionSettings.xml was referenced by OEM code but not found as a standalone SSD-backup file in phase-0 inventory",
       "source_key": "InspectionSettings.xml",
