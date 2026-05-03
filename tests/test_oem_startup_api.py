@@ -46,3 +46,41 @@ def test_oem_switch_audit_api_status_mode(monkeypatch, tmp_path):
     body = resp.json()
     assert body["ok"] is True
     assert body["axes"][0]["axis"] == "z"
+
+
+def test_oem_motion_worker_api_run_next_and_status(monkeypatch, tmp_path):
+    import src.bioxp.api as api
+
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    monkeypatch.setenv("BIOXP_OEM_STARTUP_ARTIFACT_BASE", str(tmp_path))
+    api._oem_startup_program = OEMStartupProgram(hardware=FakeStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
+    client = TestClient(api.app)
+
+    req = client.post("/oem/startup/request", json={"mode": "dry_run", "require_config": False})
+    assert req.status_code == 200
+
+    status_before = client.get("/oem/motion_worker/status")
+    assert status_before.status_code == 200
+    assert status_before.json()["queue_depth"] == 1
+
+    ran = client.post("/oem/motion_worker/run_next")
+    assert ran.status_code == 200
+    assert ran.json()["ok"] is True
+
+    latest = client.get("/oem/startup/status/latest").json()
+    assert latest["state"] == "diagnostic_complete"
+    assert latest["ready"] is False
+
+
+def test_oem_initial_check_live_requires_ack(monkeypatch, tmp_path):
+    import src.bioxp.api as api
+
+    monkeypatch.setenv("BIOXP_OEM_STARTUP_ARTIFACT_BASE", str(tmp_path))
+    api._oem_startup_program = None
+    client = TestClient(api.app)
+
+    resp = client.post("/oem/initial_check", json={"mode": "live"})
+
+    assert resp.status_code == 409
+    assert "operator_ack" in resp.json()["detail"]

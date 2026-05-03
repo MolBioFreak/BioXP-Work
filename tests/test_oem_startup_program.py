@@ -62,3 +62,76 @@ def test_missing_required_config_fails_before_hardware(tmp_path):
     assert status["state"] == "failed_closed"
     assert "config" in status["failure_reason"]
     assert hw.initial_check_calls == 0
+
+
+def test_already_closed_runs_initial_check_twice_before_queue(tmp_path):
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    hw = FakeStartupHardware(door_closed=True, latch_closed=True)
+    program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
+
+    status = program.request_startup({"mode": "dry_run", "require_config": False, "door_policy": "already_closed"})
+
+    assert status["state"] == "initialize_system_queued"
+    assert hw.initial_check_calls == 2
+    assert (Path(status["artifact_root"]) / "initial_check_after_door.json").exists()
+
+
+def test_live_artifact_root_must_be_absolute_and_allowed(tmp_path):
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    program = OEMStartupProgram(hardware=FakeStartupHardware(), artifact_base=tmp_path)
+
+    relative = program.request_startup({"mode": "live", "operator_ack": "INITIALIZE", "artifact_root": "relative/live"})
+    assert relative["state"] == "failed_closed"
+    assert "absolute" in relative["failure_reason"]
+
+    outside = program.request_startup({"mode": "live", "operator_ack": "INITIALIZE", "artifact_root": "/home/dalab/not-allowed-bioxp-live"})
+    assert outside["state"] == "failed_closed"
+    assert "outside allowed" in outside["failure_reason"]
+
+
+def test_door_event_only_valid_while_waiting(tmp_path):
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    program = OEMStartupProgram(hardware=FakeStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
+    status = program.request_startup({"mode": "dry_run", "require_config": False})
+
+    try:
+        program.door_event(status["session_id"], door_closed=True, latch_closed=True)
+    except ValueError as exc:
+        assert "waiting_for_door_close" in str(exc)
+    else:
+        raise AssertionError("door_event unexpectedly accepted outside waiting state")
+
+
+def test_live_homing_blocks_when_switch_predicates_unknown(tmp_path):
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    cfg = {"status": "loaded", "live_ready": True, "fields": {"StartMode": "0", "GripperVersion": "1"}, "missing_fields": []}
+    hw = FakeStartupHardware(door_closed=True, latch_closed=True, config_status=cfg)
+    program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path, allowlist_roots=[tmp_path])
+
+    status = program.request_startup({"mode": "live", "operator_ack": "INITIALIZE", "artifact_root": str(tmp_path / "live"), "require_config": True, "run_homing": True})
+
+    assert status["state"] == "failed_closed"
+    assert "predicates" in status["failure_reason"]
+    assert status["axis_reference"]["ok"] is False
+
+
+def test_worker_run_next_reaches_diagnostic_not_ready(tmp_path):
+    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+
+    hw = FakeStartupHardware(door_closed=True, latch_closed=True)
+    program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
+    queued = program.request_startup({"mode": "dry_run", "require_config": False})
+
+    result = program.run_next_worker_command()
+    status = program.status(queued["session_id"])
+
+    assert result["ok"] is True
+    assert status["state"] == "diagnostic_complete"
+    assert status["ready"] is False
+    assert "pipette" in status["failure_reason"]
+    assert (Path(status["artifact_root"]) / "initialize_motors_trace.jsonl").exists()
+    assert (Path(status["artifact_root"]) / "vision_inspection.json").exists()

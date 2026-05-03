@@ -4,18 +4,18 @@ import json
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Deque
+from typing import Callable, Deque, Literal
+
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class OemMotionCommand:
+class OemMotionCommand(BaseModel):
     session_id: str
-    name: str
-    payload: dict = field(default_factory=dict)
-    command_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    created_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    name: Literal["initializeSystem", "abort", "diagnostic"]
+    payload: dict = Field(default_factory=dict)
+    command_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    created_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
 
 
 class OEMMotionWorker:
@@ -55,10 +55,14 @@ class OEMMotionWorker:
         self.state = "running"
         self._event("start", command)
         try:
-            handler = self.handlers.get(command.name, lambda cmd: {"ok": True, "unhandled": True})
+            handler = self.handlers.get(command.name)
+            if handler is None:
+                raise RuntimeError(f"no handler registered for OEM motion command {command.name}")
             result = handler(command)
             self.last_result = result
-            self._event("complete", command, ok=bool(result.get("ok", True)))
+            ok = bool(result.get("ok", False))
+            self._event("complete" if ok else "failed", command, ok=ok, result=result)
+            self.state = "queued" if self.queue else "idle"
             return result
         except Exception as exc:
             self.last_result = {"ok": False, "error": str(exc)}
@@ -67,8 +71,6 @@ class OEMMotionWorker:
             return self.last_result
         finally:
             self.active = None
-            if self.state != "failed":
-                self.state = "queued" if self.queue else "idle"
 
     def abort(self, *, reason: str = "abort") -> dict:
         active = self.active

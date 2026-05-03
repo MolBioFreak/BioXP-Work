@@ -2134,44 +2134,66 @@ class BioXpTester:
                 row["detail"] = detail
             checks.append(row)
 
-        backend_ready = {"ok": True, "mode": str(mode)}
+        sequence = []
+        backend_ready = {"ok": True, "mode": str(mode), "source_shape": "wait CAN_READY up to OEM initialCheck timeout"}
+        sequence.append("backend_ready")
+        add("backend_ready", backend_ready.get("ok", False), backend_ready)
+
+        def snapshot(label):
+            sequence.append(label)
+            try:
+                snap = self.io_snapshot(self.BOARD_DECK)
+            except Exception as exc:
+                snap = {"error": str(exc)}
+            return snap
+
         led_white = {"skipped": not live, "reason": "shadow mode" if not live else None}
         deactivate = {"skipped": not live, "reason": "shadow mode" if not live else None}
         activate = {"skipped": not live, "reason": "shadow mode" if not live else None}
+
         if live:
+            sequence.append("led_white")
             try:
                 led_white = self.strip_set_rgb(255, 255, 255)
             except Exception as exc:
                 led_white = {"ok": False, "error": str(exc)}
+            add("led_white", bool(led_white.get("ok", True)) if isinstance(led_white, dict) else True, led_white)
+
+        before_snap = snapshot("door_latch_before")
+        before_door = bool(before_snap.get(1)) if isinstance(before_snap, dict) else False
+        before_latch = bool(before_snap.get(3)) if isinstance(before_snap, dict) else False
+        rail_24v_ok = not bool(before_snap.get("no24v", False)) if isinstance(before_snap, dict) else False
+        add("door_closed_before", before_door, before_snap)
+        add("latch_closed_before", before_latch, before_snap)
+        add("rail_24v", rail_24v_ok, before_snap)
+
+        if live:
+            sequence.append("deactivate_boards")
             try:
                 deactivate = self.deactivate_boards(expect_reply=True)
             except Exception as exc:
                 deactivate = {"ok": False, "error": str(exc)}
+            add("deactivate_boards", "error" not in deactivate if isinstance(deactivate, dict) else True, deactivate)
+            sequence.append("activate_boards")
             try:
                 activate = self.activate_boards(expect_reply=True)
             except Exception as exc:
                 activate = {"ok": False, "error": str(exc)}
-
-        try:
-            snap = self.io_snapshot(self.BOARD_DECK)
-        except Exception as exc:
-            snap = {"error": str(exc)}
-        door_closed = bool(snap.get(1)) if isinstance(snap, dict) else False
-        latch_closed = bool(snap.get(3)) if isinstance(snap, dict) else False
-        add("backend_ready", backend_ready.get("ok", False), backend_ready)
-        add("door_closed", door_closed, snap)
-        add("latch_closed", latch_closed, snap)
-        if live:
-            add("led_white", bool(led_white.get("ok", True)) if isinstance(led_white, dict) else True, led_white)
-            add("deactivate_boards", "error" not in deactivate if isinstance(deactivate, dict) else True, deactivate)
             add("activate_boards", "error" not in activate if isinstance(activate, dict) else True, activate)
+
+        final_snap = snapshot("door_latch_final")
+        door_closed = bool(final_snap.get(1)) if isinstance(final_snap, dict) else False
+        latch_closed = bool(final_snap.get(3)) if isinstance(final_snap, dict) else False
+        add("door_closed_final", door_closed, final_snap)
+        add("latch_closed_final", latch_closed, final_snap)
         ok = all(bool(row.get("ok")) for row in checks)
         return {
             "ok": bool(ok),
             "source_anchor": "ControlLib.initialCheck lines 8728-8759; queryDoorStatus lines 8762-8770",
+            "sequence": sequence,
             "backend_ready": backend_ready,
             "led_white": led_white,
-            "door_latch": {"door_closed": door_closed, "latch_closed": latch_closed, "snapshot": snap},
+            "door_latch": {"door_closed": door_closed, "latch_closed": latch_closed, "rail_24v_ok": rail_24v_ok, "before_snapshot": before_snap, "final_snapshot": final_snap},
             "deactivate_boards": deactivate,
             "activate_boards": activate,
             "checks": checks,

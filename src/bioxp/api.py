@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_compat.api import router as oem_compat_router
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, FakeStartupHardware
-from .oem_startup_types import OemDoorEventRequest, OemStartupRequest, OemSwitchAuditRequest
+from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import FakeSwitchAuditHardware, run_switch_audit
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -187,11 +187,13 @@ def _get_tester() -> BioXpTester:
 def _get_oem_startup_program(*, dry_safe: bool = True) -> OEMStartupProgram:
     global _oem_startup_program
     base = os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE") or "/tmp/bioxp-live-runs"
-    if _oem_startup_program is None:
-        if dry_safe or _tester is None:
-            hardware = FakeStartupHardware(door_closed=False, latch_closed=False)
-        else:
+    want_live_provider = not dry_safe
+    current_is_fake = isinstance(getattr(_oem_startup_program, "hardware", None), FakeStartupHardware)
+    if _oem_startup_program is None or (want_live_provider and current_is_fake):
+        if want_live_provider and _tester is not None:
             hardware = BioXpStartupHardware(_get_tester)
+        else:
+            hardware = FakeStartupHardware(door_closed=False, latch_closed=False)
         _oem_startup_program = OEMStartupProgram(hardware=hardware, artifact_base=base)
     return _oem_startup_program
 
@@ -282,11 +284,31 @@ async def oem_startup_door_event(req: OemDoorEventRequest):
 
 
 @app.post("/oem/initial_check")
-async def oem_initial_check():
-    program = _get_oem_startup_program(dry_safe=_tester is None)
+async def oem_initial_check(req: OemInitialCheckRequest | None = None):
+    payload = (req.model_dump() if hasattr(req, "model_dump") else req.dict()) if req is not None else {"mode": "shadow"}
+    mode = payload.get("mode", "shadow")
+    if mode == "live" and payload.get("operator_ack") != "INITIALIZE":
+        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE required for live OEM initialCheck")
+    program = _get_oem_startup_program(dry_safe=(mode != "live" or _tester is None))
     if hasattr(program.hardware, "initial_check"):
-        return program.hardware.initial_check(mode="shadow" if _tester is not None else "dry_run")
+        return program.hardware.initial_check(mode=mode if _tester is not None else "dry_run")
     raise HTTPException(status_code=503, detail="OEM initialCheck provider unavailable")
+
+
+@app.get("/oem/motion_worker/status")
+async def oem_motion_worker_status():
+    return _get_oem_startup_program().worker_status()
+
+
+@app.post("/oem/motion_worker/run_next")
+async def oem_motion_worker_run_next():
+    result = _get_oem_startup_program().run_next_worker_command()
+    return {"ok": result is not None, "result": result, "status": _get_oem_startup_program().worker_status()}
+
+
+@app.post("/oem/motion_worker/abort")
+async def oem_motion_worker_abort(reason: str = "operator abort"):
+    return _get_oem_startup_program().abort_worker(reason=reason)
 
 
 @app.post("/oem/switch_audit")
@@ -294,7 +316,7 @@ async def oem_switch_audit(req: OemSwitchAuditRequest):
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     mode = payload.get("mode", "status")
     artifact_root = payload.get("artifact_root") or os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE")
-    hardware = FakeSwitchAuditHardware() if (_tester is None or mode == "status") else _BioXpSwitchAuditHardware(_get_tester())
+    hardware = _BioXpSwitchAuditHardware(_get_tester()) if _tester is not None else FakeSwitchAuditHardware()
     result = run_switch_audit(hardware, axes=payload.get("axes") or ["x", "y", "z", "g", "door"], mode=mode, artifact_root=artifact_root)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error"))

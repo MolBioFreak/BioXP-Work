@@ -32,3 +32,28 @@ def test_motion_worker_abort_marks_active_and_clears_queue(tmp_path):
     assert result["aborted"] is True
     assert worker.status()["state"] == "aborted"
     assert worker.status()["queue_depth"] == 0
+
+
+def test_motion_worker_fails_closed_without_handler(tmp_path):
+    from src.bioxp.oem_motion_worker import OEMMotionWorker, OemMotionCommand
+
+    worker = OEMMotionWorker(artifact_root=tmp_path, handlers={})
+    worker.enqueue(OemMotionCommand(session_id="s1", name="initializeSystem"))
+
+    result = worker.run_next()
+
+    assert result["ok"] is False
+    assert "no handler" in result["error"]
+    assert worker.status()["state"] == "failed"
+
+
+def test_motion_command_rejects_unknown_names():
+    from pydantic import ValidationError
+    from src.bioxp.oem_motion_worker import OemMotionCommand
+
+    try:
+        OemMotionCommand(session_id="s1", name="randomMove")
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("unknown OEM motion command was accepted")
