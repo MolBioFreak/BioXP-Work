@@ -18,6 +18,7 @@ _ALLOWED_SECTIONS = {
     "process_time",
     "thermal_chiller",
     "script_corpus",
+    "deck_semantics",
 }
 
 

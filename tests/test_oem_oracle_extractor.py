@@ -4,6 +4,7 @@ from src.bioxp.oem_compat.oracle_extractor import (
     extract_calibration_reference,
     extract_default_parameters,
     extract_location_id_enum,
+    extract_plate_location_mappings,
     extract_position_table,
     extract_process_time,
     extract_script_corpus,
@@ -148,6 +149,38 @@ public static class DefaultParameters
     assert constants["PSUDO_Z_HOME_LOW"] == 65000
 
 
+def test_extract_plate_location_mappings_parses_class_globals_tables(tmp_path):
+    globals_path = tmp_path / "ClassGlobals.cs"
+    globals_path.write_text(
+        """
+private static Dictionary<string, plateName> lookupSrcDstPlate = new Dictionary<string, plateName>
+{
+    { "PL_POOL", plateName.POOL_PLATE },
+    { "TROUGH", plateName.TROUGH }
+};
+private static Dictionary<plateName, string> lookupSrcLocation = new Dictionary<plateName, string>
+{
+    { plateName.POOL_PLATE, "POOL_PLATE" },
+    { plateName.TROUGH, ((object)(locationID)16/*cast due to .constrained prefix*/).ToString() }
+};
+private static NameValueCollection lookupDesLocation = new NameValueCollection
+{
+    { "LOC_TC", "LOC_BSC" },
+    { "LOC_TC", "LOC_P_TC" },
+    { "LOC_MS", "LOC_P_MS" }
+};
+public static plateName plateLookup(string plate) { throw new Exception(); }
+""",
+        encoding="utf-8",
+    )
+
+    mappings = extract_plate_location_mappings(globals_path, {16: "LOC_TROUGH"})
+
+    assert mappings["script_plate_tokens"] == {"PL_POOL": "POOL_PLATE", "TROUGH": "TROUGH"}
+    assert mappings["source_locations"] == {"POOL_PLATE": "POOL_PLATE", "TROUGH": "LOC_TROUGH"}
+    assert mappings["destination_locations"] == {"LOC_MS": ["LOC_P_MS"], "LOC_TC": ["LOC_BSC", "LOC_P_TC"]}
+
+
 def test_extract_script_corpus_counts_cmd_attribute_verbs(tmp_path):
     script_a = tmp_path / "demo.xml"
     script_b = tmp_path / "lifetest.xml"
@@ -175,6 +208,7 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
     process_path = tmp_path / "ProcessTime.xml.deploy"
     default_path = tmp_path / "DefaultParameters.cs"
     script_path = tmp_path / "demo.xml"
+    globals_path = tmp_path / "ClassGlobals.cs"
     output_path = tmp_path / "binding.json"
     enum_path.write_text(LOCATION_ENUM, encoding="utf-8")
     source_path.write_text(POSITION_TABLE, encoding="utf-8")
@@ -182,6 +216,13 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
     process_path.write_text("<BioXPCommonLib><processTime><mov process=\"7.12\" /></processTime></BioXPCommonLib>", encoding="utf-8")
     default_path.write_text("public const int X_MOTOR_VELOCITY = 1700;", encoding="utf-8")
     script_path.write_text("<WpfGenBotCommonLib><line cmd=\"MT PL_REAGENT A1\" /></WpfGenBotCommonLib>", encoding="utf-8")
+    globals_path.write_text(
+        'private static Dictionary<string, plateName> lookupSrcDstPlate = new Dictionary<string, plateName> { { "PL_POOL", plateName.POOL_PLATE } };\n'
+        'private static Dictionary<plateName, string> lookupSrcLocation = new Dictionary<plateName, string> { { plateName.POOL_PLATE, "POOL_PLATE" } };\n'
+        'private static NameValueCollection lookupDesLocation = new NameValueCollection { { "LOC_MS", "LOC_P_MS" } };\n'
+        'public static plateName plateLookup(string plate) { throw new Exception(); }',
+        encoding="utf-8",
+    )
 
     write_position_table_binding(
         class_bioxp_settings_path=source_path,
@@ -191,6 +232,7 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
         process_time_path=process_path,
         default_parameters_path=default_path,
         script_paths=[script_path],
+        class_globals_path=globals_path,
     )
 
     text = output_path.read_text(encoding="utf-8")
@@ -200,6 +242,8 @@ def test_write_position_table_binding_creates_source_backed_schema(tmp_path):
     assert '"process_time"' in text
     assert '"motion_constants"' in text
     assert '"script_corpus"' in text
+    assert '"deck_semantics"' in text
+    assert '"script_plate_tokens"' in text
     assert '"MT": 1' in text
     assert '"LOC_MS"' in text
     assert '"source_type": "decompiled_csharp"' in text

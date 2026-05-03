@@ -37,6 +37,72 @@
       "source_key": "calreference.xml.deploy",
       "status": "available"
     },
+    "deck_semantics": {
+      "destination_locations": {
+        "LOC_BSCS": [
+          "LOC_BSCS"
+        ],
+        "LOC_HOLDER": [
+          "LOC_HOLDER"
+        ],
+        "LOC_MS": [
+          "LOC_P_MS"
+        ],
+        "LOC_OC": [
+          "LOC_OC_COVER",
+          "LOC_P_OC"
+        ],
+        "LOC_OCS": [
+          "LOC_OC_COVER_STORAGE"
+        ],
+        "LOC_RC": [
+          "LOC_RC_COVER",
+          "UNKNOWN"
+        ],
+        "LOC_RCS": [
+          "LOC_RC_COVER_STORAGE"
+        ],
+        "LOC_TC": [
+          "LOC_BSC",
+          "LOC_P_TC"
+        ]
+      },
+      "script_plate_tokens": {
+        "CV_BIOSECURITY": "BIO_SECURITY_COVER",
+        "CV_OUTPUT": "OUTPUT_COVER",
+        "CV_REAGENT": "REAGENT_COVER",
+        "PL_ACC": "ACCUMULATION_PLATE",
+        "PL_ELUTION": "ELUTION_PLATE",
+        "PL_GENE_QUANT": "GENE_QUANTITATION_PLATE",
+        "PL_OLIGO_QUANT": "OLIGO_QUANTITATION_PLATE",
+        "PL_OUTPUT": "OUTPUT_PLATE",
+        "PL_POOL": "POOL_PLATE",
+        "PL_REAGENT": "REAGENT_PLATE",
+        "PL_SYNTHESIS": "SYNTHESIS_PLATE",
+        "PL_TFF_REAGENT": "TFF_REAGENT_BLOCK",
+        "STRIP1": "STRIP_ONE",
+        "STRIP2": "STRIP_TWO",
+        "STRIP3": "STRIP_THREE",
+        "STRIP4": "STRIP_FOUR",
+        "TROUGH": "TROUGH"
+      },
+      "source_key": "ClassGlobals lookup tables",
+      "source_locations": {
+        "ACCUMULATION_PLATE": "ACCUMULATION_PLATE",
+        "ELUTION_PLATE": "ELUTION_PLATE",
+        "GENE_QUANTITATION_PLATE": "GENE_QUANTITATION_PLATE",
+        "OLIGO_QUANTITATION_PLATE": "OLIGO_QUANTITATION_PLATE",
+        "OUTPUT_PLATE": "OUTPUT_PLATE",
+        "POOL_PLATE": "POOL_PLATE",
+        "REAGENT_PLATE": "REAGENT_PLATE",
+        "STRIP_FOUR": "LOC_STRIP4",
+        "STRIP_ONE": "LOC_STRIP1",
+        "STRIP_THREE": "LOC_STRIP3",
+        "STRIP_TWO": "LOC_STRIP2",
+        "TROUGH": "LOC_TROUGH"
+      },
+      "status": "available"
+    },
     "motion_constants": {
       "constants": {
         "CHILLER_COOL_RATE": -0.025,

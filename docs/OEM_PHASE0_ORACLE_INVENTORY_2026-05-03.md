@@ -82,6 +82,7 @@ Current binding contents:
 - section `process_time`: available from `ProcessTime.xml.deploy`
 - section `motion_constants`: available from `DefaultParameters.cs`
 - section `script_corpus`: available from standalone `Scripts/*.xml`
+- section `deck_semantics`: available from `ClassGlobals.cs` lookup tables
 - section `vision_calibration`: not_extracted, explicit reason
 - section `pipette_calibration`: not_extracted, explicit reason
 
@@ -93,6 +94,8 @@ Validated facts from the generated binding:
 - 5 standalone OEM XML scripts scanned
 - 2,933 standalone script commands counted
 - standalone script verb coverage extracted: `MT=1451`, `MC=485`, `SP=352`, `TCD=173`, `LOOP=100`, `DWELL=96`, `PP=95`, `LED=44`, `ET=31`, `MP=30`, `WAIT=26`, plus lower-frequency verbs `CC`, `ZW`, `LA`, `SW`, `RT`, `ST`, `DELAYPOINT`, `FP`, `SS`, `TT`, `SA`
+- ClassGlobals script/deck semantics extracted: 17 script plate tokens, 12 source-location mappings, 8 destination-location alias groups
+- example ClassGlobals token mappings: `PL_POOL -> POOL_PLATE`, `PL_OUTPUT -> OUTPUT_PLATE`, `PL_REAGENT -> REAGENT_PLATE`, `TROUGH -> TROUGH`, `CV_REAGENT -> REAGENT_COVER`
 - 2 source-backed part-number calibration reference tables extracted
 - fluid reference offsets extracted: `FLUID_TC_OFFSET=5178`, `FLUID_RC_OFFSET=5300`, `FLUID_STRIP_OFFSET=9200`
 - example PositionTable entries:
@@ -120,6 +123,7 @@ Pure/read-only, no hardware calls:
   - `extract_calibration_reference(path)`
   - `extract_process_time(path)`
   - `extract_default_parameters(path)`
+  - `extract_plate_location_mappings(class_globals_path, location_id_by_ordinal)`
   - `extract_script_corpus(paths)`
   - `write_position_table_binding(...)`
 
@@ -137,7 +141,7 @@ python3 -m pytest tests/test_oem_oracle_extractor.py tests/test_oem_binding_load
 Result:
 
 ```text
-14 passed
+15 passed
 ```
 
 ## Why this matters

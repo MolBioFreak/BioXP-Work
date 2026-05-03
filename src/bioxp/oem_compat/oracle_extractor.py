@@ -17,6 +17,10 @@ _POSITION_BLOCK_RE = re.compile(
 )
 _FIELD_RE = re.compile(r"(?P<key>name|x|y|zLow|zHigh|zDelta|inc_factor)\s*=\s*(?P<value>\"[^\"]*\"|-?\d+)")
 _CONST_RE = re.compile(r"public\s+const\s+(?:int|double)\s+(?P<name>[A-Z0-9_]+)\s*=\s*(?P<value>-?\d+(?:\.\d+)?)\s*;")
+_PLATE_TOKEN_RE = re.compile(r"\{\s*\"(?P<token>[^\"]+)\"\s*,\s*plateName\.(?P<plate>[A-Z0-9_]+)\s*\}")
+_SOURCE_LOCATION_STRING_RE = re.compile(r"\{\s*plateName\.(?P<plate>[A-Z0-9_]+)\s*,\s*\"(?P<location>[^\"]+)\"\s*\}")
+_SOURCE_LOCATION_ORDINAL_RE = re.compile(r"\{\s*plateName\.(?P<plate>[A-Z0-9_]+)\s*,\s*\(\(object\)\(locationID\)(?P<ordinal>\d+).*?\.ToString\(\)\s*\}", re.DOTALL)
+_DEST_LOCATION_RE = re.compile(r"\{\s*\"(?P<src>[^\"]+)\"\s*,\s*\"(?P<dst>[^\"]+)\"\s*\}")
 
 
 def extract_location_id_enum(path: str | Path) -> dict[int, str]:
@@ -149,6 +153,45 @@ def extract_default_parameters(path: str | Path) -> dict[str, int | float]:
     return constants
 
 
+def extract_plate_location_mappings(
+    class_globals_path: str | Path,
+    location_id_by_ordinal: Mapping[int, str],
+) -> dict[str, Any]:
+    """Extract OEM ClassGlobals script plate/location translation tables."""
+
+    source = Path(class_globals_path).read_text(encoding="utf-8", errors="replace")
+    try:
+        src_dst_block = source.split("lookupSrcDstPlate", 1)[1].split("lookupSrcLocation", 1)[0]
+        src_location_block = source.split("lookupSrcLocation", 1)[1].split("lookupDesLocation", 1)[0]
+        dest_location_block = source.split("lookupDesLocation", 1)[1].split("public static", 1)[0]
+    except IndexError as exc:
+        raise ValueError(f"Could not find ClassGlobals lookup tables in {class_globals_path}") from exc
+
+    script_plate_tokens = {
+        match.group("token"): match.group("plate")
+        for match in _PLATE_TOKEN_RE.finditer(src_dst_block)
+    }
+    source_locations: dict[str, str] = {
+        match.group("plate"): match.group("location")
+        for match in _SOURCE_LOCATION_STRING_RE.finditer(src_location_block)
+    }
+    for match in _SOURCE_LOCATION_ORDINAL_RE.finditer(src_location_block):
+        ordinal = int(match.group("ordinal"))
+        source_locations[match.group("plate")] = location_id_by_ordinal.get(ordinal, f"LOCATION_{ordinal}")
+
+    destination_locations: dict[str, list[str]] = {}
+    for match in _DEST_LOCATION_RE.finditer(dest_location_block):
+        destination_locations.setdefault(match.group("src"), []).append(match.group("dst"))
+
+    if not script_plate_tokens or not source_locations or not destination_locations:
+        raise ValueError(f"Incomplete ClassGlobals lookup extraction from {class_globals_path}")
+    return {
+        "script_plate_tokens": dict(sorted(script_plate_tokens.items())),
+        "source_locations": dict(sorted(source_locations.items())),
+        "destination_locations": {key: destination_locations[key] for key in sorted(destination_locations)},
+    }
+
+
 def extract_script_corpus(paths: Iterable[str | Path]) -> dict[str, Any]:
     """Count OEM XML cmd-attribute verbs across standalone script files."""
 
@@ -203,6 +246,7 @@ def write_position_table_binding(
     process_time_path: str | Path | None = None,
     default_parameters_path: str | Path | None = None,
     script_paths: Iterable[str | Path] | None = None,
+    class_globals_path: str | Path | None = None,
 ) -> None:
     """Write initial OEM binding JSON for source-backed OEM config data."""
 
@@ -249,6 +293,12 @@ def write_position_table_binding(
             "status": "available",
             "source_key": "Scripts/*.xml",
             **extract_script_corpus(script_paths),
+        }
+    if class_globals_path is not None:
+        sections["deck_semantics"] = {
+            "status": "available",
+            "source_key": "ClassGlobals lookup tables",
+            **extract_plate_location_mappings(class_globals_path, extract_location_id_enum(enum_path)),
         }
     payload = {
         "schema": OEM_BINDING_SCHEMA,
