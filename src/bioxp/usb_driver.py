@@ -741,16 +741,18 @@ class BioXpTester:
         self.send_tmcl(self.BOARD_DECK, 14, 1, 2, 1, wait_reply=False, write_timeout_ms=30)
         time.sleep(0.01)
 
-    def activate_boards(self, expect_reply=True):
-        self.enable_motor_power()
+    def _set_boards_active(self, active: bool, expect_reply=True):
+        if active:
+            self.enable_motor_power()
         out = {}
+        value = 1 if active else 0
         for bid in self.BOARDS:
             out[bid] = self.send_tmcl_retry(
                 bid,
                 64,
                 0,
                 0,
-                1,
+                value,
                 attempts=2 if expect_reply else 1,
                 wait_reply=expect_reply,
                 write_timeout_ms=35 if expect_reply else 20,
@@ -760,6 +762,18 @@ class BioXpTester:
             )
             time.sleep(0.005)
         return out
+
+    def activate_boards(self, expect_reply=True):
+        return self._set_boards_active(True, expect_reply=expect_reply)
+
+    def deactivate_boards(self, expect_reply=True):
+        """OEM initialCheck board-cycle counterpart to activate_boards().
+
+        Command 64 value 0 places the motion/auxiliary boards into inactive state.
+        This is intentionally explicit because live OEM initialCheck requires a
+        deactivate -> activate cycle rather than silently skipping the first half.
+        """
+        return self._set_boards_active(False, expect_reply=expect_reply)
 
     def board_activate(self, board_id):
         ack = self.send_tmcl_retry(
