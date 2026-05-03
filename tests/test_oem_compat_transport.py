@@ -148,3 +148,43 @@ def test_shadow_transport_allows_query_frames_and_blocks_mutating_frames():
     with pytest.raises(MutatingCommandBlocked):
         transport.transmit(mutating)
     assert adapter.frames == [query]
+
+
+def test_live_transport_requires_operator_ack_and_artifact_root_before_adapter_use(tmp_path):
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import LiveTransport, LiveTransportNotArmed
+
+    class Adapter:
+        def __init__(self):
+            self.called = False
+
+        def transmit(self, frame):
+            self.called = True
+            return [bytes([0, 0, 0, 0, 0, 0, frame.sidh, 100, frame.command, 0, 0, 0, 0, 0])]
+
+    adapter = Adapter()
+    frame = OemCommandFrame.tmcl(5, 5, 4, 0, 1700)
+
+    with pytest.raises(LiveTransportNotArmed, match="operator"):
+        LiveTransport(adapter=adapter, operator_ack=False, artifact_root=tmp_path).transmit(frame)
+    with pytest.raises(LiveTransportNotArmed, match="artifact"):
+        LiveTransport(adapter=adapter, operator_ack=True, artifact_root=None).transmit(frame)
+    assert adapter.called is False
+
+
+def test_live_transport_fails_closed_on_ambiguous_reply(tmp_path):
+    from src.bioxp.oem_compat.frames import OemCommandFrame
+    from src.bioxp.oem_compat.transport import AmbiguousReply, LiveTransport
+
+    class AmbiguousAdapter:
+        def transmit(self, frame):
+            return [
+                bytes([0, 0, 0, 0, 0, 0, frame.sidh, 100, frame.command, 0, 0, 0, 1, 0]),
+                bytes([0, 0, 0, 0, 0, 0, frame.sidh, 100, frame.command, 0, 0, 0, 2, 0]),
+            ]
+
+    frame = OemCommandFrame.tmcl(5, 5, 4, 0, 1700)
+    transport = LiveTransport(adapter=AmbiguousAdapter(), operator_ack=True, artifact_root=tmp_path)
+
+    with pytest.raises(AmbiguousReply):
+        transport.transmit(frame)

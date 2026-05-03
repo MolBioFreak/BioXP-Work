@@ -27,6 +27,10 @@ class MutatingCommandBlocked(RuntimeError):
     pass
 
 
+class LiveTransportNotArmed(RuntimeError):
+    pass
+
+
 class SafetyContractViolation(RuntimeError):
     pass
 
@@ -162,4 +166,29 @@ class ShadowTransport:
         reply = match_tmcl_reply(raw_responses, expected=frame)
         self.frames.append(frame)
         assert_transport_safety(mode=self.mode, opened_usb=self.opened_usb, physical_motion=False)
+        return reply
+
+
+@dataclass
+class LiveTransport:
+    """Operator-armed live transport wrapper with strict reply matching."""
+
+    adapter: object
+    operator_ack: bool
+    artifact_root: Path | str | None
+    frames: list[OemCommandFrame] = field(default_factory=list)
+    opened_usb: bool = True
+    mode: str = "live"
+
+    def _assert_armed(self) -> None:
+        if not self.operator_ack:
+            raise LiveTransportNotArmed("live transport requires explicit operator acknowledgement")
+        if self.artifact_root is None:
+            raise LiveTransportNotArmed("live transport requires an artifact root")
+
+    def transmit(self, frame: OemCommandFrame) -> OemReplyFrame:
+        self._assert_armed()
+        raw_responses = self.adapter.transmit(frame)
+        reply = match_tmcl_reply(raw_responses, expected=frame)
+        self.frames.append(frame)
         return reply

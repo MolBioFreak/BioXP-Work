@@ -21,6 +21,10 @@ Phase1 objective is transport and reply compliance: command/reply correlation, a
   - physical motion remains forbidden by the shared safety contract
   - only read/status TMCL commands are allowed through to the adapter
   - mutating frames are blocked before reaching the adapter
+- Added `LiveTransport` arming seam:
+  - requires explicit operator acknowledgement before adapter use
+  - requires an artifact root before adapter use
+  - uses the same strict reply matcher, so ambiguous/non-success/no-match replies do not report success
 
 ## Current shadow read whitelist
 
@@ -35,7 +39,7 @@ Validated with:
 
 ```text
 python3 -m pytest tests/test_oem_compat_transport.py tests/test_oem_compat_api.py tests/test_oem_oracle_extractor.py tests/test_oem_binding_loader.py -q
-29 passed in 0.25s
+31 passed in 0.24s
 ```
 
 Compile check:
