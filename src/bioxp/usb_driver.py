@@ -2181,19 +2181,42 @@ class BioXpTester:
         add("latch_closed_before", before_latch, before_snap)
         add("rail_24v", rail_24v_ok, before_snap)
 
+        def board_cycle_summary(action, requested_value, reply):
+            if not isinstance(reply, dict):
+                return {"action": action, "requested_value": requested_value, "reply": reply, "ok": bool(reply)}
+            if "error" in reply:
+                out = dict(reply)
+                out.setdefault("action", action)
+                out.setdefault("requested_value", requested_value)
+                out.setdefault("ok", False)
+                return out
+            if "ok" in reply and not any(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in reply):
+                out = dict(reply)
+                out.setdefault("action", action)
+                out.setdefault("requested_value", requested_value)
+                out["ok"] = bool(out.get("ok"))
+                return out
+            ok = True
+            boards = {}
+            for board, ack in reply.items():
+                board_ok = ack is None or (isinstance(ack, dict) and ack.get("status") in (None, 100))
+                ok = ok and bool(board_ok)
+                boards[str(board)] = {"requested_value": requested_value, "ack": ack, "ok": bool(board_ok)}
+            return {"action": action, "requested_value": requested_value, "ok": bool(ok), "boards": boards}
+
         if live:
             sequence.append("deactivate_boards")
             try:
-                deactivate = self.deactivate_boards(expect_reply=True)
+                deactivate = board_cycle_summary("deactivate_boards", 0, self.deactivate_boards(expect_reply=True))
             except Exception as exc:
-                deactivate = {"ok": False, "error": str(exc)}
-            add("deactivate_boards", "error" not in deactivate if isinstance(deactivate, dict) else True, deactivate)
+                deactivate = {"action": "deactivate_boards", "requested_value": 0, "ok": False, "error": str(exc)}
+            add("deactivate_boards", bool(deactivate.get("ok")) if isinstance(deactivate, dict) else True, deactivate)
             sequence.append("activate_boards")
             try:
-                activate = self.activate_boards(expect_reply=True)
+                activate = board_cycle_summary("activate_boards", 1, self.activate_boards(expect_reply=True))
             except Exception as exc:
-                activate = {"ok": False, "error": str(exc)}
-            add("activate_boards", "error" not in activate if isinstance(activate, dict) else True, activate)
+                activate = {"action": "activate_boards", "requested_value": 1, "ok": False, "error": str(exc)}
+            add("activate_boards", bool(activate.get("ok")) if isinstance(activate, dict) else True, activate)
 
         final_snap = snapshot("door_latch_final")
         door_closed = bool(final_snap.get(1)) if isinstance(final_snap, dict) else False
