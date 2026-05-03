@@ -11,8 +11,10 @@ def test_switch_audit_status_mode_never_moves_axes(tmp_path):
     assert axis["axis"] == "z"
     assert "gap9_left" in axis
     assert "gap10_right" in axis
-    assert axis["interpreted"]["confidence"] == "unknown"
+    assert axis["interpreted"]["confidence"] == "implementation_mapped"
+    assert axis["interpreted"]["homing_enable_state"] == "blocked_until_live_verified"
     assert result["homing_allowed"] is False
+    assert result["predicate_blockers"][0]["axis"] == "z"
     assert (tmp_path / "switch_audit.json").exists()
 
 
