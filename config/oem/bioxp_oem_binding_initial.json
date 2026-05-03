@@ -1,0 +1,307 @@
+{
+  "schema": "bioxp-oem-binding-v1",
+  "sections": {
+    "pipette_calibration": {
+      "reason": "Pipette constants require ClassPipette/ClassPipetteCollection extraction in a later phase",
+      "source_key": "ClassPipetteCollection/ClassPipette",
+      "status": "not_extracted"
+    },
+    "position_table": {
+      "entries": {
+        "CAMERA_OFFSET": {
+          "inc_factor": 0,
+          "ordinal": 31,
+          "x": 0,
+          "y": 0,
+          "zDelta": 0,
+          "zHigh": 0,
+          "zLow": 0
+        },
+        "LOC_BSC": {
+          "inc_factor": 0,
+          "name": "Bio. Sec. Cover",
+          "ordinal": 5,
+          "x": 41688,
+          "y": 8947,
+          "zDelta": 111564,
+          "zHigh": 3000,
+          "zLow": 114564
+        },
+        "LOC_BSCS": {
+          "inc_factor": 0,
+          "name": "Bio Sec. St.",
+          "ordinal": 4,
+          "x": 82088,
+          "y": 61947,
+          "zDelta": 112564,
+          "zHigh": -1000,
+          "zLow": 111564
+        },
+        "LOC_MS": {
+          "inc_factor": 1,
+          "name": "Magnetic Tray",
+          "ordinal": 0,
+          "x": 25743,
+          "y": 9399,
+          "zDelta": 37400,
+          "zHigh": 44153,
+          "zLow": 81553
+        },
+        "LOC_OC": {
+          "inc_factor": 1,
+          "name": "Output Tray",
+          "ordinal": 1,
+          "x": 25791,
+          "y": 42538,
+          "zDelta": 31150,
+          "zHigh": 65038,
+          "zLow": 96188
+        },
+        "LOC_OC_COVER": {
+          "inc_factor": 0,
+          "name": "OC Cover",
+          "ordinal": 17,
+          "x": 788,
+          "y": 41947,
+          "zDelta": 111564,
+          "zHigh": 0,
+          "zLow": 111564
+        },
+        "LOC_OC_COVER_STORAGE": {
+          "inc_factor": 0,
+          "name": "OC Cov. St.",
+          "ordinal": 18,
+          "x": 84368,
+          "y": 6047,
+          "zDelta": 111564,
+          "zHigh": 0,
+          "zLow": 111564
+        },
+        "LOC_PARK": {
+          "inc_factor": 0,
+          "name": "Park",
+          "ordinal": 28,
+          "x": 226,
+          "y": 1101,
+          "zDelta": 116142,
+          "zHigh": 0,
+          "zLow": 116142
+        },
+        "LOC_P_MS": {
+          "inc_factor": 0,
+          "name": "MS Plate",
+          "ordinal": 25,
+          "x": 788,
+          "y": 8947,
+          "zDelta": 144564,
+          "zHigh": 0,
+          "zLow": 144564
+        },
+        "LOC_P_MS_PRESS": {
+          "inc_factor": 0,
+          "ordinal": 26,
+          "x": 788,
+          "y": 8947,
+          "zDelta": 122935,
+          "zHigh": 0,
+          "zLow": 122935
+        },
+        "LOC_P_OC": {
+          "inc_factor": 0,
+          "name": "Output Plate",
+          "ordinal": 21,
+          "x": 588,
+          "y": 41947,
+          "zDelta": 158564,
+          "zHigh": 0,
+          "zLow": 158564
+        },
+        "LOC_P_OC_PRESS": {
+          "inc_factor": 0,
+          "ordinal": 22,
+          "x": 588,
+          "y": 41947,
+          "zDelta": 137935,
+          "zHigh": 0,
+          "zLow": 137935
+        },
+        "LOC_P_RC_PRESS": {
+          "inc_factor": 0,
+          "ordinal": 27,
+          "x": 41738,
+          "y": 44947,
+          "zDelta": 109935,
+          "zHigh": 0,
+          "zLow": 109935
+        },
+        "LOC_P_TC": {
+          "inc_factor": 0,
+          "name": "Pool Pate",
+          "ordinal": 23,
+          "x": 41988,
+          "y": 8947,
+          "zDelta": 134564,
+          "zHigh": 0,
+          "zLow": 134564
+        },
+        "LOC_P_TC_PRESS": {
+          "inc_factor": 0,
+          "ordinal": 24,
+          "x": 41988,
+          "y": 8947,
+          "zDelta": 116935,
+          "zHigh": 0,
+          "zLow": 116935
+        },
+        "LOC_RC": {
+          "inc_factor": 1,
+          "name": "Reagent Tray",
+          "ordinal": 3,
+          "x": 67294,
+          "y": 45338,
+          "zDelta": 43100,
+          "zHigh": 47285,
+          "zLow": 90385
+        },
+        "LOC_RC_COVER": {
+          "inc_factor": 0,
+          "name": "RC Cover",
+          "ordinal": 19,
+          "x": 41738,
+          "y": 44947,
+          "zDelta": 111564,
+          "zHigh": 0,
+          "zLow": 111564
+        },
+        "LOC_RC_COVER_STORAGE": {
+          "inc_factor": 0,
+          "name": "RC Cover St.",
+          "ordinal": 20,
+          "x": 83315,
+          "y": 35947,
+          "zDelta": 111564,
+          "zHigh": 0,
+          "zLow": 111564
+        },
+        "LOC_STRIP1": {
+          "inc_factor": 1,
+          "ordinal": 11,
+          "x": 74493,
+          "y": 83554,
+          "zDelta": 63534,
+          "zHigh": 0,
+          "zLow": 63534
+        },
+        "LOC_STRIP2": {
+          "inc_factor": 1,
+          "name": "Strip 2",
+          "ordinal": 12,
+          "x": 72371,
+          "y": 83554,
+          "zDelta": 63534,
+          "zHigh": 0,
+          "zLow": 63534
+        },
+        "LOC_STRIP3": {
+          "inc_factor": 1,
+          "ordinal": 13,
+          "x": 70249,
+          "y": 83554,
+          "zDelta": 63534,
+          "zHigh": 0,
+          "zLow": 63534
+        },
+        "LOC_STRIP4": {
+          "inc_factor": 1,
+          "ordinal": 14,
+          "x": 68127,
+          "y": 83554,
+          "zDelta": 63534,
+          "zHigh": 0,
+          "zLow": 63534
+        },
+        "LOC_TC": {
+          "inc_factor": 1,
+          "name": "Pool Tray",
+          "ordinal": 2,
+          "x": 67300,
+          "y": 9225,
+          "zDelta": 35000,
+          "zHigh": 37894,
+          "zLow": 72894
+        },
+        "LOC_TROUGH": {
+          "inc_factor": 0,
+          "ordinal": 16,
+          "x": 85343,
+          "y": 63404,
+          "zDelta": 66678,
+          "zHigh": 44556,
+          "zLow": 111234
+        },
+        "TECANRACK1": {
+          "inc_factor": 1,
+          "name": "Tip Tray 1",
+          "ordinal": 7,
+          "x": 59851,
+          "y": 71675,
+          "zDelta": 53000,
+          "zHigh": 92866,
+          "zLow": 145866
+        },
+        "TECANRACK2": {
+          "inc_factor": 1,
+          "name": "Tip Tray 2",
+          "ordinal": 8,
+          "x": 24415,
+          "y": 71675,
+          "zDelta": 53000,
+          "zHigh": 92866,
+          "zLow": 145866
+        },
+        "TECANRACK3": {
+          "inc_factor": 1,
+          "name": "Tip Tray 3",
+          "ordinal": 9,
+          "x": 59851,
+          "y": 95247,
+          "zDelta": 53000,
+          "zHigh": 94137,
+          "zLow": 147137
+        },
+        "TECANRACK4": {
+          "inc_factor": 1,
+          "name": "Tip Tray 4",
+          "ordinal": 10,
+          "x": 24415,
+          "y": 95247,
+          "zDelta": 53000,
+          "zHigh": 94137,
+          "zLow": 147137
+        },
+        "WASTE_BIN": {
+          "inc_factor": 0,
+          "ordinal": 6,
+          "x": 91919,
+          "y": 93208,
+          "zDelta": 0,
+          "zHigh": 0,
+          "zLow": 0
+        }
+      },
+      "source_key": "ClassBioXPSettings.m_positionTable",
+      "status": "available"
+    },
+    "vision_calibration": {
+      "reason": "InspectionSettings.xml was referenced by OEM code but not found as a standalone SSD-backup file in phase-0 inventory",
+      "source_key": "InspectionSettings.xml",
+      "status": "not_extracted"
+    }
+  },
+  "source": {
+    "source_hash": "sha256:08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41",
+    "source_key": "ClassBioXPSettings.m_positionTable",
+    "source_path": "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
+    "source_type": "decompiled_csharp"
+  }
+}
