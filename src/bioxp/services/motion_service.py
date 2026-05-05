@@ -41,6 +41,8 @@ class RelativeMoveCommand:
     axis: Any
     steps: int
     wait_timeout_s: float
+    speed: int | None = None
+    acc: int | None = None
     reuse_prepared: bool = False
     artifact: MotionArtifactOptions = field(default_factory=MotionArtifactOptions)
 
@@ -50,6 +52,8 @@ class RelativeMoveCommand:
             axis=req.axis,
             steps=int(req.steps),
             wait_timeout_s=float(req.wait_timeout_s),
+            speed=None if getattr(req, "speed", None) is None else int(req.speed),
+            acc=None if getattr(req, "acc", None) is None else int(req.acc),
             reuse_prepared=bool(getattr(req, "reuse_prepared", False)),
             artifact=MotionArtifactOptions.from_request(req),
         )
@@ -59,6 +63,8 @@ class RelativeMoveCommand:
             "axis": _axis_value(self.axis),
             "steps": int(self.steps),
             "wait_timeout_s": float(self.wait_timeout_s),
+            "speed": None if self.speed is None else int(self.speed),
+            "acc": None if self.acc is None else int(self.acc),
             "reuse_prepared": bool(self.reuse_prepared),
             **self.artifact.to_payload(),
         }
@@ -69,6 +75,8 @@ class AbsoluteMoveCommand:
     axis: Any
     position_steps: int
     wait_timeout_s: float
+    speed: int | None = None
+    acc: int | None = None
     artifact: MotionArtifactOptions = field(default_factory=MotionArtifactOptions)
 
     @classmethod
@@ -77,6 +85,8 @@ class AbsoluteMoveCommand:
             axis=req.axis,
             position_steps=int(req.position_steps),
             wait_timeout_s=float(req.wait_timeout_s),
+            speed=None if getattr(req, "speed", None) is None else int(req.speed),
+            acc=None if getattr(req, "acc", None) is None else int(req.acc),
             artifact=MotionArtifactOptions.from_request(req),
         )
 
@@ -85,6 +95,8 @@ class AbsoluteMoveCommand:
             "axis": _axis_value(self.axis),
             "position_steps": int(self.position_steps),
             "wait_timeout_s": float(self.wait_timeout_s),
+            "speed": None if self.speed is None else int(self.speed),
+            "acc": None if self.acc is None else int(self.acc),
             **self.artifact.to_payload(),
         }
 
@@ -265,6 +277,8 @@ async def run_relative_motion_command(
             command.axis,
             int(command.steps),
             float(command.wait_timeout_s),
+            speed=command.speed,
+            acc=command.acc,
             reuse_prepared=bool(command.reuse_prepared),
         ),
         timeout_s=max(25.0, float(command.wait_timeout_s) + 10.0),
@@ -302,6 +316,8 @@ async def run_absolute_motion_command(
             command.axis,
             int(command.position_steps),
             float(command.wait_timeout_s),
+            speed=command.speed,
+            acc=command.acc,
         ),
         timeout_s=max(35.0, float(command.wait_timeout_s) + 10.0),
     )

@@ -58,8 +58,13 @@ def test_reconnect_prefers_soft_rebind_before_usb_reset(monkeypatch):
     tester, connect_calls = _make_tester([None])
     initial_dev = tester.dev
 
-    tester.reconnect()
+    result = tester.reconnect()
 
+    assert isinstance(result, dict)
+    assert result["reset_provenance"]["schema_version"] == "bioxp.reset_provenance.v1"
+    assert result["reset_provenance"]["subsystem"] == "usb_runtime"
+    assert result["reset_provenance"]["hardware_usb_reset_performed"] is False
+    assert result["reset_provenance"]["attempts"][0]["hard_reset"] is False
     assert connect_calls == ["connect"]
     assert initial_dev.reset_calls == 0
     assert released == [("initial", 0)]
@@ -85,8 +90,12 @@ def test_reconnect_falls_back_to_hard_reset_after_soft_failure(monkeypatch):
     tester, connect_calls = _make_tester([ConnectFailure("claim failed"), None])
     initial_dev = tester.dev
 
-    tester.reconnect()
+    result = tester.reconnect()
 
+    assert result["reset_provenance"]["hardware_usb_reset_performed"] is True
+    assert [attempt["hard_reset"] for attempt in result["reset_provenance"]["attempts"]] == [False, True]
+    assert result["reset_provenance"]["attempts"][0]["ok"] is False
+    assert "claim failed" in result["reset_provenance"]["attempts"][0]["error"]
     assert connect_calls == ["connect", "connect"]
     assert initial_dev.reset_calls == 0
     assert released == [("initial", 0), ("connected-1", 0)]
