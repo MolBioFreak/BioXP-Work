@@ -11,9 +11,10 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
+from .oem_config import harmonized_motion_config
 from .oem_compat.api import router as oem_compat_router
 from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
-from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, FakeStartupHardware
+from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import FakeSwitchAuditHardware, run_switch_audit
 from pydantic import BaseModel, Field
@@ -59,6 +60,7 @@ from .services.protocol_service import (
     review_protocol_job,
     compile_protocol_source,
 )
+from .protocols import ProtocolActionKind
 from .services.reference_service import (
     MarkAxisDesyncedCommand,
     MarkAxisReferencedCommand,
@@ -195,12 +197,12 @@ def _get_oem_startup_program(*, dry_safe: bool = True) -> OEMStartupProgram:
     global _oem_startup_program
     base = os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE") or "/tmp/bioxp-live-runs"
     want_live_provider = not dry_safe
-    current_is_fake = isinstance(getattr(_oem_startup_program, "hardware", None), FakeStartupHardware)
+    current_is_fake = isinstance(getattr(_oem_startup_program, "hardware", None), DryRunStartupHardware)
     if _oem_startup_program is None or (want_live_provider and current_is_fake):
         if want_live_provider and _tester is not None:
             hardware = BioXpStartupHardware(_get_tester)
         else:
-            hardware = FakeStartupHardware(door_closed=False, latch_closed=False)
+            hardware = DryRunStartupHardware(door_closed=False, latch_closed=False)
         _oem_startup_program = OEMStartupProgram(hardware=hardware, artifact_base=base)
     return _oem_startup_program
 
@@ -419,6 +421,16 @@ class MoveRelativeRequest(MotionArtifactRequest):
     axis: AxisName
     steps: int = Field(..., description="Relative target in motor steps")
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
+    speed: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Optional commissioning override for TMCL SAP4 max speed; clamped by the axis OEM speed/acc normalization.",
+    )
+    acc: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Optional commissioning override for TMCL SAP5 max acceleration; clamped by the axis OEM speed/acc normalization.",
+    )
     reuse_prepared: bool = Field(
         False,
         description=(
@@ -432,6 +444,16 @@ class MoveAbsoluteRequest(MotionArtifactRequest):
     axis: AxisName
     position_steps: int = Field(..., description="Absolute target in motor steps")
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
+    speed: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Optional commissioning override for TMCL SAP4 max speed; clamped by the axis OEM speed/acc normalization.",
+    )
+    acc: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Optional commissioning override for TMCL SAP5 max acceleration; clamped by the axis OEM speed/acc normalization.",
+    )
 
 
 class HomeAxisRequest(MotionArtifactRequest):
@@ -1062,9 +1084,17 @@ def _execute_relative_move(
     steps: int,
     wait_timeout_s: float,
     *,
+    speed: Optional[int] = None,
+    acc: Optional[int] = None,
     reuse_prepared: bool = False,
 ) -> dict:
-    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, reuse_prepared=reuse_prepared)
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(
+        tester,
+        axis,
+        speed=speed,
+        acc=acc,
+        reuse_prepared=reuse_prepared,
+    )
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_direction(axis, steps, switch_before, preset)
@@ -1086,6 +1116,9 @@ def _execute_relative_move(
         "motion_profile": {
             "speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
+            "requested_speed": None if speed is None else int(speed),
+            "requested_acc": None if acc is None else int(acc),
+            "normalization": preset.get("speed_acc_normalization"),
             "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
         },
         "position_before": position_before,
@@ -1098,8 +1131,16 @@ def _execute_relative_move(
     }
 
 
-def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: int, wait_timeout_s: float) -> dict:
-    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis)
+def _execute_absolute_move(
+    tester: BioXpTester,
+    axis: AxisName,
+    position_steps: int,
+    wait_timeout_s: float,
+    *,
+    speed: Optional[int] = None,
+    acc: Optional[int] = None,
+) -> dict:
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, speed=speed, acc=acc)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_absolute_target(axis, position_before, position_steps, switch_before, preset)
@@ -1121,6 +1162,9 @@ def _execute_absolute_move(tester: BioXpTester, axis: AxisName, position_steps: 
         "motion_profile": {
             "speed": int(preset["speed"]),
             "acc": int(preset["acc"]),
+            "requested_speed": None if speed is None else int(speed),
+            "requested_acc": None if acc is None else int(acc),
+            "normalization": preset.get("speed_acc_normalization"),
             "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
         },
         "position_before": position_before,
@@ -1280,8 +1324,31 @@ def _set_motion_axis_currents(
     }
 
 
-def _prepare_motion_axis(tester: BioXpTester, axis: AxisName, *, reuse_prepared: bool = False):
-    preset = _axis_preset(tester, axis)
+def _prepare_motion_axis(
+    tester: BioXpTester,
+    axis: AxisName,
+    *,
+    speed: Optional[int] = None,
+    acc: Optional[int] = None,
+    reuse_prepared: bool = False,
+):
+    preset = dict(_axis_preset(tester, axis))
+    requested_profile = {
+        "speed": None if speed is None else int(speed),
+        "acc": None if acc is None else int(acc),
+    }
+    if speed is not None or acc is not None:
+        norm = tester.motor_normalize_speed_acc(
+            preset["board"],
+            motor=preset["motor"],
+            speed=preset["speed"] if speed is None else int(speed),
+            acc=preset["acc"] if acc is None else int(acc),
+        )
+        preset["speed"] = int(norm["speed"])
+        preset["acc"] = int(norm["acc"])
+        preset["requested_speed"] = requested_profile["speed"]
+        preset["requested_acc"] = requested_profile["acc"]
+        preset["speed_acc_normalization"] = norm
     board_status = None
     interlock = None
     prep = None
@@ -1987,6 +2054,58 @@ async def axes_status(axes: str = Query("x,y,z", description="Comma-separated ax
     )
 
 
+@app.get("/motion/range/status")
+async def motion_range_status(axes: str = Query("x,y,z,g", description="Comma-separated axis names to include")):
+    requested_axes = _parse_axes_csv(axes)
+    config = harmonized_motion_config()
+
+    def build() -> dict:
+        live_rows = None
+        live_error = None
+        if _tester is not None:
+            try:
+                live_rows = _axis_status_batch_payload(_tester, requested_axes)
+            except Exception as exc:  # keep config evidence available even if USB read fails
+                live_error = str(exc)
+        rows = {}
+        configured = config.get("axis_limits", {}) if isinstance(config, dict) else {}
+        live_status_rows = live_rows.get("rows", {}) if isinstance(live_rows, dict) else {}
+        for axis in requested_axes:
+            key = axis.value
+            limit = dict(configured.get(key, {})) if isinstance(configured, dict) else {}
+            live = live_status_rows.get(key) if isinstance(live_status_rows, dict) else None
+            position = None
+            if isinstance(live, dict):
+                position = (((live.get("status") or {}).get("position") or {}).get("position"))
+            rows[key] = {
+                "axis": key,
+                "configured_limit": limit,
+                "current_position_steps": position,
+                "distance_to_min_steps": None if position is None or "min_steps" not in limit else int(position) - int(limit["min_steps"]),
+                "distance_to_max_steps": None if position is None or "max_steps" not in limit else int(limit["max_steps"]) - int(position),
+                "live_status": live,
+            }
+        return {
+            "ok": True,
+            "axes": [axis.value for axis in requested_axes],
+            "rows": rows,
+            "motion_config": config,
+            "live_status_available": live_rows is not None,
+            "live_status_error": live_error,
+            "operator_truth": {
+                "limits_are_source_grounded": True,
+                "limits_are_physical_endpoint_proof": False,
+                "absolute_move_policy": "clamp_or_refuse_against configured_limit before live moves; do not call arbitrary relative probes max travel",
+            },
+        }
+
+    return await _run_blocking(
+        "Motion range status",
+        build,
+        timeout_s=max(20.0, 5.0 * float(len(requested_axes))),
+    )
+
+
 @app.post("/motion/interlock/prepare")
 async def prepare_interlock():
     tester = _get_tester()
@@ -2177,7 +2296,19 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
     interlock = tester.motor_prepare_motion_interlock(force_lock=True)
     # Keep each supervised step source-shaped to ClassControlInterface.initializeMotors().
     if step == "z-home":
-        result = tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s)
+        z_home = tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s)
+        home_payload = z_home.get("home") if isinstance(z_home, dict) else z_home
+        home_ok = bool(home_payload.get("ok")) if isinstance(home_payload, dict) else bool(home_payload)
+        z_reference = None
+        if home_ok:
+            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=timeout_s)
+        result = {
+            "ok": bool(home_ok and isinstance(z_reference, dict) and z_reference.get("ok")),
+            "home": home_payload,
+            "z_home": z_home,
+            "z_reference_return": z_reference,
+            "z_reference_return_skipped": not home_ok,
+        }
     elif step == "gripper-clear":
         preset = tester._motion_oem_axis_profile("g", startup=True)
         set_current = tester.motor_set_axis_param(preset["board"], 6, 31, motor=preset["motor"])
@@ -2644,6 +2775,62 @@ async def protocol_compile(req: ProtocolCompileRequest):
     return compiled.to_payload()
 
 
+def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = params.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _protocol_live_move_handler(action, state):
+    params = dict(action.params or {})
+    raw_axis = params.get("axis") or params.get("axis_name")
+    if raw_axis is None:
+        raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
+    axis = AxisName(str(raw_axis).strip().lower())
+    wait_timeout_s = float(params.get("wait_timeout_s") or params.get("timeout_s") or 30.0)
+    speed = _optional_int_payload(params, "speed", "max_speed")
+    acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
+    tester = _get_tester()
+
+    position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
+    if position_steps is not None:
+        result = _execute_absolute_move(
+            tester,
+            axis,
+            int(position_steps),
+            wait_timeout_s,
+            speed=speed,
+            acc=acc,
+        )
+        _reference_state_store.record_motion(axis, "protocol_absolute")
+        return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute", "move": result}
+
+    steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
+    if steps is None:
+        raise ValueError(
+            f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps"
+        )
+    result = _execute_relative_move(
+        tester,
+        axis,
+        int(steps),
+        wait_timeout_s,
+        speed=speed,
+        acc=acc,
+        reuse_prepared=bool(params.get("reuse_prepared", False)),
+    )
+    _reference_state_store.record_motion(axis, "protocol_relative")
+    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "relative", "move": result}
+
+
+def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
+    return {
+        ProtocolActionKind.MOVE: _protocol_live_move_handler,
+    }
+
+
 @app.post("/protocol/execute")
 async def protocol_execute(req: ProtocolExecuteRequest):
     try:
@@ -2651,6 +2838,7 @@ async def protocol_execute(req: ProtocolExecuteRequest):
             create_protocol_job,
             req.model_dump(exclude_none=True),
             dry_run=bool(req.dry_run),
+            handlers=None if req.dry_run else _protocol_live_handlers(),
         )
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc

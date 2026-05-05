@@ -157,7 +157,7 @@ def test_run_relative_motion_command_preserves_live_success_when_bundle_write_fa
     assert "disk full" in result["artifact_bundle_error"]
 
 
-def test_run_absolute_motion_command_executes_blocking_move():
+def test_run_absolute_motion_command_executes_blocking_move_with_profile_override():
     observed = {}
 
     async def fake_run_blocking(label, func, timeout_s=30.0):
@@ -165,14 +165,16 @@ def test_run_absolute_motion_command_executes_blocking_move():
         observed["timeout_s"] = timeout_s
         return func()
 
-    def fake_execute(tester, axis, position_steps, wait_timeout_s):
+    def fake_execute(tester, axis, position_steps, wait_timeout_s, *, speed=None, acc=None):
         observed["tester"] = tester
         observed["axis"] = axis
         observed["position_steps"] = position_steps
         observed["wait_timeout_s"] = wait_timeout_s
+        observed["speed"] = speed
+        observed["acc"] = acc
         return {"axis": "z", "target_position": position_steps, "wait": {"ok": True}}
 
-    command = AbsoluteMoveCommand(axis="z", position_steps=321, wait_timeout_s=7.5)
+    command = AbsoluteMoveCommand(axis="z", position_steps=321, wait_timeout_s=7.5, speed=200, acc=80)
     result = asyncio.run(
         run_absolute_motion_command(
             command,
@@ -187,6 +189,8 @@ def test_run_absolute_motion_command_executes_blocking_move():
     assert observed["axis"] == "z"
     assert observed["position_steps"] == 321
     assert observed["wait_timeout_s"] == 7.5
+    assert observed["speed"] == 200
+    assert observed["acc"] == 80
     assert observed["timeout_s"] == 35.0
 
 
@@ -262,6 +266,8 @@ def test_move_axis_relative_route_delegates_to_motion_service(monkeypatch):
         axis=api.AxisName.X,
         steps=9,
         wait_timeout_s=4.0,
+        speed=200,
+        acc=80,
         capture_bundle=True,
         operator_note="route smoke",
     )
@@ -269,6 +275,8 @@ def test_move_axis_relative_route_delegates_to_motion_service(monkeypatch):
 
     assert result == {"ok": True, "axis": "x"}
     assert captured["command"].steps == 9
+    assert captured["command"].speed == 200
+    assert captured["command"].acc == 80
     assert captured["command"].artifact.capture_bundle is True
     assert captured["command"].artifact.operator_note == "route smoke"
     assert captured["kwargs"]["get_tester"] is api._get_tester
@@ -280,6 +288,8 @@ def test_move_axis_absolute_route_records_motion_after_success(monkeypatch):
     recorded = []
 
     async def fake_runner(command, **kwargs):
+        assert command.speed == 200
+        assert command.acc == 80
         return {"axis": getattr(command.axis, "value", command.axis), "target_position": 100, "wait": {"ok": True}}
 
     class FakeStore:
@@ -290,11 +300,111 @@ def test_move_axis_absolute_route_records_motion_after_success(monkeypatch):
     monkeypatch.setattr(api, "run_absolute_motion_command", fake_runner)
     monkeypatch.setattr(api, "_reference_state_store", FakeStore())
 
-    req = api.MoveAbsoluteRequest(axis=api.AxisName.GRIPPER, position_steps=100, wait_timeout_s=5.0)
+    req = api.MoveAbsoluteRequest(axis=api.AxisName.GRIPPER, position_steps=100, wait_timeout_s=5.0, speed=200, acc=80)
     result = asyncio.run(api.move_axis_absolute(req))
 
     assert result["target_position"] == 100
     assert recorded == [(api.AxisName.GRIPPER, "absolute")]
+
+
+def test_execute_absolute_move_applies_profile_override_before_motion(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motor_function_preset(self, key):
+            assert key == "x"
+            return {
+                "board": 5,
+                "motor": 0,
+                "speed": 100,
+                "acc": 50,
+                "run_current": 31,
+                "standby_current": 20,
+            }
+
+        def motor_normalize_speed_acc(self, board, *, motor=0, speed=None, acc=None):
+            assert (board, motor, speed, acc) == (5, 0, 200, 80)
+            return {"axis_key": "x", "speed": 200, "acc": 80, "changes": []}
+
+        def motion_arm_state(self):
+            return {"armed": True, "reason": "test"}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=True):
+            return {5: "ok"}
+
+        def motor_prepare_motion_interlock(self, force_lock=True):
+            return {"ok": True}
+
+        def motor_prepare_axis(self, board, **kwargs):
+            assert board == 5
+            assert kwargs["speed"] == 200
+            assert kwargs["acc"] == 80
+            return {"ok": True, "kwargs": kwargs}
+
+        def motor_get_position(self, board, *, motor=0):
+            return {"position": 0}
+
+        def motor_get_switch_activity(self, board, *, motor=0):
+            return {"left_active": False, "right_active": False}
+
+        def motor_move_absolute(self, board, position, *, motor=0):
+            assert (board, position, motor) == (5, 91869, 0)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        api,
+        "_wait_for_motion_with_guardrails",
+        lambda tester, board, motor, timeout_s: {
+            "ok": True,
+            "position_after": {"position": 91869},
+            "switch_activity_after": {"left_active": False, "right_active": True},
+        },
+    )
+
+    result = api._execute_absolute_move(FakeTester(), api.AxisName.X, 91869, 30.0, speed=200, acc=80)
+
+    assert result["motion_profile"]["speed"] == 200
+    assert result["motion_profile"]["acc"] == 80
+    assert result["motion_profile"]["requested_speed"] == 200
+    assert result["motion_profile"]["requested_acc"] == 80
+
+
+def test_protocol_live_move_handler_executes_absolute_profile_override(monkeypatch):
+    api = load_api(monkeypatch)
+    recorded = []
+
+    class Action:
+        action_id = "move-x-limit"
+        params = {"axis": "x", "position_steps": 91869, "wait_timeout_s": 30, "speed": 200, "acc": 80}
+
+    monkeypatch.setattr(api, "_get_tester", lambda: "tester")
+
+    def fake_execute_absolute(tester, axis, position_steps, wait_timeout_s, *, speed=None, acc=None):
+        assert tester == "tester"
+        assert axis == api.AxisName.X
+        assert position_steps == 91869
+        assert wait_timeout_s == 30.0
+        assert speed == 200
+        assert acc == 80
+        return {"ok": True, "motion_profile": {"speed": 200, "acc": 80}}
+
+    class FakeStore:
+        def record_motion(self, axis, motion_kind):
+            recorded.append((axis, motion_kind))
+            return {"ok": True}
+
+    monkeypatch.setattr(api, "_execute_absolute_move", fake_execute_absolute)
+    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
+
+    result = api._protocol_live_move_handler(Action(), None)
+
+    assert result["ok"] is True
+    assert result["move_mode"] == "absolute"
+    assert result["move"]["motion_profile"] == {"speed": 200, "acc": 80}
+    assert recorded == [(api.AxisName.X, "protocol_absolute")]
 
 
 def test_move_axis_relative_route_skips_reference_updates_for_dry_run(monkeypatch):

@@ -3,9 +3,9 @@ from pathlib import Path
 
 
 def test_dry_run_waits_for_door_close_without_motion(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    hw = FakeStartupHardware(door_closed=False, latch_closed=False)
+    hw = DryRunStartupHardware(door_closed=False, latch_closed=False)
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
 
     status = program.request_startup({"mode": "dry_run", "require_config": False, "door_policy": "wait_for_closed"})
@@ -20,9 +20,9 @@ def test_dry_run_waits_for_door_close_without_motion(tmp_path):
 
 
 def test_door_event_queues_initialize_system_after_initial_check(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    hw = FakeStartupHardware(door_closed=False, latch_closed=False)
+    hw = DryRunStartupHardware(door_closed=False, latch_closed=False)
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
     first = program.request_startup({"mode": "dry_run", "require_config": False, "door_policy": "wait_for_closed"})
 
@@ -38,9 +38,9 @@ def test_door_event_queues_initialize_system_after_initial_check(tmp_path):
 
 
 def test_live_startup_requires_ack_and_artifact_root(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    program = OEMStartupProgram(hardware=FakeStartupHardware(), artifact_base=tmp_path)
+    program = OEMStartupProgram(hardware=DryRunStartupHardware(), artifact_base=tmp_path)
 
     missing_ack = program.request_startup({"mode": "live", "artifact_root": str(tmp_path / "live")})
     assert missing_ack["state"] == "failed_closed"
@@ -52,9 +52,9 @@ def test_live_startup_requires_ack_and_artifact_root(tmp_path):
 
 
 def test_missing_required_config_fails_before_hardware(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    hw = FakeStartupHardware(config_status={"status": "missing", "searched_roots": []})
+    hw = DryRunStartupHardware(config_status={"status": "missing", "searched_roots": []})
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
 
     status = program.request_startup({"mode": "dry_run", "require_config": True})
@@ -65,9 +65,9 @@ def test_missing_required_config_fails_before_hardware(tmp_path):
 
 
 def test_already_closed_runs_initial_check_twice_before_queue(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    hw = FakeStartupHardware(door_closed=True, latch_closed=True)
+    hw = DryRunStartupHardware(door_closed=True, latch_closed=True)
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
 
     status = program.request_startup({"mode": "dry_run", "require_config": False, "door_policy": "already_closed"})
@@ -78,9 +78,9 @@ def test_already_closed_runs_initial_check_twice_before_queue(tmp_path):
 
 
 def test_live_artifact_root_must_be_absolute_and_allowed(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    program = OEMStartupProgram(hardware=FakeStartupHardware(), artifact_base=tmp_path)
+    program = OEMStartupProgram(hardware=DryRunStartupHardware(), artifact_base=tmp_path)
 
     relative = program.request_startup({"mode": "live", "operator_ack": "INITIALIZE", "artifact_root": "relative/live"})
     assert relative["state"] == "failed_closed"
@@ -92,9 +92,9 @@ def test_live_artifact_root_must_be_absolute_and_allowed(tmp_path):
 
 
 def test_door_event_only_valid_while_waiting(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    program = OEMStartupProgram(hardware=FakeStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
+    program = OEMStartupProgram(hardware=DryRunStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
     status = program.request_startup({"mode": "dry_run", "require_config": False})
 
     try:
@@ -106,10 +106,10 @@ def test_door_event_only_valid_while_waiting(tmp_path):
 
 
 def test_live_homing_blocks_when_switch_predicates_unknown(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
     cfg = {"status": "loaded", "live_ready": True, "fields": {"StartMode": "0", "GripperVersion": "1"}, "missing_fields": []}
-    hw = FakeStartupHardware(door_closed=True, latch_closed=True, config_status=cfg)
+    hw = DryRunStartupHardware(door_closed=True, latch_closed=True, config_status=cfg)
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path, allowlist_roots=[tmp_path])
 
     status = program.request_startup({"mode": "live", "operator_ack": "INITIALIZE", "artifact_root": str(tmp_path / "live"), "require_config": True, "run_homing": True})
@@ -120,9 +120,9 @@ def test_live_homing_blocks_when_switch_predicates_unknown(tmp_path):
 
 
 def test_worker_run_next_reaches_diagnostic_not_ready(tmp_path):
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
-    hw = FakeStartupHardware(door_closed=True, latch_closed=True)
+    hw = DryRunStartupHardware(door_closed=True, latch_closed=True)
     program = OEMStartupProgram(hardware=hw, artifact_base=tmp_path)
     queued = program.request_startup({"mode": "dry_run", "require_config": False})
 

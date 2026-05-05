@@ -51,10 +51,10 @@ def test_oem_switch_audit_api_status_mode(monkeypatch, tmp_path):
 def test_oem_motion_worker_api_run_next_and_status(monkeypatch, tmp_path):
     import src.bioxp.api as api
 
-    from src.bioxp.oem_startup_program import OEMStartupProgram, FakeStartupHardware
+    from src.bioxp.oem_startup_program import OEMStartupProgram, DryRunStartupHardware
 
     monkeypatch.setenv("BIOXP_OEM_STARTUP_ARTIFACT_BASE", str(tmp_path))
-    api._oem_startup_program = OEMStartupProgram(hardware=FakeStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
+    api._oem_startup_program = OEMStartupProgram(hardware=DryRunStartupHardware(door_closed=True, latch_closed=True), artifact_base=tmp_path)
     client = TestClient(api.app)
 
     req = client.post("/oem/startup/request", json={"mode": "dry_run", "require_config": False})

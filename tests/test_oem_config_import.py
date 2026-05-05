@@ -35,4 +35,65 @@ def test_parse_oem_config_extracts_startup_fields(tmp_path):
     assert result["fields"]["StartMode"] == "Service"
     assert result["fields"]["GripperVersion"] == "2"
     assert result["fields"]["XAxisMax"] == "100000"
+    assert result["axis_limits"]["x"]["max_steps"] == 91919
+    assert result["axis_limits"]["y"]["max_steps"] == 95247
+    assert result["axis_limits"]["z"]["max_steps"] == 160000
+    assert result["axis_limits"]["g"]["max_steps"] == 15000
     assert result["fields"]["ZMotorStallGuardThreshold"] == "9"
+
+
+def test_parse_oem_config_extracts_axislimits_overrides(tmp_path):
+    from src.bioxp.oem_config import harmonized_motion_config, load_oem_config
+
+    cfg = tmp_path / "config.xml"
+    cfg.write_text(
+        """
+        <Config>
+          <StartMode>Service</StartMode>
+          <GripperVersion>2</GripperVersion>
+          <AxisLimits>
+            <X_limit minSteps="-10" maxSteps="91000" />
+            <Y_limit minSteps="5" maxSteps="92000" />
+            <Z_limit minSteps="0" maxSteps="170000" />
+            <G_limit minSteps="0" maxSteps="15500" />
+          </AxisLimits>
+        </Config>
+        """.strip()
+    )
+
+    loaded = load_oem_config(cfg)
+    assert loaded["status"] == "loaded"
+    assert loaded["axis_limits"]["x"] == {
+        "min_steps": -10,
+        "max_steps": 91000,
+        "source": "config_xml_axislimits",
+        "config_tag": "X_limit",
+    }
+    assert loaded["axis_limits"]["y"]["min_steps"] == 5
+    assert loaded["axis_limits"]["z"]["max_steps"] == 170000
+    assert loaded["axis_limits"]["g"]["max_steps"] == 15500
+
+    harmonized = harmonized_motion_config(loaded)
+    assert harmonized["source"] == "config_xml"
+    assert harmonized["axis_limits"]["x"]["max_steps"] == 91000
+    assert harmonized["source_evidence"]["absolute_clamp"]
+
+
+def test_harmonized_motion_config_uses_oem_defaults_when_config_missing(tmp_path):
+    from src.bioxp.oem_config import find_oem_config, harmonized_motion_config
+
+    missing = find_oem_config([tmp_path / "missing"])
+    harmonized = harmonized_motion_config(missing)
+
+    assert missing["status"] == "missing"
+    assert harmonized["source"] == "oem_defaults_no_config_xml_found"
+    assert harmonized["axis_limits"]["x"]["max_steps"] == 91919
+    assert harmonized["axis_limits"]["y"]["max_steps"] == 95247
+    assert harmonized["axis_limits"]["z"]["max_steps"] == 160000
+    assert harmonized["axis_limits"]["g"]["max_steps"] == 15000
+    assert harmonized["source_evidence"]["config_loader"]
+    assert harmonized["deck_coordinate_extents"]["x"]["max_steps"] == 91919
+    assert harmonized["deck_coordinate_extents"]["y"]["max_steps"] == 95247
+    assert harmonized["axis_limit_diagnostics"]["x"]["default_limit_below_deck_extent"] is False
+    assert harmonized["axis_limit_diagnostics"]["y"]["default_limit_below_deck_extent"] is False
+    assert harmonized["axis_limit_diagnostics"]["x"]["recommended_status"] == "config_or_default_consistent_with_known_deck_extent"

@@ -1,9 +1,33 @@
 import re
 import struct
+import time
 from enum import IntEnum
 from typing import Any
 
-import can
+try:
+    import can  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised indirectly by offline tests
+    class _OfflineCanError(Exception):
+        pass
+
+    class _OfflineMessage:
+        def __init__(self, *, arbitration_id: int, data, is_extended_id: bool = False):
+            self.arbitration_id = int(arbitration_id)
+            self.data = list(data)
+            self.dlc = len(self.data)
+            self.is_extended_id = bool(is_extended_id)
+
+    class _OfflineInterface:
+        @staticmethod
+        def Bus(*args, **kwargs):
+            raise RuntimeError("python-can is required for live SocketCAN hardware access")
+
+    class _OfflineCanModule:
+        CanError = _OfflineCanError
+        Message = _OfflineMessage
+        interface = _OfflineInterface()
+
+    can = _OfflineCanModule()
 
 
 class BoardAssy(IntEnum):
@@ -80,7 +104,7 @@ class BioXpCanDriver:
             return True
         return False
 
-    def _receive_reply(self, *, timeout_s: float, ack_mode: str) -> dict[str, Any]:
+    def _receive_reply(self, *, timeout_s: float, ack_mode: str, expected_arbitration_id: int | None = None) -> dict[str, Any]:
         recv = getattr(self.bus, 'recv', None)
         if not callable(recv):
             return {
@@ -89,29 +113,69 @@ class BioXpCanDriver:
                 "error": "bus_recv_unavailable",
                 "timeout_s": float(timeout_s),
             }
-        reply = recv(timeout=float(timeout_s))
-        if reply is None:
-            return {
-                "ok": False,
-                "received": False,
-                "error": "ack_timeout",
-                "timeout_s": float(timeout_s),
-            }
-        payload = self._reply_payload(reply)
-        data = payload["data"]
-        ack_ok = self._ack_ok(data, ack_mode=ack_mode)
-        payload.update(
-            {
-                "ok": ack_ok,
-                "received": True,
-                "ack_mode": ack_mode,
-                "error_code": data[0] if data else None,
-                "oem_no_error_code_present": 0x20 in data,
-            }
-        )
-        if not ack_ok:
-            payload["error"] = "pipette_reply_error"
-        return payload
+        skipped: list[dict[str, Any]] = []
+        skipped_total = 0
+        max_skipped_frames = 12
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        inverse_pipette_ids = {int(v): str(k) for k, v in self.pipette_can_ids().items()}
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return {
+                    "ok": False,
+                    "received": False,
+                    "error": "ack_timeout",
+                    "timeout_s": float(timeout_s),
+                    "demux": {
+                        "expected_arbitration_id": expected_arbitration_id,
+                        "matched_address": None,
+                        "skipped_count": skipped_total,
+                        "skipped_frames": skipped,
+                        "skipped_frames_truncated": skipped_total > len(skipped),
+                    },
+                }
+            reply = recv(timeout=float(remaining_s))
+            if reply is None:
+                return {
+                    "ok": False,
+                    "received": False,
+                    "error": "ack_timeout",
+                    "timeout_s": float(timeout_s),
+                    "demux": {
+                        "expected_arbitration_id": expected_arbitration_id,
+                        "matched_address": None,
+                        "skipped_count": skipped_total,
+                        "skipped_frames": skipped,
+                        "skipped_frames_truncated": skipped_total > len(skipped),
+                    },
+                }
+            payload = self._reply_payload(reply)
+            if expected_arbitration_id is not None and int(payload["arbitration_id"]) != int(expected_arbitration_id):
+                skipped_total += 1
+                if len(skipped) < max_skipped_frames:
+                    skipped.append(payload)
+                continue
+            data = payload["data"]
+            ack_ok = self._ack_ok(data, ack_mode=ack_mode)
+            payload.update(
+                {
+                    "ok": ack_ok,
+                    "received": True,
+                    "ack_mode": ack_mode,
+                    "error_code": data[0] if data else None,
+                    "oem_no_error_code_present": 0x20 in data,
+                    "demux": {
+                        "expected_arbitration_id": expected_arbitration_id,
+                        "matched_address": inverse_pipette_ids.get(int(payload["arbitration_id"])),
+                        "skipped_count": skipped_total,
+                        "skipped_frames": skipped,
+                        "skipped_frames_truncated": skipped_total > len(skipped),
+                    },
+                }
+            )
+            if not ack_ok:
+                payload["error"] = "pipette_reply_error"
+            return payload
 
     def _send_packet(
         self,
@@ -162,6 +226,7 @@ class BioXpCanDriver:
         ack = self._receive_reply(
             timeout_s=float(response_timeout_s if response_timeout_s is not None else self.response_timeout_s),
             ack_mode=ack_mode,
+            expected_arbitration_id=int(board_id),
         )
         return {
             **base,
@@ -264,13 +329,15 @@ class BioXpCanDriver:
     def _parse_tip_loaded(result: dict[str, Any]) -> bool | None:
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         data = ack.get("data", []) if isinstance(ack, dict) else []
-        if len(data) > 4 and data[4] == ord('1'):
+        # OEM report frames seen during shadow/live prep can carry the ASCII
+        # truth byte in either the trimmed ClassCanLib position (index 2) or in
+        # the full/raw frame position (index 4). Treat an explicit ASCII 1 in
+        # either known slot as tip-present; only call it false when a known slot
+        # is present and neither reports 1.
+        known_slots = [idx for idx in (2, 4) if len(data) > idx]
+        if any(data[idx] == ord('1') for idx in known_slots):
             return True
-        if len(data) > 4 and data[4] != ord('1'):
-            return False
-        if len(data) > 2 and data[2] == ord('1'):
-            return True
-        if len(data) > 2:
+        if any(data[idx] == ord('0') for idx in known_slots):
             return False
         return None
 
@@ -278,10 +345,10 @@ class BioXpCanDriver:
     def _parse_numeric_ascii_from_ack(result: dict[str, Any]) -> float | None:
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         ascii_text = ack.get("ascii", "") if isinstance(ack, dict) else ""
-        match = re.search(r"[-+]?\d+(?:\.\d+)?", str(ascii_text)[2:]) or re.search(r"[-+]?\d+(?:\.\d+)?", str(ascii_text))
+        match = re.search(r"(?:^|\b)P\s*=\s*([-+]?\d+(?:\.\d+)?)", str(ascii_text))
         if match is None:
             return None
-        return float(match.group(0))
+        return float(match.group(1))
 
     def pipette_initialize(self, pressure_profile='1R'):
         # OEM ClassPipette.initiate sends WR on m_CANCommandid after any wake frame.
@@ -295,7 +362,9 @@ class BioXpCanDriver:
         return {
             **result,
             "tip_loaded": tip_loaded,
-            "hardware_truth_level": "hardware_query" if result.get("ok") else "no_readback",
+            "semantic_ok": tip_loaded is not None,
+            "hardware_truth_level": "hardware_query" if result.get("ok") and tip_loaded is not None else ("unparsed_hardware_reply" if result.get("ok") else "no_readback"),
+            "oem_source_anchor": "ClassPipette.QueryTipStatus: ?31",
         }
 
     def query_pressure(self):
@@ -304,7 +373,9 @@ class BioXpCanDriver:
         return {
             **result,
             "pressure": pressure,
-            "hardware_truth_level": "hardware_query" if result.get("ok") else "no_readback",
+            "semantic_ok": pressure is not None,
+            "hardware_truth_level": "hardware_query" if result.get("ok") and pressure is not None else ("unparsed_hardware_reply" if result.get("ok") else "no_readback"),
+            "oem_source_anchor": "ClassPipette.QueryPressure: ?57",
         }
 
     def pipette_load_tip(self):

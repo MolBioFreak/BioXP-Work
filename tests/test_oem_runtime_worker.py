@@ -143,7 +143,7 @@ def test_runtime_stepwise_homing_plan_and_live_gates(tmp_path):
     class Hardware:
         def startup_homing_stepwise(self, *, mode="shadow", step="plan", execute=False):
             calls.append((mode, step, execute))
-            return {"ok": True, "physical_motion": False, "steps": [{"step": "z-home"}], "monolithic_homing_blocked": True}
+            return {"ok": True, "physical_motion": False, "steps": [{"step": "z-home"}], "monolithic_homing_blocked": True, "not_a_replacement_sequence": True}
 
     class Program:
         hardware = Hardware()
@@ -161,7 +161,7 @@ def test_runtime_stepwise_homing_plan_and_live_gates(tmp_path):
     worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(root), params={"run_stepwise_homing": True, "homing_step": "z-home"}))
     result = worker.run_next_for_tests()
     assert result["ok"] is False
-    assert "operator_ack_HOME_required_for_live_stepwise_homing" in result["result"]["blockers"]
+    assert "operator_ack_HOME_required_for_live_oem_initializeMotors_step" in result["result"]["blockers"]
     assert calls == [("shadow", "plan", False)]
 
 
@@ -176,7 +176,7 @@ def test_runtime_stepwise_homing_live_bad_ack_rejects_before_provider_open(tmp_p
     worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(tmp_path / "artifact"), params={"run_stepwise_homing": True, "homing_step": "z-home"}))
     result = worker.run_next_for_tests()
     assert result["ok"] is False
-    assert "operator_ack_HOME_required_for_live_stepwise_homing" in result["result"]["blockers"]
+    assert "operator_ack_HOME_required_for_live_oem_initializeMotors_step" in result["result"]["blockers"]
 
 
 def test_worker_fails_closed_when_handler_missing(tmp_path):
@@ -188,3 +188,32 @@ def test_worker_fails_closed_when_handler_missing(tmp_path):
     assert "no handler" in result["error"]
     assert worker.snapshot()["gantry_available"] is True
     assert store.read_journal("runtime_errors.jsonl")
+
+def test_runtime_oem_initialize_motors_step_requires_home_ack_and_passes_step(tmp_path):
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    calls = []
+
+    class Hardware:
+        def startup_homing_stepwise(self, *, mode="shadow", step="plan", execute=False, preclear_abs=None, require_operator_observed=True):
+            calls.append((mode, step, execute, preclear_abs, require_operator_observed))
+            return {"ok": True, "physical_motion": bool(execute), "step": {"step": step}, "oem_source_order_preserved": True}
+
+    class Program:
+        hardware = Hardware()
+
+    root = tmp_path / "artifact"
+    store = OEMRuntimeStore(tmp_path / "store")
+    worker = OEMRuntimeWorker(store=store, handlers=OEMRuntimeCommandHandlers(startup_program=Program()).handlers())
+    worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(root), params={"run_stepwise_homing": True, "homing_step": "z-home"}))
+    result = worker.run_next_for_tests()
+    assert result["ok"] is False
+    assert "operator_ack_HOME_required_for_live_oem_initializeMotors_step" in result["result"]["blockers"]
+    assert calls == []
+
+    worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="HOME", artifact_root=str(root), params={"run_stepwise_homing": True, "homing_step": "z-home", "require_operator_observed": True}))
+    result = worker.run_next_for_tests()
+    assert result["ok"] is True
+    assert result["result"]["state"] == "stepwise_homing_step_complete"
+    assert calls == [("live", "z-home", True, None, True)]
+    assert (root / "runtime_stepwise_homing_z-home.json").exists()

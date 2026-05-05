@@ -244,7 +244,12 @@ class BioXpTester:
     MOTOR_HEAD_CLEARANCE_TIMEOUT_S = 20.0
     MOTOR_HEAD_CLEARANCE_SPEED = 250
     MOTOR_HEAD_CLEARANCE_PRECLEAR_ABS = 2500
-    MOTOR_HEAD_CLEARANCE_LIFT_ABS = 50000
+    # 2026-05-03 live commissioning proof: Z negative is physical head-up/lock-clear.
+    # The working supervised path used incremental lifts from logical 0 through
+    # -12500; operator requested a single bounded 15000-step total clearance move
+    # for extra safety margin. Do not fall back to the old 50000-step lift during
+    # commissioning.
+    MOTOR_HEAD_CLEARANCE_LIFT_ABS = 15000
     # Fail-intolerant motion probe error catalog.
     MOTION_ERROR_CODES = {
         "AXIS_PROBE_ERROR": 9100,
@@ -3274,14 +3279,46 @@ class BioXpTester:
     def _motion_oem_axis_profile(self, axis_key, *, startup=False):
         key = str(axis_key).strip().lower()
         preset = dict(self.motor_function_preset(key))
+        # OEM order and intent come from ClassControlInterface.initializeMotors().
+        # The live motor drive profile below is the 2026-05-03 unit-specific correction
+        # that turned controller ACK/counter motion into physically smooth motion. It is
+        # not a replacement sequence; it is the Linux TMCL parameterization used while
+        # executing the OEM sequence on this robot.
         if key == "x":
-            preset.update({"home_speed": 250 if startup else 500, "run_current": 31, "stall_guard": 16})
+            preset.update({
+                "speed": 300 if startup else preset.get("speed", 1700),
+                "acc": 120 if startup else preset.get("acc", 350),
+                "home_speed": 250 if startup else 500,
+                "run_current": 31,
+                "standby_current": 20 if startup else preset.get("standby_current", 10),
+                "stall_guard": 16,
+                "oem_home_step": "MotorX.axisSearchHome(speed=250)",
+            })
             return preset
         if key == "y":
-            preset.update({"home_speed": 250 if startup else 500, "run_current": 31, "stall_guard": 16})
+            preset.update({
+                "speed": 300 if startup else preset.get("speed", 1800),
+                "acc": 120 if startup else preset.get("acc", 400),
+                "home_speed": 250 if startup else 500,
+                "run_current": 31,
+                "standby_current": 20 if startup else preset.get("standby_current", 10),
+                "stall_guard": 16,
+                "oem_home_step": "MotorY.axisSearchHome(speed=250)",
+            })
             return preset
         if key == "z":
-            preset.update({"home_speed": 1791, "run_current": 31})
+            preset.update({
+                "speed": 250 if startup else preset.get("speed", 1791),
+                "acc": 60 if startup else preset.get("acc", 576),
+                # OEM source speed is retained as provenance, but the live search/return
+                # profile is softened until switch semantics are fully reconciled.
+                "home_speed": 250 if startup else 1791,
+                "oem_home_speed": 1791,
+                "run_current": 31,
+                "standby_current": 20 if startup else preset.get("standby_current", 10),
+                "positive_down_requires_right_mask": True,
+                "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
+            })
             return preset
         if key == "g":
             gv = self._motion_oem_gripper_version()
@@ -3323,6 +3360,42 @@ class BioXpTester:
         active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
         position_before = self.motor_get_position(board, motor=motor)
         home_before = self.motor_query_home_switch(board, motor=motor)
+        switches_before = self.motor_get_switch_activity(board, motor=motor)
+        # Z live parity correction: this unit's Z physical reference/pin-zero state is
+        # reported by the right/GAP10 channel while the generic home query reads GAP9.
+        # If the controller coordinate is already at the observed Z reference (0) and
+        # GAP10 is active, do not launch a blind velocity home that can move away from
+        # the aligned pin. Mark this as an already-at-reference Z home with an explicit
+        # predicate, then preserve normal Z reference-return handling in the startup step.
+        key = str(axis_key).strip().lower()
+        pos_value = position_before.get("position") if isinstance(position_before, dict) else None
+        if key == "z" and switches_before.get("right_active") is True and pos_value is not None and abs(int(pos_value)) <= 1000:
+            sethome = self.motor_set_home(board, motor=motor)
+            home_after = self.motor_query_home_switch(board, motor=motor)
+            switches_after = self.motor_get_switch_activity(board, motor=motor)
+            position_after = self.motor_get_position(board, motor=motor)
+            return {
+                "axis": key,
+                "board": board,
+                "motor": motor,
+                "speed": int(speed),
+                "rehome": bool(rehome),
+                "position_before": position_before,
+                "position_after": position_after,
+                "home_before": home_before,
+                "home_after": home_after,
+                "switches_before": switches_before,
+                "switches_after": switches_after,
+                "z_home_predicate": {"channel": "right/GAP10", "active_value": active_value, "reason": "z_reference_at_controller_zero"},
+                "already_at_z_reference": True,
+                "physical_motion_commanded": False,
+                "move_home": None,
+                "move_direction": None,
+                "wait": {"stopped": True, "already_at_z_reference": True, "seen_nonzero": False},
+                "stop": None,
+                "set_home": sethome,
+                "ok": True,
+            }
         rehome_move = None
         rehome_wait = None
         if bool(rehome) or home_before.get("value") == active_value:
@@ -3493,6 +3566,84 @@ class BioXpTester:
             "home": home,
             "restore_current": restore_current,
         }
+
+    def motor_oem_move_z_to_reference(self, *, target_position=0, timeout_s=30.0):
+        """Move Z toward the OEM physical reference coordinate while preserving live switch semantics.
+
+        2026-05-03 live proof: from aligned/observed-safe head geometry, positive Z/down
+        motion toward physical coordinate 0 is accepted-but-inert unless SAP12 disables/masks
+        the active right limit. This helper is Z-only and is used by the OEM initialization
+        conversion as a semantic correction, not as a replacement for initializeMotors order.
+        """
+        preset = self._motion_oem_axis_profile("z", startup=True)
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        pre_pos = self.motor_get_position(board, motor=motor)
+        pre_value = pre_pos.get("position") if isinstance(pre_pos, dict) else None
+        if pre_value is None:
+            return {"ok": False, "axis": "z", "target_position": int(target_position), "error": "z_position_unavailable", "pre_position": pre_pos}
+        steps = int(target_position) - int(pre_value)
+        out = {
+            "ok": False,
+            "axis": "z",
+            "board": board,
+            "motor": motor,
+            "target_position": int(target_position),
+            "pre_position": pre_pos,
+            "steps": steps,
+            "speed": int(preset.get("speed", 250)),
+            "acc": int(preset.get("acc", 60)),
+            "run_current": int(preset.get("run_current", 31)),
+            "standby_current": int(preset.get("standby_current", 20)),
+            "right_mask_applied_for_positive_down": bool(steps > 0 and preset.get("positive_down_requires_right_mask")),
+            "x_y_motion_commanded": False,
+        }
+        if steps == 0:
+            out["post"] = self.motor_axis_status(board, motor=motor)
+            out["ok"] = True
+            out["already_at_target"] = True
+            return out
+        out["stop_before"] = self.motor_stop(board, motor=motor)
+        out["run_current_set"] = self.motor_set_axis_param(board, 6, out["run_current"], motor=motor)
+        out["standby_current_set"] = self.motor_set_axis_param(board, 7, out["standby_current"], motor=motor)
+        out["speed_set"] = self.motor_set_axis_param(board, 4, out["speed"], motor=motor)
+        out["acc_set"] = self.motor_set_axis_param(board, 5, out["acc"], motor=motor)
+        out["stall_guard_set"] = self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 16)), motor=motor)
+        prior_right_disable = None
+        prior_left_disable = None
+        if out["right_mask_applied_for_positive_down"]:
+            prior_right_disable = self.motor_get_axis_param(board, 12, motor=motor)
+            prior_left_disable = self.motor_get_axis_param(board, 13, motor=motor)
+            out["disable_right_prior"] = prior_right_disable
+            out["disable_left_prior"] = prior_left_disable
+            out["disable_right_set"] = self.motor_set_axis_param(board, 12, 1, motor=motor)
+            out["disable_left_set"] = self.motor_set_axis_param(board, 13, 0, motor=motor)
+        try:
+            out["move"] = self.motor_move_relative(board, steps, motor=motor)
+            out["wait"] = self.motor_wait_stopped(board, motor=motor, timeout_s=max(2.0, float(timeout_s)), poll_s=0.08, require_seen_nonzero=False, min_polls=4)
+        finally:
+            out["stop_after"] = self.motor_stop(board, motor=motor)
+            if out["right_mask_applied_for_positive_down"]:
+                right_restore_value = prior_right_disable.get("value") if isinstance(prior_right_disable, dict) else None
+                left_restore_value = prior_left_disable.get("value") if isinstance(prior_left_disable, dict) else None
+                if right_restore_value is not None:
+                    out["disable_right_restore"] = self.motor_set_axis_param(board, 12, int(right_restore_value), motor=motor)
+                else:
+                    out["disable_right_restore"] = {"ok": False, "error": "prior_right_disable_unavailable"}
+                if left_restore_value is not None:
+                    out["disable_left_restore"] = self.motor_set_axis_param(board, 13, int(left_restore_value), motor=motor)
+                else:
+                    out["disable_left_restore"] = {"ok": False, "error": "prior_left_disable_unavailable"}
+        # Preserve Z hold current after successful/reference moves; do not current-zero.
+        out["hold_current_after"] = {
+            "run": self.motor_set_axis_param(board, 6, out["run_current"], motor=motor),
+            "standby": self.motor_set_axis_param(board, 7, out["standby_current"], motor=motor),
+        }
+        out["post"] = self.motor_axis_status(board, motor=motor)
+        wait_ok = isinstance(out.get("wait"), dict) and out["wait"].get("stopped") is True
+        move_ok = bool(out.get("move", {}).get("ok")) or self._tmcl_success(out.get("move", {}).get("ack"))
+        out["ok"] = bool(wait_ok and move_ok)
+        return out
 
     def motor_startup_homing_mimic(self):
         """

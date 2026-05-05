@@ -89,6 +89,40 @@ def test_motor_oem_home_axis_restores_gripper_current_for_version_one(monkeypatc
 
 
 
+def test_head_clearance_default_is_operator_requested_15k(monkeypatch):
+    tester, _ = _make_tester(monkeypatch)
+
+    assert tester.MOTOR_HEAD_CLEARANCE_LIFT_ABS == 15000
+
+
+
+def test_motor_oem_go_home_z_at_zero_uses_right_reference_without_motion(monkeypatch):
+    tester, _ = _make_tester(monkeypatch)
+    tester.MOTOR_SWITCH_ACTIVE_VALUE = 1
+    calls = []
+
+    monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis_key: {"board": 4, "motor": 1})
+    monkeypatch.setattr(tester, "motor_get_position", lambda board_id, motor=0: {"position": 0, "board": board_id, "motor": motor})
+    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"value": 0, "board": board_id, "motor": motor})
+    monkeypatch.setattr(
+        tester,
+        "motor_get_switch_activity",
+        lambda board_id, motor=0: {"left_state": 0, "right_state": 1, "left_active": False, "right_active": True},
+    )
+    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_move_right", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Z reference-at-zero must not launch move_right")))
+    monkeypatch.setattr(tester, "motor_move_left", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Z reference-at-zero must not launch move_left")))
+
+    result = tester.motor_oem_go_home("z", speed=250, rehome=False, timeout_s=5.0)
+
+    assert result["ok"] is True
+    assert result["already_at_z_reference"] is True
+    assert result["physical_motion_commanded"] is False
+    assert result["z_home_predicate"]["channel"] == "right/GAP10"
+    assert calls == [("set_home", 4, 1)]
+
+
+
 def test_motor_startup_homing_mimic_uses_oem_initialize_sequence(monkeypatch):
     tester, _ = _make_tester(monkeypatch)
     sequence = []

@@ -227,8 +227,9 @@ class OEMRuntimeCommandHandlers:
 
     def _handle_stepwise_homing_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         step = str(params.get("homing_step", "plan")).strip().lower()
-        if command.mode == "live" and command.operator_ack != "HOME":
-            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_stepwise_homing"]}
+        required_ack = "HOME"
+        if command.mode == "live" and command.operator_ack != required_ack:
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_oem_initializeMotors_step"]}
         if command.mode == "live" and step in {"plan", "full", "all"}:
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["live_stepwise_homing_requires_single_homing_step"]}
         program = self._startup_program()
@@ -237,7 +238,19 @@ class OEMRuntimeCommandHandlers:
         hardware = program.hardware
         if not hasattr(hardware, "startup_homing_stepwise"):
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["startup_homing_stepwise_method_unavailable"]}
-        result = hardware.startup_homing_stepwise(mode=("live" if command.mode == "live" else "shadow"), step=step, execute=command.mode == "live")
+        stage_kwargs = {
+            "mode": ("live" if command.mode == "live" else "shadow"),
+            "step": step,
+            "execute": command.mode == "live",
+            "preclear_abs": params.get("preclear_abs"),
+            "require_operator_observed": bool(params.get("require_operator_observed", True)),
+        }
+        try:
+            result = hardware.startup_homing_stepwise(**stage_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            result = hardware.startup_homing_stepwise(mode=stage_kwargs["mode"], step=step, execute=command.mode == "live")
         artifact_path = self._write_stage_artifact(command, f"runtime_stepwise_homing_{step}.json", {"command": command.to_dict(), "stepwise_homing": result})
         ok = bool(result.get("ok"))
         return {
@@ -251,8 +264,7 @@ class OEMRuntimeCommandHandlers:
             "stepwise_homing": result,
             "artifact_path": artifact_path,
             "blockers": ([] if ok else ["stepwise_homing_stage_failed"]) + [
-                "physical_observation_required_for_each_live_step",
-                "z_home_predicate_unresolved_gap9_vs_gap10",
+                "physical_observation_required_for_each_live_oem_initializeMotors_step",
                 "pipette_gate_unproven",
                 "vision_gate_unproven",
                 "parkGantry_gate_unproven",

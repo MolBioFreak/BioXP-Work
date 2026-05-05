@@ -9,6 +9,7 @@ from typing import Any
 
 from .oem_config import find_oem_config
 from .oem_motion_worker import OEMMotionWorker, OemMotionCommand
+from .oem_pipette_collection import dry_run_initialize_motion_pipette_cleanup
 from .oem_startup_types import OemStartupState, STARTUP_STAGE_ORDER
 from .oem_switch_audit import require_confident_predicates
 
@@ -104,7 +105,18 @@ def validate_artifact_root(mode: str, artifact_root: str | Path | None, artifact
     return True, None, root
 
 
-class FakeStartupHardware:
+class DryRunStartupHardware:
+    """No-hardware startup provider for unit tests and offline artifact-shape checks.
+
+    This object must not be used as evidence that live robot hardware, CAN, USB,
+    pipette, camera, latch, rail, or motion behavior passed. It exists only to
+    exercise OEM startup state-machine/artifact formatting without opening a
+    hardware transport.
+    """
+
+    hardware_provider_kind = "dry_run_test_double"
+    live_robot_proof = False
+
     def __init__(
         self,
         *,
@@ -282,12 +294,12 @@ class BioXpStartupHardware:
             "errors": errors,
         }
 
-    def startup_homing_stepwise(self, *, mode: str = "shadow", step: str = "plan", execute: bool = False) -> dict:
+    def startup_homing_stepwise(self, *, mode: str = "shadow", step: str = "plan", execute: bool = False, preclear_abs: int | None = None, require_operator_observed: bool = True) -> dict:
         tester = self.tester
         steps = [
-            {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
+            {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True, "live_semantic_correction": "2026-05-03: positive/down return to physical Z=0 requires right-limit mask on this unit"},
             {"step": "gripper-clear", "oem_anchor": "initializeMotors: setGripperCurrent(31); MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
-            {"step": "g-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "x-park-6000", "oem_anchor": "initializeMotors: setHome(X); setSpeed(X,1700); moveX(6000)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "y-home", "oem_anchor": "initializeMotors: MotorY.axisSearchHome(speed=250)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
@@ -296,7 +308,17 @@ class BioXpStartupHardware:
         ]
         selected = str(step).strip().lower()
         if selected in {"plan", "full", "all", ""}:
-            return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "steps": steps, "live_policy": "single_step_only_operator_ack_HOME", "monolithic_homing_blocked": True}
+            return {
+                "ok": True,
+                "mode": mode,
+                "execute": False,
+                "physical_motion": False,
+                "steps": steps,
+                "oem_sequence_anchor": SOURCE_ANCHORS["initializeMotors"],
+                "live_policy": "single_oem_initializeMotors_step_only_operator_ack_HOME; diagnostic harness must preserve OEM order/function",
+                "monolithic_homing_blocked": True,
+                "not_a_replacement_sequence": True,
+            }
         matches = [row for row in steps if row["step"] == selected]
         if not matches:
             return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "error": f"unknown_homing_step:{selected}", "allowed_steps": [row["step"] for row in steps]}
@@ -305,7 +327,26 @@ class BioXpStartupHardware:
         if not bool(execute):
             return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "planned only; no axis/home/move command issued"}
         if selected == "z-home":
-            return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "error": "z_home_predicate_unresolved_gap9_vs_gap10", "refusal": "live Z home blocked until predicate matrix is resolved from source/physical observation"}
+            if not bool(execute):
+                return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "OEM initializeMotors first step: MotorZ.axisSearchHome(speed=1791); live profile softened and right-mask reference return encoded from 2026-05-03 proof"}
+            z_home = tester.motor_oem_home_axis("z", startup=True)
+            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=30.0)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            z_home_ok = bool((z_home.get("home") or {}).get("ok")) if isinstance(z_home, dict) else False
+            z_reference_ok = bool(z_reference.get("ok")) if isinstance(z_reference, dict) else False
+            return {
+                "ok": bool(z_home_ok and z_reference_ok),
+                "mode": mode,
+                "execute": True,
+                "physical_motion": True,
+                "step": row,
+                "pre_snapshot": pre,
+                "post_snapshot": post,
+                "z_home": z_home,
+                "z_reference_return": z_reference,
+                "operator_observation_required": bool(require_operator_observed),
+                "oem_source_order_preserved": True,
+            }
         return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "error": "live_step_execution_not_enabled_for_this_step", "refusal": "scaffold installed; enable one step only after prior step proof and operator observation"}
 
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:
@@ -320,7 +361,7 @@ class BioXpStartupHardware:
     def run_initialize_system(self, *, mode: str, run_homing: bool, run_post_home: bool, artifact_root: Path, session_id: str) -> dict:
         if mode == "live":
             raise RuntimeError("live initializeSystem is blocked until switch predicates, pipette, and vision gates are proven")
-        return FakeStartupHardware().run_initialize_system(mode=mode, run_homing=run_homing, run_post_home=run_post_home, artifact_root=artifact_root, session_id=session_id)
+        return DryRunStartupHardware().run_initialize_system(mode=mode, run_homing=run_homing, run_post_home=run_post_home, artifact_root=artifact_root, session_id=session_id)
 
 
 class OEMStartupProgram:
@@ -519,7 +560,8 @@ class OEMStartupProgram:
         else:
             status["axis_reference"] = {"required": True, "ok": False, "skipped": True, "reason": "run_homing=false"}
         self._stage(status, OemStartupState.POST_HOME_PIPETTE)
-        post_pipette = {"ok": False, "required": True, "skipped": True, "blocks_ready": True, "reason": "queryTipStatus/eject/checkPipetteStatus gate not implemented for live parity"}
+        post_pipette = dry_run_initialize_motion_pipette_cleanup(mode=status["mode"])
+        post_pipette.update({"required": True, "blocks_ready": True})
         _atomic_json(root / "post_home_pipette_cleanup.json", post_pipette)
         self._stage(status, OemStartupState.VISION_INSPECTION)
         vision = self.hardware.vision_startup_check(mode=status["mode"]) if hasattr(self.hardware, "vision_startup_check") else {"ok": False, "required": True, "blocks_ready": True, "reason": "vision provider absent"}
