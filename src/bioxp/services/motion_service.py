@@ -41,6 +41,8 @@ class RelativeMoveCommand:
     axis: Any
     steps: int
     wait_timeout_s: float
+    speed: int | None = None
+    acc: int | None = None
     reuse_prepared: bool = False
     artifact: MotionArtifactOptions = field(default_factory=MotionArtifactOptions)
 
@@ -50,6 +52,8 @@ class RelativeMoveCommand:
             axis=req.axis,
             steps=int(req.steps),
             wait_timeout_s=float(req.wait_timeout_s),
+            speed=None if getattr(req, "speed", None) is None else int(req.speed),
+            acc=None if getattr(req, "acc", None) is None else int(req.acc),
             reuse_prepared=bool(getattr(req, "reuse_prepared", False)),
             artifact=MotionArtifactOptions.from_request(req),
         )
@@ -59,6 +63,8 @@ class RelativeMoveCommand:
             "axis": _axis_value(self.axis),
             "steps": int(self.steps),
             "wait_timeout_s": float(self.wait_timeout_s),
+            "speed": None if self.speed is None else int(self.speed),
+            "acc": None if self.acc is None else int(self.acc),
             "reuse_prepared": bool(self.reuse_prepared),
             **self.artifact.to_payload(),
         }
@@ -69,6 +75,8 @@ class AbsoluteMoveCommand:
     axis: Any
     position_steps: int
     wait_timeout_s: float
+    speed: int | None = None
+    acc: int | None = None
     artifact: MotionArtifactOptions = field(default_factory=MotionArtifactOptions)
 
     @classmethod
@@ -77,6 +85,8 @@ class AbsoluteMoveCommand:
             axis=req.axis,
             position_steps=int(req.position_steps),
             wait_timeout_s=float(req.wait_timeout_s),
+            speed=None if getattr(req, "speed", None) is None else int(req.speed),
+            acc=None if getattr(req, "acc", None) is None else int(req.acc),
             artifact=MotionArtifactOptions.from_request(req),
         )
 
@@ -85,6 +95,8 @@ class AbsoluteMoveCommand:
             "axis": _axis_value(self.axis),
             "position_steps": int(self.position_steps),
             "wait_timeout_s": float(self.wait_timeout_s),
+            "speed": None if self.speed is None else int(self.speed),
+            "acc": None if self.acc is None else int(self.acc),
             **self.artifact.to_payload(),
         }
 
@@ -94,6 +106,7 @@ class HomeAxisCommand:
     axis: Any
     speed: int | None
     timeout_s: float
+    allow_implementation_mapped_predicate: bool = False
     artifact: MotionArtifactOptions = field(default_factory=MotionArtifactOptions)
 
     @classmethod
@@ -102,6 +115,7 @@ class HomeAxisCommand:
             axis=req.axis,
             speed=None if getattr(req, "speed", None) is None else int(req.speed),
             timeout_s=float(req.timeout_s),
+            allow_implementation_mapped_predicate=bool(getattr(req, "allow_implementation_mapped_predicate", False)),
             artifact=MotionArtifactOptions.from_request(req),
         )
 
@@ -110,6 +124,7 @@ class HomeAxisCommand:
             "axis": _axis_value(self.axis),
             "speed": None if self.speed is None else int(self.speed),
             "timeout_s": float(self.timeout_s),
+            "allow_implementation_mapped_predicate": bool(self.allow_implementation_mapped_predicate),
             **self.artifact.to_payload(),
         }
 
@@ -172,18 +187,20 @@ def dry_run_prep_policy(axis: Any, *, reuse_requested: bool = False) -> dict[str
 
 def dry_run_motion_response(command: str, axis: Any, *, reuse_requested: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "ok": False,
         "axis": _axis_value(axis),
         "dry_run": True,
+        "validation_only": True,
         "skipped_hardware_io": True,
-        "message": "Dry-run validation bundle created; hardware command skipped.",
+        "message": "Dry-run validation bundle created; hardware command skipped; this is not a pass/fail proof of motion.",
         "prep_policy": dry_run_prep_policy(axis, reuse_requested=reuse_requested),
         "motion_truth": dry_run_motion_truth_payload(),
     }
     if command == "home":
-        payload["home"] = {"ok": True, "skipped": True}
+        payload["home"] = {"ok": False, "skipped": True, "validation_only": True}
     else:
-        payload["move"] = {"ok": True, "skipped": True, "mode": command}
-        payload["wait"] = {"ok": True, "skipped": True}
+        payload["move"] = {"ok": False, "skipped": True, "mode": command, "validation_only": True}
+        payload["wait"] = {"ok": False, "skipped": True, "validation_only": True}
     return payload
 
 
@@ -229,10 +246,16 @@ def attach_motion_artifact_bundle_safe(
             dry_run=dry_run,
         )
     except Exception as exc:
-        if dry_run:
-            raise
         enriched = dict(response_payload)
-        enriched["artifact_bundle_error"] = str(exc)
+        enriched["artifact_bundle_error"] = {
+            "category": "validation_artifact_unavailable",
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "route_error": False,
+            "hardware_motion_commanded": not bool(dry_run),
+        }
+        if dry_run:
+            enriched["ok"] = False
         return enriched
 
 
@@ -265,6 +288,8 @@ async def run_relative_motion_command(
             command.axis,
             int(command.steps),
             float(command.wait_timeout_s),
+            speed=command.speed,
+            acc=command.acc,
             reuse_prepared=bool(command.reuse_prepared),
         ),
         timeout_s=max(25.0, float(command.wait_timeout_s) + 10.0),
@@ -302,6 +327,8 @@ async def run_absolute_motion_command(
             command.axis,
             int(command.position_steps),
             float(command.wait_timeout_s),
+            speed=command.speed,
+            acc=command.acc,
         ),
         timeout_s=max(35.0, float(command.wait_timeout_s) + 10.0),
     )
@@ -338,6 +365,7 @@ async def run_home_axis_command(
             command.axis,
             command.speed,
             float(command.timeout_s),
+            allow_implementation_mapped_predicate=bool(command.allow_implementation_mapped_predicate),
         ),
         timeout_s=max(35.0, float(command.timeout_s) + 10.0),
     )
