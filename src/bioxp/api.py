@@ -1,11 +1,16 @@
 import asyncio
 import base64
+import hashlib
+import json
 import os
 import signal
 import shutil
 import subprocess
+import tarfile
 import tempfile
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any, Optional
@@ -14,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_config import harmonized_motion_config
 from .oem_compat.api import router as oem_compat_router
+from .oem_homing_routes import router as oem_homing_router
 from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
@@ -130,6 +136,8 @@ _camera_stream_state = {
     "last_frame_at": None,
     "last_error": None,
 }
+USB_SNIFF_ACK = "USB_SNIFF"
+USB_SNIFF_PROFILES = {"passive", "manual_observe", "debug"}
 RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
 MAINTENANCE_STATE_SCHEMA_VERSION = "bioxp.maintenance_state.v1"
 MAINTENANCE_RECOVERY_ACK = "RECOVER"
@@ -233,6 +241,10 @@ async def lifespan(app: FastAPI):
     try:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
         _tester = BioXpTester(alt=alt)
+        try:
+            _tester.motor_restore_gripper_idle_current(reason="api_startup_safe_idle")
+        except Exception as idle_exc:
+            print(f"[WARN] BioXP gripper idle-current sanitizer failed: {idle_exc}")
         _startup_error = None
     except Exception as exc:
         _tester = None
@@ -262,6 +274,7 @@ app = FastAPI(
 )
 app.include_router(oem_compat_router)
 app.include_router(oem_runtime_router)
+app.include_router(oem_homing_router)
 
 
 def _get_tester() -> BioXpTester:
@@ -592,7 +605,22 @@ class MotionInterlockOverrideRequest(BaseModel):
     override_latch_sensor: Optional[bool] = Field(None, description="Treat latch/magnetic sensor as permissive while still requiring door and solenoid readbacks.")
     override_rail_24v: Optional[bool] = Field(None, description="Treat 24V sense input as permissive for commissioning when the sense line is known/misaligned faulty.")
     operator_ack: str = Field(..., description="Must be exactly INTERLOCK_OVERRIDE; this bypasses normal latch/24V interlock checks.")
+    reason: Optional[str] = Field(None, max_length=2000, description="Operator reason alias accepted from BMS cockpit; stored with the override audit note.")
     operator_note: Optional[str] = Field(None, max_length=2000)
+
+
+class UsbSniffCaptureRequest(BaseModel):
+    profile: str = Field("passive", description="Capture profile: passive, manual_observe, or debug.")
+    duration_s: int = Field(300, ge=1, le=1800)
+    include_pcap: bool = True
+    include_driver_ledger: bool = True
+    passive_only: bool = True
+    reason: Optional[str] = Field(None, max_length=2000)
+    operator_ack: Optional[str] = Field(None, description="Must be exactly USB_SNIFF for start/stop actions.")
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+    stop_existing: bool = False
+    run_id: Optional[str] = Field(None, max_length=120)
+    tail: Optional[int] = Field(None, ge=1, le=1000)
 
 
 class MaintenanceRecoverMotionRequest(BaseModel):
@@ -891,11 +919,26 @@ def _axis_status_payload(tester: BioXpTester, axis: AxisName, *, include_current
     if include_current:
         status["max_current"] = tester.motor_get_axis_param(board, 6, motor=motor)
         status["standby_current"] = tester.motor_get_axis_param(board, 7, motor=motor)
+    current_safety = None
+    if axis == AxisName.GRIPPER and include_current:
+        speed_value = status.get("speed", {}).get("speed") if isinstance(status.get("speed"), dict) else None
+        run_value = status.get("max_current", {}).get("value") if isinstance(status.get("max_current"), dict) else None
+        standby_value = status.get("standby_current", {}).get("value") if isinstance(status.get("standby_current"), dict) else None
+        unsafe_hot_idle = bool(speed_value == 0 and ((isinstance(run_value, int) and run_value > OEM_IDLE_STANDBY_CURRENT) or (isinstance(standby_value, int) and standby_value > OEM_IDLE_STANDBY_CURRENT)))
+        current_safety = {
+            "classification": "G_CURRENT_UNSAFE_HOT_IDLE" if unsafe_hot_idle else "G_CURRENT_IDLE_SAFE",
+            "speed": speed_value,
+            "run_current_param6": run_value,
+            "standby_current_param7": standby_value,
+            "safe_idle_max": OEM_IDLE_STANDBY_CURRENT,
+            "motion_commanded": False,
+        }
     return {
         "axis": axis.value,
         "preset": preset,
         "status": status,
         "switch_activity": _switch_activity_from_switches(tester, board, motor, switches),
+        "current_safety": current_safety,
     }
 
 
@@ -922,7 +965,7 @@ def _parse_axes_csv(axes_csv: str) -> list[AxisName]:
 def _axis_status_batch_payload(tester: BioXpTester, axes: list[AxisName]) -> dict:
     rows = {}
     for axis in axes:
-        rows[axis.value] = _axis_status_payload(tester, axis, include_current=False)
+        rows[axis.value] = _axis_status_payload(tester, axis, include_current=(axis == AxisName.GRIPPER))
     return {
         "axes": [axis.value for axis in axes],
         "rows": rows,
@@ -970,6 +1013,21 @@ def _require_motion_route_ready(req: Optional[MotionArtifactRequest] = None) -> 
     _require_motion_not_blocked_by_maintenance()
 
 
+def _reference_row_for_axis(axis: AxisName) -> dict:
+    snapshot = _reference_state_store.snapshot([axis])
+    rows = snapshot.get("rows", {}) if isinstance(snapshot, dict) else {}
+    return rows.get(axis.value, {}) if isinstance(rows, dict) else {}
+
+
+def _require_axis_not_operator_desynced(axis: AxisName, *, command: str) -> None:
+    # 2026-06-02 Christian override: do not block motion solely because the
+    # reference metadata is marked desynced. Keep the reference/desync state
+    # visible in status and motion evidence, but allow explicitly requested
+    # commissioning moves to proceed through the normal arm/interlock/limit
+    # gates so we can compare working vs inconsistent control paths.
+    return
+
+
 def _motion_truth_payload() -> dict:
     return {
         "evidence_level": "controller_only",
@@ -1013,6 +1071,8 @@ def _motion_failure_response(
     move: Optional[dict] = None,
     wait: Optional[dict] = None,
     target_position: Optional[int] = None,
+    raw_events: Optional[list[dict]] = None,
+    event_capture_attempted: bool = False,
 ) -> dict:
     response = {
         "ok": False,
@@ -1043,7 +1103,318 @@ def _motion_failure_response(
         response["move"] = move
     if wait is not None:
         response["wait"] = wait
+    response["motion_evidence"] = _build_motion_evidence(
+        preset={},
+        prep=prep,
+        interlock=interlock,
+        position_before=position_before,
+        switch_before=switch_before,
+        position_after=position_after,
+        switch_after=switch_after,
+        move=move,
+        wait=wait,
+        motion_profile=motion_profile,
+        raw_events=raw_events,
+        event_capture_attempted=event_capture_attempted,
+    )
     return response
+
+
+def _trim_motion_ack(ack: Any) -> Any:
+    if not isinstance(ack, dict):
+        return ack
+    return {k: ack.get(k) for k in ("board", "cmd", "status", "status_str", "value") if k in ack}
+
+
+def _extract_motion_value(row: Any) -> Any:
+    if not isinstance(row, dict):
+        return None
+    if "value" in row:
+        return row.get("value")
+    rb = row.get("readback")
+    if isinstance(rb, dict):
+        return rb.get("value")
+    return None
+
+
+def _prep_ops_by_name(prep: Any) -> dict[str, dict]:
+    if not isinstance(prep, dict):
+        return {}
+    ops = prep.get("ops")
+    if not isinstance(ops, list):
+        return {}
+    out: dict[str, dict] = {}
+    for op in ops:
+        if isinstance(op, dict) and isinstance(op.get("op"), str):
+            out[op["op"]] = op
+    return out
+
+
+def _prep_param_summary(ops: dict[str, dict], op_name: str, *, fallback_set: Any = None, as_bool: bool = False) -> dict:
+    op = ops.get(op_name) if isinstance(ops, dict) else None
+    set_value = op.get("set") if isinstance(op, dict) and "set" in op else fallback_set
+    readback = _extract_motion_value(op.get("rb")) if isinstance(op, dict) else None
+    if as_bool and set_value is not None:
+        set_value = bool(set_value)
+    if as_bool and readback is not None:
+        readback = bool(readback)
+    ack = _trim_motion_ack(op.get("ack")) if isinstance(op, dict) else None
+    ok = None
+    if isinstance(ack, dict) and "status" in ack:
+        ok = ack.get("status") == 100
+    return {"set": set_value, "readback": readback, "ack": ack, "ok": ok}
+
+
+def _normalize_motion_prep_params(preset: Any, prep: Any, motion_profile: Optional[dict] = None) -> dict:
+    preset = preset if isinstance(preset, dict) else {}
+    motion_profile = motion_profile if isinstance(motion_profile, dict) else {}
+    ops = _prep_ops_by_name(prep)
+    return {
+        "speed": motion_profile.get("speed", preset.get("speed")),
+        "acc": motion_profile.get("acc", preset.get("acc")),
+        "run_current_param6": _prep_param_summary(ops, "sap6-run_current", fallback_set=preset.get("run_current")),
+        "standby_current_param7": _prep_param_summary(ops, "sap7-standby_current", fallback_set=preset.get("standby_current")),
+        "speed_param4": _prep_param_summary(ops, "sap4-max_speed", fallback_set=motion_profile.get("speed", preset.get("speed"))),
+        "acc_param5": _prep_param_summary(ops, "sap5-max_acc", fallback_set=motion_profile.get("acc", preset.get("acc"))),
+        "stallguard_param205": _prep_param_summary(ops, "sap205-stall_guard", fallback_set=preset.get("stall_guard")),
+        "switch_masks": {
+            "right_param12": _prep_param_summary(ops, "sap12-disable_right", fallback_set=preset.get("disable_right"), as_bool=True),
+            "left_param13": _prep_param_summary(ops, "sap13-disable_left", fallback_set=preset.get("disable_left"), as_bool=True),
+        },
+        "source": "motor_prepare_axis.ops",
+    }
+
+
+_MOTION_EVENT_BUCKETS = {
+    128: "target_reached_128",
+    130: "stallguard_130",
+    13: "voltage_drop_13",
+    14: "max_current_reference_deviation_14",
+    132: "door_latch_132",
+}
+
+
+def _classify_motion_events(raw_events: Optional[list[dict]] = None, *, capture_attempted: bool = False) -> dict:
+    raw = [event for event in (raw_events or []) if isinstance(event, dict)]
+    out = {"capture_attempted": bool(capture_attempted), "raw": raw, "captured_count": len(raw)}
+    for bucket in _MOTION_EVENT_BUCKETS.values():
+        out[bucket] = []
+    for event in raw:
+        status = event.get("status")
+        try:
+            status_int = int(status)
+        except (TypeError, ValueError):
+            continue
+        bucket = _MOTION_EVENT_BUCKETS.get(status_int)
+        if bucket:
+            out[bucket].append(event)
+    out["bucket_counts"] = {bucket: len(out[bucket]) for bucket in _MOTION_EVENT_BUCKETS.values()}
+    if not capture_attempted:
+        out["note"] = "Async bus-event capture is deliberately not enabled in the default movement path; no USB read-stream drain was added."
+    elif not raw:
+        out["note"] = "USB bus-event capture was attempted for this motion window, but no non-heartbeat async frames were observed."
+    return out
+
+
+def _dedupe_motion_events(events: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        raw = event.get("raw")
+        if isinstance(raw, list):
+            key = tuple(raw)
+        else:
+            key = (event.get("board"), event.get("status"), event.get("cmd"), event.get("value"), event.get("observed_ms"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(event)
+    return out
+
+
+def _clear_motion_event_capture(tester: BioXpTester) -> None:
+    clear = getattr(tester, "clear_bus_event_buffer", None)
+    drain = getattr(tester, "drain", None)
+    if callable(clear):
+        try:
+            clear()
+        except Exception:
+            pass
+    drained = False
+    if callable(drain):
+        try:
+            # Flush endpoint-stale async frames immediately before the motion window.
+            # drain() preserves frames into the buffer, so clear again afterward.
+            drain(max_reads=12, timeout_ms=2)
+            drained = True
+        except Exception:
+            pass
+    if drained and callable(clear):
+        try:
+            clear()
+        except Exception:
+            pass
+
+
+def _collect_motion_event_capture(tester: BioXpTester) -> tuple[list[dict], bool]:
+    raw_events: list[dict] = []
+    attempted = False
+    pop = getattr(tester, "pop_bus_event_buffer", None)
+    if callable(pop):
+        attempted = True
+        try:
+            popped = pop()
+            if isinstance(popped, list):
+                raw_events.extend(event for event in popped if isinstance(event, dict))
+        except Exception as exc:
+            raw_events.append({"status": None, "source": "pop_bus_event_buffer_error", "error": repr(exc)})
+    collect = getattr(tester, "collect_bus_events", None)
+    if callable(collect):
+        attempted = True
+        try:
+            tail = collect(duration_s=0.25, timeout_ms=12, max_events=96)
+            if isinstance(tail, list):
+                raw_events.extend(event for event in tail if isinstance(event, dict))
+        except Exception as exc:
+            raw_events.append({"status": None, "source": "collect_bus_events_error", "error": repr(exc)})
+    return _dedupe_motion_events(raw_events), attempted
+
+
+def _motion_log_nonzero_speed(wait: Any) -> bool:
+    if isinstance(wait, dict) and wait.get("seen_nonzero") is True:
+        return True
+    tail = wait.get("log_tail") if isinstance(wait, dict) else None
+    if not isinstance(tail, list):
+        return False
+    for row in tail:
+        if not isinstance(row, dict):
+            continue
+        speed = row.get("speed")
+        if isinstance(speed, int) and speed != 0:
+            return True
+    return False
+
+
+def _motion_telemetry_packet(position_before: Any, switch_before: Any, position_after: Any, switch_after: Any, wait: Any) -> dict:
+    during = wait.get("log_tail") if isinstance(wait, dict) and isinstance(wait.get("log_tail"), list) else []
+    last_speed = wait.get("last_speed") if isinstance(wait, dict) else None
+    return {
+        "before": {
+            "gap1_position": position_before,
+            "gap3_speed": None,
+            "gap8_target_reached": {"available": False, "value": None, "source": "not_polled_in_default_path"},
+            "gap9_gap10_switches": switch_before,
+        },
+        "during": during,
+        "after": {
+            "gap1_position": position_after,
+            "gap3_speed": {"speed": last_speed} if last_speed is not None else None,
+            "gap8_target_reached": {"available": False, "value": None, "source": "not_polled_in_default_path"},
+            "gap9_gap10_switches": switch_after,
+        },
+    }
+
+
+def _motion_classification(move: Any, wait: Any, position_before: Any, position_after: Any, events: dict) -> dict:
+    delta = _position_delta(position_before, position_after)
+    nonzero_speed_seen = _motion_log_nonzero_speed(wait)
+    target_event_seen = bool(events.get("target_reached_128")) if isinstance(events, dict) else False
+    stall_event_seen = bool(events.get("stallguard_130")) if isinstance(events, dict) else False
+    voltage_drop_seen = bool(events.get("voltage_drop_13")) if isinstance(events, dict) else False
+    max_current_reference_deviation_seen = bool(events.get("max_current_reference_deviation_14")) if isinstance(events, dict) else False
+    door_latch_event_seen = bool(events.get("door_latch_132")) if isinstance(events, dict) else False
+    move_ack_ok = bool(isinstance(move, dict) and move.get("ok") is True)
+    controller_motion_evidence = bool(
+        move_ack_ok
+        and (
+            (delta is not None and int(delta) != 0)
+            or nonzero_speed_seen
+            or target_event_seen
+        )
+    )
+    return {
+        "move_ack_ok": move_ack_ok,
+        "controller_motion_evidence": controller_motion_evidence,
+        "stall_event_seen": stall_event_seen,
+        "target_reached_event_seen": target_event_seen,
+        "voltage_drop_seen": voltage_drop_seen,
+        "max_current_reference_deviation_seen": max_current_reference_deviation_seen,
+        "door_latch_event_seen": door_latch_event_seen,
+        "position_delta": delta,
+        "nonzero_speed_seen": nonzero_speed_seen,
+        "gap8_target_reached": None,
+        "physical_motion_confirmed": False,
+        "physical_proof_source": None,
+        "evidence_level": "controller_only",
+    }
+
+
+def _build_motion_evidence(
+    *,
+    preset: Any,
+    prep: Any,
+    interlock: Any,
+    position_before: Any,
+    switch_before: Any,
+    position_after: Any,
+    switch_after: Any,
+    move: Any,
+    wait: Any,
+    motion_profile: Optional[dict] = None,
+    raw_events: Optional[list[dict]] = None,
+    event_capture_attempted: bool = False,
+) -> dict:
+    events = _classify_motion_events(raw_events, capture_attempted=event_capture_attempted)
+    telemetry = _motion_telemetry_packet(position_before, switch_before, position_after, switch_after, wait)
+    return {
+        "prep_params": _normalize_motion_prep_params(preset, prep, motion_profile=motion_profile),
+        "telemetry": telemetry,
+        "events": events,
+        "interlock": {
+            "before": interlock.get("snap_before") if isinstance(interlock, dict) else None,
+            "after": interlock.get("snap_after") if isinstance(interlock, dict) else None,
+            "raw": interlock,
+        },
+        "classification": _motion_classification(move, wait, position_before, position_after, events),
+    }
+
+
+def _build_home_motion_evidence(*, preset: Any, prep: Any, interlock: Any, home: Any, motion_profile: Optional[dict] = None) -> dict:
+    payload = _unwrap_oem_home_payload(home)
+    position_before = payload.get("position_before") if isinstance(payload, dict) else None
+    position_after = payload.get("position_after") if isinstance(payload, dict) else None
+    switch_before = payload.get("switch_activity_before") if isinstance(payload, dict) else None
+    switch_after = payload.get("switch_activity_after") if isinstance(payload, dict) else None
+    wait = {
+        "ok": payload.get("ok") if isinstance(payload, dict) else None,
+        "log_tail": payload.get("log_tail") if isinstance(payload, dict) else [],
+        "seen_nonzero": _motion_log_nonzero_speed({"log_tail": payload.get("log_tail")}) if isinstance(payload, dict) else False,
+    }
+    move = payload.get("move_left") or payload if isinstance(payload, dict) else None
+    return _build_motion_evidence(
+        preset=preset,
+        prep=prep,
+        interlock=interlock,
+        position_before=position_before,
+        switch_before=switch_before,
+        position_after=position_after,
+        switch_after=switch_after,
+        move=move,
+        wait=wait,
+        motion_profile=motion_profile,
+    )
+
+
+def _motion_interlock_override_reason(req: MotionInterlockOverrideRequest) -> str:
+    reason = str(req.reason if req.reason is not None else (req.operator_note or "")).strip()
+    if bool(req.enabled) and not reason:
+        raise HTTPException(status_code=409, detail="enabled interlock override requires a non-empty reason or operator_note")
+    parts = ["api_interlock_override"]
+    if reason:
+        parts.append(reason[:2000])
+    return " | ".join(parts)
 
 
 def _motion_prep_policy(
@@ -1341,8 +1712,10 @@ def _execute_relative_move(
         "normalization": preset.get("speed_acc_normalization"),
         "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
     }
+    _clear_motion_event_capture(tester)
     move = tester.motor_move_relative(preset["board"], steps, motor=preset["motor"])
     if not move.get("ok"):
+        raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
         return _motion_failure_response(
             axis=axis,
             category="controller_command_failed",
@@ -1357,9 +1730,12 @@ def _execute_relative_move(
             switch_before=switch_before,
             switch_after=None,
             move=move,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
         )
     wait = _wait_for_motion_with_guardrails(tester, preset["board"], preset["motor"], timeout_s=wait_timeout_s)
     if not wait.get("ok"):
+        raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
         return _motion_failure_response(
             axis=axis,
             category="guardrail_no_motion",
@@ -1375,9 +1751,20 @@ def _execute_relative_move(
             switch_after=wait.get("switch_activity_after"),
             move=move,
             wait=wait,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
         )
     position_after = wait.get("position_after") or tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_after = wait.get("switch_activity_after") or tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
+    motion_profile = {
+        "speed": int(preset["speed"]),
+        "acc": int(preset["acc"]),
+        "requested_speed": None if speed is None else int(speed),
+        "requested_acc": None if acc is None else int(acc),
+        "normalization": preset.get("speed_acc_normalization"),
+        "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
+    }
+    raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
     return {
         "axis": axis.value,
         "board_status": board_status,
@@ -1385,14 +1772,21 @@ def _execute_relative_move(
         "prep": prep,
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
-        "motion_profile": {
-            "speed": int(preset["speed"]),
-            "acc": int(preset["acc"]),
-            "requested_speed": None if speed is None else int(speed),
-            "requested_acc": None if acc is None else int(acc),
-            "normalization": preset.get("speed_acc_normalization"),
-            "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
-        },
+        "motion_evidence": _build_motion_evidence(
+            preset=preset,
+            prep=prep,
+            interlock=interlock,
+            position_before=position_before,
+            switch_before=switch_before,
+            position_after=position_after,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            motion_profile=motion_profile,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        ),
+        "motion_profile": motion_profile,
         "position_before": position_before,
         "position_after": position_after,
         "position_delta": _position_delta(position_before, position_after),
@@ -1425,8 +1819,10 @@ def _execute_absolute_move(
         "normalization": preset.get("speed_acc_normalization"),
         "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
     }
+    _clear_motion_event_capture(tester)
     move = tester.motor_move_absolute(preset["board"], position_steps, motor=preset["motor"])
     if not move.get("ok"):
+        raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
         return _motion_failure_response(
             axis=axis,
             category="controller_command_failed",
@@ -1442,9 +1838,12 @@ def _execute_absolute_move(
             switch_after=None,
             move=move,
             target_position=position_steps,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
         )
     wait = _wait_for_motion_with_guardrails(tester, preset["board"], preset["motor"], timeout_s=wait_timeout_s)
     if not wait.get("ok"):
+        raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
         return _motion_failure_response(
             axis=axis,
             category="guardrail_no_motion",
@@ -1461,9 +1860,20 @@ def _execute_absolute_move(
             move=move,
             wait=wait,
             target_position=position_steps,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
         )
     position_after = wait.get("position_after") or tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_after = wait.get("switch_activity_after") or tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
+    motion_profile = {
+        "speed": int(preset["speed"]),
+        "acc": int(preset["acc"]),
+        "requested_speed": None if speed is None else int(speed),
+        "requested_acc": None if acc is None else int(acc),
+        "normalization": preset.get("speed_acc_normalization"),
+        "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
+    }
+    raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
     return {
         "axis": axis.value,
         "board_status": board_status,
@@ -1471,14 +1881,21 @@ def _execute_absolute_move(
         "prep": prep,
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
-        "motion_profile": {
-            "speed": int(preset["speed"]),
-            "acc": int(preset["acc"]),
-            "requested_speed": None if speed is None else int(speed),
-            "requested_acc": None if acc is None else int(acc),
-            "normalization": preset.get("speed_acc_normalization"),
-            "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
-        },
+        "motion_evidence": _build_motion_evidence(
+            preset=preset,
+            prep=prep,
+            interlock=interlock,
+            position_before=position_before,
+            switch_before=switch_before,
+            position_after=position_after,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            motion_profile=motion_profile,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        ),
+        "motion_profile": motion_profile,
         "position_before": position_before,
         "position_after": position_after,
         "position_delta": _position_delta(position_before, position_after),
@@ -1643,6 +2060,13 @@ def _execute_home_axis(
             "prep": prep,
             "prep_policy": prep_policy,
             "motion_truth": _motion_failure_truth_payload(message),
+            "motion_evidence": _build_home_motion_evidence(
+                preset=preset,
+                prep=prep,
+                interlock=interlock,
+                home=home,
+                motion_profile=motion_profile,
+            ),
             "motion_failure": {
                 "category": "home_not_confirmed",
                 "message": message,
@@ -1661,6 +2085,13 @@ def _execute_home_axis(
         "prep": prep,
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
+        "motion_evidence": _build_home_motion_evidence(
+            preset=preset,
+            prep=prep,
+            interlock=interlock,
+            home=home,
+            motion_profile=motion_profile,
+        ),
         "motion_profile": motion_profile,
         "home": home,
     }
@@ -1763,6 +2194,7 @@ def _prepare_motion_axis(
     acc: Optional[int] = None,
     reuse_prepared: bool = False,
 ):
+    _require_axis_not_operator_desynced(axis, command="axis motion/prepare")
     preset = dict(_axis_preset(tester, axis))
     requested_profile = {
         "speed": None if speed is None else int(speed),
@@ -1953,6 +2385,512 @@ def _camera_snapshot_with_data(tester: BioXpTester, preferred: str) -> dict:
     result["image_b64"] = image_b64
     result["image_error"] = image_error
     return result
+
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+class UsbSniffManager:
+    """Robot-local capture manager for Novo USB observability.
+
+    This is capture-only diagnostics: it never homes, arms, recovers, or moves axes.
+    It can run a driver TX/RX JSONL ledger immediately. Kernel usbmon pcap capture
+    is enabled only when the service user can see a tcpdump usbmon interface.
+    """
+
+    def __init__(self) -> None:
+        self.root = os.path.abspath(os.environ.get("BIOXP_USB_SNIFF_ROOT") or os.path.join(os.environ.get("BIOXP_LOG_ROOT") or "/tmp/bioxp-live-runs", "usb-sniff"))
+        self._lock = threading.RLock()
+        self._active: dict[str, Any] | None = None
+        self._latest_run_id: str | None = None
+
+    def _ensure_root(self) -> None:
+        os.makedirs(self.root, exist_ok=True)
+
+    def _safe_run_id(self, run_id: str) -> str:
+        safe = str(run_id or "").strip()
+        if not safe or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in safe):
+            raise HTTPException(status_code=400, detail="invalid usb-sniff run_id")
+        return safe
+
+    def _run_dir(self, run_id: str) -> str:
+        return os.path.join(self.root, self._safe_run_id(run_id))
+
+    def _read_json(self, path: str, fallback: Any = None) -> Any:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return fallback
+
+    def _write_json(self, path: str, payload: dict[str, Any]) -> None:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+            handle.write("\n")
+        os.replace(tmp, path)
+
+    def _append_jsonl(self, path: str, payload: dict[str, Any]) -> None:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+
+    def _tool(self, name: str) -> str | None:
+        return shutil.which(name)
+
+    def _command_output(self, args: list[str], timeout_s: float = 5.0) -> dict[str, Any]:
+        try:
+            cp = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_s)
+            return {"ok": cp.returncode == 0, "returncode": cp.returncode, "output": cp.stdout}
+        except Exception as exc:
+            return {"ok": False, "returncode": None, "output": str(exc), "error": str(exc)}
+
+    def _usb_inventory(self) -> dict[str, Any]:
+        return {
+            "lsusb": self._command_output(["lsusb"], timeout_s=5.0),
+            "lsusb_tree": self._command_output(["lsusb", "-t"], timeout_s=5.0),
+            "target_vid_pid": "03eb:2423",
+            "target_hint": "Novo USB-to-CAN Board; expected on USB bus 002 at full-speed 12M on this robot",
+        }
+
+    def _pcap_probe(self) -> dict[str, Any]:
+        tcpdump = self._tool("tcpdump")
+        probe: dict[str, Any] = {
+            "available": False,
+            "tool": tcpdump,
+            "mode": None,
+            "interface": None,
+            "reason": None,
+            "interfaces": [],
+        }
+        if tcpdump:
+            result = self._command_output([tcpdump, "-D"], timeout_s=8.0)
+            probe["tcpdump_D"] = {k: result.get(k) for k in ("ok", "returncode", "error") if k in result}
+            interfaces: list[str] = []
+            for raw_line in str(result.get("output") or "").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                # tcpdump -D format: "1.eth0 [...]" or "10.usbmon2 ..."
+                name = line.split(" ", 1)[0].split(".", 1)[-1]
+                interfaces.append(name)
+            probe["interfaces"] = interfaces
+            preferred = os.environ.get("BIOXP_USB_SNIFF_IFACE") or "usbmon2"
+            if preferred in interfaces:
+                probe.update({"available": True, "mode": "tcpdump_pcap", "interface": preferred, "reason": "tcpdump_usbmon_interface_available"})
+                return probe
+            for name in interfaces:
+                if name.startswith("usbmon"):
+                    probe.update({"available": True, "mode": "tcpdump_pcap", "interface": name, "reason": "tcpdump_usbmon_interface_available"})
+                    return probe
+        else:
+            probe["tcpdump_D"] = {"ok": False, "returncode": None, "error": "tcpdump_not_installed_in_runtime"}
+
+        # Fallback: the robot handler runs as root inside the udocker/proot runtime,
+        # where tcpdump may be absent but debugfs usbmon text streams can be readable.
+        # This is still packet-level IN/OUT evidence, just not pcapng.
+        candidates = []
+        env_path = os.environ.get("BIOXP_USBMON_TEXT_PATH")
+        if env_path:
+            candidates.append(env_path)
+        bus_hint = os.environ.get("BIOXP_USBMON_BUS") or "2"
+        candidates.extend([
+            f"/sys/kernel/debug/usb/usbmon/{bus_hint}u",
+            f"/sys/kernel/debug/usb/usbmon/{bus_hint}t",
+            "/sys/kernel/debug/usb/usbmon/0u",
+            "/sys/kernel/debug/usb/usbmon/0t",
+        ])
+        checked = []
+        for path in candidates:
+            if not path or path in checked:
+                continue
+            checked.append(path)
+            try:
+                if os.path.exists(path) and os.access(path, os.R_OK):
+                    probe.update({"available": True, "mode": "usbmon_text", "interface": path, "reason": "debugfs_usbmon_text_available", "checked_paths": checked})
+                    return probe
+            except Exception:
+                continue
+        probe["checked_paths"] = checked
+        probe["reason"] = "usbmon_not_visible_to_service_user" if tcpdump else "tcpdump_not_installed_and_usbmon_text_not_readable"
+        return probe
+
+    def _status_payload_locked(self) -> dict[str, Any]:
+        active = self._active
+        runs = self._list_runs_locked(limit=8)
+        pcap = self._pcap_probe()
+        return {
+            "ok": True,
+            "available": True,
+            "active": active is not None,
+            "current_run": self._public_run(active) if active else None,
+            "latest_run": runs[0] if runs else None,
+            "runs": runs,
+            "capture_only": True,
+            "safety_boundary": {
+                "homes_axes": False,
+                "arms_motion": False,
+                "recovers_motion": False,
+                "commands_axis_motion": False,
+                "requires_operator_ack": USB_SNIFF_ACK,
+            },
+            "capabilities": {
+                "driver_ledger": True,
+                "pcap": bool(pcap.get("available")),
+                "pcap_probe": pcap,
+                "export_bundle": True,
+                "tail": True,
+            },
+            "root": self.root,
+            "target": {"vid_pid": "03eb:2423", "endpoints": {"in": "0x81", "out": "0x02"}, "speed": "full-speed 12M"},
+            "warnings": [] if pcap.get("available") else ["kernel usbmon pcap is not visible to the bioxp-api service user; driver ledger can still run, but full packet capture needs usbmon/debugfs privilege"],
+        }
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._status_payload_locked()
+
+    def _public_run(self, run: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not run:
+            return None
+        return {k: v for k, v in run.items() if k not in {"process", "timer"}}
+
+    def _run_summary_from_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+        return {
+            "run_id": manifest.get("run_id"),
+            "status": manifest.get("status"),
+            "profile": manifest.get("profile"),
+            "reason": manifest.get("reason"),
+            "operator": manifest.get("operator"),
+            "started_at": manifest.get("started_at"),
+            "ended_at": manifest.get("ended_at"),
+            "duration_s": manifest.get("duration_s"),
+            "run_dir": manifest.get("run_dir"),
+            "pcap_available": bool(((manifest.get("capabilities") or {}).get("pcap_probe") or {}).get("available")),
+            "driver_ledger": bool(files.get("driver_ledger")),
+            "pcap": bool(files.get("pcap")),
+            "export": files.get("export"),
+            "packet_accounting": manifest.get("packet_accounting"),
+            "warnings": manifest.get("warnings") or [],
+        }
+
+    def _list_runs_locked(self, limit: int | None = None) -> list[dict[str, Any]]:
+        self._ensure_root()
+        rows = []
+        for name in os.listdir(self.root):
+            if name.startswith("."):
+                continue
+            mpath = os.path.join(self.root, name, "manifest.json")
+            if not os.path.exists(mpath):
+                continue
+            manifest = self._read_json(mpath, {})
+            if isinstance(manifest, dict):
+                rows.append(self._run_summary_from_manifest(manifest))
+        rows.sort(key=lambda row: str(row.get("started_at") or row.get("run_id") or ""), reverse=True)
+        return rows[:limit] if limit else rows
+
+    def runs(self) -> dict[str, Any]:
+        with self._lock:
+            return {"ok": True, "available": True, "active": self._active is not None, "runs": self._list_runs_locked(limit=50)}
+
+    def _new_run_id(self) -> str:
+        return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
+
+    def _start_pcap(self, run_dir: str, pcap_probe: dict[str, Any]) -> tuple[subprocess.Popen | None, str | None, dict[str, Any]]:
+        if not pcap_probe.get("available"):
+            return None, None, {"started": False, "reason": pcap_probe.get("reason") or "pcap_unavailable"}
+        mode = str(pcap_probe.get("mode") or "tcpdump_pcap")
+        iface = str(pcap_probe.get("interface") or "usbmon2")
+        if mode == "usbmon_text":
+            capture_path = os.path.join(run_dir, "usbmon_capture.txt")
+            log_path = os.path.join(run_dir, "usbmon_text.log")
+            cmd = ["cat", iface]
+            out_handle = open(capture_path, "ab")
+            log_handle = open(log_path, "ab")
+            try:
+                proc = subprocess.Popen(cmd, stdout=out_handle, stderr=log_handle)
+            except Exception as exc:
+                out_handle.close()
+                log_handle.close()
+                return None, None, {"started": False, "reason": "usbmon_text_start_failed", "error": str(exc), "command": cmd}
+            return proc, capture_path, {"started": True, "pid": proc.pid, "mode": mode, "interface": iface, "command": cmd, "log": log_path, "format": "linux_usbmon_text"}
+        tcpdump = str(pcap_probe.get("tool") or "tcpdump")
+        pcap_path = os.path.join(run_dir, "usbmon_capture.pcap")
+        log_path = os.path.join(run_dir, "tcpdump.log")
+        cmd = [tcpdump, "-i", iface, "-w", pcap_path, "-U", "-s", "0"]
+        log_handle = open(log_path, "ab")
+        try:
+            proc = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            log_handle.close()
+            return None, None, {"started": False, "reason": "tcpdump_start_failed", "error": str(exc), "command": cmd}
+        return proc, pcap_path, {"started": True, "pid": proc.pid, "mode": mode, "interface": iface, "command": cmd, "log": log_path, "format": "pcap"}
+
+    def start(self, req: "UsbSniffCaptureRequest") -> dict[str, Any]:
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        if str(payload.get("operator_ack") or "") != USB_SNIFF_ACK:
+            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture")
+        reason = str(payload.get("reason") or "").strip()
+        if not reason:
+            raise HTTPException(status_code=409, detail="reason is required for USB packet capture")
+        profile = str(payload.get("profile") or "passive")
+        if profile not in USB_SNIFF_PROFILES:
+            raise HTTPException(status_code=400, detail=f"profile must be one of {sorted(USB_SNIFF_PROFILES)}")
+        duration_s = max(1, min(1800, int(payload.get("duration_s") or 300)))
+        with self._lock:
+            if self._active is not None:
+                if bool(payload.get("stop_existing")):
+                    self._stop_locked(reason="replaced by new USB capture", operator=str(payload.get("operator") or "bms-cockpit"))
+                else:
+                    raise HTTPException(status_code=409, detail={"error": "usb_sniff_already_active", "current_run": self._public_run(self._active)})
+            self._ensure_root()
+            run_id = self._new_run_id()
+            run_dir = self._run_dir(run_id)
+            os.makedirs(run_dir, exist_ok=False)
+            ledger_path = os.path.join(run_dir, "driver_ledger.jsonl")
+            event_path = os.path.join(run_dir, "events.jsonl")
+            manifest_path = os.path.join(run_dir, "manifest.json")
+            pcap_probe = self._pcap_probe()
+            inventory = self._usb_inventory()
+            pcap_proc = None
+            pcap_path = None
+            pcap_start = {"started": False, "reason": "not_requested"}
+            if bool(payload.get("include_pcap", True)):
+                pcap_proc, pcap_path, pcap_start = self._start_pcap(run_dir, pcap_probe)
+            tester = None
+            driver_ledger_enabled = False
+            driver_ledger_result: dict[str, Any] = {"enabled": False, "reason": "not_requested"}
+            if bool(payload.get("include_driver_ledger", True)):
+                try:
+                    tester = _get_tester()
+                    enable = getattr(tester, "set_usb_sniff_ledger_path", None)
+                    if callable(enable):
+                        driver_ledger_result = enable(ledger_path, run_id=run_id)
+                        driver_ledger_enabled = bool(driver_ledger_result.get("enabled"))
+                    else:
+                        driver_ledger_result = {"enabled": False, "error": "BioXpTester lacks set_usb_sniff_ledger_path"}
+                except Exception as exc:
+                    driver_ledger_result = {"enabled": False, "error": str(exc)}
+            warnings = []
+            if bool(payload.get("include_pcap", True)) and not bool(pcap_start.get("started")):
+                warnings.append(f"pcap_not_active:{pcap_start.get('reason')}")
+            if bool(payload.get("include_driver_ledger", True)) and not driver_ledger_enabled:
+                warnings.append("driver_ledger_not_active")
+            if bool(payload.get("include_pcap", True)) and bool(payload.get("include_driver_ledger", True)) and not bool(pcap_start.get("started")) and not driver_ledger_enabled:
+                raise HTTPException(status_code=503, detail={"error": "no_usb_capture_channel_available", "pcap": pcap_start, "driver_ledger": driver_ledger_result})
+            run = {
+                "run_id": run_id,
+                "status": "active",
+                "profile": profile,
+                "duration_s": duration_s,
+                "passive_only": bool(payload.get("passive_only", True)),
+                "reason": reason,
+                "operator": str(payload.get("operator") or "bms-cockpit"),
+                "started_at": _now_utc(),
+                "run_dir": run_dir,
+                "manifest_path": manifest_path,
+                "ledger_path": ledger_path if driver_ledger_enabled else None,
+                "event_path": event_path,
+                "pcap_path": pcap_path,
+                "process": pcap_proc,
+                "pcap_start": pcap_start,
+                "driver_ledger": driver_ledger_result,
+                "warnings": warnings,
+            }
+            manifest = dict(run)
+            manifest.pop("process", None)
+            manifest["schema_version"] = "bioxp.usb_sniff_run.v1"
+            manifest["capture_only"] = True
+            manifest["safety_boundary"] = {"homes_axes": False, "arms_motion": False, "recovers_motion": False, "commands_axis_motion": False}
+            manifest["capabilities"] = {"pcap_probe": pcap_probe, "driver_ledger": driver_ledger_result}
+            manifest["usb_inventory"] = inventory
+            manifest["files"] = {"manifest": manifest_path, "driver_ledger": ledger_path if driver_ledger_enabled else None, "pcap": pcap_path, "events": event_path}
+            manifest["packet_accounting"] = {"driver_ledger_lines": 0, "pcap_size_bytes": 0, "unmatched_frames": None, "status": "pending"}
+            self._write_json(manifest_path, manifest)
+            self._append_jsonl(event_path, {"at": _now_utc(), "event": "start", "run_id": run_id, "pcap": pcap_start, "driver_ledger": driver_ledger_result})
+            timer = threading.Timer(duration_s, lambda: self.stop(reason="duration elapsed", operator="auto_timer"))
+            timer.daemon = True
+            timer.start()
+            run["timer"] = timer
+            self._active = run
+            self._latest_run_id = run_id
+            return {"ok": True, "available": True, "active": True, "current_run": self._public_run(run), "status": self._status_payload_locked()}
+
+    def _ledger_line_count(self, path: str | None) -> int:
+        if not path or not os.path.exists(path):
+            return 0
+        try:
+            with open(path, "rb") as handle:
+                return sum(1 for _ in handle)
+        except Exception:
+            return 0
+
+    def _file_sha256(self, path: str) -> str | None:
+        if not path or not os.path.exists(path):
+            return None
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def _finalize_manifest(self, run: dict[str, Any], *, status: str, reason: str, operator: str) -> dict[str, Any]:
+        manifest_path = str(run.get("manifest_path"))
+        manifest = self._read_json(manifest_path, {})
+        if not isinstance(manifest, dict):
+            manifest = {}
+        manifest.update({
+            "run_id": run.get("run_id"),
+            "status": status,
+            "ended_at": _now_utc(),
+            "stop_reason": reason,
+            "stop_operator": operator,
+            "run_dir": run.get("run_dir"),
+        })
+        files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+        for key in ("driver_ledger", "pcap", "events"):
+            path = files.get(key)
+            if path and os.path.exists(path):
+                files[f"{key}_size_bytes"] = os.path.getsize(path)
+                files[f"{key}_sha256"] = self._file_sha256(path)
+        manifest["files"] = files
+        manifest["packet_accounting"] = {
+            "driver_ledger_lines": self._ledger_line_count(files.get("driver_ledger")),
+            "pcap_size_bytes": os.path.getsize(files.get("pcap")) if files.get("pcap") and os.path.exists(files.get("pcap")) else 0,
+            "unmatched_frames": None,
+            "status": "pcap_and_driver_reconciliation_pending" if files.get("pcap") and files.get("driver_ledger") else "partial_capture_channel",
+        }
+        self._write_json(manifest_path, manifest)
+        return manifest
+
+    def _stop_locked(self, *, reason: str, operator: str) -> dict[str, Any]:
+        run = self._active
+        if run is None:
+            return {"ok": True, "available": True, "active": False, "message": "no active USB capture", "latest_run": self._list_runs_locked(limit=1)[0] if self._list_runs_locked(limit=1) else None}
+        timer = run.get("timer")
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        proc = run.get("process")
+        pcap_stop: dict[str, Any] = {"stopped": False, "reason": "no_process"}
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=4)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=4)
+                pcap_stop = {"stopped": True, "returncode": proc.returncode}
+            except Exception as exc:
+                pcap_stop = {"stopped": False, "error": str(exc)}
+        try:
+            tester = _get_tester()
+            disable = getattr(tester, "set_usb_sniff_ledger_path", None)
+            if callable(disable):
+                disable(None, run_id=str(run.get("run_id") or ""))
+        except Exception:
+            pass
+        event_path = run.get("event_path")
+        if event_path:
+            self._append_jsonl(str(event_path), {"at": _now_utc(), "event": "stop", "run_id": run.get("run_id"), "reason": reason, "operator": operator, "pcap_stop": pcap_stop})
+        manifest = self._finalize_manifest(run, status="stopped", reason=reason, operator=operator)
+        self._latest_run_id = str(run.get("run_id") or self._latest_run_id or "")
+        self._active = None
+        return {"ok": True, "available": True, "active": False, "stopped_run": self._run_summary_from_manifest(manifest), "pcap_stop": pcap_stop, "status": self._status_payload_locked()}
+
+    def stop(self, *, reason: str = "operator stopped USB capture", operator: str = "bms-cockpit") -> dict[str, Any]:
+        with self._lock:
+            return self._stop_locked(reason=reason, operator=operator)
+
+    def _resolve_run_id_locked(self, run_id: str | None = None) -> str:
+        if run_id:
+            return self._safe_run_id(run_id)
+        if self._active is not None:
+            return str(self._active.get("run_id"))
+        if self._latest_run_id:
+            return self._latest_run_id
+        rows = self._list_runs_locked(limit=1)
+        if rows:
+            return str(rows[0].get("run_id"))
+        raise HTTPException(status_code=404, detail="no USB capture run available")
+
+    def tail(self, run_id: str, limit: int = 200) -> dict[str, Any]:
+        limit = max(1, min(1000, int(limit or 200)))
+        with self._lock:
+            rid = self._safe_run_id(run_id)
+            run_dir = self._run_dir(rid)
+            ledger = os.path.join(run_dir, "driver_ledger.jsonl")
+            events = os.path.join(run_dir, "events.jsonl")
+            rows: list[str] = []
+            for path in [ledger, events]:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                        rows.extend(handle.readlines()[-limit:])
+                except Exception:
+                    continue
+            rows = rows[-limit:]
+            parsed = []
+            for line in rows:
+                try:
+                    parsed.append(json.loads(line))
+                except Exception:
+                    parsed.append({"raw": line.rstrip("\n")})
+            return {"ok": True, "run_id": rid, "limit": limit, "lines": [line.rstrip("\n") for line in rows], "events": parsed}
+
+    def files(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            rid = self._safe_run_id(run_id)
+            run_dir = self._run_dir(rid)
+            if not os.path.isdir(run_dir):
+                raise HTTPException(status_code=404, detail="USB capture run not found")
+            files = []
+            for name in sorted(os.listdir(run_dir)):
+                path = os.path.join(run_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                files.append({"name": name, "path": path, "size_bytes": os.path.getsize(path), "sha256": self._file_sha256(path)})
+            return {"ok": True, "run_id": rid, "run_dir": run_dir, "files": files}
+
+    def export(self, run_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            rid = self._resolve_run_id_locked(run_id)
+            run_dir = self._run_dir(rid)
+            if not os.path.isdir(run_dir):
+                raise HTTPException(status_code=404, detail="USB capture run not found")
+            export_path = os.path.join(run_dir, f"{rid}.tar.gz")
+            with tarfile.open(export_path, "w:gz") as tar:
+                for name in sorted(os.listdir(run_dir)):
+                    path = os.path.join(run_dir, name)
+                    if os.path.isfile(path) and path != export_path:
+                        tar.add(path, arcname=os.path.join(rid, name))
+            manifest_path = os.path.join(run_dir, "manifest.json")
+            manifest = self._read_json(manifest_path, {})
+            if isinstance(manifest, dict):
+                files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+                files["export"] = export_path
+                files["export_size_bytes"] = os.path.getsize(export_path)
+                files["export_sha256"] = self._file_sha256(export_path)
+                manifest["files"] = files
+                self._write_json(manifest_path, manifest)
+            return {"ok": True, "run_id": rid, "export_path": export_path, "size_bytes": os.path.getsize(export_path), "sha256": self._file_sha256(export_path), "files": self.files(rid)["files"]}
+
+
+_usb_sniff_manager = UsbSniffManager()
 
 
 async def _run_blocking(label: str, func, timeout_s: float = 30.0):
@@ -2717,14 +3655,12 @@ async def motion_interlock_override_set(req: MotionInterlockOverrideRequest):
     if not bool(req.enabled):
         override_latch = False
         override_rail = False
-    reason_parts = ["api_interlock_override"]
-    if req.operator_note:
-        reason_parts.append(str(req.operator_note)[:2000])
+    reason = _motion_interlock_override_reason(req)
     return await _run_blocking(
         "Motion interlock override set",
         lambda: tester.motion_latch_override_set(
             enabled=bool(req.enabled),
-            reason=" | ".join(reason_parts),
+            reason=reason,
             override_latch_sensor=override_latch,
             override_rail_24v=override_rail,
         ),
@@ -2919,6 +3855,8 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
         finally:
             restore_standby = tester.motor_set_axis_param(board, 7, int(preset.get("standby_current", OEM_IDLE_STANDBY_CURRENT)), motor=motor)
             restore_current = tester.motor_set_axis_param(board, 6, int(preset.get("restore_current", OEM_IDLE_STANDBY_CURRENT)), motor=motor)
+            if hasattr(tester, "motor_restore_gripper_idle_current"):
+                restore_current = tester.motor_restore_gripper_idle_current(reason="gripper_clear_finally")
         result = {
             "set_gripper_standby_idle": set_standby,
             "set_gripper_current_31_for_move": set_current,
@@ -3259,6 +4197,55 @@ async def motion_reference_mark_desynced(req: ReferenceDesyncRequest):
             motion_kind="manual_desync",
         )
     )
+
+
+@app.get("/diagnostics/usb-sniff/status")
+async def diagnostics_usb_sniff_status():
+    return _usb_sniff_manager.status()
+
+
+@app.get("/diagnostics/usb-sniff/runs")
+async def diagnostics_usb_sniff_runs():
+    return _usb_sniff_manager.runs()
+
+
+@app.post("/diagnostics/usb-sniff/start")
+async def diagnostics_usb_sniff_start(req: UsbSniffCaptureRequest):
+    return _usb_sniff_manager.start(req)
+
+
+@app.post("/diagnostics/usb-sniff/stop")
+async def diagnostics_usb_sniff_stop(req: UsbSniffCaptureRequest | None = None):
+    reason = "operator stopped USB packet capture"
+    operator = "bms-cockpit"
+    if req is not None:
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        if str(payload.get("operator_ack") or "") != USB_SNIFF_ACK:
+            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture stop")
+        reason = str(payload.get("reason") or reason).strip() or reason
+        operator = str(payload.get("operator") or operator)
+    return _usb_sniff_manager.stop(reason=reason, operator=operator)
+
+
+@app.post("/diagnostics/usb-sniff/export")
+async def diagnostics_usb_sniff_export(req: UsbSniffCaptureRequest | None = None):
+    run_id = None
+    if req is not None:
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        if payload.get("operator_ack") and str(payload.get("operator_ack")) != USB_SNIFF_ACK:
+            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture export")
+        run_id = payload.get("run_id")
+    return _usb_sniff_manager.export(run_id=run_id)
+
+
+@app.get("/diagnostics/usb-sniff/runs/{run_id}/tail")
+async def diagnostics_usb_sniff_tail(run_id: str, limit: int = Query(200, ge=1, le=1000)):
+    return _usb_sniff_manager.tail(run_id, limit=limit)
+
+
+@app.get("/diagnostics/usb-sniff/runs/{run_id}/files")
+async def diagnostics_usb_sniff_files(run_id: str):
+    return _usb_sniff_manager.files(run_id)
 
 
 @app.post("/thermal/baseline")
