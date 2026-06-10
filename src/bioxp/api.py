@@ -18,6 +18,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_config import harmonized_motion_config
+from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gripper_idle_current
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
 from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
@@ -635,6 +636,19 @@ class MaintenanceRecoverMotionRequest(BaseModel):
 class OemStartupStepRequest(BaseModel):
     step: str = Field(..., pattern=r"^(z-home|gripper-clear|gripper-home|x-home|x-park-6000|y-home|door-home|y-set-home)$")
     timeout_s: float = Field(25.0, gt=0.1, le=90.0)
+
+
+class GripperActionRequest(BaseModel):
+    operator_ack: str = Field(..., description="Must be GRIPPER_CLEAR or GRIPPER_HOME depending on the operation.")
+    reason: str = Field(..., min_length=1, max_length=2000)
+    timeout_s: float = Field(15.0, gt=0.1, le=90.0)
+    capture_bundle: bool = False
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
+class GripperRestoreIdleRequest(BaseModel):
+    reason: str = Field("operator_restore_idle_current", max_length=2000)
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
 
 
 class OemHomeXYRequest(BaseModel):
@@ -3831,45 +3845,19 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
             "z_reference_return_skipped": not home_ok,
         }
     elif step == "gripper-clear":
-        preset = tester._motion_oem_axis_profile("g", startup=True)
-        board = preset["board"]
-        motor = preset["motor"]
-        set_standby = None
-        set_current = None
-        move = None
-        wait = None
-        restore_standby = None
-        restore_current = None
-        try:
-            # Source-shaped operation current is high only while the gripper is doing work.
-            # Keep standby/hold at OEM idle and always restore param6 to the hold current.
-            set_standby = tester.motor_set_axis_param(board, 7, int(preset.get("standby_current", OEM_IDLE_STANDBY_CURRENT)), motor=motor)
-            set_current = tester.motor_set_axis_param(board, 6, 31, motor=motor)
-            move = tester.motor_move_relative(board, 10000, motor=motor)
-            wait = tester.motor_wait_stopped(
-                board,
-                motor=motor,
-                timeout_s=min(float(timeout_s), 12.0),
-                require_seen_nonzero=True,
-            )
-        finally:
-            restore_standby = tester.motor_set_axis_param(board, 7, int(preset.get("standby_current", OEM_IDLE_STANDBY_CURRENT)), motor=motor)
-            restore_current = tester.motor_set_axis_param(board, 6, int(preset.get("restore_current", OEM_IDLE_STANDBY_CURRENT)), motor=motor)
-            if hasattr(tester, "motor_restore_gripper_idle_current"):
-                restore_current = tester.motor_restore_gripper_idle_current(reason="gripper_clear_finally")
-        result = {
-            "set_gripper_standby_idle": set_standby,
-            "set_gripper_current_31_for_move": set_current,
-            "move_steps_10000": move,
-            "wait": wait,
-            "restore_gripper_standby_idle": restore_standby,
-            "restore_gripper_hold_current": restore_current,
-            "oem_current_semantics": "high current only during gripper action; restore hold current after action",
-        }
-        if not (isinstance(move, dict) and move.get("ok") and isinstance(wait, dict) and wait.get("stopped") is True):
-            raise HTTPException(status_code=409, detail={"error": "OEM gripper clear failed/ambiguous", "result": result})
+        result = gripper_clear(
+            tester,
+            operator_ack="GRIPPER_CLEAR",
+            reason="OEM startup_step gripper-clear",
+            timeout_s=timeout_s,
+        )
     elif step == "gripper-home":
-        result = tester.motor_oem_home_axis("g", startup=True, timeout_s=timeout_s)
+        result = gripper_home(
+            tester,
+            operator_ack="GRIPPER_HOME",
+            reason="OEM startup_step gripper-home",
+            timeout_s=timeout_s,
+        )
     elif step == "x-home":
         result = tester.motor_oem_home_axis("x", startup=True, timeout_s=timeout_s)
     elif step == "x-park-6000":
@@ -3980,6 +3968,48 @@ def _execute_oem_initialize_motion(
         },
         "result": result,
     }
+
+
+@app.get("/motion/gripper/status")
+async def motion_gripper_status():
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper status",
+        lambda: gripper_status(tester),
+        timeout_s=20.0,
+    )
+
+
+@app.post("/motion/gripper/restore_idle_current")
+async def motion_gripper_restore_idle_current(req: GripperRestoreIdleRequest):
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper restore idle current",
+        lambda: restore_gripper_idle_current(tester, reason=req.reason),
+        timeout_s=20.0,
+    )
+
+
+@app.post("/motion/gripper/clear")
+async def motion_gripper_clear(req: GripperActionRequest):
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper clear",
+        lambda: gripper_clear(tester, operator_ack=req.operator_ack, reason=req.reason, timeout_s=req.timeout_s),
+        timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 120.0),
+    )
+
+
+@app.post("/motion/gripper/home")
+async def motion_gripper_home(req: GripperActionRequest):
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper home",
+        lambda: gripper_home(tester, operator_ack=req.operator_ack, reason=req.reason, timeout_s=req.timeout_s),
+        timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 120.0),
+    )
 
 
 @app.post("/motion/oem/startup_step")
