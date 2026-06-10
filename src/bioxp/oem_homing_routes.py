@@ -11,11 +11,31 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from .oem_config import find_oem_machine_config_bundle
 from .oem_homing_runtime import OemHomingDryRunRuntime
 from .oem_homing_spec import all_programs, get_program
 from .oem_shadow_readback_live import build_shadow_readback_artifact
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
+
+
+
+
+@router.get("/motion/oem/machine_config")
+async def get_oem_machine_config(root_dir: str | None = None) -> dict[str, Any]:
+    """Return read-only OEM machine config binding/provenance.
+
+    This endpoint parses extracted original-SSD appdata config files only. It
+    does not open USB, talk to CAN, command motion, mutate reference state, or
+    make homing decisions. Secrets/serial are redacted from the response.
+    """
+    result = find_oem_machine_config_bundle(root_dir)
+    result.setdefault("opened_usb", False)
+    result.setdefault("physical_motion", False)
+    result.setdefault("motion_commanded", False)
+    result.setdefault("current_mutation_commanded", False)
+    result.setdefault("switch_mask_mutation_commanded", False)
+    return result
 
 
 @router.get("/motion/oem/programs")
