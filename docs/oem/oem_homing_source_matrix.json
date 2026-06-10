@@ -1,0 +1,1130 @@
+{
+  "axis_to_board": {
+    "door": {
+      "board": "thermal/CAN6",
+      "motor": 0,
+      "oem_designator": "ThermalDoor"
+    },
+    "g": {
+      "board": "head/CAN4",
+      "motor": 2,
+      "oem_designator": "MotorGrip"
+    },
+    "x": {
+      "board": "deck/CAN5",
+      "motor": 0,
+      "oem_designator": "MotorX"
+    },
+    "y": {
+      "board": "head/CAN4",
+      "motor": 0,
+      "oem_designator": "MotorY"
+    },
+    "z": {
+      "board": "head/CAN4",
+      "motor": 1,
+      "oem_designator": "MotorZ"
+    }
+  },
+  "board_primitives": {
+    "axisSearchHome.deck": {
+      "file": "ClassCanLib/ClassDeckBoard.cs",
+      "lines": "362-380",
+      "note": "setHome; optional preclear to 10000; MotorHome=false; goHome(false)",
+      "symbol": "ClassDeckBoard.axisSearchHome"
+    },
+    "axisSearchHome.head": {
+      "file": "ClassCanLib/ClassHeadBoard.cs",
+      "lines": "368-386",
+      "note": "setHome; optional preclear to 10000; MotorHome=false; goHome(false)",
+      "symbol": "ClassHeadBoard.axisSearchHome"
+    },
+    "axisSearchHome.thermal": {
+      "file": "ClassCanLib/ClassThermalBoard.cs",
+      "lines": "412-430",
+      "note": "setHome; optional preclear to 10000; MotorHome=false; goHome(false)",
+      "symbol": "ClassThermalBoard.axisSearchHome"
+    },
+    "doorSearchHome.deck": {
+      "file": "ClassCanLib/ClassDeckBoard.cs",
+      "lines": "318-360",
+      "note": "stallguard preclear then stall/home search",
+      "symbol": "ClassDeckBoard.doorSearchHome"
+    },
+    "doorSearchHome.head": {
+      "file": "ClassCanLib/ClassHeadBoard.cs",
+      "lines": "320-362",
+      "note": "stallguard preclear then stall/home search",
+      "symbol": "ClassHeadBoard.doorSearchHome"
+    },
+    "doorSearchHome.thermal": {
+      "file": "ClassCanLib/ClassThermalBoard.cs",
+      "lines": "364-410",
+      "note": "thermal door throws if calibrated and home not found",
+      "symbol": "ClassThermalBoard.doorSearchHome"
+    },
+    "goHome.deck": {
+      "file": "ClassCanLib/ClassDeckBoard.cs",
+      "lines": "73-132",
+      "note": "move-left search, stop on home, setHome",
+      "symbol": "ClassDeckBoard.goHome"
+    },
+    "goHome.head": {
+      "file": "ClassCanLib/ClassHeadBoard.cs",
+      "lines": "60-119",
+      "note": "same host algorithm for head-board axes",
+      "symbol": "ClassHeadBoard.goHome"
+    },
+    "goHome.thermal": {
+      "file": "ClassCanLib/ClassThermalBoard.cs",
+      "lines": "118-177",
+      "note": "same host algorithm for thermal-board motor",
+      "symbol": "ClassThermalBoard.goHome"
+    },
+    "queryHome.deck": {
+      "file": "ClassCanLib/ClassDeckBoard.cs",
+      "lines": "383-395",
+      "note": "left switch status 0 means home true",
+      "symbol": "ClassDeckBoard.queryHome"
+    },
+    "queryHome.head": {
+      "file": "ClassCanLib/ClassHeadBoard.cs",
+      "lines": "389-401",
+      "note": "left switch status 0 means home true",
+      "symbol": "ClassHeadBoard.queryHome"
+    },
+    "queryHome.thermal": {
+      "file": "ClassCanLib/ClassThermalBoard.cs",
+      "lines": "433-445",
+      "note": "left switch status 0 means home true",
+      "symbol": "ClassThermalBoard.queryHome"
+    },
+    "queryLeftSwitchStatus.motor": {
+      "file": "ClassCanLib/ClassMotor.cs",
+      "lines": "641-664",
+      "note": "CAN payload {6,9,axis,...}; reply byte 6 == 1 returns 0",
+      "symbol": "ClassMotor.queryLeftSwitchStatus"
+    },
+    "queryRightSensor.deck": {
+      "file": "ClassCanLib/ClassDeckBoard.cs",
+      "lines": "397-409",
+      "note": "right switch status 0 means right sensor true",
+      "symbol": "ClassDeckBoard.queryRightSensor"
+    },
+    "queryRightSwitchStatus.motor": {
+      "file": "ClassCanLib/ClassMotor.cs",
+      "lines": "666-689",
+      "note": "CAN payload {6,10,axis,...}; reply byte 6 == 1 returns 0",
+      "symbol": "ClassMotor.queryRightSwitchStatus"
+    },
+    "setHome.motor": {
+      "file": "ClassCanLib/ClassMotor.cs",
+      "lines": "492-517",
+      "note": "sets current position 0, clears stall, CAN payload {5,1,axis,...}",
+      "symbol": "ClassMotor.setHome"
+    }
+  },
+  "deviations_to_live_linux": [
+    "Current live Linux homing is a guarded reconstruction with safety/workaround paths, not a clean line-by-line port.",
+    "Z startup may use a live GAP10/controller-zero reference workaround; source model keeps that separate from OEM ClassHeadBoard.queryHome/GAP9 provenance.",
+    "BMS /api/bioxp/* is a proxy/linkage layer and may not expose every raw FastAPI route."
+  ],
+  "live_target_mappings": [
+    {
+      "deviations": [
+        "Constants are partly reconstructed/defaulted without recovered machine config.xml."
+      ],
+      "source_mode": "initializeMotorsWithoutMotion",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3397,
+      "target_status": "implemented_source_shaped_setup",
+      "target_symbol": "BioXpTester.motor_oem_initialize_without_motion"
+    },
+    {
+      "deviations": [
+        "Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.",
+        "Live adaptations exist for axes whose raw switches were non-informative."
+      ],
+      "source_mode": "initializeMotors/startup_step",
+      "target_file": "src/bioxp/api.py",
+      "target_line": 2714,
+      "target_status": "stepwise_guarded_subset_not_monolithic_oem",
+      "target_symbol": "motion_oem_startup_step / _execute_oem_startup_step"
+    },
+    {
+      "deviations": [
+        "Poll/guard implementation is Linux reconstruction of board primitive semantics.",
+        "Z startup may bypass source GAP9 search via GAP10/controller-zero workaround."
+      ],
+      "source_mode": "startup axisSearchHome",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3418,
+      "target_status": "partial_guarded_reconstruction",
+      "target_symbol": "BioXpTester.motor_oem_axis_search_home"
+    },
+    {
+      "deviations": [
+        "Manual /motion/axis/home has known Z/X failure incidents and must not be treated as proven true homing.",
+        "Requires switch deassert->active proof before setHome/reporting reference."
+      ],
+      "source_mode": "manual button goHome(true)",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3510,
+      "target_status": "unsafe_until_predicate_matrix_fixed",
+      "target_symbol": "BioXpTester.motor_oem_go_home / motor_oem_home_axis(startup=False)"
+    },
+    {
+      "deviations": [
+        "Door search is implemented separately but still needs physical predicate proof for parity."
+      ],
+      "source_mode": "doorSearchHome",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3725,
+      "target_status": "partial_guarded_reconstruction",
+      "target_symbol": "BioXpTester.motor_oem_door_search_home"
+    },
+    {
+      "deviations": [
+        "Current public home route routes through Linux helper selection, not a direct HomeAxis source clone."
+      ],
+      "source_mode": "HomeAxis",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3787,
+      "target_status": "not_clean_one_to_one_port",
+      "target_symbol": "BioXpTester.motor_oem_switch_search_home_axis / motor_oem_home_axis"
+    },
+    {
+      "deviations": [
+        "No direct parallel HomeXY source-mode implementation identified in current live code."
+      ],
+      "source_mode": "HomeXY",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 0,
+      "target_status": "missing_direct_port",
+      "target_symbol": "no direct one-to-one function found"
+    },
+    {
+      "deviations": [
+        "Door-state save/restore wrapper semantics are not represented as a clean ControlLib.rehome port."
+      ],
+      "source_mode": "ControlLib.rehome",
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 4003,
+      "target_status": "approximated_by_stepwise_startup_not_rehome_wrapper",
+      "target_symbol": "motor_startup_homing_mimic / startup_step routes"
+    },
+    {
+      "deviations": [
+        "Includes artifacts/readiness gates and separates live motion; not a full OEM initializeMotion clone."
+      ],
+      "source_mode": "ControlLib.initializeMotion",
+      "target_file": "src/bioxp/oem_startup_program.py",
+      "target_line": 461,
+      "target_status": "artifact_state_machine_not_full_live_motion_equivalent",
+      "target_symbol": "OEMStartupProgram.request_startup"
+    }
+  ],
+  "manual_home": {
+    "door": [
+      {
+        "axis": "door",
+        "board": "thermal/CAN6",
+        "motor": 0,
+        "name": "manual.door.doorSearchHome",
+        "notes": [],
+        "operation": "doorSearchHome",
+        "params": {
+          "speed": "TC_DOOR_VELOCITY",
+          "stallguard": "TCDoorStallGuardThreshold"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "1224-1240",
+          "note": "",
+          "symbol": "btnDHome_Click"
+        }
+      }
+    ],
+    "g": [
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "manual.g.current_high",
+        "notes": [],
+        "operation": "setMaxCurrent",
+        "params": {
+          "run_current": 31
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2046-2054",
+          "note": "",
+          "symbol": "btnGripperHome_Click"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "manual.g.goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": true,
+          "speed": "600 or 200 by GripperVersion",
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2059-2064",
+          "note": "",
+          "symbol": "btnGripperHome_Click"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "manual.g.restore_current",
+        "notes": [],
+        "operation": "setMaxCurrent",
+        "params": {
+          "condition": "GripperVersion == 1",
+          "run_current": 10
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2065-2069",
+          "note": "",
+          "symbol": "btnGripperHome_Click"
+        }
+      }
+    ],
+    "x": [
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "manual.x.goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": true,
+          "speed": 500,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2262-2274",
+          "note": "",
+          "symbol": "btnHomeX_Click"
+        }
+      }
+    ],
+    "y": [
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "manual.y.goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": true,
+          "speed": 500,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2302-2314",
+          "note": "",
+          "symbol": "btnHomeY_Click"
+        }
+      }
+    ],
+    "z": [
+      {
+        "axis": "z",
+        "board": "head/CAN4",
+        "motor": 1,
+        "name": "manual.z.goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": true,
+          "speed": 1791,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "2350-2362",
+          "note": "",
+          "symbol": "btnHomeZ_Click"
+        }
+      }
+    ]
+  },
+  "raw_fastapi_route_table": [
+    {
+      "classification": "stepwise initializeMotors subset",
+      "methods": "POST",
+      "name": "motion_oem_startup_step",
+      "path": "/motion/oem/startup_step"
+    },
+    {
+      "classification": "manual/goHome-style route",
+      "methods": "POST",
+      "name": "home_axis",
+      "path": "/motion/axis/home"
+    },
+    {
+      "classification": "Linux absolute controller-zero, not OEM homing",
+      "methods": "POST",
+      "name": "move_axis_zero",
+      "path": "/motion/axis/zero"
+    },
+    {
+      "classification": "strict startup arm; homing guarded/blocked by policy",
+      "methods": "POST",
+      "name": "motion_arm_strict_startup",
+      "path": "/motion/arm/strict_startup"
+    },
+    {
+      "classification": "OEM app/startup artifact state machine",
+      "methods": "POST",
+      "name": "oem_startup_request",
+      "path": "/oem/startup/request"
+    },
+    {
+      "classification": "ControlLib.initialCheck-style diagnostic",
+      "methods": "POST",
+      "name": "oem_initial_check",
+      "path": "/oem/initial_check"
+    },
+    {
+      "classification": "predicate audit; not motion proof",
+      "methods": "POST",
+      "name": "oem_switch_audit",
+      "path": "/oem/switch_audit"
+    },
+    {
+      "classification": "OEM runtime worker/status surface",
+      "methods": "GET",
+      "name": "runtime_status",
+      "path": "/oem/runtime/status"
+    }
+  ],
+  "routes": [
+    {
+      "equivalence": "not-equivalent-to-manual-home",
+      "maps_to": "stepwise initializeMotors subset",
+      "method": "POST",
+      "notes": [
+        "Raw FastAPI lives inside robot/container network in this setup.",
+        "Use this for supervised OEM startup steps, not as a generic Home button."
+      ],
+      "route": "/motion/oem/startup_step",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "not-equivalent-to-startup-axisSearchHome",
+      "maps_to": "manual button goHome-style route",
+      "method": "POST",
+      "notes": [
+        "Historically routed through _execute_home_axis(... startup=False).",
+        "Unsafe until per-axis predicates/transitions are repaired and proven."
+      ],
+      "route": "/motion/axis/home",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "linux-only-not-oem-home",
+      "maps_to": "Linux absolute controller-zero route",
+      "method": "POST",
+      "notes": [
+        "Return-to-controller-zero is not switch/reference homing."
+      ],
+      "route": "/motion/axis/zero",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "proxy-not-authority",
+      "maps_to": "proxy/linkage to raw startup_step when exposed",
+      "method": "POST",
+      "notes": [
+        "BMS may expose/proxy a subset and status shape can differ from raw robot API."
+      ],
+      "route": "/api/bioxp/motion/oem/startup_step",
+      "surface": "bms-proxy"
+    },
+    {
+      "equivalence": "proxy-not-authority",
+      "maps_to": "proxy/linkage to raw manual home when exposed",
+      "method": "POST",
+      "notes": [
+        "Do not assume this is present or a full mirror; probe route existence separately."
+      ],
+      "route": "/api/bioxp/motion/axis/home",
+      "surface": "bms-proxy"
+    }
+  ],
+  "traces": {
+    "HomeAxis": [
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "HomeAxis.x.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": 250
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5002-5007",
+          "note": "",
+          "symbol": "HomeAxis"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "HomeAxis.y.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": 250
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5009-5014",
+          "note": "",
+          "symbol": "HomeAxis"
+        }
+      },
+      {
+        "axis": "z",
+        "board": "head/CAN4",
+        "motor": 1,
+        "name": "HomeAxis.z.current_axisSearchHome",
+        "notes": [],
+        "operation": "setMaxCurrent + axisSearchHome",
+        "params": {
+          "run_current": 31,
+          "speed": 597
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5016-5022",
+          "note": "",
+          "symbol": "HomeAxis"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "HomeAxis.g.current_stall_axisSearchHome",
+        "notes": [],
+        "operation": "setMaxCurrent + setStallGuard + axisSearchHome",
+        "params": {
+          "speed": "200 or 150 by GripperVersion"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5024-5035",
+          "note": "",
+          "symbol": "HomeAxis"
+        }
+      },
+      {
+        "axis": "door",
+        "board": "thermal/CAN6",
+        "motor": 0,
+        "name": "HomeAxis.door.preclear_doorSearchHome",
+        "notes": [],
+        "operation": "doorSearchHome",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5037-5048",
+          "note": "",
+          "symbol": "HomeAxis"
+        }
+      }
+    ],
+    "HomeXY": [
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "HomeXY.set_xy_speedacc_200",
+        "notes": [],
+        "operation": "setSpeedAcc",
+        "params": {
+          "x": [
+            200,
+            200
+          ],
+          "y": [
+            200,
+            200
+          ]
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5056-5061",
+          "note": "",
+          "symbol": "HomeXY"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "HomeXY.parallel_x_goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": false,
+          "speed": 200,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5062",
+          "note": "",
+          "symbol": "HomeXY"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "HomeXY.parallel_y_goHome",
+        "notes": [],
+        "operation": "goHome",
+        "params": {
+          "rehome": false,
+          "speed": 200,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5063",
+          "note": "",
+          "symbol": "HomeXY"
+        }
+      },
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "HomeXY.restore_xy_speedacc",
+        "notes": [],
+        "operation": "setSpeedAcc",
+        "params": {
+          "x": [
+            1700,
+            350
+          ],
+          "y": [
+            1800,
+            400
+          ]
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "5064-5067",
+          "note": "",
+          "symbol": "HomeXY"
+        }
+      }
+    ],
+    "initializeMotion": [
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "initializeMotion.flags",
+        "notes": [],
+        "operation": "set motion/script stop flags",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8797-8810",
+          "note": "",
+          "symbol": "ControlLib.initializeMotion"
+        }
+      },
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "initializeMotion.initializeMotors",
+        "notes": [],
+        "operation": "initializeMotors",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8811-8814",
+          "note": "",
+          "symbol": "ControlLib.initializeMotion"
+        }
+      },
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "initializeMotion.tip_pipette_cleanup",
+        "notes": [],
+        "operation": "tip/pipette cleanup and park-related motion",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8815-8848",
+          "note": "",
+          "symbol": "ControlLib.initializeMotion"
+        }
+      }
+    ],
+    "initializeMotors": [
+      {
+        "axis": "z",
+        "board": "head/CAN4",
+        "motor": 1,
+        "name": "z.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": 1791
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3350-3353",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "g.setMaxCurrent.before_clear",
+        "notes": [],
+        "operation": "setMaxCurrent",
+        "params": {
+          "run_current": 31
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3354",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "g.clear.moveSteps",
+        "notes": [],
+        "operation": "moveSteps",
+        "params": {
+          "steps": 10000,
+          "waitforstop": true
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3355",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "g.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": "600 if GripperVersion==0 else 200"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3356-3365",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": 250
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3367-3369",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.setHome",
+        "notes": [],
+        "operation": "setHome",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3370-3371",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.setSpeed.restore",
+        "notes": [],
+        "operation": "setSpeed",
+        "params": {
+          "speed": 1700
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3372-3373",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.park_6000",
+        "notes": [],
+        "operation": "moveX",
+        "params": {
+          "position": 6000
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3374-3375",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "y.axisSearchHome",
+        "notes": [],
+        "operation": "axisSearchHome",
+        "params": {
+          "speed": 250
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3376-3379",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "door",
+        "board": "thermal/CAN6",
+        "motor": 0,
+        "name": "door.doorSearchHome",
+        "notes": [],
+        "operation": "doorSearchHome",
+        "params": {
+          "speed": "TC_DOOR_VELOCITY",
+          "stallguard": "TCDoorStallGuardThreshold"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3380-3383",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "y.setHome.final",
+        "notes": [],
+        "operation": "setHome",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3389-3392",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "g.restore_current.version1",
+        "notes": [],
+        "operation": "setMaxCurrent",
+        "params": {
+          "condition": "GripperVersion == 1",
+          "run_current": 10
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3417-3420",
+          "note": "",
+          "symbol": "initializeMotors"
+        }
+      }
+    ],
+    "initializeMotorsWithoutMotion": [
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.setup.speed_acc",
+        "notes": [],
+        "operation": "setSpeedAcc",
+        "params": {
+          "acc": 350,
+          "speed": 1700
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3187-3189",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.setup.current",
+        "notes": [],
+        "operation": "setMaxCurrent/readMaxCurrent",
+        "params": {
+          "run_current": 31
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3190-3192",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "x",
+        "board": "deck/CAN5",
+        "motor": 0,
+        "name": "x.setup.stallguard",
+        "notes": [],
+        "operation": "setStallGuardThreshold",
+        "params": {
+          "threshold": 16
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3193-3194",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "y.setup.speed_acc",
+        "notes": [],
+        "operation": "setSpeedAcc",
+        "params": {
+          "acc": 400,
+          "speed": 1800
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3196-3198",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "y.setup.current",
+        "notes": [],
+        "operation": "setMaxCurrent/readMaxCurrent",
+        "params": {
+          "run_current": 31
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3199-3201",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "y",
+        "board": "head/CAN4",
+        "motor": 0,
+        "name": "y.setup.stallguard_disable_right",
+        "notes": [],
+        "operation": "setStallGuardThreshold + disableRightSwitch",
+        "params": {
+          "threshold": 16
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3202-3205",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "z",
+        "board": "head/CAN4",
+        "motor": 1,
+        "name": "z.setup.speed_acc",
+        "notes": [],
+        "operation": "setSpeedAcc",
+        "params": {
+          "acc": 576,
+          "speed": 1791
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3207-3209",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "z",
+        "board": "head/CAN4",
+        "motor": 1,
+        "name": "z.setup.current_stallguard",
+        "notes": [],
+        "operation": "setMaxCurrent/readMaxCurrent/setStallGuardThreshold",
+        "params": {
+          "run_current": "Z_MOTOR_MAX_CURRENT_UP",
+          "stallguard": "Z_MOTOR_STALL_GUARD_THRESHOLD"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3210-3215",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "g",
+        "board": "head/CAN4",
+        "motor": 2,
+        "name": "g.setup.versioned",
+        "notes": [],
+        "operation": "setSpeedAcc/current/stallguard/RDIV/PDIV",
+        "params": {
+          "pdiv": 2,
+          "rdiv": 6,
+          "run_current": "31 or 10 by GripperVersion",
+          "speed": "600 or 200 by GripperVersion"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3217-3242",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      },
+      {
+        "axis": "door",
+        "board": "thermal/CAN6",
+        "motor": 0,
+        "name": "door.setup",
+        "notes": [],
+        "operation": "setSpeedAcc/current/stallguard/disable switches",
+        "params": {
+          "acc": "TC_DOOR_ACCELERATION",
+          "run_current": "TC_DOOR_MAX_CURRENT",
+          "speed": "TC_DOOR_VELOCITY",
+          "stallguard": "TCDoorStallGuardThreshold"
+        },
+        "source": {
+          "file": "BioXPControlLib/ClassControlInterface.cs",
+          "lines": "3244-3255",
+          "note": "",
+          "symbol": "initializeMotorsWithoutMotion"
+        }
+      }
+    ],
+    "rehome": [
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "rehome.save_door_state",
+        "notes": [],
+        "operation": "save door-open state",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8784-8788",
+          "note": "",
+          "symbol": "ControlLib.rehome"
+        }
+      },
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "rehome.initializeMotors",
+        "notes": [],
+        "operation": "initializeMotors",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8789",
+          "note": "",
+          "symbol": "ControlLib.rehome"
+        }
+      },
+      {
+        "axis": null,
+        "board": null,
+        "motor": null,
+        "name": "rehome.sleep_restore_door",
+        "notes": [],
+        "operation": "sleep and restore door/thermal state",
+        "params": {},
+        "source": {
+          "file": "BioXPControlLib/ControlLib.cs",
+          "lines": "8790-8795",
+          "note": "",
+          "symbol": "ControlLib.rehome"
+        }
+      }
+    ]
+  },
+  "truth_level": "source_model_only_no_motion_no_usb"
+}

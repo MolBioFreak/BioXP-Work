@@ -16,6 +16,14 @@ from .locations import (
     UnknownLocationError,
     UnknownWellError,
 )
+from .oem_bindings import (
+    OemBindingData,
+    OemBindingSection,
+    OemBindingSource,
+    OemBindingStatus,
+    bind_oem_metadata_to_deck_layout,
+    load_oem_binding_data,
+)
 
 __all__ = [
     "Capability",
@@ -30,10 +38,16 @@ __all__ = [
     "LabwareDefinition",
     "LocationReference",
     "MissingCapabilityError",
+    "OemBindingData",
+    "OemBindingSection",
+    "OemBindingSource",
+    "OemBindingStatus",
     "ResolvedLocation",
     "UnknownLocationError",
     "UnknownWellError",
     "WellDefinition",
+    "bind_oem_metadata_to_deck_layout",
     "load_deck_layout",
     "load_layout_data",
+    "load_oem_binding_data",
 ]

@@ -1,4 +1,5 @@
 from .models import (
+    LiquidLocation,
     PipetteAspirateCommand,
     PipetteCommandError,
     PipetteDispenseCommand,
@@ -6,6 +7,8 @@ from .models import (
     PipetteInitCommand,
     PipetteMixCommand,
     PipetteNotReadyError,
+    PipetteOperationContext,
+    PipettePreflightError,
     PipetteTipAction,
     PipetteTipCommand,
     PipetteTipStateError,
@@ -13,8 +16,16 @@ from .models import (
     PipetteValidationError,
 )
 from .transport import CanPipetteTransport, PipetteTransport, build_default_pipette_transport
+try:
+    from ..novo_usb_can import BioXpNovoUsbDriver, NovoUsbCanBus, novo_decode, novo_encode
+except Exception:  # pragma: no cover - optional live USB backend
+    BioXpNovoUsbDriver = None  # type: ignore[assignment]
+    NovoUsbCanBus = None  # type: ignore[assignment]
+    novo_decode = None  # type: ignore[assignment]
+    novo_encode = None  # type: ignore[assignment]
 
 __all__ = [
+    "LiquidLocation",
     "PipetteAspirateCommand",
     "PipetteCommandError",
     "PipetteDispenseCommand",
@@ -22,6 +33,8 @@ __all__ = [
     "PipetteInitCommand",
     "PipetteMixCommand",
     "PipetteNotReadyError",
+    "PipetteOperationContext",
+    "PipettePreflightError",
     "PipetteTipAction",
     "PipetteTipCommand",
     "PipetteTipStateError",
@@ -30,4 +43,8 @@ __all__ = [
     "CanPipetteTransport",
     "PipetteTransport",
     "build_default_pipette_transport",
+    "BioXpNovoUsbDriver",
+    "NovoUsbCanBus",
+    "novo_decode",
+    "novo_encode",
 ]

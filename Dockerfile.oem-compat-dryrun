@@ -1,0 +1,19 @@
+# Workstation-only BioXP OEM compatibility dry-run image.
+# This intentionally does not mount /dev/bus/usb and defaults to dry_run.
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    BIOXP_MODE=dry_run \
+    BIOXP_HARDWARE_ENABLE=0
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir fastapi uvicorn pydantic starlette pyusb pytest httpx
+
+COPY src /app/src
+COPY tests /app/tests
+
+EXPOSE 8080
+
+CMD ["uvicorn", "src.bioxp.api:app", "--host", "0.0.0.0", "--port", "8080"]

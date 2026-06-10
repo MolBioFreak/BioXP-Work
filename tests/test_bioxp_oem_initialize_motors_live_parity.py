@@ -1,0 +1,180 @@
+from src.bioxp.oem_startup_program import BioXpStartupHardware
+from src.bioxp.usb_driver import BioXpTester
+
+
+class _FakeTester:
+    BOARD_HEAD = 0x04
+    BOARD_DECK = 0x05
+    BOARD_THERMAL = 0x06
+    MOTOR_HEAD_CLEARANCE_LIFT_ABS = 12500
+
+    def __init__(self):
+        self.calls = []
+
+    def motor_get_position(self, board, motor=0):
+        return {"position": 0}
+
+    def motor_get_speed(self, board, motor=0):
+        return {"speed": 0}
+
+    def motor_get_switch_activity(self, board, motor=0):
+        return {"left_state": 0, "right_state": 1}
+
+    def motor_query_24v_sensor(self):
+        return {"no24v": False}
+
+    def io_snapshot(self, board):
+        return {1: 1, 3: 1}
+
+
+def test_stepwise_plan_is_oem_initialize_motors_order_not_head_clearance_replacement():
+    hw = BioXpStartupHardware(lambda: _FakeTester())
+
+    result = hw.startup_homing_stepwise(mode="shadow", step="plan", execute=False)
+
+    assert result["ok"] is True
+    assert [row["step"] for row in result["steps"]] == [
+        "z-home",
+        "gripper-clear",
+        "gripper-home",
+        "x-home",
+        "x-park-6000",
+        "y-home",
+        "door-home",
+        "y-set-home",
+    ]
+    assert "head-clearance-z-up" not in [row["step"] for row in result["steps"]]
+    assert result["oem_sequence_anchor"].endswith("ClassControlInterface.initializeMotors lines 3348-3421")
+
+
+def test_stepwise_plan_steps_are_accepted_by_direct_supervised_api_schema():
+    from src.bioxp.api import OemStartupStepRequest
+
+    hw = BioXpStartupHardware(lambda: _FakeTester())
+    plan = hw.startup_homing_stepwise(mode="shadow", step="plan", execute=False)
+
+    for row in plan["steps"]:
+        parsed = OemStartupStepRequest(step=row["step"])
+        assert parsed.step == row["step"]
+
+
+def test_live_commissioning_profiles_are_soft_but_preserve_oem_home_order():
+    tester = BioXpTester.__new__(BioXpTester)
+
+    x = tester._motion_oem_axis_profile("x", startup=True)
+    y = tester._motion_oem_axis_profile("y", startup=True)
+    z = tester._motion_oem_axis_profile("z", startup=True)
+
+    assert x["speed"] == 300
+    assert x["acc"] == 120
+    assert x["standby_current"] == 20
+    assert x["home_speed"] == 250
+    assert x["oem_home_step"] == "MotorX.axisSearchHome(speed=250)"
+
+    assert y["speed"] == 300
+    assert y["acc"] == 120
+    assert y["standby_current"] == 20
+    assert y["home_speed"] == 250
+    assert y["oem_home_step"] == "MotorY.axisSearchHome(speed=250)"
+
+    assert z["speed"] == 250
+    assert z["acc"] == 60
+    assert z["standby_current"] == 20
+    assert z["home_speed"] == 250
+    assert z["positive_down_requires_right_mask"] is True
+    assert z["oem_home_step"] == "MotorZ.axisSearchHome(speed=1791)"
+
+
+def test_z_home_step_skips_reference_return_when_home_fails():
+    import pytest
+    from fastapi import HTTPException
+    from src.bioxp.api import _execute_oem_startup_step
+
+    calls = []
+
+    class Tester:
+        def motion_arm_state(self):
+            return {"armed": True}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=False):
+            calls.append(("activate", expect_reply))
+            return {"ok": True}
+
+        def motor_prepare_motion_interlock(self, force_lock=False):
+            calls.append(("interlock", force_lock))
+            return {"ok": True}
+
+        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):
+            calls.append(("home", axis, startup, timeout_s))
+            return {"home": {"ok": False, "error": "ambiguous switch state"}}
+
+        def motor_oem_move_z_to_reference(self, *args, **kwargs):  # pragma: no cover - must not run on failed home
+            calls.append(("z_reference", args, kwargs))
+            return {"ok": True}
+
+    with pytest.raises(HTTPException) as exc_info:
+        _execute_oem_startup_step(Tester(), "z-home", timeout_s=10)
+
+    assert exc_info.value.status_code == 409
+    assert "did not confirm" in str(exc_info.value.detail)
+    assert not any(call[0] == "z_reference" for call in calls)
+
+
+def test_z_reference_return_masks_right_limit_without_changing_x_y():
+    calls = []
+
+    class Tester(BioXpTester):
+        BOARD_HEAD = 0x04
+        BOARD_DECK = 0x05
+        BOARD_THERMAL = 0x06
+        MOTOR_SWITCH_ACTIVE_VALUE = 1
+
+        def motor_get_position(self, board, motor=0):
+            calls.append(("get_position", board, motor))
+            return {"position": -10000}
+
+        def motor_axis_status(self, board, motor=0):
+            calls.append(("status", board, motor))
+            return {"position": {"position": 0 if calls.count(("status", board, motor)) else -10000}, "speed": {"speed": 0}, "max_current": {"value": 20}, "switches": {"right_state": 1, "left_state": 0}}
+
+        def motor_stop(self, board, motor=0):
+            calls.append(("stop", board, motor))
+            return {"ok": True}
+
+        def motor_get_axis_param(self, board, param, motor=0):
+            calls.append(("gap", board, motor, param))
+            if param == 12:
+                return {"value": 0}
+            if param == 13:
+                return {"value": 0}
+            return {"value": 0}
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            calls.append(("sap", board, motor, param, value))
+            return {"ok": True, "param": param, "value": value}
+
+        def motor_move_relative(self, board, steps, motor=0):
+            calls.append(("move_relative", board, motor, steps))
+            return {"ok": True}
+
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            calls.append(("wait", board, motor, kwargs))
+            return {"stopped": True, "seen_nonzero": True}
+
+        def motor_query_24v_sensor(self):
+            return {"no24v": False}
+
+    tester = Tester.__new__(Tester)
+
+    result = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=10)
+
+    assert result["ok"] is True
+    assert result["steps"] == 10000
+    assert ("sap", 0x04, 1, 12, 1) in calls  # disable/mask right limit for positive Z/down
+    assert ("sap", 0x04, 1, 13, 0) in calls
+    assert calls.count(("sap", 0x04, 1, 12, 0)) == 1  # restore prior right-limit mask state
+    assert calls.count(("sap", 0x04, 1, 13, 0)) >= 2  # set then restore prior left-mask state
+    assert not any(call[:3] == ("sap", 0x05, 0) for call in calls)  # no X mutation

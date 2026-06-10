@@ -1,0 +1,27 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    BIOXP_RUNTIME_OWNER=udocker-container \
+    PYTHONPATH=/app/src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      procps \
+      psmisc \
+      v4l-utils \
+      libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+      fastapi \
+      "uvicorn[standard]" \
+      pydantic \
+      starlette \
+      pyusb \
+      python-can \
+      httpx
+
+WORKDIR /app
+
+CMD ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123"]

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
-
 from ..pipette.models import (
     PipetteAspirateCommand,
     PipetteDispenseCommand,
@@ -17,6 +16,7 @@ from ..pipette.transport import PipetteTransport
 
 BlockingRunner = Callable[..., Awaitable[dict[str, Any]]]
 TransportGetter = Callable[[], PipetteTransport]
+PipettePreflight = Callable[[str, Any], dict[str, Any]]
 
 
 def _pipette_error_to_http_exception(exc: PipetteError) -> HTTPException:
@@ -30,14 +30,28 @@ async def _run_transport_call(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     operation: Callable[[PipetteTransport], dict[str, Any]],
+    operation_name: str | None = None,
+    command: Any | None = None,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
+    preflight_payload: dict[str, Any] | None = None
+    if preflight is not None:
+        try:
+            preflight_payload = preflight(operation_name or label, command)
+        except PipetteError as exc:
+            raise _pipette_error_to_http_exception(exc) from exc
+        except ValueError as exc:
+            raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
     transport = get_transport()
     try:
-        return await run_blocking(label, lambda: operation(transport), timeout_s=timeout_s)
+        result = await run_blocking(label, lambda: operation(transport), timeout_s=timeout_s)
     except PipetteError as exc:
         raise _pipette_error_to_http_exception(exc) from exc
     except ValueError as exc:
         raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
+    if preflight_payload is not None and isinstance(result, dict):
+        result.setdefault("preflight", preflight_payload)
+    return result
 
 
 async def run_pipette_status(*, get_transport: TransportGetter, run_blocking: BlockingRunner) -> dict[str, Any]:
@@ -47,6 +61,7 @@ async def run_pipette_status(*, get_transport: TransportGetter, run_blocking: Bl
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.get_status(),
+        operation_name="status",
     )
 
 
@@ -55,6 +70,7 @@ async def run_pipette_init_command(
     *,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette init",
@@ -62,6 +78,9 @@ async def run_pipette_init_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.initialize(command),
+        operation_name="init",
+        command=command,
+        preflight=preflight,
     )
 
 
@@ -70,6 +89,7 @@ async def run_pipette_tip_command(
     *,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette tip",
@@ -77,6 +97,9 @@ async def run_pipette_tip_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.set_tip(command),
+        operation_name="tip",
+        command=command,
+        preflight=preflight,
     )
 
 
@@ -85,6 +108,7 @@ async def run_pipette_aspirate_command(
     *,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette aspirate",
@@ -92,6 +116,9 @@ async def run_pipette_aspirate_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.aspirate(command),
+        operation_name="aspirate",
+        command=command,
+        preflight=preflight,
     )
 
 
@@ -100,6 +127,7 @@ async def run_pipette_dispense_command(
     *,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette dispense",
@@ -107,6 +135,9 @@ async def run_pipette_dispense_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.dispense(command),
+        operation_name="dispense",
+        command=command,
+        preflight=preflight,
     )
 
 
@@ -115,6 +146,7 @@ async def run_pipette_mix_command(
     *,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
+    preflight: PipettePreflight | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette mix",
@@ -122,4 +154,7 @@ async def run_pipette_mix_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.mix(command),
+        operation_name="mix",
+        command=command,
+        preflight=preflight,
     )

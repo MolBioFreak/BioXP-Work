@@ -24,3 +24,9 @@ output/
 
 # Local agent/planning scratch files
 .hermes/
+# Local raw OEM AppData extracts may contain instrument/server fields; commit redacted manifests only.
+config/oem/original_ssd_appdata_*/
+# Historical implementation backups must not live beside active runtime source.
+backup-bin/
+*.bak-*
+*.py.bak-*

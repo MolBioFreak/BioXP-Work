@@ -1,0 +1,26 @@
+{
+  "removed_count": 21,
+  "removed": [
+    "src/bioxp/api.py.bak-usb-sniff-20260601T213449Z",
+    "src/bioxp/usb_driver.py.bak-rail-override-20260526T013805Z",
+    "src/bioxp/api.py.bak-event-drain-20260530T233052Z",
+    "src/bioxp/api.py.bak-g-current-invariant-20260609T023201Z",
+    "src/bioxp/api.py.bak-desync-guard-20260529T035132Z",
+    "src/bioxp/usb_driver.py.bak-g-current-invariant-20260609T023201Z",
+    "src/bioxp/api.py.bak-g-current-invariant-v2-20260609T023333Z",
+    "src/bioxp/usb_driver.py.bak-g-current-invariant-v2-20260609T023333Z",
+    "src/bioxp/api.py.bak-disable-desync-guard-20260602T041648Z",
+    "src/bioxp/usb_driver.py.bak-event-drain-20260530T233052Z",
+    "src/bioxp/api.py.bak-usb-sniff-fallback-20260601T213806Z",
+    "src/bioxp/usb_driver.py.bak-usb-sniff-20260601T213449Z",
+    "src/bioxp/api.py.bak-current-lifecycle-20260527T002154Z",
+    "src/bioxp/usb_driver.py.bak-current-lifecycle-20260527T002154Z",
+    "tests/test_motion_phase1.py.bak-event-drain-20260530T233052Z",
+    "tests/test_motion_phase1.py.bak-g-current-invariant-v2-20260609T023333Z",
+    "tests/test_motion_phase1.py.bak-g-current-invariant-20260609T023201Z",
+    ".hermes/backups/bioxp_robot_container_run.sh.20260519T122321Z",
+    ".hermes/backups/api.py.20260519T122321Z",
+    "backup-bin/",
+    "docs/oem/OEM_PARITY_FRESH_ATTEMPT_PHASE0_BACKUP_20260609.md"
+  ]
+}

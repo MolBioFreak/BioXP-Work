@@ -1,10 +1,19 @@
 from pathlib import Path
 
+import pytest
+
 from src.bioxp.protocols.compiler import compile_native_protocol
 from src.bioxp.protocols.executor import ProtocolExecutor
 from src.bioxp.protocols.runtime_state import StageExecutionStatus
 from src.bioxp.services import protocol_service
-from src.bioxp.services.protocol_service import ProtocolOperatorBundleStore, compile_protocol_source, create_protocol_job, get_protocol_jobs_root, review_protocol_job
+from src.bioxp.services.protocol_service import (
+    ProtocolLiveContractError,
+    ProtocolOperatorBundleStore,
+    compile_protocol_source,
+    create_protocol_job,
+    get_protocol_jobs_root,
+    review_protocol_job,
+)
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "testdata" / "oem_xml"
@@ -108,3 +117,110 @@ def test_protocol_operator_bundle_persists_and_resumes_review_job(tmp_path) -> N
     assert resumed["operator"]["pending_review"] is None
     assert resumed["operator"]["reviews"][0]["reviewer"] == "test"
     assert resumed["execution"]["runtime_state"]["completed"] is True
+
+
+def _live_protocol_payload(**live_overrides):
+    live_execution = {
+        "operator_id": "integration-operator",
+        "live_execution_ack": True,
+        "physical_console_verified": True,
+        "deck_manifest": {
+            "source": "operator-preflight",
+            "locations": {
+                "reagent_rack:A1": {"contents": "water", "volume_ul": 100.0},
+                "waste:A1": {"contents": "empty"},
+            },
+        },
+        "preflight": {
+            "reference_snapshot": {
+                "rows": {
+                    "x": {"state": "referenced"},
+                    "y": {"state": "referenced"},
+                    "z": {"state": "referenced"},
+                }
+            },
+            "artifact_refs": ["snapshot://deck-before-live-run"],
+        },
+    }
+    live_execution.update(live_overrides)
+    return {
+        "source_type": "native",
+        "document": {
+            "protocol_id": "live-gated-protocol",
+            "stages": [
+                {
+                    "stage_id": "move-stage",
+                    "actions": [
+                        {"action_id": "move-x", "kind": "move", "axis": "x", "steps": 4},
+                    ],
+                }
+            ],
+        },
+        "live_execution": live_execution,
+    }
+
+
+def test_live_protocol_execution_requires_ack_manifest_reference_and_artifacts(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    payload = _live_protocol_payload(
+        operator_id="",
+        live_execution_ack=False,
+        physical_console_verified=False,
+        deck_manifest={},
+        preflight={"reference_snapshot": {"rows": {"x": {"state": "referenced"}}}, "artifact_refs": []},
+    )
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(payload, dry_run=False, store=store)
+
+    details = exc_info.value.to_payload()
+    assert details["error"] == "live_protocol_contract_failed"
+    assert set(details["missing_contract_fields"]) >= {
+        "live_execution_ack",
+        "operator_id",
+        "physical_console_verified",
+        "deck_manifest",
+        "preflight.artifact_refs",
+    }
+    assert details["missing_reference_axes"] == ["y", "z"]
+
+
+def test_live_protocol_execution_rejects_hardware_actions_without_registered_handlers(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(_live_protocol_payload(), dry_run=False, store=store)
+
+    details = exc_info.value.to_payload()
+    assert details["error"] == "live_protocol_contract_failed"
+    assert details["missing_live_handlers"] == ["move"]
+    assert details["hardware_action_kinds"] == ["move"]
+
+
+def test_live_protocol_execution_persists_contract_preflight_artifact_and_uses_handlers(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+
+    def move_handler(action, state):
+        calls.append({"action_id": action.action_id, "protocol_id": state.protocol_id, "params": dict(action.params)})
+        return {"ok": True, "handler": "test-move", "position_delta": action.params["steps"]}
+
+    bundle = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+
+    assert calls == [{"action_id": "move-x", "protocol_id": "live-gated-protocol", "params": {"axis": "x", "steps": 4}}]
+    assert bundle["status"] == "completed"
+    assert bundle["execution"]["dry_run"] is False
+    contract = bundle["execution"]["live_contract"]
+    assert contract["schema_version"] == "bioxp.protocol_live_execution_contract.v1"
+    assert contract["operator_id"] == "integration-operator"
+    assert contract["preflight"]["reference_axes_verified"] == ["x", "y", "z"]
+    assert contract["artifacts"]["required"] is True
+    assert contract["artifacts"]["refs"] == ["snapshot://deck-before-live-run"]
+    preflight_path = Path(bundle["artifacts"]["preflight_path"])
+    assert preflight_path.exists()
+    assert preflight_path.read_text(encoding="utf-8").count("snapshot://deck-before-live-run") == 1
