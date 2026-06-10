@@ -3571,6 +3571,7 @@ class BioXpTester:
             })
             return preset
         if key == "z":
+            z_max, z_max_source = self._machine_config_axis_max("z", 160000)
             preset.update({
                 "speed": 250 if startup else preset.get("speed", 1791),
                 "acc": 60 if startup else preset.get("acc", 576),
@@ -3582,8 +3583,8 @@ class BioXpTester:
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
                 "positive_down_requires_right_mask": True,
                 "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
-                "home_search_max_abs_delta": 30000,
-                "home_search_max_abs_delta_source": "commissioned_linux_z_guard_not_oem_max",
+                "home_search_max_abs_delta": z_max,
+                "home_search_max_abs_delta_source": z_max_source,
             })
             return preset
         if key == "g":

@@ -180,6 +180,11 @@ def parse_oem_machine_config_bundle(root_dir: str | Path) -> dict[str, Any]:
             row = {"name": elem.tag}
             for k, v in elem.attrib.items():
                 row[k] = _typed(v)
+            if "zLow" in row and "zDelta" in row and "zHigh" not in row:
+                try:
+                    row["zHigh"] = int(row["zLow"]) - int(row["zDelta"])
+                except (TypeError, ValueError):
+                    pass
             positions.append(row)
     calibration = _first_attrs(root, "./GenBot/Calibration")
     config = _first_attrs(root, "./GenBot/Config")

@@ -85,5 +85,5 @@ def test_usb_homing_profiles_use_bound_machine_axis_limits_for_xyg(tmp_path, mon
     assert y["home_search_max_abs_delta_source"] == "original_ssd_machine_config"
     assert g["home_search_max_abs_delta"] == 15000
     assert g["home_search_max_abs_delta_source"] == "original_ssd_machine_config"
-    assert z["home_search_max_abs_delta"] == 30000
-    assert z["home_search_max_abs_delta_source"] == "commissioned_linux_z_guard_not_oem_max"
+    assert z["home_search_max_abs_delta"] == 160000
+    assert z["home_search_max_abs_delta_source"] == "original_ssd_machine_config"

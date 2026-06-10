@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from .oem_config import find_oem_machine_config_bundle
 from .oem_homing_runtime import OemHomingDryRunRuntime
 from .oem_homing_spec import all_programs, get_program
+from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_shadow_readback_live import build_shadow_readback_artifact
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
@@ -37,6 +38,66 @@ async def get_oem_machine_config(root_dir: str | None = None) -> dict[str, Any]:
     result.setdefault("switch_mask_mutation_commanded", False)
     return result
 
+
+
+
+@router.get("/motion/oem/position_table")
+async def get_oem_position_table(root_dir: str | None = None) -> dict[str, Any]:
+    """Return the bound OEM PositionTable from original SSD config, read-only."""
+    table = load_bound_oem_position_table(root_dir)
+    rows = table.rows()
+    return {
+        "ok": True,
+        "source": table.source,
+        "schema_version": "bioxp.oem_position_table.v1",
+        "position_table_count": len(rows),
+        "rows": rows,
+        "opened_usb": False,
+        "physical_motion": False,
+        "motion_commanded": False,
+        "source_anchors": [
+            "ClassControlInterface.cs:3663-3688 moveTo(location,column,row,Tip10,highPos)",
+            "ClassControlInterface.cs:3691-3715 moveTo(location,offsetX,offsetY)",
+            "ClassControlInterface.cs:3734-3860 scriptmoveTo initial target-coordinate branch",
+            "DefaultParameters.cs:47-59 PSUDO_Z_HOME_LOW/HIGH",
+        ],
+    }
+
+
+@router.get("/motion/oem/position_table/plan")
+async def plan_oem_position_table_move(
+    location_id: str,
+    column: int = 0,
+    row: int = 0,
+    high_pos: bool = True,
+    mode: str = "moveTo",
+    positionflag: int = 0,
+    tip_location: int = -1,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    root_dir: str | None = None,
+) -> dict[str, Any]:
+    """Dry-run exact OEM PositionTable coordinate planning. No USB/motion."""
+    table = load_bound_oem_position_table(root_dir)
+    mode_key = str(mode).strip().lower()
+    if mode_key == "moveto":
+        plan = table.compile_move_to(location_id, column=column, row=row, high_pos=high_pos)
+    elif mode_key == "scriptmoveto":
+        plan = table.compile_script_move_to(location_id, column=column, row=row, positionflag=positionflag, tip_location=tip_location)
+    elif mode_key in {"offset", "moveto_offset", "offsetmoveto"}:
+        cfg = find_oem_machine_config_bundle(root_dir)
+        axis_limits = (((cfg.get("config") or {}).get("axis_limits") or {}) if isinstance(cfg, dict) else {})
+        plan = table.compile_offset_move_to(
+            location_id,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            x_high_limit=(axis_limits.get("x") or {}).get("max_steps"),
+            y_high_limit=(axis_limits.get("y") or {}).get("max_steps"),
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported OEM position-table plan mode: {mode}")
+    plan.update({"ok": True, "schema_version": "bioxp.oem_position_plan.v1", "motion_commanded": False, "current_mutation_commanded": False, "switch_mask_mutation_commanded": False})
+    return plan
 
 @router.get("/motion/oem/programs")
 async def list_oem_homing_programs() -> dict[str, Any]:
