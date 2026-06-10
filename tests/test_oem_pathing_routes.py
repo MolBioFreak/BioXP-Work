@@ -44,3 +44,52 @@ def test_scriptmove_plan_route_is_read_only_and_uses_path_planner(tmp_path, monk
     assert payload["opened_usb"] is False
     assert payload["motion_commanded"] is False
     assert payload["current_mutation_commanded"] is False
+
+
+
+def test_scriptmove_execute_route_defaults_to_no_motion_preview(tmp_path, monkeypatch):
+    from src.bioxp.oem_homing_routes import execute_oem_scriptmove_path
+    _write_bundle(tmp_path)
+    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
+
+    payload = asyncio.run(execute_oem_scriptmove_path({
+        "location_id": "LOC_MS",
+        "current_loc": "LOC_MS",
+        "current_x": 0,
+        "current_y": 0,
+        "current_z": 0,
+        "column": 2,
+        "row": 3,
+        "positionflag": 1,
+        "gripper_confirmed": True,
+    }))
+
+    assert payload["ok"] is True
+    assert payload["schema_version"] == "bioxp.oem_scriptmove_execution.v1"
+    assert payload["mode"] == "dry_run"
+    assert payload["motion_commanded"] is False
+    assert payload["opened_usb"] is False
+    assert payload["executor_status"] == "preview_only"
+    assert payload["plan"]["branch"] == "gripper_confirmed_no_tip_direct_moveTo"
+    assert payload["execution_steps"][0]["op"] == "moveTo"
+    assert payload["execution_steps"][0]["would_call"] == "/motion/axis/absolute_sequence"
+
+
+def test_scriptmove_execute_live_requires_explicit_ack(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    from src.bioxp.oem_homing_routes import execute_oem_scriptmove_path
+    _write_bundle(tmp_path)
+    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
+
+    try:
+        asyncio.run(execute_oem_scriptmove_path({
+            "mode": "live",
+            "location_id": "LOC_MS",
+            "current_loc": "LOC_MS",
+            "gripper_confirmed": True,
+        }))
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert "operator_ack" in str(exc.detail)
+    else:
+        raise AssertionError("live execution without ack should fail closed")

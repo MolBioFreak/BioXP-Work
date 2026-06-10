@@ -9,10 +9,10 @@ def test_movement_readiness_comparison_is_no_motion_and_lists_hard_gaps():
     assert payload["opened_usb"] is False
     assert payload["physical_motion"] is False
     assert payload["motion_commanded"] is False
-    assert payload["summary"]["live_oem_path_execution"] == "not_enabled"
-    assert payload["summary"]["hard_gap_count"] >= 3
+    assert payload["summary"]["live_oem_path_execution"] == "executor_preview_only"
+    assert payload["summary"]["hard_gap_count"] == 1
     assert any(row["layer"] == "Live execution adapter" and row["gap"] for row in payload["matrix"])
-    assert any("operator or camera proof" in item for item in payload["movement_test_start_policy"])
+    assert any("operator or camera observation" in item for item in payload["movement_test_start_policy"])
 
 
 def test_movement_readiness_route_is_read_only():

@@ -190,13 +190,13 @@ Gap: no committed adapter yet that consumes `scriptmove_plan.steps` and executes
 
 Implication: do **not** begin with full OEM path execution. Begin only with a supervised micro-move/proof move after live gates pass.
 
-### 4. Physical proof
+### 4. Movement observation / operator truth
 
-Status: **mandatory gap for every future move**.
+Status: **not an OEM-parity blocker**.
 
-The system explicitly reports motion truth as controller-only unless independently confirmed. Prior sessions proved controller counters can advance while physical motion does not occur.
+Correction: this is a commissioning observation discipline, not a separate parity gap. The OEM stack also does not provide independent automatic physical-motion proof; it commands controller motion and relies on instrument/operator context. For our tests, we still record operator/camera observation so the result is auditable.
 
-Gap: no automatic physical-proof classifier is integrated into the next movement result. Operator/camera/fiducial proof must be attached manually for every test.
+Gap: none for OEM parity. Observation remains required for commissioning evidence quality.
 
 ### 5. Arm/interlock/live state
 
@@ -253,7 +253,7 @@ Not ready for:
 - blind absolute moves
 - switch-search homing
 - full OEM `scriptmoveTo` execution
-- movement based only on controller counters
+- movement reported without commissioning observation
 - any unattended move
 
 ### Eligible first movement class after gates pass
@@ -261,7 +261,7 @@ Not ready for:
 Only after arm/latch/current/speed gates pass:
 
 - one supervised relative micro-move on a selected axis
-- operator/camera/fiducial before/after proof required
+- operator/camera before/after observation recorded for commissioning evidence
 - controller telemetry classified as controller-only until physical proof confirms motion
 
 ## Required immediate pre-move checklist

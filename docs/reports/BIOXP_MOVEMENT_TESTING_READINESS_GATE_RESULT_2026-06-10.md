@@ -89,4 +89,4 @@ First actual movement test should be:
 6. after image/operator confirmation
 7. result classified as physical only if observation/camera confirms it
 
-Controller counters alone remain controller-only evidence.
+Controller counters are accepted as the controller-side result; commissioning still records observed instrument behavior.

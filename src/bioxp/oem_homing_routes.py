@@ -186,6 +186,104 @@ async def plan_oem_scriptmove_path(
     plan.update({"current_mutation_commanded": False, "switch_mask_mutation_commanded": False})
     return plan
 
+
+
+def _execution_preview_for_step(step: dict[str, Any]) -> dict[str, Any]:
+    op = str(step.get("op") or "")
+    payload = dict(step)
+    payload.setdefault("motion_commanded", False)
+    payload.setdefault("opened_usb", False)
+    payload.setdefault("physical_motion", False)
+    if op == "moveTo":
+        payload["would_call"] = "/motion/axis/absolute_sequence"
+        payload["would_execute"] = [
+            {"axis": "x", "position_steps": payload.get("x")},
+            {"axis": "y", "position_steps": payload.get("y")},
+            {"axis": "z", "position_steps": payload.get("z")},
+        ]
+    elif op == "moveXY":
+        payload["would_call"] = "/motion/axis/absolute_sequence"
+        payload["would_execute"] = [
+            {"axis": "x", "position_steps": payload.get("x")},
+            {"axis": "y", "position_steps": payload.get("y")},
+        ]
+    elif op == "moveX":
+        payload["would_call"] = "/motion/axis/absolute"
+        payload["would_execute"] = {"axis": "x", "position_steps": payload.get("x")}
+    elif op == "moveY":
+        payload["would_call"] = "/motion/axis/absolute"
+        payload["would_execute"] = {"axis": "y", "position_steps": payload.get("y")}
+    elif op == "moveZ":
+        payload["would_call"] = "/motion/axis/absolute"
+        payload["would_execute"] = {"axis": "z", "position_steps": payload.get("z")}
+    elif op == "moveSteps":
+        payload["would_call"] = "/motion/axis/relative"
+        payload["would_execute"] = {"axis": payload.get("axis"), "steps": payload.get("delta")}
+    elif op == "parallel":
+        payload["would_call"] = "/motion/axis/absolute_sequence_parallel_semantics_disabled"
+        payload["would_execute"] = [_execution_preview_for_step(child) for child in payload.get("steps") or []]
+    elif op == "sleep":
+        payload["would_call"] = "sleep"
+        payload["would_execute"] = {"milliseconds": payload.get("milliseconds")}
+    else:
+        payload["would_call"] = "unsupported"
+        payload["would_execute"] = None
+    return payload
+
+
+@router.post("/motion/oem/pathing/scriptmove_execute")
+async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Guarded OEM scriptmoveTo executor handoff.
+
+    Default mode is preview-only and commands no motion. Live mode is intentionally
+    fail-closed unless the caller supplies the explicit commissioning ack; the
+    actual actuation layer is implemented in a separate step so the dry-run
+    planner becomes the sole executor input without silently bypassing gates.
+    """
+    payload = payload or {}
+    mode = str(payload.get("mode") or "dry_run").strip().lower()
+    if mode not in {"dry_run", "preview", "live"}:
+        raise HTTPException(status_code=400, detail=f"unsupported scriptmove_execute mode: {mode}")
+    if mode == "live" and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
+        raise HTTPException(status_code=409, detail="operator_ack OEM_PATH_EXECUTE required for live OEM path execution")
+    plan = await plan_oem_scriptmove_path(
+        location_id=str(payload.get("location_id") or "UNKNOWN"),
+        current_loc=payload.get("current_loc"),
+        current_well=payload.get("current_well"),
+        column=int(payload.get("column") or 0),
+        row=int(payload.get("row") or 0),
+        positionflag=int(payload.get("positionflag") or 0),
+        current_x=int(payload.get("current_x") or 0),
+        current_y=int(payload.get("current_y") or 0),
+        current_z=int(payload.get("current_z") or 0),
+        tip_loaded=bool(payload.get("tip_loaded") or False),
+        tip_dirty=bool(payload.get("tip_dirty") or False),
+        tip_location=int(payload.get("tip_location") if payload.get("tip_location") is not None else -1),
+        clean_path=bool(payload.get("clean_path") or False),
+        device_type=str(payload.get("device_type") or ""),
+        gripper_confirmed=bool(payload.get("gripper_confirmed") or False),
+        pseudo_z_home=payload.get("pseudo_z_home"),
+        run_in_parallel=bool(payload.get("run_in_parallel") if payload.get("run_in_parallel") is not None else True),
+        root_dir=payload.get("root_dir"),
+    )
+    execution_steps = [_execution_preview_for_step(step) for step in plan.get("steps") or []]
+    live_enabled = mode == "live"
+    return {
+        "ok": True,
+        "schema_version": "bioxp.oem_scriptmove_execution.v1",
+        "mode": "live" if live_enabled else "dry_run",
+        "executor_status": "live_acknowledged_preview_only" if live_enabled else "preview_only",
+        "plan": plan,
+        "execution_steps": execution_steps,
+        "opened_usb": False,
+        "motion_commanded": False,
+        "physical_motion": False,
+        "current_mutation_commanded": False,
+        "switch_mask_mutation_commanded": False,
+        "live_motion_note": "Live actuation is still disabled in this scaffold; this route now makes the planner the required executor input.",
+    }
+
+
 @router.get("/motion/oem/programs")
 async def list_oem_homing_programs() -> dict[str, Any]:
     programs = []

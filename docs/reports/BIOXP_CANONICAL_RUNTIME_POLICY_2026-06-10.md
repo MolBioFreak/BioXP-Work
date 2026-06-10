@@ -47,6 +47,6 @@ The current reference includes:
 - movement readiness comparison route
 - strict no-homing readiness gate result documentation
 - gripper idle-current safety invariant
-- controller-only motion truth classification
+- explicit motion truth/evidence classification
 
 Policy: controller counters are not physical proof. The next iteration starts from supervised relative proof moves only after live no-motion gates pass.
