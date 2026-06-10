@@ -16,6 +16,7 @@ from .oem_homing_runtime import OemHomingDryRunRuntime
 from .oem_homing_spec import all_programs, get_program
 from .oem_compat.machine_state import OemDefaultParameters, OemMachineState
 from .oem_compat.pathing import OemPathPlanner
+from .oem_compat.movement_readiness import build_movement_readiness_comparison
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_shadow_readback_live import build_shadow_readback_artifact
 
@@ -101,6 +102,14 @@ async def plan_oem_position_table_move(
     plan.update({"ok": True, "schema_version": "bioxp.oem_position_plan.v1", "motion_commanded": False, "current_mutation_commanded": False, "switch_mask_mutation_commanded": False})
     return plan
 
+
+
+
+
+@router.get("/motion/oem/movement_readiness/comparison")
+async def get_oem_movement_readiness_comparison() -> dict[str, Any]:
+    """No-motion OEM-vs-new movement-test readiness/gap comparison."""
+    return build_movement_readiness_comparison()
 
 
 @router.get("/motion/oem/pathing/default_parameters")
