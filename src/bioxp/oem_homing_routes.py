@@ -14,6 +14,8 @@ from fastapi import APIRouter, HTTPException
 from .oem_config import find_oem_machine_config_bundle
 from .oem_homing_runtime import OemHomingDryRunRuntime
 from .oem_homing_spec import all_programs, get_program
+from .oem_compat.machine_state import OemDefaultParameters, OemMachineState
+from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_shadow_readback_live import build_shadow_readback_artifact
 
@@ -97,6 +99,82 @@ async def plan_oem_position_table_move(
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported OEM position-table plan mode: {mode}")
     plan.update({"ok": True, "schema_version": "bioxp.oem_position_plan.v1", "motion_commanded": False, "current_mutation_commanded": False, "switch_mask_mutation_commanded": False})
+    return plan
+
+
+
+@router.get("/motion/oem/pathing/default_parameters")
+async def get_oem_pathing_default_parameters(
+    pseudo_z_home: int | None = None,
+    force_high_home: bool = False,
+    tiploaded: str | None = None,
+    plateloaded: str | None = None,
+) -> dict[str, Any]:
+    """Dry-run OEM DefaultParameters pseudo-Z state. No USB/motion."""
+    params = OemDefaultParameters(pseudo_z_home) if pseudo_z_home is not None else OemDefaultParameters()
+    if force_high_home:
+        params = params.force_to_high_home()
+    elif tiploaded is not None or plateloaded is not None:
+        params = params.gantry_load(tiploaded=tiploaded, plateloaded=plateloaded)
+    payload = params.to_payload()
+    payload.update({"ok": True, "opened_usb": False, "physical_motion": False, "motion_commanded": False})
+    return payload
+
+
+@router.get("/motion/oem/pathing/scriptmove_plan")
+async def plan_oem_scriptmove_path(
+    location_id: str,
+    current_loc: str | None = None,
+    current_well: str | None = None,
+    column: int = 0,
+    row: int = 0,
+    positionflag: int = 0,
+    current_x: int = 0,
+    current_y: int = 0,
+    current_z: int = 0,
+    tip_loaded: bool = False,
+    tip_dirty: bool = False,
+    tip_location: int = -1,
+    clean_path: bool = False,
+    device_type: str = "",
+    gripper_confirmed: bool = False,
+    pseudo_z_home: int | None = None,
+    run_in_parallel: bool = True,
+    root_dir: str | None = None,
+) -> dict[str, Any]:
+    """Dry-run exact OEM scriptmoveTo path/branch planner. No USB/motion."""
+    table = load_bound_oem_position_table(root_dir)
+    cfg = find_oem_machine_config_bundle(root_dir)
+    axis_limits = (((cfg.get("config") or {}).get("axis_limits") or {}) if isinstance(cfg, dict) else {})
+    planner = OemPathPlanner(
+        table,
+        x_high_limit=int((axis_limits.get("x") or {}).get("max_steps") or 90263),
+        y_high_limit=int((axis_limits.get("y") or {}).get("max_steps") or 102956),
+    )
+    state = OemMachineState.from_query(
+        current_location_id=current_loc,
+        current_well_id=current_well,
+        current_x=current_x,
+        current_y=current_y,
+        current_z=current_z,
+        tip_loaded=tip_loaded,
+        tip_dirty=tip_dirty,
+        tip_location=tip_location,
+        clean_path=clean_path,
+        device_type=device_type,
+        gripper_confirmed=gripper_confirmed,
+        pseudo_z_home=pseudo_z_home,
+    )
+    plan = planner.plan_script_move_to(
+        current_loc=current_loc,
+        location_id=location_id,
+        column=column,
+        row=row,
+        positionflag=positionflag,
+        state=state,
+        run_in_parallel=run_in_parallel,
+    )
+    plan.update({"current_mutation_commanded": False, "switch_mask_mutation_commanded": False})
     return plan
 
 @router.get("/motion/oem/programs")
