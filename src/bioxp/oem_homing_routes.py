@@ -103,7 +103,7 @@ class _ApiShadowReadbackProvider:
             self._api.AxisName.Y,
             self._api.AxisName.Z,
             self._api.AxisName.GRIPPER,
-            self._api.AxisName.DOOR,
+            self._api.AxisName.THERMAL_DOOR,
         ])
 
 
@@ -118,10 +118,26 @@ async def oem_shadow_readback(axes: str = "x,y,z,g,door") -> dict[str, Any]:
     from . import api as api_mod
 
     requested_axes = [axis.value for axis in api_mod._parse_axes_csv(axes)]
-    provider = _ApiShadowReadbackProvider(api_mod)
+
+    def _capture() -> dict[str, Any]:
+        try:
+            provider = _ApiShadowReadbackProvider(api_mod)
+            return build_shadow_readback_artifact(provider, axes=requested_axes)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "failed_closed": True,
+                "motion_commanded": False,
+                "current_mutation_commanded": False,
+                "switch_mask_mutation_commanded": False,
+                "axes_requested": requested_axes,
+                "error": str(exc),
+                "blockers": ["shadow_readback_unavailable"],
+            }
+
     return await api_mod._run_blocking(
         "OEM shadow readback",
-        lambda: build_shadow_readback_artifact(provider, axes=requested_axes),
+        _capture,
         timeout_s=max(20.0, 6.0 * float(len(requested_axes))),
     )
 
