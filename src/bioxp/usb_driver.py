@@ -3930,53 +3930,46 @@ class BioXpTester:
             "ok": ok,
         }
 
-    def motor_oem_door_search_home(self, *, timeout_s=20.0):
+    def motor_oem_door_search_home(self, *, timeout_s=20.0, startup=False):
+        """OEM thermal-door search-home.
+
+        Startup initializeMotors() calls doorSearchHome(...) directly and then
+        confirms tcDoorClosed. Manual HomeAxis("D") has an additional preclear
+        branch when the closed predicate is already active. Keep those modes
+        separate so startup parity does not inherit manual-home-only preclear
+        behavior or unbounded proxy-visible waits.
+        """
         preset = self._motion_oem_axis_profile("door")
         board = int(preset["board"])
         motor = int(preset["motor"])
         threshold = int(preset.get("stall_guard", 6))
+        wait_timeout = max(2.0, min(float(timeout_s), 20.0 if bool(startup) else float(timeout_s)))
         home_before = self.motor_query_home_switch(board, motor=motor)
         preclear_threshold = None
         preclear_move = None
         preclear_wait = None
-        if home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
+        if (not bool(startup)) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
             preclear_threshold = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold + 2, motor=motor)
             preclear_move = self.motor_move_relative(board, 2000, motor=motor)
             preclear_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 8.0))
         threshold_restore = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold, motor=motor)
         move_left = self.motor_move_left(board, speed=int(preset.get("home_speed", preset.get("speed", 600))), motor=motor)
-        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=max(2.0, float(timeout_s)), require_seen_nonzero=True)
-        if wait.get("ambiguous_no_motion"):
-            stop = self.motor_stop(board, motor=motor)
-            home_after = self.motor_query_home_switch(board, motor=motor)
-            switches_after = self.motor_get_switch_activity(board, motor=motor)
-            return {
-                "axis": "door",
-                "board": board,
-                "motor": motor,
-                "speed": int(preset.get("home_speed", preset.get("speed", 600))),
-                "home_before": home_before,
-                "preclear_threshold": preclear_threshold,
-                "preclear_move": preclear_move,
-                "preclear_wait": preclear_wait,
-                "threshold_restore": threshold_restore,
-                "move_left": move_left,
-                "wait": wait,
-                "stop": stop,
-                "set_home": None,
-                "home_after": home_after,
-                "switches_after": switches_after,
-                "ambiguous_no_motion": True,
-                "ok": False,
-            }
+        wait = self.motor_wait_stopped(
+            board,
+            motor=motor,
+            timeout_s=wait_timeout,
+            require_seen_nonzero=not bool(startup),
+        )
         stop = self.motor_stop(board, motor=motor)
-        sethome = self.motor_set_home(board, motor=motor)
         home_after = self.motor_query_home_switch(board, motor=motor)
         switches_after = self.motor_get_switch_activity(board, motor=motor)
-        return {
+        closed_confirmed = home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else False
+        base = {
             "axis": "door",
             "board": board,
             "motor": motor,
+            "startup": bool(startup),
+            "oem_mode": "initializeMotors.doorSearchHome" if bool(startup) else "HomeAxis(D).doorSearchHome",
             "speed": int(preset.get("home_speed", preset.get("speed", 600))),
             "home_before": home_before,
             "preclear_threshold": preclear_threshold,
@@ -3986,10 +3979,34 @@ class BioXpTester:
             "move_left": move_left,
             "wait": wait,
             "stop": stop,
-            "set_home": sethome,
             "home_after": home_after,
             "switches_after": switches_after,
-            "ok": home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else True,
+            "closed_confirmed": bool(closed_confirmed),
+        }
+        if wait.get("ambiguous_no_motion"):
+            return {
+                **base,
+                "set_home": None,
+                "ambiguous_no_motion": True,
+                "partial": False,
+                "failure": "door_search_no_motion_observed",
+                "ok": False,
+            }
+        if wait.get("stopped") is not True:
+            return {
+                **base,
+                "set_home": None,
+                "partial": True,
+                "failure": "door_search_wait_timeout",
+                "ok": False,
+            }
+        sethome = self.motor_set_home(board, motor=motor)
+        return {
+            **base,
+            "set_home": sethome,
+            "partial": False,
+            "failure": None,
+            "ok": bool(closed_confirmed),
         }
 
     def motor_oem_switch_search_home_axis(self, axis_key, *, speed=None, timeout_s=20.0):
@@ -4018,7 +4035,7 @@ class BioXpTester:
         effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
         axis_key_norm = str(axis_key).strip().lower()
         if axis_key_norm == "door":
-            home = self.motor_oem_door_search_home(timeout_s=timeout_s)
+            home = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
         else:
             home = self.motor_oem_axis_search_home(
                 axis_key_norm,
@@ -4058,7 +4075,7 @@ class BioXpTester:
         effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
         axis_key_norm = str(axis_key).strip().lower()
         if axis_key_norm == "door":
-            home = self.motor_oem_door_search_home(timeout_s=timeout_s)
+            home = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=bool(startup))
         elif axis_key_norm == "z" and bool(startup):
             # OEM source labels the startup step as MotorZ.axisSearchHome(speed=1791),
             # implemented through ClassHeadBoard.queryHome() -> GAP9/left.  Live runs
