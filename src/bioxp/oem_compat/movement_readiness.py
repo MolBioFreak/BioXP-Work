@@ -35,10 +35,10 @@ READINESS_MATRIX: list[dict[str, Any]] = [
     {
         "layer": "Live execution adapter",
         "oem_expected": "OEM moveTo/moveXY/moveZ/moveSteps sequence executes through controller with interlocks, current prep, and waits.",
-        "new_system_status": "executor_preview_route_implemented_live_actuation_disabled",
-        "evidence": ["POST /motion/oem/pathing/scriptmove_execute", "POST /motion/axis/relative", "POST /motion/axis/absolute"],
-        "gap": "executor handoff now consumes OEM path-plan steps, but live actuation of those steps is still disabled pending supervised execution wiring",
-        "movement_gate": "do not run full OEM path moves until scriptmove_execute live mode performs guarded step execution and has supervised proof",
+        "new_system_status": "implemented_guarded_live_executor",
+        "evidence": ["POST /motion/oem/pathing/scriptmove_execute", "POST /motion/axis/relative", "POST /motion/axis/absolute", "tests/test_oem_pathing_executor.py"],
+        "gap": None,
+        "movement_gate": "live mode requires operator_ack=OEM_PATH_EXECUTE plus non-empty reason; full path moves still require immediate pre-move live checks and supervised operator/camera observation",
     },
     {
         "layer": "Movement observation / operator truth",
@@ -79,8 +79,8 @@ def build_movement_readiness_comparison() -> dict[str, Any]:
         "current_mutation_commanded": False,
         "summary": {
             "config_and_dry_run_pathing": "ready_for_pre_move_review",
-            "live_oem_path_execution": "executor_preview_only",
-            "blind_absolute_or_full_path_motion": "not_ready_without_reference_and_live_executor_gates",
+            "live_oem_path_execution": "guarded_live_executor_available",
+            "blind_absolute_or_full_path_motion": "not_ready_without_reference_and_operator_observation",
             "supervised_micro_move_testing": "eligible_only_after_live_gates_pass",
             "hard_gap_count": len(hard_gaps),
         },
@@ -98,7 +98,7 @@ def build_movement_readiness_comparison() -> dict[str, Any]:
         ],
         "movement_test_start_policy": [
             "No homing unless explicitly requested and separately reviewed.",
-            "No full OEM path execution until scriptmove_execute live mode performs guarded step execution and is tested.",
+            "Full OEM path execution must use scriptmove_execute live mode with operator_ack=OEM_PATH_EXECUTE and a non-empty reason.",
             "If arm=false/startup, run only strict_startup with run_homing=false after operator clearance.",
             "If reference state is desynced/unknown, use only supervised relative micro-move proof, not blind absolute/path moves.",
             "During commissioning, record before/after operator or camera observation just as OEM testing depends on observed instrument behavior.",

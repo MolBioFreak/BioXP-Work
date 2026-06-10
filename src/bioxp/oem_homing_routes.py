@@ -7,6 +7,7 @@ BioXpTester, open USB/CAN/camera transports, or command motion.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -231,21 +232,182 @@ def _execution_preview_for_step(step: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-@router.post("/motion/oem/pathing/scriptmove_execute")
-async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+class _ApiPathMotionExecutor:
+    """Adapter from OEM path-plan steps to existing guarded API motion primitives."""
+
+    def __init__(self, api_mod):
+        self._api = api_mod
+        self._tester = api_mod._get_tester()
+
+    def absolute(self, axis: str, position_steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
+        axis_enum = self._api.AxisName(str(axis))
+        return self._api._execute_absolute_move(
+            self._tester,
+            axis_enum,
+            int(position_steps),
+            float(wait_timeout_s),
+            speed=speed,
+            acc=acc,
+        )
+
+    def relative(self, axis: str, steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
+        axis_enum = self._api.AxisName(str(axis))
+        return self._api._execute_relative_move(
+            self._tester,
+            axis_enum,
+            int(steps),
+            float(wait_timeout_s),
+            speed=speed,
+            acc=acc,
+            reuse_prepared=False,
+        )
+
+    def sleep(self, milliseconds: int) -> dict[str, Any]:
+        delay_s = max(0.0, min(float(milliseconds) / 1000.0, 30.0))
+        time.sleep(delay_s)
+        return {"ok": True, "milliseconds": int(milliseconds), "slept_s": delay_s}
+
+
+def _step_result_failed(result: Any) -> bool:
+    return not isinstance(result, dict) or result.get("ok") is False or isinstance(result.get("motion_failure"), dict)
+
+
+def _execute_oem_step_live(
+    step: dict[str, Any],
+    motion_executor: Any,
+    *,
+    wait_timeout_s: float,
+    speed: int | None,
+    acc: int | None,
+    path: str,
+) -> dict[str, Any]:
+    op = str(step.get("op") or "")
+    result: dict[str, Any] = {"ok": True, "path": path, "op": op, "source_step": dict(step), "results": []}
+
+    def run_absolute(axis: str, position: Any) -> bool:
+        if position is None:
+            result.update({"ok": False, "error": f"{op} missing {axis} target"})
+            return False
+        sub = motion_executor.absolute(axis, int(position), speed=speed, acc=acc, wait_timeout_s=wait_timeout_s)
+        row = {"axis": axis, "command": "absolute", "target_position": int(position), "result": sub}
+        result["results"].append(row)
+        if _step_result_failed(sub):
+            result.update({"ok": False, "failed_axis": axis, "error": f"{op} absolute {axis} step failed"})
+            return False
+        return True
+
+    if op == "moveTo":
+        for axis in ("x", "y", "z"):
+            if not run_absolute(axis, step.get(axis)):
+                break
+    elif op == "moveXY":
+        for axis in ("x", "y"):
+            if not run_absolute(axis, step.get(axis)):
+                break
+    elif op == "moveX":
+        run_absolute("x", step.get("x"))
+    elif op == "moveY":
+        run_absolute("y", step.get("y"))
+    elif op == "moveZ":
+        run_absolute("z", step.get("z"))
+    elif op == "moveSteps":
+        axis = str(step.get("axis") or "")
+        delta = step.get("delta")
+        if axis not in {"x", "y", "z", "g", "door"} or delta is None:
+            result.update({"ok": False, "error": "moveSteps requires axis and delta"})
+        else:
+            sub = motion_executor.relative(axis, int(delta), speed=speed, acc=acc, wait_timeout_s=wait_timeout_s)
+            result["results"].append({"axis": axis, "command": "relative", "steps": int(delta), "result": sub})
+            if _step_result_failed(sub):
+                result.update({"ok": False, "failed_axis": axis, "error": "moveSteps relative step failed"})
+    elif op == "sleep":
+        ms = int(step.get("milliseconds") or 0)
+        sub = motion_executor.sleep(ms)
+        result["results"].append({"command": "sleep", "milliseconds": ms, "result": sub})
+        if _step_result_failed(sub):
+            result.update({"ok": False, "error": "sleep step failed"})
+    elif op == "parallel":
+        # The current safe commissioning executor intentionally serializes planned
+        # parallel children so every primitive still goes through the existing
+        # one-axis guarded API path and returns a per-step evidence envelope.
+        result["parallel_semantics"] = "sequentialized_for_guarded_commissioning"
+        for idx, child in enumerate(step.get("steps") or []):
+            child_result = _execute_oem_step_live(
+                child,
+                motion_executor,
+                wait_timeout_s=wait_timeout_s,
+                speed=speed,
+                acc=acc,
+                path=f"{path}.{idx}",
+            )
+            result["results"].append(child_result)
+            if _step_result_failed(child_result):
+                result.update({"ok": False, "error": "parallel child step failed"})
+                break
+    else:
+        result.update({"ok": False, "error": f"unsupported OEM path step op: {op}"})
+    return result
+
+
+def _execute_oem_steps_live(
+    steps: list[dict[str, Any]],
+    motion_executor: Any,
+    *,
+    wait_timeout_s: float,
+    speed: int | None,
+    acc: int | None,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    motion_commanded = False
+    for idx, step in enumerate(steps):
+        op = str(step.get("op") or "")
+        step_result = _execute_oem_step_live(
+            step,
+            motion_executor,
+            wait_timeout_s=wait_timeout_s,
+            speed=speed,
+            acc=acc,
+            path=str(idx),
+        )
+        results.append(step_result)
+        if op != "sleep":
+            motion_commanded = True
+        if _step_result_failed(step_result):
+            return {
+                "ok": False,
+                "failed_closed": True,
+                "executor_status": "failed_closed_step_error",
+                "motion_commanded": motion_commanded,
+                "execution_results": results,
+                "error": step_result.get("error") or "OEM path step failed",
+            }
+    return {
+        "ok": True,
+        "executor_status": "live_step_execution_complete",
+        "motion_commanded": motion_commanded,
+        "execution_results": results,
+    }
+
+
+async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = None, motion_executor: Any | None = None) -> dict[str, Any]:
     """Guarded OEM scriptmoveTo executor handoff.
 
-    Default mode is preview-only and commands no motion. Live mode is intentionally
-    fail-closed unless the caller supplies the explicit commissioning ack; the
-    actual actuation layer is implemented in a separate step so the dry-run
-    planner becomes the sole executor input without silently bypassing gates.
+    Default mode is preview-only and commands no motion. Live mode requires the
+    explicit OEM_PATH_EXECUTE ack plus a non-empty reason, then executes the
+    planned OEM steps through the existing guarded motion primitives. The route
+    still reports physical_motion=false because controller execution is not
+    independent physical proof.
     """
     payload = payload or {}
     mode = str(payload.get("mode") or "dry_run").strip().lower()
     if mode not in {"dry_run", "preview", "live"}:
         raise HTTPException(status_code=400, detail=f"unsupported scriptmove_execute mode: {mode}")
-    if mode == "live" and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
+    live_enabled = mode == "live"
+    if live_enabled and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
         raise HTTPException(status_code=409, detail="operator_ack OEM_PATH_EXECUTE required for live OEM path execution")
+    reason = str(payload.get("reason") or payload.get("operator_note") or "").strip()
+    if live_enabled and not reason:
+        raise HTTPException(status_code=409, detail="live OEM path execution requires a non-empty reason/operator_note")
     plan = await plan_oem_scriptmove_path(
         location_id=str(payload.get("location_id") or "UNKNOWN"),
         current_loc=payload.get("current_loc"),
@@ -267,12 +429,10 @@ async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> 
         root_dir=payload.get("root_dir"),
     )
     execution_steps = [_execution_preview_for_step(step) for step in plan.get("steps") or []]
-    live_enabled = mode == "live"
-    return {
+    base = {
         "ok": True,
         "schema_version": "bioxp.oem_scriptmove_execution.v1",
         "mode": "live" if live_enabled else "dry_run",
-        "executor_status": "live_acknowledged_preview_only" if live_enabled else "preview_only",
         "plan": plan,
         "execution_steps": execution_steps,
         "opened_usb": False,
@@ -280,8 +440,58 @@ async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> 
         "physical_motion": False,
         "current_mutation_commanded": False,
         "switch_mask_mutation_commanded": False,
-        "live_motion_note": "Live actuation is still disabled in this scaffold; this route now makes the planner the required executor input.",
+        "operator_ack": payload.get("operator_ack") if live_enabled else None,
+        "reason": reason or None,
+        "live_motion_note": "Controller execution is not independent physical proof; supervised operator/camera observation is still required.",
     }
+    if not live_enabled:
+        base["executor_status"] = "preview_only"
+        return base
+
+    wait_timeout_s = float(payload.get("wait_timeout_s") or 12.0)
+    speed = payload.get("speed")
+    acc = payload.get("acc")
+    speed_i = None if speed is None else int(speed)
+    acc_i = None if acc is None else int(acc)
+
+    if motion_executor is None:
+        from . import api as api_mod
+
+        def _run_live() -> dict[str, Any]:
+            api_mod._require_motion_route_ready()
+            executor = _ApiPathMotionExecutor(api_mod)
+            return _execute_oem_steps_live(
+                list(plan.get("steps") or []),
+                executor,
+                wait_timeout_s=wait_timeout_s,
+                speed=speed_i,
+                acc=acc_i,
+            )
+
+        live_result = await api_mod._run_blocking(
+            "OEM scriptmoveTo guarded live executor",
+            _run_live,
+            timeout_s=max(30.0, min(300.0, wait_timeout_s * max(1, len(plan.get("steps") or [])) * 4.0)),
+        )
+    else:
+        live_result = _execute_oem_steps_live(
+            list(plan.get("steps") or []),
+            motion_executor,
+            wait_timeout_s=wait_timeout_s,
+            speed=speed_i,
+            acc=acc_i,
+        )
+
+    base.update(live_result)
+    base["opened_usb"] = True
+    base["current_mutation_commanded"] = bool(base.get("motion_commanded"))
+    base["switch_mask_mutation_commanded"] = False
+    return base
+
+
+@router.post("/motion/oem/pathing/scriptmove_execute")
+async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return await _execute_oem_scriptmove_path_impl(payload)
 
 
 @router.get("/motion/oem/programs")

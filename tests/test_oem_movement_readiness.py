@@ -4,14 +4,16 @@ from src.bioxp.oem_compat.movement_readiness import build_movement_readiness_com
 from src.bioxp.oem_homing_routes import get_oem_movement_readiness_comparison
 
 
-def test_movement_readiness_comparison_is_no_motion_and_lists_hard_gaps():
+def test_movement_readiness_comparison_is_no_motion_and_reports_executor_available():
     payload = build_movement_readiness_comparison()
     assert payload["opened_usb"] is False
     assert payload["physical_motion"] is False
     assert payload["motion_commanded"] is False
-    assert payload["summary"]["live_oem_path_execution"] == "executor_preview_only"
-    assert payload["summary"]["hard_gap_count"] == 1
-    assert any(row["layer"] == "Live execution adapter" and row["gap"] for row in payload["matrix"])
+    assert payload["summary"]["live_oem_path_execution"] == "guarded_live_executor_available"
+    assert payload["summary"]["hard_gap_count"] == 0
+    adapter = next(row for row in payload["matrix"] if row["layer"] == "Live execution adapter")
+    assert adapter["gap"] is None
+    assert adapter["new_system_status"] == "implemented_guarded_live_executor"
     assert any("operator or camera observation" in item for item in payload["movement_test_start_policy"])
 
 
