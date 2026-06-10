@@ -11,6 +11,11 @@ import signal
 import json
 import concurrent.futures
 
+try:
+    from .oem_config import find_oem_machine_config_bundle
+except Exception:  # pragma: no cover - script/import fallback
+    find_oem_machine_config_bundle = None
+
 import usb.core
 import usb.util
 
@@ -367,6 +372,11 @@ class BioXpTester:
         self._thermal_noresp_streak = 0
         self._led_state_path = self._default_led_state_path()
         self._led_state_cache = None
+        self._bus_event_buffer = []
+        self._bus_event_buffer_max = 256
+        self._usb_sniff_ledger_path = None
+        self._usb_sniff_ledger_run_id = None
+        self._usb_sniff_ledger_seq = 0
         self._libc = ctypes.CDLL(None, use_errno=True)
         self.UVCIOC_CTRL_QUERY = self._build_uvc_ioctl_query()
         self._motion_arm = {
@@ -648,12 +658,103 @@ class BioXpTester:
         out["persisted"] = state
         return out
 
+    def _decode_bus_event_frame(self, resp, source="usb_in"):
+        frame = list(resp)
+        if tuple(frame) in self.KNOWN_HEARTBEATS or len(frame) < 14:
+            return None
+        try:
+            status = int(frame[7])
+            value = struct.unpack(">i", bytes(frame[9:13]))[0]
+        except Exception:
+            return None
+        return {
+            "board": int(frame[6]),
+            "status": status,
+            "status_str": TMCL_STATUS.get(status, f"?({status})"),
+            "cmd": int(frame[8]),
+            "value": int(value),
+            "raw": frame,
+            "source": str(source),
+            "observed_ms": int(time.time() * 1000),
+        }
+
+    def _remember_bus_event(self, resp, source="usb_in"):
+        event = self._decode_bus_event_frame(resp, source=source)
+        if event is None:
+            return None
+        self._bus_event_buffer.append(event)
+        overflow = len(self._bus_event_buffer) - int(self._bus_event_buffer_max)
+        if overflow > 0:
+            del self._bus_event_buffer[:overflow]
+        return event
+
+    def set_usb_sniff_ledger_path(self, path=None, run_id=None):
+        """Enable/disable JSONL TX/RX ledger recording for external USB capture runs.
+
+        This is observability-only and never commands hardware by itself.
+        """
+        if path:
+            path = os.path.abspath(str(path))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._usb_sniff_ledger_path = path
+            self._usb_sniff_ledger_run_id = str(run_id or "")
+            self._usb_sniff_ledger_seq = 0
+            self._record_usb_sniff_ledger("meta", event="ledger_enabled")
+            return {"ok": True, "enabled": True, "path": path, "run_id": self._usb_sniff_ledger_run_id}
+        old = self._usb_sniff_ledger_path
+        self._record_usb_sniff_ledger("meta", event="ledger_disabled")
+        self._usb_sniff_ledger_path = None
+        self._usb_sniff_ledger_run_id = None
+        return {"ok": True, "enabled": False, "previous_path": old, "run_id": str(run_id or "")}
+
+    def usb_sniff_ledger_status(self):
+        return {"enabled": bool(self._usb_sniff_ledger_path), "path": self._usb_sniff_ledger_path, "run_id": self._usb_sniff_ledger_run_id, "seq": self._usb_sniff_ledger_seq}
+
+    def _record_usb_sniff_ledger(self, direction, frame=None, **extra):
+        path = getattr(self, "_usb_sniff_ledger_path", None)
+        if not path:
+            return None
+        try:
+            self._usb_sniff_ledger_seq = int(getattr(self, "_usb_sniff_ledger_seq", 0)) + 1
+            raw = list(frame) if frame is not None else None
+            row = {
+                "schema_version": "bioxp.usb_driver_ledger.v1",
+                "seq": self._usb_sniff_ledger_seq,
+                "run_id": getattr(self, "_usb_sniff_ledger_run_id", None),
+                "ts_ms": int(time.time() * 1000),
+                "direction": str(direction),
+                "frame_len": len(raw) if raw is not None else None,
+                "raw": raw,
+            }
+            row.update(extra)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+            return row
+        except Exception:
+            return None
+
+    def clear_bus_event_buffer(self):
+        cleared = len(self._bus_event_buffer)
+        self._bus_event_buffer = []
+        return {"cleared": cleared}
+
+    def pop_bus_event_buffer(self):
+        events = list(self._bus_event_buffer)
+        self._bus_event_buffer = []
+        return events
+
     def drain(self, max_reads=16, timeout_ms=8):
+        events = []
         for _ in range(max_reads):
             try:
-                self.ep_in.read(64, timeout=timeout_ms)
+                resp = list(self.ep_in.read(64, timeout=timeout_ms))
             except usb.core.USBTimeoutError:
                 break
+            self._record_usb_sniff_ledger("IN", resp, source="drain", timeout_ms=int(timeout_ms))
+            event = self._remember_bus_event(resp, source="drain")
+            if event is not None:
+                events.append(event)
+        return events
 
     @staticmethod
     def _build_frame(board_id, command, cmd_type, motor, value):
@@ -694,9 +795,11 @@ class BioXpTester:
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
         # Keep stale async frames from poisoning strict response matching.
         self.drain(max_reads=6, timeout_ms=2)
+        self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
         try:
             self.ep_out.write(frame, timeout=write_timeout_ms)
         except usb.core.USBTimeoutError:
+            self._record_usb_sniff_ledger("error", None, source="send_tmcl", error="usb_write_timeout", board=int(board_id), command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
 
         if not wait_reply:
@@ -718,9 +821,11 @@ class BioXpTester:
                 resp = list(self.ep_in.read(64, timeout=read_timeout_ms))
             except usb.core.USBTimeoutError:
                 continue
+            self._record_usb_sniff_ledger("IN", resp, source="wait_for_reply", expected_board=int(board_id), expected_command=int(command), strict_match=bool(strict_match), read_timeout_ms=int(read_timeout_ms))
             if tuple(resp) in self.KNOWN_HEARTBEATS or len(resp) < 14:
                 continue
             if strict_match and (resp[6] != board_id or resp[8] != command):
+                self._remember_bus_event(resp, source="reply_mismatch")
                 continue
             status = resp[7]
             return {
@@ -744,17 +849,12 @@ class BioXpTester:
                 resp = list(self.ep_in.read(64, timeout=int(timeout_ms)))
             except usb.core.USBTimeoutError:
                 continue
+            self._record_usb_sniff_ledger("IN", resp, source="collect_bus_events", timeout_ms=int(timeout_ms))
             if tuple(resp) in self.KNOWN_HEARTBEATS or len(resp) < 14:
                 continue
-            status = resp[7]
-            ev = {
-                "board": resp[6],
-                "status": status,
-                "status_str": TMCL_STATUS.get(status, f"?({status})"),
-                "cmd": resp[8],
-                "value": struct.unpack(">i", bytes(resp[9:13]))[0],
-                "raw": resp,
-            }
+            ev = self._decode_bus_event_frame(resp, source="collect_bus_events")
+            if ev is None:
+                continue
             events.append(ev)
         return events
 
@@ -2975,6 +3075,38 @@ class BioXpTester:
             rows.append({"op": "sap5-max_acc", "ack": ra.get("ack"), "rb": ra.get("readback"), "set": int(acc)})
         return rows
 
+    def motor_restore_gripper_idle_current(self, *, reason="gripper_idle_invariant"):
+        """Force gripper G back to OEM idle/hold current without commanding motion."""
+        preset = self.motor_function_preset("g")
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        idle = max(0, min(10, int(preset.get("standby_current", 10))))
+        before6 = self.motor_get_axis_param(board, 6, motor=motor)
+        before7 = self.motor_get_axis_param(board, 7, motor=motor)
+        speed_before = self.motor_get_speed(board, motor=motor)
+        write7 = self.motor_set_axis_param(board, 7, idle, motor=motor)
+        write6 = self.motor_set_axis_param(board, 6, idle, motor=motor)
+        after6 = self.motor_get_axis_param(board, 6, motor=motor)
+        after7 = self.motor_get_axis_param(board, 7, motor=motor)
+        speed_after = self.motor_get_speed(board, motor=motor)
+        speed_value = speed_after.get("speed") if isinstance(speed_after, dict) else None
+        after6_value = after6.get("value") if isinstance(after6, dict) else None
+        after7_value = after7.get("value") if isinstance(after7, dict) else None
+        unsafe_hot_idle = bool(speed_value == 0 and ((isinstance(after6_value, int) and after6_value > idle) or (isinstance(after7_value, int) and after7_value > idle)))
+        return {
+            "ok": bool(write6.get("ok") and write7.get("ok") and after6_value == idle and after7_value == idle),
+            "axis": "g",
+            "board": board,
+            "motor": motor,
+            "reason": str(reason),
+            "idle_current": idle,
+            "motion_commanded": False,
+            "before": {"param6": before6, "param7": before7, "speed": speed_before},
+            "writes": {"param7_standby_idle": write7, "param6_run_idle": write6},
+            "after": {"param6": after6, "param7": after7, "speed": speed_after},
+            "classification": "G_CURRENT_UNSAFE_HOT_IDLE" if unsafe_hot_idle else "G_CURRENT_IDLE_SAFE",
+        }
+
     def motor_prepare_axis(
         self,
         board_id,
@@ -3377,6 +3509,31 @@ class BioXpTester:
         except Exception:
             return 0
 
+    def _machine_config_axis_max(self, axis_key, fallback):
+        """Return bound original-SSD max steps for a homing guard, if available.
+
+        This helper is read-only and never talks to hardware. It only prevents
+        live homing/search guards from silently using generic source/default deck
+        extents after a machine-specific OEM config has been bound.
+        """
+        key = str(axis_key).strip().lower()
+        result = None
+        if find_oem_machine_config_bundle is not None:
+            try:
+                result = find_oem_machine_config_bundle()
+            except Exception:
+                result = None
+        if isinstance(result, dict) and result.get("ok") is True:
+            axis_limits = (((result.get("config") or {}).get("axis_limits") or {}))
+            row = axis_limits.get(key) if isinstance(axis_limits, dict) else None
+            if isinstance(row, dict) and row.get("max_steps") is not None:
+                try:
+                    return int(row["max_steps"]), "original_ssd_machine_config"
+                except (TypeError, ValueError):
+                    pass
+        return int(fallback), "oem_source_default_or_commissioned_guard"
+
+
     def _motion_oem_axis_profile(self, axis_key, *, startup=False):
         key = str(axis_key).strip().lower()
         preset = dict(self.motor_function_preset(key))
@@ -3385,6 +3542,7 @@ class BioXpTester:
         # the OEM step order/method labels.  Full-speed vendor constants are provenance,
         # not the safe default for supervised Linux homing proof runs.
         if key == "x":
+            x_max, x_max_source = self._machine_config_axis_max("x", 91919)
             preset.update({
                 "speed": 300 if startup else preset.get("speed", 1700),
                 "acc": 120 if startup else preset.get("acc", 350),
@@ -3393,10 +3551,12 @@ class BioXpTester:
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
                 "stall_guard": 16,
                 "oem_home_step": "MotorX.axisSearchHome(speed=250)" if startup else "MotorX.goHome(speed=500,rehome=true)",
-                "home_search_max_abs_delta": 91919,
+                "home_search_max_abs_delta": x_max,
+                "home_search_max_abs_delta_source": x_max_source,
             })
             return preset
         if key == "y":
+            y_max, y_max_source = self._machine_config_axis_max("y", 95247)
             preset.update({
                 "speed": 300 if startup else preset.get("speed", 1800),
                 "acc": 120 if startup else preset.get("acc", 400),
@@ -3406,7 +3566,8 @@ class BioXpTester:
                 "stall_guard": 16,
                 "disable_right": True,
                 "oem_home_step": "MotorY.axisSearchHome(speed=250)" if startup else "MotorY.goHome(speed=500,rehome=true)",
-                "home_search_max_abs_delta": 95247,
+                "home_search_max_abs_delta": y_max,
+                "home_search_max_abs_delta_source": y_max_source,
             })
             return preset
         if key == "z":
@@ -3422,15 +3583,18 @@ class BioXpTester:
                 "positive_down_requires_right_mask": True,
                 "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
                 "home_search_max_abs_delta": 30000,
+                "home_search_max_abs_delta_source": "commissioned_linux_z_guard_not_oem_max",
             })
             return preset
         if key == "g":
             gv = self._motion_oem_gripper_version()
             op_current = 31 if bool(startup) else 10
             if gv == 1:
-                preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": op_current, "standby_current": 10, "home_speed": 200, "restore_current": 10, "home_search_max_abs_delta": 15000})
+                g_max, g_max_source = self._machine_config_axis_max("g", 15000)
+                preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": op_current, "standby_current": 10, "home_speed": 200, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
             else:
-                preset.update({"speed": 600, "acc": 5, "stall_guard": 5, "run_current": op_current, "standby_current": 10, "home_speed": 600, "restore_current": 10, "home_search_max_abs_delta": 15000})
+                g_max, g_max_source = self._machine_config_axis_max("g", 15000)
+                preset.update({"speed": 600, "acc": 5, "stall_guard": 5, "run_current": op_current, "standby_current": 10, "home_speed": 600, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
             return preset
         if key == "door":
             preset.update({"home_speed": int(preset.get("speed", 600)), "stall_guard_param": 205})
@@ -3862,8 +4026,8 @@ class BioXpTester:
                 max_search_abs_delta=preset.get("home_search_max_abs_delta"),
             )
         restore_current = None
-        if axis_key_norm == "g" and preset.get("restore_current") is not None:
-            restore_current = self.motor_set_axis_param(preset["board"], 6, int(preset["restore_current"]), motor=preset["motor"])
+        if axis_key_norm == "g":
+            restore_current = self.motor_restore_gripper_idle_current(reason="manual_switch_search_home_g_finally")
         return {
             "axis": axis_key_norm,
             "startup": False,
@@ -3955,8 +4119,8 @@ class BioXpTester:
         else:
             home = self.motor_oem_go_home(axis_key_norm, speed=effective_speed, rehome=True, timeout_s=timeout_s)
         restore_current = None
-        if str(axis_key).strip().lower() == "g" and preset.get("restore_current") is not None:
-            restore_current = self.motor_set_axis_param(preset["board"], 6, int(preset["restore_current"]), motor=preset["motor"])
+        if str(axis_key).strip().lower() == "g":
+            restore_current = self.motor_restore_gripper_idle_current(reason="oem_home_axis_g_finally")
         return {
             "axis": str(axis_key).strip().lower(),
             "startup": bool(startup),

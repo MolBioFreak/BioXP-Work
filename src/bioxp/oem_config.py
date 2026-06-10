@@ -393,22 +393,43 @@ def _axis_limit_diagnostics(axis_limits: dict[str, dict[str, Any]], config_statu
 
 
 def harmonized_motion_config(config_result: dict | None = None) -> dict:
-    config = config_result or find_oem_config()
-    axis_limits = config.get("axis_limits") if isinstance(config, dict) else None
+    """Return source-grounded motion config, preferring bound machine SSD config.
+
+    This is still read-only metadata. It does not command motion; it only makes
+    status/planning surfaces stop reporting generic source extents when the
+    original SSD's machine config has been explicitly bound.
+    """
+    machine = None if config_result is not None else find_oem_machine_config_bundle()
+    if isinstance(machine, dict) and machine.get("ok") is True:
+        machine_config = machine.get("config", {}) if isinstance(machine.get("config"), dict) else {}
+        axis_limits = machine_config.get("axis_limits") if isinstance(machine_config, dict) else None
+        source = "original_ssd_machine_config"
+        config_status: dict[str, Any] = {
+            "status": "loaded",
+            "path": (machine.get("files", {}).get("config_xml", {}) or {}).get("path"),
+            "source_type": machine.get("source_type"),
+            "machine_calibrated": machine.get("machine_calibrated"),
+            "runtime_binding": machine.get("runtime_binding"),
+            "files": machine.get("files", {}),
+            "diff_vs_source_defaults": machine.get("diff_vs_source_defaults", {}),
+        }
+    else:
+        config = config_result or find_oem_config()
+        axis_limits = config.get("axis_limits") if isinstance(config, dict) else None
+        source = "config_xml" if isinstance(config, dict) and config.get("status") == "loaded" and any(
+            isinstance(row, dict) and row.get("source") == "config_xml_axislimits" for row in (axis_limits or {}).values()
+        ) else "oem_defaults_no_config_xml_found"
+        config_status = config if isinstance(config, dict) else {"status": "missing"}
     if not isinstance(axis_limits, dict) or not axis_limits:
         axis_limits = {axis: dict(row) for axis, row in OEM_DEFAULT_AXIS_LIMITS.items()}
-    source = "config_xml" if isinstance(config, dict) and config.get("status") == "loaded" and any(
-        isinstance(row, dict) and row.get("source") == "config_xml_axislimits" for row in axis_limits.values()
-    ) else "oem_defaults_no_config_xml_found"
-    config_status = config.get("status") if isinstance(config, dict) else None
     return {
         "ok": True,
         "schema_version": "bioxp.oem_motion_config.v1",
         "source": source,
-        "config_status": config,
+        "config_status": config_status,
         "axis_limits": axis_limits,
         "deck_coordinate_extents": {axis: dict(row) for axis, row in OEM_DEFAULT_DECK_COORDINATE_EXTENTS.items()},
-        "axis_limit_diagnostics": _axis_limit_diagnostics(axis_limits, config_status),
+        "axis_limit_diagnostics": _axis_limit_diagnostics(axis_limits, config_status.get("status") if isinstance(config_status, dict) else None),
         "source_evidence": OEM_AXIS_LIMIT_SOURCE_EVIDENCE,
         "caveats": [
             "These are software/configured OEM limits, not proof of physical endpoint travel.",
