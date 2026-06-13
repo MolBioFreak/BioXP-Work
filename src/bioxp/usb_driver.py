@@ -4494,12 +4494,44 @@ class BioXpTester:
                     "speed": self.motor_set_axis_param(board, 4, int(preset.get("speed", 1700 if axis == "x" else 1800)), motor=motor),
                     "acc": self.motor_set_axis_param(board, 5, int(preset.get("acc", 350 if axis == "x" else 400)), motor=motor),
                 }
+        out["home_rebase"] = {}
+        for axis, preset in (("x", px), ("y", py)):
+            board = int(preset["board"])
+            motor = int(preset["motor"])
+            status_before_rebase = self.motor_axis_status(board, motor=motor)
+            switches = status_before_rebase.get("switches") if isinstance(status_before_rebase, dict) else {}
+            speed_row = status_before_rebase.get("speed") if isinstance(status_before_rebase, dict) else {}
+            home_switch_confirmed = bool(isinstance(switches, dict) and switches.get("left_raw_active") is True)
+            stopped = bool(isinstance(speed_row, dict) and speed_row.get("speed") == 0)
+            rebase = {
+                "axis": axis,
+                "board": board,
+                "motor": motor,
+                "status_before_rebase": status_before_rebase,
+                "home_switch_confirmed": home_switch_confirmed,
+                "stopped": stopped,
+                "set_home": None,
+                "position_after_set_home": None,
+                "home_rebased": False,
+            }
+            if home_switch_confirmed and stopped:
+                rebase["set_home"] = self.motor_set_home(board, motor=motor)
+                rebase["position_after_set_home"] = self.motor_get_position(board, motor=motor)
+                pos_value = rebase["position_after_set_home"].get("position") if isinstance(rebase["position_after_set_home"], dict) else None
+                rebase["home_rebased"] = bool(isinstance(pos_value, int) and abs(int(pos_value)) <= 2)
+            out["home_rebase"][axis] = rebase
+
         def _home_ok(row):
             return isinstance(row, dict) and row.get("ok") is True
+        def _rebase_ok(axis):
+            row = out["home_rebase"].get(axis)
+            return isinstance(row, dict) and row.get("home_rebased") is True
         out["ok"] = bool(
             not out["home_errors"]
             and _home_ok(out["homes"].get("x"))
             and _home_ok(out["homes"].get("y"))
+            and _rebase_ok("x")
+            and _rebase_ok("y")
         )
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
