@@ -4049,6 +4049,26 @@ class BioXpTester:
             "ok": ok,
         }
 
+    def motor_capture_thermal_door_state(self) -> dict:
+        from .oem_initialization import classify_thermal_door_state
+
+        status = self.motor_thermal_door_status()
+        return {
+            "status": status,
+            "classified": classify_thermal_door_state(status),
+            "source_mode": "ControlLib.rehome door_state_capture",
+        }
+
+    def motor_plan_thermal_door_restore(self, *, restore_requested=True) -> dict:
+        from .oem_initialization import build_thermal_door_state_restore_plan
+
+        capture = self.motor_capture_thermal_door_state()
+        plan = build_thermal_door_state_restore_plan(capture["status"], restore_requested=restore_requested)
+        return {
+            "capture": capture,
+            "restore_plan": plan,
+        }
+
     def motor_thermal_door_status(self) -> dict:
         """Return OEM thermal-door position plus closed/open predicates.
 
@@ -4546,13 +4566,14 @@ class BioXpTester:
         """
         t0 = time.time()
         result = self.motor_startup_homing_mimic()
+        door_state_save = self.motor_plan_thermal_door_restore(restore_requested=False)
         return {
             "ok": bool(isinstance(result, dict) and result.get("aborted_at") is None),
             "source_mode": "ControlLib.rehome",
             "oem_reference": "ControlLib.rehome save door state -> initializeMotors -> sleep/restore door state",
-            "door_state_save": {"implemented": False, "reason": "no trusted Linux door-state setter/source-equivalent primitive exposed"},
+            "door_state_save": door_state_save["capture"],
             "initialize_motors": result,
-            "door_state_restore": {"implemented": False, "reason": "no trusted Linux door-state setter/source-equivalent primitive exposed"},
+            "door_state_restore": door_state_save["restore_plan"],
             "timeout_s": float(timeout_s),
             "elapsed_ms": int((time.time() - t0) * 1000),
         }

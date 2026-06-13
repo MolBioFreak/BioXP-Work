@@ -206,3 +206,83 @@ def build_machine_calibration_manifest(bundle: dict[str, Any] | None = None, *, 
 
 def oem_initialization_phase_catalog() -> list[dict[str, Any]]:
     return [phase.to_dict() for phase in OEM_INIT_PHASES]
+
+
+
+def classify_thermal_door_state(status: dict[str, Any]) -> dict[str, Any]:
+    """Classify thermal-door state using OEM predicates.
+
+    OEM predicate anchors:
+    - closed: queryHome(ThermalDoor) / tcDoorClosed
+    - opened: queryRightSensor(ThermalDoor) / tcDoorOpened
+    """
+    predicates = status.get("oem_predicates") if isinstance(status, dict) else None
+    closed = None
+    opened = None
+    if isinstance(predicates, dict):
+        closed = predicates.get("tcDoorClosed")
+        opened = predicates.get("tcDoorOpened")
+    if closed is None:
+        closed = status.get("closed") if isinstance(status, dict) else None
+    if opened is None:
+        opened = status.get("opened") if isinstance(status, dict) else None
+    if closed is True and opened is False:
+        state = "closed"
+        safe = True
+    elif opened is True and closed is False:
+        state = "open"
+        safe = True
+    else:
+        state = "ambiguous"
+        safe = False
+    return {
+        "state": state,
+        "safe": safe,
+        "tcDoorClosed": closed,
+        "tcDoorOpened": opened,
+        "source_anchor": SOURCE_ANCHORS["thermal_door"].to_dict(),
+        "closed_source": "queryHome(ThermalDoor)",
+        "opened_source": "queryRightSensor(ThermalDoor)",
+    }
+
+
+def build_thermal_door_state_restore_plan(before: dict[str, Any], *, restore_requested: bool = True) -> dict[str, Any]:
+    """Build a source-explicit restore policy for ControlLib.rehome door handling.
+
+    Linux currently has source-equivalent open/close/home primitives, but the full
+    ControlLib door-state setter/restore wrapper is not implemented as an automatic
+    hidden side effect. The safe controller policy is therefore explicit:
+    - if restore is not requested, leave/prove closed at end;
+    - if restore is requested for an originally open door, require an explicit
+      post-init open action rather than silently reopening during homing;
+    - ambiguous before-state fails closed.
+    """
+    classified = classify_thermal_door_state(before)
+    state = classified["state"]
+    if state == "ambiguous":
+        action = "fail_closed"
+        supported = False
+        reason = "pre_init_door_state_ambiguous"
+    elif not restore_requested:
+        action = "leave_closed_after_initialization"
+        supported = True
+        reason = "restore_not_requested"
+    elif state == "closed":
+        action = "ensure_closed_after_initialization"
+        supported = True
+        reason = "source_safe_closed_state"
+    else:
+        action = "explicit_open_restore_required_after_init"
+        supported = False
+        reason = "automatic_open_restore_not_implemented_safe_policy"
+    return {
+        "ok": state != "ambiguous",
+        "implemented": supported,
+        "restore_requested": bool(restore_requested),
+        "before": classified,
+        "recommended_action": action,
+        "reason": reason,
+        "source_command": "ControlLib.rehome door state save/restore around initializeMotors",
+        "source_anchor": SOURCE_ANCHORS["control_initialize_motion"].to_dict(),
+        "not_silent": True,
+    }
