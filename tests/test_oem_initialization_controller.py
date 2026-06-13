@@ -75,6 +75,20 @@ class FakeInitTester:
         self.calls.append(("door_home", timeout_s, startup))
         return {"ok": True}
 
+    def motor_oem_initialize_motors_full_sequence(self, timeout_s=120.0):
+        self.calls.append(("full_initialize_motors", timeout_s))
+        return {
+            "ok": True,
+            "source_mode": "ClassControlInterface.initializeMotors",
+            "steps": [
+                "z_axisSearchHome_1791",
+                "g_moveSteps_plus10000_then_axisSearchHome",
+                "x_axisSearchHome_250_setHome_setSpeed1700_moveX6000",
+                "y_axisSearchHome_250",
+                "thermal_door_doorSearchHome",
+            ],
+        }
+
     def motion_arm_state(self):
         return {"armed": True, "reason": "strict_init_pass"}
 
@@ -94,38 +108,64 @@ def test_controller_no_homing_builds_all_phases_without_motion():
     assert not any(call == ("homexy", 60.0) for call in tester.calls)
 
 
-def test_controller_with_homing_runs_source_ordered_motion_phases():
+def test_controller_with_homing_runs_full_initialize_motors_phase():
     tester = FakeInitTester()
 
     result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=90)
 
     assert result["ok"] is True
     assert result["ready"] is True
-    names = result["phase_names"]
-    assert names.index("z_reference") < names.index("g_reference") < names.index("home_xy") < names.index("door_home_or_restore")
-    assert any(call[0] == "homexy" for call in tester.calls)
-    assert not any(call[0] == "move_relative" for call in tester.calls)
+    assert "initialize_motors_full_sequence" in result["phase_names"]
+    assert ("full_initialize_motors", 90) in tester.calls
+    assert not any(isinstance(call, tuple) and call[0] == "homexy" for call in tester.calls)
 
 
-def test_controller_fails_closed_on_home_xy_failure():
-    class BadXY(FakeInitTester):
-        def motor_oem_home_xy(self, timeout_s=60.0):
+def test_controller_fails_closed_on_full_initialize_motors_failure():
+    class BadFullInit(FakeInitTester):
+        def motor_oem_initialize_motors_full_sequence(self, timeout_s=120.0):
             return {"ok": False, "error": "x_not_rebased"}
 
-    result = run_oem_initialization_controller(BadXY(), run_homing=True)
+    result = run_oem_initialization_controller(BadFullInit(), run_homing=True)
 
     assert result["ok"] is False
     assert result["ready"] is False
-    assert result["failed_at"] == "home_xy"
+    assert result["failed_at"] == "initialize_motors_full_sequence"
 
 
+class FakeFullInitSequenceTester(FakeInitTester):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
 
-def test_controller_skips_gripper_clear_when_oem_g_already_home():
-    tester = FakeInitTester()
+    def motor_oem_home_xy(self, timeout_s=60.0):
+        self.calls.append(("homexy",))
+        return {"ok": False, "should_not_be_called": True}
 
-    result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=90)
+    def motor_oem_initialize_motors_full_sequence(self, timeout_s=120.0):
+        self.calls.append(("full_initialize_motors", timeout_s))
+        return {
+            "ok": True,
+            "source_mode": "ClassControlInterface.initializeMotors",
+            "steps": [
+                "z_axisSearchHome_1791",
+                "g_moveSteps_plus10000_then_axisSearchHome",
+                "x_axisSearchHome_250_setHome_setSpeed1700_moveX6000",
+                "y_axisSearchHome_250",
+                "thermal_door_doorSearchHome",
+            ],
+        }
+
+
+def test_controller_uses_full_initialize_motors_not_homexy_for_run_homing():
+    tester = FakeFullInitSequenceTester()
+
+    result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=123)
 
     assert result["ok"] is True
-    g_phases = [p for p in result["phases"] if p.get("phase") == "g_reference"]
-    assert g_phases[0]["already_home"] is True
-    assert not any(call[0] == "move_relative" for call in tester.calls)
+    assert ("full_initialize_motors", 123) in tester.calls
+    assert not any(call[0] == "homexy" for call in tester.calls)
+    assert any(
+        p.get("phase") == "initialize_motors_full_sequence"
+        and p.get("result", {}).get("source_mode") == "ClassControlInterface.initializeMotors"
+        for p in result["phases"]
+    )

@@ -353,44 +353,14 @@ def run_oem_initialization_controller(
         return _finalize_oem_initialization(False, phases, manifest, "door_state_capture")
 
     if bool(run_homing):
-        z_home = _safe_call("z_reference", lambda: tester.motor_oem_axis_already_home("z", tolerance_steps=2))
-        z_result = z_home.get("result") if isinstance(z_home, dict) else None
-        if not (isinstance(z_result, dict) and z_result.get("ok") is True):
-            z_home = _safe_call("z_reference", lambda: tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s), movement=True)
-        add("z_reference", z_home)
-        if not z_home.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "z_reference")
-
-        z_clear = _safe_call("z_clearance", lambda: tester.motor_oem_verify_z_clearance_for_xy(target=-15000, min_clearance=-10000, timeout_s=min(float(timeout_s), 30.0)), movement=True)
-        add("z_reference", {**z_clear, "phase_detail": "z_clearance_for_xy"})
-        if not z_clear.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "z_clearance_for_xy")
-
-        g_status = _safe_call("g_reference_already_home", lambda: _controller_gripper_status(tester), movement=False)
-        g_body = g_status.get("result") if isinstance(g_status, dict) else None
-        g_pred = (g_body.get("oem_home_predicate") if isinstance(g_body, dict) else {}) or {}
-        if bool(g_pred.get("oem_confirmed_home")):
-            add("g_reference", {**g_status, "already_home": True, "reason": "OEM confirmAxis(g) true: queryHome(MotorGrip) OR getG()<50; skip clear/home motion"})
-        else:
-            g_clear = _safe_call("g_reference_clear", lambda: _controller_gripper_clear(tester, timeout_s=timeout_s), movement=True)
-            add("g_reference", g_clear)
-            if not g_clear.get("ok"):
-                return _finalize_oem_initialization(False, phases, manifest, "g_reference_clear")
-
-            g_home = _safe_call("g_reference_home", lambda: _controller_gripper_home(tester, timeout_s=timeout_s), movement=True)
-            add("g_reference", g_home)
-            if not g_home.get("ok"):
-                return _finalize_oem_initialization(False, phases, manifest, "g_reference_home")
-
-        home_xy = _safe_call("home_xy", lambda: tester.motor_oem_home_xy(timeout_s=min(float(timeout_s), 60.0)), movement=True)
-        add("home_xy", home_xy)
-        if not home_xy.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "home_xy")
-
-        door_home = _safe_call("door_home_or_restore", lambda: tester.motor_oem_door_search_home(timeout_s=min(float(timeout_s), 45.0), startup=False), movement=True)
-        add("door_home_or_restore", door_home)
-        if not door_home.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "door_home_or_restore")
+        full_init = _safe_call(
+            "initialize_motors_full_sequence",
+            lambda: tester.motor_oem_initialize_motors_full_sequence(timeout_s=timeout_s),
+            movement=True,
+        )
+        add("initialize_motors_full_sequence", full_init)
+        if not full_init.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "initialize_motors_full_sequence")
     else:
         for phase in ("z_reference", "g_reference", "home_xy", "door_home_or_restore"):
             add(phase, {"ok": True, "skipped": True, "reason": "run_homing_false", "physical_motion_commanded": False})

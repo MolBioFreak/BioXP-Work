@@ -4549,6 +4549,107 @@ class BioXpTester:
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
 
+    def motor_oem_initialize_motors_full_sequence(self, *, timeout_s=120.0):
+        """Source-shaped ClassControlInterface.initializeMotors() full homing sequence.
+
+        This is the OEM full initialization homing body, distinct from the separate
+        HomeXY helper.  Source order:
+        Z axisSearchHome(1791) -> G +10000 clear + G axisSearchHome ->
+        X axisSearchHome(250), setHome, setSpeed(1700), moveX(6000) ->
+        Y axisSearchHome(250) -> ThermalDoor.doorSearchHome.
+        """
+        t0 = time.time()
+        out = {
+            "ok": False,
+            "source_mode": "ClassControlInterface.initializeMotors",
+            "oem_reference": "ClassControlInterface.initializeMotors lines 3348-3384",
+            "physical_motion_commanded": True,
+            "steps": [],
+            "results": {},
+            "failed_at": None,
+        }
+
+        def _record(name, fn):
+            try:
+                result = fn()
+            except Exception as exc:
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            out["steps"].append(name)
+            out["results"][name] = result
+            ok = bool(isinstance(result, dict) and result.get("ok") is True)
+            if not ok and out["failed_at"] is None:
+                out["failed_at"] = name
+            return result, ok
+
+        # 3350-3352: MotorZ.axisSearchHome(..., 1791).  Use the live-hardened Z
+        # path that accepts already-home/top, then establish XY clearance.
+        _, ok = _record("z_axisSearchHome_1791", lambda: self.motor_oem_axis_already_home("z", tolerance_steps=2))
+        if not ok:
+            _, ok = _record("z_axisSearchHome_1791_motion", lambda: self.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("z_clearance_for_xy", lambda: self.motor_oem_verify_z_clearance_for_xy(target=-15000, min_clearance=-10000, timeout_s=min(float(timeout_s), 30.0)))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+
+        # 3354-3365: G clear + home.  If OEM confirmAxis(g) is already true,
+        # record the source step as already satisfied rather than forcing a clear
+        # from home/endstop.
+        from .oem_gripper import gripper_clear, gripper_home, gripper_status
+        g_status, _ = _record("g_confirmAxis_before_clear", lambda: gripper_status(self))
+        g_pred = (g_status.get("oem_home_predicate") if isinstance(g_status, dict) else {}) or {}
+        if bool(g_pred.get("oem_confirmed_home")):
+            out["results"]["g_moveSteps_plus10000_then_axisSearchHome"] = {
+                "ok": True,
+                "already_home": True,
+                "source_step_satisfied_by": "confirmAxis(g): queryHome(MotorGrip) OR getG()<50",
+                "status": g_status,
+            }
+            out["steps"].append("g_moveSteps_plus10000_then_axisSearchHome")
+        else:
+            _, ok = _record("g_moveSteps_plus10000", lambda: gripper_clear(self, operator_ack="GRIPPER_CLEAR", reason="OEM initializeMotors G clear", timeout_s=min(float(timeout_s), 20.0)))
+            if not ok:
+                out["elapsed_ms"] = int((time.time() - t0) * 1000)
+                return out
+            _, ok = _record("g_axisSearchHome", lambda: gripper_home(self, operator_ack="GRIPPER_HOME", reason="OEM initializeMotors G home", timeout_s=min(float(timeout_s), 30.0)))
+            if not ok:
+                out["elapsed_ms"] = int((time.time() - t0) * 1000)
+                return out
+
+        # 3367-3375: X axisSearchHome(250), setHome, setSpeed(1700), moveX(6000).
+        _, ok = _record("x_axisSearchHome_250", lambda: self.motor_oem_home_axis("x", startup=True, timeout_s=min(float(timeout_s), 60.0), allow_implementation_mapped_predicate=True))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        xprof = self._motion_oem_axis_profile("x")
+        xb, xm = int(xprof["board"]), int(xprof["motor"])
+        _, ok = _record("x_setHome", lambda: self.motor_set_home(xb, motor=xm))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("x_setSpeed_1700", lambda: self.motor_set_axis_param(xb, 4, 1700, motor=xm))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("x_moveX_6000", lambda: self.motor_move_absolute(xb, 6000, motor=xm, timeout_s=min(float(timeout_s), 60.0)))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+
+        # 3376-3379: Y axisSearchHome(250).
+        _, ok = _record("y_axisSearchHome_250", lambda: self.motor_oem_home_axis("y", startup=True, timeout_s=min(float(timeout_s), 60.0), allow_implementation_mapped_predicate=True))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+
+        # 3380-3384: ThermalDoor.doorSearchHome(...).
+        _, ok = _record("thermal_door_doorSearchHome", lambda: self.motor_oem_door_search_home(timeout_s=min(float(timeout_s), 45.0), startup=False))
+        out["ok"] = bool(ok and out["failed_at"] is None)
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+
     def motor_oem_rehome(self, *, timeout_s=120.0):
         """Direct source-mode surface for ControlLib.rehome().
 
