@@ -87,3 +87,31 @@ def test_thermal_door_home_and_close_routes_call_oem_methods(monkeypatch):
 
     assert home["closed_after"] is True
     assert close["after"]["closed"] is True
+
+
+
+def test_axis_preset_uses_resolved_machine_calibrated_door_profile(monkeypatch):
+    class FakeTester:
+        def _motion_oem_axis_profile(self, axis):
+            assert axis == "door"
+            return {
+                "label": "THERMAL_DOOR",
+                "board": 6,
+                "motor": 0,
+                "speed": 50,
+                "acc": 20,
+                "run_current": 31,
+                "standby_current": 10,
+                "stall_guard": 6,
+                "open_position": 18500,
+                "open_position_source": "original_ssd_machine_config",
+                "close_position": 0,
+            }
+
+        def motor_function_preset(self, axis):
+            raise AssertionError("status should prefer resolved OEM axis profile")
+
+    preset = api._axis_preset(FakeTester(), api.AxisName.THERMAL_DOOR)
+
+    assert preset["open_position"] == 18500
+    assert preset["open_position_source"] == "original_ssd_machine_config"

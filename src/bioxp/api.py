@@ -882,7 +882,10 @@ _MOTION_PREP_REUSE_DEBUG_ENV = "BIOXP_ENABLE_PREP_REUSE_DEBUG"
 
 
 def _axis_preset(tester: BioXpTester, axis: AxisName):
-    preset = tester.motor_function_preset(axis.value)
+    try:
+        preset = tester._motion_oem_axis_profile(axis.value)
+    except Exception:
+        preset = tester.motor_function_preset(axis.value)
     if not isinstance(preset, dict):
         raise HTTPException(status_code=404, detail=f"Unknown axis preset for {axis.value}")
     out = dict(preset)
