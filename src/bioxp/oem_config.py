@@ -37,14 +37,44 @@ OEM_DEFAULT_AXIS_LIMITS = {
     "g": {"min_steps": 0, "max_steps": 15000, "source": "oem_default_class_bioxpsettings"},
 }
 
+OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS = {
+    "serial_lt_10": {
+        "TCDoorOpen": 93000,
+        "TC_DOOR_VELOCITY": 900,
+        "TC_DOOR_ACCELERATION": 20,
+        "TC_DOOR_MAX_CURRENT": 31,
+        "TCDoorStallGuardThreshold": 6,
+    },
+    "serial_ge_10": {
+        "TCDoorOpen": 16000,
+        "TC_DOOR_VELOCITY": 50,
+        "TC_DOOR_ACCELERATION": 20,
+        "TC_DOOR_MAX_CURRENT": 31,
+        "TCDoorStallGuardThreshold": 6,
+    },
+}
+
+
+def oem_thermal_door_defaults(serial_number: int | str | None) -> dict[str, int]:
+    """Return OEM thermal-door settings from ClassBioXPSettings serial branch.
+
+    OEM source: serial <10 uses the legacy long-travel door profile; serial >=10
+    uses the BioXP3200-era profile (TCDoorOpen=16000, velocity=50). Unknown
+    serials fail closed to the >=10 profile used by this instrument class.
+    """
+    try:
+        serial = int(serial_number) if serial_number is not None else 10
+    except (TypeError, ValueError):
+        serial = 10
+    key = "serial_lt_10" if serial < 10 else "serial_ge_10"
+    return dict(OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS[key])
+
+
 OEM_CRITICAL_SOURCE_DEFAULTS = {
     "Z_MOTOR_MAX_CURRENT_UP": 31,
     "Z_MOTOR_MAX_CURRENT_DOWN": 25,
     "Z_MOTOR_STALL_GUARD_THRESHOLD": 3,
-    "TCDoorStallGuardThreshold": 6,
-    "TC_DOOR_VELOCITY": 50,
-    "TC_DOOR_ACCELERATION": 20,
-    "TC_DOOR_MAX_CURRENT": 31,
+    **OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS["serial_ge_10"],
 }
 
 INTERESTING_FIELDS = {
@@ -243,6 +273,7 @@ def machine_config_diff(parsed_config: dict[str, Any]) -> dict[str, Any]:
         "m_TC_DOOR_VELOCITY": "TC_DOOR_VELOCITY",
         "m_TC_DOOR_ACCELERATION": "TC_DOOR_ACCELERATION",
         "m_TC_DOOR_MAX_CURRENT": "TC_DOOR_MAX_CURRENT",
+        "m_TCDoorOpen": "TCDoorOpen",
     }
     changed_constants: dict[str, Any] = {}
     if isinstance(offsets, dict):
