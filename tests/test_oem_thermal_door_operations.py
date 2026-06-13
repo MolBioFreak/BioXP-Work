@@ -26,8 +26,13 @@ class FakeDoorTester(BioXpTester):
             "ok": True,
             "left_state": 1 if self.closed else 0,
             "right_state": 1 if self.opened else 0,
-            "left_active": self.closed,
-            "right_active": self.opened,
+            "left_raw_active": self.closed,
+            "right_raw_active": self.opened,
+            # Door motion masks both switches; OEM predicates still read raw sensors.
+            "left_disabled": True,
+            "right_disabled": True,
+            "left_active": False,
+            "right_active": False,
             "board": board,
             "motor": motor,
         }

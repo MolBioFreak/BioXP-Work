@@ -4056,10 +4056,17 @@ class BioXpTester:
         closed = bool(isinstance(home, dict) and home.get("value") == active)
         opened = False
         if isinstance(switches, dict):
-            if switches.get("right_active") is not None:
-                opened = bool(switches.get("right_active"))
+            # OEM confirmAxis("tcDoorOpened") calls queryRightSensor(ThermalDoor).
+            # That is raw sensor truth; do not suppress it with SAP12/right-disable
+            # semantics.  The thermal-door profile intentionally masks both
+            # hardware limit channels for motion, but the right switch still
+            # remains the OEM open predicate.
+            if switches.get("right_raw_active") is not None:
+                opened = bool(switches.get("right_raw_active"))
             elif switches.get("right_state") is not None:
                 opened = int(switches.get("right_state")) == active
+            elif switches.get("right_active") is not None:
+                opened = bool(switches.get("right_active"))
         return {
             "axis": "door",
             "board": board,
