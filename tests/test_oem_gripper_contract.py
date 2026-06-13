@@ -72,30 +72,30 @@ class FakeTester:
         return {"ok": True, "reason": reason, "run_current_param6": {"value": 10}, "standby_current_param7": {"value": 10}}
 
 
-def test_gripper_status_reports_both_limit_conflict_and_oem_near_zero_predicate():
+def test_gripper_status_reports_gap10_diagnostic_and_oem_near_zero_predicate():
     from src.bioxp.oem_gripper import gripper_status
 
     payload = gripper_status(FakeTester(position=49))
 
     assert payload["physical_motion"] is False
     assert payload["switches"]["both_effective_limits_active"] is True
-    assert "both_effective_limits_active" in payload["blockers"]
+    assert "both_effective_limits_active" not in payload["blockers"]
     assert payload["oem_home_predicate"]["position_lt_50"] is True
     assert payload["oem_home_predicate"]["oem_confirmed_home"] is True
     assert payload["current"]["idle_safe"] is True
 
 
-def test_gripper_clear_fails_before_motion_when_both_effective_limits_active():
+def test_gripper_clear_does_not_hard_block_on_generic_both_effective_limits_active():
     from src.bioxp.oem_gripper import gripper_clear
 
     tester = FakeTester(left=1, right=1)
 
-    with pytest.raises(HTTPException) as exc:
-        gripper_clear(tester, operator_ack="GRIPPER_CLEAR", reason="supervised test")
+    payload = gripper_clear(tester, operator_ack="GRIPPER_CLEAR", reason="supervised test")
 
-    assert exc.value.status_code == 409
-    assert "both_effective_limits_active" in str(exc.value.detail)
-    assert not any(call[0] == "move_relative" for call in tester.calls)
+    assert payload["ok"] is True
+    assert payload["before"]["switches"]["both_effective_limits_active"] is True
+    assert payload["before"]["gap10_motion_gate"]["hard_blocker_removed"] is True
+    assert any(call[0] == "move_relative" for call in tester.calls)
 
 
 def test_gripper_clear_requires_ack_and_reason_before_motion():
@@ -135,3 +135,18 @@ def test_gripper_home_requires_ack_and_routes_through_oem_home_with_restore():
     assert any(call[0] == "home" and call[1] == "g" for call in tester.calls)
     assert tester.current[(4, 6, 2)] == 10
     assert tester.current[(4, 7, 2)] == 10
+
+
+
+def test_gripper_profile_reports_machine_config_positions_and_source_anchor():
+    from src.bioxp.oem_gripper import gripper_status
+
+    payload = gripper_status(FakeTester(position=49))
+    profile = payload["profile"]
+
+    assert profile["machine_positions"]["originOffsetG"] == 4450
+    assert profile["machine_positions"]["close"] == 27350
+    assert profile["machine_positions"]["open"] == 31400
+    assert profile["machine_positions"]["open_wide"] == 32400
+    assert profile["machine_positions"]["source"] == "original_ssd_machine_config"
+    assert profile["provenance"]["source_anchor"]["name"] == "MotorGrip home/confirm/machine positions"

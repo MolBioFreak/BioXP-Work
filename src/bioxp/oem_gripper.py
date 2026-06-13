@@ -12,6 +12,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from .oem_initialization import SOURCE_ANCHORS, build_machine_calibration_manifest
+
 OEM_IDLE_CURRENT = 10
 GRIPPER_ACTION_CURRENT = 31
 GRIPPER_CLEAR_STEPS = 10000
@@ -37,6 +39,30 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _manifest_value(row: Any) -> Any:
+    if isinstance(row, dict):
+        return row.get("value")
+    return None
+
+
+def _machine_gripper_config() -> dict[str, Any]:
+    try:
+        manifest = build_machine_calibration_manifest()
+    except Exception as exc:  # pragma: no cover - defensive live path
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    gripper = manifest.get("gripper", {}) if isinstance(manifest, dict) else {}
+    return {
+        "ok": bool(manifest.get("ok")) if isinstance(manifest, dict) else False,
+        "source_anchor": SOURCE_ANCHORS["gripper"].to_dict(),
+        "machine_settings_anchor": SOURCE_ANCHORS["machine_settings"].to_dict(),
+        "config_path": manifest.get("config_path") if isinstance(manifest, dict) else None,
+        "originOffsetG": gripper.get("originOffsetG") if isinstance(gripper, dict) else None,
+        "GripperClosePOS": gripper.get("GripperClosePOS") if isinstance(gripper, dict) else None,
+        "GripperOpenPOS": gripper.get("GripperOpenPOS") if isinstance(gripper, dict) else None,
+        "GripperOpenWide": gripper.get("GripperOpenWide") if isinstance(gripper, dict) else None,
+    }
+
+
 def _profile(tester: Any) -> dict[str, Any]:
     raw = tester._motion_oem_axis_profile("g", startup=True)
     if not isinstance(raw, dict):
@@ -54,10 +80,20 @@ def _profile(tester: Any) -> dict[str, Any]:
     out.setdefault("stall_guard", 5)
     out.setdefault("rdiv", 6)
     out.setdefault("pdiv", 2)
+    machine_gripper = _machine_gripper_config()
     out["provenance"] = {
         "source": "ClassControlInterface initializeMotorsWithoutMotion/initializeMotors gripper profile",
+        "source_anchor": SOURCE_ANCHORS["gripper"].to_dict(),
         "gripper_version": out.get("gripper_version", out.get("version", "runtime_profile_or_fallback")),
         "fallback_fields_possible": True,
+    }
+    out["machine_config"] = machine_gripper
+    out["machine_positions"] = {
+        "originOffsetG": _manifest_value(machine_gripper.get("originOffsetG")),
+        "close": _manifest_value(machine_gripper.get("GripperClosePOS")),
+        "open": _manifest_value(machine_gripper.get("GripperOpenPOS")),
+        "open_wide": _manifest_value(machine_gripper.get("GripperOpenWide")),
+        "source": "original_ssd_machine_config" if machine_gripper.get("ok") else "unavailable",
     }
     return out
 
@@ -115,8 +151,9 @@ def gripper_status(tester: Any) -> dict[str, Any]:
     speed_value = _int_or_none(_value(speed, "speed"))
     idle_safe = bool((run_value is None or run_value <= OEM_IDLE_CURRENT) and (standby_value is None or standby_value <= OEM_IDLE_CURRENT))
     blockers: list[str] = []
-    if switches["both_effective_limits_active"]:
-        blockers.append("both_effective_limits_active")
+    # OEM gripper confirmation is queryHome(MotorGrip) OR getG()<50.
+    # GAP9/GAP10 remain raw diagnostics, but generic both-effective-limit
+    # state is not a document-aligned gripper motion blocker by itself.
     if speed_value == 0 and not idle_safe:
         blockers.append("g_current_hot_while_idle")
     return {
@@ -194,8 +231,16 @@ def _apply_profile(tester: Any, profile: dict[str, Any]) -> dict[str, Any]:
 
 def _preflight_for_motion(tester: Any) -> dict[str, Any]:
     status = gripper_status(tester)
-    if "both_effective_limits_active" in status.get("blockers", []):
-        raise HTTPException(status_code=409, detail={"error": "gripper_switch_conflict", "blocker": "both_effective_limits_active", "motion_commanded": False, "status": status})
+    switches = status.get("switches", {}) if isinstance(status, dict) else {}
+    oem_home = (status.get("oem_home_predicate", {}) if isinstance(status, dict) else {}).get("oem_confirmed_home")
+    if isinstance(switches, dict) and switches.get("both_effective_limits_active") is True:
+        status = dict(status)
+        status["gap10_motion_gate"] = {
+            "generic_both_effective_limits_active": True,
+            "hard_blocker_removed": True,
+            "reason": "OEM gripper confirmation is queryHome(MotorGrip) OR getG()<50; GAP10 is raw diagnostic until motion proof.",
+            "oem_home_confirmed": bool(oem_home),
+        }
     return status
 
 

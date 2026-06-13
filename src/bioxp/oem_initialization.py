@@ -90,6 +90,12 @@ SOURCE_ANCHORS: dict[str, OemSourceAnchor] = {
         lines="220-275,3138-3160,3828-3855",
         summary="Machine-specific XML settings override compiled defaults for door, gripper and axis limits.",
     ),
+    "gripper": OemSourceAnchor(
+        name="MotorGrip home/confirm/machine positions",
+        file="decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        lines="56-60,2028-2055,2736-2745,3354-3365",
+        summary="MotorGrip is head-board axis 2; home confirmation is queryHome(MotorGrip) OR getG()<50; initializeMotors clears +10000 then homes at version-specific speed.",
+    ),
 }
 
 OEM_INIT_PHASES: tuple[OemInitPhase, ...] = (
