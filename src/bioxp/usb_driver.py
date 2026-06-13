@@ -3815,7 +3815,10 @@ class BioXpTester:
                     "home_active_value": active_value,
                     "position_before": position_before,
                     "position_after": position_after,
-                    "home_before": home_before,
+                    "status_before": status_before,
+            "closed_before": bool(status_before.get("closed")) if isinstance(status_before, dict) else None,
+            "opened_before": bool(status_before.get("opened")) if isinstance(status_before, dict) else None,
+            "home_before": home_before,
                     "switches_before": switches_before,
                     "home_after_rehome": home_after_rehome,
                     "switches_after_rehome": switches_after_rehome,
@@ -3849,7 +3852,10 @@ class BioXpTester:
                 "home_active_value": active_value,
                 "position_before": position_before,
                 "position_after": position_after,
-                "home_before": home_before,
+                "status_before": status_before,
+            "closed_before": bool(status_before.get("closed")) if isinstance(status_before, dict) else None,
+            "opened_before": bool(status_before.get("opened")) if isinstance(status_before, dict) else None,
+            "home_before": home_before,
                 "switches_before": switches_before,
                 "home_after_rehome": home_after_rehome,
                 "switches_after_rehome": switches_after_rehome,
@@ -3947,6 +3953,9 @@ class BioXpTester:
             "home_active_value": active_value,
             "position_before": position_before,
             "position_after": position_after,
+            "status_before": status_before,
+            "closed_before": bool(status_before.get("closed")) if isinstance(status_before, dict) else None,
+            "opened_before": bool(status_before.get("opened")) if isinstance(status_before, dict) else None,
             "home_before": home_before,
             "switches_before": switches_before,
             "home_after_rehome": home_after_rehome,
@@ -3972,6 +3981,144 @@ class BioXpTester:
             "ok": ok,
         }
 
+    def motor_thermal_door_status(self) -> dict:
+        """Return OEM thermal-door position plus closed/open predicates.
+
+        OEM confirmAxis mapping:
+          - tcDoorClosed -> queryHome(ThermalDoor)
+          - tcDoorOpened -> queryRightSensor(ThermalDoor)
+        """
+        preset = self._motion_oem_axis_profile("door")
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        position = self.motor_get_position(board, motor=motor)
+        speed = self.motor_get_speed(board, motor=motor)
+        home = self.motor_query_home_switch(board, motor=motor)
+        switches = self.motor_get_switch_activity(board, motor=motor)
+        active = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        closed = bool(isinstance(home, dict) and home.get("value") == active)
+        opened = False
+        if isinstance(switches, dict):
+            if switches.get("right_active") is not None:
+                opened = bool(switches.get("right_active"))
+            elif switches.get("right_state") is not None:
+                opened = int(switches.get("right_state")) == active
+        return {
+            "axis": "door",
+            "board": board,
+            "motor": motor,
+            "position": position,
+            "speed": speed,
+            "home": home,
+            "switches": switches,
+            "closed": closed,
+            "opened": opened,
+            "oem_predicates": {
+                "tcDoorClosed": closed,
+                "tcDoorOpened": opened,
+                "closed_source": "queryHome(ThermalDoor)",
+                "opened_source": "queryRightSensor(ThermalDoor)",
+            },
+        }
+
+    def _prepare_oem_thermal_door_motion(self, *, stall_guard_offset=0) -> dict:
+        preset = self._motion_oem_axis_profile("door")
+        return self.motor_prepare_axis(
+            preset["board"],
+            motor=preset["motor"],
+            run_current=int(preset.get("run_current", 31)),
+            standby_current=int(preset.get("standby_current", 10)),
+            speed=int(preset.get("speed", 50)),
+            acc=int(preset.get("acc", 20)),
+            stall_guard=int(preset.get("stall_guard", 6)) + int(stall_guard_offset),
+            ramp_mode=preset.get("ramp_mode"),
+            disable_right=preset.get("disable_right"),
+            disable_left=preset.get("disable_left"),
+            rdiv=preset.get("rdiv"),
+            pdiv=preset.get("pdiv"),
+            warm_enable=bool(preset.get("warm_enable", False)),
+        )
+
+    def motor_oem_open_thermal_door(self, *, timeout_s=20.0) -> dict:
+        """OEM ClassControlInterface.openThermalDoor parity surface."""
+        preset = self._motion_oem_axis_profile("door")
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        target = int(preset.get("open_position", 16000))
+        before = self.motor_thermal_door_status()
+        prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
+        move = self.motor_move_absolute(board, target, motor=motor)
+        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 60.0), require_seen_nonzero=False)
+        after = self.motor_thermal_door_status()
+        opened = bool(after.get("opened"))
+        ok = bool(self._tmcl_success(move.get("ack")) and wait.get("stopped") is True and opened)
+        failure = None
+        if not self._tmcl_success(move.get("ack")):
+            failure = "door_open_ack_failed"
+        elif wait.get("stopped") is not True:
+            failure = "door_open_wait_timeout"
+        elif not opened:
+            failure = "door_open_predicate_not_confirmed"
+        return {
+            "ok": ok,
+            "axis": "door",
+            "operation": "openThermalDoor",
+            "target": target,
+            "before": before,
+            "prepare": prepare,
+            "move": move,
+            "wait": wait,
+            "after": after,
+            "failure": failure,
+            "oem_reference": "ClassControlInterface.openThermalDoor lines 2651-2678",
+        }
+
+    def motor_oem_close_thermal_door(self, *, timeout_s=20.0) -> dict:
+        """OEM ClassControlInterface.closeThermalDoor parity surface."""
+        preset = self._motion_oem_axis_profile("door")
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        target = int(preset.get("close_position", 0))
+        before = self.motor_thermal_door_status()
+        if not bool(before.get("opened")):
+            return {
+                "ok": bool(before.get("closed")),
+                "axis": "door",
+                "operation": "closeThermalDoor",
+                "target": target,
+                "skipped": True,
+                "reason": "tcDoorOpened_false_before_close",
+                "before": before,
+                "after": before,
+                "oem_reference": "ClassControlInterface.closeThermalDoor only moves when tcDoorOpened is true",
+            }
+        prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
+        move = self.motor_move_absolute(board, target, motor=motor)
+        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 60.0), require_seen_nonzero=False)
+        after = self.motor_thermal_door_status()
+        closed = bool(after.get("closed"))
+        ok = bool(self._tmcl_success(move.get("ack")) and wait.get("stopped") is True and closed)
+        failure = None
+        if not self._tmcl_success(move.get("ack")):
+            failure = "door_close_ack_failed"
+        elif wait.get("stopped") is not True:
+            failure = "door_close_wait_timeout"
+        elif not closed:
+            failure = "door_close_predicate_not_confirmed"
+        return {
+            "ok": ok,
+            "axis": "door",
+            "operation": "closeThermalDoor",
+            "target": target,
+            "before": before,
+            "prepare": prepare,
+            "move": move,
+            "wait": wait,
+            "after": after,
+            "failure": failure,
+            "oem_reference": "ClassControlInterface.closeThermalDoor lines 2678-2692",
+        }
+
     def motor_oem_door_search_home(self, *, timeout_s=20.0, startup=False):
         """OEM thermal-door search-home.
 
@@ -3986,7 +4133,8 @@ class BioXpTester:
         motor = int(preset["motor"])
         threshold = int(preset.get("stall_guard", 6))
         wait_timeout = max(2.0, min(float(timeout_s), 20.0 if bool(startup) else float(timeout_s)))
-        home_before = self.motor_query_home_switch(board, motor=motor)
+        status_before = self.motor_thermal_door_status()
+        home_before = status_before.get("home") if isinstance(status_before, dict) else self.motor_query_home_switch(board, motor=motor)
         preclear_threshold = None
         preclear_move = None
         preclear_wait = None
@@ -4003,9 +4151,10 @@ class BioXpTester:
             require_seen_nonzero=not bool(startup),
         )
         stop = self.motor_stop(board, motor=motor)
-        home_after = self.motor_query_home_switch(board, motor=motor)
-        switches_after = self.motor_get_switch_activity(board, motor=motor)
-        closed_confirmed = home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else False
+        status_after = self.motor_thermal_door_status()
+        home_after = status_after.get("home") if isinstance(status_after, dict) else self.motor_query_home_switch(board, motor=motor)
+        switches_after = status_after.get("switches") if isinstance(status_after, dict) else self.motor_get_switch_activity(board, motor=motor)
+        closed_confirmed = bool(status_after.get("closed")) if isinstance(status_after, dict) else (home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else False)
         base = {
             "axis": "door",
             "board": board,
@@ -4013,6 +4162,9 @@ class BioXpTester:
             "startup": bool(startup),
             "oem_mode": "initializeMotors.doorSearchHome" if bool(startup) else "HomeAxis(D).doorSearchHome",
             "speed": int(preset.get("home_speed", preset.get("speed", 600))),
+            "status_before": status_before,
+            "closed_before": bool(status_before.get("closed")) if isinstance(status_before, dict) else None,
+            "opened_before": bool(status_before.get("opened")) if isinstance(status_before, dict) else None,
             "home_before": home_before,
             "preclear_threshold": preclear_threshold,
             "preclear_move": preclear_move,
@@ -4021,6 +4173,9 @@ class BioXpTester:
             "move_left": move_left,
             "wait": wait,
             "stop": stop,
+            "status_after": status_after,
+            "closed_after": bool(status_after.get("closed")) if isinstance(status_after, dict) else None,
+            "opened_after": bool(status_after.get("opened")) if isinstance(status_after, dict) else None,
             "home_after": home_after,
             "switches_after": switches_after,
             "closed_confirmed": bool(closed_confirmed),
