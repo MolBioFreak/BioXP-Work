@@ -69,9 +69,8 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            # Unit-specific: positive X travel is blocked unless the right limit is masked.
-            "disable_right": True,
-            "disable_left": False,
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for X.
+            # Absence means no-write; do not actively force controller mask params to 0.
             "warm_enable": True,
         },
         "y": {
@@ -84,7 +83,7 @@ class BioXpTester:
             "standby_current": 10,
             "stall_guard": 16,
             "disable_right": True,
-            "disable_left": False,
+            # OEM does not write SAP13 for Y; absence means no-write.
             "warm_enable": True,
         },
         "z": {
@@ -96,14 +95,8 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            # Unit-specific Z switch semantics match the observed X/Y right-mask pattern:
-            # positive/down absolute moves can be acknowledged by TMCL but held at zero
-            # speed while the right switch line is active unless SAP12 is masked.
-            # Keep the left/home switch live; mask only the right/open side for controlled
-            # supervised Z moves such as returning from high clearance toward a negative
-            # absolute target.
-            "disable_right": True,
-            "disable_left": False,
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
+            # Absence means no-write; do not actively force controller mask params to 0.
             "warm_enable": True,
         },
         "g": {
@@ -112,11 +105,11 @@ class BioXpTester:
             "motor": 2,
             # OEM source has both G_MOTOR_MAX_CURRENT=31 and G_MOTOR_HOLD_CURRENT=10.
             # Gripper actions may elevate to 31, but the idle/default hold must be 10.
-            "speed": 600,
-            "acc": 5,
+            "speed": 1500,
+            "acc": 20,
             "run_current": 10,
             "standby_current": 10,
-            "stall_guard": 5,
+            "stall_guard": 20,
             "rdiv": 6,
             "pdiv": 2,
         },
@@ -140,11 +133,15 @@ class BioXpTester:
             "label": "THERMAL_DOOR",
             "board": BOARD_THERMAL,
             "motor": 0,
-            "speed": 600,
-            "acc": 200,
-            "run_current": 20,
+            # OEM ClassBioXPSettings serial >=10 defaults for ThermalDoor.
+            "speed": 50,
+            "home_speed": 50,
+            "acc": 20,
+            "run_current": 31,
             "standby_current": 10,
             "stall_guard": 6,
+            "open_position": 16000,
+            "close_position": 0,
             "disable_right": True,
             "disable_left": True,
         },
@@ -1315,8 +1312,8 @@ class BioXpTester:
             acc=int(acc),
             stall_guard=p.get("stall_guard"),
             ramp_mode=p.get("ramp_mode"),
-            disable_right=bool(p.get("disable_right", False)),
-            disable_left=bool(p.get("disable_left", False)),
+            disable_right=p.get("disable_right"),
+            disable_left=p.get("disable_left"),
             rdiv=p.get("rdiv"),
             pdiv=p.get("pdiv"),
             warm_enable=False,
@@ -2906,8 +2903,8 @@ class BioXpTester:
             acc=pclear["acc"],
             stall_guard=pclear.get("stall_guard"),
             ramp_mode=pclear.get("ramp_mode"),
-            disable_right=bool(pclear.get("disable_right", False)),
-            disable_left=bool(pclear.get("disable_left", False)),
+            disable_right=pclear.get("disable_right"),
+            disable_left=pclear.get("disable_left"),
             rdiv=pclear.get("rdiv"),
             pdiv=pclear.get("pdiv"),
             warm_enable=bool(pclear.get("warm_enable", False)),
@@ -3198,8 +3195,8 @@ class BioXpTester:
                 acc=p["acc"],
                 stall_guard=p.get("stall_guard"),
                 ramp_mode=p.get("ramp_mode"),
-                disable_right=bool(p.get("disable_right", False)),
-                disable_left=bool(p.get("disable_left", False)),
+                disable_right=p.get("disable_right"),
+                disable_left=p.get("disable_left"),
                 rdiv=p.get("rdiv"),
                 pdiv=p.get("pdiv"),
                 warm_enable=bool(p.get("warm_enable", False)),
@@ -3581,7 +3578,7 @@ class BioXpTester:
                 "oem_home_speed": 1791,
                 "run_current": 31,
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
-                "positive_down_requires_right_mask": True,
+                "positive_down_requires_right_mask": False,
                 "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
                 "home_search_max_abs_delta": z_max,
                 "home_search_max_abs_delta_source": z_max_source,
@@ -3595,7 +3592,7 @@ class BioXpTester:
                 preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": op_current, "standby_current": 10, "home_speed": 200, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
             else:
                 g_max, g_max_source = self._machine_config_axis_max("g", 15000)
-                preset.update({"speed": 600, "acc": 5, "stall_guard": 5, "run_current": op_current, "standby_current": 10, "home_speed": 600, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
+                preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": op_current, "standby_current": 10, "home_speed": 600, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
             return preset
         if key == "door":
             preset.update({"home_speed": int(preset.get("speed", 600)), "stall_guard_param": 205})
@@ -3615,8 +3612,8 @@ class BioXpTester:
                 acc=preset.get("acc"),
                 stall_guard=preset.get("stall_guard"),
                 ramp_mode=preset.get("ramp_mode"),
-                disable_right=bool(preset.get("disable_right", False)),
-                disable_left=bool(preset.get("disable_left", False)),
+                disable_right=preset.get("disable_right"),
+                disable_left=preset.get("disable_left"),
                 rdiv=preset.get("rdiv"),
                 pdiv=preset.get("pdiv"),
                 warm_enable=bool(preset.get("warm_enable", False)),
@@ -3713,6 +3710,51 @@ class BioXpTester:
             "set_home": go_home.get("set_home") if isinstance(go_home, dict) else None,
             "switch_transition": go_home.get("switch_transition") if isinstance(go_home, dict) else None,
             "false_home_guard": go_home.get("false_home_guard") if isinstance(go_home, dict) else None,
+        }
+
+    def motor_oem_verify_z_clearance_for_xy(self, *, target=-15000, min_clearance=-10000, timeout_s=20.0):
+        """Ensure Z/head is raised before any X/Y travel.
+
+        Machine truth from supervised BioXP work: negative Z is up/clear; Z=0 is the
+        low/reference height and can collide with the locking key during Y travel.
+        """
+        pz = self._motion_oem_axis_profile("z", startup=True)
+        board = int(pz["board"])
+        motor = int(pz["motor"])
+        before = self.motor_get_position(board, motor=motor)
+        speed_before = self.motor_get_speed(board, motor=motor)
+        switches_before = self.motor_get_switch_activity(board, motor=motor)
+        before_pos = before.get("position") if isinstance(before, dict) else None
+        already_clear = isinstance(before_pos, int) and before_pos <= int(min_clearance)
+        move = None
+        wait = None
+        after = before
+        speed_after = speed_before
+        switches_after = switches_before
+        if not already_clear:
+            move = self.motor_move_absolute(board, int(target), motor=motor)
+            wait = self.motor_wait_stopped(board, motor=motor, timeout_s=float(timeout_s), require_seen_nonzero=True)
+            after = self.motor_get_position(board, motor=motor)
+            speed_after = self.motor_get_speed(board, motor=motor)
+            switches_after = self.motor_get_switch_activity(board, motor=motor)
+        after_pos = after.get("position") if isinstance(after, dict) else None
+        after_speed = speed_after.get("speed") if isinstance(speed_after, dict) else None
+        clear = isinstance(after_pos, int) and after_pos <= int(min_clearance) and after_speed == 0
+        return {
+            "axis": "z",
+            "target": int(target),
+            "min_clearance": int(min_clearance),
+            "before": before,
+            "speed_before": speed_before,
+            "switches_before": switches_before,
+            "already_clear": bool(already_clear),
+            "move": move,
+            "wait": wait,
+            "after": after,
+            "speed_after": speed_after,
+            "switches_after": switches_after,
+            "clear": bool(clear),
+            "ok": bool(clear),
         }
 
     def motor_oem_go_home(
@@ -4026,8 +4068,8 @@ class BioXpTester:
             acc=preset.get("acc"),
             stall_guard=preset.get("stall_guard"),
             ramp_mode=preset.get("ramp_mode"),
-            disable_right=bool(preset.get("disable_right", False)),
-            disable_left=bool(preset.get("disable_left", False)),
+            disable_right=preset.get("disable_right"),
+            disable_left=preset.get("disable_left"),
             rdiv=preset.get("rdiv"),
             pdiv=preset.get("pdiv"),
             warm_enable=bool(preset.get("warm_enable", False)),
@@ -4066,8 +4108,8 @@ class BioXpTester:
             acc=preset.get("acc"),
             stall_guard=preset.get("stall_guard"),
             ramp_mode=preset.get("ramp_mode"),
-            disable_right=bool(preset.get("disable_right", False)),
-            disable_left=bool(preset.get("disable_left", False)),
+            disable_right=preset.get("disable_right"),
+            disable_left=preset.get("disable_left"),
             rdiv=preset.get("rdiv"),
             pdiv=preset.get("pdiv"),
             warm_enable=bool(preset.get("warm_enable", False)),
@@ -4304,6 +4346,9 @@ class BioXpTester:
             "acc": int(preset.get("acc", 60)),
             "run_current": int(preset.get("run_current", 31)),
             "standby_current": int(preset.get("standby_current", 20)),
+            # OEM default does not mask Z right/GAP10. This path remains capable of
+            # temporary right-mask diagnostics only when the caller/profile explicitly
+            # requests positive_down_requires_right_mask=True.
             "right_mask_applied_for_positive_down": bool(steps > 0 and preset.get("positive_down_requires_right_mask")),
             "x_y_motion_commanded": False,
         }
@@ -4405,11 +4450,15 @@ class BioXpTester:
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
             return out
 
-        # OEM source does Z home first. The previous Linux conversion incorrectly moved the gripper
-        # before Z, which can fight the parked pin-hole/head-lock geometry on this instrument.
+        # Z must be both homed and raised/verified clear before any G/X/Y travel.
+        # Christian observed the failure mode directly: Z at 0/minimum height ran into the locking key
+        # during Y home and prevented Y from reaching its limit.
         out["z_home"] = self.motor_oem_home_axis("z", startup=True)
         if not _home_ok(out["z_home"]):
             return _abort("z_home")
+        out["z_clear_for_xy"] = self.motor_oem_verify_z_clearance_for_xy(target=-15000, min_clearance=-10000, timeout_s=20.0)
+        if not bool(out["z_clear_for_xy"].get("ok")):
+            return _abort("z_clear_for_xy")
 
         out["g_pre_move"] = self.motor_move_relative(pg["board"], 10000, motor=pg["motor"])
         out["g_pre_wait"] = self.motor_wait_stopped(pg["board"], motor=pg["motor"], timeout_s=10.0, require_seen_nonzero=True)
@@ -4545,8 +4594,8 @@ class BioXpTester:
             acc=px["acc"],
             stall_guard=px.get("stall_guard"),
             ramp_mode=px.get("ramp_mode"),
-            disable_right=bool(px.get("disable_right", False)),
-            disable_left=bool(px.get("disable_left", False)),
+            disable_right=px.get("disable_right"),
+            disable_left=px.get("disable_left"),
             rdiv=px.get("rdiv"),
             pdiv=px.get("pdiv"),
             warm_enable=bool(px.get("warm_enable", False)),
@@ -4560,8 +4609,8 @@ class BioXpTester:
             acc=pz["acc"],
             stall_guard=pz.get("stall_guard"),
             ramp_mode=pz.get("ramp_mode"),
-            disable_right=bool(pz.get("disable_right", False)),
-            disable_left=bool(pz.get("disable_left", False)),
+            disable_right=pz.get("disable_right"),
+            disable_left=pz.get("disable_left"),
             rdiv=pz.get("rdiv"),
             pdiv=pz.get("pdiv"),
             warm_enable=bool(pz.get("warm_enable", False)),
@@ -4965,8 +5014,8 @@ class BioXpTester:
                 acc=int(cfg["acc"]),
                 stall_guard=p.get("stall_guard"),
                 ramp_mode=p.get("ramp_mode"),
-                disable_right=bool(p.get("disable_right", False)),
-                disable_left=bool(p.get("disable_left", False)),
+                disable_right=p.get("disable_right"),
+                disable_left=p.get("disable_left"),
                 rdiv=p.get("rdiv"),
                 pdiv=p.get("pdiv"),
                 warm_enable=False,
@@ -5172,8 +5221,8 @@ class BioXpTester:
                 acc=p["acc"],
                 stall_guard=p.get("stall_guard"),
                 ramp_mode=p.get("ramp_mode"),
-                disable_right=bool(p.get("disable_right", False)),
-                disable_left=bool(p.get("disable_left", False)),
+                disable_right=p.get("disable_right"),
+                disable_left=p.get("disable_left"),
                 rdiv=p.get("rdiv"),
                 pdiv=p.get("pdiv"),
                 warm_enable=bool(p.get("warm_enable", False)),
@@ -5231,8 +5280,8 @@ class BioXpTester:
                 acc=int(p["acc"]),
                 stall_guard=p.get("stall_guard"),
                 ramp_mode=p.get("ramp_mode"),
-                disable_right=bool(p.get("disable_right", False)),
-                disable_left=bool(p.get("disable_left", False)),
+                disable_right=p.get("disable_right"),
+                disable_left=p.get("disable_left"),
                 rdiv=p.get("rdiv"),
                 pdiv=p.get("pdiv"),
                 warm_enable=False,
@@ -5262,8 +5311,8 @@ class BioXpTester:
                     acc=int(probe_acc.get(key, 90)),
                     stall_guard=p.get("stall_guard"),
                     ramp_mode=p.get("ramp_mode"),
-                    disable_right=bool(p.get("disable_right", False)),
-                    disable_left=bool(p.get("disable_left", False)),
+                    disable_right=p.get("disable_right"),
+                    disable_left=p.get("disable_left"),
                     rdiv=p.get("rdiv"),
                     pdiv=p.get("pdiv"),
                     warm_enable=False,
@@ -5297,8 +5346,8 @@ class BioXpTester:
                     acc=int(p["acc"]),
                     stall_guard=p.get("stall_guard"),
                     ramp_mode=p.get("ramp_mode"),
-                    disable_right=bool(p.get("disable_right", False)),
-                    disable_left=bool(p.get("disable_left", False)),
+                    disable_right=p.get("disable_right"),
+                    disable_left=p.get("disable_left"),
                     rdiv=p.get("rdiv"),
                     pdiv=p.get("pdiv"),
                     warm_enable=False,
@@ -8672,13 +8721,15 @@ def run_thermal_door_menu(tester):
     p = tester.motor_function_preset("door")
     board = int(p["board"])
     motor = int(p["motor"])
-    speed = 100
-    acc = 50
-    run_current = 31
+    # Diagnostic menu wrapper, but use OEM thermal-door settings rather than
+    # historical ad-hoc targets. Production/API routes must verify predicates.
+    speed = int(p.get("speed", 50))
+    acc = int(p.get("acc", 20))
+    run_current = int(p.get("run_current", 31))
     standby_current = int(p["standby_current"])
-    stall_guard = 8
-    open_pos = 10750
-    close_pos = -7000
+    stall_guard = int(p.get("stall_guard", 6)) + 2
+    open_pos = int(p.get("open_position", 16000))
+    close_pos = int(p.get("close_position", 0))
     nudge_steps = 2000
     seek_step = 300
     seek_max_moves = 90
@@ -8693,8 +8744,8 @@ def run_thermal_door_menu(tester):
             acc=acc,
             stall_guard=stall_guard,
             ramp_mode=p.get("ramp_mode"),
-            disable_right=bool(p.get("disable_right", True)),
-            disable_left=bool(p.get("disable_left", True)),
+            disable_right=p.get("disable_right"),
+            disable_left=p.get("disable_left"),
         )
         return prep
 
@@ -9189,8 +9240,8 @@ def run_motor_menu(tester):
                 acc=pd["acc"],
                 stall_guard=pd.get("stall_guard"),
                 ramp_mode=pd.get("ramp_mode"),
-                disable_right=bool(pd.get("disable_right", False)),
-                disable_left=bool(pd.get("disable_left", False)),
+                disable_right=pd.get("disable_right"),
+                disable_left=pd.get("disable_left"),
                 rdiv=pd.get("rdiv"),
                 pdiv=pd.get("pdiv"),
                 warm_enable=bool(pd.get("warm_enable", False)),
@@ -9287,8 +9338,8 @@ def run_motor_menu(tester):
                     acc=p["acc"],
                     stall_guard=p.get("stall_guard"),
                     ramp_mode=p.get("ramp_mode"),
-                    disable_right=bool(p.get("disable_right", False)),
-                    disable_left=bool(p.get("disable_left", False)),
+                    disable_right=p.get("disable_right"),
+                    disable_left=p.get("disable_left"),
                     rdiv=p.get("rdiv"),
                     pdiv=p.get("pdiv"),
                     warm_enable=bool(p.get("warm_enable", False)),
