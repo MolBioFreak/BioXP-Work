@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_config import harmonized_motion_config
 from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gripper_idle_current
+from .oem_initialization import run_oem_initialization_controller
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
 from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
@@ -679,6 +680,14 @@ class OemInitializeMotionRequest(BaseModel):
     run_homing: bool = Field(False, description="False calls initialize-without-motion only; true delegates to the homing/rehome wrapper.")
     include_tip_pipette_cleanup: bool = Field(False, description="Reserved label only; cleanup remains not ported until source-equivalent primitives exist.")
     timeout_s: float = Field(120.0, gt=1.0, le=240.0)
+
+
+class OemInitializationRunRequest(BaseModel):
+    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing dry/controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING for live homing body.")
+    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true runs source-shaped homing/controller phases.")
+    restore_door_state: bool = Field(False, description="Request explicit source-mode door restore policy after init. Open restore remains explicit, not silent.")
+    include_tip_pipette_cleanup: bool = Field(False, description="Reserved label; cleanup remains explicitly unsupported until source-equivalent primitives exist.")
+    timeout_s: float = Field(180.0, gt=1.0, le=300.0)
 
 
 OEM_IDLE_STANDBY_CURRENT = 10
@@ -4122,6 +4131,26 @@ async def motion_oem_rehome(req: OemRehomeRequest):
         "OEM ControlLib.rehome direct wrapper",
         lambda: _execute_oem_rehome(tester, timeout_s=req.timeout_s),
         timeout_s=min(max(float(req.timeout_s) + 10.0, 30.0), 260.0),
+    )
+
+
+@app.post("/motion/oem/initialization/run")
+async def motion_oem_initialization_run(req: OemInitializationRunRequest):
+    expected_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if bool(req.run_homing) else "OEM_INITIALIZATION_RUN"
+    if req.operator_ack != expected_ack:
+        raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initialization controller run_homing={bool(req.run_homing)}")
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM initialization controller",
+        lambda: run_oem_initialization_controller(
+            tester,
+            run_homing=req.run_homing,
+            restore_door_state=req.restore_door_state,
+            include_tip_pipette_cleanup=req.include_tip_pipette_cleanup,
+            timeout_s=req.timeout_s,
+        ),
+        timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
     )
 
 

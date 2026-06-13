@@ -292,3 +292,163 @@ def build_thermal_door_state_restore_plan(before: dict[str, Any], *, restore_req
         "source_anchor": SOURCE_ANCHORS["control_initialize_motion"].to_dict(),
         "not_silent": True,
     }
+
+
+
+def _safe_call(label: str, fn, *, movement: bool = False) -> dict[str, Any]:
+    try:
+        result = fn()
+        ok = bool(isinstance(result, dict) and result.get("ok", True) is True)
+        return {"name": label, "ok": ok, "physical_motion_commanded": bool(movement), "result": result}
+    except Exception as exc:  # pragma: no cover - exercised by API integration paths
+        return {"name": label, "ok": False, "physical_motion_commanded": bool(movement), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def run_oem_initialization_controller(
+    tester: Any,
+    *,
+    run_homing: bool,
+    restore_door_state: bool = False,
+    include_tip_pipette_cleanup: bool = False,
+    timeout_s: float = 180.0,
+) -> dict[str, Any]:
+    """Run a first-class source-anchored OEM initialization controller.
+
+    This is the Phase-6 controller layer.  It orchestrates already-hardened lower
+    primitives and records every phase.  It does not hide unsupported semantics.
+    """
+    phases: list[dict[str, Any]] = []
+    manifest = build_machine_calibration_manifest()
+
+    def add(phase_name: str, row: dict[str, Any]) -> dict[str, Any]:
+        catalog = {p.name: p for p in OEM_INIT_PHASES}
+        phase = catalog.get(phase_name)
+        row = dict(row)
+        row.setdefault("phase", phase_name)
+        if phase is not None:
+            row.setdefault("source_command", phase.source_command)
+            row.setdefault("source_anchor", phase.source_anchor.to_dict())
+            row.setdefault("linux_status", phase.linux_status)
+        phases.append(row)
+        return row
+
+    add("accepted", {"ok": True, "run_homing": bool(run_homing), "restore_door_state": bool(restore_door_state), "include_tip_pipette_cleanup": bool(include_tip_pipette_cleanup)})
+
+    initial_check = _safe_call("initial_check", lambda: {"ok": True, "note": "API route preconditions/interlocks checked by caller when live"})
+    add("initial_check", initial_check)
+
+    interlock = _safe_call("interlock_prepare", lambda: tester.motion_gate_live_snapshot() if hasattr(tester, "motion_gate_live_snapshot") else {"ok": True})
+    add("interlock_prepare", interlock)
+    if not interlock.get("ok"):
+        return _finalize_oem_initialization(False, phases, manifest, "interlock_prepare")
+
+    prep = _safe_call("initialize_without_motion", lambda: tester.motor_oem_initialize_without_motion())
+    add("initialize_without_motion", prep)
+    if not prep.get("ok"):
+        return _finalize_oem_initialization(False, phases, manifest, "initialize_without_motion")
+
+    door_capture = _safe_call("door_state_capture", lambda: tester.motor_plan_thermal_door_restore(restore_requested=restore_door_state))
+    add("door_state_capture", door_capture)
+    if not door_capture.get("ok"):
+        return _finalize_oem_initialization(False, phases, manifest, "door_state_capture")
+
+    if bool(run_homing):
+        z_home = _safe_call("z_reference", lambda: tester.motor_oem_axis_already_home("z", tolerance_steps=2))
+        z_result = z_home.get("result") if isinstance(z_home, dict) else None
+        if not (isinstance(z_result, dict) and z_result.get("ok") is True):
+            z_home = _safe_call("z_reference", lambda: tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s), movement=True)
+        add("z_reference", z_home)
+        if not z_home.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "z_reference")
+
+        z_clear = _safe_call("z_clearance", lambda: tester.motor_oem_verify_z_clearance_for_xy(target=-15000, min_clearance=-10000, timeout_s=min(float(timeout_s), 30.0)), movement=True)
+        add("z_reference", {**z_clear, "phase_detail": "z_clearance_for_xy"})
+        if not z_clear.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "z_clearance_for_xy")
+
+        g_clear = _safe_call("g_reference_clear", lambda: _controller_gripper_clear(tester, timeout_s=timeout_s), movement=True)
+        add("g_reference", g_clear)
+        if not g_clear.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "g_reference_clear")
+
+        g_home = _safe_call("g_reference_home", lambda: _controller_gripper_home(tester, timeout_s=timeout_s), movement=True)
+        add("g_reference", g_home)
+        if not g_home.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "g_reference_home")
+
+        home_xy = _safe_call("home_xy", lambda: tester.motor_oem_home_xy(timeout_s=min(float(timeout_s), 60.0)), movement=True)
+        add("home_xy", home_xy)
+        if not home_xy.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "home_xy")
+
+        door_home = _safe_call("door_home_or_restore", lambda: tester.motor_oem_door_search_home(timeout_s=min(float(timeout_s), 45.0), startup=False), movement=True)
+        add("door_home_or_restore", door_home)
+        if not door_home.get("ok"):
+            return _finalize_oem_initialization(False, phases, manifest, "door_home_or_restore")
+    else:
+        for phase in ("z_reference", "g_reference", "home_xy", "door_home_or_restore"):
+            add(phase, {"ok": True, "skipped": True, "reason": "run_homing_false", "physical_motion_commanded": False})
+
+    cleanup = {
+        "ok": True,
+        "requested": bool(include_tip_pipette_cleanup),
+        "implemented": False,
+        "reason": "tip/pipette cleanup remains separate until source-equivalent primitives are ported",
+        "physical_motion_commanded": False,
+    }
+    add("tip_pipette_cleanup_or_unsupported", cleanup)
+
+    park = {"ok": True, "implemented": False, "reason": "parkGantry/PrepareToRunJob remains separate; controller ends at initialized home/reference state", "physical_motion_commanded": False}
+    add("park_or_ready_position", park)
+
+    final = _safe_call("final_readiness", lambda: _controller_final_status(tester))
+    add("final_readiness", final)
+    ok = bool(final.get("ok"))
+    return _finalize_oem_initialization(ok, phases, manifest, None if ok else "final_readiness")
+
+
+def _controller_gripper_clear(tester: Any, *, timeout_s: float) -> dict[str, Any]:
+    from .oem_gripper import gripper_clear
+
+    return gripper_clear(tester, operator_ack="GRIPPER_CLEAR", reason="OEM initialization controller G clear", timeout_s=min(float(timeout_s), 20.0))
+
+
+def _controller_gripper_home(tester: Any, *, timeout_s: float) -> dict[str, Any]:
+    from .oem_gripper import gripper_home
+
+    return gripper_home(tester, operator_ack="GRIPPER_HOME", reason="OEM initialization controller G home", timeout_s=min(float(timeout_s), 20.0))
+
+
+def _controller_final_status(tester: Any) -> dict[str, Any]:
+    status: dict[str, Any] = {"ok": True}
+    if hasattr(tester, "motion_arm_state"):
+        status["motion_arm"] = tester.motion_arm_state()
+    if hasattr(tester, "motor_axis_status") and hasattr(tester, "_motion_oem_axis_profile"):
+        axes = {}
+        for axis in ("x", "y", "z", "g", "door"):
+            try:
+                preset = tester._motion_oem_axis_profile(axis, startup=True)
+                axes[axis] = tester.motor_axis_status(preset["board"], motor=preset["motor"])
+            except Exception as exc:  # pragma: no cover - defensive live path
+                axes[axis] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        status["axes"] = axes
+        for axis, row in axes.items():
+            speed = row.get("speed") if isinstance(row, dict) else None
+            if isinstance(speed, dict) and speed.get("speed") not in (0, None):
+                status["ok"] = False
+                status.setdefault("blockers", []).append(f"{axis}_speed_nonzero")
+    return status
+
+
+def _finalize_oem_initialization(ok: bool, phases: list[dict[str, Any]], manifest: dict[str, Any], failed_at: str | None) -> dict[str, Any]:
+    return {
+        "ok": bool(ok),
+        "ready": bool(ok),
+        "schema": "bioxp.oem_initialization_controller.v1",
+        "source_mode": "GenBotApp.initializeSystem -> ControlLib.initializeMotion -> initializeMotors",
+        "route_semantics": {"not_equivalent_to": ["/motion/axis/home", "/motion/axis/zero", "/motion/oem/rehome monolith"]},
+        "failed_at": failed_at,
+        "machine_calibration_manifest": manifest,
+        "phases": phases,
+        "phase_names": [row.get("phase") for row in phases],
+    }

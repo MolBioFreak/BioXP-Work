@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from .oem_runtime_types import OEMRuntimeCommand
+from .oem_initialization import run_oem_initialization_controller
 
 
 PREPARE_TO_RUN_JOB_READINESS_SCHEMA_VERSION = "bioxp.oem_runtime.prepare_to_run_job_readiness.v1"
@@ -54,6 +55,8 @@ class OEMRuntimeCommandHandlers:
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
+        if bool(params.get("run_oem_initialization", False)):
+            return self._handle_oem_initialization_controller_stage(command, params)
         if bool(params.get("run_stepwise_homing", False)):
             return self._handle_stepwise_homing_stage(command, params)
         if bool(params.get("run_initialize_motion", False)) or bool(params.get("initialize_motion_only", False)):
@@ -107,6 +110,37 @@ class OEMRuntimeCommandHandlers:
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
         tmp.replace(artifact_path)
         return str(artifact_path)
+
+    def _handle_oem_initialization_controller_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
+        run_homing = bool(params.get("run_homing", False))
+        required_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if run_homing else "OEM_INITIALIZATION_RUN"
+        if command.mode == "live" and command.operator_ack != required_ack:
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "oemInitializationController", "blockers": [f"operator_ack_{required_ack}_required_for_live_oem_initialization_controller"]}
+        program = self._startup_program()
+        if program is None or not hasattr(program, "hardware"):
+            return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "oemInitializationController", "blockers": ["oem_initialization_provider_not_bound"]}
+        hardware = program.hardware
+        timeout_s = float(params.get("timeout_s", command.timeout_s or 180.0))
+        result = run_oem_initialization_controller(
+            hardware,
+            run_homing=run_homing,
+            restore_door_state=bool(params.get("restore_door_state", False)),
+            include_tip_pipette_cleanup=bool(params.get("include_tip_pipette_cleanup", False)),
+            timeout_s=timeout_s,
+        )
+        artifact_path = self._write_stage_artifact(command, "runtime_oem_initialization_controller.json", {"command": command.to_dict(), "oem_initialization": result})
+        ok = bool(result.get("ok"))
+        return {
+            "ok": ok,
+            "ready": ok,
+            "state": "init_ready" if ok else "init_failed",
+            "command": command.name,
+            "stage": "oemInitializationController",
+            "mode": "live" if command.mode == "live" else "shadow",
+            "artifact_path": artifact_path,
+            "oem_initialization": result,
+            "blockers": [] if ok else ["oem_initialization_controller_failed"],
+        }
 
     def _handle_initial_check_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         if command.mode == "live" and command.operator_ack != "INITIALIZE":
