@@ -3843,6 +3843,17 @@ class BioXpTester:
         position_before = self.motor_get_position(board, motor=motor)
         home_before = self.motor_query_home_switch(board, motor=motor)
         switches_before = self.motor_get_switch_activity(board, motor=motor)
+        if key == "door":
+            status_before = self.motor_thermal_door_status()
+        else:
+            status_before = {
+                "axis": key,
+                "position": position_before,
+                "home": home_before,
+                "switches": switches_before,
+                "closed": None,
+                "opened": None,
+            }
         rehome_move = None
         rehome_wait = None
         rehome_position = None
