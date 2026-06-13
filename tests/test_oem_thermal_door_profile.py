@@ -3,7 +3,7 @@ from pathlib import Path
 from src.bioxp.usb_driver import BioXpTester
 
 
-def test_thermal_door_profile_matches_oem_serial_ge_10_defaults():
+def test_thermal_door_static_profile_preserves_oem_serial_ge_10_defaults():
     door = BioXpTester.MOTOR_FUNCTION_PRESETS["door"]
 
     assert door["speed"] == 50
@@ -16,6 +16,19 @@ def test_thermal_door_profile_matches_oem_serial_ge_10_defaults():
     assert door["close_position"] == 0
     assert door["disable_right"] is True
     assert door["disable_left"] is True
+
+
+def test_thermal_door_runtime_profile_prefers_original_ssd_machine_calibration():
+    tester = object.__new__(BioXpTester)
+
+    door = tester._motion_oem_axis_profile("door")
+
+    assert door["open_position"] == 18500
+    assert door["open_position_source"] == "original_ssd_machine_config"
+    assert door["speed"] == 50
+    assert door["acc"] == 20
+    assert door["run_current"] == 31
+    assert door["stall_guard"] == 6
 
 
 def test_diagnostic_door_menu_no_longer_uses_ad_hoc_targets():

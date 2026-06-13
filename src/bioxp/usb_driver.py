@@ -10,6 +10,7 @@ import re
 import signal
 import json
 import concurrent.futures
+from pathlib import Path
 
 try:
     from .oem_config import find_oem_machine_config_bundle
@@ -3506,6 +3507,42 @@ class BioXpTester:
         except Exception:
             return 0
 
+
+    def _machine_config_bundle(self):
+        """Load the bound original-SSD machine config with a repo-local fallback."""
+        if not callable(find_oem_machine_config_bundle):
+            return {"ok": False, "blockers": ["find_oem_machine_config_bundle_unavailable"]}
+        candidates = []
+        env_dir = os.environ.get("BIOXP_OEM_MACHINE_CONFIG_DIR")
+        env_xml = os.environ.get("BIOXP_OEM_MACHINE_CONFIG_XML")
+        if env_dir:
+            candidates.append(env_dir)
+        if env_xml:
+            candidates.append(str(Path(env_xml).parent))
+        candidates.append(str(Path(__file__).resolve().parents[2] / "config" / "oem" / "original_ssd_appdata_20260610"))
+        last = None
+        for candidate in candidates:
+            try:
+                result = find_oem_machine_config_bundle(candidate)
+            except Exception as exc:  # pragma: no cover - defensive live path
+                result = {"ok": False, "blockers": [f"{type(exc).__name__}: {exc}"], "root_dir": candidate}
+            last = result
+            if isinstance(result, dict) and result.get("ok") is True:
+                return result
+        return last or {"ok": False, "blockers": ["no_machine_config_candidates"]}
+
+    def _machine_config_offset_int(self, machine_key, fallback):
+        machine = self._machine_config_bundle()
+        if isinstance(machine, dict) and machine.get("ok") is True:
+            config = machine.get("config", {}) if isinstance(machine.get("config"), dict) else {}
+            offsets = config.get("offsets", {}) if isinstance(config, dict) else {}
+            if isinstance(offsets, dict) and machine_key in offsets:
+                try:
+                    return int(offsets[machine_key]), "original_ssd_machine_config"
+                except (TypeError, ValueError):
+                    pass
+        return int(fallback), "oem_source_default"
+
     def _machine_config_axis_max(self, axis_key, fallback):
         """Return bound original-SSD max steps for a homing guard, if available.
 
@@ -3595,7 +3632,27 @@ class BioXpTester:
                 preset.update({"speed": 1500, "acc": 20, "stall_guard": 20, "run_current": op_current, "standby_current": 10, "home_speed": 600, "restore_current": 10, "home_search_max_abs_delta": g_max, "home_search_max_abs_delta_source": g_max_source})
             return preset
         if key == "door":
-            preset.update({"home_speed": int(preset.get("speed", 600)), "stall_guard_param": 205})
+            open_pos, open_source = self._machine_config_offset_int("m_TCDoorOpen", preset.get("open_position", 16000))
+            stall_guard, stall_source = self._machine_config_offset_int("m_TCDoorStallGuardThreshold", preset.get("stall_guard", 6))
+            velocity, velocity_source = self._machine_config_offset_int("m_TC_DOOR_VELOCITY", preset.get("speed", 50))
+            acc, acc_source = self._machine_config_offset_int("m_TC_DOOR_ACCELERATION", preset.get("acc", 20))
+            current, current_source = self._machine_config_offset_int("m_TC_DOOR_MAX_CURRENT", preset.get("run_current", 31))
+            preset.update({
+                "speed": velocity,
+                "home_speed": velocity,
+                "acc": acc,
+                "run_current": current,
+                "stall_guard": stall_guard,
+                "open_position": open_pos,
+                "open_position_source": open_source,
+                "stall_guard_source": stall_source,
+                "velocity_source": velocity_source,
+                "acc_source": acc_source,
+                "run_current_source": current_source,
+                "close_position": 0,
+                "close_position_source": "oem_home_zero_after_doorSearchHome",
+                "stall_guard_param": 205,
+            })
             return preset
         raise ValueError(f"Unknown OEM home axis: {axis_key}")
 
