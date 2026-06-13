@@ -366,15 +366,21 @@ def run_oem_initialization_controller(
         if not z_clear.get("ok"):
             return _finalize_oem_initialization(False, phases, manifest, "z_clearance_for_xy")
 
-        g_clear = _safe_call("g_reference_clear", lambda: _controller_gripper_clear(tester, timeout_s=timeout_s), movement=True)
-        add("g_reference", g_clear)
-        if not g_clear.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "g_reference_clear")
+        g_status = _safe_call("g_reference_already_home", lambda: _controller_gripper_status(tester), movement=False)
+        g_body = g_status.get("result") if isinstance(g_status, dict) else None
+        g_pred = (g_body.get("oem_home_predicate") if isinstance(g_body, dict) else {}) or {}
+        if bool(g_pred.get("oem_confirmed_home")):
+            add("g_reference", {**g_status, "already_home": True, "reason": "OEM confirmAxis(g) true: queryHome(MotorGrip) OR getG()<50; skip clear/home motion"})
+        else:
+            g_clear = _safe_call("g_reference_clear", lambda: _controller_gripper_clear(tester, timeout_s=timeout_s), movement=True)
+            add("g_reference", g_clear)
+            if not g_clear.get("ok"):
+                return _finalize_oem_initialization(False, phases, manifest, "g_reference_clear")
 
-        g_home = _safe_call("g_reference_home", lambda: _controller_gripper_home(tester, timeout_s=timeout_s), movement=True)
-        add("g_reference", g_home)
-        if not g_home.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "g_reference_home")
+            g_home = _safe_call("g_reference_home", lambda: _controller_gripper_home(tester, timeout_s=timeout_s), movement=True)
+            add("g_reference", g_home)
+            if not g_home.get("ok"):
+                return _finalize_oem_initialization(False, phases, manifest, "g_reference_home")
 
         home_xy = _safe_call("home_xy", lambda: tester.motor_oem_home_xy(timeout_s=min(float(timeout_s), 60.0)), movement=True)
         add("home_xy", home_xy)
@@ -405,6 +411,12 @@ def run_oem_initialization_controller(
     add("final_readiness", final)
     ok = bool(final.get("ok"))
     return _finalize_oem_initialization(ok, phases, manifest, None if ok else "final_readiness")
+
+
+def _controller_gripper_status(tester: Any) -> dict[str, Any]:
+    from .oem_gripper import gripper_status
+
+    return gripper_status(tester)
 
 
 def _controller_gripper_clear(tester: Any, *, timeout_s: float) -> dict[str, Any]:

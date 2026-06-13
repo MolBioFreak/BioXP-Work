@@ -103,8 +103,8 @@ def test_controller_with_homing_runs_source_ordered_motion_phases():
     assert result["ready"] is True
     names = result["phase_names"]
     assert names.index("z_reference") < names.index("g_reference") < names.index("home_xy") < names.index("door_home_or_restore")
-    assert any(call[0] == "move_relative" for call in tester.calls)
     assert any(call[0] == "homexy" for call in tester.calls)
+    assert not any(call[0] == "move_relative" for call in tester.calls)
 
 
 def test_controller_fails_closed_on_home_xy_failure():
@@ -117,3 +117,15 @@ def test_controller_fails_closed_on_home_xy_failure():
     assert result["ok"] is False
     assert result["ready"] is False
     assert result["failed_at"] == "home_xy"
+
+
+
+def test_controller_skips_gripper_clear_when_oem_g_already_home():
+    tester = FakeInitTester()
+
+    result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=90)
+
+    assert result["ok"] is True
+    g_phases = [p for p in result["phases"] if p.get("phase") == "g_reference"]
+    assert g_phases[0]["already_home"] is True
+    assert not any(call[0] == "move_relative" for call in tester.calls)

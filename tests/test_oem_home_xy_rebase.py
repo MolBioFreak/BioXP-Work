@@ -54,3 +54,37 @@ def test_oem_home_xy_sets_home_after_switch_confirmed():
     assert result["home_rebase"]["y"]["home_rebased"] is True
     assert ("set_home", "x", 0x05, 0) in tester.calls
     assert ("set_home", "y", 0x04, 0) in tester.calls
+
+
+
+def test_oem_homexy_serializes_linux_usb_context():
+    calls = []
+
+    class Tester(BioXpTester):
+        def __init__(self):
+            pass
+
+        def _motion_oem_axis_profile(self, axis, startup=True):
+            return {"x": {"board": 5, "motor": 0, "speed": 1700, "acc": 350}, "y": {"board": 4, "motor": 0, "speed": 1800, "acc": 400}}[axis]
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            return {"ok": True, "board": board, "param": param, "value": value}
+
+        def motor_oem_go_home(self, axis, **kwargs):
+            calls.append(axis)
+            return {"ok": True, "axis": axis}
+
+        def motor_axis_status(self, board, motor=0):
+            return {"speed": {"speed": 0}, "switches": {"left_raw_active": True}}
+
+        def motor_set_home(self, board, motor=0):
+            return {"ok": True}
+
+        def motor_get_position(self, board, motor=0):
+            return {"position": 0}
+
+    result = Tester().motor_oem_home_xy(timeout_s=1)
+
+    assert result["ok"] is True
+    assert result["live_parallel_execution"] is False
+    assert calls == ["x", "y"]

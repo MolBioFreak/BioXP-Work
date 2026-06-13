@@ -4481,31 +4481,24 @@ class BioXpTester:
                 "speed": self.motor_set_axis_param(board, 4, 200, motor=motor),
                 "acc": self.motor_set_axis_param(board, 5, 200, motor=motor),
             }
+        # OEM C# uses Task.Run/WaitAll over board objects.  The Linux udocker/libusb
+        # path uses a shared USB context and is not safe for concurrent TMCL calls:
+        # live proof 2026-06-13 produced USBError [Errno 19] on X while X/Y still
+        # physically homed/rebased.  Preserve OEM order/semantics but serialize bus IO.
+        out["live_parallel_execution"] = False
+        out["implementation_note"] = "oem_homexy_semantics_serialized_for_linux_usb_context"
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="bioxp_homexy") as executor:
-                futures = {
-                    "x": executor.submit(
-                        self.motor_oem_go_home,
-                        "x",
+            for axis in ("x", "y"):
+                try:
+                    out["homes"][axis] = self.motor_oem_go_home(
+                        axis,
                         speed=200,
                         rehome=False,
                         timeout_s=timeout_s,
                         require_switch_transition=False,
-                    ),
-                    "y": executor.submit(
-                        self.motor_oem_go_home,
-                        "y",
-                        speed=200,
-                        rehome=False,
-                        timeout_s=timeout_s,
-                        require_switch_transition=False,
-                    ),
-                }
-                for axis, fut in futures.items():
-                    try:
-                        out["homes"][axis] = fut.result()
-                    except Exception as exc:
-                        out["home_errors"][axis] = {"type": type(exc).__name__, "message": str(exc)}
+                    )
+                except Exception as exc:
+                    out["home_errors"][axis] = {"type": type(exc).__name__, "message": str(exc)}
         finally:
             for axis, preset in (("x", px), ("y", py)):
                 board = int(preset["board"])
