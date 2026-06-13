@@ -4828,7 +4828,11 @@ class BioXpTester:
         near_reference = isinstance(pos_value, int) and abs(int(pos_value)) <= int(tolerance_steps)
         stopped = speed_value == 0
         predicate_active = home_value == active_value
-        ok = bool(predicate_active and stopped and near_reference)
+        live_z_reference_active = False
+        if key == "z":
+            right_value = switches.get("right_state") if isinstance(switches, dict) else None
+            live_z_reference_active = bool(near_reference and stopped and right_value is not None and int(right_value) == active_value)
+        ok = bool(stopped and near_reference and (predicate_active or live_z_reference_active))
         return {
             "axis": key,
             "board": board,
@@ -4843,9 +4847,14 @@ class BioXpTester:
             "home": home,
             "switches": switches,
             "predicate_active": bool(predicate_active),
+            "live_z_reference_active": bool(live_z_reference_active),
             "stopped": bool(stopped),
             "near_reference": bool(near_reference),
             "source_intent": "safe_reference_established_before_downstream_initialization",
+            "z_reference_contract": {
+                "accepted": bool(live_z_reference_active),
+                "reason": "live Z reference is controller zero plus GAP10/right raw active; GAP9 remains OEM-source provenance but is not the live verifier on this robot",
+            } if key == "z" else None,
         }
 
     def motor_startup_homing_mimic(self):

@@ -38,3 +38,28 @@ def test_z_profile_requires_right_mask_for_positive_reference_recovery(monkeypat
 
     assert profile["positive_down_requires_right_mask"] is True
     assert "live Z reference recovery" in profile["oem_home_step"]
+
+
+
+def test_z_already_home_accepts_controller_zero_gap10_live_reference(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+    monkeypatch.setattr(tester, "motor_function_preset", lambda key: {"board": 4, "motor": 1, "speed": 1791, "acc": 576, "standby_current": 10})
+    monkeypatch.setattr(tester, "_machine_config_axis_max", lambda axis, fallback: (160000, "test"))
+    monkeypatch.setattr(tester, "motor_get_position", lambda board, motor=0: {"position": 0})
+    monkeypatch.setattr(tester, "motor_get_speed", lambda board, motor=0: {"speed": 0})
+    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board, motor=0: {"value": 0})
+    monkeypatch.setattr(tester, "motor_get_switch_activity", lambda board, motor=0: {
+        "right_state": 1,
+        "right_raw_active": True,
+        "right_disabled": True,
+        "left_state": 0,
+        "left_raw_active": False,
+        "left_disabled": False,
+    })
+
+    result = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
+
+    assert result["ok"] is True
+    assert result["predicate_active"] is False
+    assert result["live_z_reference_active"] is True
+    assert result["z_reference_contract"]["accepted"] is True
