@@ -3615,8 +3615,12 @@ class BioXpTester:
                 "oem_home_speed": 1791,
                 "run_current": 31,
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
-                "positive_down_requires_right_mask": False,
-                "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
+                # Live robot proof: positive Z/down toward controller reference 0 is
+                # accepted-but-inert while GAP10/right is active unless SAP12 masks
+                # the right limit. Full OEM init must use this live reference-recovery
+                # contract instead of falling into generic MoveLeft/GAP9 search.
+                "positive_down_requires_right_mask": True,
+                "oem_home_step": "MotorZ.axisSearchHome(speed=1791) via live Z reference recovery",
                 "home_search_max_abs_delta": z_max,
                 "home_search_max_abs_delta_source": z_max_source,
             })
@@ -4581,11 +4585,24 @@ class BioXpTester:
                 out["failed_at"] = name
             return result, ok
 
-        # 3350-3352: MotorZ.axisSearchHome(..., 1791).  Use the live-hardened Z
-        # path that accepts already-home/top, then establish XY clearance.
-        _, ok = _record("z_axisSearchHome_1791", lambda: self.motor_oem_axis_already_home("z", tolerance_steps=2))
+        # 3350-3352: MotorZ.axisSearchHome(..., 1791).  On this live robot,
+        # source-shaped MoveLeft/GAP9 Z search is a known-bad hazard: it drives
+        # farther negative while GAP9 remains inactive and GAP10/right stays active.
+        # Full init therefore implements the OEM intent (establish Z reference
+        # before XY/G work) through the live-proven Z reference contract:
+        #   1) accept already-at-reference if controller Z≈0 and predicate proof holds
+        #   2) otherwise move positive/down to controller reference 0 using the Z-only
+        #      SAP12/right-mask recovery helper
+        #   3) verify reference, then move to the established XY clearance.
+        # It must never fall through to generic motor_oem_home_axis("z") switch-search.
+        z_probe = self.motor_oem_axis_already_home("z", tolerance_steps=2)
+        out["steps"].append("z_axisSearchHome_1791_probe")
+        out["results"]["z_axisSearchHome_1791_probe"] = z_probe
+        ok = bool(isinstance(z_probe, dict) and z_probe.get("ok") is True)
         if not ok:
-            _, ok = _record("z_axisSearchHome_1791_motion", lambda: self.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s))
+            _, ok = _record("z_return_to_live_reference_0", lambda: self.motor_oem_move_z_to_reference(target_position=0, timeout_s=min(float(timeout_s), 90.0)))
+            if ok:
+                _, ok = _record("z_reference_verify_after_return", lambda: self.motor_oem_axis_already_home("z", tolerance_steps=2))
         if not ok:
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
             return out

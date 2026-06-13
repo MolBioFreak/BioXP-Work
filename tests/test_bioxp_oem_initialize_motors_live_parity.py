@@ -81,8 +81,8 @@ def test_live_commissioning_profiles_are_soft_but_preserve_oem_home_order():
     assert z["acc"] == 60
     assert z["standby_current"] == 20
     assert z["home_speed"] == 250
-    assert z["positive_down_requires_right_mask"] is False
-    assert z["oem_home_step"] == "MotorZ.axisSearchHome(speed=1791)"
+    assert z["positive_down_requires_right_mask"] is True
+    assert z["oem_home_step"] == "MotorZ.axisSearchHome(speed=1791) via live Z reference recovery"
 
 
 def test_z_home_step_skips_reference_return_when_home_fails():
@@ -123,7 +123,7 @@ def test_z_home_step_skips_reference_return_when_home_fails():
     assert not any(call[0] == "z_reference" for call in calls)
 
 
-def test_z_reference_return_is_oem_unmasked_by_default_without_changing_x_y():
+def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y():
     calls = []
 
     class Tester(BioXpTester):
@@ -173,6 +173,9 @@ def test_z_reference_return_is_oem_unmasked_by_default_without_changing_x_y():
 
     assert result["ok"] is True
     assert result["steps"] == 10000
-    assert ("sap", 0x04, 1, 12, 1) not in calls  # OEM default: no Z right-limit mask
-    assert ("sap", 0x04, 1, 13, 0) not in calls  # OEM default: no Z left-limit mask mutation
+    assert ("sap", 0x04, 1, 12, 1) in calls  # live Z reference recovery masks GAP10/right during positive-to-0 motion
+    assert ("sap", 0x04, 1, 13, 0) in calls
+    assert result["right_mask_applied_for_positive_down"] is True
+    assert result["disable_right_restore"]["value"] == 0
+    assert result["disable_left_restore"]["value"] == 0
     assert not any(call[:3] == ("sap", 0x05, 0) for call in calls)  # no X mutation
