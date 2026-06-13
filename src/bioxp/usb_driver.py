@@ -4636,7 +4636,7 @@ class BioXpTester:
                 return out
 
         # 3367-3375: X axisSearchHome(250), setHome, setSpeed(1700), moveX(6000).
-        _, ok = _record("x_axisSearchHome_250", lambda: self.motor_oem_home_axis("x", startup=True, timeout_s=min(float(timeout_s), 60.0), allow_implementation_mapped_predicate=True))
+        _, ok = _record("x_axisSearchHome_250", lambda: self.motor_oem_home_axis("x", startup=True, timeout_s=min(float(timeout_s), 60.0)))
         if not ok:
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
             return out
@@ -4656,7 +4656,7 @@ class BioXpTester:
             return out
 
         # 3376-3379: Y axisSearchHome(250).
-        _, ok = _record("y_axisSearchHome_250", lambda: self.motor_oem_home_axis("y", startup=True, timeout_s=min(float(timeout_s), 60.0), allow_implementation_mapped_predicate=True))
+        _, ok = _record("y_axisSearchHome_250", lambda: self.motor_oem_home_axis("y", startup=True, timeout_s=min(float(timeout_s), 60.0)))
         if not ok:
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
             return out
