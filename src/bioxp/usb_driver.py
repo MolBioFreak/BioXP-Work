@@ -4180,6 +4180,20 @@ class BioXpTester:
             "switches_after": switches_after,
             "closed_confirmed": bool(closed_confirmed),
         }
+        # Live OEM-parity test showed the door may reach the closed/home predicate
+        # while motor_wait_stopped reports a timeout. OEM truth is predicate-backed:
+        # once tcDoorClosed/queryHome is true and speed is stopped, setHome is valid.
+        if bool(closed_confirmed):
+            sethome = self.motor_set_home(board, motor=motor)
+            return {
+                **base,
+                "set_home": sethome,
+                "ambiguous_no_motion": bool(wait.get("ambiguous_no_motion")),
+                "partial": False,
+                "failure": None,
+                "wait_warning": None if wait.get("stopped") is True else "wait_not_stopped_but_closed_predicate_confirmed",
+                "ok": True,
+            }
         if wait.get("ambiguous_no_motion"):
             return {
                 **base,
@@ -4197,13 +4211,12 @@ class BioXpTester:
                 "failure": "door_search_wait_timeout",
                 "ok": False,
             }
-        sethome = self.motor_set_home(board, motor=motor)
         return {
             **base,
-            "set_home": sethome,
+            "set_home": None,
             "partial": False,
-            "failure": None,
-            "ok": bool(closed_confirmed),
+            "failure": "door_search_closed_predicate_not_confirmed",
+            "ok": False,
         }
 
     def motor_oem_switch_search_home_axis(self, axis_key, *, speed=None, timeout_s=20.0):

@@ -148,3 +148,23 @@ def test_door_search_home_reports_before_after_predicates_and_sets_home_when_clo
     assert result["closed_after"] is True
     assert result["opened_after"] is False
     assert any(call[0] == "set_home" for call in tester.calls)
+
+
+class TimeoutButClosedDoorTester(FakeDoorTester):
+    def motor_wait_stopped(self, board, motor=0, timeout_s=20.0, require_seen_nonzero=False):
+        self.calls.append(("wait_timeout", board, motor, timeout_s, require_seen_nonzero))
+        # Simulate live observation: search reached tcDoorClosed, but wait helper timed out.
+        self.closed = True
+        self.opened = False
+        return {"stopped": False, "timeout": True, "seen_nonzero": True}
+
+
+def test_door_search_home_sets_home_when_closed_predicate_confirmed_despite_wait_timeout():
+    tester = TimeoutButClosedDoorTester(closed=False, opened=False)
+
+    result = tester.motor_oem_door_search_home(timeout_s=5, startup=False)
+
+    assert result["ok"] is True
+    assert result["closed_after"] is True
+    assert result["wait_warning"] == "wait_not_stopped_but_closed_predicate_confirmed"
+    assert any(call[0] == "set_home" for call in tester.calls)
