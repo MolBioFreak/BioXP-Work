@@ -651,6 +651,14 @@ class GripperRestoreIdleRequest(BaseModel):
     operator: Optional[str] = Field("bms-cockpit", max_length=200)
 
 
+class ThermalDoorActionRequest(BaseModel):
+    operator_ack: str = Field(..., description="Must be HOME_THERMAL_DOOR, OPEN_THERMAL_DOOR, or CLOSE_THERMAL_DOOR for the selected route.")
+    reason: str = Field(..., min_length=1, max_length=2000)
+    timeout_s: float = Field(20.0, gt=0.1, le=60.0)
+    capture_bundle: bool = False
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
 class OemHomeXYRequest(BaseModel):
     operator_ack: str = Field(..., description="Must be exactly HOMEXY for the direct OEM HomeXY mode.")
     timeout_s: float = Field(30.0, gt=0.1, le=120.0)
@@ -2273,8 +2281,8 @@ def _prepare_motion_axis(
                 acc=preset["acc"],
                 stall_guard=preset.get("stall_guard"),
                 ramp_mode=preset.get("ramp_mode"),
-                disable_right=bool(preset.get("disable_right", False)),
-                disable_left=bool(preset.get("disable_left", False)),
+                disable_right=preset.get("disable_right") if "disable_right" in preset else None,
+                disable_left=preset.get("disable_left") if "disable_left" in preset else None,
                 rdiv=preset.get("rdiv"),
                 pdiv=preset.get("pdiv"),
                 warm_enable=bool(preset.get("warm_enable", False)),
@@ -2288,6 +2296,7 @@ def _prepare_motion_axis(
         interlock_reused=interlock_reused,
     )
     return preset, board_status, interlock, prep, prep_policy
+
 
 
 def _hardware_connected_from_board_status(board_status: Any) -> bool:
@@ -4009,6 +4018,57 @@ async def motion_gripper_home(req: GripperActionRequest):
         "OEM gripper home",
         lambda: gripper_home(tester, operator_ack=req.operator_ack, reason=req.reason, timeout_s=req.timeout_s),
         timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 120.0),
+    )
+
+
+def _thermal_door_success_or_409(result: dict) -> dict:
+    if isinstance(result, dict) and result.get("ok") is True:
+        return result
+    raise HTTPException(status_code=409, detail=result)
+
+
+@app.post("/motion/thermal_door/home")
+async def motion_thermal_door_home(req: ThermalDoorActionRequest):
+    if req.operator_ack != "HOME_THERMAL_DOOR":
+        raise HTTPException(status_code=422, detail="operator_ack must be HOME_THERMAL_DOOR")
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM thermal door home",
+        lambda: _thermal_door_success_or_409(
+            tester.motor_oem_door_search_home(timeout_s=req.timeout_s, startup=False)
+        ),
+        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
+    )
+
+
+@app.post("/motion/thermal_door/open")
+async def motion_thermal_door_open(req: ThermalDoorActionRequest):
+    if req.operator_ack != "OPEN_THERMAL_DOOR":
+        raise HTTPException(status_code=422, detail="operator_ack must be OPEN_THERMAL_DOOR")
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM thermal door open",
+        lambda: _thermal_door_success_or_409(
+            tester.motor_oem_open_thermal_door(timeout_s=req.timeout_s)
+        ),
+        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
+    )
+
+
+@app.post("/motion/thermal_door/close")
+async def motion_thermal_door_close(req: ThermalDoorActionRequest):
+    if req.operator_ack != "CLOSE_THERMAL_DOOR":
+        raise HTTPException(status_code=422, detail="operator_ack must be CLOSE_THERMAL_DOOR")
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM thermal door close",
+        lambda: _thermal_door_success_or_409(
+            tester.motor_oem_close_thermal_door(timeout_s=req.timeout_s)
+        ),
+        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
     )
 
 
