@@ -4642,6 +4642,48 @@ class BioXpTester:
         out["ok"] = bool(wait_ok and move_ok)
         return out
 
+    def motor_oem_axis_already_home(self, axis_key, *, tolerance_steps=2):
+        """Return a no-motion OEM reference proof when an axis is already on home.
+
+        This is intentionally conservative.  It exists for the live-observed Z case
+        where the axis can start at the active top/home predicate near 0/-1 and a
+        forced re-search would trip the false-home transition guard.
+        """
+        preset = self._motion_oem_axis_profile(axis_key, startup=True)
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        key = str(axis_key).strip().lower()
+        active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        position = self.motor_get_position(board, motor=motor)
+        speed = self.motor_get_speed(board, motor=motor)
+        home = self.motor_query_home_switch(board, motor=motor)
+        switches = self.motor_get_switch_activity(board, motor=motor)
+        pos_value = position.get("position") if isinstance(position, dict) else None
+        speed_value = speed.get("speed") if isinstance(speed, dict) else None
+        home_value = home.get("value") if isinstance(home, dict) else None
+        near_reference = isinstance(pos_value, int) and abs(int(pos_value)) <= int(tolerance_steps)
+        stopped = speed_value == 0
+        predicate_active = home_value == active_value
+        ok = bool(predicate_active and stopped and near_reference)
+        return {
+            "axis": key,
+            "board": board,
+            "motor": motor,
+            "ok": ok,
+            "already_home": ok,
+            "physical_motion_commanded": False,
+            "home_active_value": active_value,
+            "tolerance_steps": int(tolerance_steps),
+            "position": position,
+            "speed": speed,
+            "home": home,
+            "switches": switches,
+            "predicate_active": bool(predicate_active),
+            "stopped": bool(stopped),
+            "near_reference": bool(near_reference),
+            "source_intent": "safe_reference_established_before_downstream_initialization",
+        }
+
     def motor_startup_homing_mimic(self):
         """
         Recreate the OEM initializeMotors startup order from the decompiled vendor code:
@@ -4693,10 +4735,14 @@ class BioXpTester:
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
             return out
 
-        # Z must be both homed and raised/verified clear before any G/X/Y travel.
-        # Christian observed the failure mode directly: Z at 0/minimum height ran into the locking key
-        # during Y home and prevented Y from reaching its limit.
-        out["z_home"] = self.motor_oem_home_axis("z", startup=True)
+        # Z must be both referenced and verified clear before any G/X/Y travel.
+        # If Z is already at the active top/home predicate near the reference coordinate,
+        # accept that no-motion proof instead of forcing a false-home re-search.
+        out["z_already_home"] = self.motor_oem_axis_already_home("z", tolerance_steps=2)
+        if bool(out["z_already_home"].get("ok")):
+            out["z_home"] = out["z_already_home"]
+        else:
+            out["z_home"] = self.motor_oem_home_axis("z", startup=True)
         if not _home_ok(out["z_home"]):
             return _abort("z_home")
         out["z_clear_for_xy"] = self.motor_oem_verify_z_clearance_for_xy(target=-15000, min_clearance=-10000, timeout_s=20.0)
