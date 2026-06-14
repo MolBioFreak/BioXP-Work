@@ -535,3 +535,58 @@ Critical comparison against the bad `7dcd859` behavior:
 The Linux `max_search_abs_delta` guard is disabled only inside this OEM full-init X/Y call (`None`) because OEM SSD `axisSearchHome/goHome` does not stop based on stale/desynced controller coordinates. QueryHome transition is the proof, not controller distance.
 
 Predicate-layer clarification was added in `src/bioxp/oem_parity_predicates.py`: `home_active_value=0` is the OEM helper return-code layer; raw Linux GAP reads still use raw active value `1` via `usb_driver.MOTOR_SWITCH_ACTIVE_VALUE`.
+
+
+## Live verification follow-up: 2026-06-14 Phase 4
+
+Commits applied before live test:
+
+```text
+00e5021 fix: fail closed on unverified XY OEM homing
+aa779f9 fix: restore OEM XY axis search in full init
+019ef99 fix: normalize X switch masks for OEM homing
+```
+
+Live full-init artifact after restoring SSD X/Y sequence and normalizing X SAP12/SAP13:
+
+```text
+/tmp/bioxp-live-runs/20260614T062011Z_full_init_oem_xy_xmask_fixed.json
+```
+
+Result:
+
+```text
+Z reference/recovery: ok
+Z clearance: ok, Z=-15000
+G confirm/home: ok, G=0, current 10/10
+X axisSearchHome(250): failed closed
+```
+
+X failure details:
+
+```text
+source step: MotorX.axisSearchHome(250)
+Linux command: MoveLeft/cmd=2, speed=250
+X masks before search: SAP12=0, SAP13=0
+X before search: GAP9/left=0, GAP10/right=1
+X after search: GAP9/left=0, GAP10/right=1
+X final position after failed search: -281869
+failure: home_switch_timeout_without_transition
+```
+
+A bounded reverse-direction diagnostic was also run before the mask-normalized full init:
+
+```text
+/tmp/bioxp-live-runs/20260614T061533Z_x_positive_gap9_search.json
+```
+
+It moved X in +50,000-step chunks from `-338017` to `+61987`; GAP9/left remained `0` throughout. Therefore GAP9 did not assert in either direction across the tested controller span.
+
+Interpretation:
+
+- The false-ready software discrepancy has been fixed: full init now fails closed instead of claiming ready.
+- The SSD command bytes and query polarity are implemented: `MoveLeft` is cmd=2; `queryHome` uses GAP9 raw `1` via helper return-code `0`.
+- X SAP12/SAP13 are now normalized to enabled for source parity before X homing.
+- The remaining blocker is live X switch truth: GAP9 does not assert while X is being driven by source-equivalent commands.
+
+Do not run more blind X motion until operator/camera truth confirms where the head is relative to the physical X home switch and whether the switch/harness is expected to be engaged. The next diagnostic should correlate live visual position with GAP9/GAP10 while the head is physically placed/observed near the OEM X home side.
