@@ -179,3 +179,76 @@ def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y(
     assert result["disable_right_restore"]["value"] == 0
     assert result["disable_left_restore"]["value"] == 0
     assert not any(call[:3] == ("sap", 0x05, 0) for call in calls)  # no X mutation
+
+
+
+def test_full_init_x_y_use_live_reference_zero_not_generic_switch_search(monkeypatch):
+    from src.bioxp.usb_driver import BioXpTester
+
+    calls = []
+
+    class Tester(BioXpTester):
+        def __init__(self):
+            self.pos = {(4,1): 0, (5,0): -189798, (4,0): 0, (4,2): 0, (6,0): 0}
+
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            presets = {
+                'x': {'board':5,'motor':0,'speed':300,'acc':120},
+                'y': {'board':4,'motor':0,'speed':300,'acc':120},
+                'z': {'board':4,'motor':1,'speed':250,'acc':60,'positive_down_requires_right_mask': True},
+                'door': {'board':6,'motor':0,'speed':50,'acc':20},
+                'g': {'board':4,'motor':2,'speed':1500,'acc':20,'run_current':31,'standby_current':10,'restore_current':10},
+            }
+            return presets[axis]
+
+        def motor_oem_axis_already_home(self, axis, tolerance_steps=2):
+            calls.append(('already_home', axis))
+            return {'ok': True, 'axis': axis}
+
+        def motor_oem_verify_z_clearance_for_xy(self, **kwargs):
+            calls.append(('z_clearance', kwargs))
+            return {'ok': True}
+
+        def motor_oem_home_axis(self, axis, **kwargs):
+            calls.append(('generic_home_axis', axis, kwargs))
+            return {'ok': False}
+
+        def motor_get_position(self, board, motor=0):
+            calls.append(('get_position', board, motor))
+            return {'ok': True, 'position': self.pos[(board,motor)]}
+
+        def motor_move_absolute(self, board, position, motor=0):
+            calls.append(('move_absolute', board, motor, position))
+            self.pos[(board,motor)] = int(position)
+            return {'ok': True, 'position': int(position)}
+
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            calls.append(('wait', board, motor, kwargs))
+            return {'ok': True, 'stopped': True, 'seen_nonzero': True}
+
+        def motor_set_home(self, board, motor=0):
+            calls.append(('set_home', board, motor))
+            self.pos[(board,motor)] = 0
+            return {'ok': True}
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            calls.append(('set_param', board, motor, param, value))
+            return {'ok': True, 'param': param, 'value': value}
+
+        def motor_oem_door_search_home(self, **kwargs):
+            calls.append(('door_home', kwargs))
+            return {'ok': True}
+
+    import src.bioxp.oem_gripper as og
+    monkeypatch.setattr(og, 'gripper_status', lambda tester: {'ok': True, 'oem_home_predicate': {'oem_confirmed_home': True}})
+
+    tester = Tester()
+    result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=30)
+
+    assert result['ok'] is True
+    assert not any(call[0] == 'generic_home_axis' and call[1] in {'x','y'} for call in calls)
+    assert ('move_absolute', 5, 0, 0) in calls
+    assert ('move_absolute', 4, 0, 0) in calls
+    assert ('set_home', 5, 0) in calls
+    assert ('set_home', 4, 0) in calls
+    assert ('move_absolute', 5, 0, 6000) in calls
