@@ -255,30 +255,83 @@ def gripper_clear(tester: Any, *, operator_ack: str | None, reason: str | None, 
     move = None
     wait = None
     restore = None
+    position_before = tester.motor_get_position(board, motor=motor)
+    prior_right_disable = tester.motor_get_axis_param(board, 12, motor=motor)
+    prior_left_disable = tester.motor_get_axis_param(board, 13, motor=motor)
+    limit_mask = {"right_prior": prior_right_disable, "left_prior": prior_left_disable}
     try:
-        prepare = _apply_profile(tester, profile)
+        # OEM gripper home already proved that G requires gripper-specific
+        # preparation/current semantics, not the generic axis relative route.
+        # After a successful home this machine reports both G switch channels
+        # active.  Generic unmasked moveSteps ACKs but produces zero motion.
+        # Temporarily masking both G limit inputs matches the existing
+        # supervised force-probe recovery pattern and lets OEM moveSteps(+10000)
+        # actually leave the home switch state; restore happens in finally.
+        prepare = tester.motor_prepare_axis(
+            board,
+            motor=motor,
+            run_current=int(profile.get("run_current", GRIPPER_ACTION_CURRENT)),
+            standby_current=int(profile.get("standby_current", OEM_IDLE_CURRENT)),
+            speed=int(profile.get("speed", 600)),
+            acc=int(profile.get("acc", 5)),
+            stall_guard=profile.get("stall_guard"),
+            rdiv=profile.get("rdiv", 6),
+            pdiv=profile.get("pdiv", 2),
+            disable_right=True,
+            disable_left=True,
+            warm_enable=bool(profile.get("warm_enable", False)),
+        )
+        limit_mask["disable_right_set"] = tester.motor_set_axis_param(board, 12, 1, motor=motor)
+        limit_mask["disable_left_set"] = tester.motor_set_axis_param(board, 13, 1, motor=motor)
         set_action_current = tester.motor_set_axis_param(board, 6, GRIPPER_ACTION_CURRENT, motor=motor)
         move = tester.motor_move_relative(board, GRIPPER_CLEAR_STEPS, motor=motor)
-        wait = tester.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 12.0), require_seen_nonzero=True)
-        ok = bool(isinstance(move, dict) and move.get("ok") and isinstance(wait, dict) and wait.get("stopped") is True and wait.get("seen_nonzero") is not False)
+        wait = tester.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 20.0), require_seen_nonzero=False)
+        position_after = tester.motor_get_position(board, motor=motor)
+        pre_pos = _int_or_none(_value(position_before, "position"))
+        post_pos = _int_or_none(_value(position_after, "position"))
+        delta = None if pre_pos is None or post_pos is None else int(post_pos) - int(pre_pos)
+        move_ok = bool(isinstance(move, dict) and (move.get("ok") or _value(move, "ack", "status") == 100))
+        stopped = bool(isinstance(wait, dict) and wait.get("stopped") is True)
+        physical_motion = bool(delta is not None and delta != 0)
+        ok = bool(move_ok and stopped and physical_motion)
         if not ok:
-            raise HTTPException(status_code=409, detail={"error": "OEM gripper clear failed/ambiguous", "motion_commanded": True, "move": move, "wait": wait, "before": before})
+            raise HTTPException(status_code=409, detail={
+                "error": "OEM gripper clear failed/ambiguous",
+                "motion_commanded": True,
+                "move": move,
+                "wait": wait,
+                "position_before": position_before,
+                "position_after": position_after,
+                "position_delta": delta,
+                "limit_mask": limit_mask,
+                "before": before,
+            })
         return {
             "ok": True,
             "schema": "bioxp.oem_gripper_clear.v1",
             "motion_commanded": True,
-            "physical_motion": False,
+            "physical_motion": True,
             "oem_source": "initializeMotors: setGripperCurrent(31); moveSteps(MotorGrip,+10000,true)",
             "before": before,
             "profile": profile,
             "prepare": prepare,
+            "limit_mask": limit_mask,
             "set_action_current": set_action_current,
             "move_steps_10000": move,
             "wait": wait,
-            "restore": None,  # filled by finally side effect is returned via after_status below in caller-visible state
+            "position_before": position_before,
+            "position_after": position_after,
+            "position_delta": delta,
+            "restore": None,
             "after_status": None,
         }
     finally:
+        right_restore_value = _int_or_none(_value(prior_right_disable, "value"))
+        left_restore_value = _int_or_none(_value(prior_left_disable, "value"))
+        if right_restore_value is not None:
+            limit_mask["disable_right_restore"] = tester.motor_set_axis_param(board, 12, right_restore_value, motor=motor)
+        if left_restore_value is not None:
+            limit_mask["disable_left_restore"] = tester.motor_set_axis_param(board, 13, left_restore_value, motor=motor)
         restore = _restore_idle(tester, "gripper_clear_finally")
         # Mutate local return if possible is intentionally skipped; always verify with status endpoint.
 

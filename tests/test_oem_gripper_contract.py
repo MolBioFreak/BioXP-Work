@@ -55,6 +55,8 @@ class FakeTester:
 
     def motor_move_relative(self, board, steps, motor=0):
         self.calls.append(("move_relative", board, steps, motor))
+        if self.move_ok:
+            self.position += int(steps)
         return {"ok": self.move_ok, "steps": steps}
 
     def motor_wait_stopped(self, board, motor=0, timeout_s=12.0, require_seen_nonzero=False):
@@ -182,3 +184,19 @@ def test_gripper_home_accepts_final_query_home_even_with_both_limits_active():
     assert payload["after_status"]["switches"]["both_effective_limits_active"] is True
     assert tester.current[(4, 6, 2)] == 10
     assert tester.current[(4, 7, 2)] == 10
+
+
+
+def test_gripper_clear_masks_both_g_limits_while_moving_off_home():
+    from src.bioxp.oem_gripper import gripper_clear
+
+    tester = FakeTester(left=1, right=1, left_disabled=False, right_disabled=False, position=-17925)
+
+    payload = gripper_clear(tester, operator_ack="GRIPPER_CLEAR", reason="operator move down")
+
+    assert payload["ok"] is True
+    assert payload["position_delta"] == 10000
+    assert any(call == ("set", 4, 12, 1, 2) for call in tester.calls)
+    assert any(call == ("set", 4, 13, 1, 2) for call in tester.calls)
+    assert payload["limit_mask"]["disable_right_restore"]["value"] == 0
+    assert payload["limit_mask"]["disable_left_restore"]["value"] == 0
