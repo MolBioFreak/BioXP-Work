@@ -4635,33 +4635,67 @@ class BioXpTester:
                 out["elapsed_ms"] = int((time.time() - t0) * 1000)
                 return out
 
-        # 3367-3379: X/Y must be real OEM switch-search/reference proof.
-        # Do not substitute controller-coordinate zero recovery here: operator
-        # truth on 2026-06-14 showed the head remained physically mid-deck while
-        # controller-zero recovery reported full init ready.  That is not OEM
-        # initialization parity.  Until the X/Y switch predicate/direction matrix
-        # is repaired and physically verified, fail closed before X/Y motion rather
-        # than setting home at a possibly-mid-deck pose.
-        xprof = self._motion_oem_axis_profile("x")
-        yprof = self._motion_oem_axis_profile("y")
-        xy_block = {
-            "ok": False,
-            "error": "xy_oem_switch_home_unverified_fail_closed",
-            "source_step": "MotorX.axisSearchHome(250) / MotorY.axisSearchHome(250)",
-            "reason": "controller-zero recovery is not OEM physical homing proof; operator observed head still mid-deck after prior pass",
-            "x_status": self.motor_axis_status(int(xprof["board"]), motor=int(xprof["motor"])),
-            "y_status": self.motor_axis_status(int(yprof["board"]), motor=int(yprof["motor"])),
-            "required_fix": "repair live X/Y switch predicate/direction transition proof before full init can report ready",
-            "physical_motion_commanded": False,
-        }
-        out["steps"].append("xy_axisSearchHome_250_unverified_fail_closed")
-        out["results"]["xy_axisSearchHome_250_unverified_fail_closed"] = xy_block
-        out["failed_at"] = "xy_axisSearchHome_250_unverified_fail_closed"
-        out["elapsed_ms"] = int((time.time() - t0) * 1000)
-        return out
+        # 3367-3379: OEM X/Y switch-search sequence.  This must not be
+        # replaced with controller-coordinate zero recovery: operator truth on
+        # 2026-06-14 showed that produced a false ready state with the head still
+        # physically mid-deck.  Use the SSD method names/order and require the
+        # guarded Linux axisSearchHome implementation to earn success from
+        # queryHome/GAP9 transition proof before setHome is accepted.
+        xprof = self._motion_oem_axis_profile("x", startup=True)
+        yprof = self._motion_oem_axis_profile("y", startup=True)
+        xb, xm = int(xprof["board"]), int(xprof["motor"])
+        yb, ym = int(yprof["board"]), int(yprof["motor"])
 
-        # 3380-3384: ThermalDoor.doorSearchHome(...).
+        _, ok = _record(
+            "x_axisSearchHome_250",
+            lambda: self.motor_oem_axis_search_home(
+                "x",
+                speed=250,
+                timeout_s=min(float(timeout_s), 45.0),
+                # OEM does not use a controller-coordinate distance guard here.
+                # A desynced controller frame caused the prior false stop before
+                # physical X home; queryHome transition is the proof.
+                max_search_abs_delta=None,
+            ),
+        )
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("x_setHome", lambda: self.motor_set_home(xb, motor=xm))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("x_setSpeed_1700", lambda: self.motor_set_axis_param(xb, 4, 1700, motor=xm))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record(
+            "x_moveX_6000",
+            lambda: {**self.motor_move_absolute(xb, 6000, motor=xm), "wait": self.motor_wait_stopped(xb, motor=xm, timeout_s=min(float(timeout_s), 45.0), require_seen_nonzero=False)},
+        )
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+
+        _, ok = _record(
+            "y_axisSearchHome_250",
+            lambda: self.motor_oem_axis_search_home(
+                "y",
+                speed=250,
+                timeout_s=min(float(timeout_s), 45.0),
+                max_search_abs_delta=None,
+            ),
+        )
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+
+        # 3380-3384: ThermalDoor.doorSearchHome(...), then 3389-3391 Y.setHome.
         _, ok = _record("thermal_door_doorSearchHome", lambda: self.motor_oem_door_search_home(timeout_s=min(float(timeout_s), 45.0), startup=False))
+        if not ok:
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+        _, ok = _record("y_setHome", lambda: self.motor_set_home(yb, motor=ym))
         out["ok"] = bool(ok and out["failed_at"] is None)
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out

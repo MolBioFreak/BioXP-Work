@@ -183,7 +183,8 @@ def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y(
 
 
 
-def test_full_init_fails_closed_instead_of_controller_zero_xy_false_ready(monkeypatch):
+
+def test_full_init_uses_oem_xy_axis_search_not_controller_zero(monkeypatch):
     from src.bioxp.usb_driver import BioXpTester
 
     calls = []
@@ -192,7 +193,7 @@ def test_full_init_fails_closed_instead_of_controller_zero_xy_false_ready(monkey
         def _motion_oem_axis_profile(self, axis, startup=False):
             return {
                 'x': {'board':5,'motor':0},
-                'y': {'board':4,'motor':0},
+                'y': {'board':4,'motor':0,'disable_right': True},
                 'z': {'board':4,'motor':1},
                 'g': {'board':4,'motor':2,'run_current':31,'standby_current':10,'restore_current':10},
                 'door': {'board':6,'motor':0},
@@ -204,16 +205,25 @@ def test_full_init_fails_closed_instead_of_controller_zero_xy_false_ready(monkey
         def motor_oem_verify_z_clearance_for_xy(self, **kwargs):
             return {'ok': True}
 
-        def motor_axis_status(self, board, motor=0):
-            return {'position': {'position': 6000 if board == 5 else 0}, 'speed': {'speed': 0}, 'switches': {'left_state': 0, 'right_state': 1}}
+        def motor_oem_axis_search_home(self, axis, **kwargs):
+            calls.append(('axis_search_home', axis, kwargs))
+            return {'ok': True, 'axis': axis, 'switch_transition': True, 'set_home': {'ok': True}}
+
+        def motor_set_home(self, board, motor=0):
+            calls.append(('set_home', board, motor))
+            return {'ok': True}
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            calls.append(('set_axis_param', board, motor, param, value))
+            return {'ok': True}
 
         def motor_move_absolute(self, board, position, motor=0):
             calls.append(('move_absolute', board, motor, position))
             return {'ok': True}
 
-        def motor_set_home(self, board, motor=0):
-            calls.append(('set_home', board, motor))
-            return {'ok': True}
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            calls.append(('wait_stopped', board, motor, kwargs))
+            return {'stopped': True}
 
         def motor_oem_door_search_home(self, **kwargs):
             calls.append(('door_home', kwargs))
@@ -225,7 +235,13 @@ def test_full_init_fails_closed_instead_of_controller_zero_xy_false_ready(monkey
     tester = Tester.__new__(Tester)
     result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=30)
 
-    assert result['ok'] is False
-    assert result['failed_at'] == 'xy_axisSearchHome_250_unverified_fail_closed'
-    assert result['results']['xy_axisSearchHome_250_unverified_fail_closed']['physical_motion_commanded'] is False
-    assert not any(call[0] in {'move_absolute', 'set_home'} for call in calls)
+    assert result['ok'] is True
+    assert result['failed_at'] is None
+    assert result['steps'][-6:] == ['x_axisSearchHome_250', 'x_setHome', 'x_setSpeed_1700', 'x_moveX_6000', 'y_axisSearchHome_250', 'thermal_door_doorSearchHome', 'y_setHome'][-6:]
+    axis_searches = [call for call in calls if call[0] == 'axis_search_home']
+    assert axis_searches[0][1:] == ('x', {'speed': 250, 'timeout_s': 30.0, 'max_search_abs_delta': None})
+    assert axis_searches[1][1:] == ('y', {'speed': 250, 'timeout_s': 30.0, 'max_search_abs_delta': None})
+    # The only absolute move allowed in this phase is the OEM X park to 6000.
+    assert ('move_absolute', 5, 0, 0) not in calls
+    assert ('move_absolute', 4, 0, 0) not in calls
+    assert ('move_absolute', 5, 0, 6000) in calls

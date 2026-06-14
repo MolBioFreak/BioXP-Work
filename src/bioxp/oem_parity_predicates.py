@@ -25,12 +25,15 @@ class SwitchPredicate:
         return self.__dict__.copy()
 
 
+# `home_active_value` is the OEM helper return-code layer: ClassMotor
+# queryLeftSwitchStatus/queryRightSwitchStatus return 0 when raw GAP9/GAP10 == 1.
+# Linux raw GAP reads must use `raw_gap_active_value=1` (see usb_driver.MOTOR_SWITCH_ACTIVE_VALUE).
 SWITCH_PREDICATES: dict[str, SwitchPredicate] = {
     "x": SwitchPredicate(axis="x", home_query="queryHome", home_active_value=0, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus"),
     "y": SwitchPredicate(axis="y", home_query="queryHome", home_active_value=0, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus", right_switch_can_be_disabled=True),
     "z": SwitchPredicate(axis="z", home_query="queryHome", home_active_value=0, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus"),
     "g": SwitchPredicate(axis="g", home_query="queryHome", home_active_value=0, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus", requires_current_restore=True),
-    "door": SwitchPredicate(axis="door", home_query="tcDoorClosed", home_active_value=1, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus", left_switch_can_be_disabled=True, right_switch_can_be_disabled=True),
+    "door": SwitchPredicate(axis="door", home_query="tcDoorClosed", home_active_value=0, left_query="queryLeftSwitchStatus", right_query="queryRightSwitchStatus", left_switch_can_be_disabled=True, right_switch_can_be_disabled=True),
 }
 
 

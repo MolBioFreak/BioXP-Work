@@ -509,3 +509,29 @@ These are broadly defensible with caveats above.
 ```
 
 This is **not** defensible as OEM full init. It should be reverted or superseded by a fail-closed X/Y patch before further work.
+
+
+## Implementation follow-up: 2026-06-14 Phase 2/3 fixes
+
+After the fail-closed guard commit, the full-init X/Y block was restored to the SSD method names/order:
+
+```text
+MotorX.axisSearchHome(250)
+MotorX.setHome()
+MotorX.setSpeed(1700)
+moveX(6000)
+MotorY.axisSearchHome(250)
+ThermalDoor.doorSearchHome(...)
+MotorY.setHome()
+```
+
+Critical comparison against the bad `7dcd859` behavior:
+
+- Bad: `move_absolute(X,0)` / `move_absolute(Y,0)` as a substitute for home.
+- Fixed: no controller-zero substitution; X/Y must pass `motor_oem_axis_search_home(... speed=250 ...)`.
+- Bad: controller coordinate success could report full init ready while head was physically mid-deck.
+- Fixed: full init success depends on the guarded switch-search primitive, which only returns `ok=true` after queryHome/GAP9 proof and setHome acceptance.
+
+The Linux `max_search_abs_delta` guard is disabled only inside this OEM full-init X/Y call (`None`) because OEM SSD `axisSearchHome/goHome` does not stop based on stale/desynced controller coordinates. QueryHome transition is the proof, not controller distance.
+
+Predicate-layer clarification was added in `src/bioxp/oem_parity_predicates.py`: `home_active_value=0` is the OEM helper return-code layer; raw Linux GAP reads still use raw active value `1` via `usb_driver.MOTOR_SWITCH_ACTIVE_VALUE`.
