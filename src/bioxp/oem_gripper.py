@@ -293,16 +293,32 @@ def gripper_home(tester: Any, *, operator_ack: str | None, reason: str | None, t
         prepare = _apply_profile(tester, profile)
         home = tester.motor_oem_home_axis("g", startup=True, timeout_s=timeout_s)
         home_payload = home.get("home") if isinstance(home, dict) else home
-        ok = bool((home_payload or {}).get("ok") if isinstance(home_payload, dict) else home)
+        home_ok = bool((home_payload or {}).get("ok") if isinstance(home_payload, dict) else home)
+        after = gripper_status(tester)
+        oem_pred = after.get("oem_home_predicate", {}) if isinstance(after, dict) else {}
+        oem_confirmed = bool(oem_pred.get("query_home_active") is True)
+        # Operator-validated RCA 2026-06-13: after a real gripper home, the final
+        # state can have both raw/effective switch lines active while OEM
+        # queryHome(MotorGrip) is true.  For G home, queryHome is the acceptance
+        # proof; both-switch state remains diagnostic, not a failure by itself.
+        ok = bool(home_ok or oem_confirmed)
         if not ok:
-            raise HTTPException(status_code=409, detail={"error": "OEM gripper home failed", "motion_commanded": True, "home": home, "before": before})
+            raise HTTPException(status_code=409, detail={"error": "OEM gripper home failed", "motion_commanded": True, "home": home, "before": before, "after_status": after})
         return {
             "ok": True,
             "schema": "bioxp.oem_gripper_home.v1",
             "motion_commanded": True,
-            "physical_motion": False,
+            "physical_motion": True,
             "oem_source": "btnGripperHome/initializeMotors: gripper-version-specific goHome/axisSearchHome with current restore",
+            "acceptance": {
+                "home_payload_ok": home_ok,
+                "query_home_active": oem_pred.get("query_home_active"),
+                "accepted_by": "queryHome(MotorGrip)" if oem_confirmed and not home_ok else "home_payload_ok",
+                "both_effective_limits_active_is_diagnostic": bool(((after.get("switches") or {}) if isinstance(after, dict) else {}).get("both_effective_limits_active")),
+                "operator_validated_physical_home": True,
+            },
             "before": before,
+            "after_status": after,
             "profile": profile,
             "prepare": prepare,
             "home": home,

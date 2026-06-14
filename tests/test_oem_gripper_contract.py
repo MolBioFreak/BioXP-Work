@@ -150,3 +150,35 @@ def test_gripper_profile_reports_machine_config_positions_and_source_anchor():
     assert profile["machine_positions"]["open_wide"] == 32400
     assert profile["machine_positions"]["source"] == "original_ssd_machine_config"
     assert profile["provenance"]["source_anchor"]["name"] == "MotorGrip home/confirm/machine positions"
+
+
+
+def test_gripper_home_accepts_final_query_home_even_with_both_limits_active():
+    from src.bioxp.oem_gripper import gripper_home
+
+    class FinalQueryHomeTester(FakeTester):
+        def __init__(self):
+            super().__init__(left=0, right=1, position=0, run=31, standby=31)
+            self.home_called = False
+
+        def motor_oem_home_axis(self, axis, startup=False, timeout_s=15.0):
+            self.calls.append(("home", axis, startup, timeout_s))
+            self.home_called = True
+            # Simulate old nested payload reporting failure/ambiguous, while the
+            # final OEM queryHome status proves home after motion.
+            self.left = 1
+            self.right = 1
+            self.position = -17925
+            return {"ok": False, "home": {"ok": False, "false_home_guard": "both_effective_limits_active_diagnostic"}}
+
+    tester = FinalQueryHomeTester()
+
+    payload = gripper_home(tester, operator_ack="GRIPPER_HOME", reason="operator watched physical home")
+
+    assert payload["ok"] is True
+    assert payload["acceptance"]["query_home_active"] is True
+    assert payload["acceptance"]["accepted_by"] == "queryHome(MotorGrip)"
+    assert payload["acceptance"]["both_effective_limits_active_is_diagnostic"] is True
+    assert payload["after_status"]["switches"]["both_effective_limits_active"] is True
+    assert tester.current[(4, 6, 2)] == 10
+    assert tester.current[(4, 7, 2)] == 10
