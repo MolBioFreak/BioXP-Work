@@ -4635,65 +4635,30 @@ class BioXpTester:
                 out["elapsed_ms"] = int((time.time() - t0) * 1000)
                 return out
 
-        # 3367-3379: X/Y reference.  Source OEM uses axisSearchHome(250), but on
-        # this live robot X switch-search from a desynced negative controller frame
-        # drove farther negative without GAP9/home transition.  Preserve OEM intent
-        # (establish controller home before X park/Y setHome) through the same
-        # live-safe controller-reference adaptation previously validated for
-        # stepwise startup: move X/Y to controller 0, verify stopped/near-zero, then
-        # perform the OEM setHome / X speed / X park / Y setHome side effects.
+        # 3367-3379: X/Y must be real OEM switch-search/reference proof.
+        # Do not substitute controller-coordinate zero recovery here: operator
+        # truth on 2026-06-14 showed the head remained physically mid-deck while
+        # controller-zero recovery reported full init ready.  That is not OEM
+        # initialization parity.  Until the X/Y switch predicate/direction matrix
+        # is repaired and physically verified, fail closed before X/Y motion rather
+        # than setting home at a possibly-mid-deck pose.
         xprof = self._motion_oem_axis_profile("x")
         yprof = self._motion_oem_axis_profile("y")
-        xb, xm = int(xprof["board"]), int(xprof["motor"])
-        yb, ym = int(yprof["board"]), int(yprof["motor"])
-
-        def _move_axis_to_controller_zero(axis_name, board, motor, timeout_limit):
-            before = self.motor_get_position(board, motor=motor)
-            move = self.motor_move_absolute(board, 0, motor=motor)
-            wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_limit), 45.0), require_seen_nonzero=False)
-            after = self.motor_get_position(board, motor=motor)
-            pos = after.get("position") if isinstance(after, dict) else None
-            ok = bool(
-                isinstance(move, dict) and move.get("ok") is True
-                and isinstance(wait, dict) and wait.get("stopped") is True
-                and isinstance(pos, int) and abs(int(pos)) <= 5
-            )
-            return {
-                "ok": ok,
-                "axis": axis_name,
-                "source_step_adapted_from": f"Motor{axis_name.upper()}.axisSearchHome(250)",
-                "adaptation": "live_controller_reference_zero_recovery_no_switch_search",
-                "position_before": before,
-                "move_absolute_0": move,
-                "wait": wait,
-                "position_after": after,
-            }
-
-        _, ok = _record("x_axisSearchHome_250_live_reference_0", lambda: _move_axis_to_controller_zero("x", xb, xm, timeout_s))
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-        _, ok = _record("x_setHome", lambda: self.motor_set_home(xb, motor=xm))
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-        _, ok = _record("x_setSpeed_1700", lambda: self.motor_set_axis_param(xb, 4, 1700, motor=xm))
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-        _, ok = _record("x_moveX_6000", lambda: {**self.motor_move_absolute(xb, 6000, motor=xm), "wait": self.motor_wait_stopped(xb, motor=xm, timeout_s=min(float(timeout_s), 45.0), require_seen_nonzero=False)})
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-
-        _, ok = _record("y_axisSearchHome_250_live_reference_0", lambda: _move_axis_to_controller_zero("y", yb, ym, timeout_s))
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-        _, ok = _record("y_setHome", lambda: self.motor_set_home(yb, motor=ym))
-        if not ok:
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
+        xy_block = {
+            "ok": False,
+            "error": "xy_oem_switch_home_unverified_fail_closed",
+            "source_step": "MotorX.axisSearchHome(250) / MotorY.axisSearchHome(250)",
+            "reason": "controller-zero recovery is not OEM physical homing proof; operator observed head still mid-deck after prior pass",
+            "x_status": self.motor_axis_status(int(xprof["board"]), motor=int(xprof["motor"])),
+            "y_status": self.motor_axis_status(int(yprof["board"]), motor=int(yprof["motor"])),
+            "required_fix": "repair live X/Y switch predicate/direction transition proof before full init can report ready",
+            "physical_motion_commanded": False,
+        }
+        out["steps"].append("xy_axisSearchHome_250_unverified_fail_closed")
+        out["results"]["xy_axisSearchHome_250_unverified_fail_closed"] = xy_block
+        out["failed_at"] = "xy_axisSearchHome_250_unverified_fail_closed"
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
 
         # 3380-3384: ThermalDoor.doorSearchHome(...).
         _, ok = _record("thermal_door_doorSearchHome", lambda: self.motor_oem_door_search_home(timeout_s=min(float(timeout_s), 45.0), startup=False))
