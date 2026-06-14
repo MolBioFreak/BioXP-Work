@@ -3584,6 +3584,12 @@ class BioXpTester:
                 "run_current": 31,
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
                 "stall_guard": 16,
+                # OEM initializeMotorsWithoutMotion does not disable X switches.
+                # Linux sessions previously left SAP12/right disabled, which makes
+                # GAP10 read active everywhere and prevents source-parity homing.
+                # Normalize X masks to enabled before OEM X home/search.
+                "disable_right": False,
+                "disable_left": False,
                 "oem_home_step": "MotorX.axisSearchHome(speed=250)" if startup else "MotorX.goHome(speed=500,rehome=true)",
                 "home_search_max_abs_delta": x_max,
                 "home_search_max_abs_delta_source": x_max_source,
