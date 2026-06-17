@@ -249,7 +249,7 @@ LIVE_TARGET_MAPPINGS: tuple[LiveTargetMapping, ...] = (
         "motion_oem_startup_step / _execute_oem_startup_step",
         2714,
         "stepwise_guarded_subset_not_monolithic_oem",
-        ("Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.", "Live adaptations exist for axes whose raw switches were non-informative."),
+        ("Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.", "The z-home step is explicitly harmonized to the same live-reference contract used by the initializeMotors Z stage."),
     ),
     LiveTargetMapping(
         "startup axisSearchHome",

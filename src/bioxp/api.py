@@ -3852,18 +3852,28 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
     interlock = tester.motor_prepare_motion_interlock(force_lock=True)
     # Keep each supervised step source-shaped to ClassControlInterface.initializeMotors().
     if step == "z-home":
-        z_home = tester.motor_oem_home_axis("z", startup=True, timeout_s=timeout_s)
-        home_payload = z_home.get("home") if isinstance(z_home, dict) else z_home
-        home_ok = bool(home_payload.get("ok")) if isinstance(home_payload, dict) else bool(home_payload)
+        # Harmonize the stepwise startup route with the full initializeMotors Z stage.
+        # OEM source says initializeMotors starts with MotorZ.axisSearchHome(1791), but on
+        # this live stack the reconstructed startup semantics for that stage are the proven
+        # Z reference contract: accept an already-established reference, otherwise return to
+        # controller reference 0 with the Z-only helper and then verify.
+        z_probe = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
         z_reference = None
-        if home_ok:
-            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=timeout_s)
+        z_verify = None
+        z_ok = bool(isinstance(z_probe, dict) and z_probe.get("ok") is True)
+        if not z_ok:
+            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=min(float(timeout_s), 90.0))
+            if isinstance(z_reference, dict) and z_reference.get("ok") is True:
+                z_verify = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
+                z_ok = bool(isinstance(z_verify, dict) and z_verify.get("ok") is True)
         result = {
-            "ok": bool(home_ok and isinstance(z_reference, dict) and z_reference.get("ok")),
-            "home": home_payload,
-            "z_home": z_home,
+            "ok": bool(z_ok),
+            "home": z_verify if isinstance(z_verify, dict) else z_probe,
+            "z_axisSearchHome_1791_probe": z_probe,
             "z_reference_return": z_reference,
-            "z_reference_return_skipped": not home_ok,
+            "z_reference_verify_after_return": z_verify,
+            "z_reference_return_skipped": bool(z_ok and z_reference is None),
+            "oem_z_stage_contract": "initializeMotors Z startup stage mirrored from full init live-reference recovery",
         }
     elif step == "gripper-clear":
         result = gripper_clear(

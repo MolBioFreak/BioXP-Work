@@ -85,7 +85,49 @@ def test_live_commissioning_profiles_are_soft_but_preserve_oem_home_order():
     assert z["oem_home_step"] == "MotorZ.axisSearchHome(speed=1791) via live Z reference recovery"
 
 
-def test_z_home_step_skips_reference_return_when_home_fails():
+def test_z_home_step_uses_full_init_z_reference_contract_when_probe_fails():
+    from src.bioxp.api import _execute_oem_startup_step
+
+    calls = []
+
+    class Tester:
+        def motion_arm_state(self):
+            return {"armed": True}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=False):
+            calls.append(("activate", expect_reply))
+            return {"ok": True}
+
+        def motor_prepare_motion_interlock(self, force_lock=False):
+            calls.append(("interlock", force_lock))
+            return {"ok": True}
+
+        def motor_oem_axis_already_home(self, axis, tolerance_steps=0):
+            calls.append(("probe", axis, tolerance_steps))
+            if sum(1 for c in calls if c[0] == "probe") == 1:
+                return {"ok": False, "position": {"position": -12345}, "home": {"value": 0}}
+            return {"ok": True, "position": {"position": 0}, "home": {"value": 1}}
+
+        def motor_oem_move_z_to_reference(self, *args, **kwargs):
+            calls.append(("z_reference", args, kwargs))
+            return {"ok": True, "target_position": 0}
+
+        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):  # pragma: no cover - must not run
+            raise AssertionError(f"generic startup home route must not run for z-home: {axis} {startup} {timeout_s}")
+
+    result = _execute_oem_startup_step(Tester(), "z-home", timeout_s=10)
+
+    assert result["result"]["ok"] is True
+    assert result["result"]["z_axisSearchHome_1791_probe"]["ok"] is False
+    assert result["result"]["z_reference_return"]["ok"] is True
+    assert result["result"]["z_reference_verify_after_return"]["ok"] is True
+    assert any(call[0] == "z_reference" for call in calls)
+
+
+def test_z_home_step_fails_closed_when_reference_return_does_not_verify_home():
     import pytest
     from fastapi import HTTPException
     from src.bioxp.api import _execute_oem_startup_step
@@ -107,20 +149,23 @@ def test_z_home_step_skips_reference_return_when_home_fails():
             calls.append(("interlock", force_lock))
             return {"ok": True}
 
-        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):
-            calls.append(("home", axis, startup, timeout_s))
-            return {"home": {"ok": False, "error": "ambiguous switch state"}}
+        def motor_oem_axis_already_home(self, axis, tolerance_steps=0):
+            calls.append(("probe", axis, tolerance_steps))
+            return {"ok": False, "position": {"position": -12345}, "home": {"value": 0}}
 
-        def motor_oem_move_z_to_reference(self, *args, **kwargs):  # pragma: no cover - must not run on failed home
+        def motor_oem_move_z_to_reference(self, *args, **kwargs):
             calls.append(("z_reference", args, kwargs))
-            return {"ok": True}
+            return {"ok": True, "target_position": 0}
+
+        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):  # pragma: no cover - must not run
+            raise AssertionError(f"generic startup home route must not run for z-home: {axis} {startup} {timeout_s}")
 
     with pytest.raises(HTTPException) as exc_info:
         _execute_oem_startup_step(Tester(), "z-home", timeout_s=10)
 
     assert exc_info.value.status_code == 409
     assert "did not confirm" in str(exc_info.value.detail)
-    assert not any(call[0] == "z_reference" for call in calls)
+    assert any(call[0] == "z_reference" for call in calls)
 
 
 def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y():
