@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable, Protocol
 
 from .. import BioXpCanDriver
@@ -46,7 +47,7 @@ class CanPipetteTransport:
         channel: str = "can0",
         bitrate: int = 1_000_000,
         pipette_id: int = 0,
-        response_timeout_s: float = 1.0,
+        response_timeout_s: float = 60.0,
         transport_name: str = "can",
         transport_details: dict[str, Any] | None = None,
     ) -> None:
@@ -241,12 +242,17 @@ class CanPipetteTransport:
         )
 
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
+        if command.prime_volume_ul is not None:
+            raise PipetteCommandError(
+                "Initialization priming remains blocked; this pass enables no liquid mutation.",
+                details={"prime_volume_ul": command.prime_volume_ul, "liquid_mutation_enabled": False},
+            )
         driver = self._get_driver()
         init_result = self._assert_driver_result(
             "initialize",
             driver.pipette_initialize(pressure_profile=command.pressure_profile),
         )
-        self._initialized = True
+        self._initialized = bool(init_result.get("initialized_after_valid_completion"))
         self._pressure_profile = command.pressure_profile
         self._last_command = "initialize"
         payload = self._status_payload(
@@ -255,22 +261,6 @@ class CanPipetteTransport:
             requested=command.to_payload(),
             hardware_truth_level="acknowledged_command",
         )
-        if command.prime_volume_ul is not None:
-            tip_status = self._require_tip_loaded(driver)
-            aspirate_result = self._assert_driver_result(
-                "prime_aspirate",
-                driver.aspirate(command.prime_volume_ul, tip_pressure_profile=command.pressure_profile),
-            )
-            dispense_result = self._assert_driver_result(
-                "prime_dispense",
-                driver.dispense(command.prime_volume_ul, tip_pressure_profile=command.pressure_profile),
-            )
-            payload["prime"] = {
-                "volume_ul": float(command.prime_volume_ul),
-                "tip_status": tip_status,
-                "aspirate": aspirate_result,
-                "dispense": dispense_result,
-            }
         return payload
 
     def set_tip(self, command: PipetteTipCommand) -> dict[str, Any]:
@@ -393,47 +383,267 @@ class CanPipetteTransport:
             close_fn()
 
 
-def build_default_pipette_transport(*, shared_usb: Any | None = None) -> CanPipetteTransport:
+class FourPipetteTransport:
+    """Production ClassPipetteCollection-shaped owner for channels 0..3."""
+
+    CHANNELS = (0, 1, 2, 3)
+
+    def __init__(self, transports: list[CanPipetteTransport], *, sleep: Callable[[float], None] = time.sleep) -> None:
+        if len(transports) != 4:
+            raise ValueError("OEM production pipette collection requires exactly four channels")
+        self._transports = list(transports)
+        self._sleep = sleep
+        self._last_group_transaction: dict[str, Any] | None = None
+
+    def _channel_status(self, channel: int, transport: CanPipetteTransport) -> dict[str, Any]:
+        driver = transport._get_driver()
+        tip = transport._safe_query_tip_status(driver)
+        pressure = transport._safe_query_pressure(driver)
+        return {
+            **transport._status_payload(
+                hardware_tip_status=tip,
+                hardware_pressure=pressure,
+                hardware_truth_level="hardware_query" if any(
+                    isinstance(row, dict) and row.get("ok") for row in (tip, pressure)
+                ) else "unavailable",
+            ),
+            "channel": int(channel),
+        }
+
+    def get_status(self) -> dict[str, Any]:
+        rows = [
+            {
+                **transport._status_payload(hardware_truth_level="cached_transport_state"),
+                "channel": index,
+                "available": bool(transport._transport_details.get("shared_bioxp_usb_runtime"))
+                if transport._transport_name == "novo_usb_can" else True,
+            }
+            for index, transport in enumerate(self._transports)
+        ]
+        return {
+            "ok": all(bool(row.get("available")) for row in rows),
+            "transport": "novo_usb_can",
+            "channels": rows,
+            "channel_count": 4,
+            "group_status_spacing_ms": 30,
+            "live_query_performed": False,
+            "last_group_transaction": self._last_group_transaction,
+            "liquid_mutation_enabled": False,
+        }
+
+    def _run_group_cycle(self, *, cycle: str) -> dict[str, Any]:
+        sends: list[dict[str, Any]] = []
+        for channel, transport in enumerate(self._transports):
+            result = transport._get_driver().pipette_initiate_group()
+            sends.append({"channel": channel, "result": result})
+            if not result.get("immediate_ack_received"):
+                for registered in range(channel + 1):
+                    self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
+                return {
+                    "ok": False,
+                    "cycle": cycle,
+                    "outcome": "invalid_or_missing_immediate_group_ack",
+                    "sends": sends,
+                    "completion_timeout_ms": 10_000,
+                }
+
+        # Exact collection-level waitforcompletion("Reinitialize pipette", 10000):
+        # one deadline for all four completions, never four serial extensions.
+        deadline = time.monotonic() + 10.0
+        completions: list[dict[str, Any]] = []
+        for channel, transport in enumerate(self._transports):
+            remaining = max(0.0, deadline - time.monotonic())
+            result = transport._get_driver().wait_pipette_initialization_completion(remaining)
+            completions.append({"channel": channel, "result": result})
+        if not all(row["result"].get("ok") for row in completions):
+            return {
+                "ok": False,
+                "cycle": cycle,
+                "outcome": "group_completion_timeout_or_error",
+                "sends": sends,
+                "delayed_completions": completions,
+                "completion_timeout_ms": 10_000,
+            }
+
+        stream_on = [
+            {"channel": channel, "result": transport._get_driver().enable_pressure_stream(True)}
+            for channel, transport in enumerate(self._transports)
+        ]
+        self._sleep(1.000)
+        stream_off = [
+            {"channel": channel, "result": transport._get_driver().enable_pressure_stream(False)}
+            for channel, transport in enumerate(self._transports)
+        ]
+        first_driver = self._transports[0]._get_driver()
+        router = getattr(getattr(first_driver, "bus", None), "router", None)
+        pressure_offsets = router.calculate_pressure_offsets() if router is not None else {}
+        stream_ok = all(row["result"].get("ok") for row in stream_on + stream_off)
+        return {
+            "ok": bool(stream_ok),
+            "cycle": cycle,
+            "outcome": "completion" if stream_ok else "pressure_stream_command_failed",
+            "sends": sends,
+            "delayed_completions": completions,
+            "completion_timeout_ms": 10_000,
+            "pressure_stream": {"on": stream_on, "wait_ms": 1_000, "off": stream_off},
+            "pressure_offsets": pressure_offsets,
+            "pressure_offset_order": "stream_on_1000ms_stream_off_calculate_from_router_samples",
+        }
+
+    def _query_condition(self) -> list[dict[str, Any]]:
+        return [
+            {"channel": channel, "result": transport._get_driver().query_firmware(1)}
+            for channel, transport in enumerate(self._transports)
+        ]
+
+    def _query_status(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for channel, transport in enumerate(self._transports):
+            rows.append({"channel": channel, "result": transport._get_driver().query_status()})
+            self._sleep(0.030)
+        self._sleep(0.001)
+        return rows
+
+    def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
+        started = time.monotonic()
+        initialized = []
+        for channel, transport in enumerate(self._transports):
+            result = transport.initialize(command)
+            initialized.append({"channel": channel, "result": result})
+            if not result.get("driver_result", {}).get("immediate_ack_received"):
+                for registered in range(channel + 1):
+                    self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
+                self._last_group_transaction = {
+                    "ok": False, "outcome": "invalid_or_missing_immediate_ack", "channels": initialized,
+                    "group_wait_ms": 10_000,
+                }
+                return dict(self._last_group_transaction)
+
+        # Each constructor initiation has the exact OEM 60,000 ms delayed-
+        # completion contract.  The empty ACK above is never completion proof.
+        completion_deadline = time.monotonic() + 60.0
+        completions = []
+        for channel, transport in enumerate(self._transports):
+            remaining = max(0.0, completion_deadline - time.monotonic())
+            result = transport._get_driver().wait_pipette_initialization_completion(remaining)
+            completions.append({"channel": channel, "result": result})
+            transport._initialized = bool(result.get("ok"))
+        if not all(row["result"].get("ok") for row in completions):
+            self._last_group_transaction = {
+                "ok": False,
+                "outcome": "invalid_or_missing_delayed_completion",
+                "channels": initialized,
+                "delayed_completions": completions,
+                "completion_timeout_ms": 60_000,
+                "group_wait_ms": 10_000,
+            }
+            return dict(self._last_group_transaction)
+
+        initial_group = self._run_group_cycle(cycle="constructor_initiateGroup")
+        if not initial_group.get("ok"):
+            self._last_group_transaction = {
+                "ok": False,
+                "outcome": "initial_group_cycle_failed",
+                "channels": initialized,
+                "constructor_delayed_completions": completions,
+                "initial_group": initial_group,
+                "completion_timeout_ms": 60_000,
+                "group_wait_ms": 10_000,
+                "liquid_mutation_enabled": False,
+            }
+            return dict(self._last_group_transaction)
+
+        condition = self._query_condition()
+        condition_ok = all(row["result"].get("ok") for row in condition)
+        first_status = self._query_status()
+        first_status_ok = all(row["result"].get("ok") for row in first_status)
+        retry_group = None
+        retry_status = None
+        if condition_ok and not first_status_ok:
+            retry_group = self._run_group_cycle(cycle="single_conditional_status_retry")
+            if retry_group.get("ok"):
+                retry_status = self._query_status()
+        final_status = retry_status if retry_status is not None else first_status
+        final_status_ok = all(row["result"].get("ok") for row in final_status)
+        ok = bool(condition_ok and final_status_ok and (retry_group is None or retry_group.get("ok")))
+        self._last_group_transaction = {
+            "ok": ok,
+            "outcome": "completion" if ok else "condition_or_status_failed",
+            "channels": initialized,
+            "constructor_delayed_completions": completions,
+            "initial_group": initial_group,
+            "condition_readback": condition,
+            "status_readback_first": first_status,
+            "single_conditional_retry_performed": retry_group is not None,
+            "retry_group": retry_group,
+            "status_readback_retry": retry_status,
+            "status_readback_final": final_status,
+            "group_wait_ms": 10_000,
+            "completion_timeout_ms": 60_000,
+            "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),
+            "liquid_mutation_enabled": False,
+        }
+        return dict(self._last_group_transaction)
+
+    @staticmethod
+    def _mutation_blocked(operation: str) -> dict[str, Any]:
+        raise PipetteCommandError(
+            f"Pipette {operation} remains blocked by the accepted production safety envelope.",
+            details={"operation": operation, "liquid_mutation_enabled": False, "channel_count": 4},
+        )
+
+    def set_tip(self, command: PipetteTipCommand) -> dict[str, Any]:
+        del command
+        return self._mutation_blocked("tip mutation")
+
+    def aspirate(self, command: PipetteAspirateCommand) -> dict[str, Any]:
+        del command
+        return self._mutation_blocked("aspirate")
+
+    def dispense(self, command: PipetteDispenseCommand) -> dict[str, Any]:
+        del command
+        return self._mutation_blocked("dispense")
+
+    def mix(self, command: PipetteMixCommand) -> dict[str, Any]:
+        del command
+        return self._mutation_blocked("mix")
+
+    def close(self) -> None:
+        for transport in self._transports:
+            transport.close()
+
+
+def build_default_pipette_transport(*, shared_usb: Any | None = None) -> FourPipetteTransport:
     transport = os.environ.get("BIOXP_PIPETTE_TRANSPORT", "novo_usb").strip().lower().replace("-", "_")
-    pipette_id = int(os.environ.get("BIOXP_PIPETTE_ID", "0"))
-    response_timeout_s = float(os.environ.get("BIOXP_PIPETTE_RESPONSE_TIMEOUT_S", "1.0"))
+    response_timeout_s = 60.0
+    transports: list[CanPipetteTransport] = []
     if transport in {"can", "socketcan", "can0"}:
-        channel = os.environ.get("BIOXP_PIPETTE_CAN_CHANNEL", "can0")
-        bitrate = int(os.environ.get("BIOXP_PIPETTE_CAN_BITRATE", "1000000"))
-        return CanPipetteTransport(
-            channel=channel,
-            bitrate=bitrate,
-            pipette_id=pipette_id,
-            response_timeout_s=response_timeout_s,
-            transport_name="socketcan",
-            transport_details={"source": "BIOXP_PIPETTE_TRANSPORT", "selected": transport},
+        raise PipetteTransportUnavailableError(
+            "SocketCAN is not an accepted production fallback; the shared NovoRouter is required.",
+            details={"selected": transport, "shared_router_required": True},
         )
 
     if transport in {"novo", "novo_usb", "usb", "pyusb"}:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
 
-        def _factory() -> Any:
-            if BioXpNovoUsbDriver is None:
-                raise PipetteTransportUnavailableError(
-                    "Novo USB-CAN backend is unavailable for the BioXP pipette transport.",
-                    details={"transport": transport, "reason": "BioXpNovoUsbDriver import failed"},
-                )
-            return BioXpNovoUsbDriver(shared_usb=shared_usb, alt=alt, pipette_id=pipette_id, response_timeout_s=response_timeout_s)
+        for pipette_id in FourPipetteTransport.CHANNELS:
+            def _factory(channel_id: int = pipette_id) -> Any:
+                if BioXpNovoUsbDriver is None or shared_usb is None:
+                    raise PipetteTransportUnavailableError(
+                        "Novo USB-CAN requires the shared BioXpTester/NovoRouter owner.",
+                        details={"transport": transport, "channel": channel_id, "shared_router": False},
+                    )
+                return BioXpNovoUsbDriver(shared_usb=shared_usb, alt=alt, pipette_id=channel_id, response_timeout_s=60.0)
 
-        return CanPipetteTransport(
-            driver_factory=_factory,
-            channel="novo-usb-shared" if shared_usb is not None else "novo-usb",
-            bitrate=0,
-            pipette_id=pipette_id,
-            response_timeout_s=response_timeout_s,
-            transport_name="novo_usb_can",
-            transport_details={
-                "source": "OEM Novo.Devices.CanInterfaceBoard over PyUSB bulk endpoints",
-                "vid": "0x03eb",
-                "pid": "0x2423",
-                "alt": alt,
-                "shared_bioxp_usb_runtime": shared_usb is not None,
-            },
-        )
+            transports.append(CanPipetteTransport(
+                driver_factory=_factory, channel="novo-usb-shared", bitrate=0,
+                pipette_id=pipette_id, response_timeout_s=60.0, transport_name="novo_usb_can",
+                transport_details={
+                    "source": "OEM Novo.Devices.CanInterfaceBoard over one shared NovoRouter",
+                    "vid": "0x03eb", "pid": "0x2423", "alt": alt,
+                    "shared_bioxp_usb_runtime": shared_usb is not None,
+                },
+            ))
+        return FourPipetteTransport(transports)
 
     raise ValueError(f"Unsupported BIOXP_PIPETTE_TRANSPORT={transport!r}; expected novo_usb or socketcan")

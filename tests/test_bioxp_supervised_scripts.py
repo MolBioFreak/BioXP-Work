@@ -30,7 +30,7 @@ def test_oem_reference_challenge_is_live_only_and_records_required_proof():
     assert "no dry-run/demo mode" in script
     assert "--execute" in script
     assert "CHALLENGE_TARGETS = {\"z\": -70000, \"x\": 50000, \"y\": 50000}" in script
-    assert "require_switch_transition=True" in script
-    assert "max_search_abs_delta" in script
+    assert 'and h.get("switch_transition")' in script
+    assert 'and h.get("false_home_guard") is None' in script
     assert "MarkAxisReferencedCommand" in script
     assert "sensor_reference_artifacts" in script

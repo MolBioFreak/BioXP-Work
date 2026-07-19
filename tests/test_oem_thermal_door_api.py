@@ -38,7 +38,7 @@ def _run(coro):
 
 
 def test_thermal_door_routes_exist_in_fastapi_app():
-    paths = {route.path for route in api.app.routes}
+    paths = set(api.app.openapi()["paths"])
 
     assert "/motion/thermal_door/home" in paths
     assert "/motion/thermal_door/open" in paths

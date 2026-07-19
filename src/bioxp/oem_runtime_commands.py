@@ -56,7 +56,19 @@ class OEMRuntimeCommandHandlers:
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
         if bool(params.get("run_oem_initialization", False)):
-            return self._handle_oem_initialization_controller_stage(command, params)
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "oemInitializationController",
+                "blockers": ["legacy_monolithic_initialization_cannot_bypass_canonical_startup_stages"],
+                "required_routes": [
+                    "POST /oem/startup/constructor_pipettes",
+                    "POST /oem/startup/initialize_without_motion",
+                    "POST /oem/initial_check",
+                ],
+            }
         if bool(params.get("run_stepwise_homing", False)):
             return self._handle_stepwise_homing_stage(command, params)
         if bool(params.get("run_initialize_motion", False)) or bool(params.get("initialize_motion_only", False)):
@@ -113,7 +125,16 @@ class OEMRuntimeCommandHandlers:
 
     def _handle_oem_initialization_controller_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         run_homing = bool(params.get("run_homing", False))
-        required_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if run_homing else "OEM_INITIALIZATION_RUN"
+        if run_homing:
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "oemInitializationController",
+                "blockers": ["run_homing_is_not_permitted_in_initializeMotorsWithoutMotion_stage"],
+            }
+        required_ack = "OEM_INITIALIZATION_RUN"
         if command.mode == "live" and command.operator_ack != required_ack:
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "oemInitializationController", "blockers": [f"operator_ack_{required_ack}_required_for_live_oem_initialization_controller"]}
         program = self._startup_program()
@@ -121,13 +142,25 @@ class OEMRuntimeCommandHandlers:
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "oemInitializationController", "blockers": ["oem_initialization_provider_not_bound"]}
         hardware = program.hardware
         timeout_s = float(params.get("timeout_s", command.timeout_s or 180.0))
-        result = run_oem_initialization_controller(
-            hardware,
-            run_homing=run_homing,
-            restore_door_state=bool(params.get("restore_door_state", False)),
-            include_tip_pipette_cleanup=bool(params.get("include_tip_pipette_cleanup", False)),
-            timeout_s=timeout_s,
-        )
+        from .lifecycle_state import LifecycleStateError, lifecycle_state
+
+        try:
+            lifecycle = lifecycle_state.run_stage(
+                "initialization_without_motion",
+                lambda: run_oem_initialization_controller(
+                    hardware,
+                    run_homing=run_homing,
+                    restore_door_state=bool(params.get("restore_door_state", False)),
+                    include_tip_pipette_cleanup=bool(params.get("include_tip_pipette_cleanup", False)),
+                    timeout_s=timeout_s,
+                ),
+            )
+        except LifecycleStateError as exc:
+            result = {"ok": False, "error": str(exc), "predecessor_rejected": True}
+        else:
+            stage = lifecycle["startup"]["stages"]["initialization_without_motion"]
+            result = dict(stage.get("evidence") or {})
+            result["lifecycle"] = lifecycle
         artifact_path = self._write_stage_artifact(command, "runtime_oem_initialization_controller.json", {"command": command.to_dict(), "oem_initialization": result})
         ok = bool(result.get("ok"))
         return {
@@ -173,7 +206,21 @@ class OEMRuntimeCommandHandlers:
                 "blockers": ["initialCheck_method_unavailable"],
             }
         mode = "live" if command.mode == "live" else "shadow"
-        result = hardware.initial_check(mode=mode)
+        if mode != "live":
+            result = {"ok": True, "executed": False, "mode": mode, "reason": "non-live worker command cannot complete canonical initialCheck"}
+        else:
+            from .lifecycle_state import LifecycleStateError, lifecycle_state
+
+            try:
+                lifecycle = lifecycle_state.run_initial_check(
+                    hardware,
+                    can_ready=lambda: lifecycle_state.projection()["CAN_READY"],
+                )
+            except LifecycleStateError as exc:
+                result = {"ok": False, "error": str(exc), "predecessor_rejected": True}
+            else:
+                stage = lifecycle["startup"]["stages"]["initial_check"]
+                result = {"ok": stage["state"] == "passed", "lifecycle": lifecycle, "evidence": stage["evidence"]}
         artifact_path = self._write_stage_artifact(command, "runtime_initial_check.json", {"command": command.to_dict(), "initial_check": result})
         ok = bool(result.get("ok"))
         door_latch = result.get("door_latch") or {}
@@ -183,7 +230,7 @@ class OEMRuntimeCommandHandlers:
         return {
             "ok": ok,
             "ready": False,
-            "state": "initial_check_passed" if ok else "failed_closed",
+            "state": ("diagnostic_complete" if result.get("executed") is False else "initial_check_passed") if ok else "failed_closed",
             "command": command.name,
             "stage": "initialCheck",
             "mode": mode,
@@ -285,6 +332,19 @@ class OEMRuntimeCommandHandlers:
         }
 
     def _handle_stepwise_homing_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.projection()
+        if lifecycle["startup"]["stages"]["initial_check"]["state"] != "passed":
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "stage": "startupHomingStepwise",
+                "blockers": ["canonical_initial_check_predecessor_not_passed"],
+                "startup": lifecycle["startup"],
+            }
         step = str(params.get("homing_step", "plan")).strip().lower()
         required_ack = "HOME"
         if command.mode == "live" and command.operator_ack != required_ack:

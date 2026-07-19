@@ -3,7 +3,7 @@ from pathlib import Path
 from src.bioxp.protocols.models import ProtocolActionKind
 from src.bioxp.protocols.oem_xml_import import generate_oem_fixture_coverage_report, import_oem_xml_protocol
 
-OEM_SCRIPT_ROOT = Path("/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts")
+OEM_SCRIPT_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 OEM_SCRIPT_PATHS = sorted(OEM_SCRIPT_ROOT.glob("*.xml"))
 
 

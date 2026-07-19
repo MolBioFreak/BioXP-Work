@@ -11,6 +11,7 @@ from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
 from .oem_runtime_store import OEMRuntimeStore
 from .oem_runtime_types import OEMCommandName, OEMRuntimeCommand
+from .lifecycle_state import lifecycle_state
 
 router = APIRouter(prefix="/oem/runtime", tags=["OEM runtime app parity"])
 
@@ -69,6 +70,21 @@ def _require_runtime():
     return _store, _worker, _events, _status
 
 
+def _runtime_unavailable(component: str) -> dict[str, Any]:
+    lifecycle = lifecycle_state.projection()
+    return {
+        "ok": lifecycle["operation_state"] not in {"error", "emergency"},
+        "available": False,
+        "cache_state": "missing",
+        "component": component,
+        "error": "OEM runtime owner has not been created by an explicit lifecycle POST",
+        "runtime_state": lifecycle["operation_state"],
+        "operation_state": lifecycle["operation_state"],
+        "startup": lifecycle["startup"],
+        "lifecycle": lifecycle,
+    }
+
+
 def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
     _, worker, _, _ = _require_runtime()
     try:
@@ -80,32 +96,42 @@ def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
 
 @router.get("/status")
 def runtime_status():
-    _, _, _, status = _require_runtime()
-    return status.status()
+    if _status is None or _store is None:
+        return _runtime_unavailable("status")
+    if _store.read_state() is None:
+        return _runtime_unavailable("status")
+    return _status.status()
 
 
 @router.get("/state")
 def runtime_state():
-    store, _, _, status = _require_runtime()
-    return {"ok": True, "state": status.status(), "recovery": store.recover_state()}
+    if _store is None or _status is None:
+        return _runtime_unavailable("state")
+    if _store.read_state() is None:
+        return _runtime_unavailable("state")
+    return {"ok": True, "state": _status.status(), "recovery": _store.recover_state()}
 
 
 @router.get("/events/latest")
 def runtime_events_latest(limit: int = 50):
-    store, _, _, _ = _require_runtime()
-    return {"ok": True, "events": store.read_journal("event_journal.jsonl", limit=limit)}
+    if _store is None:
+        return {**_runtime_unavailable("events"), "events": []}
+    return {"ok": True, "events": _store.read_journal("event_journal.jsonl", limit=limit)}
 
 
 @router.get("/commands/history")
 def runtime_commands_history(limit: int = 50):
-    store, _, _, _ = _require_runtime()
-    return {"ok": True, "commands": store.read_journal("command_history.jsonl", limit=limit)}
+    if _store is None:
+        return {**_runtime_unavailable("commands"), "commands": []}
+    return {"ok": True, "commands": _store.read_journal("command_history.jsonl", limit=limit)}
 
 
 @router.get("/worker/status")
 def runtime_worker_status():
-    _, worker, _, _ = _require_runtime()
-    return {"ok": True, "worker": worker.snapshot()}
+    if _worker is None:
+        return {**_runtime_unavailable("worker"), "worker": None}
+    lifecycle = lifecycle_state.projection()
+    return {"ok": lifecycle["operation_state"] not in {"error", "emergency"}, "worker": _worker.snapshot(), "runtime_state": lifecycle["operation_state"], "startup": lifecycle["startup"], "lifecycle": lifecycle}
 
 
 @router.post("/commands/enqueue")

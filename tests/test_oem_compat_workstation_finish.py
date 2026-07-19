@@ -48,7 +48,7 @@ def test_oem_compat_api_rejects_trace_artifact_outside_allowed_roots(tmp_path):
 
 
 def test_workstation_readiness_script_writes_report_and_artifacts(tmp_path):
-    repo = Path("/home/dalab/Desktop/BioXP 3200 Development Work/bioxp_re")
+    repo = Path(__file__).resolve().parents[1]
     report = tmp_path / "readiness.json"
     result = subprocess.run(
         ["python3", "scripts/oem_compat_workstation_readiness.py", "--output", str(report), "--skip-pytest"],

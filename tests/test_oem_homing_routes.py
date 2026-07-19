@@ -5,10 +5,15 @@ from pathlib import Path
 from bioxp.api import app
 
 
-def _route(path, method):
+def _route(path: str, method: str):
     for route in app.routes:
-        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
-            return route
+        candidates = [route]
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            candidates += list(effective_route_contexts())  # type: ignore[misc]
+        for candidate in candidates:
+            if getattr(candidate, "path", None) == path and method in (getattr(candidate, "methods", None) or set()):
+                return candidate
     raise AssertionError(f"missing route {method} {path}")
 
 

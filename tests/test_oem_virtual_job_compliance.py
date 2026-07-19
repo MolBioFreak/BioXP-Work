@@ -5,7 +5,7 @@ from src.bioxp.oem_compat.state import VirtualBioXP
 from src.bioxp.protocols.models import ProtocolAction, ProtocolActionKind, ProtocolDocument, ProtocolStage
 from src.bioxp.protocols.oem_xml_import import import_oem_xml_protocol
 
-OEM_SCRIPT_ROOT = Path("/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts")
+OEM_SCRIPT_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 
 
 def _action(kind, params=None, *, verb="TEST", action_id="a1"):

@@ -53,10 +53,10 @@ def test_z_already_home_fails_closed_when_position_is_not_near_reference():
     assert result["near_reference"] is False
 
 
-def test_startup_homing_mimic_uses_z_already_home_before_search():
+def test_startup_homing_mimic_does_not_skip_literal_z_axis_search_when_near_reference():
     class StartupTester(FakeTester):
-        def reconnect(self):
-            self.calls.append(("reconnect",))
+        def reconnect(self, *, hard_reset=False):
+            self.calls.append(("reconnect", hard_reset))
 
         def activate_boards(self, expect_reply=False):
             self.calls.append(("activate", expect_reply))
@@ -66,8 +66,8 @@ def test_startup_homing_mimic_uses_z_already_home_before_search():
             self.calls.append(("prep",))
             return {"ok": True}
 
-        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):
-            self.calls.append(("searched_home", axis, startup))
+        def motor_oem_home_axis(self, axis_key, *, speed=None, timeout_s=20.0, startup=False):
+            self.calls.append(("searched_home", axis_key, startup))
             return {"home": {"ok": False}}
 
         def motor_oem_verify_z_clearance_for_xy(self, **kwargs):
@@ -81,7 +81,43 @@ def test_startup_homing_mimic_uses_z_already_home_before_search():
 
     result = tester.motor_startup_homing_mimic()
 
+    assert result["aborted_at"] == "z_home"
+    assert ("searched_home", "z", True) in tester.calls
+    assert not any(call[0] == "z_clear" for call in tester.calls)
+
+
+def test_startup_homing_mimic_uses_literal_z_axis_search_not_coordinate_recovery():
+    class StartupTester(FakeTester):
+        def reconnect(self, *, hard_reset=False):
+            self.calls.append(("reconnect", hard_reset))
+
+        def activate_boards(self, expect_reply=False):
+            self.calls.append(("activate", expect_reply))
+            return {"ok": True}
+
+        def motor_oem_initialize_without_motion(self):
+            self.calls.append(("prep",))
+            return {"ok": True}
+
+        def motor_oem_move_z_to_reference(self, **kwargs):
+            raise AssertionError(f"coordinate recovery must not substitute for OEM Z startup: {kwargs}")
+
+        def motor_oem_home_axis(self, axis_key, *, speed=None, timeout_s=20.0, startup=False):
+            self.calls.append(("searched_home", axis_key, startup, speed))
+            return {"home": {"ok": True}}
+
+        def motor_oem_verify_z_clearance_for_xy(self, **kwargs):
+            self.calls.append(("z_clear", kwargs))
+            return {"ok": False, "forced_abort_after_z_for_test": True}
+
+        def motor_query_24v_sensor(self):
+            return {"no24v": False}
+
+    tester = StartupTester(position=-100, speed=0, home=0)
+
+    result = tester.motor_startup_homing_mimic()
+
     assert result["aborted_at"] == "z_clear_for_xy"
-    assert result["z_home"]["already_home"] is True
-    assert ("searched_home", "z", True) not in tester.calls
-    assert any(call[0] == "z_clear" for call in tester.calls)
+    assert result["z_reference_return"] is None
+    assert result["z_reference_verify_after_return"] is None
+    assert ("searched_home", "z", True, None) in tester.calls

@@ -344,7 +344,7 @@ def gripper_home(tester: Any, *, operator_ack: str | None, reason: str | None, t
     home = None
     try:
         prepare = _apply_profile(tester, profile)
-        home = tester.motor_oem_home_axis("g", startup=True, timeout_s=timeout_s)
+        home = tester.motor_oem_home_axis("g", startup=False, timeout_s=timeout_s)
         home_payload = home.get("home") if isinstance(home, dict) else home
         home_ok = bool((home_payload or {}).get("ok") if isinstance(home_payload, dict) else home)
         after = gripper_status(tester)
@@ -378,3 +378,210 @@ def gripper_home(tester: Any, *, operator_ack: str | None, reason: str | None, t
         }
     finally:
         _restore_idle(tester, "gripper_home_finally")
+
+
+# OEM calibrated gripper positions (from SSD machine config)
+# GripperClosePOS, GripperOpenPOS, GripperOpenWide -- explicit move endpoints
+GRIPPER_CLOSE_ACK = "GRIPPER_CLOSE"
+GRIPPER_OPEN_ACK = "GRIPPER_OPEN"
+GRIPPER_OPEN_WIDE_ACK = "GRIPPER_OPEN_WIDE"
+
+
+def _gripper_calibrated_position(field_name):
+    # Look up a calibrated OEM gripper position from machine config.
+    cfg = _machine_gripper_config()
+    if not cfg.get("ok"):
+        return None
+    raw = cfg.get(field_name)
+    return _manifest_value(raw) if isinstance(raw, dict) else None
+
+
+def _gripper_move_to_calibrated(
+    tester,
+    *,
+    field_name,
+    operator_ack,
+    expected_ack,
+    reason,
+    timeout_s=15.0,
+):
+    # Move gripper to an OEM-calibrated absolute position.
+    # Follows the same OEM semantics as gripper_clear:
+    # - mask both limit switches
+    # - set action current (31)
+    # - move to calibrated position
+    # - wait stopped
+    # - restore masks and idle current
+    _require_action(operator_ack, expected_ack, reason)
+    before = _preflight_for_motion(tester)
+    profile = _profile(tester)
+    board = int(profile["board"])
+    motor = int(profile["motor"])
+
+    target = _gripper_calibrated_position(field_name)
+    if target is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Calibrated position " + field_name + " not available in machine config",
+                "motion_commanded": False,
+            },
+        )
+
+    position_before = tester.motor_get_position(board, motor=motor)
+    prior_right_disable = tester.motor_get_axis_param(board, 12, motor=motor)
+    prior_left_disable = tester.motor_get_axis_param(board, 13, motor=motor)
+    limit_mask = {
+        "right_prior": prior_right_disable,
+        "left_prior": prior_left_disable,
+    }
+
+    prepare = None
+    move = None
+    wait = None
+    restore = None
+
+    try:
+        # Mask both switches, set action current -- same as gripper_clear
+        prepare = tester.motor_prepare_axis(
+            board,
+            motor=motor,
+            run_current=int(profile.get("run_current", GRIPPER_ACTION_CURRENT)),
+            standby_current=int(profile.get("standby_current", OEM_IDLE_CURRENT)),
+            speed=int(profile.get("speed", 600)),
+            acc=int(profile.get("acc", 5)),
+            stall_guard=profile.get("stall_guard"),
+            rdiv=profile.get("rdiv", 6),
+            pdiv=profile.get("pdiv", 2),
+            disable_right=True,
+            disable_left=True,
+            warm_enable=bool(profile.get("warm_enable", False)),
+        )
+        limit_mask["disable_right_set"] = tester.motor_set_axis_param(
+            board, 12, 1, motor=motor
+        )
+        limit_mask["disable_left_set"] = tester.motor_set_axis_param(
+            board, 13, 1, motor=motor
+        )
+        set_action_current = tester.motor_set_axis_param(
+            board, 6, GRIPPER_ACTION_CURRENT, motor=motor
+        )
+        # Move to calibrated absolute position
+        move = tester.motor_move_absolute(board, target, motor=motor)
+        wait = tester.motor_wait_stopped(
+            board, motor=motor,
+            timeout_s=min(float(timeout_s), 30.0),
+            require_seen_nonzero=False,
+        )
+        position_after = tester.motor_get_position(board, motor=motor)
+
+        pre_pos = _int_or_none(_value(position_before, "position"))
+        post_pos = _int_or_none(_value(position_after, "position"))
+        delta = None if pre_pos is None or post_pos is None else int(post_pos) - int(pre_pos)
+        move_ok = bool(isinstance(move, dict) and (move.get("ok") or _value(move, "ack", "status") == 100))
+        stopped = bool(isinstance(wait, dict) and wait.get("stopped") is True)
+        physical_motion = bool(delta is not None and delta != 0)
+        ok = bool(move_ok and stopped and physical_motion)
+
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "OEM gripper " + field_name + " move failed/ambiguous",
+                    "motion_commanded": True,
+                    "move": move,
+                    "wait": wait,
+                    "position_before": position_before,
+                    "position_after": position_after,
+                    "position_delta": delta,
+                    "limit_mask": limit_mask,
+                    "before": before,
+                },
+            )
+
+        return {
+            "ok": True,
+            "schema": "bioxp.oem_gripper_" + field_name.lower() + ".v1",
+            "motion_commanded": True,
+            "physical_motion": True,
+            "oem_source": "SSD machine config " + field_name + " = " + str(target),
+            "before": before,
+            "profile": profile,
+            "prepare": prepare,
+            "limit_mask": limit_mask,
+            "set_action_current": set_action_current,
+            "move_to_calibrated": move,
+            "wait": wait,
+            "position_before": position_before,
+            "position_after": position_after,
+            "position_delta": delta,
+            "target_position": target,
+            "restore": None,
+            "after_status": None,
+        }
+    finally:
+        right_restore_value = _int_or_none(_value(prior_right_disable, "value"))
+        left_restore_value = _int_or_none(_value(prior_left_disable, "value"))
+        if right_restore_value is not None:
+            limit_mask["disable_right_restore"] = tester.motor_set_axis_param(
+                board, 12, right_restore_value, motor=motor
+            )
+        if left_restore_value is not None:
+            limit_mask["disable_left_restore"] = tester.motor_set_axis_param(
+                board, 13, left_restore_value, motor=motor
+            )
+        restore = _restore_idle(tester, "gripper_" + field_name.lower() + "_finally")
+
+
+def gripper_close(
+    tester,
+    *,
+    operator_ack,
+    reason,
+    timeout_s=15.0,
+):
+    # OEM: GripperClosePOS -- close gripper to calibrated position.
+    return _gripper_move_to_calibrated(
+        tester,
+        field_name="GripperClosePOS",
+        operator_ack=operator_ack,
+        expected_ack=GRIPPER_CLOSE_ACK,
+        reason=reason,
+        timeout_s=timeout_s,
+    )
+
+
+def gripper_open(
+    tester,
+    *,
+    operator_ack,
+    reason,
+    timeout_s=15.0,
+):
+    # OEM: GripperOpenPOS -- open gripper to calibrated position.
+    return _gripper_move_to_calibrated(
+        tester,
+        field_name="GripperOpenPOS",
+        operator_ack=operator_ack,
+        expected_ack=GRIPPER_OPEN_ACK,
+        reason=reason,
+        timeout_s=timeout_s,
+    )
+
+
+def gripper_open_wide(
+    tester,
+    *,
+    operator_ack,
+    reason,
+    timeout_s=15.0,
+):
+    # OEM: GripperOpenWide -- open gripper to wide calibrated position.
+    return _gripper_move_to_calibrated(
+        tester,
+        field_name="GripperOpenWide",
+        operator_ack=operator_ack,
+        expected_ack=GRIPPER_OPEN_WIDE_ACK,
+        reason=reason,
+        timeout_s=timeout_s,
+    )

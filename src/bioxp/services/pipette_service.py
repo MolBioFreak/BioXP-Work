@@ -57,7 +57,7 @@ async def _run_transport_call(
 async def run_pipette_status(*, get_transport: TransportGetter, run_blocking: BlockingRunner) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette status",
-        timeout_s=10.0,
+        timeout_s=600.0,
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.get_status(),
@@ -74,7 +74,7 @@ async def run_pipette_init_command(
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette init",
-        timeout_s=20.0,
+        timeout_s=1800.0,
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.initialize(command),

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -14,6 +12,7 @@ else:  # pragma: no cover - import itself is environment-dependent
     _usb_import_error = None
 
 from .can_driver import BioXpCanDriver
+from .novo_router import NovoRouter
 
 NOVO_USB_VENDOR_ID = 0x03EB
 NOVO_USB_PRODUCT_ID = 0x2423
@@ -99,8 +98,8 @@ class NovoUsbCanBus:
     - bulk OUT writes NovoEncoding( module_id[4] + dlc[1] + data[dlc] )
     - bulk IN reads the same record shape and returns a message-like object
 
-    If ``shared_usb`` is a live BioXpTester, its already-claimed endpoints are
-    reused instead of trying to claim the interface a second time.
+    Live use requires the router owned by the shared ``BioXpTester``. This
+    adapter never claims USB or reads the IN endpoint itself.
     """
 
     def __init__(
@@ -114,8 +113,8 @@ class NovoUsbCanBus:
         write_timeout_ms: int = 2000,
         claim_interface: bool = True,
     ) -> None:
-        if _usb_import_error is not None and shared_usb is None:
-            raise NovoUsbCanError(f"pyusb is required for Novo USB-CAN access: {_usb_import_error}")
+        if shared_usb is None:
+            raise NovoUsbCanError("Novo USB-CAN requires the shared BioXpTester/NovoRouter owner")
         self.vendor_id = int(vendor_id)
         self.product_id = int(product_id)
         self.alt = int(alt)
@@ -126,7 +125,8 @@ class NovoUsbCanBus:
         self.dev: Any | None = None
         self.ep_out: Any | None = None
         self.ep_in: Any | None = None
-        self._owns_device = shared_usb is None
+        self.router: NovoRouter | None = None
+        self._owns_device = False
         self._connect()
 
     def _connect(self) -> None:
@@ -136,97 +136,112 @@ class NovoUsbCanBus:
             self.ep_in = getattr(self.shared_usb, "ep_in", None)
             if self.ep_out is None or self.ep_in is None:
                 raise NovoUsbCanError("shared BioXpTester does not expose live USB endpoints")
+            self.router = getattr(self.shared_usb, "novo_router", None)
+            if self.router is None or not self.router.running:
+                raise NovoUsbCanError("shared BioXpTester does not expose one running NovoRouter")
             return
-
-        assert usb is not None
-        self.dev = usb.core.find(idVendor=self.vendor_id, idProduct=self.product_id)
-        if self.dev is None:
-            raise NovoUsbCanError(
-                f"Novo USB-CAN device not found (vid=0x{self.vendor_id:04x}, pid=0x{self.product_id:04x})"
-            )
-        try:
-            if self.dev.is_kernel_driver_active(0):
-                try:
-                    self.dev.detach_kernel_driver(0)
-                except usb.core.USBError:
-                    pass
-        except (NotImplementedError, usb.core.USBError):
-            pass
-        self.dev.set_configuration()
-        if self.claim_interface:
-            usb.util.claim_interface(self.dev, 0)
-        self.dev.set_interface_altsetting(interface=0, alternate_setting=self.alt)
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, self.alt)]
-        self.ep_out = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
-        )
-        self.ep_in = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
-        )
-        if self.ep_out is None or self.ep_in is None:
-            raise NovoUsbCanError("Novo USB-CAN bulk endpoints were not found")
 
     @staticmethod
     def build_payload(arbitration_id: int, data: list[int] | bytes | bytearray, dlc: int | None = None) -> bytes:
         payload_data = [int(byte) & 0xFF for byte in data]
         data_len = len(payload_data) if dlc is None else int(dlc)
-        data_len = max(0, min(255, data_len))
-        payload_data = payload_data[:data_len]
+        if data_len < 0 or data_len > 8:
+            raise NovoUsbCanError(f"invalid classic CAN DLC: {data_len}")
+        if data_len != len(payload_data):
+            raise NovoUsbCanError(
+                f"CAN DLC/data mismatch: dlc={data_len}, data_length={len(payload_data)}; padding is forbidden"
+            )
         module_id = int(arbitration_id) & 0xFFFFFFFF
         return module_id.to_bytes(4, "big") + bytes([data_len]) + bytes(payload_data)
 
     def send(self, msg: Any) -> None:
-        if self.ep_out is None:
-            raise NovoUsbCanError("Novo USB-CAN OUT endpoint is not connected")
+        router = self._current_router()
         payload = self.build_payload(
             int(getattr(msg, "arbitration_id")),
             list(getattr(msg, "data", [])),
             int(getattr(msg, "dlc", len(getattr(msg, "data", [])))),
         )
         frame = novo_encode(payload)
-        self.ep_out.write(frame, timeout=self.write_timeout_ms)
-
-    def recv(self, timeout: float | None = None) -> Any | None:
-        if self.ep_in is None:
-            raise NovoUsbCanError("Novo USB-CAN IN endpoint is not connected")
-        timeout_ms = None if timeout is None else max(1, int(float(timeout) * 1000.0))
-        try:
-            raw = self.ep_in.read(self.read_size, timeout=timeout_ms)
-        except Exception as exc:
-            if exc.__class__.__name__ == "USBTimeoutError" or isinstance(exc, TimeoutError):
-                return None
-            raise
-        decoded = novo_decode(list(raw))
-        if len(decoded) < 5:
-            raise NovoUsbCanError(f"Novo USB-CAN decoded payload too short: {decoded!r}")
-        arbitration_id = int.from_bytes(decoded[0:4], "big")
-        dlc = int(decoded[4])
-        data = list(decoded[5 : 5 + dlc])
-        return SimpleNamespace(
-            arbitration_id=arbitration_id,
-            data=data,
-            dlc=len(data),
-            is_extended_id=False,
-            timestamp=time.time(),
+        router.transact(
+            frame,
+            matcher=None,
+            matcher_name="tx_only",
+            timeout_s=0.0,
+            write_timeout_ms=self.write_timeout_ms,
+            provenance={
+                "tx_id": int(getattr(msg, "arbitration_id")),
+                "tx_dlc": int(getattr(msg, "dlc", len(getattr(msg, "data", [])))),
+                "tx_data": list(getattr(msg, "data", [])),
+            },
         )
 
+    def recv(self, timeout: float | None = None) -> Any | None:
+        raise NovoUsbCanError("direct receive is forbidden; register a transaction with NovoRouter")
+
+    def _current_router(self) -> NovoRouter:
+        router = getattr(self.shared_usb, "novo_router", None) if self.shared_usb is not None else None
+        if router is None or not router.running:
+            raise NovoUsbCanError("shared Novo router is unavailable")
+        self.router = router
+        self.ep_out = getattr(self.shared_usb, "ep_out", None)
+        self.ep_in = getattr(self.shared_usb, "ep_in", None)
+        return router
+
+    def transact_can(
+        self,
+        msg: Any,
+        *,
+        channel: int,
+        expected_function: int,
+        timeout_s: float,
+        matcher_name: str,
+        initialization: bool = False,
+        completion_timeout_s: float = 60.0,
+    ) -> dict[str, Any]:
+        router = self._current_router()
+        tx_id = int(getattr(msg, "arbitration_id"))
+        tx_data = list(getattr(msg, "data", []))
+        tx_dlc = int(getattr(msg, "dlc", len(tx_data)))
+        payload = self.build_payload(tx_id, tx_data, tx_dlc)
+        expected_rx_id = tx_id | 0x400
+        if initialization:
+            router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
+        try:
+            return router.transact(
+                novo_encode(payload),
+                matcher=router.pipette_matcher(
+                    channel=int(channel),
+                    expected_function=int(expected_function),
+                    initialization=bool(initialization),
+                ),
+                matcher_name=matcher_name,
+                timeout_s=float(timeout_s),
+                write_timeout_ms=self.write_timeout_ms,
+                provenance={
+                    "channel": int(channel),
+                    "command_family": int(expected_function),
+                    "tx_id": tx_id,
+                    "tx_dlc": tx_dlc,
+                    "tx_data": tx_data[:tx_dlc],
+                    "expected_rx_id": expected_rx_id,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization else None,
+                },
+            )
+        except Exception:
+            if initialization:
+                router.wait_pipette_completion(int(channel), 0.0)
+            raise
+
+    def wait_pipette_completion(self, channel: int, timeout_s: float) -> dict[str, Any]:
+        return self._current_router().wait_pipette_completion(int(channel), float(timeout_s))
+
     def shutdown(self) -> None:
-        if not self._owns_device or self.dev is None or usb is None:
-            return
-        try:
-            usb.util.release_interface(self.dev, 0)
-        except Exception:
-            pass
-        try:
-            usb.util.dispose_resources(self.dev)
-        except Exception:
-            pass
+        # The shared BioXpTester is the lifecycle owner; a client cannot stop
+        # its reader or release its USB interface.
         self.dev = None
         self.ep_out = None
         self.ep_in = None
+        self.router = None
 
 
 class BioXpNovoUsbDriver(BioXpCanDriver):
@@ -238,7 +253,7 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         shared_usb: Any | None = None,
         alt: int = NOVO_USB_DEFAULT_ALT,
         pipette_id: int = 0,
-        response_timeout_s: float = 1.0,
+        response_timeout_s: float = 60.0,
         vendor_id: int = NOVO_USB_VENDOR_ID,
         product_id: int = NOVO_USB_PRODUCT_ID,
     ) -> None:
@@ -251,13 +266,15 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         self.channel = "novo-usb-shared" if shared_usb is not None else "novo-usb"
         self.bitrate = 0
         self.pipette_id = int(pipette_id)
-        self.response_timeout_s = float(response_timeout_s)
+        self.response_timeout_s = 60.0
         self.usb = {
             "vendor_id": int(vendor_id),
             "product_id": int(product_id),
             "alt": int(alt),
             "shared_usb": shared_usb is not None,
             "framing": "NovoEncoding.cs",
+            "requested_response_timeout_s": float(response_timeout_s),
+            "transaction_timeout_ms": 60_000,
         }
 
     def close(self):

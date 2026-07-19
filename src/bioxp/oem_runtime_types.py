@@ -171,12 +171,25 @@ class OEMRuntimeSnapshot:
     runtime_state: str = OEMRuntimeStateName.IDLE_NOT_READY.value
     machine_status: OEMMachineStatus = field(default_factory=OEMMachineStatus)
     worker: OEMWorkerSnapshot = field(default_factory=OEMWorkerSnapshot)
-    hardware: dict[str, Any] = field(default_factory=lambda: {"backend_ready": False, "can_ready": False, "usb_connected": False, "board_status": {}})
+    hardware: dict[str, Any] = field(default_factory=lambda: {"backend_ready": None, "can_ready": None, "usb_connected": None, "board_status": None, "truth_state": "unknown"})
     operator: dict[str, Any] = field(default_factory=lambda: {"action_required": False, "message_id": None, "error_situation": OEMErrorSituation.NONE.value})
     confidence: dict[str, str] = field(default_factory=lambda: {"door_latch": "unknown", "motion_reference": "unknown", "pipette": "unproven", "vision": "unproven"})
     updated_at: float = field(default_factory=utc_ts)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["ok"] = self.runtime_state not in {OEMRuntimeStateName.ERROR_OPERATOR_ACTION_REQUIRED.value, OEMRuntimeStateName.EMERGENCY_STOPPED.value}
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.projection()
+        payload["runtime_state_legacy"] = payload.pop("runtime_state")
+        payload["runtime_state"] = lifecycle["operation_state"]
+        payload["operation_state"] = lifecycle["operation_state"]
+        payload["startup"] = lifecycle["startup"]
+        payload["lifecycle"] = lifecycle
+        payload["machine_status"]["enclosure_door_closed"] = lifecycle["door"]["door_closed"]
+        payload["machine_status"]["latch_closed"] = lifecycle["door"]["latch_closed"]
+        payload["machine_status"]["user_paused"] = lifecycle["operation_state"] == "paused"
+        payload["machine_status"]["running_job"] = lifecycle["operation_state"] == "running"
+        payload["machine_status"]["latest_status"] = lifecycle["operation_state"]
+        payload["ok"] = lifecycle["operation_state"] not in {"error", "emergency"}
         return payload

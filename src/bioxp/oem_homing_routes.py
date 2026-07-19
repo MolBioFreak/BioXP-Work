@@ -20,8 +20,17 @@ from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.movement_readiness import build_movement_readiness_comparison
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_shadow_readback_live import build_shadow_readback_artifact
+from .runtime_state import OemRuntimeStateError, get_active_oem_runtime_state_store
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
+
+
+def _require_bound_snapshot(root_dir: str | None) -> None:
+    if root_dir is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="root_dir is diagnostic-only; production routes use the process-bound accepted OEM snapshot",
+        )
 
 
 
@@ -34,7 +43,12 @@ async def get_oem_machine_config(root_dir: str | None = None) -> dict[str, Any]:
     does not open USB, talk to CAN, command motion, mutate reference state, or
     make homing decisions. Secrets/serial are redacted from the response.
     """
-    result = find_oem_machine_config_bundle(root_dir)
+    _require_bound_snapshot(root_dir)
+    result = find_oem_machine_config_bundle()
+    try:
+        result["transactional_runtime_state"] = get_active_oem_runtime_state_store().status_projection()
+    except OemRuntimeStateError:
+        result["transactional_runtime_state"] = {"ok": False, "status": "unbound"}
     result.setdefault("opened_usb", False)
     result.setdefault("physical_motion", False)
     result.setdefault("motion_commanded", False)
@@ -48,7 +62,8 @@ async def get_oem_machine_config(root_dir: str | None = None) -> dict[str, Any]:
 @router.get("/motion/oem/position_table")
 async def get_oem_position_table(root_dir: str | None = None) -> dict[str, Any]:
     """Return the bound OEM PositionTable from original SSD config, read-only."""
-    table = load_bound_oem_position_table(root_dir)
+    _require_bound_snapshot(root_dir)
+    table = load_bound_oem_position_table()
     rows = table.rows()
     return {
         "ok": True,
@@ -82,14 +97,15 @@ async def plan_oem_position_table_move(
     root_dir: str | None = None,
 ) -> dict[str, Any]:
     """Dry-run exact OEM PositionTable coordinate planning. No USB/motion."""
-    table = load_bound_oem_position_table(root_dir)
+    _require_bound_snapshot(root_dir)
+    table = load_bound_oem_position_table()
     mode_key = str(mode).strip().lower()
     if mode_key == "moveto":
         plan = table.compile_move_to(location_id, column=column, row=row, high_pos=high_pos)
     elif mode_key == "scriptmoveto":
         plan = table.compile_script_move_to(location_id, column=column, row=row, positionflag=positionflag, tip_location=tip_location)
     elif mode_key in {"offset", "moveto_offset", "offsetmoveto"}:
-        cfg = find_oem_machine_config_bundle(root_dir)
+        cfg = find_oem_machine_config_bundle()
         axis_limits = (((cfg.get("config") or {}).get("axis_limits") or {}) if isinstance(cfg, dict) else {})
         plan = table.compile_offset_move_to(
             location_id,
@@ -153,13 +169,18 @@ async def plan_oem_scriptmove_path(
     root_dir: str | None = None,
 ) -> dict[str, Any]:
     """Dry-run exact OEM scriptmoveTo path/branch planner. No USB/motion."""
-    table = load_bound_oem_position_table(root_dir)
-    cfg = find_oem_machine_config_bundle(root_dir)
+    _require_bound_snapshot(root_dir)
+    table = load_bound_oem_position_table()
+    cfg = find_oem_machine_config_bundle()
     axis_limits = (((cfg.get("config") or {}).get("axis_limits") or {}) if isinstance(cfg, dict) else {})
+    x_limit = (axis_limits.get("x") or {}).get("max_steps")
+    y_limit = (axis_limits.get("y") or {}).get("max_steps")
+    if x_limit is None or y_limit is None:
+        raise HTTPException(status_code=503, detail="immutable OEM machine snapshot axis limits are unavailable")
     planner = OemPathPlanner(
         table,
-        x_high_limit=int((axis_limits.get("x") or {}).get("max_steps") or 90263),
-        y_high_limit=int((axis_limits.get("y") or {}).get("max_steps") or 102956),
+        x_high_limit=int(x_limit),
+        y_high_limit=int(y_limit),
     )
     state = OemMachineState.from_query(
         current_location_id=current_loc,
@@ -585,41 +606,38 @@ class _ApiShadowReadbackProvider:
 
 @router.get("/motion/oem/shadow_readback")
 async def oem_shadow_readback(axes: str = "x,y,z,g,door") -> dict[str, Any]:
-    """Capture query-only OEM shadow/readback truth.
-
-    This endpoint opens only the existing tester/status path and calls passive
-    status helpers. It does not command motion, set current, change switch masks,
-    arm, home, or mark references.
-    """
+    """Project the shadow-readback domain of one completed canonical snapshot."""
     from . import api as api_mod
 
     requested_axes = [axis.value for axis in api_mod._parse_axes_csv(axes)]
-
-    def _capture() -> dict[str, Any]:
-        try:
-            provider = _ApiShadowReadbackProvider(api_mod)
-            return build_shadow_readback_artifact(provider, axes=requested_axes)
-        except Exception as exc:
-            return {
-                "ok": False,
-                "failed_closed": True,
-                "motion_commanded": False,
-                "current_mutation_commanded": False,
-                "switch_mask_mutation_commanded": False,
-                "axes_requested": requested_axes,
-                "error": str(exc),
-                "blockers": ["shadow_readback_unavailable"],
-            }
-
-    return await api_mod._run_blocking(
-        "OEM shadow readback",
-        _capture,
-        timeout_s=max(20.0, 6.0 * float(len(requested_axes))),
-    )
+    projection = api_mod.hardware_state.project("shadow_readback")
+    row = (projection.get("domains") or {}).get("shadow_readback") or {}
+    observed = row.get("observation") if row.get("status") == "observed" else None
+    axes_observed = ((observed or {}).get("axes") or {}).get("rows") or {}
+    return {
+        **projection,
+        "ok": observed is not None,
+        "failed_closed": observed is None,
+        "axes_requested": requested_axes,
+        "axes": {axis: axes_observed.get(axis) for axis in requested_axes},
+        "interlocks": None if observed is None else observed.get("interlocks"),
+        "reference_state": None if observed is None else observed.get("reference_state"),
+        "motion_commanded": False,
+        "current_mutation_commanded": False,
+        "switch_mask_mutation_commanded": False,
+        "error": None if observed is not None else "canonical shadow_readback observation unavailable",
+    }
 
 
 @router.post("/motion/oem/shadow_readback/capture")
 async def oem_shadow_readback_capture(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = payload or {}
-    axes = str(payload.get("axes") or "x,y,z,g,door")
-    return await oem_shadow_readback(axes=axes)
+    del payload
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "shadow_readback_collection_moved",
+            "required_route": "POST /hardware/snapshot/collect",
+            "required_domain": "shadow_readback",
+            "hardware_queried": False,
+        },
+    )

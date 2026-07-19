@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 import xml.etree.ElementTree as ET
 
+from .oem_machine_bundle import OemMachineBundleError, OemMachineSnapshot, get_active_oem_machine_snapshot
+
 SOURCE_DEFAULTS: dict[str, Any] = {
     "X_MOTOR_MAX_POSITION": 91919,
     "Y_MOTOR_MAX_POSITION": 95247,
@@ -133,15 +135,56 @@ def _coerce(text: str) -> Any:
             return s
 
 
-def load_oem_parity_config(config_xml: str | Path | None) -> OemParityConfig:
-    values = dict(SOURCE_DEFAULTS)
-    if config_xml is None:
+def _snapshot_values(snapshot: OemMachineSnapshot) -> dict[str, Any]:
+    offsets = snapshot.config_sections["offsets"]
+    config = snapshot.config_sections["config"]
+    calibration = snapshot.config_sections["calibration"]
+    camera = snapshot.config_sections["camera"]
+    values: dict[str, Any] = {
+        "X_MOTOR_MAX_POSITION": snapshot.axis_limits["x"]["max_steps"],
+        "Y_MOTOR_MAX_POSITION": snapshot.axis_limits["y"]["max_steps"],
+        "Z_MOTOR_MAX_POSITION": snapshot.axis_limits["z"]["max_steps"],
+        "G_MOTOR_MAX_POSITION": snapshot.axis_limits["g"]["max_steps"],
+        "Z_MOTOR_MAX_CURRENT_UP": offsets["m_Z_MOTOR_MAX_CURRENT_UP"],
+        "Z_MOTOR_MAX_CURRENT_DOWN": offsets["m_Z_MOTOR_MAX_CURRENT_DOWN"],
+        "TCDoorStallGuardThreshold": offsets["m_TCDoorStallGuardThreshold"],
+        "TC_DOOR_VELOCITY": offsets["m_TC_DOOR_VELOCITY"],
+        "TC_DOOR_ACCELERATION": offsets["m_TC_DOOR_ACCELERATION"],
+        "TC_DOOR_MAX_CURRENT": offsets["m_TC_DOOR_MAX_CURRENT"],
+        "GripperVersion": config["GripperVersion"],
+        "SerialNumber": snapshot.machine_serial,
+        "CameraCalibrated": camera["Cameracalibrated"],
+        "Calibrated": calibration["Calibrated"],
+    }
+    return values
+
+
+def load_oem_parity_config(config_xml: str | Path | OemMachineSnapshot | None) -> OemParityConfig:
+    if isinstance(config_xml, OemMachineSnapshot):
+        snapshot = config_xml
+    elif config_xml is None:
+        try:
+            snapshot = get_active_oem_machine_snapshot()
+        except OemMachineBundleError:
+            return OemParityConfig(
+                calibration_source="unbound_fail_closed",
+                machine_calibrated=False,
+                values={},
+                blockers=["OemMachineSnapshot_not_bound"],
+            )
+    else:
+        snapshot = None
+    if snapshot is not None:
         return OemParityConfig(
-            calibration_source="source_defaults",
-            machine_calibrated=False,
-            values=values,
-            blockers=["config.xml_not_bound", "source_defaults_not_machine_calibration"],
+            calibration_source="immutable_oem_machine_snapshot",
+            machine_calibrated=snapshot.machine_calibrated,
+            values=_snapshot_values(snapshot),
+            blockers=[] if snapshot.mutation_authorized else ["operator_physical_label_not_matched"],
         )
+
+    # Explicit XML parsing is retained only for offline diagnostics. These
+    # labeled source fallbacks are never reachable from accepted live mode.
+    values = dict(SOURCE_DEFAULTS)
     path = Path(config_xml)
     root = ET.parse(path).getroot()
     unknown: list[str] = []
@@ -155,9 +198,9 @@ def load_oem_parity_config(config_xml: str | Path | None) -> OemParityConfig:
         else:
             unknown.append(key)
     return OemParityConfig(
-        calibration_source=str(path),
-        machine_calibrated=True,
+        calibration_source=f"non_authoritative_diagnostic:{path}",
+        machine_calibrated=False,
         values=values,
-        blockers=[],
+        blockers=["explicit_XML_diagnostic_is_not_accepted_live_authority", "source_defaults_present_in_diagnostic_projection"],
         unknown_keys=sorted(set(unknown)),
     )
