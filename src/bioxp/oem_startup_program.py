@@ -191,6 +191,40 @@ class BioXpStartupHardware:
     def load_config(self) -> dict:
         return find_oem_config(self.config_roots)
 
+    # Canonical initialCheck adapter methods.  They are invoked only by an
+    # explicit lifecycle stage; none is called during provider construction.
+    def set_led_rgb(self, r: int, g: int, b: int) -> dict:
+        return self.tester.strip_set_rgb(int(r), int(g), int(b), reconnect_first=False)
+
+    def query_door(self) -> dict:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 1, 0, 0)
+        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
+
+    def query_latch(self) -> dict:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 3, 0, 0)
+        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
+
+    def set_solenoid(self, value: int) -> dict:
+        return self.tester.deck_io_set_type(2, int(value))
+
+    def query_voltage(self) -> dict:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 0, 0, 0)
+        status = None if ack is None else ack.get("status")
+        voltage = None if ack is None or status != 100 else ack.get("value")
+        return {
+            "payload_raw": voltage,
+            "reply_present": ack is not None,
+            "transport_outcome": "reply" if ack is not None else "no_reply",
+            "oem_status": status,
+            "ack": ack,
+        }
+
+    def deactivate_boards(self) -> dict:
+        return self.tester.deactivate_boards(expect_reply=True)
+
+    def activate_boards(self) -> dict:
+        return self.tester.activate_boards(expect_reply=True)
+
     def initial_check(self, *, mode: str = "shadow") -> dict:
         tester = self.tester
         if hasattr(tester, "oem_initial_check"):
@@ -246,7 +280,20 @@ class BioXpStartupHardware:
     def configure_without_motion(self, *, mode: str = "shadow") -> dict:
         tester = self.tester
         if hasattr(tester, "motor_oem_initialize_without_motion") and mode == "live":
-            return tester.motor_oem_initialize_without_motion()
+            prep = tester.motor_oem_initialize_without_motion()
+            if isinstance(prep, dict) and "ok" in prep:
+                return prep
+            # Backward-compatible guard for older tester implementations that returned
+            # raw {axis: prep_row} without an aggregate success bit.  The startup
+            # state machine requires a top-level ok; otherwise live startup falsely
+            # failed at initializeMotorsWithoutMotion even when all prep writes ACKed.
+            return {
+                "ok": True,
+                "physical_motion": False,
+                "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"],
+                "axes": prep,
+                "normalized_from_raw_axis_prep": True,
+            }
         return {"ok": True, "physical_motion": False, "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"], "skipped_live_write": mode != "live"}
 
     def initialize_motion_diagnostic(self, *, mode: str = "shadow", run_homing: bool = False) -> dict:
@@ -471,6 +518,24 @@ class OEMStartupProgram:
         status = self._new_session(req)
         if status.get("failed_closed"):
             return status
+        # Generic startup binds a session/artifact owner only.  The accepted
+        # constructor -> initialize-without-motion -> initialCheck stages are
+        # separately approved POST/worker actions and cannot execute here.
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.transition("waiting", reason="startup_session_bound_awaiting_constructor_stage")
+        status.update({
+            "state": "waiting_for_constructor_pipette_stage",
+            "active_stage": None,
+            "ready": False,
+            "queued": False,
+            "lifecycle": lifecycle,
+            "next_action": "POST /oem/startup/constructor_pipettes",
+        })
+        return self._closeout(status)
+
+        # Historical full-sequence implementation remains below for source
+        # traceability but is intentionally unreachable from generic startup.
         root = Path(status["artifact_root"])
 
         self._stage(status, OemStartupState.CONFIG_LOADING)
@@ -584,14 +649,28 @@ class OEMStartupProgram:
         return self.worker.run_next()
 
     def abort_worker(self, *, reason: str = "operator abort") -> dict:
+        from .lifecycle_state import lifecycle_state
+
         result = self.worker.abort(reason=reason)
         if self.latest_session_id and self.latest_session_id in self.sessions:
             status = self.sessions[self.latest_session_id]
             status.update({"ok": False, "state": OemStartupState.ABORTED.value, "ready": False, "failed": True, "failed_closed": True, "failure_reason": reason})
             self._closeout(status)
-        return result
+        lifecycle = lifecycle_state.transition("stopped", reason=f"startup_worker_abort:{reason}")
+        return {**result, "state": lifecycle["operation_state"], "lifecycle": lifecycle}
 
     def door_event(self, session_id: str | None, *, door_closed: bool, latch_closed: bool) -> dict:
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.record_door_event(
+            door_closed=door_closed,
+            latch_closed=latch_closed,
+            source="OEMStartupProgram.door_event",
+        )
+        return {"ok": True, "session_id": session_id or "canonical", "door": lifecycle["door"], "state": lifecycle["operation_state"], "lifecycle": lifecycle}
+
+        # Retained historical artifact logic below is unreachable; door events
+        # may no longer execute initialCheck or queue startup stages implicitly.
         sid = session_id or self.latest_session_id
         if not sid or sid not in self.sessions:
             raise KeyError("startup session not found")
@@ -618,10 +697,21 @@ class OEMStartupProgram:
         return self._queue_initialize_system(status)
 
     def status(self, session_id: str | None = None) -> dict:
-        sid = session_id or self.latest_session_id
-        if not sid or sid not in self.sessions:
-            return {"ok": False, "state": "none", "ready": False, "failed": False, "failed_closed": False, "failure_reason": "no startup session"}
-        return self._closeout(self.sessions[sid])
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.projection()
+        sid = session_id or self.latest_session_id or "canonical"
+        return {
+            "ok": lifecycle["operation_state"] not in {"error", "emergency"},
+            "session_id": sid,
+            "state": lifecycle["operation_state"],
+            "startup_state": lifecycle["startup"]["state"],
+            "ready": lifecycle["startup"]["state"] == "passed",
+            "lifecycle": lifecycle,
+        }
 
     def worker_status(self) -> dict:
-        return self.worker.status()
+        from .lifecycle_state import lifecycle_state
+
+        lifecycle = lifecycle_state.projection()
+        return {**self.worker.status(), "state": lifecycle["operation_state"], "startup": lifecycle["startup"], "lifecycle": lifecycle}

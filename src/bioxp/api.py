@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -18,6 +19,10 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from .oem_config import harmonized_motion_config
+from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_state
+from .lifecycle_state import LifecycleStateError, lifecycle_state
+from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
+from .runtime_state import configure_oem_runtime_state_from_env
 from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gripper_idle_current
 from .oem_initialization import run_oem_initialization_controller
 from .oem_compat.api import router as oem_compat_router
@@ -79,6 +84,14 @@ from .services.vision_service import (
     run_barcode_read_command,
     run_inspection_command,
 )
+
+BMS_COMMISSIONING_CAPABILITIES = (
+    "collect_hardware_snapshot",
+    "construct_pipettes",
+    "initialize_without_motion",
+    "run_initial_check",
+)
+
 try:
     from .usb_driver import BioXpTester
 except ModuleNotFoundError as exc:
@@ -121,7 +134,7 @@ def _default_reference_state_path() -> str:
 _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
-_pipette_transport = build_default_pipette_transport()
+_pipette_transport = None
 try:
     _vision_capabilities = load_deck_layout().capabilities
 except Exception:
@@ -138,6 +151,10 @@ _camera_stream_state = {
     "last_frame_at": None,
     "last_error": None,
 }
+_camera_projection_lock = threading.RLock()
+_camera_projection_epoch = 0
+_camera_probe_cache: dict[str, Any] | None = None
+_camera_session: dict[str, Any] | None = None
 USB_SNIFF_ACK = "USB_SNIFF"
 USB_SNIFF_PROFILES = {"passive", "manual_observe", "debug"}
 RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
@@ -184,6 +201,28 @@ def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]
     _maintenance_state["last_transition"] = str(transition)
     _maintenance_state["last_transition_at"] = _now_utc()
     return _maintenance_state_payload()
+
+
+def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
+    """Invalidate every hardware and camera projection on ownership changes."""
+    global _camera_projection_epoch, _camera_probe_cache
+    epoch = hardware_state.change_ownership(
+        reason=reason,
+        transport=transport,
+        usb=usb,
+        router=router,
+    )
+    with _camera_projection_lock:
+        _camera_projection_epoch += 1
+        _camera_probe_cache = None
+        _camera_stream_state.update(
+            {
+                "active": False,
+                "last_error": f"invalidated by ownership change: {reason}",
+                "last_frame_at": None,
+            }
+        )
+    return epoch
 
 
 def _mark_post_maintenance_motion_block(*, source: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -241,31 +280,53 @@ async def lifespan(app: FastAPI):
     del app
     global _tester, _startup_error, _pipette_transport
     try:
-        alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
-        _tester = BioXpTester(alt=alt)
-        try:
-            _tester.motor_restore_gripper_idle_current(reason="api_startup_safe_idle")
-        except Exception as idle_exc:
-            print(f"[WARN] BioXP gripper idle-current sanitizer failed: {idle_exc}")
-        _startup_error = None
+        machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
+        configure_oem_runtime_state_from_env(machine_snapshot)
+        # OEM BioXPMainWindow sets BoardTestMode only when the process command
+        # line contains the separate token "boardtest".  It is not StartMode.
+        board_test_mode = os.environ.get("BIOXP_BOARD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "boardtest"}
+        lifecycle_state.bind_configuration(
+            start_mode=machine_snapshot.startup_mode,
+            board_test_mode=board_test_mode,
+            check_camera=bool(machine_snapshot.operation_parameters["CheckCamera"]),
+        )
     except Exception as exc:
         _tester = None
-        _startup_error = str(exc)
-        print(f"[WARN] BioXP USB runtime unavailable: {_startup_error}")
-    _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
-    try:
-        configure_oem_runtime(startup_program_factory=lambda: _get_oem_startup_program(dry_safe=(_tester is None)), autostart=True)
-    except Exception as exc:
-        print(f"[WARN] BioXP OEM runtime unavailable: {exc}")
+        _startup_error = f"OEM machine/runtime-state authority unavailable: {exc}"
+        print(f"[WARN] {_startup_error}")
+    else:
+        _tester = None
+        _startup_error = (
+            "USB transport is intentionally unbound during generic API lifespan; "
+            "use an explicit ownership POST before hardware collection."
+        )
+    _ownership_changed(
+        reason="generic_lifespan_unbound",
+        transport="unbound",
+        usb="unbound",
+        router="unbound",
+    )
     try:
         yield
     finally:
+        await _stop_owned_camera_session(reason="lifespan shutdown")
         shutdown_oem_runtime()
-        _tester = None
         close_fn = getattr(_pipette_transport, "close", None)
         if callable(close_fn):
             close_fn()
-        _pipette_transport = build_default_pipette_transport()
+        tester = _tester
+        if tester is not None:
+            disconnect = getattr(tester, "_disconnect", None)
+            if callable(disconnect):
+                disconnect()
+        _tester = None
+        _pipette_transport = None
+        _ownership_changed(
+            reason="generic_lifespan_shutdown",
+            transport="unbound",
+            usb="unbound",
+            router="stopped",
+        )
 
 
 app = FastAPI(
@@ -341,7 +402,90 @@ class _BioXpSwitchAuditHardware:
         }
 
 
+class _LifecycleHardware:
+    """Exact startup-stage adapter; constructed only inside explicit POST work."""
+
+    def __init__(self, tester: BioXpTester):
+        self.tester = tester
+
+    def set_led_rgb(self, r: int, g: int, b: int) -> dict[str, Any]:
+        return self.tester.strip_set_rgb(int(r), int(g), int(b), reconnect_first=False)
+
+    def query_door(self) -> dict[str, Any]:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 1, 0, 0)
+        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
+
+    def query_latch(self) -> dict[str, Any]:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 3, 0, 0)
+        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
+
+    def set_solenoid(self, value: int) -> dict[str, Any]:
+        return self.tester.deck_io_set_type(2, int(value))
+
+    def query_voltage(self) -> dict[str, Any]:
+        ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 0, 0, 0)
+        status = None if ack is None else ack.get("status")
+        value = None if ack is None or status != 100 else ack.get("value")
+        return {
+            "payload_raw": value,
+            "reply_present": ack is not None,
+            "transport_outcome": "reply" if ack is not None else "no_reply",
+            "oem_status": status,
+            "ack": ack,
+        }
+
+    def deactivate_boards(self) -> dict[str, Any]:
+        return self.tester.deactivate_boards(expect_reply=True)
+
+    def activate_boards(self) -> dict[str, Any]:
+        return self.tester.activate_boards(expect_reply=True)
+
+
+def _can_ready_observation() -> bool | None:
+    return (hardware_state.ownership_projection().get("ownership") or {}).get("CAN_READY")
+
+
+def _constructor_pipette_action() -> dict[str, Any]:
+    owner = _get_pipette_transport()
+    if owner.__class__.__name__ != "FourPipetteTransport":
+        return {"ok": False, "error": "exact_four_pipette_owner_required"}
+    result = owner.initialize(PipetteInitCommand())
+    return {
+        **result,
+        "ok": bool(result.get("ok")),
+        "channel_count": 4,
+        "channels_constructed_unconditionally": [0, 1, 2, 3],
+        "predecessor": "CAN_READY",
+        "can_ready_evidence": _can_ready_observation(),
+        "motion_commanded": False,
+    }
+
+
+def _initialize_without_motion_action() -> dict[str, Any]:
+    tester = _get_tester()
+    motor_current = tester.motor_oem_initialize_without_motion()
+    if bool(motor_current.get("physical_motion")):
+        return {"ok": False, "error": "initialize_without_motion_reported_motion", "motor_current_verification": motor_current}
+    led_red = tester.strip_set_rgb(255, 0, 0, reconnect_first=False)
+    lifecycle = lifecycle_state.projection()
+    ok = bool(motor_current.get("ok") and isinstance(led_red, dict) and led_red.get("ok", "error" not in led_red) and "error" not in led_red)
+    return {
+        "ok": ok,
+        "motor_current_verification": motor_current,
+        "led_red": led_red,
+        "start_mode_assignment": {
+            "value": lifecycle.get("start_mode"),
+            "source": "immutable OperationParameters.Mode",
+            "assigned_to": "canonical lifecycle owner",
+        },
+        "physical_motion": False,
+        "homing_performed": False,
+    }
+
+
 def _get_pipette_transport():
+    if _pipette_transport is None:
+        raise HTTPException(status_code=503, detail="Pipette transport owner is unavailable")
     return _pipette_transport
 
 
@@ -352,47 +496,79 @@ async def oem_startup_request(req: OemStartupRequest):
         raise HTTPException(status_code=409, detail="operator_ack INITIALIZE required for live OEM startup")
     if request_payload.get("mode") == "live" and not request_payload.get("artifact_root"):
         raise HTTPException(status_code=409, detail="artifact_root required for live OEM startup")
-    program = _get_oem_startup_program(dry_safe=request_payload.get("mode") == "dry_run")
-    status = program.request_startup(request_payload)
-    if status.get("failed_closed") and request_payload.get("mode") == "live":
-        raise HTTPException(status_code=409, detail=status.get("failure_reason") or "OEM startup failed closed")
+    # This route binds the explicit startup owner only.  It cannot collapse the
+    # three separately approved OEM stages into a generic startup request.
+    _get_oem_startup_program(dry_safe=request_payload.get("mode") == "dry_run")
+    status = lifecycle_state.transition("waiting", reason="startup_requested_awaiting_constructor_stage")
     return {
-        "ok": bool(status.get("ok", True)),
-        "session_id": status.get("session_id"),
-        "status": status.get("state"),
-        "state": status.get("state"),
-        "mode": status.get("mode"),
-        "queued": bool(status.get("queued", False)),
-        "artifact_root": status.get("artifact_root"),
-        "startup_status_url": f"/oem/startup/status/{status.get('session_id')}",
-        "source_anchors": list((status.get("source_anchors") or {}).values()),
+        "ok": True,
+        "session_id": "canonical",
+        "status": status["startup"]["state"],
+        "state": status["operation_state"],
+        "mode": request_payload.get("mode"),
+        "queued": False,
+        "artifact_root": request_payload.get("artifact_root"),
+        "startup_status_url": "/oem/startup/status/canonical",
+        "lifecycle": status,
+        "next_action": "POST /oem/startup/constructor_pipettes",
     }
 
 
 @app.get("/oem/startup/status/latest")
 async def oem_startup_status_latest():
-    return _get_existing_oem_startup_program().status()
+    projection = lifecycle_state.projection()
+    return {"ok": True, "available": True, "cache_state": "memory", "state": projection["startup"]["state"], "lifecycle": projection}
 
 
 @app.get("/oem/startup/status/{session_id}")
 async def oem_startup_status(session_id: str):
-    status = _get_existing_oem_startup_program().status(session_id)
-    if status.get("state") == "none":
+    if session_id != "canonical":
         raise HTTPException(status_code=404, detail="startup session not found")
-    return status
+    projection = lifecycle_state.projection()
+    return {"ok": True, "available": True, "cache_state": "memory", "session_id": session_id, "state": projection["startup"]["state"], "lifecycle": projection}
+
+
+@app.post("/oem/startup/constructor_pipettes")
+async def oem_startup_constructor_pipettes():
+    if _can_ready_observation() is not True:
+        raise HTTPException(status_code=409, detail="constructor pipette stage requires explicit CAN_READY=true evidence")
+    try:
+        projection = await _run_blocking(
+            "OEM constructor four-pipette stage",
+            lambda: lifecycle_state.run_stage("constructor_pipette_stage", _constructor_pipette_action),
+            timeout_s=260.0,
+        )
+    except LifecycleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if projection["startup"]["stages"]["constructor_pipette_stage"]["state"] != "passed":
+        raise HTTPException(status_code=409, detail=projection)
+    return {"ok": True, "lifecycle": projection}
+
+
+@app.post("/oem/startup/initialize_without_motion")
+async def oem_startup_initialize_without_motion():
+    try:
+        projection = await _run_blocking(
+            "OEM initializeMotorsWithoutMotion stage",
+            lambda: lifecycle_state.run_stage("initialization_without_motion", _initialize_without_motion_action),
+            timeout_s=120.0,
+        )
+    except LifecycleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if projection["startup"]["stages"]["initialization_without_motion"]["state"] != "passed":
+        raise HTTPException(status_code=409, detail=projection)
+    return {"ok": True, "lifecycle": projection}
 
 
 @app.post("/oem/startup/door_event")
 async def oem_startup_door_event(req: OemDoorEventRequest):
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-    try:
-        return _get_existing_oem_startup_program().door_event(
-            payload.get("session_id"),
-            door_closed=bool(payload.get("door_closed")),
-            latch_closed=bool(payload.get("latch_closed")),
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    projection = lifecycle_state.record_door_event(
+        door_closed=payload.get("door_closed"),
+        latch_closed=payload.get("latch_closed"),
+        source="POST /oem/startup/door_event",
+    )
+    return {"ok": True, "lifecycle": projection, "door": projection["door"]}
 
 
 @app.post("/oem/initial_check")
@@ -401,15 +577,36 @@ async def oem_initial_check(req: OemInitialCheckRequest | None = None):
     mode = payload.get("mode", "shadow")
     if mode == "live" and payload.get("operator_ack") != "INITIALIZE":
         raise HTTPException(status_code=409, detail="operator_ack INITIALIZE required for live OEM initialCheck")
-    program = _get_oem_startup_program(dry_safe=(mode == "dry_run"))
-    if hasattr(program.hardware, "initial_check"):
-        return program.hardware.initial_check(mode=mode)
-    raise HTTPException(status_code=503, detail="OEM initialCheck provider unavailable")
+    if mode != "live":
+        return {
+            "ok": True,
+            "executed": False,
+            "mode": mode,
+            "lifecycle": lifecycle_state.projection(),
+            "reason": "shadow/dry-run cannot claim completion of the OEM physical initialCheck stage",
+        }
+    tester = _get_tester()
+    try:
+        projection = await _run_blocking(
+            "OEM initialCheck stage",
+            lambda: lifecycle_state.run_initial_check(
+                _LifecycleHardware(tester),
+                can_ready=_can_ready_observation,
+            ),
+            timeout_s=60.0,
+        )
+    except LifecycleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if projection["startup"]["stages"]["initial_check"]["state"] != "passed":
+        raise HTTPException(status_code=409, detail=projection)
+    return {"ok": True, "lifecycle": projection}
 
 
 @app.get("/oem/motion_worker/status")
 async def oem_motion_worker_status():
-    return _get_existing_oem_startup_program().worker_status()
+    if _oem_startup_program is None:
+        return {"ok": False, "available": False, "cache_state": "missing", "worker": None, "error": "OEM startup worker has not been created by an explicit startup POST"}
+    return {**_oem_startup_program.worker_status(), "lifecycle": lifecycle_state.projection()}
 
 
 @app.post("/oem/motion_worker/run_next")
@@ -1054,12 +1251,21 @@ def _reference_row_for_axis(axis: AxisName) -> dict:
 
 
 def _require_axis_not_operator_desynced(axis: AxisName, *, command: str) -> None:
-    # 2026-06-02 Christian override: do not block motion solely because the
-    # reference metadata is marked desynced. Keep the reference/desync state
-    # visible in status and motion evidence, but allow explicitly requested
-    # commissioning moves to proceed through the normal arm/interlock/limit
-    # gates so we can compare working vs inconsistent control paths.
-    return
+    row = _reference_row_for_axis(axis)
+    if isinstance(row, dict) and row.get("state") == "desynced":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Axis {axis.value} reference is marked desynced; refusing {command} "
+                    "until the operator re-establishes a trusted physical reference."
+                ),
+                "axis": axis.value,
+                "state": row,
+                "blocked_command": command,
+                "reason": "operator_physical_truth_over_controller_counter_truth",
+            },
+        )
 
 
 def _motion_truth_payload() -> dict:
@@ -1228,6 +1434,56 @@ _MOTION_EVENT_BUCKETS = {
 }
 
 
+def _event_matches_motion_axis(event: dict, preset: Any) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if not isinstance(preset, dict):
+        return True
+    expected_board = preset.get("board")
+    expected_motor = preset.get("motor")
+    try:
+        if expected_board is not None and event.get("board") is not None and int(event.get("board")) != int(expected_board):
+            return False
+    except (TypeError, ValueError):
+        return False
+    # OEM dispatches TARGET_POSITION_REACHED/STALL_GUARD to a specific motor.
+    # If the event carries a motor byte, it must match. If it does not carry a
+    # motor byte, do not use it as positive target-reached proof.
+    if event.get("status") == 128 and event.get("motor") is None:
+        return False
+    try:
+        if expected_motor is not None and event.get("motor") is not None and int(event.get("motor")) != int(expected_motor):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _filter_motion_events_for_axis(raw_events: Optional[list[dict]], preset: Any) -> list[dict]:
+    out = []
+    for event in raw_events or []:
+        if not isinstance(event, dict):
+            continue
+        status = event.get("status")
+        try:
+            status_int = int(status)
+        except (TypeError, ValueError):
+            out.append(event)
+            continue
+        if status_int == 128:
+            if _event_matches_motion_axis(event, preset):
+                out.append(event)
+            continue
+        if status_int in {130, 14, 13}:
+            # Error events fail closed. If motor-specific, require matching motor;
+            # if not motor-specific, keep them because OEM raises board errors.
+            if event.get("motor") is None or _event_matches_motion_axis(event, preset):
+                out.append(event)
+            continue
+        out.append(event)
+    return out
+
+
 def _classify_motion_events(raw_events: Optional[list[dict]] = None, *, capture_attempted: bool = False) -> dict:
     raw = [event for event in (raw_events or []) if isinstance(event, dict)]
     out = {"capture_attempted": bool(capture_attempted), "raw": raw, "captured_count": len(raw)}
@@ -1331,27 +1587,74 @@ def _motion_log_nonzero_speed(wait: Any) -> bool:
     return False
 
 
+def _gap8_target_reached_value(wait: Any) -> Any:
+    if not isinstance(wait, dict):
+        return None
+    row = wait.get("reached_position_after")
+    if isinstance(row, dict) and "target_reached" in row:
+        return row.get("target_reached")
+    tail = wait.get("log_tail")
+    if isinstance(tail, list):
+        for entry in reversed(tail):
+            if isinstance(entry, dict) and "target_reached" in entry:
+                return entry.get("target_reached")
+    return None
+
+
+def _gap8_target_confirmed(wait: Any) -> bool:
+    # Decompiled OEM ClassMotor.queryReachedPosition() only treats GAP8 query ACK
+    # success as method return 0. It is tracked as telemetry but not used as the
+    # normal movement-complete proof; async event 128 is the proof.
+    return False
+
+
+def _first_controller_motion_error(events: Any) -> Optional[dict]:
+    if not isinstance(events, dict):
+        return None
+    for bucket, status in (("stallguard_130", 130), ("max_current_reference_deviation_14", 14), ("voltage_drop_13", 13)):
+        rows = events.get(bucket)
+        if isinstance(rows, list) and rows:
+            event = rows[0] if isinstance(rows[0], dict) else {"raw": rows[0]}
+            out = dict(event)
+            out.setdefault("status", status)
+            out.setdefault("bucket", bucket)
+            return out
+    return None
+
+
 def _motion_telemetry_packet(position_before: Any, switch_before: Any, position_after: Any, switch_after: Any, wait: Any) -> dict:
     during = wait.get("log_tail") if isinstance(wait, dict) and isinstance(wait.get("log_tail"), list) else []
     last_speed = wait.get("last_speed") if isinstance(wait, dict) else None
+    gap8_value = _gap8_target_reached_value(wait)
+    gap8_after = wait.get("reached_position_after") if isinstance(wait, dict) else None
+    gap8_available = isinstance(gap8_after, dict)
     return {
         "before": {
             "gap1_position": position_before,
             "gap3_speed": None,
-            "gap8_target_reached": {"available": False, "value": None, "source": "not_polled_in_default_path"},
+            "gap8_target_reached": {"available": False, "value": None, "source": "not_sampled_before_move"},
             "gap9_gap10_switches": switch_before,
         },
         "during": during,
         "after": {
             "gap1_position": position_after,
             "gap3_speed": {"speed": last_speed} if last_speed is not None else None,
-            "gap8_target_reached": {"available": False, "value": None, "source": "not_polled_in_default_path"},
+            "gap8_target_reached": {"available": gap8_available, "value": gap8_value, "row": gap8_after, "source": "GAP8/ClassMotor.queryReachedPosition" if gap8_available else "not_available"},
             "gap9_gap10_switches": switch_after,
         },
     }
 
 
-def _motion_classification(move: Any, wait: Any, position_before: Any, position_after: Any, events: dict) -> dict:
+def _motion_classification(
+    move: Any,
+    wait: Any,
+    position_before: Any,
+    position_after: Any,
+    events: dict,
+    *,
+    switch_transition: bool = False,
+    home_predicate_confirmed: bool = False,
+) -> dict:
     delta = _position_delta(position_before, position_after)
     nonzero_speed_seen = _motion_log_nonzero_speed(wait)
     target_event_seen = bool(events.get("target_reached_128")) if isinstance(events, dict) else False
@@ -1359,14 +1662,23 @@ def _motion_classification(move: Any, wait: Any, position_before: Any, position_
     voltage_drop_seen = bool(events.get("voltage_drop_13")) if isinstance(events, dict) else False
     max_current_reference_deviation_seen = bool(events.get("max_current_reference_deviation_14")) if isinstance(events, dict) else False
     door_latch_event_seen = bool(events.get("door_latch_132")) if isinstance(events, dict) else False
+    gap8_value = _gap8_target_reached_value(wait)
+    gap8_confirmed = _gap8_target_confirmed(wait)
+    controller_error_seen = bool(stall_event_seen or voltage_drop_seen or max_current_reference_deviation_seen)
     move_ack_ok = bool(isinstance(move, dict) and move.get("ok") is True)
+    controller_target_confirmed = bool(target_event_seen or gap8_confirmed)
+    # GAP1/GAP3 deltas are not independent proof of motion because the controller
+    # can report phantom position/speed when the axis is stalled or desynced.
+    # Accept only source-shaped controller evidence:
+    # (a) a target-reached event for normal moves, or
+    # (b) the home predicate confirmed after stop + setHome for homing.
+    # A switch transition is retained as telemetry, but OEM goHome ultimately keys
+    # on queryHome() active after the search, not on our Linux-only requirement that
+    # an inactive sample must have appeared in the polling window.
     controller_motion_evidence = bool(
         move_ack_ok
-        and (
-            (delta is not None and int(delta) != 0)
-            or nonzero_speed_seen
-            or target_event_seen
-        )
+        and not controller_error_seen
+        and (controller_target_confirmed or home_predicate_confirmed)
     )
     return {
         "move_ack_ok": move_ack_ok,
@@ -1378,7 +1690,11 @@ def _motion_classification(move: Any, wait: Any, position_before: Any, position_
         "door_latch_event_seen": door_latch_event_seen,
         "position_delta": delta,
         "nonzero_speed_seen": nonzero_speed_seen,
-        "gap8_target_reached": None,
+        "gap8_target_reached": gap8_value,
+        "controller_target_confirmed": controller_target_confirmed,
+        "controller_error_seen": controller_error_seen,
+        "switch_transition": switch_transition,
+        "home_predicate_confirmed": bool(home_predicate_confirmed),
         "physical_motion_confirmed": False,
         "physical_proof_source": None,
         "evidence_level": "controller_only",
@@ -1399,8 +1715,11 @@ def _build_motion_evidence(
     motion_profile: Optional[dict] = None,
     raw_events: Optional[list[dict]] = None,
     event_capture_attempted: bool = False,
+    switch_transition: bool = False,
+    home_predicate_confirmed: bool = False,
 ) -> dict:
-    events = _classify_motion_events(raw_events, capture_attempted=event_capture_attempted)
+    filtered_events = _filter_motion_events_for_axis(raw_events, preset)
+    events = _classify_motion_events(filtered_events, capture_attempted=event_capture_attempted)
     telemetry = _motion_telemetry_packet(position_before, switch_before, position_after, switch_after, wait)
     return {
         "prep_params": _normalize_motion_prep_params(preset, prep, motion_profile=motion_profile),
@@ -1411,7 +1730,17 @@ def _build_motion_evidence(
             "after": interlock.get("snap_after") if isinstance(interlock, dict) else None,
             "raw": interlock,
         },
-        "classification": _motion_classification(move, wait, position_before, position_after, events),
+        "classification": _motion_classification(
+            move,
+            wait,
+            position_before,
+            position_after,
+            events,
+            switch_transition=switch_transition,
+            home_predicate_confirmed=home_predicate_confirmed,
+        ),
+        "switch_transition": switch_transition,
+        "home_predicate_confirmed": bool(home_predicate_confirmed),
     }
 
 
@@ -1421,10 +1750,26 @@ def _build_home_motion_evidence(*, preset: Any, prep: Any, interlock: Any, home:
     position_after = payload.get("position_after") if isinstance(payload, dict) else None
     switch_before = payload.get("switch_activity_before") if isinstance(payload, dict) else None
     switch_after = payload.get("switch_activity_after") if isinstance(payload, dict) else None
+    switch_transition = bool(payload.get("switch_transition")) if isinstance(payload, dict) else False
+    active_value = payload.get("home_active_value") if isinstance(payload, dict) else None
+    home_after = payload.get("home_after") if isinstance(payload, dict) else None
+    set_home = payload.get("set_home") if isinstance(payload, dict) else None
+    home_after_active = bool(
+        active_value is not None
+        and isinstance(home_after, dict)
+        and home_after.get("value") is not None
+        and int(home_after.get("value")) == int(active_value)
+    )
+    set_home_ok = bool(isinstance(set_home, dict) and set_home.get("ok") is True)
+    # OEM goHome proof is queryHome() active after the search/stop followed by setHome().
+    # The inactive->active transition is useful telemetry, not a Linux-only hard gate.
+    home_predicate_confirmed = bool(home_after_active and set_home_ok and payload.get("ok") is True)
     wait = {
         "ok": payload.get("ok") if isinstance(payload, dict) else None,
         "log_tail": payload.get("log_tail") if isinstance(payload, dict) else [],
         "seen_nonzero": _motion_log_nonzero_speed({"log_tail": payload.get("log_tail")}) if isinstance(payload, dict) else False,
+        "home_after_active": home_after_active,
+        "set_home_ok": set_home_ok,
     }
     move = payload.get("move_left") or payload if isinstance(payload, dict) else None
     return _build_motion_evidence(
@@ -1438,6 +1783,8 @@ def _build_home_motion_evidence(*, preset: Any, prep: Any, interlock: Any, home:
         move=move,
         wait=wait,
         motion_profile=motion_profile,
+        switch_transition=switch_transition,
+        home_predicate_confirmed=home_predicate_confirmed,
     )
 
 
@@ -1505,6 +1852,64 @@ def _guard_direction(axis: AxisName, steps: int, switch_activity: Optional[dict]
     return
 
 
+def _axis_limit_row(axis: AxisName) -> dict:
+    config = harmonized_motion_config()
+    limits = config.get("axis_limits", {}) if isinstance(config, dict) else {}
+    row = limits.get(axis.value) if isinstance(limits, dict) else None
+    out = dict(row) if isinstance(row, dict) else {}
+    if axis == AxisName.Z:
+        source_min = _limit_int(out, "min_steps")
+        source_max = _limit_int(out, "max_steps")
+        # OEM ClassBioXPSettings stores source-space Z as 0..ZHighLimit,
+        # while the commissioned live controller reports upward travel as
+        # negative counts with reference at zero. Preserve both contracts.
+        if (
+            source_min is not None
+            and source_max is not None
+            and source_min >= 0
+            and source_max >= source_min
+        ):
+            out.update({
+                "source_min_steps": source_min,
+                "source_max_steps": source_max,
+                "min_steps": -source_max,
+                "max_steps": 0,
+                "coordinate_contract": "observed_live_signed_z",
+                "source_coordinate_contract": "oem_source_nonnegative_z",
+                "oem_equivalent": False,
+            })
+    return out
+
+
+def _limit_int(row: dict, key: str) -> Optional[int]:
+    try:
+        value = row.get(key)
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _guard_axis_position_within_oem_limits(axis: AxisName, position_row: Optional[dict], *, command: str) -> None:
+    position = _position_value(position_row)
+    if position is None:
+        return
+    limit = _axis_limit_row(axis)
+    min_steps = _limit_int(limit, "min_steps")
+    max_steps = _limit_int(limit, "max_steps")
+    if (min_steps is not None and int(position) < min_steps) or (max_steps is not None and int(position) > max_steps):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Axis {axis.value} controller position is outside the OEM configured envelope; refusing {command}.",
+                "axis": axis.value,
+                "position_steps": int(position),
+                "configured_limit": limit,
+                "motion_blocked": True,
+                "reason": "controller_position_outside_oem_axis_limits",
+            },
+        )
+
+
 def _guard_absolute_target(
     axis: AxisName,
     current_position: Optional[dict],
@@ -1513,9 +1918,37 @@ def _guard_absolute_target(
     preset: Optional[dict] = None,
 ) -> None:
     current = _position_value(current_position)
+    limit = _axis_limit_row(axis)
+    min_steps = _limit_int(limit, "min_steps")
+    max_steps = _limit_int(limit, "max_steps")
+    target = int(target_steps)
+    if (min_steps is not None and target < min_steps) or (max_steps is not None and target > max_steps):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Axis {axis.value} target is outside the configured live envelope; refusing motion.",
+                "axis": axis.value,
+                "current_position_steps": None if current is None else int(current),
+                "target_position_steps": target,
+                "configured_limit": limit,
+                "motion_blocked": True,
+                "reason": "target_outside_oem_axis_limits",
+            },
+        )
     if current is None:
-        return
-    _guard_direction(axis, int(target_steps) - int(current), switch_activity, preset)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Axis {axis.value} current controller position is unavailable; refusing motion.",
+                "axis": axis.value,
+                "target_position_steps": target,
+                "configured_limit": limit,
+                "motion_blocked": True,
+                "reason": "current_position_unavailable_for_motion_guard",
+            },
+        )
+    _guard_axis_position_within_oem_limits(axis, current_position, command="axis absolute/relative move")
+    _guard_direction(axis, target - int(current), switch_activity, preset)
 
 
 def _wait_for_motion_with_guardrails(
@@ -1541,9 +1974,14 @@ def _wait_for_motion_with_guardrails(
         speed_row = tester.motor_get_speed(board, motor=motor)
         position_row = tester.motor_get_position(board, motor=motor)
         switch_row = tester.motor_get_switch_activity(board, motor=motor)
+        reached_row = {"available": False, "target_reached": None, "source": "motor_get_reached_position_unavailable"}
+        get_reached = getattr(tester, "motor_get_reached_position", None)
+        if callable(get_reached):
+            reached_row = get_reached(board, motor=motor)
         now = time.monotonic()
         speed = _speed_value(speed_row)
         position = _position_value(position_row)
+        target_reached = reached_row.get("target_reached") if isinstance(reached_row, dict) else None
         polls += 1
         if isinstance(speed, int) and speed != 0:
             seen_nonzero = True
@@ -1555,7 +1993,7 @@ def _wait_for_motion_with_guardrails(
             last_position = position
             last_progress_at = now
 
-        log_tail.append({"elapsed_ms": int((now - started) * 1000), "speed": speed, "position": position})
+        log_tail.append({"elapsed_ms": int((now - started) * 1000), "speed": speed, "position": position, "target_reached": target_reached})
         if len(log_tail) > 20:
             log_tail = log_tail[-20:]
 
@@ -1571,6 +2009,7 @@ def _wait_for_motion_with_guardrails(
                     "seen_nonzero": seen_nonzero,
                     "position_after": position_row,
                     "switch_activity_after": switch_row,
+                    "reached_position_after": reached_row,
                     "stop": stop,
                     "log_tail": log_tail,
                 }
@@ -1582,6 +2021,7 @@ def _wait_for_motion_with_guardrails(
                 "seen_nonzero": seen_nonzero,
                 "position_after": position_row,
                 "switch_activity_after": switch_row,
+                "reached_position_after": reached_row,
                 "log_tail": log_tail,
             }
 
@@ -1599,6 +2039,7 @@ def _wait_for_motion_with_guardrails(
                 "seen_nonzero": seen_nonzero,
                 "position_after": position_row,
                 "switch_activity_after": switch_row,
+                "reached_position_after": reached_row,
                 "stop": stop,
                 "settle": settle,
                 "log_tail": log_tail,
@@ -1737,7 +2178,11 @@ def _execute_relative_move(
     )
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
-    _guard_direction(axis, steps, switch_before, preset)
+    current = _position_value(position_before)
+    if current is not None:
+        _guard_absolute_target(axis, position_before, int(current) + int(steps), switch_before, preset)
+    else:
+        _guard_direction(axis, steps, switch_before, preset)
     motion_profile = {
         "speed": int(preset["speed"]),
         "acc": int(preset["acc"]),
@@ -1799,27 +2244,73 @@ def _execute_relative_move(
         "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
     }
     raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
+    events = _classify_motion_events(_filter_motion_events_for_axis(raw_events, preset), capture_attempted=event_capture_attempted)
+    controller_error = _first_controller_motion_error(events)
+    if controller_error is not None:
+        response = _motion_failure_response(
+            axis=axis,
+            category="controller_motion_error",
+            message=f"Axis {axis.value} controller reported motion error event {controller_error.get('status')} during relative move.",
+            board_status=board_status,
+            interlock=interlock,
+            prep=prep,
+            prep_policy=prep_policy,
+            motion_profile=motion_profile,
+            position_before=position_before,
+            position_after=position_after,
+            switch_before=switch_before,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        )
+        response["motion_failure"]["event_status"] = controller_error.get("status")
+        response["motion_failure"]["event_bucket"] = controller_error.get("bucket")
+        response["motion_failure"]["event"] = controller_error
+        return response
+    evidence = _build_motion_evidence(
+        preset=preset,
+        prep=prep,
+        interlock=interlock,
+        position_before=position_before,
+        switch_before=switch_before,
+        position_after=position_after,
+        switch_after=switch_after,
+        move=move,
+        wait=wait,
+        motion_profile=motion_profile,
+        raw_events=raw_events,
+        event_capture_attempted=event_capture_attempted,
+    )
+    if not (((evidence.get("classification") or {}).get("controller_motion_evidence")) is True):
+        return _motion_failure_response(
+            axis=axis,
+            category="oem_motion_evidence_missing",
+            message=f"Axis {axis.value} move lacked OEM target-reached/switch-transition evidence; refusing success from GAP1/GAP3 alone.",
+            board_status=board_status,
+            interlock=interlock,
+            prep=prep,
+            prep_policy=prep_policy,
+            motion_profile=motion_profile,
+            position_before=position_before,
+            position_after=position_after,
+            switch_before=switch_before,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        )
     return {
+        "ok": True,
         "axis": axis.value,
         "board_status": board_status,
         "interlock": interlock,
         "prep": prep,
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
-        "motion_evidence": _build_motion_evidence(
-            preset=preset,
-            prep=prep,
-            interlock=interlock,
-            position_before=position_before,
-            switch_before=switch_before,
-            position_after=position_after,
-            switch_after=switch_after,
-            move=move,
-            wait=wait,
-            motion_profile=motion_profile,
-            raw_events=raw_events,
-            event_capture_attempted=event_capture_attempted,
-        ),
+        "motion_evidence": evidence,
         "motion_profile": motion_profile,
         "position_before": position_before,
         "position_after": position_after,
@@ -1908,27 +2399,74 @@ def _execute_absolute_move(
         "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
     }
     raw_events, event_capture_attempted = _collect_motion_event_capture(tester)
+    events = _classify_motion_events(_filter_motion_events_for_axis(raw_events, preset), capture_attempted=event_capture_attempted)
+    controller_error = _first_controller_motion_error(events)
+    if controller_error is not None:
+        response = _motion_failure_response(
+            axis=axis,
+            category="controller_motion_error",
+            message=f"Axis {axis.value} controller reported motion error event {controller_error.get('status')} during absolute move.",
+            board_status=board_status,
+            interlock=interlock,
+            prep=prep,
+            prep_policy=prep_policy,
+            motion_profile=motion_profile,
+            position_before=position_before,
+            position_after=position_after,
+            switch_before=switch_before,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        )
+        response["motion_failure"]["event_status"] = controller_error.get("status")
+        response["motion_failure"]["event_bucket"] = controller_error.get("bucket")
+        response["motion_failure"]["event"] = controller_error
+        return response
+    evidence = _build_motion_evidence(
+        preset=preset,
+        prep=prep,
+        interlock=interlock,
+        position_before=position_before,
+        switch_before=switch_before,
+        position_after=position_after,
+        switch_after=switch_after,
+        move=move,
+        wait=wait,
+        motion_profile=motion_profile,
+        raw_events=raw_events,
+        event_capture_attempted=event_capture_attempted,
+    )
+    if not (((evidence.get("classification") or {}).get("controller_motion_evidence")) is True):
+        return _motion_failure_response(
+            axis=axis,
+            category="oem_motion_evidence_missing",
+            message=f"Axis {axis.value} move lacked OEM target-reached/switch-transition evidence; refusing success from GAP1/GAP3 alone.",
+            board_status=board_status,
+            interlock=interlock,
+            prep=prep,
+            prep_policy=prep_policy,
+            motion_profile=motion_profile,
+            position_before=position_before,
+            position_after=position_after,
+            switch_before=switch_before,
+            switch_after=switch_after,
+            move=move,
+            wait=wait,
+            target_position=position_steps,
+            raw_events=raw_events,
+            event_capture_attempted=event_capture_attempted,
+        )
     return {
+        "ok": True,
         "axis": axis.value,
         "board_status": board_status,
         "interlock": interlock,
         "prep": prep,
         "prep_policy": prep_policy,
         "motion_truth": _motion_truth_payload(),
-        "motion_evidence": _build_motion_evidence(
-            preset=preset,
-            prep=prep,
-            interlock=interlock,
-            position_before=position_before,
-            switch_before=switch_before,
-            position_after=position_after,
-            switch_after=switch_after,
-            move=move,
-            wait=wait,
-            motion_profile=motion_profile,
-            raw_events=raw_events,
-            event_capture_attempted=event_capture_attempted,
-        ),
+        "motion_evidence": evidence,
         "motion_profile": motion_profile,
         "position_before": position_before,
         "position_after": position_after,
@@ -2016,7 +2554,7 @@ def _require_home_predicate_guard(axis: AxisName, snapshot: dict, *, allow_imple
                 "required_fix_before_override": [
                     "bounded Z cmd1/cmd2 x GAP9/GAP10 predicate matrix",
                     "immediate stop on either physical limit predicate",
-                    "inactive->active transition before setHome",
+                    "queryHome active after search/stop and setHome success",
                     "camera/operator confirmation before reporting physical homing",
                 ],
             },
@@ -2037,7 +2575,7 @@ def _require_home_predicate_guard(axis: AxisName, snapshot: dict, *, allow_imple
                 "/motion/oem/startup_step for the supervised OEM startup recipe",
                 "/motion/axis/relative for operator-watched bounded jogs",
             ],
-            "override_for_supervised_commissioning": "Set allow_implementation_mapped_predicate=true only with camera/operator proof; route still requires inactive->active transition before setHome.",
+            "override_for_supervised_commissioning": "Set allow_implementation_mapped_predicate=true only with camera/operator proof; route still requires OEM queryHome/setHome proof.",
         },
     )
 
@@ -2058,7 +2596,12 @@ def _execute_home_axis(
         predicate_snapshot,
         allow_implementation_mapped_predicate=allow_implementation_mapped_predicate,
     )
-    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis)
+    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, allow_desynced_reference=True)
+    position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
+    # Homing is the OEM operation that re-establishes the controller reference.
+    # A pre-home GAP1 value outside the post-reference travel envelope is telemetry,
+    # not a reason to block the home search before it can repair the reference.
+    pre_home_axis_limit = _axis_limit_row(axis)
     transition_home = getattr(tester, "motor_oem_switch_search_home_axis", None)
     if callable(transition_home):
         home = transition_home(
@@ -2078,8 +2621,11 @@ def _execute_home_axis(
         "preset_speed": int(preset["speed"]),
         "acc": int(preset["acc"]),
         "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
-        "vendor_path": "oem_axis_search_home_transition_guarded",
+        "vendor_path": "oem_axis_search_home_queryHome_setHome",
         "predicate_snapshot_before": predicate_snapshot,
+        "position_before_home_search": position_before,
+        "pre_home_axis_limit": pre_home_axis_limit,
+        "pre_home_position_outside_limit_policy": "tracked_not_blocked_home_reestablishes_reference",
         "allow_implementation_mapped_predicate": bool(allow_implementation_mapped_predicate),
     }
     try:
@@ -2113,6 +2659,7 @@ def _execute_home_axis(
             "home": home,
         }
     return {
+        "ok": True,
         "axis": axis.value,
         "board_status": board_status,
         "interlock": interlock,
@@ -2227,8 +2774,10 @@ def _prepare_motion_axis(
     speed: Optional[int] = None,
     acc: Optional[int] = None,
     reuse_prepared: bool = False,
+    allow_desynced_reference: bool = False,
 ):
-    _require_axis_not_operator_desynced(axis, command="axis motion/prepare")
+    if not bool(allow_desynced_reference):
+        _require_axis_not_operator_desynced(axis, command="axis motion/prepare")
     preset = dict(_axis_preset(tester, axis))
     requested_profile = {
         "speed": None if speed is None else int(speed),
@@ -2316,93 +2865,231 @@ def _hardware_connected_from_board_status(board_status: Any) -> bool:
 
 
 
-def _passive_board_status(tester: BioXpTester) -> Any:
-    board_status = tester.activate_boards(expect_reply=True)
-    if _hardware_connected_from_board_status(board_status):
-        return board_status
-    retry_board_status = tester.activate_boards(expect_reply=True)
-    if _hardware_connected_from_board_status(retry_board_status):
-        return retry_board_status
-    return retry_board_status
-
-
-
-def _dedicated_chiller_status_payload(tester: BioXpTester, board_status: Any) -> Optional[dict[str, Any]]:
-    if not isinstance(board_status, dict):
-        return None
-    chiller_board = getattr(tester, "BOARD_CHILLER", 0x07)
-    if board_status.get(chiller_board) is not None:
-        return None
-
-    try:
-        activate = tester.chiller_activate()
-    except Exception as exc:
-        activate = {"ack": None, "ok": False, "error": str(exc)}
-
-    try:
-        firmware = tester.chiller_query_firmware()
-    except Exception as exc:
-        firmware = {"ack": None, "ok": False, "fw_hex": None, "error": str(exc)}
-
-    return {
-        "alive": bool(activate.get("ok") or firmware.get("ok")),
-        "activate": activate,
-        "firmware": firmware,
-        "note": "Dedicated chiller probe; board_status[7] from activate_boards is advisory.",
-    }
-
+def _domain_observation(projection: dict[str, Any], domain: str) -> Any:
+    row = (projection.get("domains") or {}).get(domain)
+    return row.get("observation") if isinstance(row, dict) and row.get("status") == "observed" else None
 
 
 def _status_payload() -> dict:
-    runtime_available = _tester is not None
-    board_status = None
-    chiller_status = None
-    deck_io_snapshot = None
-    status_error = None
-    hardware_connected = False
-    status = "degraded"
-
-    if runtime_available:
-        try:
-            board_status = _passive_board_status(_tester)
-            hardware_connected = _hardware_connected_from_board_status(board_status)
-            status = "ok" if hardware_connected else "degraded"
-            if hardware_connected:
-                try:
-                    deck_io_snapshot = _tester.io_snapshot(_tester.BOARD_DECK)
-                except Exception as exc:
-                    status_error = f"deck IO snapshot unavailable: {exc}"
-            chiller_status = _dedicated_chiller_status_payload(_tester, board_status)
-        except Exception as exc:
-            status_error = str(exc)
-
+    """Compatibility envelope projected from canonical state only."""
+    projection = hardware_state.project("transport", "boards", "latch", "chiller")
+    transport = _domain_observation(projection, "transport") or {}
+    boards = _domain_observation(projection, "boards")
+    latch = _domain_observation(projection, "latch") or {}
+    chiller = _domain_observation(projection, "chiller")
+    can_ready = transport.get("CAN_READY") if isinstance(transport, dict) else None
+    if can_ready is None:
+        can_ready = (projection.get("ownership") or {}).get("CAN_READY")
+    lifecycle = lifecycle_state.projection()
     return {
-        "status": status if runtime_available else "degraded",
+        **projection,
+        "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
+        "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
-        "runtime_available": runtime_available,
-        "hardware_connected": hardware_connected,
+        "runtime_available": transport.get("runtime_available") if isinstance(transport, dict) else None,
+        "hardware_connected": can_ready,
+        "hardware_connected_deprecated": "maps only to OEM CAN_READY",
         "startup_error": _startup_error,
-        "status_error": status_error,
-        "board_status": board_status,
-        "chiller_status": chiller_status,
-        "deck_io_snapshot": deck_io_snapshot,
+        "status_error": None if projection.get("available") else "canonical hardware snapshot unavailable",
+        "board_status": boards,
+        "chiller_status": chiller,
+        "deck_io_snapshot": latch.get("snapshot") if isinstance(latch, dict) else None,
         "maintenance_state": _maintenance_state_payload(),
+        "operation_state": lifecycle["operation_state"],
+        "startup": lifecycle["startup"],
+        "lifecycle": lifecycle,
     }
 
 
-def _motion_power_status_payload(tester: BioXpTester) -> dict:
-    board_status = _passive_board_status(tester)
-    hardware_connected = _hardware_connected_from_board_status(board_status)
-    chiller_status = _dedicated_chiller_status_payload(tester, board_status)
-    deck_io_snapshot = tester.io_snapshot(tester.BOARD_DECK) if hardware_connected else None
+def _motion_power_status_payload(tester: BioXpTester | None = None) -> dict:
+    """Pure compatibility projection; ``tester`` is ignored intentionally."""
+    del tester
+    projection = hardware_state.project("transport", "boards", "power", "interlock", "latch", "chiller")
+    transport = _domain_observation(projection, "transport") or {}
+    power = _domain_observation(projection, "power") or {}
+    interlock = _domain_observation(projection, "interlock") or {}
+    latch = _domain_observation(projection, "latch") or {}
+    lifecycle = lifecycle_state.projection()
     return {
-        "hardware_connected": hardware_connected,
-        "board_status": board_status,
-        "chiller_status": chiller_status,
-        "deck_io_snapshot": deck_io_snapshot,
-        "rail_24v": tester.motor_query_24v_sensor(),
-        "motion_arm": tester.motion_arm_state(),
-        "latch_override": tester.motion_latch_override_state(),
+        **projection,
+        "hardware_connected": transport.get("CAN_READY", (projection.get("ownership") or {}).get("CAN_READY")),
+        "hardware_connected_deprecated": "maps only to OEM CAN_READY",
+        "board_status": _domain_observation(projection, "boards"),
+        "chiller_status": _domain_observation(projection, "chiller"),
+        "deck_io_snapshot": latch.get("snapshot"),
+        "rail_24v": power.get("rail_24v"),
+        "motion_arm": interlock.get("motion_arm"),
+        "latch_override": interlock.get("latch_override"),
+        "operation_state": lifecycle["operation_state"],
+        "startup": lifecycle["startup"],
+    }
+
+
+def _query_motor(tester: BioXpTester, board: int, command: int, cmd_type: int, motor: int = 0) -> dict[str, Any]:
+    ack = tester.query_only_tmcl(int(board), int(command), int(cmd_type), int(motor), 0)
+    return {"ack": ack, "value": None if ack is None else ack.get("value")}
+
+
+def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, Any]:
+    preset = _axis_preset(tester, axis)
+    board, motor = int(preset["board"]), int(preset["motor"])
+    params = {param: _query_motor(tester, board, 6, param, motor) for param in (1, 3, 6, 7, 9, 10, 12, 13)}
+    left, right = params[9]["value"], params[10]["value"]
+    left_disabled = None if params[13]["value"] is None else bool(int(params[13]["value"]) != 0)
+    right_disabled = None if params[12]["value"] is None else bool(int(params[12]["value"]) != 0)
+    active = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
+    return {
+        "axis": axis.value,
+        "preset": preset,
+        "status": {
+            "board": board,
+            "motor": motor,
+            "position": {"position": params[1]["value"], **params[1]},
+            "speed": {"speed": params[3]["value"], **params[3]},
+            "max_current": {"param": 6, **params[6]},
+            "standby_current": {"param": 7, **params[7]},
+            "switches": {"left": params[9], "right": params[10], "right_disable": params[12], "left_disable": params[13]},
+        },
+        "switch_activity": {
+            "left_raw_active": None if left is None else int(left) == active,
+            "right_raw_active": None if right is None else int(right) == active,
+            "left_disabled": left_disabled,
+            "right_disabled": right_disabled,
+        },
+    }
+
+
+def _query_io_snapshot(tester: BioXpTester) -> dict[int, Any]:
+    return {channel: _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"] for channel in (0, 1, 2, 3)}
+
+
+def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
+    banks = (tester.THERMAL_BANK_NEST, tester.THERMAL_BANK_LID) if kind == "thermal" else (tester.CHILLER_BANK_RC, tester.CHILLER_BANK_OC)
+    gp_params = (7, 8, 13, 21, 22, 23) if kind == "thermal" else (2, 3, 7, 8, 13, 21, 22, 23)
+
+    def query(command: int, cmd_type: int, motor: int) -> dict[str, Any]:
+        ack = tester.query_only_tmcl(
+            tester.BOARD_THERMAL if kind == "thermal" else tester.BOARD_CHILLER,
+            command,
+            cmd_type,
+            motor,
+            0,
+        )
+        return {"ack": ack, "value": None if ack is None else ack.get("value"), "ok": bool(ack is not None and int(ack.get("status", -1)) == 100)}
+
+    firmware = query(173, 0, 0)
+    if kind == "thermal":
+        temperatures = {
+            "tc_temp_c": {**query(10, 4, tester.THERMAL_BANK_NEST), "bank": tester.THERMAL_BANK_NEST},
+            "lid_temp_c": {**query(10, 4, tester.THERMAL_BANK_LID), "bank": tester.THERMAL_BANK_LID},
+            "ped_temp_c": {**query(143, 0, 2), "axis": 2},
+        }
+    else:
+        temperatures = {label: {**query(143, 0, int(axis)), "axis": int(axis)} for label, axis in tester.CHILLER_TEMP_AXES}
+    gp = {bank: [{"param": param, "bank": bank, **query(10, param, bank)} for param in gp_params] for bank in banks}
+    return {"activation_attempted": False, "firmware": firmware, "temps": temperatures, "gp": gp, "alive": bool(firmware["ok"] or any(row["ok"] for row in temperatures.values()))}
+
+
+def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
+    axes_cache: dict[str, Any] | None = None
+    io_cache: dict[int, Any] | None = None
+
+    def axes(_: CollectionContext) -> dict[str, Any]:
+        nonlocal axes_cache
+        if axes_cache is None:
+            axes_cache = {axis.value: _query_axis_for_snapshot(tester, axis) for axis in AxisName}
+        return {"axes": [axis.value for axis in AxisName], "rows": axes_cache}
+
+    def io() -> dict[int, Any]:
+        nonlocal io_cache
+        if io_cache is None:
+            io_cache = _query_io_snapshot(tester)
+        return io_cache
+
+    def transport(_: CollectionContext) -> dict[str, Any]:
+        state = tester.query_only_transport_state()
+        return {
+            "runtime_available": True,
+            "CAN_READY": _can_ready_observation(),
+            "transport_internal_observation": state,
+            "board_response_is_separate": True,
+            "truth_source": "canonical transport ownership",
+        }
+
+    def boards(_: CollectionContext) -> dict[int, Any]:
+        rows = {}
+        for board in tester.BOARDS:
+            if int(board) == int(tester.BOARD_THERMAL):
+                rows[int(board)] = _query_aux_snapshot(tester, "thermal")["firmware"]
+            elif int(board) == int(tester.BOARD_CHILLER):
+                rows[int(board)] = _query_aux_snapshot(tester, "chiller")["firmware"]
+            else:
+                rows[int(board)] = _query_motor(tester, int(board), 173, 0)
+        return rows
+
+    def range_projection(context: CollectionContext) -> dict[str, Any]:
+        return {"motion_config": harmonized_motion_config(), "axis_observations": axes(context)}
+
+    def power(_: CollectionContext) -> dict[str, Any]:
+        row = _query_motor(tester, tester.BOARD_DECK, 15, 0)
+        ack = row.get("ack")
+        reply_present = ack is not None
+        oem_status = ack.get("status") if isinstance(ack, dict) else None
+        voltage_v = row.get("value") if isinstance(ack, dict) and oem_status == 100 else None
+        rail = lifecycle_state.voltage_observation(
+            voltage_v=voltage_v,
+            sample_valid=bool(reply_present and oem_status == 100 and voltage_v is not None),
+            reply_present=reply_present,
+            transport_outcome="reply" if reply_present else "no_reply",
+            provenance={"route": "POST /hardware/snapshot/collect", "ack": ack},
+        )
+        rail.update({
+            "oem_status": oem_status,
+            "payload_raw": voltage_v,
+            "ack": ack,
+        })
+        return {"rail_24v": rail, "safety_valid": rail["safety_valid"], "voltage_ok": rail["voltage_ok"]}
+
+    def interlock(_: CollectionContext) -> dict[str, Any]:
+        return {"motion_arm": tester.motion_arm_state(), "latch_override": tester.motion_latch_override_state(), "deck_io": io()}
+
+    def latch(_: CollectionContext) -> dict[str, Any]:
+        snapshot = io()
+        return {"snapshot": snapshot, "rail_24v": snapshot.get(0), "door_sensor": snapshot.get(1), "solenoid_state": snapshot.get(2), "latch_sensor": snapshot.get(3)}
+
+    def gripper(context: CollectionContext) -> dict[str, Any]:
+        return (axes(context).get("rows") or {}).get(AxisName.GRIPPER.value)
+
+    def pipette(_: CollectionContext) -> dict[str, Any]:
+        transport_owner = _pipette_transport
+        if transport_owner is None or transport_owner.__class__.__name__ != "FourPipetteTransport":
+            raise RuntimeError("four-pipette shared transport owner is unavailable")
+        status = transport_owner.get_status()
+        if not isinstance(status, dict) or status.get("live_query_performed") is not False:
+            raise RuntimeError("pipette owner did not provide a cache-only four-channel projection")
+        return status
+
+    def shadow(context: CollectionContext) -> dict[str, Any]:
+        return {"axes": axes(context), "interlocks": interlock(context), "reference_state": _reference_state_store.snapshot(list(AxisName)), "motion_commanded": False}
+
+    def camera(_: CollectionContext) -> dict[str, Any]:
+        _, session_projection = _camera_session_projection()
+        return {"probe": _camera_cache_envelope(_camera_probe_cache), "session": session_projection, "hardware_queried": False}
+
+    return {
+        "transport": transport,
+        "boards": boards,
+        "axes": axes,
+        "range": range_projection,
+        "power": power,
+        "interlock": interlock,
+        "latch": latch,
+        "gripper": gripper,
+        "thermal": lambda _: _query_aux_snapshot(tester, "thermal"),
+        "chiller": lambda _: _query_aux_snapshot(tester, "chiller"),
+        "pipette": pipette,
+        "camera": camera,
+        "shadow_readback": shadow,
     }
 
 
@@ -3423,15 +4110,179 @@ async def _camera_mjpeg_response(
     )
 
 
+def _camera_cache_envelope(cache: dict[str, Any] | None) -> dict[str, Any]:
+    with _camera_projection_lock:
+        epoch = _camera_projection_epoch
+        row = None if cache is None else copy.deepcopy(cache)
+    if row is None or row.get("camera_ownership_epoch") != epoch:
+        return {"available": False, "cache_state": "missing", "camera_ownership_epoch": epoch, "freshness": {"state": "missing", "age_s": None}, "provenance": "POST /camera/probe"}
+    age = max(0.0, time.time() - float(row.get("observed_unix", time.time())))
+    state = "fresh" if age <= 30.0 else "stale"
+    return {"available": True, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": round(age, 3), "fresh_for_s": 30.0}, "provenance": "POST /camera/probe", "probe": row}
+
+
+def _camera_process_active() -> bool:
+    with _camera_projection_lock:
+        session = _camera_session
+        process = None if session is None else session.get("process")
+        return bool(process is not None and process.returncode is None)
+
+
+async def _stop_owned_camera_session(*, reason: str) -> dict[str, Any]:
+    global _camera_session, _camera_projection_epoch, _camera_probe_cache
+    with _camera_projection_lock:
+        session = _camera_session
+        _camera_session = None
+        _camera_projection_epoch += 1
+        _camera_probe_cache = None
+        epoch = _camera_projection_epoch
+    hardware_state.invalidate(reason=f"camera ownership changed: {reason}")
+    lifecycle_state.record_camera_evidence(None)
+    if session is not None:
+        proc = session.get("process")
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        task = session.get("reader_task")
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+    _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
+    return {"ok": True, "stopped_session_id": None if session is None else session.get("session_id"), "replacement": reason == "replacement", "camera_ownership_epoch": epoch}
+
+
+async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]:
+    global _camera_session, _camera_projection_epoch, _camera_probe_cache
+    replacement = _camera_session is not None
+    if replacement:
+        await _stop_owned_camera_session(reason="replacement")
+    device = str(payload.get("device") or "/dev/video0")
+    fps = max(1, min(int(payload.get("fps") or 8), 30))
+    quality = max(2, min(int(payload.get("quality") or 7), 15))
+    width = max(160, min(int(payload.get("width") or 640), 1920))
+    height = max(120, min(int(payload.get("height") or 480), 1080))
+    pick = _pick_stream_device(device)
+    if not pick.get("ok"):
+        raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
+    device = str(pick["device"])
+    if shutil.which("ffmpeg") is None:
+        raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg", device=device))
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    if proc.stdout is None:
+        proc.terminate()
+        raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=8)
+    session_id = uuid.uuid4().hex
+    with _camera_projection_lock:
+        _camera_projection_epoch += 1
+        _camera_probe_cache = None
+        epoch = _camera_projection_epoch
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        _camera_session = session
+    hardware_state.invalidate(reason="camera ownership changed: stream started")
+    _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
+
+    async def reader() -> None:
+        buffer = bytearray()
+        try:
+            while proc.returncode is None:
+                chunk = await proc.stdout.read(16384)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start < 0:
+                        if len(buffer) > 65536:
+                            buffer.clear()
+                        break
+                    if start:
+                        del buffer[:start]
+                    end = buffer.find(b"\xff\xd9", 2)
+                    if end < 0:
+                        break
+                    frame = bytes(buffer[: end + 2])
+                    del buffer[: end + 2]
+                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii") + frame + b"\r\n"
+                    if queue.full():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    queue.put_nowait(part)
+                    session["frames_emitted"] = int(session.get("frames_emitted") or 0) + 1
+                    _camera_stream_state["frames_emitted"] = session["frames_emitted"]
+                    _camera_stream_state["last_frame_at"] = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            session["error"] = str(exc)
+            _camera_stream_state["last_error"] = str(exc)
+        finally:
+            _camera_stream_state["active"] = False
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+
+    task = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
+    session["reader_task"] = task
+    return {"ok": True, "session_id": session_id, "camera_ownership_epoch": epoch, "replacement": replacement, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue_max_frames": queue.maxsize, "mjpeg_url": "/camera/mjpeg"}
+
+
+def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    with _camera_projection_lock:
+        epoch = _camera_projection_epoch
+        session = _camera_session
+        if session is None or session.get("camera_ownership_epoch") != epoch:
+            return None, {"available": False, "cache_state": "missing", "camera_ownership_epoch": epoch, "freshness": {"state": "missing", "age_s": None}, "provenance": "POST /camera/stream/start"}
+        projection = {key: value for key, value in session.items() if key not in {"queue", "process", "reader_task"}}
+    age = max(0.0, time.time() - float(projection["started_at"]))
+    active = bool(_camera_stream_state.get("active"))
+    state = "fresh" if active else "stale"
+    return session, {"available": active, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": round(age, 3)}, "provenance": "POST /camera/stream/start", "session": projection}
+
+
 @app.get("/status")
 async def get_status():
-    return await _run_blocking("BioXP status", _status_payload, timeout_s=20.0)
+    return _status_payload()
+
+
+@app.post("/hardware/snapshot/collect")
+async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
+    """Explicit serialized query-only collection; never recovers or activates."""
+    tester = _get_tester()
+    requested = (payload or {}).get("domains") or list(CANONICAL_DOMAINS)
+    if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
+        raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
+    try:
+        return await _run_blocking(
+            "Canonical hardware snapshot collection",
+            lambda: hardware_state.collect(requested, _hardware_collectors(tester)),
+            timeout_s=max(30.0, 15.0 * float(len(requested))),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/reconnect")
 async def reconnect_runtime():
+    global _pipette_transport
     tester = _get_tester()
+    close_fn = getattr(_pipette_transport, "close", None)
+    if callable(close_fn):
+        close_fn()
     await _run_blocking("BioXP reconnect", tester.reconnect, timeout_s=20.0)
+    _pipette_transport = build_default_pipette_transport(shared_usb=tester)
+    _ownership_changed(reason="runtime_reconnect", transport="owned", usb="service", router="running")
     maintenance = _mark_post_maintenance_motion_block(
         source="runtime_reconnect",
         reason="USB runtime reconnect completed; non-homing motion recovery is required before live motion.",
@@ -3453,14 +4304,19 @@ async def maintenance_usb_state():
 @app.post("/maintenance/usb/release")
 async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _startup_error
+    global _tester, _startup_error, _pipette_transport
     async with _tester_lock:
         tester = _tester
         if tester is not None:
+            close_fn = getattr(_pipette_transport, "close", None)
+            if callable(close_fn):
+                close_fn()
             disconnect = getattr(tester, "_disconnect", None)
             if callable(disconnect):
                 await asyncio.wait_for(run_in_threadpool(disconnect), timeout=20.0)
         _tester = None
+        _pipette_transport = None
+        _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
         _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
         maintenance = _mark_post_maintenance_motion_block(
             source="maintenance_usb_release",
@@ -3473,12 +4329,14 @@ async def maintenance_usb_release(request: Request):
 @app.post("/maintenance/usb/reconnect")
 async def maintenance_usb_reconnect(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _startup_error
+    global _tester, _startup_error, _pipette_transport
     async with _tester_lock:
         try:
             alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
             _tester = await asyncio.wait_for(run_in_threadpool(lambda: BioXpTester(alt=alt)), timeout=20.0)
+            _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
             _startup_error = None
+            _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
         except Exception as exc:
             _tester = None
             _startup_error = str(exc)
@@ -3531,75 +4389,37 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
 
 @app.get("/motion/axis/{axis}/status")
 async def axis_status(axis: AxisName):
-    tester = _get_tester()
-    return await _run_blocking(
-        f"Axis {axis.value} status",
-        lambda: _axis_status_payload(tester, axis, include_current=True),
-        timeout_s=20.0,
-    )
+    projection = hardware_state.project("axes")
+    observed = _domain_observation(projection, "axes") or {}
+    row = (observed.get("rows") or {}).get(axis.value)
+    return {**projection, "axis": axis.value, "axis_status": row, **(row or {})}
 
 
 @app.get("/motion/axes/status")
 async def axes_status(axes: str = Query("x,y,z", description="Comma-separated axis names, e.g. x,y,z")):
-    tester = _get_tester()
     requested_axes = _parse_axes_csv(axes)
-    return await _run_blocking(
-        "Axes status",
-        lambda: _axis_status_batch_payload(tester, requested_axes),
-        timeout_s=max(20.0, 5.0 * float(len(requested_axes))),
-    )
+    projection = hardware_state.project("axes")
+    observed = _domain_observation(projection, "axes") or {}
+    all_rows = observed.get("rows") or {}
+    return {**projection, "axes": [axis.value for axis in requested_axes], "rows": {axis.value: all_rows.get(axis.value) for axis in requested_axes}}
 
 
 @app.get("/motion/range/status")
 async def motion_range_status(axes: str = Query("x,y,z,g", description="Comma-separated axis names to include")):
     requested_axes = _parse_axes_csv(axes)
-    config = harmonized_motion_config()
-
-    def build() -> dict:
-        live_rows = None
-        live_error = None
-        if _tester is not None:
-            try:
-                live_rows = _axis_status_batch_payload(_tester, requested_axes)
-            except Exception as exc:  # keep config evidence available even if USB read fails
-                live_error = str(exc)
-        rows = {}
-        configured = config.get("axis_limits", {}) if isinstance(config, dict) else {}
-        live_status_rows = live_rows.get("rows", {}) if isinstance(live_rows, dict) else {}
-        for axis in requested_axes:
-            key = axis.value
-            limit = dict(configured.get(key, {})) if isinstance(configured, dict) else {}
-            live = live_status_rows.get(key) if isinstance(live_status_rows, dict) else None
-            position = None
-            if isinstance(live, dict):
-                position = (((live.get("status") or {}).get("position") or {}).get("position"))
-            rows[key] = {
-                "axis": key,
-                "configured_limit": limit,
-                "current_position_steps": position,
-                "distance_to_min_steps": None if position is None or "min_steps" not in limit else int(position) - int(limit["min_steps"]),
-                "distance_to_max_steps": None if position is None or "max_steps" not in limit else int(limit["max_steps"]) - int(position),
-                "live_status": live,
-            }
-        return {
-            "ok": True,
-            "axes": [axis.value for axis in requested_axes],
-            "rows": rows,
-            "motion_config": config,
-            "live_status_available": live_rows is not None,
-            "live_status_error": live_error,
-            "operator_truth": {
-                "limits_are_source_grounded": True,
-                "limits_are_physical_endpoint_proof": False,
-                "absolute_move_policy": "clamp_or_refuse_against configured_limit before live moves; do not call arbitrary relative probes max travel",
-            },
-        }
-
-    return await _run_blocking(
-        "Motion range status",
-        build,
-        timeout_s=max(20.0, 5.0 * float(len(requested_axes))),
-    )
+    projection = hardware_state.project("range")
+    observed = _domain_observation(projection, "range") or {}
+    config = observed.get("motion_config") or {}
+    live_rows = ((observed.get("axis_observations") or {}).get("rows") or {})
+    configured = config.get("axis_limits", {}) if isinstance(config, dict) else {}
+    rows = {}
+    for axis in requested_axes:
+        key = axis.value
+        limit = dict(configured.get(key, {})) if isinstance(configured, dict) else {}
+        live = live_rows.get(key)
+        position = (((live or {}).get("status") or {}).get("position") or {}).get("position") if isinstance(live, dict) else None
+        rows[key] = {"axis": key, "configured_limit": limit, "current_position_steps": position, "distance_to_min_steps": None if position is None or "min_steps" not in limit else int(position) - int(limit["min_steps"]), "distance_to_max_steps": None if position is None or "max_steps" not in limit else int(limit["max_steps"]) - int(position), "live_status": live}
+    return {**projection, "ok": projection.get("available", False), "axes": [axis.value for axis in requested_axes], "rows": rows, "motion_config": config, "live_status_available": bool(live_rows), "live_status_error": None if live_rows else "canonical range observation unavailable"}
 
 
 @app.post("/motion/interlock/prepare")
@@ -3617,12 +4437,7 @@ async def prepare_interlock():
 
 @app.get("/motion/power/status")
 async def motion_power_status():
-    tester = _get_tester()
-    return await _run_blocking(
-        "Motion power status",
-        lambda: _motion_power_status_payload(tester),
-        timeout_s=25.0,
-    )
+    return _motion_power_status_payload()
 
 
 @app.post("/motion/power/enable")
@@ -3664,17 +4479,9 @@ async def motion_axes_current(req: MotionAxisCurrentRequest):
 
 @app.get("/motion/interlock/override")
 async def motion_interlock_override_status():
-    tester = _get_tester()
-    return await _run_blocking(
-        "Motion interlock override status",
-        lambda: {
-            "state": tester.motion_latch_override_state(),
-            "gate": tester.motion_gate_live_snapshot(),
-            "motion_arm": tester.motion_arm_state(),
-            "warning": "commissioning override only; do not treat controller arm as independent physical safety proof",
-        },
-        timeout_s=20.0,
-    )
+    projection = hardware_state.project("interlock")
+    observed = _domain_observation(projection, "interlock") or {}
+    return {**projection, "state": observed.get("latch_override"), "gate": observed.get("deck_io"), "motion_arm": observed.get("motion_arm"), "warning": "commissioning override only; cached projection is not independent physical safety proof"}
 
 
 @app.post("/motion/interlock/override")
@@ -3737,6 +4544,7 @@ async def motion_hard_reset(req: MotionHardResetRequest):
         lambda: tester.motor_hard_reset(rounds=req.rounds),
         timeout_s=max(45.0, 20.0 * float(req.rounds)),
     )
+    _ownership_changed(reason="motion_hard_reset", transport="owned", usb="service", router="running")
     for axis in AxisName:
         _reference_state_store.mark_desynced(
             MarkAxisDesyncedCommand(
@@ -3777,19 +4585,9 @@ async def clear_lock():
 
 @app.get("/latch/status")
 async def latch_status():
-    tester = _get_tester()
-    snapshot = await _run_blocking(
-        "Latch status",
-        lambda: tester.io_snapshot(tester.BOARD_DECK),
-        timeout_s=20.0,
-    )
-    return {
-        "snapshot": snapshot,
-        "rail_24v": snapshot.get(0),
-        "door_sensor": snapshot.get(1),
-        "solenoid_state": snapshot.get(2),
-        "latch_sensor": snapshot.get(3),
-    }
+    projection = hardware_state.project("latch")
+    observed = _domain_observation(projection, "latch") or {}
+    return {**projection, **observed}
 
 
 @app.post("/latch/lock")
@@ -4003,12 +4801,9 @@ def _execute_oem_initialize_motion(
 
 @app.get("/motion/gripper/status")
 async def motion_gripper_status():
-    tester = _get_tester()
-    return await _run_blocking(
-        "OEM gripper status",
-        lambda: gripper_status(tester),
-        timeout_s=20.0,
-    )
+    projection = hardware_state.project("gripper")
+    observed = _domain_observation(projection, "gripper")
+    return {**projection, "gripper": observed, **(observed or {})}
 
 
 @app.post("/motion/gripper/restore_idle_current")
@@ -4190,7 +4985,14 @@ def _motion_response_allows_reference_update(response: dict) -> bool:
         return False
     if isinstance(response.get("motion_failure"), dict):
         return False
-    return True
+    evidence = response.get("motion_evidence")
+    classification = evidence.get("classification") if isinstance(evidence, dict) else None
+    if isinstance(classification, dict) and classification.get("controller_motion_evidence") is True:
+        return True
+    truth = response.get("motion_truth")
+    if isinstance(truth, dict) and truth.get("physical_motion_confirmed") is True:
+        return True
+    return False
 
 
 @app.post("/motion/axis/relative")
@@ -4282,7 +5084,7 @@ async def home_axis(req: HomeAxisRequest):
             "source_command": "home_axis_manual_button_goHome_guarded",
             "home_semantics": "manual_goHome_style_switch_search_not_startup_axisSearchHome_not_zero",
             "oem_switch_search_homing_executed": not bool(response.get("dry_run")),
-            "manual_home_safety": "fail_closed_until_predicate_matrix_live_or_source_verified; override still requires guarded inactive_to_active transition",
+            "manual_home_safety": "fail_closed_until_predicate_matrix_live_or_source_verified; OEM proof is queryHome active after stop plus setHome success",
             "not_equivalent_to": ["/motion/axis/zero", "/motion/oem/startup_step", "/motion/oem/rehome", "/motion/oem/home_xy"],
         }
     )
@@ -4294,6 +5096,15 @@ async def home_axis(req: HomeAxisRequest):
                 source="home_axis",
                 note="Axis homed via OEM switch-search API route.",
                 motion_kind="home",
+            )
+        )
+    elif not bool(response.get("dry_run")):
+        _reference_state_store.mark_desynced(
+            MarkAxisDesyncedCommand(
+                axis=req.axis,
+                reason="Home route failed or did not produce OEM motion evidence; axis reference blocked until re-established.",
+                source="home_axis_failure_guard",
+                motion_kind="home_failed_desync",
             )
         )
     return response
@@ -4388,8 +5199,9 @@ async def thermal_baseline():
 
 @app.get("/thermal/snapshot")
 async def thermal_snapshot():
-    tester = _get_tester()
-    return await _run_blocking("Thermal snapshot", tester.thermal_snapshot, timeout_s=25.0)
+    projection = hardware_state.project("thermal")
+    observed = _domain_observation(projection, "thermal")
+    return {**projection, "thermal": observed, **(observed or {})}
 
 
 @app.post("/thermal/set_temp")
@@ -4441,7 +5253,9 @@ async def thermal_fast_profile():
 @app.post("/thermal/hard_reset")
 async def thermal_hard_reset():
     tester = _get_tester()
-    return await _run_blocking("Thermal hard reset", tester.thermal_hard_reset, timeout_s=40.0)
+    result = await _run_blocking("Thermal hard reset", tester.thermal_hard_reset, timeout_s=40.0)
+    _ownership_changed(reason="thermal_hard_reset", transport="owned", usb="service", router="running")
+    return result
 
 
 @app.post("/chiller/baseline")
@@ -4452,8 +5266,9 @@ async def chiller_baseline():
 
 @app.get("/chiller/snapshot")
 async def chiller_snapshot():
-    tester = _get_tester()
-    return await _run_blocking("Chiller snapshot", tester.chiller_snapshot, timeout_s=25.0)
+    projection = hardware_state.project("chiller")
+    observed = _domain_observation(projection, "chiller")
+    return {**projection, "chiller": observed, **(observed or {})}
 
 
 @app.post("/chiller/set_temp")
@@ -4517,25 +5332,62 @@ async def set_chiller_rates(req: ChillerRatesRequest):
 @app.post("/chiller/hard_reset")
 async def chiller_hard_reset():
     tester = _get_tester()
-    return await _run_blocking("Chiller hard reset", tester.chiller_hard_reset, timeout_s=40.0)
+    result = await _run_blocking("Chiller hard reset", tester.chiller_hard_reset, timeout_s=40.0)
+    _ownership_changed(reason="chiller_hard_reset", transport="owned", usb="service", router="running")
+    return result
 
 
 @app.get("/camera/devices")
 async def camera_devices():
-    tester = _get_tester()
-    return await _run_blocking("Camera devices", lambda: _camera_devices_payload(tester), timeout_s=15.0)
+    envelope = _camera_cache_envelope(_camera_probe_cache)
+    probe = envelope.get("probe") or {}
+    return {**envelope, "ok": envelope.get("available", False), "rows": probe.get("rows", []), "preferred_device": probe.get("preferred_device")}
 
 
 @app.get("/camera/controls")
 async def camera_controls(device: str = "/dev/video0"):
+    envelope = _camera_cache_envelope(_camera_probe_cache)
+    probe = envelope.get("probe") or {}
+    controls = (probe.get("controls") or {}).get(device)
+    return {**envelope, "ok": controls is not None, "device": device, "rows": [] if controls is None else controls.get("rows", []), "error": "camera controls not present in explicit probe cache" if controls is None else controls.get("error")}
+
+
+@app.post("/camera/probe")
+async def camera_probe(payload: dict[str, Any] | None = None):
+    global _camera_probe_cache
+    if _camera_process_active():
+        raise HTTPException(status_code=409, detail="stop the owned camera stream before probing capabilities")
     tester = _get_tester()
-    return await _run_blocking("Camera controls", lambda: tester.camera_enumerate_controls(device=device), timeout_s=15.0)
+    requested = (payload or {}).get("devices")
+
+    def collect() -> dict[str, Any]:
+        devices = _camera_devices_payload(tester)
+        names = requested if isinstance(requested, list) else [row.get("device") for row in devices.get("rows", [])]
+        controls = {}
+        for name in names:
+            if isinstance(name, str):
+                controls[name] = tester.camera_enumerate_controls(device=name)
+        return {**devices, "controls": controls}
+
+    result = await _run_blocking("Explicit camera capability probe", collect, timeout_s=30.0)
+    with _camera_projection_lock:
+        _camera_probe_cache = {**result, "probe_id": uuid.uuid4().hex, "available": bool(result.get("ok", True)), "camera_ownership_epoch": _camera_projection_epoch, "observed_at": _now_utc(), "observed_unix": time.time(), "provenance": "POST /camera/probe"}
+        lifecycle_state.record_camera_evidence(_camera_probe_cache)
+        return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
+
+
+@app.post("/camera/stream/start")
+async def camera_stream_start(payload: dict[str, Any] | None = None):
+    result = await _start_owned_camera_session(payload or {})
+    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("ok")), "provenance": "POST /camera/stream/start"})
+    return result
 
 
 @app.post("/camera/control")
 async def camera_control(req: CameraControlRequest):
+    global _camera_probe_cache
     tester = _get_tester()
-    return await _run_blocking(
+    result = await _run_blocking(
         "Camera control",
         lambda: {
             **tester.v4l2_set_ctrl(req.cid, req.value, device=req.device),
@@ -4544,6 +5396,11 @@ async def camera_control(req: CameraControlRequest):
         },
         timeout_s=15.0,
     )
+    with _camera_projection_lock:
+        _camera_probe_cache = None
+    lifecycle_state.record_camera_evidence(None)
+    hardware_state.invalidate(reason="camera controls changed")
+    return result
 
 
 @app.post("/camera/snapshot")
@@ -4584,7 +5441,7 @@ async def camera_stream_health(req: CameraHealthRequest):
 
 @app.post("/camera/auto_recover")
 async def camera_auto_recover(req: CameraRecoverRequest):
-    if _camera_stream_lock.locked():
+    if _camera_process_active():
         return {
             "ok": False,
             "busy": True,
@@ -4594,26 +5451,32 @@ async def camera_auto_recover(req: CameraRecoverRequest):
             "stream_state": _camera_stream_state_payload(),
         }
     tester = _get_tester()
-    return await _run_blocking(
+    ownership = await _stop_owned_camera_session(reason="auto recover")
+    result = await _run_blocking(
         "Camera auto recover",
         lambda: tester.camera_auto_oneclick(device=req.device, max_resets=req.max_resets),
         timeout_s=75.0,
     )
+    return {**result, "camera_ownership": ownership}
 
 
 @app.post("/camera/reset")
 async def camera_reset(req: CameraSnapshotRequest):
-    return _camera_reset_local(req.device)
+    stopped = await _stop_owned_camera_session(reason="explicit reset")
+    reset = await run_in_threadpool(_camera_reset_local, req.device)
+    return {**reset, "owned_session": stopped}
 
 
 @app.post("/camera/stop")
 async def camera_stop(req: CameraSnapshotRequest):
-    return await run_in_threadpool(_camera_reset_local, req.device)
+    del req
+    return await _stop_owned_camera_session(reason="explicit stop")
 
 
 @app.get("/camera/stream_state")
 async def camera_stream_state():
-    return _camera_stream_state_payload()
+    _, projection = _camera_session_projection()
+    return {**projection, **_camera_stream_state_payload()}
 
 
 @app.get("/camera/mjpeg")
@@ -4624,32 +5487,56 @@ async def camera_mjpeg(
     width: int = Query(640, ge=160, le=1920),
     height: int = Query(480, ge=120, le=1080),
 ):
-    tester = _get_tester()
-    return await _camera_mjpeg_response(
-        tester,
-        preferred=device,
-        fps=fps,
-        quality=quality,
-        width=width,
-        height=height,
+    del device, fps, quality, width, height
+    session, projection = _camera_session_projection()
+    if session is None or not projection.get("available"):
+        raise HTTPException(status_code=503, detail={**projection, "error": "no active POST-started camera session"})
+    queue = session["queue"]
+
+    async def iterator():
+        while True:
+            part = await queue.get()
+            if part is None:
+                break
+            yield part
+
+    return StreamingResponse(
+        iterator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "X-BioXp-Camera-Session": str(session["session_id"]), "X-BioXp-Camera-Ownership-Epoch": str(session["camera_ownership_epoch"])},
     )
 
 
 @app.get("/liquid/status")
 async def liquid_status():
-    return await run_pipette_status(
-        get_transport=_get_pipette_transport,
-        run_blocking=_run_blocking,
-    )
+    projection = hardware_state.project("pipette")
+    observed = _domain_observation(projection, "pipette")
+    return {**projection, "pipette": observed, "channels": None if not isinstance(observed, dict) else observed.get("channels")}
 
 
 @app.post("/liquid/init")
 async def liquid_init(req: PipetteInitRequest):
-    return await run_pipette_init_command(
-        PipetteInitCommand.from_request(req),
-        get_transport=_get_pipette_transport,
-        run_blocking=_run_blocking,
-    )
+    command = PipetteInitCommand.from_request(req)
+    if command.prime_volume_ul is not None:
+        raise HTTPException(status_code=409, detail="constructor initialization cannot prime or mutate liquid")
+    if _can_ready_observation() is not True:
+        raise HTTPException(status_code=409, detail="constructor pipette stage requires explicit CAN_READY=true evidence")
+
+    def action() -> dict[str, Any]:
+        result = _get_pipette_transport().initialize(command)
+        return {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
+
+    try:
+        projection = await _run_blocking(
+            "OEM constructor four-pipette stage",
+            lambda: lifecycle_state.run_stage("constructor_pipette_stage", action),
+            timeout_s=260.0,
+        )
+    except LifecycleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if projection["startup"]["stages"]["constructor_pipette_stage"]["state"] != "passed":
+        raise HTTPException(status_code=409, detail=projection)
+    return {"ok": True, "lifecycle": projection}
 
 
 @app.post("/liquid/tip")

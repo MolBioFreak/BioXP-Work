@@ -99,7 +99,7 @@ def test_control_lib_startup_dry_run_calls_oem_compatible_control_interface():
 def test_oem_xml_script_parser_reads_real_demo_script_commands():
     from src.bioxp.oem_compat.scripts import OemScript
 
-    script_path = Path("/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/demo.xml")
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "demo.xml"
     parsed = OemScript.from_file(script_path)
 
     assert parsed.root_tag == "WpfGenBotCommonLib"

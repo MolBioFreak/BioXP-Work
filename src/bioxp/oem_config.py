@@ -6,6 +6,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable
 
+from .oem_machine_bundle import (
+    OemMachineBundleError,
+    OemMachineSnapshot,
+    get_active_oem_machine_snapshot,
+)
+
 OEM_AXIS_LIMIT_SOURCE_EVIDENCE = {
     "defaults": "ClassBioXPSettings.cs lines 250-263: m_min*steps=0, m_maxXsteps=80000, m_maxYsteps=80000, m_maxZsteps=160000, m_maxGsteps=15000",
     "properties": "ClassBioXPSettings.cs lines 1277-1299: X/Y/Z/G HighLimit/LowLimit and SelfTest*Max properties",
@@ -108,7 +114,7 @@ INTERESTING_FIELDS = {
 
 REQUIRED_FOR_LIVE = ["StartMode", "GripperVersion"]
 
-DEFAULT_SEARCH_ROOTS = [
+DIAGNOSTIC_NON_AUTHORITATIVE_SEARCH_ROOTS = [
     "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup",
     "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/.deploy",
     "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Users",
@@ -116,6 +122,8 @@ DEFAULT_SEARCH_ROOTS = [
     "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Program Files",
     "/home/dalab/Desktop/BioXP 3200 Development Work/BioXP_SSD_Backup/Program Files (x86)",
 ]
+# Compatibility-only alias. Accepted live mode never consults these roots.
+DEFAULT_SEARCH_ROOTS = DIAGNOSTIC_NON_AUTHORITATIVE_SEARCH_ROOTS
 
 OEM_MACHINE_CONFIG_ENV = "BIOXP_OEM_MACHINE_CONFIG_DIR"
 OEM_MACHINE_CONFIG_PATH_ENV = "BIOXP_OEM_MACHINE_CONFIG_XML"
@@ -302,20 +310,87 @@ def machine_config_diff(parsed_config: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_oem_machine_config_bundle(root_dir: str | Path | None = None) -> dict[str, Any]:
+    """Project the process-bound snapshot, or an explicit diagnostic fixture.
+
+    A directory argument is retained for offline/backward-compatible diagnostics
+    only. It can never replace an already-bound accepted live snapshot.
+    """
+    try:
+        snapshot = get_active_oem_machine_snapshot()
+    except OemMachineBundleError:
+        snapshot = None
+    if snapshot is not None:
+        if root_dir is not None:
+            raise OemMachineBundleError("accepted live snapshot authority cannot be replaced by root_dir")
+        return _snapshot_legacy_bundle(snapshot)
     if root_dir is None:
-        root_dir = os.environ.get(OEM_MACHINE_CONFIG_ENV)
-    if not root_dir:
-        config_xml = os.environ.get(OEM_MACHINE_CONFIG_PATH_ENV)
-        if config_xml:
-            return parse_oem_machine_config_bundle(Path(config_xml).parent)
         return {
             "ok": False,
             "machine_calibrated": False,
             "source_type": "unbound",
             "runtime_binding": "read_only",
-            "blockers": [f"{OEM_MACHINE_CONFIG_ENV}_not_set", f"{OEM_MACHINE_CONFIG_PATH_ENV}_not_set"],
+            "accepted_live_mode": False,
+            "blockers": ["OEM_machine_snapshot_not_bound"],
         }
-    return parse_oem_machine_config_bundle(root_dir)
+    diagnostic = parse_oem_machine_config_bundle(root_dir)
+    diagnostic["accepted_live_mode"] = False
+    diagnostic["non_authoritative_diagnostic_only"] = True
+    diagnostic.setdefault("blockers", []).append("explicit_directory_is_not_accepted_live_authority")
+    return diagnostic
+
+
+def _snapshot_legacy_bundle(snapshot: OemMachineSnapshot) -> dict[str, Any]:
+    sections = {name: dict(values) for name, values in snapshot.config_sections.items()}
+    positions = [dict(row) for row in snapshot.position_table]
+    operation_parameters = dict(snapshot.operation_parameters)
+    try:
+        from .runtime_state import get_active_oem_runtime_state_store
+
+        store = get_active_oem_runtime_state_store()
+        if store.snapshot is snapshot:
+            operation_parameters = store.operation_parameters_projection()
+    except Exception:
+        pass
+    active = {
+        "serial_present": True,
+        "serial_redacted": "[REDACTED]",
+        "config": sections["config"],
+        "calibration": sections["calibration"],
+        "camera": sections["camera"],
+        "server_redacted": {},
+        "offsets": sections["offsets"],
+        "seal_cut": sections["seal_cut"],
+        "reagent_chiller": sections["reagent_chiller"],
+        "output_chiller": sections["output_chiller"],
+        "axis_limits": {axis: dict(row) for axis, row in snapshot.axis_limits.items()},
+        "position_table_count": len(positions),
+        "position_table": positions,
+        "scale_port": sections["scale_port"],
+        "operation_parameters": operation_parameters,
+        "inspection_profile": snapshot.inspection_profile_name,
+    }
+    files = {
+        "config_xml": snapshot.records["appdata/config.xml"].public_projection(),
+        "operation_parameters_xml": snapshot.records["appdata/Operation_parameters.xml"].public_projection(),
+        "inspection_settings_xml": snapshot.records["appdata/InspectionSettings.xml"].public_projection(),
+        "processtime_xml": snapshot.records["appdata/processtime.xml"].public_projection(),
+        "calreference_xml": snapshot.records["appdata/calreference.xml"].public_projection(),
+    }
+    for record in files.values():
+        record["path"] = str(snapshot.bundle_root / record["bundle_relative_path"])
+    return {
+        "ok": True,
+        "accepted_live_mode": True,
+        "machine_calibrated": snapshot.machine_calibrated,
+        "source_type": "immutable_oem_machine_snapshot",
+        "root_dir": str(snapshot.bundle_root),
+        "runtime_binding": "read_only_immutable_evidence",
+        "files": files,
+        "config": active,
+        "diff_vs_source_defaults": machine_config_diff(active),
+        "blockers": [],
+        "snapshot_status": snapshot.config_status_projection(),
+    }
 
 
 def _candidate_paths(root: Path) -> Iterable[Path]:
@@ -439,7 +514,7 @@ def harmonized_motion_config(config_result: dict | None = None) -> dict:
     if isinstance(machine, dict) and machine.get("ok") is True:
         machine_config = machine.get("config", {}) if isinstance(machine.get("config"), dict) else {}
         axis_limits = machine_config.get("axis_limits") if isinstance(machine_config, dict) else None
-        source = "original_ssd_machine_config"
+        source = "immutable_oem_machine_snapshot"
         config_status: dict[str, Any] = {
             "status": "loaded",
             "path": (machine.get("files", {}).get("config_xml", {}) or {}).get("path"),
@@ -449,17 +524,20 @@ def harmonized_motion_config(config_result: dict | None = None) -> dict:
             "files": machine.get("files", {}),
             "diff_vs_source_defaults": machine.get("diff_vs_source_defaults", {}),
         }
-    else:
-        config = config_result or find_oem_config()
+    elif config_result is not None:
+        config = config_result
         axis_limits = config.get("axis_limits") if isinstance(config, dict) else None
-        source = "config_xml" if isinstance(config, dict) and config.get("status") == "loaded" and any(
+        source = "non_authoritative_diagnostic_config_xml" if isinstance(config, dict) and config.get("status") == "loaded" and any(
             isinstance(row, dict) and row.get("source") == "config_xml_axislimits" for row in (axis_limits or {}).values()
-        ) else "oem_defaults_no_config_xml_found"
+        ) else "diagnostic_config_unavailable"
         config_status = config if isinstance(config, dict) else {"status": "missing"}
-    if not isinstance(axis_limits, dict) or not axis_limits:
-        axis_limits = {axis: dict(row) for axis, row in OEM_DEFAULT_AXIS_LIMITS.items()}
+    else:
+        axis_limits = {}
+        source = "fail_closed_oem_machine_snapshot_not_bound"
+        config_status = {"status": "unbound", "blockers": ["OEM_machine_snapshot_not_bound"]}
+    live_bound = source == "immutable_oem_machine_snapshot"
     return {
-        "ok": True,
+        "ok": live_bound or config_result is not None,
         "schema_version": "bioxp.oem_motion_config.v1",
         "source": source,
         "config_status": config_status,
@@ -467,10 +545,11 @@ def harmonized_motion_config(config_result: dict | None = None) -> dict:
         "deck_coordinate_extents": {axis: dict(row) for axis, row in OEM_DEFAULT_DECK_COORDINATE_EXTENTS.items()},
         "axis_limit_diagnostics": _axis_limit_diagnostics(axis_limits, config_status.get("status") if isinstance(config_status, dict) else None),
         "source_evidence": OEM_AXIS_LIMIT_SOURCE_EVIDENCE,
+        "live_ready": live_bound,
         "caveats": [
             "These are software/configured OEM limits, not proof of physical endpoint travel.",
-            "If config.xml is missing, defaults come from ClassBioXPSettings and may be overridden on a field-calibrated instrument.",
-            "Default position-table entries found in OEM source exceed X/Y=80000 for some locations; treat missing config.xml as a gap before claiming physical max.",
+            "Accepted live mode exposes no axis limits unless the immutable serial-206 snapshot is bound.",
+            "Compiled source defaults remain diagnostic metadata only and are not accepted live authority.",
             "Auto_XY/Auto_XY_New field calibration in OEM code rewrites X/Y high limits to measured travel minus 500 steps.",
             "Live Linux Z sign convention observed during commissioning uses negative values for upward/head-clear motion; OEM limits are source-space positive steps.",
         ],
@@ -511,10 +590,54 @@ def load_oem_config(path: str | Path) -> dict:
 
 
 def find_oem_config(roots: Iterable[str | Path] | None = None) -> dict:
-    searched = [str(Path(r)) for r in (roots or DEFAULT_SEARCH_ROOTS)]
+    if roots is None:
+        try:
+            snapshot = get_active_oem_machine_snapshot()
+        except OemMachineBundleError:
+            return {"status": "unbound", "path": None, "searched_roots": [], "fields": {}, "fields_raw": {}, "fields_typed": {}, "axis_limits": {}, "missing_fields": ["OemMachineSnapshot"], "live_ready": False, "accepted_live_mode": False, "derived_requirements": {}}
+        fields = {
+            "StartMode": snapshot.startup_mode,
+            "GripperVersion": str(snapshot.fields["machine.gripper_version"].raw_value),
+            "Calibrated": str(snapshot.fields["machine.calibrated"].raw_value),
+            "CameraCalibrated": str(snapshot.fields["machine.camera_calibrated"].raw_value),
+            "CheckCamera": str(snapshot.operation_parameters["CheckCamera"]),
+        }
+        try:
+            from .runtime_state import get_active_oem_runtime_state_store
+
+            store = get_active_oem_runtime_state_store()
+            if store.snapshot is snapshot:
+                operation = store.operation_parameters_projection()
+                fields["StartMode"] = str(operation["Mode"])
+                fields["CheckCamera"] = str(operation["CheckCamera"])
+        except Exception:
+            pass
+        return {
+            "status": "loaded",
+            "path": str(snapshot.bundle_root / "appdata/config.xml"),
+            "searched_roots": [],
+            "fields": fields,
+            "fields_raw": dict(fields),
+            "fields_typed": {key: _typed(value) for key, value in fields.items()},
+            "axis_limits": {axis: dict(row) for axis, row in snapshot.axis_limits.items()},
+            "missing_fields": [],
+            "live_ready": True,
+            "accepted_live_mode": True,
+            "derived_requirements": {
+                "camera_check_required": _typed(fields["CheckCamera"]) is True,
+                "camera_calibrated": snapshot.camera_calibrated,
+                "calibrated": snapshot.machine_calibrated,
+                "start_mode": fields["StartMode"],
+                "gripper_version": snapshot.fields["machine.gripper_version"].value,
+            },
+            "snapshot_status": snapshot.config_status_projection(),
+        }
+    searched = [str(Path(r)) for r in roots]
     for root in searched:
         for candidate in _candidate_paths(Path(root)):
             loaded = load_oem_config(candidate)
             loaded["searched_roots"] = searched
+            loaded["accepted_live_mode"] = False
+            loaded["non_authoritative_diagnostic_only"] = True
             return loaded
-    return {"status": "missing", "path": None, "searched_roots": searched, "fields": {}, "fields_raw": {}, "fields_typed": {}, "axis_limits": {axis: dict(row) for axis, row in OEM_DEFAULT_AXIS_LIMITS.items()}, "missing_fields": REQUIRED_FOR_LIVE, "live_ready": False, "derived_requirements": {}}
+    return {"status": "missing", "path": None, "searched_roots": searched, "fields": {}, "fields_raw": {}, "fields_typed": {}, "axis_limits": {}, "missing_fields": REQUIRED_FOR_LIVE, "live_ready": False, "accepted_live_mode": False, "non_authoritative_diagnostic_only": True, "derived_requirements": {}}

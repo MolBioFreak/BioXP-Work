@@ -1,7 +1,7 @@
 def test_switch_audit_status_mode_never_moves_axes(tmp_path):
-    from src.bioxp.oem_switch_audit import run_switch_audit, FakeSwitchAuditHardware
+    from src.bioxp.oem_switch_audit import run_switch_audit, OfflineSwitchAuditFixture
 
-    hw = FakeSwitchAuditHardware()
+    hw = OfflineSwitchAuditFixture()
     result = run_switch_audit(hw, axes=["z"], mode="status", artifact_root=tmp_path)
 
     assert result["ok"] is True
@@ -19,18 +19,18 @@ def test_switch_audit_status_mode_never_moves_axes(tmp_path):
 
 
 def test_switch_audit_rejects_live_probe_without_artifact_root():
-    from src.bioxp.oem_switch_audit import run_switch_audit, FakeSwitchAuditHardware
+    from src.bioxp.oem_switch_audit import run_switch_audit, OfflineSwitchAuditFixture
 
-    result = run_switch_audit(FakeSwitchAuditHardware(), axes=["z"], mode="live_probe", artifact_root=None)
+    result = run_switch_audit(OfflineSwitchAuditFixture(), axes=["z"], mode="live_probe", artifact_root=None)
 
     assert result["ok"] is False
     assert "artifact_root" in result["error"]
 
 
 def test_switch_audit_rejects_unknown_axes():
-    from src.bioxp.oem_switch_audit import run_switch_audit, FakeSwitchAuditHardware
+    from src.bioxp.oem_switch_audit import run_switch_audit, OfflineSwitchAuditFixture
 
-    result = run_switch_audit(FakeSwitchAuditHardware(), axes=["bogus"], mode="status")
+    result = run_switch_audit(OfflineSwitchAuditFixture(), axes=["bogus"], mode="status")
 
     assert result["ok"] is False
     assert "unknown axes" in result["error"]

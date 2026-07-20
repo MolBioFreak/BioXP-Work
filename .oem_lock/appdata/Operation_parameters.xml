@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<BioXPCommonLib>
+  <OperationParameters>
+    <Mode Mode="WebMode" />
+    <EnablePreviousJobCheck EnablePreviousJobCheck="True" />
+    <AllowPause AllowPause="False" />
+    <AutoTime AutoTime="False" />
+    <DeckInspection DeckInspection="True" />
+    <CheckForStaticTipLoss CheckForStaticTipLoss="False" />
+    <InspectionLogOnly InspectionLogOnly="False" />
+    <SelfTest SelfTest="True" />
+    <ExtensiveLog ExtensiveLog="True" />
+    <LogPressure LogPressure="False" />
+    <ThermalFault ThermalFault="False" />
+    <ShowAdvertising ShowAdvertising="False" />
+    <AdvertisingDelay AdvertisingDelay="300000" />
+    <CheckCamera CheckCamera="True" />
+    <PressureFailTipRestore PressureFailTipRestore="False" />
+    <ScreenResolutionHigh ScreenResolutionHigh="False" />
+  </OperationParameters>
+</BioXPCommonLib>

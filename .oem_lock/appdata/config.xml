@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<BioXPCommonLib>
+  <GenBot>
+    <SerialNumber GenBot="206" />
+    <Config Version="3" GripperVersion="1" TroughVersion="1" ExpirationDate="1/1/1970 12:00:00 AM" />
+    <Calibration Calibrated="1" m_cal_software="5.0.0.1" m_cal_tool="50010-01A" m_cal_reversion="0" m_cal_date="9/26/2018 11:50:43 PM" m_Liquid_Cal="True" m_Liquid_Cal_date="1/8/2019 12:23:02 PM" m_liquid_cal_reversion="0" m_Gripper_Cal_date="9/26/2018 9:36:30 AM" />
+    <CameraInstalled Camera="1" Cameracalibrated="True" />
+    <Server Password="changeit" Host="customer.sgidna.com" SimpleServer="" JobInfoLocation="" />
+  </GenBot>
+  <LanguageSetting>
+    <Languages English="en-US" Française="fr-FR" />
+    <CurrentLanguage English="en-US" />
+  </LanguageSetting>
+  <CalibrationFactors>
+    <Offsets m_originOffsetG="4450" m_GripperClosePOS="27350" m_GripperOpenPOS="31400" m_GripperOpenWide="32400" m_TCDoorOpen="18500" m_TCDoorStallGuardThreshold="6" m_TC_DOOR_VELOCITY="50" m_TC_DOOR_ACCELERATION="20" m_TC_DOOR_MAX_CURRENT="31" m_Z_MOTOR_MAX_CURRENT_DOWN="25" m_Z_MOTOR_MAX_CURRENT_UP="31" m_Z_MOTOR_STALL_GUARD_THRESHOLD="3" OutPutBufferatMS_Zlow="0" OutlierRangeFactor="4" />
+    <SealCut m_cut_gclose_offset="0" m_cut_z_offset="4000" m_cut_x_offset="0" />
+    <ReagentChiller MaxHeatingCurrent="5" MaxCoolingCurrent="-5" Proportional="1.5" FeedForward="400" />
+    <OutputChiller MaxHeatingCurrent="5" MaxCoolingCurrent="-5" Proportional="1.5" FeedForward="400" />
+  </CalibrationFactors>
+  <TipCollection>
+    <TypeA color="#FFFF0000" capacity="10" />
+    <TypeB color="#FF008000" capacity="25" />
+  </TipCollection>
+  <AxisLimits>
+    <X_limit minSteps="0" maxSteps="90263" />
+    <Y_limit minSteps="0" maxSteps="102956" />
+    <Z_limit minSteps="0" maxSteps="160000" />
+    <G_limit minSteps="0" maxSteps="15000" />
+  </AxisLimits>
+  <PositionTable>
+    <LOC_MS x="26213" y="9241" zLow="83407" zDelta="37400" inc_factor="1" />
+    <LOC_OC x="26213" y="42413" zLow="90540" zDelta="31150" inc_factor="1" />
+    <LOC_TC x="67606" y="9241" zLow="71565" zDelta="35000" inc_factor="1" />
+    <LOC_RC x="67677" y="45256" zLow="87671" zDelta="43100" inc_factor="1" />
+    <LOC_BSCS x="82868" y="61772" zLow="108317" zDelta="112564" inc_factor="0" />
+    <WASTE_BIN x="92049" y="93211" zLow="0" zDelta="0" inc_factor="0" />
+    <TECANRACK1 x="60571" y="71755" zLow="141531" zDelta="53000" inc_factor="1" />
+    <TECANRACK2 x="25029" y="71755" zLow="141531" zDelta="53000" inc_factor="1" />
+    <TECANRACK3 x="60571" y="95449" zLow="142312" zDelta="53000" inc_factor="1" />
+    <TECANRACK4 x="25029" y="95449" zLow="142312" zDelta="53000" inc_factor="1" />
+    <LOC_STRIP1 x="75022" y="83403" zLow="57966" zDelta="59054" inc_factor="1" />
+    <LOC_STRIP2 x="72890" y="83403" zLow="57966" zDelta="59054" inc_factor="1" />
+    <LOC_STRIP3 x="70758" y="83403" zLow="57966" zDelta="59054" inc_factor="1" />
+    <LOC_STRIP4 x="68625" y="83403" zLow="57966" zDelta="59054" inc_factor="1" />
+    <LOC_TROUGH x="85555" y="63278" zLow="106754" zDelta="51754" inc_factor="0" />
+    <LOC_OC_COVER x="1324" y="42129" zLow="107001" zDelta="107496" inc_factor="0" />
+    <LOC_OC_COVER_STORAGE x="84252" y="6057" zLow="105981" zDelta="107496" inc_factor="0" />
+    <LOC_RC_COVER x="42788" y="44972" zLow="107496" zDelta="107084" inc_factor="0" />
+    <LOC_RC_COVER_STORAGE x="84252" y="36267" zLow="105981" zDelta="107496" inc_factor="0" />
+    <LOC_BSC x="42518" y="8779" zLow="112222" zDelta="112222" inc_factor="0" />
+    <LOC_P_OC x="1125" y="41950" zLow="153750" zDelta="154084" inc_factor="0" />
+    <LOC_P_TC x="42518" y="8779" zLow="129851" zDelta="129851" inc_factor="0" />
+    <LOC_P_MS x="1125" y="8779" zLow="143882" zDelta="143882" inc_factor="0" />
+    <LOC_P_TC_PRESS x="42518" y="8779" zLow="115222" zDelta="116935" inc_factor="0" />
+    <LOC_P_MS_PRESS x="1125" y="8779" zLow="129253" zDelta="129253" inc_factor="0" />
+    <LOC_P_OC_PRESS x="1125" y="41950" zLow="132585" zDelta="137935" inc_factor="0" />
+    <LOC_P_RC_PRESS x="42786" y="44971" zLow="108020" zDelta="109935" inc_factor="0" />
+    <LOC_PARK x="1506" y="71" zLow="114092" zDelta="114092" inc_factor="0" />
+    <CAMERA_OFFSET x="3499" y="-7744" zLow="3145" zDelta="6842" inc_factor="0" />
+  </PositionTable>
+  <ScalePort>
+    <Port com="COM1" baud="9600" databits="8" stopbits="One" parity="None" flowcontrol="None" />
+  </ScalePort>
+</BioXPCommonLib>

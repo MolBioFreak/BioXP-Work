@@ -75,7 +75,7 @@ class FakeTester:
         return {"left_active": False, "right_active": False}
 
     def motor_move_relative(self, board: int, steps: int, motor: int = 0):
-        self.bus_events.append({"board": board, "status": 128, "cmd": 4, "value": steps, "source": "fake_move_ack_window"})
+        self.bus_events.append({"board": board, "status": 128, "motor": motor, "cmd": 4, "value": steps, "source": "fake_move_ack_window"})
         return {"ok": True, "board": board, "motor": motor, "steps": steps}
 
     def clear_bus_event_buffer(self):
@@ -299,7 +299,7 @@ def test_set_motion_axis_currents_rejects_unsupported_axes(monkeypatch):
         raise AssertionError("expected unsupported axis rejection")
 
 
-def test_relative_move_response_exposes_oem_style_motion_evidence(monkeypatch):
+def test_relative_move_response_exposes_and_rejects_stall_evidence(monkeypatch):
     monkeypatch.delenv("BIOXP_ENABLE_PREP_REUSE_DEBUG", raising=False)
     api = load_api(monkeypatch)
     mark_x_referenced(api, monkeypatch)
@@ -335,6 +335,8 @@ def test_relative_move_response_exposes_oem_style_motion_evidence(monkeypatch):
     )
 
     evidence = result["motion_evidence"]
+    assert result["ok"] is False
+    assert result["motion_failure"]["category"] == "controller_motion_error"
     assert evidence["prep_params"]["run_current_param6"]["set"] == 31
     assert evidence["prep_params"]["standby_current_param7"]["readback"] == 10
     assert evidence["prep_params"]["speed_param4"]["set"] == 1700
@@ -351,7 +353,7 @@ def test_relative_move_response_exposes_oem_style_motion_evidence(monkeypatch):
     assert evidence["events"]["captured_count"] == 2
     assert evidence["events"]["target_reached_128"][0]["source"] == "fake_move_ack_window"
     assert evidence["events"]["stallguard_130"][0]["source"] == "fake_tail_collect"
-    assert evidence["classification"]["controller_motion_evidence"] is True
+    assert evidence["classification"]["controller_motion_evidence"] is False
     assert evidence["classification"]["target_reached_event_seen"] is True
     assert evidence["classification"]["stall_event_seen"] is True
     assert evidence["classification"]["position_delta"] == 12

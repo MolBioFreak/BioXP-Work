@@ -30,3 +30,6 @@ config/oem/original_ssd_appdata_*/
 backup-bin/
 *.bak-*
 *.py.bak-*
+
+# Mutable robot-local transaction state; preserved outside Git.
+.oem_runtime_state/

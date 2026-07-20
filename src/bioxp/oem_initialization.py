@@ -3,9 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from pathlib import Path
-
-from .oem_config import find_oem_machine_config_bundle, oem_thermal_door_defaults, parse_oem_machine_config_bundle
+from .oem_config import find_oem_machine_config_bundle
 
 
 @dataclass(frozen=True)
@@ -144,39 +142,30 @@ def _config_attr(bundle: dict[str, Any], key: str) -> Any:
     return None
 
 
-def _default_repo_machine_config_bundle() -> dict[str, Any] | None:
-    # Repo-local copy of the original SSD AppData config. This is read-only and
-    # used when env vars are not set on the robot/runtime.
-    root = Path.cwd() / "config" / "oem" / "original_ssd_appdata_20260610"
-    if root.exists():
-        return parse_oem_machine_config_bundle(root)
-    return None
-
-
 def build_machine_calibration_manifest(bundle: dict[str, Any] | None = None, *, serial_number: int | str | None = None) -> dict[str, Any]:
     """Return the OEM machine-calibration values the initialization controller must consume.
 
-    Source defaults are reported only as fallback; when the extracted SSD config exists
-    its values must be preferred and tagged as machine config.
+    Accepted live values come only from the immutable machine snapshot. Missing
+    fields remain unavailable and block the consuming stage; no source default is
+    substituted here.
     """
     if bundle is None:
         bundle = find_oem_machine_config_bundle()
-        if not bool(isinstance(bundle, dict) and bundle.get("ok")):
-            bundle = _default_repo_machine_config_bundle() or bundle
-    defaults = oem_thermal_door_defaults(serial_number)
     ok = bool(isinstance(bundle, dict) and bundle.get("ok"))
+    if serial_number is not None and int(serial_number) != 206:
+        ok = False
     config_path = None
     if ok:
         files = bundle.get("files") or {}
         cfg_file = files.get("config_xml") if isinstance(files, dict) else None
         if isinstance(cfg_file, dict):
             config_path = cfg_file.get("path")
-    def value(name: str, default: Any) -> dict[str, Any]:
+    def value(name: str) -> dict[str, Any]:
         if ok:
             v = _config_attr(bundle, name)
             if v is not None:
-                return {"value": v, "source": "original_ssd_machine_config", "fallback": False, "config_path": config_path}
-        return {"value": default, "source": "oem_source_default", "fallback": True, "config_path": config_path}
+                return {"value": v, "source": "immutable_oem_machine_snapshot", "fallback": False, "config_path": config_path}
+        return {"value": None, "source": "unavailable_fail_closed", "fallback": False, "config_path": config_path}
 
     manifest = {
         "ok": ok,
@@ -184,17 +173,17 @@ def build_machine_calibration_manifest(bundle: dict[str, Any] | None = None, *, 
         "config_path": config_path,
         "machine_calibrated": bool(bundle.get("machine_calibrated")) if isinstance(bundle, dict) else False,
         "thermal_door": {
-            "TCDoorOpen": value("TCDoorOpen", defaults["TCDoorOpen"]),
-            "TC_DOOR_VELOCITY": value("TC_DOOR_VELOCITY", defaults["TC_DOOR_VELOCITY"]),
-            "TC_DOOR_ACCELERATION": value("TC_DOOR_ACCELERATION", defaults["TC_DOOR_ACCELERATION"]),
-            "TC_DOOR_MAX_CURRENT": value("TC_DOOR_MAX_CURRENT", defaults["TC_DOOR_MAX_CURRENT"]),
-            "TCDoorStallGuardThreshold": value("TCDoorStallGuardThreshold", defaults["TCDoorStallGuardThreshold"]),
+            "TCDoorOpen": value("TCDoorOpen"),
+            "TC_DOOR_VELOCITY": value("TC_DOOR_VELOCITY"),
+            "TC_DOOR_ACCELERATION": value("TC_DOOR_ACCELERATION"),
+            "TC_DOOR_MAX_CURRENT": value("TC_DOOR_MAX_CURRENT"),
+            "TCDoorStallGuardThreshold": value("TCDoorStallGuardThreshold"),
         },
         "gripper": {
-            "originOffsetG": value("originOffsetG", None),
-            "GripperClosePOS": value("GripperClosePOS", None),
-            "GripperOpenPOS": value("GripperOpenPOS", None),
-            "GripperOpenWide": value("GripperOpenWide", None),
+            "originOffsetG": value("originOffsetG"),
+            "GripperClosePOS": value("GripperClosePOS"),
+            "GripperOpenPOS": value("GripperOpenPOS"),
+            "GripperOpenWide": value("GripperOpenWide"),
         },
         "axis_limits": {},
         "phases": [phase.to_dict() for phase in OEM_INIT_PHASES],
@@ -203,8 +192,8 @@ def build_machine_calibration_manifest(bundle: dict[str, Any] | None = None, *, 
         row = _axis_limit_from_bundle(bundle, axis) if ok else None
         manifest["axis_limits"][axis] = {
             "value": row,
-            "source": "original_ssd_machine_config" if row is not None else "oem_source_default_or_unavailable",
-            "fallback": row is None,
+            "source": "immutable_oem_machine_snapshot" if row is not None else "unavailable_fail_closed",
+            "fallback": False,
             "config_path": config_path,
         }
     return manifest

@@ -253,7 +253,7 @@ def test_run_relative_motion_command_dry_run_bundle_failure_is_structured_not_50
     )
 
     assert result["dry_run"] is True
-    assert result["ok"] is False
+    assert result.get("ok") is False
     assert "artifact_bundle" not in result
     assert result["artifact_bundle_error"]["category"] == "validation_artifact_unavailable"
     assert "disk full" in result["artifact_bundle_error"]["message"]
@@ -298,7 +298,7 @@ def test_move_axis_absolute_route_records_motion_after_success(monkeypatch):
     async def fake_runner(command, **kwargs):
         assert command.speed == 200
         assert command.acc == 80
-        return {"axis": getattr(command.axis, "value", command.axis), "target_position": 100, "wait": {"ok": True}}
+        return {"axis": getattr(command.axis, "value", command.axis), "target_position": 100, "wait": {"ok": True}, "motion_evidence": {"classification": {"controller_motion_evidence": True}}}
 
     class FakeStore:
         def record_motion(self, axis, motion_kind):
@@ -317,6 +317,12 @@ def test_move_axis_absolute_route_records_motion_after_success(monkeypatch):
 
 def test_execute_absolute_move_applies_profile_override_before_motion(monkeypatch):
     api = load_api(monkeypatch)
+
+    class FakeReferenceStore:
+        def snapshot(self, axes):
+            return {"rows": {ax.value if hasattr(ax, "value") else ax: {"axis": ax.value if hasattr(ax, "value") else ax, "state": "referenced"} for ax in axes}}
+
+    monkeypatch.setattr(api, "_reference_state_store", FakeReferenceStore())
 
     class FakeTester:
         def motor_function_preset(self, key):
@@ -443,7 +449,7 @@ def test_move_axis_zero_route_moves_to_absolute_zero(monkeypatch):
 
     async def fake_runner(command, **kwargs):
         recorded.append(command)
-        return {"axis": getattr(command.axis, "value", command.axis), "move": {"ok": True, "mode": "absolute"}}
+        return {"axis": getattr(command.axis, "value", command.axis), "move": {"ok": True, "mode": "absolute"}, "motion_evidence": {"classification": {"controller_motion_evidence": True}}}
 
     class FakeStore:
         def record_motion(self, axis, motion_kind):
@@ -469,7 +475,7 @@ def test_home_axis_route_preserves_oem_switch_search_and_marks_reference(monkeyp
 
     async def fake_runner(command, **kwargs):
         recorded.append(command)
-        return {"axis": getattr(command.axis, "value", command.axis), "home": {"ok": True}}
+        return {"axis": getattr(command.axis, "value", command.axis), "home": {"ok": True}, "motion_evidence": {"classification": {"controller_motion_evidence": True}}}
 
     class FakeStore:
         def mark_referenced(self, command):
@@ -538,6 +544,12 @@ def test_dual_limit_switch_state_is_readback_only_for_supervised_motion(monkeypa
 def test_execute_relative_move_returns_structured_no_motion_failure_instead_of_409(monkeypatch):
     api = load_api(monkeypatch)
 
+    class FakeReferenceStore:
+        def snapshot(self, axes):
+            return {"rows": {ax.value if hasattr(ax, "value") else ax: {"axis": ax.value if hasattr(ax, "value") else ax, "state": "referenced"} for ax in axes}}
+
+    monkeypatch.setattr(api, "_reference_state_store", FakeReferenceStore())
+
     class FakeTester:
         def motor_function_preset(self, key):
             assert key == "x"
@@ -593,6 +605,192 @@ def test_execute_relative_move_returns_structured_no_motion_failure_instead_of_4
     assert "no nonzero speed" in result["motion_failure"]["message"]
     assert result["motion_truth"]["physical_motion_confirmed"] is False
     assert result["wait"]["ok"] is False
+
+
+
+def test_wait_for_motion_polls_oem_gap8_reached_position(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def __init__(self):
+            self.speed_values = [100, 100, 0]
+            self.position_values = [0, 500, 1000, 1000]
+            self.gap8_calls = 0
+
+        def motor_get_position(self, board, *, motor=0):
+            value = self.position_values.pop(0) if self.position_values else 1000
+            return {"board": board, "motor": motor, "position": value, "ok": True}
+
+        def motor_get_speed(self, board, *, motor=0):
+            value = self.speed_values.pop(0) if self.speed_values else 0
+            return {"board": board, "motor": motor, "speed": value, "ok": True}
+
+        def motor_get_switch_activity(self, board, *, motor=0):
+            return {"left_active": False, "right_active": False}
+
+        def motor_get_reached_position(self, board, *, motor=0):
+            self.gap8_calls += 1
+            return {"board": board, "motor": motor, "target_reached": 1, "ok": True}
+
+    tester = FakeTester()
+    result = api._wait_for_motion_with_guardrails(tester, 5, 0, timeout_s=5.0, poll_s=0.01)
+
+    assert result["ok"] is True
+    assert tester.gap8_calls >= 1
+    assert result["reached_position_after"]["target_reached"] == 1
+    assert result["log_tail"][-1]["target_reached"] == 1
+
+
+def test_motion_evidence_reports_gap8_from_wait(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        position_before={"position": 0},
+        switch_before={"left_active": False, "right_active": False},
+        position_after={"position": 1000},
+        switch_after={"left_active": False, "right_active": False},
+        move={"ok": True},
+        wait={
+            "ok": True,
+            "seen_nonzero": True,
+            "last_speed": 0,
+            "reached_position_after": {"target_reached": 1, "ok": True},
+            "log_tail": [{"speed": 100, "position": 500, "target_reached": 0}, {"speed": 0, "position": 1000, "target_reached": 1}],
+        },
+        motion_profile={"speed": 200, "acc": 200},
+        raw_events=[],
+        event_capture_attempted=True,
+    )
+
+    assert evidence["telemetry"]["after"]["gap8_target_reached"]["value"] == 1
+    assert evidence["classification"]["gap8_target_reached"] == 1
+    assert evidence["classification"]["controller_target_confirmed"] is False
+    assert evidence["classification"]["controller_motion_evidence"] is False
+
+
+def test_home_motion_evidence_rejects_fake_position_speed_without_switch_transition(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_home_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        home={
+            "ok": False,
+            "position_before": {"position": 0},
+            "position_after": {"position": 93241},
+            "switch_activity_before": {"left_active": False, "right_active": False},
+            "switch_activity_after": {"left_active": False, "right_active": False},
+            "move_left": {"ok": True},
+            "switch_transition": False,
+            "log_tail": [
+                {"speed": -200, "position": -10000, "home": 0},
+                {"speed": -200, "position": -50000, "home": 0},
+                {"speed": -200, "position": -93241, "home": 0},
+            ],
+        },
+        motion_profile={"speed": 200, "acc": 200},
+    )
+
+    assert evidence["classification"]["nonzero_speed_seen"] is True
+    assert evidence["classification"]["position_delta"] == 93241
+    assert evidence["classification"]["controller_target_confirmed"] is False
+    assert evidence["classification"]["controller_motion_evidence"] is False
+    assert evidence["switch_transition"] is False
+
+
+def test_home_motion_evidence_accepts_switch_transition_as_physical_proof(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_home_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        home={
+            "ok": True,
+            "position_before": {"position": 0},
+            "position_after": {"position": -1000},
+            "switch_activity_before": {"left_active": False, "right_active": False},
+            "switch_activity_after": {"left_active": True, "right_active": False},
+            "move_left": {"ok": True},
+            "home_active_value": 1,
+            "home_after": {"value": 1},
+            "set_home": {"ok": True},
+            "switch_transition": True,
+            "log_tail": [
+                {"speed": -200, "position": -500, "home": 0},
+                {"speed": -200, "position": -1000, "home": 1},
+            ],
+        },
+        motion_profile={"speed": 200, "acc": 200},
+    )
+
+    assert evidence["classification"]["controller_motion_evidence"] is True
+    assert evidence["classification"]["switch_transition"] is True
+    assert evidence["switch_transition"] is True
+
+
+def test_motion_error_events_fail_relative_move_even_with_counter_delta(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motor_function_preset(self, key):
+            return {"board": 5, "motor": 0, "speed": 200, "acc": 200, "run_current": 31, "standby_current": 10, "stall_guard": 16}
+
+        def motor_normalize_speed_acc(self, board, *, motor=0, speed=None, acc=None):
+            return {"axis_key": "x", "speed": speed or 200, "acc": acc or 200, "changes": []}
+
+        def motion_arm_state(self):
+            return {"armed": True}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=True):
+            return {5: {"status": 100}}
+
+        def motor_prepare_motion_interlock(self, force_lock=True):
+            return {"ok": True}
+
+        def motor_prepare_axis(self, board, **kwargs):
+            return {"ok": True, "ops": []}
+
+        def motor_get_position(self, board, *, motor=0):
+            return {"position": 0}
+
+        def motor_get_switch_activity(self, board, *, motor=0):
+            return {"left_active": False, "right_active": False}
+
+        def motor_move_relative(self, board, steps, *, motor=0):
+            return {"ok": True, "steps": steps}
+
+    class FakeReferenceStore:
+        def snapshot(self, axes):
+            return {"rows": {"x": {"axis": "x", "state": "referenced"}}}
+
+    monkeypatch.setattr(api, "_reference_state_store", FakeReferenceStore())
+    monkeypatch.setattr(
+        api,
+        "_wait_for_motion_with_guardrails",
+        lambda tester, board, motor, timeout_s: {
+            "ok": True,
+            "seen_nonzero": True,
+            "position_after": {"position": 1000},
+            "switch_activity_after": {"left_active": False, "right_active": False},
+            "reached_position_after": {"target_reached": 1},
+            "log_tail": [{"speed": 100, "position": 500, "target_reached": 0}, {"speed": 0, "position": 1000, "target_reached": 1}],
+        },
+    )
+    monkeypatch.setattr(api, "_collect_motion_event_capture", lambda tester: ([{"status": 14, "board": 5, "motor": 0}], True))
+
+    result = api._execute_relative_move(FakeTester(), api.AxisName.X, 1000, 5.0)
+
+    assert result["ok"] is False
+    assert result["motion_failure"]["category"] == "controller_motion_error"
+    assert result["motion_failure"]["event_status"] == 14
 
 
 def test_move_axis_relative_skips_reference_update_for_structured_motion_failure(monkeypatch):
@@ -725,3 +923,324 @@ def test_protocol_live_move_is_blocked_after_maintenance_before_executor(monkeyp
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["hardware_motion_commanded"] is False
+
+
+
+def test_controller_only_motion_truth_does_not_update_reference(monkeypatch):
+    api = load_api(monkeypatch)
+
+    assert api._motion_response_allows_reference_update({
+        "axis": "x",
+        "position_delta": 1000,
+        "wait": {"ok": True, "seen_nonzero": True},
+        "motion_truth": {"physical_motion_confirmed": False, "evidence_level": "controller_only"},
+    }) is False
+
+    assert api._motion_response_allows_reference_update({
+        "axis": "x",
+        "position_delta": 1000,
+        "motion_truth": {"physical_motion_confirmed": True, "evidence_level": "operator_or_camera"},
+    }) is True
+
+
+def test_operator_desynced_axis_blocks_motion_prepare(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeStore:
+        def snapshot(self, axes):
+            return {"rows": {"x": {"axis": "x", "state": "desynced", "note": "operator reported no physical movement"}}}
+
+    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
+
+    try:
+        api._require_axis_not_operator_desynced(api.AxisName.X, command="axis motion/prepare")
+    except api.HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail["axis"] == "x"
+        assert exc.detail["reason"] == "operator_physical_truth_over_controller_counter_truth"
+    else:
+        raise AssertionError("desynced axis was not blocked")
+
+
+
+def test_axis_limit_guard_blocks_current_position_outside_oem_envelope(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(api, "harmonized_motion_config", lambda: {"axis_limits": {"x": {"min_steps": 0, "max_steps": 90263}}})
+
+    try:
+        api._guard_axis_position_within_oem_limits(api.AxisName.X, {"position": -307111}, command="home search")
+    except api.HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail["reason"] == "controller_position_outside_oem_axis_limits"
+        assert exc.detail["position_steps"] == -307111
+    else:
+        raise AssertionError("out-of-range X position was not blocked")
+
+
+def test_axis_limit_guard_blocks_relative_target_outside_oem_envelope(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(api, "harmonized_motion_config", lambda: {"axis_limits": {"x": {"min_steps": 0, "max_steps": 90263}}})
+
+    try:
+        api._guard_absolute_target(api.AxisName.X, {"position": 1000}, -1, {"left_active": False, "right_active": False}, {})
+    except api.HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail["reason"] == "target_outside_oem_axis_limits"
+        assert exc.detail["target_position_steps"] == -1
+    else:
+        raise AssertionError("out-of-range X target was not blocked")
+
+
+def test_z_guard_transforms_oem_source_limits_into_live_signed_controller_envelope(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(
+        api,
+        "harmonized_motion_config",
+        lambda: {"axis_limits": {"z": {"min_steps": 0, "max_steps": 160000, "source": "test_oem_source"}}},
+    )
+
+    api._guard_absolute_target(
+        api.AxisName.Z,
+        {"position": 0},
+        -1,
+        {"left_active": False, "right_active": False},
+        {},
+    )
+
+    for unsafe_target in (1, -160001):
+        try:
+            api._guard_absolute_target(
+                api.AxisName.Z,
+                {"position": 0},
+                unsafe_target,
+                {"left_active": False, "right_active": False},
+                {},
+            )
+        except api.HTTPException as exc:
+            assert exc.status_code == 409
+            assert exc.detail["reason"] == "target_outside_oem_axis_limits"
+            assert exc.detail["configured_limit"]["coordinate_contract"] == "observed_live_signed_z"
+        else:
+            raise AssertionError(f"unsafe signed-Z target {unsafe_target} was not blocked")
+
+
+def test_target_validation_runs_before_missing_current_position_fails_closed(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(
+        api,
+        "harmonized_motion_config",
+        lambda: {"axis_limits": {"z": {"min_steps": 0, "max_steps": 160000}}},
+    )
+
+    try:
+        api._guard_absolute_target(
+            api.AxisName.Z,
+            None,
+            1,
+            {"left_active": False, "right_active": False},
+            {},
+        )
+    except api.HTTPException as exc:
+        assert exc.detail["reason"] == "target_outside_oem_axis_limits"
+    else:
+        raise AssertionError("out-of-range target bypassed validation when current position was absent")
+
+    try:
+        api._guard_absolute_target(
+            api.AxisName.Z,
+            None,
+            -1,
+            {"left_active": False, "right_active": False},
+            {},
+        )
+    except api.HTTPException as exc:
+        assert exc.detail["reason"] == "current_position_unavailable_for_motion_guard"
+        assert exc.detail["motion_blocked"] is True
+    else:
+        raise AssertionError("missing current position did not fail closed")
+
+
+
+def test_target_reached_event_for_wrong_motor_does_not_confirm_motion(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        position_before={"position": 0},
+        switch_before={"left_active": False, "right_active": False},
+        position_after={"position": 1000},
+        switch_after={"left_active": False, "right_active": False},
+        move={"ok": True},
+        wait={"ok": True, "seen_nonzero": True, "log_tail": [{"speed": 100, "position": 500}]},
+        raw_events=[{"board": 5, "motor": 1, "status": 128, "cmd": 138, "value": 0}],
+        event_capture_attempted=True,
+    )
+
+    assert evidence["events"]["target_reached_128"] == []
+    assert evidence["classification"]["target_reached_event_seen"] is False
+    assert evidence["classification"]["controller_motion_evidence"] is False
+
+
+def test_target_reached_event_for_matching_motor_confirms_motion(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        position_before={"position": 0},
+        switch_before={"left_active": False, "right_active": False},
+        position_after={"position": 1000},
+        switch_after={"left_active": False, "right_active": False},
+        move={"ok": True},
+        wait={"ok": True, "seen_nonzero": True, "log_tail": [{"speed": 100, "position": 500}]},
+        raw_events=[{"board": 5, "motor": 0, "status": 128, "cmd": 138, "value": 0}],
+        event_capture_attempted=True,
+    )
+
+    assert len(evidence["events"]["target_reached_128"]) == 1
+    assert evidence["classification"]["target_reached_event_seen"] is True
+    assert evidence["classification"]["controller_motion_evidence"] is True
+
+
+def test_gap8_query_reports_oem_return_semantics_not_raw_target_value(monkeypatch):
+    from src.bioxp.usb_driver import BioXpTester
+
+    tester = BioXpTester.__new__(BioXpTester)
+    tester.motor_get_axis_param = lambda board, param, motor=0: {
+        "board": board,
+        "param": param,
+        "motor": motor,
+        "value": 0,
+        "ack": {"status": 100, "status_str": "Success"},
+    }
+    tester._tmcl_success = lambda ack: isinstance(ack, dict) and ack.get("status") == 100
+
+    row = tester.motor_get_reached_position(5, motor=0)
+
+    assert row["gap_param"] == 8
+    assert row["oem_query_reached_position_return"] == 0
+    assert row["ack_success"] is True
+    assert row["target_reached"] is None
+
+
+
+def test_relative_move_fails_without_matching_oem_target_event(monkeypatch):
+    api = load_api(monkeypatch)
+    store = api.ReferenceStateStore()
+    store.mark_referenced(api.MarkAxisReferencedCommand(axis=api.AxisName.X, position_steps=0, source="test", motion_kind="test"))
+    monkeypatch.setattr(api, "_reference_state_store", store)
+    monkeypatch.setattr(api, "harmonized_motion_config", lambda: {"axis_limits": {"x": {"min_steps": 0, "max_steps": 90263}}})
+
+    class FakeTester:
+        MOTOR_SWITCH_ACTIVE_VALUE = 1
+        def __init__(self):
+            self.speeds = [100, 100, 0, 0]
+            self.positions = [0, 500, 1000, 1000, 1000]
+        def motor_function_preset(self, key):
+            return {"board": 5, "motor": 0, "label": "X", "speed": 200, "acc": 200, "run_current": 31, "standby_current": 10, "stall_guard": 16}
+        def motor_normalize_speed_acc(self, board, *, motor=0, speed=None, acc=None):
+            return {"axis_key": "x", "speed": speed or 200, "acc": acc or 200, "changes": []}
+        def motion_arm_state(self): return {"armed": True}
+        def motion_gate_live_snapshot(self): return {"ok": True}
+        def activate_boards(self, expect_reply=True): return {5: {"status": 100}}
+        def motor_prepare_motion_interlock(self, force_lock=True): return {"ok": True}
+        def motor_prepare_axis(self, board, **kwargs): return {"ok": True, "ops": []}
+        def motor_get_position(self, board, *, motor=0):
+            value = self.positions.pop(0) if self.positions else 1000
+            return {"position": value}
+        def motor_get_switch_activity(self, board, *, motor=0): return {"left_active": False, "right_active": False}
+        def clear_bus_event_buffer(self): pass
+        def drain(self, **kwargs): return []
+        def motor_move_relative(self, board, steps, *, motor=0): return {"ok": True}
+        def motor_get_speed(self, board, *, motor=0):
+            value = self.speeds.pop(0) if self.speeds else 0
+            return {"speed": value}
+        def motor_get_reached_position(self, board, *, motor=0): return {"gap_param": 8, "oem_query_reached_position_return": 0, "target_reached": None, "ok": True}
+        def motor_stop(self, board, *, motor=0): return {"ok": True}
+        def motor_wait_stopped(self, board, *, motor=0, timeout_s=2.0, poll_s=0.06): return {"ok": True}
+        def pop_bus_event_buffer(self): return []
+        def collect_bus_events(self, **kwargs): return []
+
+    result = api._execute_relative_move(FakeTester(), api.AxisName.X, 1000, 5.0)
+
+    assert result.get("ok") is False
+    assert result["motion_failure"]["category"] == "oem_motion_evidence_missing"
+    assert result["motion_evidence"]["classification"]["controller_motion_evidence"] is False
+
+
+
+def test_home_evidence_uses_oem_queryhome_sethome_not_required_transition(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_home_motion_evidence(
+        preset={"board": 5, "motor": 0},
+        prep={},
+        interlock={},
+        motion_profile={},
+        home={
+            "ok": True,
+            "home_active_value": 1,
+            "position_before": {"position": -307111},
+            "position_after": {"position": 0},
+            "switch_activity_before": {"left_active": True, "right_active": True},
+            "switch_activity_after": {"left_active": True, "right_active": True},
+            "move_left": {"ok": True},
+            "home_after": {"value": 1},
+            "set_home": {"ok": True},
+            "switch_transition": False,
+        },
+    )
+
+    assert evidence["home_predicate_confirmed"] is True
+    assert evidence["switch_transition"] is False
+    assert evidence["classification"]["home_predicate_confirmed"] is True
+    assert evidence["classification"]["controller_motion_evidence"] is True
+
+
+def test_home_route_does_not_block_prehome_outside_oem_envelope(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(api, "harmonized_motion_config", lambda: {"axis_limits": {"x": {"min_steps": 0, "max_steps": 90263}}})
+    store = api.ReferenceStateStore()
+    store.mark_referenced(api.MarkAxisReferencedCommand(axis=api.AxisName.X, position_steps=0, source="test", motion_kind="test"))
+    monkeypatch.setattr(api, "_reference_state_store", store)
+    monkeypatch.setattr(api, "_home_predicate_snapshot", lambda tester, axis: {"interpreted": {"confidence": "source_anchored"}})
+
+    class FakeTester:
+        MOTOR_SWITCH_ACTIVE_VALUE = 1
+        def _motion_oem_axis_profile(self, key):
+            return {"board": 5, "motor": 0, "label": "X", "speed": 200, "home_speed": 200, "acc": 200, "run_current": 31, "standby_current": 10}
+        def motor_function_preset(self, key):
+            return self._motion_oem_axis_profile(key)
+        def motion_arm_state(self): return {"armed": True}
+        def motion_gate_live_snapshot(self): return {"ok": True}
+        def activate_boards(self, expect_reply=True): return {5: {"status": 100}}
+        def motor_prepare_motion_interlock(self, force_lock=True): return {"ok": True}
+        def motor_prepare_axis(self, board, **kwargs): return {"ok": True, "ops": []}
+        def motor_get_position(self, board, *, motor=0): return {"position": -307111}
+        def motor_oem_switch_search_home_axis(self, axis_key, *, speed, timeout_s):
+            return {
+                "ok": True,
+                "axis": axis_key,
+                "board": 5,
+                "motor": 0,
+                "home_active_value": 1,
+                "position_before": {"position": -307111},
+                "position_after": {"position": 0},
+                "switch_activity_before": {"left_active": True, "right_active": True},
+                "switch_activity_after": {"left_active": True, "right_active": True},
+                "move_left": {"ok": True},
+                "home_after": {"value": 1},
+                "set_home": {"ok": True},
+                "switch_transition": False,
+            }
+
+    result = api._execute_home_axis(FakeTester(), api.AxisName.X, 200, 10.0)
+
+    assert result["ok"] is True
+    assert result["motion_profile"]["position_before_home_search"] == {"position": -307111}
+    assert result["motion_profile"]["pre_home_position_outside_limit_policy"] == "tracked_not_blocked_home_reestablishes_reference"
+    assert result["motion_evidence"]["classification"]["controller_motion_evidence"] is True
+    assert api._motion_response_allows_reference_update(result) is True

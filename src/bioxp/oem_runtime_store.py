@@ -38,6 +38,21 @@ class OEMRuntimeStore:
 
     def write_state(self, snapshot: OEMRuntimeSnapshot | dict[str, Any]) -> dict[str, Any]:
         payload = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        from .hardware_status import hardware_state
+        from .lifecycle_state import lifecycle_state
+
+        canonical = hardware_state.completed_snapshot()
+        payload["canonical_hardware_snapshot"] = {
+            "snapshot_id": None if canonical is None else canonical.get("snapshot_id"),
+            "ownership_epoch": hardware_state.ownership_epoch,
+            "available": canonical is not None,
+            "reference_only": True,
+        }
+        lifecycle = lifecycle_state.projection()
+        payload["runtime_state"] = lifecycle["operation_state"]
+        payload["operation_state"] = lifecycle["operation_state"]
+        payload["startup"] = lifecycle["startup"]
+        payload["lifecycle_revision"] = lifecycle["revision"]
         payload["sequence"] = self.next_seq()
         payload["updated_at"] = utc_ts()
         _atomic_json(self.root / "runtime_state.json", payload)

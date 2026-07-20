@@ -1,3 +1,5 @@
+import threading
+
 from src.bioxp.usb_driver import BioXpTester
 
 
@@ -57,8 +59,10 @@ def test_oem_home_xy_sets_home_after_switch_confirmed():
 
 
 
-def test_oem_homexy_serializes_linux_usb_context():
+def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
     calls = []
+    calls_lock = threading.Lock()
+    both_started = threading.Event()
 
     class Tester(BioXpTester):
         def __init__(self):
@@ -71,7 +75,14 @@ def test_oem_homexy_serializes_linux_usb_context():
             return {"ok": True, "board": board, "param": param, "value": value}
 
         def motor_oem_go_home(self, axis, **kwargs):
-            calls.append(axis)
+            assert kwargs["require_switch_transition"] is True
+            with calls_lock:
+                calls.append(("started", axis))
+                if len([row for row in calls if row[0] == "started"]) == 2:
+                    both_started.set()
+            assert both_started.wait(timeout=0.5), "other HomeXY task did not start concurrently"
+            with calls_lock:
+                calls.append(("finished", axis))
             return {"ok": True, "axis": axis}
 
         def motor_axis_status(self, board, motor=0):
@@ -86,5 +97,7 @@ def test_oem_homexy_serializes_linux_usb_context():
     result = Tester().motor_oem_home_xy(timeout_s=1)
 
     assert result["ok"] is True
-    assert result["live_parallel_execution"] is False
-    assert calls == ["x", "y"]
+    assert result["live_parallel_execution"] is True
+    assert result["implementation_note"] == "oem_task_run_waitall_with_transaction_serialized_usb"
+    first_finish = next(index for index, row in enumerate(calls) if row[0] == "finished")
+    assert {row[1] for row in calls[:first_finish] if row[0] == "started"} == {"x", "y"}

@@ -66,7 +66,7 @@ def test_status_payload_does_not_reconnect_when_board_wake_is_all_none(monkeypat
     result = api._status_payload()
 
     assert result["hardware_connected"] is False
-    assert tester.activate_boards_calls == 4
+    assert tester.activate_boards_calls == 2
     assert tester.reconnect_calls == 0
     assert tester.io_snapshot_calls == 0
 
@@ -79,20 +79,19 @@ def test_motion_power_status_payload_does_not_reconnect_when_board_wake_is_all_n
     result = api._motion_power_status_payload(tester)
 
     assert result["hardware_connected"] is False
-    assert tester.activate_boards_calls == 4
+    assert tester.activate_boards_calls == 2
     assert tester.reconnect_calls == 0
     assert tester.io_snapshot_calls == 0
 
 
 
-def test_status_payload_passively_retries_bounded_board_wakes_before_reporting_degraded(monkeypatch):
+def test_status_payload_passively_retries_one_extra_board_wake_before_reporting_degraded(monkeypatch):
     api = load_api(monkeypatch)
 
     class SequencedStatusTester(FakeStatusTester):
         def __init__(self):
             super().__init__({4: None, 5: None, 6: None, 7: None})
             self._board_statuses = [
-                {4: None, 5: None, 6: None, 7: None},
                 {4: None, 5: None, 6: None, 7: None},
                 {4: {"status": 100}, 5: {"status": 100}, 6: {"status": 100}, 7: None},
             ]
@@ -108,20 +107,19 @@ def test_status_payload_passively_retries_bounded_board_wakes_before_reporting_d
     result = api._status_payload()
 
     assert result["hardware_connected"] is True
-    assert tester.activate_boards_calls == 3
+    assert tester.activate_boards_calls == 2
     assert tester.reconnect_calls == 0
     assert tester.io_snapshot_calls == 1
 
 
 
-def test_motion_power_status_payload_passively_retries_bounded_board_wakes_before_reporting_degraded(monkeypatch):
+def test_motion_power_status_payload_passively_retries_one_extra_board_wake_before_reporting_degraded(monkeypatch):
     api = load_api(monkeypatch)
 
     class SequencedStatusTester(FakeStatusTester):
         def __init__(self):
             super().__init__({4: None, 5: None, 6: None, 7: None})
             self._board_statuses = [
-                {4: None, 5: None, 6: None, 7: None},
                 {4: None, 5: None, 6: None, 7: None},
                 {4: {"status": 100}, 5: {"status": 100}, 6: {"status": 100}, 7: None},
             ]
@@ -136,7 +134,7 @@ def test_motion_power_status_payload_passively_retries_bounded_board_wakes_befor
     result = api._motion_power_status_payload(tester)
 
     assert result["hardware_connected"] is True
-    assert tester.activate_boards_calls == 3
+    assert tester.activate_boards_calls == 2
     assert tester.reconnect_calls == 0
     assert tester.io_snapshot_calls == 1
 

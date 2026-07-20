@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from ..oem_config import find_oem_machine_config_bundle
+from ..oem_machine_bundle import OemMachineSnapshot, get_active_oem_machine_snapshot
 
 OEM_X_INCREMENT = -2132
 OEM_Y_INCREMENT = 2132
@@ -96,18 +97,30 @@ class PositionTable:
                 z_high = z_low - z_delta
             z_high_int = int(float(z_high)) if z_high is not None else None
             inc_factor = int(float(row.get("inc_factor", row.get("incFactor", 0)) or 0))
-            coords = {"x": x, "y": y, "z": int(z_high_int if z_high_int is not None else (z_low or 0))}
+            coords = {
+                "x": x,
+                "y": y,
+                # Preserved ClassBioXPSettings PositionTable parsing does not
+                # recognize a plain `z` field. Unknown aliases cannot silently
+                # become an OEM motion target.
+                "z": int(z_high_int if z_high_int is not None else (z_low if z_low is not None else 0)),
+            }
             offsets = {"x": int(float(row.get("xOffset", row.get("x_offset", 0)) or 0)), "y": int(float(row.get("yOffset", row.get("y_offset", 0)) or 0)), "z": int(float(row.get("zOffset", row.get("z_offset", 0)) or 0))}
             targets.append(PositionTarget(location_id=str(location_id).strip().upper(), well_id=None if well_id is None else str(well_id).strip().upper(), plate_name=None if plate_name is None else str(plate_name).strip().lower(), base_coordinates=coords, offsets=offsets, z_low=z_low, z_high=z_high_int, z_delta=z_delta, inc_factor=inc_factor, source_anchor=str(row.get("source") or row.get("source_anchor") or source)))
         return cls(targets, source=source)
 
     @classmethod
-    def from_bound_machine_config(cls, root_dir: str | None = None) -> "PositionTable":
+    def from_bound_machine_config(cls, root_dir: str | OemMachineSnapshot | None = None) -> "PositionTable":
+        if isinstance(root_dir, OemMachineSnapshot):
+            return cls.from_rows(root_dir.position_table, source="immutable_oem_machine_snapshot.PositionTable")
+        if root_dir is None:
+            snapshot = get_active_oem_machine_snapshot()
+            return cls.from_rows(snapshot.position_table, source="immutable_oem_machine_snapshot.PositionTable")
         bundle = find_oem_machine_config_bundle(root_dir)
         if not isinstance(bundle, dict) or bundle.get("ok") is not True:
             raise RuntimeError(f"OEM machine config not bound: {bundle}")
         rows = (((bundle.get("config") or {}).get("position_table")) or [])
-        return cls.from_rows(rows, source="original_ssd_machine_config.PositionTable")
+        return cls.from_rows(rows, source="non_authoritative_diagnostic_machine_config.PositionTable")
 
     def rows(self) -> list[dict[str, Any]]:
         return [target.to_payload() for target in self._targets]
@@ -133,5 +146,5 @@ class PositionTable:
         return {"semantic_action": "scriptmoveTo", "source_formula": "ClassControlInterface.cs:3734-3860 initial target-coordinate branch", "source_table": self.source, "target": target.to_payload(), "column": int(column), "row": int(row), "positionflag": int(positionflag), "tip_location": int(tip_location), "planned_coordinates": target.oem_script_move_to_coordinates(column=column, row=row, positionflag=positionflag, tip_location=tip_location), "controller_command_planned": False, "opened_usb": False, "physical_motion": False, "remaining_live_dependencies": ["currentLoc/currentWell pathing/midpoint branch", "MachineStatus.TipLoaded/TipLocation", "confirmAxis(gripper)"]}
 
 
-def load_bound_oem_position_table(root_dir: str | None = None) -> PositionTable:
+def load_bound_oem_position_table(root_dir: str | OemMachineSnapshot | None = None) -> PositionTable:
     return PositionTable.from_bound_machine_config(root_dir)

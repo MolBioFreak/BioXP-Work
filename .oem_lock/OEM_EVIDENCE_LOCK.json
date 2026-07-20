@@ -1,0 +1,1040 @@
+{
+  "schema_version": 4,
+  "created_date": "2026-07-19",
+  "controlling_rule": "OEM binaries/IL/decode, OEM data pull and authenticated transfer, the directly cloned SSD corpus, and captured OEM logs are the immutable authority. Linux code, Linux defaults, and Linux tests are implementation-under-correction and cannot reinterpret, normalize, or overrule the OEM record.",
+  "authority_order_for_conflict_resolution": [
+    "captured OEM binary bytes and raw IL",
+    "directly cloned OEM configuration/calibration/data bytes with receiver-verified hashes",
+    "captured OEM runtime logs/traces and transferred machine state",
+    "decompiled OEM source projection anchored to captured binaries",
+    "Linux implementation and tests (never authoritative)"
+  ],
+  "acquisition": {
+    "session_id": "20260719T024740Z-4a7fe6783205846c",
+    "root": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows_phase0_extension/20260719T024740Z-4a7fe6783205846c",
+    "source_asset_manifest_sha256": "c825864c5d89dc9b26aa1e8cad0b015294cfb32f10ddd6aca10a47fedc1393ce",
+    "captured_root_ledger_sha256": "1bbb8eb37e159ab697cb3ed6ad4db81b3d2b9d377c8308b8225a43edf91e970c",
+    "completion_record_sha256": "a6f13db0370f4ca91adb947a6d2a0ceac78b0ad7985c0c3fc9eb25ba6ddf962f"
+  },
+  "frozen_ssd_corpus": {
+    "root": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup",
+    "role": "directly cloned immutable OEM SSD corpus and decode tree",
+    "baseline_generated_utc": "2026-07-19T07:50:59Z",
+    "provenance_boundary": "Read-only hash baseline of the pre-existing directly cloned SSD corpus at generation time. This establishes current frozen-clone integrity; it is not retroactive acquisition-time transfer proof.",
+    "manifest_relative_to_lock_dir": "FROZEN_SSD_CORPUS_MANIFEST.jsonl",
+    "manifest_sha256": "ce5104c91f5149374910b0f4fca2aef1c49f42270d1c35ccd788da3ec63e818a",
+    "summary_relative_to_lock_dir": "FROZEN_SSD_CORPUS_MANIFEST.summary.json",
+    "summary_sha256": "bfac210d6659b070473b85799a6ad37c07b2adae22d725407d323b09b71d7374",
+    "regular_file_count": 3080,
+    "total_bytes": 168311414
+  },
+  "clickonce_binary_root_relative": "source_roots/profile_3_clickonce_genbotapp_1/C/Users/BioXp PC/AppData/Local/Apps/2.0/95WM87ZT.NKJ/M077NK28.8QY/genb..tion_0000000000000000_0006.0003_153bce31295c21ca",
+  "live_machine_corpus": {
+    "distinction": "This is the exact 19-file live AppData machine corpus. It is unrelated to historical v1\u2019s exact 19-row denominator: ten workflow rows and nine heterogeneous non-workflow rows, each hash-bound and dispositioned by schema v4 with zero silent exclusions.",
+    "root_label": "localappdata_synthetic_genomics",
+    "source_root": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics",
+    "record_kind": "file_default_stream",
+    "expected_record_count": 19,
+    "records": [
+      {
+        "logical_relative_path": "Config_History/config_history.csv",
+        "runtime_projection_relative_path": "appdata_parent/Config_History/config_history.csv",
+        "role": "mutable_audit_history_seed",
+        "mutation_policy": "copy_on_write_runtime_state_seed",
+        "consumer_status": "OEM append target; immutable captured baseline seeds separate transactional audit history",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\Config_History\\config_history.csv",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/Config_History/config_history.csv",
+        "size": 2477,
+        "creation_utc": "2018-09-26T16:17:26.3066235Z",
+        "last_write_utc": "2018-09-26T17:22:51.5629218Z",
+        "sha256": "ba715995d2fc63a1bcce97d50b85d9d6928b015aaf8cd93a5ddfa47a317ad57b",
+        "receiver_sha256": "ba715995d2fc63a1bcce97d50b85d9d6928b015aaf8cd93a5ddfa47a317ad57b",
+        "stable_capture": true,
+        "upload_status": 201,
+        "runtime_state_relative_path": "appdata_parent/Config_History/config_history.csv"
+      },
+      {
+        "logical_relative_path": "GenBotApp/calreference.xml",
+        "runtime_projection_relative_path": "appdata/calreference.xml",
+        "role": "machine_configuration",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM machine/AppData configuration input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\calreference.xml",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/calreference.xml",
+        "size": 840,
+        "creation_utc": "2018-09-26T10:51:48.5706709Z",
+        "last_write_utc": "2018-09-26T10:51:48.6019334Z",
+        "sha256": "f941cb252028a1ee649ffb4185f9b0314f7b483e7f482e926ba10efe32a94e20",
+        "receiver_sha256": "f941cb252028a1ee649ffb4185f9b0314f7b483e7f482e926ba10efe32a94e20",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/config.xml",
+        "runtime_projection_relative_path": "appdata/config.xml",
+        "role": "machine_configuration",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM machine/AppData configuration input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\config.xml",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/config.xml",
+        "size": 4473,
+        "creation_utc": "2018-09-26T10:51:48.3987626Z",
+        "last_write_utc": "2019-01-29T19:41:35.9513380Z",
+        "sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
+        "receiver_sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/cover.jpg",
+        "runtime_projection_relative_path": "appdata/cover.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\cover.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/cover.jpg",
+        "size": 71082,
+        "creation_utc": "2020-10-23T18:36:54.0000000Z",
+        "last_write_utc": "2020-10-23T18:36:54.0000000Z",
+        "sha256": "d467be79fd298b5703f86ad79d0e6a28e4b8b6fcea159af810d29224ded4028d",
+        "receiver_sha256": "d467be79fd298b5703f86ad79d0e6a28e4b8b6fcea159af810d29224ded4028d",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/EmptyStorage.jpg",
+        "runtime_projection_relative_path": "appdata/EmptyStorage.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\EmptyStorage.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/EmptyStorage.jpg",
+        "size": 21387,
+        "creation_utc": "2020-10-27T18:39:34.0000000Z",
+        "last_write_utc": "2020-10-27T18:39:34.0000000Z",
+        "sha256": "1c911218f17dd542c5cf88153fc4bcc4402c6b48d274f8e015dc1a58d9e3cc69",
+        "receiver_sha256": "1c911218f17dd542c5cf88153fc4bcc4402c6b48d274f8e015dc1a58d9e3cc69",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/EmptyTrough.jpg",
+        "runtime_projection_relative_path": "appdata/EmptyTrough.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\EmptyTrough.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/EmptyTrough.jpg",
+        "size": 15007,
+        "creation_utc": "2020-10-28T17:42:36.0000000Z",
+        "last_write_utc": "2020-10-28T17:42:36.0000000Z",
+        "sha256": "8a896cdb82732a26464f6c8a9611c19b3ecdd9a38ed5daac8edeee3273e13b3d",
+        "receiver_sha256": "8a896cdb82732a26464f6c8a9611c19b3ecdd9a38ed5daac8edeee3273e13b3d",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/InspectionSettings.xml",
+        "runtime_projection_relative_path": "appdata/InspectionSettings.xml",
+        "role": "machine_configuration",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM machine/AppData configuration input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\InspectionSettings.xml",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/InspectionSettings.xml",
+        "size": 20395,
+        "creation_utc": "2021-07-26T13:57:10.0821915Z",
+        "last_write_utc": "2021-07-26T13:57:10.3634173Z",
+        "sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
+        "receiver_sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/LowerHandle.jpg",
+        "runtime_projection_relative_path": "appdata/LowerHandle.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\LowerHandle.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/LowerHandle.jpg",
+        "size": 45521,
+        "creation_utc": "2020-10-23T20:36:22.0000000Z",
+        "last_write_utc": "2020-10-23T20:36:22.0000000Z",
+        "sha256": "ff1aefce8e7f586379a247e4b4a6dcdc573b27c54f4b56b9096c5e1a77b6a251",
+        "receiver_sha256": "ff1aefce8e7f586379a247e4b4a6dcdc573b27c54f4b56b9096c5e1a77b6a251",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/Operation_parameters.xml",
+        "runtime_projection_relative_path": "appdata/Operation_parameters.xml",
+        "role": "mutable_operation_policy_seed",
+        "mutation_policy": "copy_on_write_runtime_state_seed",
+        "consumer_status": "OEM read/write operation policy; current-directory lookup precedes AppData, no current-directory copy was captured, and OEM writes AppData; immutable captured baseline seeds separate transactional AppData state",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\Operation_parameters.xml",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/Operation_parameters.xml",
+        "size": 857,
+        "creation_utc": "2018-09-26T10:51:48.4456684Z",
+        "last_write_utc": "2026-07-17T00:11:24.3847328Z",
+        "sha256": "d032d58c08312706892a2d5c7a9a319f817a6d9ef73e75d30dd933ae110c9685",
+        "receiver_sha256": "d032d58c08312706892a2d5c7a9a319f817a6d9ef73e75d30dd933ae110c9685",
+        "stable_capture": true,
+        "upload_status": 201,
+        "runtime_state_relative_path": "appdata/Operation_parameters.xml"
+      },
+      {
+        "logical_relative_path": "GenBotApp/output.jpg",
+        "runtime_projection_relative_path": "appdata/output.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\output.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/output.jpg",
+        "size": 20360,
+        "creation_utc": "2020-10-27T20:47:08.0000000Z",
+        "last_write_utc": "2020-10-27T20:47:08.0000000Z",
+        "sha256": "a5b6853674bd6a72f905de2809bdb9b83943032f7c3de8e71492bb9948bf4c1c",
+        "receiver_sha256": "a5b6853674bd6a72f905de2809bdb9b83943032f7c3de8e71492bb9948bf4c1c",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/output_empty.jpg",
+        "runtime_projection_relative_path": "appdata/output_empty.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\output_empty.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/output_empty.jpg",
+        "size": 19608,
+        "creation_utc": "2020-10-27T20:46:20.0000000Z",
+        "last_write_utc": "2020-10-27T20:46:20.0000000Z",
+        "sha256": "fba247c64b05761abfafed74a9793e3c291bbc581dbd1f9f209f47f7ff983f49",
+        "receiver_sha256": "fba247c64b05761abfafed74a9793e3c291bbc581dbd1f9f209f47f7ff983f49",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/outputw_foil.jpg",
+        "runtime_projection_relative_path": "appdata/outputw_foil.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\outputw_foil.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/outputw_foil.jpg",
+        "size": 18543,
+        "creation_utc": "2020-10-27T20:51:38.0000000Z",
+        "last_write_utc": "2020-10-27T20:51:38.0000000Z",
+        "sha256": "0338b5622e19d2aef758d018cd110f6c5b46ed19d7be3b065aff175092eca2d4",
+        "receiver_sha256": "0338b5622e19d2aef758d018cd110f6c5b46ed19d7be3b065aff175092eca2d4",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/pressurebuffer.txt",
+        "runtime_projection_relative_path": "appdata/pressurebuffer.txt",
+        "role": "mutable_runtime_state_seed",
+        "mutation_policy": "copy_on_write_runtime_state_seed",
+        "consumer_status": "OEM AppData runtime read/write state; captured bytes seed a separate mutable state root",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\pressurebuffer.txt",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/pressurebuffer.txt",
+        "size": 39277,
+        "creation_utc": "2018-09-27T04:31:15.8628054Z",
+        "last_write_utc": "2021-07-27T03:51:16.3859068Z",
+        "sha256": "96213f97bdf9b429642e0e1e8ed86500c22bd45f17dd96a546b3b37362295c42",
+        "receiver_sha256": "96213f97bdf9b429642e0e1e8ed86500c22bd45f17dd96a546b3b37362295c42",
+        "stable_capture": true,
+        "upload_status": 201,
+        "runtime_state_relative_path": "appdata/pressurebuffer.txt"
+      },
+      {
+        "logical_relative_path": "GenBotApp/processtime.xml",
+        "runtime_projection_relative_path": "appdata/processtime.xml",
+        "role": "mutable_runtime_state_seed",
+        "mutation_policy": "copy_on_write_runtime_state_seed",
+        "consumer_status": "OEM AppData runtime read/write state; captured bytes seed a separate mutable state root",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\processtime.xml",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/processtime.xml",
+        "size": 1414,
+        "creation_utc": "2018-09-27T04:31:15.8438037Z",
+        "last_write_utc": "2021-07-27T03:51:16.3259057Z",
+        "sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+        "receiver_sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+        "stable_capture": true,
+        "upload_status": 201,
+        "runtime_state_relative_path": "appdata/processtime.xml"
+      },
+      {
+        "logical_relative_path": "GenBotApp/purificationTray.jpg",
+        "runtime_projection_relative_path": "appdata/purificationTray.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\purificationTray.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/purificationTray.jpg",
+        "size": 31412,
+        "creation_utc": "2020-10-24T00:42:38.0000000Z",
+        "last_write_utc": "2020-10-24T00:42:38.0000000Z",
+        "sha256": "a57ab7e6376397a902fc6441ae9e5ef2d761b22b04d6d02e6c949b1448832796",
+        "receiver_sha256": "a57ab7e6376397a902fc6441ae9e5ef2d761b22b04d6d02e6c949b1448832796",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/reagentEmpty.jpg",
+        "runtime_projection_relative_path": "appdata/reagentEmpty.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\reagentEmpty.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/reagentEmpty.jpg",
+        "size": 39460,
+        "creation_utc": "2020-10-23T21:35:14.0000000Z",
+        "last_write_utc": "2020-10-23T21:35:14.0000000Z",
+        "sha256": "2b36b053655f5d3c3ad042ffd991560f8384bf53ad0357433eae13bbd5645aac",
+        "receiver_sha256": "2b36b053655f5d3c3ad042ffd991560f8384bf53ad0357433eae13bbd5645aac",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/reagentTray.jpg",
+        "runtime_projection_relative_path": "appdata/reagentTray.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\reagentTray.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/reagentTray.jpg",
+        "size": 42479,
+        "creation_utc": "2020-10-23T21:34:00.0000000Z",
+        "last_write_utc": "2020-10-23T21:34:00.0000000Z",
+        "sha256": "796f848393da3282df9891db6525d75f51fa8fcdbea4cb2520632167ab9db0cb",
+        "receiver_sha256": "796f848393da3282df9891db6525d75f51fa8fcdbea4cb2520632167ab9db0cb",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/Trough.jpg",
+        "runtime_projection_relative_path": "appdata/Trough.jpg",
+        "role": "vision_template_candidate",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "captured template candidate; direct reader unresolved and must not be invented",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\Trough.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/Trough.jpg",
+        "size": 8508,
+        "creation_utc": "2020-10-27T21:57:24.0000000Z",
+        "last_write_utc": "2020-10-27T21:57:24.0000000Z",
+        "sha256": "a80bb90bab79062022336bf55d6f115dfbf550e6a8d38aeed650d478e6570498",
+        "receiver_sha256": "a80bb90bab79062022336bf55d6f115dfbf550e6a8d38aeed650d478e6570498",
+        "stable_capture": true,
+        "upload_status": 201
+      },
+      {
+        "logical_relative_path": "GenBotApp/UpperHandle.jpg",
+        "runtime_projection_relative_path": "appdata/UpperHandle.jpg",
+        "role": "vision_template",
+        "mutation_policy": "read_only_commissioned_input",
+        "consumer_status": "OEM case-sensitive vision/template input",
+        "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\UpperHandle.jpg",
+        "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/UpperHandle.jpg",
+        "size": 48035,
+        "creation_utc": "2020-10-23T20:14:34.0000000Z",
+        "last_write_utc": "2020-10-23T20:14:34.0000000Z",
+        "sha256": "43aed9f668a4723f915f055bacc4b63e30e4d1cc9e277908b3e8fcd17abb073b",
+        "receiver_sha256": "43aed9f668a4723f915f055bacc4b63e30e4d1cc9e277908b3e8fcd17abb073b",
+        "stable_capture": true,
+        "upload_status": 201
+      }
+    ],
+    "contract_schema_id": "bioxp.live_machine_corpus.serial206.v1",
+    "expected_root_label": "localappdata_synthetic_genomics",
+    "expected_record_kind": "file_default_stream"
+  },
+  "machine_bundle": [
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\config.xml",
+      "bundle_relative_path": "appdata/config.xml",
+      "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/config.xml",
+      "size": 4473,
+      "last_write_utc": "2019-01-29T19:41:35.9513380Z",
+      "sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
+      "receiver_sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
+      "stable_capture": true,
+      "upload_status": 201
+    },
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\Operation_parameters.xml",
+      "bundle_relative_path": "appdata/Operation_parameters.xml",
+      "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/Operation_parameters.xml",
+      "size": 857,
+      "last_write_utc": "2026-07-17T00:11:24.3847328Z",
+      "sha256": "d032d58c08312706892a2d5c7a9a319f817a6d9ef73e75d30dd933ae110c9685",
+      "receiver_sha256": "d032d58c08312706892a2d5c7a9a319f817a6d9ef73e75d30dd933ae110c9685",
+      "stable_capture": true,
+      "upload_status": 201,
+      "known_linux_deviation": {
+        "path": "config/oem/original_ssd_appdata_20260610/Operation_parameters.xml",
+        "size": 471,
+        "sha256": "b50b338e62e71205f959d164b97454fe12dc4934d908ed542950882536409368",
+        "status": "normalized rewrite; forbidden as runtime authority"
+      }
+    },
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\InspectionSettings.xml",
+      "bundle_relative_path": "appdata/InspectionSettings.xml",
+      "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/InspectionSettings.xml",
+      "size": 20395,
+      "last_write_utc": "2021-07-26T13:57:10.3634173Z",
+      "sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
+      "receiver_sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
+      "stable_capture": true,
+      "upload_status": 201
+    },
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\calreference.xml",
+      "oem_role": "application-data calibration baseline (m_appDir)",
+      "bundle_relative_path": "appdata/calreference.xml",
+      "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/calreference.xml",
+      "size": 840,
+      "last_write_utc": "2018-09-26T10:51:48.6019334Z",
+      "sha256": "f941cb252028a1ee649ffb4185f9b0314f7b483e7f482e926ba10efe32a94e20",
+      "receiver_sha256": "f941cb252028a1ee649ffb4185f9b0314f7b483e7f482e926ba10efe32a94e20",
+      "stable_capture": true,
+      "upload_status": 201
+    },
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Apps\\2.0\\95WM87ZT.NKJ\\M077NK28.8QY\\genb..tion_0000000000000000_0006.0003_153bce31295c21ca\\calreference.xml",
+      "oem_role": "current-directory/ClickOnce latest calibration comparison source",
+      "bundle_relative_path": "current_directory/calreference.xml",
+      "relative_path": "source_roots/profile_3_clickonce_genbotapp_1/C/Users/BioXp PC/AppData/Local/Apps/2.0/95WM87ZT.NKJ/M077NK28.8QY/genb..tion_0000000000000000_0006.0003_153bce31295c21ca/calreference.xml",
+      "size": 843,
+      "last_write_utc": "2022-07-12T21:22:14.0852036Z",
+      "sha256": "3115c3428b52721d4a0f1c3bdd3b8ea7a437179a4166eb9ae0e682e760632762",
+      "receiver_sha256": "3115c3428b52721d4a0f1c3bdd3b8ea7a437179a4166eb9ae0e682e760632762",
+      "stable_capture": true,
+      "upload_status": 201,
+      "comparison_note": "OEM ClassCalibrationReference reads this in addition to the m_appDir copy and compares tool/fluid revision values. Preserve the exact REVERSION spelling; do not normalize it to REVISION."
+    },
+    {
+      "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Synthetic Genomics\\GenBotApp\\processtime.xml",
+      "bundle_relative_path": "appdata/processtime.xml",
+      "relative_path": "source_roots/localappdata_synthetic_genomics/C/Users/BioXp PC/AppData/Local/Synthetic Genomics/GenBotApp/processtime.xml",
+      "size": 1414,
+      "last_write_utc": "2021-07-27T03:51:16.3259057Z",
+      "sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+      "receiver_sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+      "stable_capture": true,
+      "upload_status": 201
+    }
+  ],
+  "additional_config_evidence": [
+    {
+      "logical_name": "ClickOnce ProcessTime.xml",
+      "oem_role": "associated-content/deployment template and comparison evidence; not the runtime m_app_dir source",
+      "selected_for_immediate_runtime_bundle": false,
+      "evidence_projection_relative_path": "deployment_evidence/ProcessTime.xml",
+      "selection_reason": "BioXPMainWindow.GetAppDir passes LocalApplicationData/Synthetic Genomics/GenBotApp to ClassBioXPScriptHandler and ClassTimeEstimate, which reads AppData processtime.xml.",
+      "size": 1012,
+      "sha256": "8024408747098b8e483d92a6c344b80bc06544342b7a82c4c090031b170fccbb",
+      "source_records": [
+        {
+          "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Apps\\2.0\\95WM87ZT.NKJ\\M077NK28.8QY\\genb...exe_0000000000000000_0006.0003_none_48fa64d25e9da488\\ProcessTime.xml",
+          "relative_path": "source_roots/discovered_591919701/C/Users/BioXp PC/AppData/Local/Apps/2.0/95WM87ZT.NKJ/M077NK28.8QY/genb...exe_0000000000000000_0006.0003_none_48fa64d25e9da488/ProcessTime.xml",
+          "receiver_sha256": "8024408747098b8e483d92a6c344b80bc06544342b7a82c4c090031b170fccbb",
+          "stable_capture": true
+        },
+        {
+          "source_path": "C:\\Users\\BioXp PC\\AppData\\Local\\Apps\\2.0\\Data\\J3JYZ24A.NVN\\T5394V1V.K7Q\\genb..tion_0000000000000000_0006.0003_153bce31295c21ca\\Data\\ProcessTime.xml",
+          "relative_path": "source_roots/discovered_591919701/C/Users/BioXp PC/AppData/Local/Apps/2.0/Data/J3JYZ24A.NVN/T5394V1V.K7Q/genb..tion_0000000000000000_0006.0003_153bce31295c21ca/Data/ProcessTime.xml",
+          "receiver_sha256": "8024408747098b8e483d92a6c344b80bc06544342b7a82c4c090031b170fccbb",
+          "stable_capture": true
+        }
+      ]
+    }
+  ],
+  "historical_derived_artifacts": {
+    "root": "derived/oem_parity_ledgers_v1",
+    "authority_status": "historical denominator only; explicitly not current OEM machine-config byte authority",
+    "claim_boundary": "Preserve unchanged. All 19 config_documents rows have exact hash-bound dispositions below; no historical row gains current OEM authority and none is silently excluded.",
+    "files": [
+      {
+        "path": "summary.json",
+        "sha256": "2528e900dc0a3aa2a09e13e956a1bc61add94fcc6d6725a52f334929827fc96a"
+      },
+      {
+        "path": "config_documents.jsonl",
+        "sha256": "f488ab3e00cd14a6f1eae6669ead8ee851de9c9b6626d2c2c4f794d56dc5941c"
+      },
+      {
+        "path": "config_calibration_ledger.jsonl",
+        "sha256": "f6e911fbe4a72632d35059f59b1347bbaf3f4d0ccc2f2050de0afc793724475e"
+      },
+      {
+        "path": "manifest.sha256",
+        "sha256": "269d9f41facba6a22f258fb211b80ae759e8fafeb8ade358d396123170b534bf"
+      }
+    ],
+    "config_documents_disposition_contract": {
+      "schema_id": "bioxp.historical_v1_document_dispositions.v1",
+      "source_file": "config_documents.jsonl",
+      "source_file_sha256": "f488ab3e00cd14a6f1eae6669ead8ee851de9c9b6626d2c2c4f794d56dc5941c",
+      "expected_row_count": 19,
+      "expected_workflow_rows": 10,
+      "expected_non_workflow_rows": 9,
+      "disposition_counts": {
+        "duplicate": 5,
+        "historical": 2,
+        "included": 2,
+        "routed": 10
+      },
+      "target_ledger_counts": {
+        "configuration_evidence_v2": 8,
+        "status_evidence_v2": 1,
+        "workflow_evidence_v2": 10
+      },
+      "silent_exclusion_count": 0,
+      "records": [
+        {
+          "row_index": 1,
+          "row_sha256": "b10785440aeca6380c01e81e7625dd932d7fd56fa43b2d1b51cf884599fe2e13",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/.deploy/Application Files/GenBotApp_6_3_0_1/ProcessTime.xml.deploy",
+          "sha256": "8024408747098b8e483d92a6c344b80bc06544342b7a82c4c090031b170fccbb",
+          "bytes": 1012,
+          "document_class": "process_time_reference",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "included",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "clickonce_process_time_template",
+          "reason": "Locked additional configuration evidence; retained but not runtime-selected.",
+          "parse_status": "parsed",
+          "root_tag": "BioXPCommonLib"
+        },
+        {
+          "row_index": 2,
+          "row_sha256": "5c8874a690f56bfe096545770c48a3f76ce86b4a8fd6e7ea09e60d8ae59a5d94",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/.deploy/Application Files/GenBotApp_6_3_0_1/calreference.xml.deploy",
+          "sha256": "3115c3428b52721d4a0f1c3bdd3b8ea7a437179a4166eb9ae0e682e760632762",
+          "bytes": 843,
+          "document_class": "calibration_or_inspection",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "included",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "current_directory_latest_calibration_reference",
+          "reason": "Locked current-directory/latest-reference evidence; distinct from AppData installed baseline.",
+          "parse_status": "parsed",
+          "root_tag": "CalibrationReferences"
+        },
+        {
+          "row_index": 3,
+          "row_sha256": "4767c82db6004c03d4dd4530f062a8db765d7e54637e94d73c907a795656a85b",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/Inital Test Script.xml",
+          "sha256": "3cbda3795795ed00c2fee94965a97864d3b77c4f6be26bc9687063323f1b8f58",
+          "bytes": 2519,
+          "document_class": "workflow_script",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "frozen_workflow_script",
+          "reason": "Workflow script; routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 4,
+          "row_sha256": "506cfff8bf67399306b76f6c0505dba0fce0a119c9b0a732a9afcf8a4be747e6",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/TP015 48 HOUR SYSTEM BURN-IN.xml",
+          "sha256": "4aaffc96f89fd3fbf681be031537589a2550c64b44c6a117074120a124045c63",
+          "bytes": 544978,
+          "document_class": "workflow_script",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "frozen_workflow_script",
+          "reason": "Workflow script; routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 5,
+          "row_sha256": "5f0e56e7d3f10f9c6f1e6bc0b08c435789449d716a736ab86431304c5e03941f",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/demo.xml",
+          "sha256": "b5f7c159245cbd6516c89587795a4021d4a3e1a5f71e8e4eead46a243a38b763",
+          "bytes": 3885,
+          "document_class": "workflow_script",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "frozen_workflow_script",
+          "reason": "Workflow script; routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 6,
+          "row_sha256": "bdb788f18b7a8b3130b54d05e083bdb92723a8f883a07dcea5693080b8362fc7",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/lifetest.xml",
+          "sha256": "454a235d932b79cd01ce81bb4bbb8a4ba061c3c2e41c1e1bbb743f1adbfbaba8",
+          "bytes": 26044,
+          "document_class": "workflow_script",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "frozen_workflow_script",
+          "reason": "Workflow script; routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 7,
+          "row_sha256": "db9eb57d20869140994cb4b2f1727b39077102edd4612e9291325b06b1e5b3b9",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/Scripts/tp506.xml",
+          "sha256": "1e3548cea03fc48e999be9e72a4f5a5dc551044620d94aa74156497e20cf6cf9",
+          "bytes": 1005,
+          "document_class": "workflow_script",
+          "evidence_origin": "frozen_windows_backup",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "frozen_workflow_script",
+          "reason": "Workflow script; routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 8,
+          "row_sha256": "224de0db91d50147e33acfeeed82672dd635f5dcc482e41b945d33c27c17fb31",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy/config/oem/original_ssd_appdata_20260610/InspectionSettings.xml",
+          "sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
+          "bytes": 20395,
+          "document_class": "calibration_or_inspection",
+          "evidence_origin": "linux_candidate_snapshot",
+          "disposition": "duplicate",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_duplicate_of_current_live_bytes",
+          "reason": "Historical Linux-candidate provenance retained; bytes duplicate current live InspectionSettings anchor but do not add authority.",
+          "parse_status": "parsed",
+          "root_tag": "{http://schemas.datacontract.org/2004/07/BioXPCommonLib}CameraSettings"
+        },
+        {
+          "row_index": 9,
+          "row_sha256": "fe7b0946dfce4be028ec8f19ff7a5cd8f9a15e1721947e2bcec0639be6d93896",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy/config/oem/original_ssd_appdata_20260610/Operation_parameters.xml",
+          "sha256": "f18722da4fba87a0b123ee4ba91f83eac7ca20ec9d8f11f0e485d3fb5db857b1",
+          "bytes": 471,
+          "document_class": "machine_configuration",
+          "evidence_origin": "linux_candidate_snapshot",
+          "disposition": "historical",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_conflicting_non_authoritative_candidate",
+          "reason": "Historical Linux-candidate Operation_parameters bytes differ from current immutable live acquisition and cannot outrank it.",
+          "parse_status": "parsed",
+          "root_tag": "BioXPCommonLib"
+        },
+        {
+          "row_index": 10,
+          "row_sha256": "62b85c71dfc5db4fd46a1b5d4d008eb370ec6c7ffb86c550cb520860d46163b5",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy/config/oem/original_ssd_appdata_20260610/calreference.xml",
+          "sha256": "f941cb252028a1ee649ffb4185f9b0314f7b483e7f482e926ba10efe32a94e20",
+          "bytes": 840,
+          "document_class": "calibration_or_inspection",
+          "evidence_origin": "linux_candidate_snapshot",
+          "disposition": "duplicate",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_duplicate_of_current_live_bytes",
+          "reason": "Historical Linux-candidate provenance retained; bytes duplicate current live AppData calreference anchor.",
+          "parse_status": "parsed",
+          "root_tag": "CalibrationReferences"
+        },
+        {
+          "row_index": 11,
+          "row_sha256": "1fdccb8296b5e530149e43bf02123b413a1517a6ef824a013019d4f8b6cd4a3e",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy/config/oem/original_ssd_appdata_20260610/config.xml",
+          "sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
+          "bytes": 4473,
+          "document_class": "machine_configuration",
+          "evidence_origin": "linux_candidate_snapshot",
+          "disposition": "duplicate",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_duplicate_of_current_live_bytes",
+          "reason": "Historical Linux-candidate provenance retained; bytes duplicate current live config.xml anchor.",
+          "parse_status": "parsed",
+          "root_tag": "BioXPCommonLib"
+        },
+        {
+          "row_index": 12,
+          "row_sha256": "670ad6106552d304cf145fbe0d4c6e0f883a409627c5e45c81fdec748bae3a88",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy/config/oem/original_ssd_appdata_20260610/processtime.xml",
+          "sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+          "bytes": 1414,
+          "document_class": "machine_configuration",
+          "evidence_origin": "linux_candidate_snapshot",
+          "disposition": "duplicate",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_duplicate_of_current_live_bytes",
+          "reason": "Historical Linux-candidate provenance retained; bytes duplicate current live processtime anchor.",
+          "parse_status": "parsed",
+          "root_tag": "CommonLib"
+        },
+        {
+          "row_index": 13,
+          "row_sha256": "32950578f3bc6b40b86ef80abb1661a675ed977a261629ccff7159e5c4cc3f83",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/localappdata_synthetic_genomics/GenBotApp/processtime.xml",
+          "sha256": "4ed472e39626cbdef3af013532a9233326c4c913bf7b11e222e9104f0511d186",
+          "bytes": 1414,
+          "document_class": "process_time_reference",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "duplicate",
+          "target_ledger": "configuration_evidence_v2",
+          "authority_class": "historical_duplicate_of_current_live_bytes",
+          "reason": "Older live-acquisition provenance retained; bytes duplicate current authoritative live processtime anchor.",
+          "parse_status": "parsed",
+          "root_tag": "CommonLib"
+        },
+        {
+          "row_index": 14,
+          "row_sha256": "1156e7ab4268c7cab783ae4901b4b79c1af59552edf8f4799ceb48fcfd4de994",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/logfile/instrument_status.xml",
+          "sha256": "43a286ad8e781aa0b6d321f86e233fcd0cfbafe68f1160f7765478136a2294a9",
+          "bytes": 431,
+          "document_class": "other_xml",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "historical",
+          "target_ledger": "status_evidence_v2",
+          "authority_class": "historical_status_candidate_non_authoritative",
+          "reason": "instrument_status.xml is explicitly included in the status-evidence denominator; it is historical and cannot overwrite current canonical observations.",
+          "parse_status": "parsed",
+          "root_tag": "BioXP3200Status"
+        },
+        {
+          "row_index": 15,
+          "row_sha256": "402a460abbdadcf2f5ac05701b0cd2f645ade82ec28da8e16b7068dc6f07785d",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/scripts/Inital Test Script.xml",
+          "sha256": "3cbda3795795ed00c2fee94965a97864d3b77c4f6be26bc9687063323f1b8f58",
+          "bytes": 2519,
+          "document_class": "workflow_script",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "historical_live_workflow_script",
+          "reason": "Workflow script provenance routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 16,
+          "row_sha256": "4dd53bb8254e7ed8787389d91c0938d083af64a7bd9243d0b12ddc9603ed0dd4",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/scripts/TP015 48 HOUR SYSTEM BURN-IN.xml",
+          "sha256": "4aaffc96f89fd3fbf681be031537589a2550c64b44c6a117074120a124045c63",
+          "bytes": 544978,
+          "document_class": "workflow_script",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "historical_live_workflow_script",
+          "reason": "Workflow script provenance routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 17,
+          "row_sha256": "080ebcbc7f6e4649d67e4eaab7492e22254bfc963caea445b49350fcd67a2f64",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/scripts/demo.xml",
+          "sha256": "b5f7c159245cbd6516c89587795a4021d4a3e1a5f71e8e4eead46a243a38b763",
+          "bytes": 3885,
+          "document_class": "workflow_script",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "historical_live_workflow_script",
+          "reason": "Workflow script provenance routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 18,
+          "row_sha256": "35afac0e9da5e68e571aa596dd9c8572b1f7ca8b07d69e5e16a5f4c20fde7a92",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/scripts/lifetest.xml",
+          "sha256": "454a235d932b79cd01ce81bb4bbb8a4ba061c3c2e41c1e1bbb743f1adbfbaba8",
+          "bytes": 26044,
+          "document_class": "workflow_script",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "historical_live_workflow_script",
+          "reason": "Workflow script provenance routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        },
+        {
+          "row_index": 19,
+          "row_sha256": "54eac9302122ab76da72d2845d4b7b7cf2e196eb9fe004e4e46589754fcb34b9",
+          "source_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/raw/live_oem_windows/scripts/tp506.xml",
+          "sha256": "1e3548cea03fc48e999be9e72a4f5a5dc551044620d94aa74156497e20cf6cf9",
+          "bytes": 1005,
+          "document_class": "workflow_script",
+          "evidence_origin": "live_oem_acquisition",
+          "disposition": "routed",
+          "target_ledger": "workflow_evidence_v2",
+          "authority_class": "historical_live_workflow_script",
+          "reason": "Workflow script provenance routed to workflow ledger, not machine-config denominator.",
+          "parse_status": "parsed",
+          "root_tag": "WpfGenBotCommonLib"
+        }
+      ]
+    }
+  },
+  "captured_clickonce_binaries": [
+    {
+      "name": "BioXPCommonLib.dll",
+      "sha256": "c0e430426a5af34c4fcadf067d2598aa98392569fd0175661d6478f18833382e"
+    },
+    {
+      "name": "BioXPControlLib.dll",
+      "sha256": "163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed"
+    },
+    {
+      "name": "ClassCanLib.dll",
+      "sha256": "7d91d8279fa967c20d006679c1c2d6545451b898fdeca9028224ef6d0c46dac1"
+    },
+    {
+      "name": "NovoCANUSBLib.dll",
+      "sha256": "6856ba3bda0033b938483ea7deeb664478cf446dabc93d1048fbb843d3cda3c3"
+    },
+    {
+      "name": "Novo.Devices.dll",
+      "sha256": "971efffd20c753de10f0750193cefb437ac64aac6ae6b6c22788d5bc5f2e1729"
+    },
+    {
+      "name": "CommonLib.dll",
+      "sha256": "100eee43654be4db1ce666e5d1e283c0ef16ccae478ba106db4edf6be5b449c6"
+    },
+    {
+      "name": "GenBotApp.exe",
+      "sha256": "d7cb7c94ebcfc386bc0a4acebb92f13d8463bb2b675f5439adf43be35198c6d9"
+    }
+  ],
+  "decompile_binary_map": {
+    "BioXPCommonLib.dll": [
+      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassCalibrationReference.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs"
+    ],
+    "BioXPControlLib.dll": [
+      "decompiled_src_can/BioXPControlLib/ClassPipette.cs",
+      "decompiled_src/BioXPControlLib/ClassPipetteCollection.cs",
+      "decompiled_src/BioXPControlLib/ControlLib.cs",
+      "decompiled_src/BioXPControlLib/ClassControlInterface.cs"
+    ],
+    "ClassCanLib.dll": [
+      "decompiled_src_can/ClassCanLib/ClassNovo.cs",
+      "decompiled_src_can/ClassCanLib/ClassIOControl.cs",
+      "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs"
+    ],
+    "NovoCANUSBLib.dll": [
+      "decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs"
+    ],
+    "Novo.Devices.dll": [
+      "decompiled_src_novodevices/Novo/Devices/CanInterfaceBoard.cs",
+      "decompiled_src_novodevices/Novo/Devices/NovoEncoding.cs",
+      "decompiled_src_novodevices/Novo/Devices/TecanADP.cs"
+    ],
+    "CommonLib.dll": [
+      "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs"
+    ],
+    "GenBotApp.exe": [
+      "decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs"
+    ]
+  },
+  "decompiled_source_anchors": [
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
+      "sha256": "08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41"
+    },
+    {
+      "path": "decompiled_src_can/BioXPControlLib/ClassPipette.cs",
+      "sha256": "681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957"
+    },
+    {
+      "path": "decompiled_src/BioXPControlLib/ClassPipetteCollection.cs",
+      "sha256": "ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e"
+    },
+    {
+      "path": "decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs",
+      "sha256": "e4cf1c311ed5ae79e9490564a48947bced5f46af36890cf4a77120a3b50ffb06"
+    },
+    {
+      "path": "decompiled_src_novodevices/Novo/Devices/CanInterfaceBoard.cs",
+      "sha256": "9603dfd57f8c56e0423da651280c3a6a70b38a2902662588a0d359827f477724"
+    },
+    {
+      "path": "decompiled_src_novodevices/Novo/Devices/NovoEncoding.cs",
+      "sha256": "2cd04c7cf947028161cd65320f2bc501a6c184de1d7984d895bcf91621cc68bc"
+    },
+    {
+      "path": "decompiled_src_novodevices/Novo/Devices/TecanADP.cs",
+      "sha256": "53b0ca7f3504a80a1c35ba84849ef8211401831f0a065697daaaa291f97a5c59"
+    },
+    {
+      "path": "decompiled_src/BioXPControlLib/ControlLib.cs",
+      "sha256": "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+    },
+    {
+      "path": "decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+      "sha256": "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassNovo.cs",
+      "sha256": "11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassCalibrationReference.cs",
+      "sha256": "5d6c630f63906c083912244fe1a2d6e0885095b88c23e92c5b7f57480c46d940"
+    },
+    {
+      "path": "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs",
+      "sha256": "34b87252bde7c3aed86f1b2443c7e8cc728d484b56141c04e570b866efcdb434"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs",
+      "sha256": "174d719c1f08d8474ae4cf6175839962bc3b2062546b9c90cfe1dba91f44760e"
+    },
+    {
+      "path": "decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs",
+      "sha256": "b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassIOControl.cs",
+      "sha256": "cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs",
+      "sha256": "bcae5ce4662cb3208dbc2fdf6e4c7ad0e23774307b633fc7a9ce5b727318698f"
+    }
+  ],
+  "runtime_log_anchor": {
+    "relative_path": "source_roots/logfile/C/logfile/Run started at 03-27 11-29-48.log",
+    "sha256": "f74dedb18bdff20aa4338e5968094c912d2dd8b3d8cfa762c738cbdce29616d9",
+    "proves": "OEM four-pipette pressure reads returned real values repeatedly; Linux ?57 timeout is not evidence that the physical OEM system lacks replies"
+  },
+  "schema_id": "bioxp.oem_evidence_lock.v4",
+  "linux_candidate_source_snapshot": {
+    "root": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy",
+    "claim_boundary": "Exact dirty Linux candidate used to identify deviation; never OEM authority.",
+    "expected_record_count": 14,
+    "git_status_mode": "git status --porcelain=v1 -uall",
+    "git_status_expected_entries": 29,
+    "git_status_sha256": "a54c6c48cc25b9b68d94d16de55ee77cba4276876fe7376a188806689d2a0618",
+    "records": [
+      {
+        "path": "src/bioxp/api.py",
+        "sha256": "80e926200d9b8fcfeda41a7038f1c95008fed98f6511ca752d177948871a9609",
+        "bytes": 207786,
+        "lines": 5167,
+        "role": "current Linux API/status orchestration and endpoint behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/usb_driver.py",
+        "sha256": "022439fd498486e34fb8fc9f078d34dab0c334a3385a16d044caaab31ebd2c63",
+        "bytes": 479908,
+        "lines": 11559,
+        "role": "current Linux USB transport ownership/lifecycle implementation under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/novo_usb_can.py",
+        "sha256": "2ed673dc2ddc5fafcdd5025df3f0944a46fe15d3a02136b4e90a0246712a1a29",
+        "bytes": 9964,
+        "lines": 266,
+        "role": "current Linux Novo CAN parser/routing implementation under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_config.py",
+        "sha256": "d3612fba67142032f21371eed5f25857db1c31805b2de2abc78ecc7f0eb2ed8a",
+        "bytes": 23312,
+        "lines": 520,
+        "role": "current Linux OEM configuration projection implementation under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_startup_program.py",
+        "sha256": "1937c8913eed8d73700a41f29b54333e3115e008899e708bb2b6383ab5b8d7af",
+        "bytes": 36546,
+        "lines": 640,
+        "role": "current Linux startup sequencing implementation under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/services/motion_service.py",
+        "sha256": "50a74c395a33a14622d423e788dc8ea125943d1ea1c9762aa057d4ed6ca6aba8",
+        "bytes": 13447,
+        "lines": 377,
+        "role": "current Linux motion/status service behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_homing_routes.py",
+        "sha256": "673fde7d9f6686f20b936519a381f1e6a04bed30f92ed1a316a5fa97daa3b597",
+        "bytes": 25920,
+        "lines": 625,
+        "role": "current Linux OEM homing/config planning and live shadow-readback GET behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_runtime_api.py",
+        "sha256": "cfe884a8b7f8f1cea61c3ef26c220b1da228a5dfac2d583a5368be26e7426e65",
+        "bytes": 7005,
+        "lines": 198,
+        "role": "current Linux OEM runtime GET lifecycle/status routing under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_runtime_status.py",
+        "sha256": "aa62565b1c7b556f2f3a05f817c261662a5a9048b17934eaab2e1acc7fe1668f",
+        "bytes": 1033,
+        "lines": 23,
+        "role": "current Linux persisted OEM status projection under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_runtime_store.py",
+        "sha256": "72fb7db779fe40125a59e99d78555ad429dcdb930f0308204cd74f6e2f15a9fd",
+        "bytes": 3462,
+        "lines": 92,
+        "role": "current Linux OEM runtime state persistence/recovery behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_runtime_types.py",
+        "sha256": "146b4fee0649183af5021780ee0190cb3ed2f51dada0deaf04094cb159ff509a",
+        "bytes": 6201,
+        "lines": 182,
+        "role": "current Linux OEM runtime snapshot defaults/schema under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_runtime_worker.py",
+        "sha256": "3aa9000195243a59a7407012fdf150bcd9a6c8c9adc9ee6ab956ab3ffd2ecfaa",
+        "bytes": 5583,
+        "lines": 120,
+        "role": "current Linux OEM runtime worker lifecycle/status behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/services/pipette_service.py",
+        "sha256": "3cb799c9d24ead9d21c711a54f24573cf3329cc8062150be0f9429700e16558b",
+        "bytes": 5005,
+        "lines": 160,
+        "role": "current Linux liquid-status transport-query behavior under correction",
+        "authority": "implementation_deviation_evidence_only"
+      },
+      {
+        "path": "src/bioxp/oem_compat/api.py",
+        "sha256": "7d174f7c26291cbbfbdffe42365c66b1a71a8ee860bad1565078d886e984927d",
+        "bytes": 6835,
+        "lines": 179,
+        "role": "current Linux OEM compatibility GET capability surface under correction",
+        "authority": "implementation_deviation_evidence_only"
+      }
+    ]
+  }
+}

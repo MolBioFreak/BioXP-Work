@@ -33,7 +33,7 @@ def test_position_table_resolves_oem_location_well_plate_targets():
                 "plateName": "pool",
                 "x": 1000,
                 "y": 2000,
-                "z": -300,
+                "zHigh": -300,
                 "xOffset": 10,
                 "yOffset": -20,
                 "zOffset": 5,

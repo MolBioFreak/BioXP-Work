@@ -5,7 +5,7 @@ import time
 
 
 class BioXpUsbDriver:
-    KNOWN_HEARTBEATS = {
+    KNOWN_UNSOLICITED_FRAMES = {
         (0x7e, 0x0, 0x0, 0x4, 0x82, 0x0, 0x86, 0x7e),
         (0x7e, 0x0, 0x0, 0x4, 0x8a, 0x0, 0x8e, 0x7e),
         (0x7e, 0x0, 0x0, 0x4, 0x92, 0x0, 0x96, 0x7e),
@@ -20,54 +20,14 @@ class BioXpUsbDriver:
                    6: "Command not available", 7: "Busy"}
 
     def __init__(self):
-        self.dev = usb.core.find(idVendor=0x03eb, idProduct=0x2423)
-        if self.dev is None:
-            raise ValueError("BioXP USB Device not found.")
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
-        self.dev.set_configuration()
-        usb.util.claim_interface(self.dev, 0)
-        self.dev.set_interface_altsetting(interface=0, alternate_setting=1)
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, 1)]
-        self.ep_out = usb.util.find_descriptor(
-            intf, custom_match=lambda e:
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
-        self.ep_in = usb.util.find_descriptor(
-            intf, custom_match=lambda e:
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
+        raise RuntimeError("standalone Novo USB diagnostics are disabled; use the shared BioXpTester/NovoRouter owner")
 
     def drain(self):
-        for _ in range(50):
-            try:
-                self.ep_in.read(64, timeout=30)
-            except usb.core.USBTimeoutError:
-                break
+        return []
 
     def send_tmcl(self, board_id, command, cmd_type, motor, value, retries=3):
-        val_bytes = struct.pack('>i', value)
-        inner = bytearray([0x00, 0x00, 0x00, board_id, 0x08,
-                           command, cmd_type, motor,
-                           val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3], 0x00])
-        chksum = sum(inner) & 0xFF
-        frame = bytearray([0x7E]) + inner + bytearray([chksum, 0x7E])
-        for attempt in range(retries):
-            self.drain()
-            try:
-                self.ep_out.write(frame, timeout=1000)
-            except usb.core.USBTimeoutError:
-                continue
-            for _ in range(40):
-                try:
-                    resp = list(self.ep_in.read(64, timeout=100))
-                    if tuple(resp) not in self.KNOWN_HEARTBEATS and len(resp) >= 14:
-                        return {"status": resp[7],
-                                "status_str": self.TMCL_STATUS.get(resp[7], f"?({resp[7]})"),
-                                "cmd": resp[8],
-                                "value": struct.unpack('>i', bytes(resp[9:13]))[0]}
-                except usb.core.USBTimeoutError:
-                    break
-        return None
+        del board_id, command, cmd_type, motor, value, retries
+        raise RuntimeError("standalone Novo TMCL transactions are disabled; use BioXpTester.send_tmcl")
 
     def get_pos(self, board, motor=0):
         r = self.send_tmcl(board, 6, 1, motor, 0)

@@ -135,3 +135,20 @@ def test_worker_run_next_reaches_diagnostic_not_ready(tmp_path):
     assert "pipette" in status["failure_reason"]
     assert (Path(status["artifact_root"]) / "initialize_motors_trace.jsonl").exists()
     assert (Path(status["artifact_root"]) / "vision_inspection.json").exists()
+
+
+
+def test_live_startup_normalizes_legacy_raw_axis_prep_shape(tmp_path):
+    from src.bioxp.oem_startup_program import BioXpStartupHardware
+
+    class LegacyTester:
+        def motor_oem_initialize_without_motion(self):
+            return {"x": {"ops": []}, "y": {"ops": []}}
+
+    hw = BioXpStartupHardware(lambda: LegacyTester())
+    result = hw.configure_without_motion(mode="live")
+
+    assert result["ok"] is True
+    assert result["physical_motion"] is False
+    assert result["normalized_from_raw_axis_prep"] is True
+    assert "axes" in result

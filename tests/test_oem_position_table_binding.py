@@ -65,3 +65,43 @@ def test_position_table_routes_are_read_only(tmp_path, monkeypatch):
     plan = asyncio.run(plan_oem_position_table_move(location_id="WASTE_BIN", mode="moveTo"))
     assert plan["planned_coordinates"] == {"x": 92049, "y": 93211, "z": 0}
     assert plan["physical_motion"] is False
+
+
+def test_oem_position_table_ignores_unknown_plain_z_field():
+    from src.bioxp.oem_compat.position_table import PositionTable
+
+    table = PositionTable.from_rows([{"name": "PLAIN_Z", "x": 10, "y": 20, "z": 12345}])
+    target = table.resolve(location_id="PLAIN_Z")
+
+    assert target.z_low is None
+    assert target.z_high is None
+    assert target.z_delta is None
+    assert target.base_coordinates["z"] == 0
+    assert table.compile_move_to("PLAIN_Z")["planned_coordinates"]["z"] == 0
+
+
+def test_oem_position_table_z_precedence_is_explicit_high_then_derived_then_low_default():
+    from src.bioxp.oem_compat.position_table import PositionTable
+
+    table = PositionTable.from_rows(
+        [
+            {"name": "EXPLICIT", "zLow": 80000, "zDelta": 30000, "zHigh": 41000},
+            {"name": "DERIVED", "zLow": 80000, "zDelta": 30000},
+            {"name": "LOW_ONLY", "zLow": 80000},
+            {"name": "ZERO", "zLow": 0, "zDelta": 0},
+        ]
+    )
+
+    assert table.resolve(location_id="EXPLICIT").base_coordinates["z"] == 41000
+    assert table.resolve(location_id="DERIVED").base_coordinates["z"] == 50000
+    assert table.resolve(location_id="LOW_ONLY").base_coordinates["z"] == 80000
+    assert table.resolve(location_id="ZERO").base_coordinates["z"] == 0
+
+
+def test_oem_position_table_rejects_malformed_recognized_z_fields():
+    from src.bioxp.oem_compat.position_table import PositionTable
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        PositionTable.from_rows([{"name": "BAD", "zLow": "not-a-number"}])

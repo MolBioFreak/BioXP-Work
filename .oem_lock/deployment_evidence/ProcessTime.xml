@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<BioXPCommonLib>
+  <processTime>
+    <sp process="2.548" />
+    <iniPipette process="5.945" />
+    <dopen process="19.013" />
+    <catch process="18.266" />
+    <release process="17.801" />
+    <dclose process="17.11" />
+    <step process="0.001" />
+    <led process="0.109" />
+    <ldtip process="13.508" />
+    <ms process="2.715" />
+    <rmb process="13.809" />
+    <masp process="10.417" />
+    <dsa process="8.091" />
+    <mmix process="1.338" />
+    <mr process="2.094" />
+    <mov process="7.12" />
+    <ejt process="2.974" />
+    <wiggley process="5.79" />
+    <tm process="24.116" />
+    <wait process="62.502" />
+    <cc process="0.045" />
+    <fon process="0.001" />
+    <park process="5.403" />
+    <splid process="30.347" />
+    <pressp process="0.34" />
+    <delaypoint process="600.333" />
+    <la process="0.001" />
+    <ampmix process="222.727" />
+    <empty process="24.134" />
+    <mw process="4.52" />
+  </processTime>
+</BioXPCommonLib>

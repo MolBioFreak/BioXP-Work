@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<CommonLib>
+  <processTime>
+    <sp process="4.24040282685512" />
+    <ejt process="10.6099428571429" />
+    <delaypoint process="4.4735" />
+    <cutseal process="25.427" />
+    <catch process="11.5" />
+    <release process="11.134" />
+    <dclose process="16.6998333333333" />
+    <dopen process="13.18" />
+    <iniPipette process="1.00283333333333" />
+    <step process="25.7716" />
+    <ldtip process="8.3409" />
+    <mov process="9.09076363636364" />
+    <rmb process="21.218" />
+    <masp process="4.05131884057971" />
+    <dsa process="3.51480434782609" />
+    <mmix process="3.53666666666667" />
+    <aa process="2.116" />
+    <da process="0.662" />
+    <cc process="0.082" />
+    <park process="25.786" />
+    <goto process="0" />
+    <fon process="0" />
+    <splid process="331.490954545455" />
+    <led process="14.3013333333333" />
+    <wait process="33.8968" />
+    <pressp process="8.16522222222222" />
+    <retip process="0.001" />
+    <wiggley process="0.001" />
+    <tm process="5.17" />
+    <empty process="24.214" />
+    <la process="5.93424" />
+    <mw process="4.735" />
+    <mr process="3.501" />
+    <ms process="2.12" />
+    <ampmix process="74.7526666666667" />
+    <catchPlate process="39.9198888888889" />
+    <releasePlate process="9.55696296296296" />
+    <sweep process="7.66958333333333" />
+  </processTime>
+</CommonLib>
