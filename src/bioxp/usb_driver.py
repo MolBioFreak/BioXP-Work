@@ -3337,11 +3337,6 @@ class BioXpTester:
             rl = self.motor_set_axis_param(board_id, 13, dl, motor=motor)
             ops.append({"op": "sap13-disable_left", "ack": rl.get("ack"), "rb": rl.get("readback"), "set": dl})
         
-        # Disable closed-loop encoder deviation checks to prevent WAIT_FWD_TIMEOUT
-        # when physical motion doesn't match encoder feedback.
-        renc = self.motor_set_axis_param(board_id, 212, 0, motor=motor)
-        ops.append({"op": "sap212-max_enc_deviation", "ack": renc.get("ack"), "rb": renc.get("readback"), "set": 0})
-        
         if rdiv is not None:
             rrdiv = self.motor_set_axis_param(board_id, 153, int(rdiv), motor=motor)
             ops.append({"op": "sap153-rdiv", "ack": rrdiv.get("ack"), "rb": rrdiv.get("readback"), "set": int(rdiv)})
