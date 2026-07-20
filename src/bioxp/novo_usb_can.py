@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 try:
@@ -267,6 +268,11 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         self.bitrate = 0
         self.pipette_id = int(pipette_id)
         self.response_timeout_s = 60.0
+        # Do not invoke BioXpCanDriver.__init__: it opens SocketCAN, whereas
+        # this subclass is owned by the shared OEM Novo USB router.  Retain
+        # only the inherited driver's injectable timing dependency so its
+        # OEM wake -> 100 ms -> WR sequence can run.
+        self._sleep = time.sleep
         self.usb = {
             "vendor_id": int(vendor_id),
             "product_id": int(product_id),
