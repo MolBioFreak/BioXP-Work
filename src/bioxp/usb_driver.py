@@ -3885,6 +3885,137 @@ class BioXpTester:
             "axis_failures": failures,
         }
 
+    def oem_initialize_without_motion_test_case(self):
+        """Run the literal `initializeMotorsWithoutMotion` command sequence.
+
+        This is intentionally a *live OEM-parity test case*, not a replacement
+        for the broader startup program.  It emits only the source commands in
+        source order, including the two thermal PWM-off writes and the OEM 1/2
+        ms sleeps.  In particular it does not use ``motor_prepare_axis``:
+        that helper adds normalization, readbacks, pacing, and recovery policy
+        which are useful elsewhere but are not part of this OEM method.
+        """
+        source_anchor = "ClassControlInterface.initializeMotorsWithoutMotion lines 3181-3265"
+        transcript = []
+
+        def emit(label, board, command, cmd_type, motor, value):
+            ack = self.send_tmcl_retry(
+                int(board), int(command), int(cmd_type), int(motor), int(value),
+                attempts=1, wait_reply=True, write_timeout_ms=1000,
+                read_timeout_ms=100, max_reads=10, strict_match=True,
+            )
+            row = {
+                "label": label, "board": int(board), "command": int(command),
+                "type": int(cmd_type), "motor": int(motor), "value": int(value),
+                "ack": ack, "ok": self._tmcl_success(ack),
+            }
+            transcript.append(row)
+            return row
+
+        def sleep_ms(ms):
+            time.sleep(float(ms) / 1000.0)
+            transcript.append({"label": f"Thread.Sleep({int(ms)})", "sleep_ms": int(ms), "ok": True})
+
+        def sap(label, profile, param, value):
+            return emit(label, profile["board"], 5, param, profile["motor"], value)
+
+        def gap(label, profile, param):
+            return emit(label, profile["board"], 6, param, profile["motor"], 0)
+
+        # OEM waitForBoard always sleeps once after inspecting board state.  The
+        # Linux router has no per-board IsInitialized flag, so this test case
+        # records the observable transport condition and preserves the delay;
+        # it deliberately does not substitute the non-OEM activate_boards path.
+        board_wait = {"transport": self.query_only_transport_state(), "source_behavior": "waitForBoard"}
+        sleep_ms(100)
+
+        x = self._motion_oem_axis_profile("x")
+        y = self._motion_oem_axis_profile("y")
+        z = self._motion_oem_axis_profile("z")
+        g = self._motion_oem_axis_profile("g")
+        door = self._motion_oem_axis_profile("door")
+        z_current, z_current_source = self._machine_config_offset_int("m_Z_MOTOR_MAX_CURRENT_UP", 31)
+        z_stall, z_stall_source = self._machine_config_offset_int("m_Z_MOTOR_STALL_GUARD_THRESHOLD", 16)
+        gripper_version = self._motion_oem_gripper_version()
+
+        # turnOffHeater(): the duplicate write is source behavior, not a retry.
+        emit("turnOffHeater.nest_pwm_off.1", self.BOARD_THERMAL, 144, 0, self.THERMAL_BANK_NEST, 0)
+        emit("turnOffHeater.nest_pwm_off.2", self.BOARD_THERMAL, 144, 0, self.THERMAL_BANK_NEST, 0)
+        # setChillerPWM(): Output/OC is first, then Reagent/RC.
+        emit("setChillerPWM.output_oc_off", self.BOARD_CHILLER, 144, 0, self.CHILLER_SET_AXIS[self.CHILLER_BANK_OC], 0)
+        emit("setChillerPWM.reagent_rc_off", self.BOARD_CHILLER, 144, 0, self.CHILLER_SET_AXIS[self.CHILLER_BANK_RC], 0)
+        sleep_ms(1)
+
+        for name, profile, speed, acc, current, stall, masks in (
+            ("x", x, 1700, 350, 31, 16, ()),
+            ("y", y, 1800, 400, 31, 16, ((12, 1, "disable_right"),)),
+            ("z", z, 1791, 576, z_current, z_stall, ()),
+        ):
+            sap(f"{name}.setMaxSpeed", profile, 4, speed)
+            sap(f"{name}.setMaxAcc", profile, 5, acc)
+            sleep_ms(2)
+            sap(f"{name}.setMaxCurrent", profile, 6, current)
+            sleep_ms(2)
+            if name == "z":
+                gap("z.readMaxCurrent", profile, 6)
+            sap(f"{name}.setStallGuardThreshold", profile, 205, stall)
+            sleep_ms(2)
+            for param, value, mask_name in masks:
+                sap(f"{name}.{mask_name}", profile, param, value)
+                sleep_ms(2)
+
+        gv0 = int(gripper_version) == 0
+        g_speed, g_acc, g_current, g_stall = (600, 5, 31, 5) if gv0 else (1500, 20, 10, 20)
+        sap("g.setMaxSpeed", g, 4, g_speed)
+        sap("g.setMaxAcc", g, 5, g_acc)
+        sleep_ms(2)
+        sap("g.setMaxCurrent", g, 6, g_current)
+        sleep_ms(2)
+        sap("g.setStallGuardThreshold", g, 205, g_stall)
+        sleep_ms(2)
+        # ClassHeadBoard.setRdivPdiv sends PDIV before RDIV.
+        sap("g.setPdiv", g, 154, 2)
+        sap("g.setRdiv", g, 153, 6)
+        sleep_ms(2)
+
+        for label, param, value in (
+            ("door.setMaxSpeed", 4, door["speed"]), ("door.setMaxAcc", 5, door["acc"]),
+        ):
+            sap(label, door, param, value)
+        sleep_ms(2)
+        sap("door.setMaxCurrent", door, 6, door["run_current"])
+        sleep_ms(2)
+        sap("door.setStallGuardThreshold", door, 205, door["stall_guard"])
+        sleep_ms(2)
+        sap("door.disable_right", door, 12, 1)
+        sleep_ms(2)
+        sap("door.disable_left", door, 13, 1)
+        sleep_ms(2)
+
+        # setChillerCoolRate(OC), then (RC): GP param 8 in milli-deg C/s.
+        emit("setChillerCoolRate.oc", self.BOARD_CHILLER, 9, 8, self.CHILLER_BANK_OC, -25)
+        emit("setChillerCoolRate.rc", self.BOARD_CHILLER, 9, 8, self.CHILLER_BANK_RC, -25)
+        emit("thermal.setTCHeatRate", self.BOARD_THERMAL, 9, 7, self.THERMAL_BANK_NEST, 2500)
+        emit("thermal.setTCCoolRate", self.BOARD_THERMAL, 9, 8, self.THERMAL_BANK_NEST, -2000)
+        for mask, intensity, color in ((0, 255, "red"), (1, 255, "green"), (2, 255, "blue")):
+            emit(f"setColor.white.{color}", self.BOARD_DECK, 50, 0, mask, self._led_scale_to_tmcl(intensity))
+
+        failures = [row for row in transcript if row.get("ack") is not None and not row.get("ok")]
+        no_replies = [row for row in transcript if "ack" in row and row.get("ack") is None]
+        return {
+            "ok": not failures and not no_replies,
+            "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
+            "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
+            "source_anchor": source_anchor,
+            "physical_motion": False,
+            "homing_performed": False,
+            "board_wait": board_wait,
+            "machine_values": {"z_current": z_current, "z_current_source": z_current_source, "z_stall_guard": z_stall, "z_stall_guard_source": z_stall_source, "gripper_version": gripper_version},
+            "transcript": transcript,
+            "failures": failures,
+            "no_replies": no_replies,
+        }
+
     def motor_oem_axis_search_home(self, axis_key, *, speed, timeout_s=30.0, max_search_abs_delta=None):
         """Source-faithful Class*Board.axisSearchHome(axis, speed).
 

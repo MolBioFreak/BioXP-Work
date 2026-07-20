@@ -463,16 +463,16 @@ def _constructor_pipette_action() -> dict[str, Any]:
 
 def _initialize_without_motion_action() -> dict[str, Any]:
     tester = _get_tester()
-    motor_current = tester.motor_oem_initialize_without_motion()
+    motor_current = tester.oem_initialize_without_motion_test_case()
     if bool(motor_current.get("physical_motion")):
         return {"ok": False, "error": "initialize_without_motion_reported_motion", "motor_current_verification": motor_current}
-    led_red = tester.strip_set_rgb(255, 0, 0, reconnect_first=False)
     lifecycle = lifecycle_state.projection()
-    ok = bool(motor_current.get("ok") and isinstance(led_red, dict) and led_red.get("ok", "error" not in led_red) and "error" not in led_red)
+    ok = bool(motor_current.get("ok"))
     return {
         "ok": ok,
         "motor_current_verification": motor_current,
-        "led_red": led_red,
+        "test_case": motor_current.get("test_case"),
+        "test_case_note": motor_current.get("test_case_note"),
         "start_mode_assignment": {
             "value": lifecycle.get("start_mode"),
             "source": "immutable OperationParameters.Mode",
