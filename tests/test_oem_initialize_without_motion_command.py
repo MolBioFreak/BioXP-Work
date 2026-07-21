@@ -29,11 +29,12 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
     commands = [(args[0], args[1], args[2], args[3], args[4]) for args, _ in sent]
     # waitForBoard activates all four initially-uninitialized boards before
     # initializeMotorsWithoutMotion starts its heater/chiller sequence.
-    assert commands[:4] == [
+    assert commands[:7] == [
         (4, 64, 0, 0, 1), (5, 64, 0, 0, 1),
-        (6, 64, 0, 0, 1), (7, 64, 0, 0, 1),
+        (6, 64, 0, 0, 1), (6, 10, 4, 0, 0),
+        (7, 64, 0, 0, 1), (7, 143, 0, 0, 0), (7, 143, 0, 1, 0),
     ]
-    assert commands[4:8] == [
+    assert commands[7:11] == [
         (6, 144, 0, 0, 0), (6, 144, 0, 0, 0),  # duplicate heater PWM off
         (7, 144, 0, 1, 0), (7, 144, 0, 0, 0),  # OC then RC
     ]
@@ -60,8 +61,11 @@ def test_wait_for_board_matches_oem_31_poll_then_selective_activation(monkeypatc
 
     assert result["ok"] is True
     assert len([row for row in result["trace"] if "pending" in row]) == 32
-    assert [args[0] for args in sent] == [4, 5, 6, 7]
-    assert all(args[1:5] == (64, 0, 0, 1) for args in sent)
+    assert [(args[0], args[1], args[2], args[3], args[4]) for args in sent] == [
+        (4, 64, 0, 0, 1), (5, 64, 0, 0, 1),
+        (6, 64, 0, 0, 1), (6, 10, 4, 0, 0),
+        (7, 64, 0, 0, 1), (7, 143, 0, 0, 0), (7, 143, 0, 1, 0),
+    ]
     assert sleeps.count(0.1) == 32
     assert sleeps.count(0.001) == 4
     assert sleeps.count(0.01) == 4

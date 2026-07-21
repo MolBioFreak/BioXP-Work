@@ -1006,21 +1006,123 @@ class BioXpTester:
         return int(board_id) in self.BOARDS
 
     def _oem_start_fan_service(self, board_id):
-        """Record ClassBaseBoard.startFanService dispatch.
-
-        Head/deck inherit the OEM no-op.  Thermal/chiller fan services are
-        host-side 5-second controllers; their initial dispatch sends no direct
-        TMCL command, so activation ordering remains source-identical here.
-        Their controller port is intentionally kept separate from board
-        activation rather than inventing a fan write at activation time.
-        """
+        """Literal Class{Thermal,Chiller}Board.startFanService dispatch."""
         bid = int(board_id)
-        services = getattr(self, "_oem_fan_service_started", None)
+        if bid == self.BOARD_THERMAL:
+            return {"board": bid, "service": [self._oem_fan_service_start(bid, 0)], "started": True}
+        if bid == self.BOARD_CHILLER:
+            return {"board": bid, "service": [self._oem_fan_service_start(bid, 0), self._oem_fan_service_start(bid, 1)], "started": True}
+        return {"board": bid, "service": "base_noop", "started": True}
+
+    def _oem_fan_services(self):
+        services = getattr(self, "_oem_fan_service_state", None)
         if not isinstance(services, dict):
             services = {}
-            self._oem_fan_service_started = services
-        services[bid] = True
-        return {"board": bid, "service": "thermal" if bid == self.BOARD_THERMAL else "chiller" if bid == self.BOARD_CHILLER else "base_noop", "started": True}
+            self._oem_fan_service_state = services
+        return services
+
+    @staticmethod
+    def _oem_fan_speed(current, target, pedestal, control_on, accelerate=False):
+        # Exact ClassThermalFanControl.calFanSpeed().
+        current, target, pedestal = float(current), float(target), float(pedestal)
+        if current > target + 30.0:
+            pedestal += 2.0
+            control_on = True
+        elif current > target + 15.0:
+            pedestal += 1.0
+            control_on = True
+        if control_on:
+            if accelerate:
+                return 255 if pedestal > 32.0 else 150
+            return 255 if pedestal > 37.0 else 220 if pedestal > 35.0 else 200 if pedestal > 32.0 else 150
+        return 255 if pedestal > 37.0 else 200 if pedestal > 35.0 else 150 if pedestal > 32.0 else 100 if pedestal > 30.0 else 50 if pedestal > 28.0 else 0
+
+    def _oem_fan_read(self, board, command, cmd_type, motor, fallback):
+        ack = self.send_tmcl_retry(int(board), int(command), int(cmd_type), int(motor), 0,
+            attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+        return (float(ack.get("value", int(round(float(fallback) * 1000.0)))) / 1000.0) if self._tmcl_success(ack) else float(fallback)
+
+    def _oem_fan_schedule(self, key):
+        service = self._oem_fan_services()[key]
+        if not service.get("running"):
+            return
+        timer = threading.Timer(5.0, self._oem_fan_tick, args=(key,))
+        timer.daemon = True
+        service["timer"] = timer
+        timer.start()
+
+    def _oem_fan_service_start(self, board, axis):
+        key = (int(board), int(axis))
+        services = self._oem_fan_services()
+        service = services.setdefault(key, {"pedestal_samples": [0.0] * 5, "target_c": 30.0, "current_c": 30.0, "tc_on": False, "going_down": False, "accelerate": False, "error": False, "running": False, "ticking": False})
+        # ClassThermalFanControl.startservice(): read current, then enable 5000ms timer.
+        if int(board) == self.BOARD_THERMAL:
+            service["current_c"] = self._oem_fan_read(board, 10, 4, 0, service["current_c"])
+        else:
+            service["current_c"] = self._oem_fan_read(board, 143, 0, axis, service["current_c"])
+        if not service.get("running"):
+            service["running"] = True
+            self._oem_fan_schedule(key)
+        return {"board": int(board), "axis": int(axis), "interval_ms": 5000, "current_c": service["current_c"], "started": True}
+
+    def _oem_fan_tick(self, key):
+        service = self._oem_fan_services().get(key)
+        if not isinstance(service, dict) or not service.get("running") or service.get("ticking"):
+            return
+        service["ticking"] = True
+        board, axis = key
+        try:
+            # Exact source sampling order and special going-down pedestal override.
+            samples = list(service["pedestal_samples"])
+            samples[:-1] = samples[1:]
+            if board == self.BOARD_THERMAL:
+                pedestal = self._oem_fan_read(board, 143, 0, 2, samples[-1])
+                current = self._oem_fan_read(board, 10, 4, 0, service["current_c"])
+            else:
+                pedestal_axis = 1 if axis == 0 else 4
+                pedestal = self._oem_fan_read(board, 143, 0, pedestal_axis, samples[-1])
+                current = self._oem_fan_read(board, 143, 0, axis, service["current_c"])
+            samples[-1] = pedestal
+            service["pedestal_samples"] = samples
+            averaged = sum(samples) / len(samples)
+            if service["going_down"] and samples[-1] > samples[-2] + 0.5:
+                averaged = samples[-1]
+            service["pedestal_c"] = averaged
+            service["current_c"] = current
+            if service["tc_on"]:
+                # OEM deliberately reads current a second time in the active branch.
+                current = self._oem_fan_read(board, 10, 4, 0, current) if board == self.BOARD_THERMAL else self._oem_fan_read(board, 143, 0, axis, current)
+                service["current_c"] = current
+                if current <= float(service["target_c"]) - 1.0:
+                    service["going_down"] = False
+                speed = self._oem_fan_speed(current, service["target_c"], averaged, bool(service["going_down"]), bool(service["accelerate"])) if service["going_down"] else self._oem_fan_speed(current, service["target_c"], averaged, False)
+            else:
+                speed = self._oem_fan_speed(current, service["target_c"], averaged, False)
+            service["fan_speed"] = speed
+            self.send_tmcl_retry(board, 141, 0, axis, speed, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+            if not service["error"] and averaged > 50.0:
+                if board == self.BOARD_THERMAL:
+                    self.send_tmcl_retry(board, 144, 0, 0, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                    self.send_tmcl_retry(board, 144, 0, 1, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                else:
+                    self.send_tmcl_retry(board, 144, 0, axis, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                service.update({"tc_on": False, "target_c": 30.0, "error": True})
+        finally:
+            service["ticking"] = False
+            self._oem_fan_schedule(key)
+
+    def _oem_fan_set_target(self, board, axis, target_c):
+        service = self._oem_fan_services().setdefault((int(board), int(axis)), {"pedestal_samples": [0.0] * 5, "target_c": 30.0, "current_c": 30.0, "tc_on": False, "going_down": False, "accelerate": False, "error": False, "running": False, "ticking": False})
+        service["target_c"] = float(target_c)
+        service["tc_on"] = True
+        service["going_down"] = float(service["current_c"]) > float(target_c)
+        service["accelerate"] = float(service["current_c"]) > float(target_c) + 25.0
+        service["error"] = False
+
+    def _oem_fan_turn_off(self, board, axis):
+        service = self._oem_fan_services().get((int(board), int(axis)))
+        if isinstance(service, dict):
+            service.update({"tc_on": False, "target_c": 30.0})
 
     def _oem_activate_board(self, board_id):
         """Literal Class{Head,Deck,Thermal,Chiller}Board.activateBoard()."""
@@ -6583,6 +6685,9 @@ class BioXpTester:
             time.sleep(self.CHILLER_VERIFY_SETTLE_S)
             ref = self.chiller_gp_read(22, bank)
             verified = bool(ref.get("ok") and int(ref.get("value")) == raw)
+        if self._tmcl_success(ack):
+            # ClassThermalControl.setChillerTemperature assigns TC_Target_Temp.
+            self._oem_fan_set_target(self.BOARD_CHILLER, axis, temp_c)
         return {
             "bank": bank,
             "axis": axis,
@@ -6658,6 +6763,8 @@ class BioXpTester:
             time.sleep(self.CHILLER_VERIFY_SETTLE_S)
             rb = self.chiller_gp_read(23, bank)
             verified = bool(rb.get("ok") and int(rb.get("value")) == pwm)
+        if self._tmcl_success(ack) and pwm == 0:
+            self._oem_fan_turn_off(self.BOARD_CHILLER, axis)
         return {
             "bank": bank,
             "axis": axis,
@@ -6968,6 +7075,8 @@ class BioXpTester:
             time.sleep(self.THERMAL_VERIFY_SETTLE_S)
             ref = self.thermal_gp_read(22, bank)
             verified = bool(ref.get("ok") and int(ref.get("value")) == raw)
+        if self._tmcl_success(ack) and bank == self.THERMAL_BANK_NEST:
+            self._oem_fan_set_target(self.BOARD_THERMAL, 0, temp_c)
         return {
             "bank": bank,
             "target_c": temp_c,
@@ -7065,6 +7174,8 @@ class BioXpTester:
             time.sleep(self.THERMAL_VERIFY_SETTLE_S)
             rb = self.thermal_gp_read(23, bank)
             verified = bool(rb.get("ok") and int(rb.get("value")) == pwm)
+        if self._tmcl_success(ack) and pwm == 0 and bank == self.THERMAL_BANK_NEST:
+            self._oem_fan_turn_off(self.BOARD_THERMAL, 0)
         return {"bank": bank, "pwm": pwm, "ack": ack, "readback": rb, "verified": verified, "ok": self._tmcl_success(ack)}
 
     def thermal_set_rates(self, bank, cool_rate_c_s, heat_rate_c_s, verify=False):
