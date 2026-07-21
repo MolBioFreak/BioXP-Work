@@ -984,6 +984,103 @@ class BioXpTester:
             time.sleep(0.005)
         return out
 
+    def _oem_board_state(self):
+        """Lazy mirror of ClassControlInterface.m_Boards[0..3] state.
+
+        Board ids are the OEM CAN ids: 4=head, 5=deck, 6=thermal, 7=chiller.
+        This state is deliberately distinct from the runtime's CAN_READY flag.
+        """
+        state = getattr(self, "_oem_board_initialized", None)
+        if not isinstance(state, dict):
+            state = {int(board): False for board in self.BOARDS}
+            self._oem_board_initialized = state
+        return state
+
+    def _oem_board_present(self, board_id):
+        # The OEM instance constructs these four m_Boards entries for this
+        # instrument.  Configuration may explicitly remove an entry for a
+        # variant/test harness, matching an OEM null board reference.
+        configured = getattr(self, "_oem_board_present", None)
+        if isinstance(configured, dict):
+            return bool(configured.get(int(board_id), False))
+        return int(board_id) in self.BOARDS
+
+    def _oem_start_fan_service(self, board_id):
+        """Record ClassBaseBoard.startFanService dispatch.
+
+        Head/deck inherit the OEM no-op.  Thermal/chiller fan services are
+        host-side 5-second controllers; their initial dispatch sends no direct
+        TMCL command, so activation ordering remains source-identical here.
+        Their controller port is intentionally kept separate from board
+        activation rather than inventing a fan write at activation time.
+        """
+        bid = int(board_id)
+        services = getattr(self, "_oem_fan_service_started", None)
+        if not isinstance(services, dict):
+            services = {}
+            self._oem_fan_service_started = services
+        services[bid] = True
+        return {"board": bid, "service": "thermal" if bid == self.BOARD_THERMAL else "chiller" if bid == self.BOARD_CHILLER else "base_noop", "started": True}
+
+    def _oem_activate_board(self, board_id):
+        """Literal Class{Head,Deck,Thermal,Chiller}Board.activateBoard()."""
+        bid = int(board_id)
+        if bid not in self.BOARDS:
+            raise ValueError(f"unsupported OEM board id: {bid}")
+        homes = getattr(self, "_oem_motor_home", None)
+        if not isinstance(homes, dict):
+            homes = {self.BOARD_HEAD: [False, False, False], self.BOARD_DECK: [False], self.BOARD_THERMAL: [False]}
+            self._oem_motor_home = homes
+        if bid == self.BOARD_HEAD:
+            homes[bid] = [False, False, False]
+        elif bid in (self.BOARD_DECK, self.BOARD_THERMAL):
+            homes[bid] = [False]
+        # Every OEM derived board waits 1 ms, then transmits cmd64/type0/motor0/value1 once.
+        time.sleep(0.001)
+        ack = self.send_tmcl_retry(
+            bid, 64, 0, 0, 1,
+            attempts=1, wait_reply=True, write_timeout_ms=80,
+            read_timeout_ms=100, max_reads=10, strict_match=True,
+        )
+        status = None if ack is None else ack.get("status")
+        initialized = int(status) == 100 if status is not None else False
+        if bid == self.BOARD_CHILLER and status is not None and int(status) == 2:
+            initialized = True
+        if initialized:
+            self._oem_board_state()[bid] = True
+        return {"board": bid, "ack": ack, "initialized": bool(self._oem_board_state().get(bid, False))}
+
+    def oem_activate_uninitialized_boards(self):
+        """Literal ClassControlInterface.activateBoard() control flow."""
+        rows = []
+        state = self._oem_board_state()
+        for bid in self.BOARDS:
+            if self._oem_board_present(bid) and not bool(state.get(int(bid), False)):
+                activation = self._oem_activate_board(bid)
+                fan_service = self._oem_start_fan_service(bid)
+                time.sleep(0.010)
+                rows.append({"board": int(bid), "activation": activation, "fan_service": fan_service, "post_activate_sleep_ms": 10})
+        return {"boards": rows, "initialized": dict(state)}
+
+    def oem_wait_for_board(self):
+        """Literal ClassControlInterface.waitForBoard() (including its unbounded loop)."""
+        pending = True
+        counter = 0
+        trace = []
+        state = self._oem_board_state()
+        while True:
+            pending = any(self._oem_board_present(bid) and not bool(state.get(int(bid), False)) for bid in self.BOARDS)
+            time.sleep(0.100)
+            trace.append({"pending": bool(pending), "counter_before_increment": int(counter), "sleep_ms": 100, "initialized": dict(state)})
+            if pending:
+                counter += 1
+                if counter > 30:
+                    counter = 0
+                    trace.append({"activateBoard": self.oem_activate_uninitialized_boards()})
+                continue
+            break
+        return {"ok": True, "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534", "trace": trace, "initialized": dict(state)}
+
     def activate_boards(self, expect_reply=True):
         return self._set_boards_active(True, expect_reply=expect_reply)
 
@@ -3922,12 +4019,9 @@ class BioXpTester:
         def gap(label, profile, param):
             return emit(label, profile["board"], 6, param, profile["motor"], 0)
 
-        # OEM waitForBoard always sleeps once after inspecting board state.  The
-        # Linux router has no per-board IsInitialized flag, so this test case
-        # records the observable transport condition and preserves the delay;
-        # it deliberately does not substitute the non-OEM activate_boards path.
-        board_wait = {"transport": self.query_only_transport_state(), "source_behavior": "waitForBoard"}
-        sleep_ms(100)
+        # Literal ClassControlInterface.waitForBoard().  It owns board state;
+        # CAN_READY/router ownership is intentionally not a substitute.
+        board_wait = self.oem_wait_for_board()
 
         x = self._motion_oem_axis_profile("x")
         y = self._motion_oem_axis_profile("y")
