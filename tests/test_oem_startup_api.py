@@ -158,7 +158,5 @@ def test_status_advertises_only_current_bms_commissioning_capabilities(monkeypat
     assert response.status_code == 200
     assert response.json()["capabilities"] == [
         "collect_hardware_snapshot",
-        "construct_pipettes",
-        "initialize_without_motion",
-        "run_initial_check",
+        "initialize_oem_environment",
     ]

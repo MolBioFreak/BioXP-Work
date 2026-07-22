@@ -87,9 +87,7 @@ from .services.vision_service import (
 
 BMS_COMMISSIONING_CAPABILITIES = (
     "collect_hardware_snapshot",
-    "construct_pipettes",
-    "initialize_without_motion",
-    "run_initial_check",
+    "initialize_oem_environment",
 )
 
 # Explicit camera routes own camera evidence. A generic hardware snapshot must
@@ -499,6 +497,111 @@ def _get_pipette_transport():
     return _pipette_transport
 
 
+def _oem_non_motion_startup_result(
+    projection: dict[str, Any],
+    *,
+    failed_stage: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": failed_stage is None and projection["startup"]["state"] == "passed",
+        "failed_stage": failed_stage,
+        "sequence": [
+            "constructor_pipette_stage",
+            "initialization_without_motion",
+            "initial_check",
+        ],
+        "lifecycle": projection,
+        "physical_motion": False,
+        "homing_performed": False,
+        "initialize_system_started": False,
+        "next_oem_boundary": "initializeSystem",
+        "source_anchors": {
+            "constructor": "ControlLib.cs:700,963-984",
+            "environment": "BioXPMainWindow.cs:821,973-997",
+        },
+    }
+
+
+def _run_oem_non_motion_startup_sequence(
+    *,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> dict[str, Any]:
+    """Mirror the automatic OEM startup path through initialCheck only.
+
+    The OEM ControlLib constructor performs the four-pipette sequence followed
+    by initializeMotorsWithoutMotion. BioXPMainWindow then invokes
+    initializeEnvironment/initialCheck during application load. The subsequent
+    initializeSystem command is intentionally outside this non-motion boundary.
+    """
+    projection = lifecycle_state.projection()
+    stages = projection["startup"]["stages"]
+    if any(stages[name]["state"] != expected for name, expected in (
+        ("constructor_pipette_stage", "not_run"),
+        ("initialization_without_motion", "blocked"),
+        ("initial_check", "blocked"),
+    )):
+        raise LifecycleStateError(
+            "OEM non-motion startup requires a fresh ownership epoch; completed or partial one-shot stages cannot be replayed"
+        )
+
+    projection = lifecycle_state.run_stage("constructor_pipette_stage", _constructor_pipette_action)
+    if projection["startup"]["stages"]["constructor_pipette_stage"]["state"] != "passed":
+        return _oem_non_motion_startup_result(projection, failed_stage="constructor_pipette_stage")
+
+    projection = lifecycle_state.run_stage("initialization_without_motion", _initialize_without_motion_action)
+    if projection["startup"]["stages"]["initialization_without_motion"]["state"] != "passed":
+        return _oem_non_motion_startup_result(projection, failed_stage="initialization_without_motion")
+
+    try:
+        initial_check_hardware = _LifecycleHardware(_get_tester())
+    except Exception as exc:
+        projection = lifecycle_state.run_stage(
+            "initial_check",
+            lambda: {
+                "ok": False,
+                "error": "initial_check_hardware_unavailable",
+                "detail": str(exc),
+                "exception_type": type(exc).__name__,
+                "physical_motion": False,
+            },
+        )
+        return _oem_non_motion_startup_result(projection, failed_stage="initial_check")
+
+    projection = lifecycle_state.run_initial_check(
+        initial_check_hardware,
+        can_ready=_can_ready_observation,
+        sleep=sleep,
+        clock=clock,
+    )
+    if projection["startup"]["stages"]["initial_check"]["state"] != "passed":
+        return _oem_non_motion_startup_result(projection, failed_stage="initial_check")
+    return _oem_non_motion_startup_result(projection)
+
+
+@app.post("/oem/startup/initialize_environment")
+async def oem_startup_initialize_environment(req: OemInitialCheckRequest):
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    if payload.get("mode") != "live" or payload.get("operator_ack") != "INITIALIZE":
+        raise HTTPException(
+            status_code=409,
+            detail="live mode and operator_ack INITIALIZE required for OEM non-motion startup",
+        )
+    if _can_ready_observation() is not True:
+        raise HTTPException(status_code=409, detail="OEM non-motion startup requires explicit CAN_READY=true evidence")
+    try:
+        result = await _run_blocking(
+            "OEM automatic non-motion startup through initializeEnvironment/initialCheck",
+            _run_oem_non_motion_startup_sequence,
+            timeout_s=460.0,
+        )
+    except LifecycleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
 @app.post("/oem/startup/request")
 async def oem_startup_request(req: OemStartupRequest):
     request_payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
@@ -506,8 +609,9 @@ async def oem_startup_request(req: OemStartupRequest):
         raise HTTPException(status_code=409, detail="operator_ack INITIALIZE required for live OEM startup")
     if request_payload.get("mode") == "live" and not request_payload.get("artifact_root"):
         raise HTTPException(status_code=409, detail="artifact_root required for live OEM startup")
-    # This route binds the explicit startup owner only.  It cannot collapse the
-    # three separately approved OEM stages into a generic startup request.
+    # This legacy request binds the broader motion-startup owner only. The
+    # BMS non-motion startup action uses /oem/startup/initialize_environment;
+    # initializeSystem/homing remain outside that aggregate boundary.
     _get_oem_startup_program(dry_safe=request_payload.get("mode") == "dry_run")
     status = lifecycle_state.transition("waiting", reason="startup_requested_awaiting_constructor_stage")
     return {
