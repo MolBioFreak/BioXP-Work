@@ -92,6 +92,12 @@ BMS_COMMISSIONING_CAPABILITIES = (
     "run_initial_check",
 )
 
+# Explicit camera routes own camera evidence. A generic hardware snapshot must
+# neither activate a camera nor claim an unqueried cache as observed.
+DEFAULT_HARDWARE_SNAPSHOT_DOMAINS = tuple(
+    domain for domain in CANONICAL_DOMAINS if domain != "camera"
+)
+
 try:
     from .usb_driver import BioXpTester
 except ModuleNotFoundError as exc:
@@ -466,13 +472,17 @@ def _initialize_without_motion_action() -> dict[str, Any]:
     motor_current = tester.motor_oem_initialize_without_motion()
     if bool(motor_current.get("physical_motion")):
         return {"ok": False, "error": "initialize_without_motion_reported_motion", "motor_current_verification": motor_current}
-    led_red = tester.strip_set_rgb(255, 0, 0, reconnect_first=False)
     lifecycle = lifecycle_state.projection()
-    ok = bool(motor_current.get("ok") and isinstance(led_red, dict) and led_red.get("ok", "error" not in led_red) and "error" not in led_red)
+    operations = motor_current.get("operations") if isinstance(motor_current, dict) else None
+    led_white = [
+        row for row in operations or []
+        if isinstance(row, dict) and str(row.get("name", "")).startswith("setColor.white.")
+    ]
+    ok = bool(motor_current.get("ok") and len(led_white) == 3 and all(row.get("ok") for row in led_white))
     return {
         "ok": ok,
         "motor_current_verification": motor_current,
-        "led_red": led_red,
+        "led_white": led_white,
         "start_mode_assignment": {
             "value": lifecycle.get("start_mode"),
             "source": "immutable OperationParameters.Mode",
@@ -2964,8 +2974,18 @@ def _query_io_snapshot(tester: BioXpTester) -> dict[int, Any]:
 
 
 def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
-    banks = (tester.THERMAL_BANK_NEST, tester.THERMAL_BANK_LID) if kind == "thermal" else (tester.CHILLER_BANK_RC, tester.CHILLER_BANK_OC)
-    gp_params = (7, 8, 13, 21, 22, 23) if kind == "thermal" else (2, 3, 7, 8, 13, 21, 22, 23)
+    if kind == "thermal":
+        banks = (tester.THERMAL_BANK_NEST, tester.THERMAL_BANK_LID)
+        # Named OEM ClassThermalControl/ClassThermalBoard read paths. Fan
+        # speed GP21 exists only on the nest bank; there is no OEM GP22 read.
+        gp_params_by_bank = {
+            tester.THERMAL_BANK_NEST: (7, 8, 13, 21, 23),
+            tester.THERMAL_BANK_LID: (7, 8, 13, 23),
+        }
+    else:
+        banks = (tester.CHILLER_BANK_RC, tester.CHILLER_BANK_OC)
+        # Named OEM ClassChillerBoard getters: target, heat/cool ramp, fan.
+        gp_params_by_bank = {bank: (4, 7, 8, 21) for bank in banks}
 
     def query(command: int, cmd_type: int, motor: int) -> dict[str, Any]:
         ack = tester.query_only_tmcl(
@@ -2986,7 +3006,13 @@ def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
         }
     else:
         temperatures = {label: {**query(143, 0, int(axis)), "axis": int(axis)} for label, axis in tester.CHILLER_TEMP_AXES}
-    gp = {bank: [{"param": param, "bank": bank, **query(10, param, bank)} for param in gp_params] for bank in banks}
+    gp = {
+        bank: [
+            {"param": param, "bank": bank, **query(10, param, bank)}
+            for param in gp_params_by_bank[bank]
+        ]
+        for bank in banks
+    }
     return {"activation_attempted": False, "firmware": firmware, "temps": temperatures, "gp": gp, "alive": bool(firmware["ok"] or any(row["ok"] for row in temperatures.values()))}
 
 
@@ -3035,20 +3061,24 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
         ack = row.get("ack")
         reply_present = ack is not None
         oem_status = ack.get("status") if isinstance(ack, dict) else None
-        voltage_v = row.get("value") if isinstance(ack, dict) and oem_status == 100 else None
+        payload_raw = row.get("value") if isinstance(ack, dict) and oem_status == 100 else None
         rail = lifecycle_state.voltage_observation(
-            voltage_v=voltage_v,
-            sample_valid=bool(reply_present and oem_status == 100 and voltage_v is not None),
+            payload_raw=payload_raw,
+            oem_status=oem_status,
             reply_present=reply_present,
             transport_outcome="reply" if reply_present else "no_reply",
             provenance={"route": "POST /hardware/snapshot/collect", "ack": ack},
         )
         rail.update({
             "oem_status": oem_status,
-            "payload_raw": voltage_v,
+            "payload_raw": payload_raw,
             "ack": ack,
         })
-        return {"rail_24v": rail, "safety_valid": rail["safety_valid"], "voltage_ok": rail["voltage_ok"]}
+        return {
+            "rail_24v": rail,
+            "safety_valid": rail["safety_valid"],
+            "oem_power_ok": rail["zero_valid_sample"],
+        }
 
     def interlock(_: CollectionContext) -> dict[str, Any]:
         return {"motion_arm": tester.motion_arm_state(), "latch_override": tester.motion_latch_override_state(), "deck_io": io()}
@@ -3074,7 +3104,18 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
 
     def camera(_: CollectionContext) -> dict[str, Any]:
         _, session_projection = _camera_session_projection()
-        return {"probe": _camera_cache_envelope(_camera_probe_cache), "session": session_projection, "hardware_queried": False}
+        probe_projection = _camera_cache_envelope(_camera_probe_cache)
+        if not probe_projection.get("available") and not session_projection.get("available"):
+            raise RuntimeError(
+                "camera evidence unavailable; use explicit POST /camera/probe or "
+                "POST /camera/stream/start"
+            )
+        return {
+            "probe": probe_projection,
+            "session": session_projection,
+            "hardware_queried": False,
+            "truth_source": "explicit camera cache",
+        }
 
     return {
         "transport": transport,
@@ -3615,12 +3656,29 @@ class UsbSniffManager:
 _usb_sniff_manager = UsbSniffManager()
 
 
-async def _run_blocking(label: str, func, timeout_s: float = 30.0):
+async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
     async with _tester_lock:
+        worker = asyncio.create_task(run_in_threadpool(func))
         try:
-            return await asyncio.wait_for(run_in_threadpool(func), timeout=timeout_s)
+            if timeout_s is None:
+                return await asyncio.shield(worker)
+            return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
         except asyncio.TimeoutError as exc:
+            # A Python worker thread cannot be killed safely. Keep the hardware
+            # exclusion lock until it has actually stopped before reporting the
+            # elapsed API deadline; otherwise a second command can overlap it.
+            try:
+                await asyncio.shield(worker)
+            except Exception:
+                pass
             raise HTTPException(status_code=504, detail=f"{label} timed out after {timeout_s:.0f}s") from exc
+        except asyncio.CancelledError:
+            # Client disconnect/task cancellation must not release ownership
+            # while the non-cancellable hardware worker is still running.
+            try:
+                await asyncio.shield(worker)
+            finally:
+                raise
 
 
 def _pick_capture_device(tester: BioXpTester, preferred: str) -> dict:
@@ -4260,7 +4318,7 @@ async def get_status():
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
     tester = _get_tester()
-    requested = (payload or {}).get("domains") or list(CANONICAL_DOMAINS)
+    requested = (payload or {}).get("domains") or list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS)
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:

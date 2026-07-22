@@ -43,7 +43,7 @@ def _frame(arbitration_id: int, data: list[int] | bytes | bytearray):
 def test_query_tip_status_demuxes_async_frame_until_pipette_report_reply():
     driver = _driver_with_replies(
         _frame(0x100, b"EVTdoor"),
-        _frame(0x106, [0x00, 0x00, ord("1"), 0x00, 0x00, 0x00, 0x00, 0x00]),
+        _frame(0x506, [0x20, 0x60, ord("1")]),
     )
 
     result = driver.query_tip_status()
@@ -53,8 +53,8 @@ def test_query_tip_status_demuxes_async_frame_until_pipette_report_reply():
     assert result["ok"] is True
     assert result["tip_loaded"] is True
     assert result["hardware_truth_level"] == "hardware_query"
-    assert result["ack"]["arbitration_id"] == 0x106
-    assert result["ack"]["demux"]["matched_address"] == "report"
+    assert result["ack"]["arbitration_id"] == 0x506
+    assert result["ack"]["demux"]["matched_address"] == "report_rx"
     assert result["ack"]["demux"]["skipped_count"] == 1
     assert result["ack"]["demux"]["skipped_frames"][0]["arbitration_id"] == 0x100
     assert result["oem_source_anchor"] == "ClassPipette.QueryTipStatus: ?31"
@@ -63,7 +63,7 @@ def test_query_tip_status_demuxes_async_frame_until_pipette_report_reply():
 def test_query_pressure_demuxes_report_reply_and_parses_ascii_pressure_value():
     driver = _driver_with_replies(
         _frame(0x101, b"WR\x20\x00\x00\x00\x00\x00"),
-        _frame(0x106, b"P=123.4"),
+        _frame(0x506, bytes([0x20, 0x60]) + b"123.4"),
     )
 
     result = driver.query_pressure()
@@ -72,29 +72,31 @@ def test_query_pressure_demuxes_report_reply_and_parses_ascii_pressure_value():
     assert bytes(driver.bus.sent[0].data[:3]).decode("ascii") == "?57"
     assert result["ok"] is True
     assert result["pressure"] == 123.4
-    assert result["ack"]["arbitration_id"] == 0x106
-    assert result["ack"]["demux"]["matched_address"] == "report"
+    assert result["ack"]["arbitration_id"] == 0x506
+    assert result["ack"]["demux"]["matched_address"] == "report_rx"
     assert result["ack"]["demux"]["skipped_count"] == 1
     assert result["oem_source_anchor"] == "ClassPipette.QueryPressure: ?57"
 
 
 def test_query_tip_status_keeps_transport_and_semantic_truth_separate_for_unparsed_reply():
-    driver = _driver_with_replies(_frame(0x106, b"????...."))
+    driver = _driver_with_replies(_frame(0x506, b"????...."))
 
     result = driver.query_tip_status()
 
-    assert result["ok"] is True  # transport/readback frame arrived
+    assert result["ok"] is False
+    assert result["reply_received"] is True
     assert result["semantic_ok"] is False
     assert result["tip_loaded"] is None
     assert result["hardware_truth_level"] == "unparsed_hardware_reply"
 
 
 def test_query_pressure_does_not_parse_command_echo_digits_as_pressure():
-    driver = _driver_with_replies(_frame(0x106, b"?57....."))
+    driver = _driver_with_replies(_frame(0x506, b"?57....."))
 
     result = driver.query_pressure()
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reply_received"] is True
     assert result["semantic_ok"] is False
     assert result["pressure"] is None
     assert result["hardware_truth_level"] == "unparsed_hardware_reply"

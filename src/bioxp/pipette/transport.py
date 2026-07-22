@@ -431,12 +431,28 @@ class FourPipetteTransport:
             "liquid_mutation_enabled": False,
         }
 
-    def _run_group_cycle(self, *, cycle: str) -> dict[str, Any]:
+    def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
-            result = transport._get_driver().pipette_initiate_group()
+            driver = transport._get_driver()
+            if transport._initialized:
+                # ClassPipette.initiate(false) skips the wake frame once initialized,
+                # but still waits 100 ms and transmits WR.
+                self._sleep(0.100)
+                driver_result = driver.pipette_initiate_group()
+                result = {
+                    **transport._status_payload(
+                        command="initialize",
+                        driver_result=driver_result,
+                        requested=command.to_payload(),
+                        hardware_truth_level="acknowledged_command",
+                    ),
+                    "driver_result": driver_result,
+                }
+            else:
+                result = transport.initialize(command)
             sends.append({"channel": channel, "result": result})
-            if not result.get("immediate_ack_received"):
+            if not result.get("driver_result", {}).get("immediate_ack_received"):
                 for registered in range(channel + 1):
                     self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
                 return {
@@ -447,14 +463,15 @@ class FourPipetteTransport:
                     "completion_timeout_ms": 10_000,
                 }
 
-        # Exact collection-level waitforcompletion("Reinitialize pipette", 10000):
-        # one deadline for all four completions, never four serial extensions.
+        # ClassPipetteCollection.waitforcompletion(..., 10000) owns one shared
+        # deadline for all four channel events.
         deadline = time.monotonic() + 10.0
         completions: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
             remaining = max(0.0, deadline - time.monotonic())
             result = transport._get_driver().wait_pipette_initialization_completion(remaining)
             completions.append({"channel": channel, "result": result})
+            transport._initialized = bool(result.get("ok"))
         if not all(row["result"].get("ok") for row in completions):
             return {
                 "ok": False,
@@ -465,6 +482,9 @@ class FourPipetteTransport:
                 "completion_timeout_ms": 10_000,
             }
 
+        first_driver = self._transports[0]._get_driver()
+        router = getattr(getattr(first_driver, "bus", None), "router", None)
+        pressure_epoch = router.begin_pressure_epoch() if router is not None else None
         stream_on = [
             {"channel": channel, "result": transport._get_driver().enable_pressure_stream(True)}
             for channel, transport in enumerate(self._transports)
@@ -474,8 +494,6 @@ class FourPipetteTransport:
             {"channel": channel, "result": transport._get_driver().enable_pressure_stream(False)}
             for channel, transport in enumerate(self._transports)
         ]
-        first_driver = self._transports[0]._get_driver()
-        router = getattr(getattr(first_driver, "bus", None), "router", None)
         pressure_offsets = router.calculate_pressure_offsets() if router is not None else {}
         stream_ok = all(row["result"].get("ok") for row in stream_on + stream_off)
         return {
@@ -486,8 +504,9 @@ class FourPipetteTransport:
             "delayed_completions": completions,
             "completion_timeout_ms": 10_000,
             "pressure_stream": {"on": stream_on, "wait_ms": 1_000, "off": stream_off},
+            "pressure_epoch": pressure_epoch,
             "pressure_offsets": pressure_offsets,
-            "pressure_offset_order": "stream_on_1000ms_stream_off_calculate_from_router_samples",
+            "pressure_offset_order": "new_epoch_stream_on_1000ms_stream_off_calculate",
         }
 
     def _query_condition(self) -> list[dict[str, Any]]:
@@ -506,48 +525,13 @@ class FourPipetteTransport:
 
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
         started = time.monotonic()
-        initialized = []
-        for channel, transport in enumerate(self._transports):
-            result = transport.initialize(command)
-            initialized.append({"channel": channel, "result": result})
-            if not result.get("driver_result", {}).get("immediate_ack_received"):
-                for registered in range(channel + 1):
-                    self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
-                self._last_group_transaction = {
-                    "ok": False, "outcome": "invalid_or_missing_immediate_ack", "channels": initialized,
-                    "group_wait_ms": 10_000,
-                }
-                return dict(self._last_group_transaction)
-
-        # Each constructor initiation has the exact OEM 60,000 ms delayed-
-        # completion contract.  The empty ACK above is never completion proof.
-        completion_deadline = time.monotonic() + 60.0
-        completions = []
-        for channel, transport in enumerate(self._transports):
-            remaining = max(0.0, completion_deadline - time.monotonic())
-            result = transport._get_driver().wait_pipette_initialization_completion(remaining)
-            completions.append({"channel": channel, "result": result})
-            transport._initialized = bool(result.get("ok"))
-        if not all(row["result"].get("ok") for row in completions):
-            self._last_group_transaction = {
-                "ok": False,
-                "outcome": "invalid_or_missing_delayed_completion",
-                "channels": initialized,
-                "delayed_completions": completions,
-                "completion_timeout_ms": 60_000,
-                "group_wait_ms": 10_000,
-            }
-            return dict(self._last_group_transaction)
-
-        initial_group = self._run_group_cycle(cycle="constructor_initiateGroup")
+        initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup")
         if not initial_group.get("ok"):
             self._last_group_transaction = {
                 "ok": False,
                 "outcome": "initial_group_cycle_failed",
-                "channels": initialized,
-                "constructor_delayed_completions": completions,
+                "channels": initial_group.get("sends", []),
                 "initial_group": initial_group,
-                "completion_timeout_ms": 60_000,
                 "group_wait_ms": 10_000,
                 "liquid_mutation_enabled": False,
             }
@@ -560,7 +544,7 @@ class FourPipetteTransport:
         retry_group = None
         retry_status = None
         if condition_ok and not first_status_ok:
-            retry_group = self._run_group_cycle(cycle="single_conditional_status_retry")
+            retry_group = self._run_group_cycle(command, cycle="single_conditional_status_retry")
             if retry_group.get("ok"):
                 retry_status = self._query_status()
         final_status = retry_status if retry_status is not None else first_status
@@ -569,8 +553,7 @@ class FourPipetteTransport:
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
-            "channels": initialized,
-            "constructor_delayed_completions": completions,
+            "channels": initial_group.get("sends", []),
             "initial_group": initial_group,
             "condition_readback": condition,
             "status_readback_first": first_status,
@@ -579,7 +562,7 @@ class FourPipetteTransport:
             "status_readback_retry": retry_status,
             "status_readback_final": final_status,
             "group_wait_ms": 10_000,
-            "completion_timeout_ms": 60_000,
+            "pipette_transaction_timeout_ms": 60_000,
             "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),
             "liquid_mutation_enabled": False,
         }

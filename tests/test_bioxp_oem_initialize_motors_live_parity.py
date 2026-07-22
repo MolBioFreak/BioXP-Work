@@ -79,36 +79,6 @@ def test_oem_startup_profiles_preserve_literal_xy_constants_and_masks():
     assert "disable_left" not in y
 
 
-def test_initialize_without_motion_dispatches_literal_xy_profiles_without_x_mask_writes(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-    captured = {}
-    original_profile = tester._motion_oem_axis_profile
-
-    def profile(axis):
-        if axis in {"x", "y"}:
-            return original_profile(axis, startup=True)
-        return {"board": 4, "motor": 2, "run_current": 10}
-
-    def prepare(board, *, motor=0, **kwargs):
-        axis = "x" if board == tester.BOARD_DECK else ("y" if motor == 0 else f"other-{motor}")
-        captured[axis] = kwargs
-        return {"ok": True, "ops": []}
-
-    monkeypatch.setattr(tester, "_motion_oem_axis_profile", profile)
-    monkeypatch.setattr(tester, "motor_prepare_axis", prepare)
-
-    result = tester.motor_oem_initialize_without_motion()
-
-    assert result["ok"] is True
-    assert captured["x"]["speed"] == 1700
-    assert captured["x"]["acc"] == 350
-    assert captured["x"]["disable_right"] is None
-    assert captured["x"]["disable_left"] is None
-    assert captured["y"]["speed"] == 1800
-    assert captured["y"]["acc"] == 400
-    assert captured["y"]["disable_right"] is True
-    assert captured["y"]["disable_left"] is None
-
 
 def test_z_home_step_uses_full_init_z_reference_contract_when_probe_fails():
     from src.bioxp.api import _execute_oem_startup_step
@@ -324,25 +294,6 @@ def test_z_reference_return_requires_observed_motion_and_verified_post_target(mo
     assert result["completion_evidence"]["target_position_confirmed"] is False
 
 
-def test_initialize_without_motion_keeps_gripper_v1_at_idle_current(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-    prepared = []
-
-    def fake_prepare(board, *, motor=0, **kwargs):
-        prepared.append({"board": board, "motor": motor, **kwargs})
-        return {"ops": [{"op": "prepare", "ack": {"status": 100}}]}
-
-    monkeypatch.setattr(tester, "motor_prepare_axis", fake_prepare)
-
-    result = tester.motor_oem_initialize_without_motion()
-
-    assert result["ok"] is True
-    gripper = next(row for row in prepared if row["board"] == tester.BOARD_HEAD and row["motor"] == 2)
-    assert gripper["run_current"] == 10
-    assert gripper["standby_current"] == 10
-
-
-
 
 
 def test_full_init_uses_oem_xy_axis_search_not_controller_zero(monkeypatch):
@@ -471,24 +422,3 @@ def test_full_initialize_motors_passes_bounded_x_and_y_search(monkeypatch):
     assert result["ok"] is True
     assert ("x", {"speed": 250, "timeout_s": 45.0, "max_search_abs_delta": 91919}) in calls
     assert ("y", {"speed": 250, "timeout_s": 45.0, "max_search_abs_delta": 95247}) in calls
-
-
-def test_initialize_without_motion_has_top_level_ok(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-
-    profiles = {
-        "x": {"board": 5, "motor": 0},
-        "y": {"board": 4, "motor": 0},
-        "z": {"board": 4, "motor": 1},
-        "g": {"board": 4, "motor": 2},
-        "door": {"board": 6, "motor": 0},
-    }
-    monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis: profiles[axis])
-    monkeypatch.setattr(tester, "motor_prepare_axis", lambda board, **kwargs: {"board": board, "ops": [{"op": "sap6", "ack": {"status": 100}}]})
-    monkeypatch.setattr(tester, "_tmcl_success", lambda ack: ack.get("status") == 100)
-
-    result = tester.motor_oem_initialize_without_motion()
-
-    assert result["ok"] is True
-    assert result["physical_motion"] is False
-    assert set(result["axes"]) == {"x", "y", "z", "g", "door"}

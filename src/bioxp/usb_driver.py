@@ -538,6 +538,7 @@ class BioXpTester:
         self._thermal_last_tx_ts = 0.0
         self._motor_last_tx_ts = {int(bid): 0.0 for bid in self.MOTOR_BOARDS}
         self._motor_noresp_streak = {int(bid): 0 for bid in self.MOTOR_BOARDS}
+        self._oem_initialized_boards = set()
 
     def reconnect(self, *, hard_reset=False):
         with self._transport_guard():
@@ -837,6 +838,7 @@ class BioXpTester:
         read_timeout_ms=30,
         max_reads=12,
         strict_match=True,
+        require_command_echo=True,
     ):
         with self._transport_guard():
             return self._send_tmcl_locked(
@@ -850,6 +852,7 @@ class BioXpTester:
                 read_timeout_ms=read_timeout_ms,
                 max_reads=max_reads,
                 strict_match=strict_match,
+                require_command_echo=require_command_echo,
             )
 
     def _send_tmcl_locked(
@@ -864,6 +867,7 @@ class BioXpTester:
         read_timeout_ms=30,
         max_reads=12,
         strict_match=True,
+        require_command_echo=True,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
         self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
@@ -873,7 +877,16 @@ class BioXpTester:
         try:
             transaction = router.transact(
                 bytes(frame),
-                matcher=(router.tmcl_matcher(board_id=int(board_id), command=int(command), strict=bool(strict_match)) if wait_reply else None),
+                matcher=(
+                    router.tmcl_matcher(
+                        board_id=int(board_id),
+                        command=int(command),
+                        strict=bool(strict_match),
+                        require_command_echo=bool(require_command_echo),
+                    )
+                    if wait_reply
+                    else None
+                ),
                 matcher_name=f"tmcl:{int(board_id)}:{int(command)}",
                 timeout_s=max(0.10, (int(read_timeout_ms) * int(max_reads)) / 1000.0) if wait_reply else 0.0,
                 write_timeout_ms=int(write_timeout_ms),
@@ -962,13 +975,28 @@ class BioXpTester:
         self.send_tmcl(self.BOARD_DECK, 14, 1, 2, 1, wait_reply=False, write_timeout_ms=30)
         time.sleep(0.01)
 
+    def _record_oem_board_activation(self, board_id, *, active, ack):
+        """Own IsInitialized evidence only at the OEM activate/deactivate boundary."""
+        initialized = getattr(self, "_oem_initialized_boards", None)
+        if not isinstance(initialized, set):
+            initialized = set()
+            self._oem_initialized_boards = initialized
+        status = int(ack.get("status", -1)) if isinstance(ack, dict) else -1
+        accepted = status == 100 or (int(board_id) == int(self.BOARD_CHILLER) and status == 2)
+        if not accepted:
+            return
+        if active:
+            initialized.add(int(board_id))
+        else:
+            initialized.discard(int(board_id))
+
     def _set_boards_active(self, active: bool, expect_reply=True):
         if active:
             self.enable_motor_power()
         out = {}
         value = 1 if active else 0
         for bid in self.BOARDS:
-            out[bid] = self.send_tmcl_retry(
+            ack = self.send_tmcl_retry(
                 bid,
                 64,
                 0,
@@ -980,7 +1008,14 @@ class BioXpTester:
                 read_timeout_ms=30,
                 max_reads=12,
                 strict_match=True,
+                # OEM ClassChillerBoard.activateBoard() checks only the returned
+                # status byte (100 or 2), not an echoed command byte. Preserve
+                # strict board identity while matching that literal contract.
+                require_command_echo=int(bid) != int(self.BOARD_CHILLER),
             )
+            out[bid] = ack
+            if expect_reply:
+                self._record_oem_board_activation(bid, active=active, ack=ack)
             time.sleep(0.005)
         return out
 
@@ -3857,37 +3892,247 @@ class BioXpTester:
         })
         return preset
 
+    def motor_oem_wait_for_board(
+        self,
+        *,
+        timeout_s=15.0,
+        poll_interval_s=0.100,
+        activation_every_polls=31,
+        clock=time.monotonic,
+        sleep=time.sleep,
+    ):
+        """Bound the OEM waitForBoard loop and report exact missing boards.
+
+        The Windows source loops forever.  A remote control plane cannot safely
+        inherit that behavior: one absent board otherwise owns the hardware lock
+        indefinitely and leaves the lifecycle stage permanently ``running``.
+        """
+        timeout_s = max(0.0, float(timeout_s))
+        poll_interval_s = max(0.001, float(poll_interval_s))
+        activation_every_polls = max(1, int(activation_every_polls))
+        started = clock()
+        activation_counter = 0
+        polls = 0
+        activations = []
+        while True:
+            initialized = {
+                int(board) for board in getattr(self, "_oem_initialized_boards", set())
+            }
+            missing = [int(board) for board in self.BOARDS if int(board) not in initialized]
+            if not missing:
+                return {
+                    "ok": True,
+                    "polls": polls,
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "timeout_s": timeout_s,
+                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                    "initialized_boards": sorted(initialized),
+                    "missing_boards": [],
+                    "activations": activations,
+                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                    "linux_guardrail": "bounded_wait_for_board",
+                }
+            elapsed = clock() - started
+            if elapsed >= timeout_s:
+                return {
+                    "ok": False,
+                    "error": "waitForBoard_timeout",
+                    "polls": polls,
+                    "elapsed_ms": int(round(elapsed * 1000.0)),
+                    "timeout_s": timeout_s,
+                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                    "initialized_boards": sorted(initialized),
+                    "missing_boards": missing,
+                    "activations": activations,
+                    "physical_motion": False,
+                    "motion_commanded": False,
+                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                    "linux_guardrail": "bounded_wait_for_board",
+                }
+            sleep(min(poll_interval_s, max(0.0, timeout_s - elapsed)))
+            polls += 1
+            activation_counter += 1
+            if activation_counter >= activation_every_polls:
+                activation_counter = 0
+                activations.append(self.activate_boards(expect_reply=True))
+
+    def _oem_no_motion_tmcl(self, *, name, board, command, cmd_type, motor, value):
+        ack = self.send_tmcl(
+            int(board),
+            int(command),
+            int(cmd_type),
+            int(motor),
+            int(value),
+            wait_reply=True,
+            write_timeout_ms=1000,
+            read_timeout_ms=1000,
+            max_reads=256,
+            strict_match=True,
+        )
+        return {
+            "name": str(name),
+            "board": int(board),
+            "command": int(command),
+            "type": int(cmd_type),
+            "motor": int(motor),
+            "value": int(value),
+            "ack": ack,
+            "ok": self._tmcl_success(ack),
+        }
+
     def motor_oem_initialize_without_motion(self):
-        axes = {}
+        """Literal ClassControlInterface.initializeMotorsWithoutMotion().
+
+        This path intentionally bypasses ``motor_prepare_axis``: that generic
+        helper changes OEM write order and adds SAP 212/readback operations that
+        do not exist in the OEM method.
+        """
+        operations = []
         failures = []
-        for axis_key in ("x", "y", "z", "g", "door"):
-            preset = self._motion_oem_axis_profile(axis_key)
-            row = self.motor_prepare_axis(
-                preset["board"],
-                motor=preset["motor"],
-                run_current=preset.get("run_current"),
-                standby_current=preset.get("standby_current"),
-                speed=preset.get("speed"),
-                acc=preset.get("acc"),
-                stall_guard=preset.get("stall_guard"),
-                ramp_mode=preset.get("ramp_mode"),
-                disable_right=preset.get("disable_right"),
-                disable_left=preset.get("disable_left"),
-                rdiv=preset.get("rdiv"),
-                pdiv=preset.get("pdiv"),
-                warm_enable=bool(preset.get("warm_enable", False)),
+
+        def record(row):
+            operations.append(row)
+            if isinstance(row, dict) and row.get("ok") is False:
+                failures.append({"name": row.get("name"), "ack": row.get("ack")})
+            return row
+
+        def tx(name, board, command, cmd_type, motor, value):
+            return record(
+                self._oem_no_motion_tmcl(
+                    name=name,
+                    board=board,
+                    command=command,
+                    cmd_type=cmd_type,
+                    motor=motor,
+                    value=value,
+                )
             )
-            axes[axis_key] = row
-            for op in row.get("ops", []) if isinstance(row, dict) else []:
-                ack = op.get("ack") if isinstance(op, dict) else None
-                if ack is not None and not self._tmcl_success(ack):
-                    failures.append({"axis": axis_key, "op": op.get("op"), "ack": ack})
+
+        def sap(name, board, motor, param, value):
+            return tx(name, board, 5, param, motor, value)
+
+        def gap(name, board, motor, param):
+            return tx(name, board, 6, param, motor, 0)
+
+        def speed_acc(prefix, board, motor, speed, acc):
+            sap(f"{prefix}.setMaxSpeed", board, motor, 4, speed)
+            sap(f"{prefix}.setMaxAcc", board, motor, 5, acc)
+
+        wait = self.motor_oem_wait_for_board()
+        record({"name": "waitForBoard", **wait})
+        if not wait.get("ok"):
+            return {
+                "ok": False,
+                "error": str(wait.get("error") or "waitForBoard_failed"),
+                "physical_motion": False,
+                "motion_commanded": False,
+                "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion lines 3181-3265",
+                "wire_contract": "literal_oem_order_no_generic_axis_helper",
+                "operations": operations,
+                "failures": failures,
+                "blocked_before_configuration_writes": True,
+                "wait_for_board": wait,
+            }
+
+        # turnOffHeater(): the decompiled OEM method performs the axis-0 write twice.
+        tx("turnOffHeater.tc_pwm_0.first", self.BOARD_THERMAL, 144, 0, 0, 0)
+        tx("turnOffHeater.tc_pwm_0.second", self.BOARD_THERMAL, 144, 0, 0, 0)
+
+        # setChillerPWM(null, 0): OutputChiller then ReagentChiller.
+        tx("setChillerPWM.OC", self.BOARD_CHILLER, 144, 0, 1, 0)
+        tx("setChillerPWM.RC", self.BOARD_CHILLER, 144, 0, 0, 0)
+        time.sleep(0.001)
+
+        x = self.motor_function_preset("x")
+        speed_acc("x", x["board"], x["motor"], 1700, 350)
+        time.sleep(0.002)
+        sap("x.setMaxCurrent", x["board"], x["motor"], 6, 31)
+        time.sleep(0.002)
+        sap("x.setStallGuardThreshold", x["board"], x["motor"], 205, 16)
+        time.sleep(0.002)
+
+        y = self.motor_function_preset("y")
+        speed_acc("y", y["board"], y["motor"], 1800, 400)
+        time.sleep(0.002)
+        sap("y.setMaxCurrent", y["board"], y["motor"], 6, 31)
+        time.sleep(0.002)
+        sap("y.setStallGuardThreshold", y["board"], y["motor"], 205, 16)
+        time.sleep(0.002)
+        sap("y.disableRightSwitch", y["board"], y["motor"], 12, 1)
+        time.sleep(0.002)
+
+        z = self.motor_function_preset("z")
+        z_current, z_current_source = self._machine_config_offset_int("m_Z_MOTOR_MAX_CURRENT_UP", None)
+        z_stall, z_stall_source = self._machine_config_offset_int("m_Z_MOTOR_STALL_GUARD_THRESHOLD", None)
+        speed_acc("z", z["board"], z["motor"], 1791, 576)
+        time.sleep(0.002)
+        sap("z.setMaxCurrent", z["board"], z["motor"], 6, z_current)
+        time.sleep(0.002)
+        gap("z.readMaxCurrent", z["board"], z["motor"], 6)
+        sap("z.setStallGuardThreshold", z["board"], z["motor"], 205, z_stall)
+        time.sleep(0.002)
+
+        g = self.motor_function_preset("g")
+        gripper_version = self._motion_oem_gripper_version()
+        if gripper_version == 0:
+            g_speed, g_acc, g_current, g_stall = 600, 5, 31, 5
+        else:
+            g_speed, g_acc, g_current, g_stall = 1500, 20, 10, 20
+        speed_acc("g", g["board"], g["motor"], g_speed, g_acc)
+        time.sleep(0.002)
+        sap("g.setMaxCurrent", g["board"], g["motor"], 6, g_current)
+        time.sleep(0.002)
+        sap("g.setStallGuardThreshold", g["board"], g["motor"], 205, g_stall)
+        time.sleep(0.002)
+        sap("g.setRdiv", g["board"], g["motor"], 153, 6)
+        sap("g.setPdiv", g["board"], g["motor"], 154, 2)
+        time.sleep(0.002)
+
+        door = self.motor_function_preset("door")
+        door_speed, door_speed_source = self._machine_config_offset_int("m_TC_DOOR_VELOCITY", None)
+        door_acc, door_acc_source = self._machine_config_offset_int("m_TC_DOOR_ACCELERATION", None)
+        door_current, door_current_source = self._machine_config_offset_int("m_TC_DOOR_MAX_CURRENT", None)
+        door_stall, door_stall_source = self._machine_config_offset_int("m_TCDoorStallGuardThreshold", None)
+        speed_acc("door", door["board"], door["motor"], door_speed, door_acc)
+        time.sleep(0.002)
+        sap("door.setMaxCurrent", door["board"], door["motor"], 6, door_current)
+        time.sleep(0.002)
+        sap("door.setStallGuardThreshold", door["board"], door["motor"], 205, door_stall)
+        time.sleep(0.002)
+        sap("door.disableRightSwitch", door["board"], door["motor"], 12, 1)
+        time.sleep(0.002)
+        sap("door.disableLeftSwitch", door["board"], door["motor"], 13, 1)
+        time.sleep(0.002)
+
+        # setChillerCoolRate defaults to -0.025 C/s => GP8 value -25.
+        tx("setChillerCoolRate.OC", self.BOARD_CHILLER, 9, 8, 1, -25)
+        tx("setChillerCoolRate.RC", self.BOARD_CHILLER, 9, 8, 0, -25)
+
+        # Thermal-controller nest heat/cool ramps: GP7=2500, GP8=-2000.
+        tx("thermal.setTCHeatRate", self.BOARD_THERMAL, 9, 7, 0, 2500)
+        tx("thermal.setTCCoolRate", self.BOARD_THERMAL, 9, 8, 0, -2000)
+
+        # setColor(255,255,255): three exact ClassIOControl.setLED writes.
+        for mask, channel in ((0, "r"), (1, "g"), (2, "b")):
+            tx(f"setColor.white.{channel}", self.BOARD_DECK, 50, 0, mask, 1024)
+
         return {
             "ok": not failures,
             "physical_motion": False,
+            "motion_commanded": False,
             "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion lines 3181-3265",
-            "axes": axes,
-            "axis_failures": failures,
+            "wire_contract": "literal_oem_order_no_generic_axis_helper",
+            "gripper_version": gripper_version,
+            "machine_values": {
+                "z_max_current_up": {"value": z_current, "source": z_current_source},
+                "z_stall_guard": {"value": z_stall, "source": z_stall_source},
+                "thermal_door_velocity": {"value": door_speed, "source": door_speed_source},
+                "thermal_door_acceleration": {"value": door_acc, "source": door_acc_source},
+                "thermal_door_max_current": {"value": door_current, "source": door_current_source},
+                "thermal_door_stall_guard": {"value": door_stall, "source": door_stall_source},
+            },
+            "operations": operations,
+            "failures": failures,
         }
 
     def motor_oem_axis_search_home(self, axis_key, *, speed, timeout_s=30.0, max_search_abs_delta=None):

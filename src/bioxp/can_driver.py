@@ -172,7 +172,8 @@ class BioXpCanDriver:
                     "oem_no_error_code_present": 0x20 in data,
                     "demux": {
                         "expected_arbitration_id": expected_arbitration_id,
-                        "matched_address": inverse_pipette_ids.get(int(payload["arbitration_id"])),
+                        "matched_address": inverse_pipette_ids.get(int(payload["arbitration_id"]))
+                        or inverse_pipette_ids.get(int(payload["arbitration_id"]) & ~0x400),
                         "skipped_count": skipped_total,
                         "skipped_frames": skipped,
                         "skipped_frames_truncated": skipped_total > len(skipped),
@@ -439,7 +440,45 @@ class BioXpCanDriver:
         return self._send_pipette_command(f"&{int(number)}", address="report", ack_mode="query", command_name="query_firmware")
 
     def query_status(self):
-        return self._send_pipette_command("Q1", address="report", ack_mode="query", command_name="query_status")
+        result = self._send_pipette_command("Q1", address="report", ack_mode="query", command_name="query_status")
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        reply_received = bool(result.get("ok"))
+        semantic_ok = bool(len(data) >= 3 and data[:2] == [0x20, 0x60])
+        raw_statuses = [int(value) for value in data[2:]] if semantic_ok else []
+        raw_status = raw_statuses[0] if raw_statuses else None
+        error_codes: list[int] = []
+        if semantic_ok:
+            # Exact ClassPipette.processMessage()/GetErrorCode() behavior for
+            # Query_Error: byte index 2 is m_error_code, while only indexes
+            # 3..dlc-1 populate m_ErrorCollection. 0x40 clears that queue.
+            for value in data[3:]:
+                if int(value) == 0x40:
+                    error_codes.clear()
+                else:
+                    error_codes.append(int(value))
+        error_code = error_codes[0] if error_codes else (0 if semantic_ok else None)
+        error_free = bool(semantic_ok and not error_codes)
+        error = result.get("error")
+        if reply_received and not semantic_ok:
+            error = "malformed_status_reply"
+        elif reply_received and not error_free and error_code is not None:
+            error = f"pipette_reported_error_0x{error_code:02x}"
+        elif reply_received and error_free:
+            error = None
+        return {
+            **result,
+            "ok": bool(reply_received and semantic_ok and error_free),
+            "reply_received": reply_received,
+            "semantic_ok": semantic_ok,
+            "oem_raw_status": raw_status,
+            "oem_raw_statuses": raw_statuses,
+            "oem_error_code": error_code,
+            "oem_error_codes": error_codes,
+            "oem_error_free": error_free,
+            "error": error,
+            "oem_source_anchor": "ClassPipette.QueryStatus/processMessage/GetErrorCode: Q1",
+        }
 
     def enable_pressure_stream(self, enabled: bool):
         setup = self._send_pipette_command("b15R", command_name="set_pressure_stream_parameter") if enabled else None
@@ -450,32 +489,36 @@ class BioXpCanDriver:
     def query_tip_status(self):
         result = self._send_pipette_command("?31", address="report", ack_mode="query", command_name="query_tip_status")
         tip_loaded = self._parse_tip_loaded(result)
+        reply_received = bool(result.get("ok"))
         semantic_ok = tip_loaded is not None
-        if result.get("ok") and not semantic_ok and isinstance(result.get("provenance"), dict):
+        if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"
         return {
             **result,
-            "ok": bool(result.get("ok") and semantic_ok),
+            "ok": bool(reply_received and semantic_ok),
+            "reply_received": reply_received,
             "error": result.get("error") if semantic_ok else "malformed_tip_status_reply",
             "tip_loaded": tip_loaded,
             "semantic_ok": semantic_ok,
-            "hardware_truth_level": "hardware_query" if result.get("ok") and tip_loaded is not None else ("unparsed_hardware_reply" if result.get("ok") else "no_readback"),
+            "hardware_truth_level": "hardware_query" if reply_received and tip_loaded is not None else ("unparsed_hardware_reply" if reply_received else "no_readback"),
             "oem_source_anchor": "ClassPipette.QueryTipStatus: ?31",
         }
 
     def query_pressure(self):
         result = self._send_pipette_command("?57", address="report", ack_mode="query", command_name="query_pressure")
         pressure = self._parse_numeric_ascii_from_ack(result)
+        reply_received = bool(result.get("ok"))
         semantic_ok = pressure is not None
-        if result.get("ok") and not semantic_ok and isinstance(result.get("provenance"), dict):
+        if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"
         return {
             **result,
-            "ok": bool(result.get("ok") and semantic_ok),
+            "ok": bool(reply_received and semantic_ok),
+            "reply_received": reply_received,
             "error": result.get("error") if semantic_ok else "malformed_pressure_reply",
             "pressure": pressure,
             "semantic_ok": semantic_ok,
-            "hardware_truth_level": "hardware_query" if result.get("ok") and pressure is not None else ("unparsed_hardware_reply" if result.get("ok") else "no_readback"),
+            "hardware_truth_level": "hardware_query" if reply_received and pressure is not None else ("unparsed_hardware_reply" if reply_received else "no_readback"),
             "oem_source_anchor": "ClassPipette.QueryPressure: ?57",
         }
 
