@@ -45,10 +45,14 @@ Accepted registry baseline:
 
 ```text
 binaries=8
-sources=26
-methods_and_members=341
+sources=32
+methods_and_members=392
 live_machine_records=19
-required_call_graph_anchors=114
+selected_configuration_records=44
+required_call_graph_anchors=124
+required_exact_call_edges=47
+ordered_source_sequences=3
+named_hazards=17
 OEM_MOVEMENT_REGISTRY=PASS
 ```
 
@@ -168,6 +172,15 @@ SelfTest=True
 DeckInspection=True
 InspectionLogOnly=False
 CheckCamera=True
+ScreenResolutionHigh=False
+
+SelfTestTravel raw OEM projection:
+  X=92049
+  Y=92049
+  Z=92049
+SelfTestXMax=90263
+SelfTestYMax=92049
+SelfTestZMax=92049
 
 OriginOffsetG=4450
 GripperClosePOS=27350
@@ -191,6 +204,8 @@ G limits=0..15000
 PositionTable=29 exact entries
 CAMERA_OFFSET=(3499,-7744,3145,6842)
 ```
+
+The self-test values above are not inferred motor limits. They are mechanically replayed from the selected 29-entry `PositionTable` through the literal `ClassBioXPSettings.loadConfig` projection at lines `3387-3450`: raw `X=Y=Z=92049`, including the cross-axis assignments at `3449-3450`, followed by `SelfTestX/Y/ZMax = Math.Min(raw, axis-high-limit)` at `1277-1281`. The resulting selected serial-206 maxima are exactly `90263/92049/92049`. This records the OEM behavior while keeping `SETTINGS_SELFTEST_AXIS_CROSS_ASSIGNMENT` as a mandatory binary-resolution and safety-review hazard.
 
 Chiller calibration:
 
@@ -344,7 +359,11 @@ python3 scripts/verify_oem_movement_registry.py
 Equivalent in-process validation must reject:
 
 - source/binary/config hash drift;
-- missing registry method IDs;
+- missing exact registry method/member IDs or overload identities;
+- missing or mismatched caller→callee edge lines;
+- altered ordered source sequence lines/tokens;
+- source-to-binary mapping not proven by the canonical evidence lock or exact project `AssemblyName`;
+- XML selector/attribute/profile identity drift or self-test derivation drift;
 - a machine serial other than 206;
 - an unknown or non-accepted source mode;
 - a physical stage without a registry binding;
@@ -359,8 +378,15 @@ InterfaceCAN.TransmitMessage
 → ClassNovo.TransmitMessage
 → ClassNovoCANUSB.sendCommand
 → ClassNovoCANUSB.transmitCommand
-→ Novo device
-→ ProcessReceivedTrafficPacket
+→ Novo.Devices.CanPacket
+→ CanInterfaceBoard.WritePacket
+→ NovoEncoding.Encode
+→ WinUsbCommunications.SendDataViaBulkTransfer
+→ USB-CAN device
+→ WinUsbCommunications.ReceiveDataViaBulkTransfer
+→ NovoEncoding.Decode
+→ CanInterfaceBoard.RxThread / ReplyPacketAvailable
+→ ClassNovoCANUSB.ProcessReceivedTrafficPacket
 → IsAMatch / IsAMatchPipette / IsAMatchPipetteUIM
 → ClassNovo.GotMessageProcess
 → board/pipette handler
@@ -368,7 +394,32 @@ InterfaceCAN.TransmitMessage
 
 Each movement primitive must produce a golden request/reply vector extracted from its registered source method and pinned captured binary. No command bytes may be supplied from generic TMCL/CAN convention alone.
 
-### 6.2 Acknowledgement policy
+### 6.2 Exact Novo.Devices wire framing
+
+The captured `Novo.Devices.dll` and recovered sources are line-registered through the USB boundary:
+
+```text
+CanPacket.DataLength = payload count
+CanInterfaceBoard.WritePacket:
+  allocate payload_length + 5
+  bytes 0..3 = ModuleId in big-endian order
+  byte 4     = DLC / DataLength
+  bytes 5..  = CAN payload
+NovoEncoding.Encode:
+  checksum = modulo-256 sum of unescaped source bytes
+  frame delimiter = 0x7e at both ends
+  escape byte     = 0x7d
+  escaped 0x7e/0x7d byte = 0x7d followed by byte XOR 0x20
+  checksum is escaped by the same rule
+WinUsbCommunications.SendDataViaBulkTransfer:
+  transfer exactly the encoded frame length
+```
+
+Receive processing must bind the raw USB bytes, decoded bytes, reconstructed module ID, DLC/payload, reply matcher, and controller acknowledgement to one command ledger entry. Golden fixtures must include normal bytes, escaped delimiter, escaped escape byte, checksum wraparound, malformed framing, malformed checksum, short payload, wrong DLC, and wrong module ID.
+
+`NovoEncoding.Decode:49-75` visibly removes framing/checksum bytes, unescapes the body, and returns `true` without checking delimiters or checksum. The Linux port must therefore **fail closed by validating both framing and checksum before reply admission**. This is a reviewed safety deviation under `NOVO_DECODE_NO_CHECKSUM_VALIDATION`, not a false claim that the OEM projection performed the check.
+
+### 6.3 Acknowledgement policy
 
 Canonical startup policy:
 
@@ -379,7 +430,7 @@ board 7 command-64 activation/deactivation: status 100 or 2
 
 All other status values are failures unless the exact registered method and binary prove a narrower exception. Empty replies, mismatched IDs, wrong DLC, stale replies, duplicate unmatched replies, and timeouts fail closed.
 
-### 6.3 Timing and serialization
+### 6.4 Timing and serialization
 
 Preserve:
 
@@ -394,13 +445,14 @@ Preserve:
 
 A safer Linux deviation must not be labeled literal OEM parity.
 
-### 6.4 Named source-hazard dispositions
+### 6.5 Named source-hazard dispositions
 
 The independent source audits established the following mandatory design constraints. These are present-source hazards—not acquisition gaps:
 
 | Hazard | Required implementation disposition |
 |---|---|
 | `ClassNovoCANUSB.cs:481-484` projects `(ID & 7) == 259/260`, while line 691 coherently uses `ID & 0x107` | Resolve raw IL before creating the pipette transport fixture or enabling the path. Do not guess the mask. |
+| `NovoEncoding.Decode:49-75` projects no delimiter/checksum validation before returning `true` | Preserve OEM receive vectors, but require explicit fail-closed framing/checksum validation as the reviewed Linux safety deviation `NOVO_DECODE_NO_CHECKSUM_VALIDATION`. |
 | `ClassMotor` and board home methods conflate null/uninitialized replies with success-like values and can update host home state after failed transport | Require a matched controller reply, expected acknowledgement, switch/readback evidence, and physical postcondition before declaring home. |
 | `ClassThermalControl` can return cached/default temperatures, success-like zero on null, dereference a null lid reply, and discard PWM status through wrappers | Preserve raw replies/status; fail closed on null, stale, or unacknowledged values. |
 | `scriptmoveTo` projected location exclusions at `3869` and `3877` are always true | Resolve against raw IL or register an explicit reviewed safety deviation before porting those predicates. |
@@ -526,14 +578,19 @@ re-entry:
   if m_systemInmotion: do not start a second lifecycle
 
 skipInitializeMotion=false:
-  require initialCheck admission
-  run initializeMotion
+  run a fresh ControlLib.initialCheck at initializeSystem line 1143
+  read ClassStatusLog.SavedStatus after that fresh check
+  if SavedStatus is neither 3 nor 4: run initializeMotion once at line 1159
 
-saved machine status 3 or 4:
-  run initializeMotion
-  run inspectCover
+skipInitializeMotion=true:
+  bypass the line-1143 fresh initialCheck and initializeMotion branch
+  continue into the later self-test/camera/cover stages exactly as OEM
+
+saved machine status 3 or 4, only inside skipInitializeMotion=false:
+  run initializeMotion at line 1148
+  run inspectCover at line 1149
   unlock/report the recovered branch and return
-  do not fall through to normal ready completion
+  do not run the normal line-1159 initializeMotion or fall through to normal completion
 
 normal branch:
   optional daily self-test only when SelfTest=true and elapsed days >1
@@ -555,6 +612,8 @@ all exits:
   clear running ownership in a finalizer
   persist exact terminal state and blocker
 ```
+
+Startup state authority is `BioXPMainWindow.MainWindowInitialize:375-822 → ClassStatusLog.loadStatus:249-391`. `loadStatus` reads `c:\\logfile\\instrument_status.xml`, copies `LatestStatus` into `SavedStatus` at lines `303-312`, and loads `SelfTestDate` at `327-335`. `ShipMode` is **not** loaded from that file: it defaults to an empty string at `ClassStatusLog.cs:44` and changes only through `updateShipMode:125-128`. Linux must therefore model `SavedStatus`, `SelfTestDate`, and runtime `ShipMode` as distinct typed inputs; it must not fabricate a selected ShipMode configuration value.
 
 The recovered application’s saved-status and PARK branches are OEM authority. The Linux finalizer and separate OS-shutdown authorization are explicit safety/reliability deviations and must be labeled as such.
 
@@ -773,7 +832,7 @@ CVisionLib.dll
 84ab0c851f1bb418289035efd9fa84420e9ff82ea0a69ec0c00bb5d401e750f2
 ```
 
-The camera adapter must select the commissioned profile exactly through `CameraSettings.GetCameraSettings(bool Is3250, InspectionItems)` at `CameraSettings.cs:318-325`. The run ledger must pin the `ScreenResolutionHigh`/`Is3250` branch and the selected ordinal (`CamereInitialCheck=4`). Commissioned initial-check profiles are:
+The camera adapter must select the commissioned profile exactly through `CameraSettings.GetCameraSettings(bool Is3250, InspectionItems)` at `CameraSettings.cs:318-325`. For the selected serial-206 corpus, `Operation_parameters.xml:19` is exactly `ScreenResolutionHigh="False"`; therefore `Is3250=false`, the active profile is `Settings3200`, and the selected initial-check ordinal is `CamereInitialCheck=4`. `Settings3250` remains registered as non-selected branch authority only:
 
 ```text
 Settings3200: exposure=1000, gain=1000, LED1/2/3=false
@@ -838,7 +897,7 @@ CAMERA_OFFSET from config.xml
 selected cover/storage PositionTable entries
 ```
 
-No branch may default to Settings3200 or Settings3250 merely because the runtime cannot prove `ScreenResolutionHigh`. An unproven branch blocks camera/cover execution.
+Serial `206` must execute the `ScreenResolutionHigh=false` / `Settings3200` branch. Selecting `Settings3250` is prohibited unless a different operation-parameter artifact is separately hash-locked, line-registered, approved, and bound to that run. If the runtime cannot prove the registered `False` value, camera/cover execution blocks rather than defaulting to either profile.
 
 All image/template hashes and resulting measurements must be bound to the run. Generated snapshots are runtime outputs and must not mutate captured templates.
 
@@ -901,7 +960,7 @@ Creation request:
   "command": "initialize_oem_movement_lifecycle",
   "operator_ack": "INITIALIZE",
   "expected_machine_serial": 206,
-  "expected_registry_sha256": "005f8d501c2acf24b07519e2404a02988174c1025789db104bb16c076e5dd3d0"
+  "expected_registry_sha256": "8aa94083af6c4facd8f543dccad8760e7a0e49f292a21021f7a8df0d2839d0a3"
 }
 ```
 
