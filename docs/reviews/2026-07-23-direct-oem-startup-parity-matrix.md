@@ -65,3 +65,37 @@ The committed BMS control proposal remains correct only as a **typed thin-proxy 
 - Focused parity validation: `14 passed` (`tests/test_bioxp_oem_initialize_motors_live_parity.py`).
 - Adjacent startup/API/thermal validation: `29 passed` (`test_oem_startup_program.py`, `test_oem_startup_api.py`, `test_oem_single_action_startup.py`, `test_oem_startup_hardware_initial_check_fallback.py`, `test_oem_thermal_door_api.py`).
 - Wider legacy-caller sweep remains intentionally non-accepting: it contains obsolete expectations for the rejected monolithic/mimic path and configuration-fixture omissions. Those failures are recorded as test-debt for the literal rewrite, not masked by fallback values or a false full-startup claim.
+
+## Independent direct-source audit reconciliation
+
+Three independent read-only audits reviewed the direct C# sources and the runtime after the initial matrix. Their conclusions are incorporated as binding review findings below.
+
+### Primitive semantics: source oracle versus guarded Linux runtime
+
+The runtime must not call its guarded helpers “exact OEM parity.” For valid status-100 replies, the core command families and active-switch polarity align, but material behavior differs:
+
+| Primitive / predicate | Direct OEM source | Guarded runtime disposition |
+|---|---|---|
+| `queryHome` / `queryRightSensor` | Board wrapper treats `ClassMotor` return `0` as active; raw status-100 byte 6=`1` maps to return `0`. A null reply and an uninitialized board also evaluate as source-true. `ClassHeadBoard.cs:389-415`; `ClassThermalBoard.cs:433-459`; `ClassMotor.cs:641-688`. | Valid raw mapping is aligned, but missing/invalid replies are non-proof. This is safer but **not literal OEM**; responses must report `oem_predicate` separately from raw/reply-valid/safety-valid evidence. |
+| `MoveLeft` | One command-2 transmit and C# host-state mutation. `ClassMotor.cs:74-115`. | TMCL command family matches, with stricter matching/retry behavior; **partial parity**. |
+| `StopMotor` | Command-3 is transmitted **twice**, and the second response controls C# result. `ClassMotor.cs:161-182`. | Current runtime sends one logical MST transaction. This is a **transaction-count deviation**, not exact parity. |
+| `setHome` | Sends SAP `5/1`, with C# local home/position state updates even on failed transport. `ClassMotor.cs:492-516`. | Command target aligns, but runtime requires acknowledgement/readback evidence. This is a safety adaptation, not OEM acceptance semantics. |
+| `goHome` / `axisSearchHome` | OEM uses its controller-stop/query sequence; `axisSearchHome` does `setHome`, conditional `+10000` preclear, 500 ms wait, clears `MotorHome`, then `goHome(false)`. `ClassHeadBoard.cs:60-119,368-386`. | Runtime adds preflight writes, active polling, transition/motion/readback proofs, and optional travel limits. It is a **guarded reconstruction**. It must never dispatch with an unbound `max_search_abs_delta`. |
+| Gripper startup | OEM sequence is unconditional: current 31 → `moveSteps(+10000,true)` → home at 600/200 → restore current 10 only at the end when version 1. `ClassControlInterface.cs:3354-3365,3417-3420`. | One-axis helper restores current in its own `finally` and does not own the mandatory clear. It cannot be represented as the full OEM gripper startup stage. |
+
+### Thermal-door residual blockers
+
+`motor_oem_door_search_home` is **partial**, not accepted parity. It now has the active-home `+2000` preclear correction, but still lacks direct-OEM handling for: `SerialNumber < 10` eligibility/fallback, `m_24Vdropped`, uninitialized-board no-op, literal 300/80/50-ms polling, OEM’s two-transmit stop, and the `CameraCalibrated` failure branch. The OEM source has no observed-motion, ACK/readback, or bounded 8/20-second success predicate; those may exist only as separately named Linux safety intercepts, not as OEM truth.
+
+### BMS / worker admission blockers
+
+No proposed live BMS homing button may be enabled until robot-local code provides all of the following:
+
+1. A persistent expected-next stage, completed-stage, immutable-artifact, and operator-observation ledger.
+2. Robot-side predecessor enforcement—canonical `initial_check` alone cannot authorize a caller-selected later stage.
+3. A no-motion observation route that cannot write controller reference state.
+4. Typed fixed command payloads and bounded timeouts; the browser must never send arbitrary `params`, paths, frame data, or stage names.
+5. Preservation of the handler’s terminal source stage/blockers in worker responses, separate from lifecycle operation state.
+6. A real source-plan artifact before exposing a “Preview OEM Full Startup” control.
+
+The only enabled BMS baseline remains ownership activation, verified hardware snapshot, and the already-proven non-motion OEM environment initialization. `InitializeMotion Diagnostic—No Homing` must stay explicitly diagnostic and `ready=false`.
