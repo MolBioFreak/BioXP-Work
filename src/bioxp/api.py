@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -4457,6 +4457,34 @@ async def get_status():
     return _status_payload()
 
 
+def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
+    """Require live transport ownership plus successful board replies.
+
+    A generic snapshot is not readiness proof.  The proof must originate from
+    the same atomic collection and include the query-only transport's live
+    CAN result as well as every collected board response.
+    """
+    domains = snapshot.get("domains")
+    if not isinstance(domains, Mapping):
+        return False
+    transport_row = domains.get("transport")
+    boards_row = domains.get("boards")
+    transport = transport_row.get("observation") if isinstance(transport_row, Mapping) else None
+    boards = boards_row.get("observation") if isinstance(boards_row, Mapping) else None
+    internal = transport.get("transport_internal_observation") if isinstance(transport, Mapping) else None
+    if not isinstance(internal, Mapping) or internal.get("CAN_READY") is not True:
+        return False
+    if internal.get("usb_bound") is not True or internal.get("router_running") is not True:
+        return False
+    if not isinstance(boards, Mapping) or not boards:
+        return False
+    for row in boards.values():
+        ack = row.get("ack") if isinstance(row, Mapping) else None
+        if not isinstance(ack, Mapping) or ack.get("status") != 100:
+            return False
+    return True
+
+
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
@@ -4465,9 +4493,22 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:
+        def collect_and_publish() -> dict[str, Any]:
+            result = hardware_state.collect(requested, _hardware_collectors(tester))
+            snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
+            if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
+                return result
+            promotion = hardware_state.publish_can_ready_from_snapshot(
+                snapshot_id=str(snapshot["snapshot_id"]),
+                reason="explicit_query_only_snapshot_can_ready",
+            )
+            if promotion.get("published"):
+                result["snapshot"] = promotion["snapshot"]
+                result["can_ready_published"] = True
+            return result
         return await _run_blocking(
             "Canonical hardware snapshot collection",
-            lambda: hardware_state.collect(requested, _hardware_collectors(tester)),
+            collect_and_publish,
             timeout_s=max(30.0, 15.0 * float(len(requested))),
         )
     except ValueError as exc:

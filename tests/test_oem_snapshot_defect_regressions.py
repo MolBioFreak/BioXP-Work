@@ -97,3 +97,57 @@ def test_explicit_camera_domain_fails_honestly_without_cached_camera_evidence(mo
 
     with pytest.raises(RuntimeError, match="explicit POST /camera/probe"):
         api._hardware_collectors(tester)["camera"](None)
+
+
+def _can_ready_snapshot(*, board_status: int = 100) -> dict:
+    return {
+        "domains": {
+            "transport": {
+                "observation": {
+                    "transport_internal_observation": {
+                        "CAN_READY": True,
+                        "usb_bound": True,
+                        "router_running": True,
+                    }
+                }
+            },
+            "boards": {"observation": {4: {"ack": {"status": board_status}}}},
+        }
+    }
+
+
+def test_snapshot_can_ready_promotion_requires_live_transport_and_board_evidence():
+    assert api._snapshot_proves_can_ready(_can_ready_snapshot()) is True
+    assert api._snapshot_proves_can_ready(_can_ready_snapshot(board_status=2)) is False
+    assert api._snapshot_proves_can_ready({"domains": {"transport": {}}}) is False
+
+
+def test_hardware_state_promotion_updates_only_current_snapshot(monkeypatch):
+    from src.bioxp import hardware_status
+
+    lifecycle_calls = []
+
+    class FakeLifecycle:
+        def transport_changed(self, can_ready, *, reason):
+            lifecycle_calls.append((can_ready, reason))
+
+    monkeypatch.setattr(hardware_status, "lifecycle_state", FakeLifecycle())
+    owner = hardware_status.HardwareStateOwner()
+    owner.change_ownership(reason="test", transport="owned", usb="service", router="running")
+    lifecycle_calls.clear()
+    collected = owner.collect(
+        ["transport", "boards"],
+        {
+            "transport": lambda _: _can_ready_snapshot()["domains"]["transport"]["observation"],
+            "boards": lambda _: _can_ready_snapshot()["domains"]["boards"]["observation"],
+        },
+    )
+
+    promoted = owner.publish_can_ready_from_snapshot(
+        snapshot_id=collected["snapshot"]["snapshot_id"], reason="test_explicit_snapshot"
+    )
+
+    assert promoted["published"] is True
+    assert owner.ownership_projection()["ownership"]["CAN_READY"] is True
+    assert promoted["snapshot"]["domains"]["transport"]["observation"]["CAN_READY"] is True
+    assert lifecycle_calls == [(True, "test_explicit_snapshot")]
