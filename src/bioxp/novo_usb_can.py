@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 try:
@@ -266,6 +267,10 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         self.channel = "novo-usb-shared" if shared_usb is not None else "novo-usb"
         self.bitrate = 0
         self.pipette_id = int(pipette_id)
+        # This shared-USB subclass cannot call BioXpCanDriver.__init__ (it would
+        # claim SocketCAN), but its OEM pipette commands retain the base 100 ms
+        # post-wake delay contract.
+        self._sleep = time.sleep
         self.response_timeout_s = 60.0
         self.usb = {
             "vendor_id": int(vendor_id),

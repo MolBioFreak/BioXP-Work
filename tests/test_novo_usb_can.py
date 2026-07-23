@@ -105,3 +105,13 @@ def test_novo_usb_driver_reuses_bioxp_tester_endpoint_and_queries_tip_status():
         assert decoded[5:8] == b"?31"
     finally:
         shared.close()
+
+
+def test_novo_usb_driver_keeps_base_pipette_delay_hook_without_claiming_socketcan():
+    shared = FakeSharedUsb([])
+    try:
+        driver = BioXpNovoUsbDriver(shared_usb=shared)
+
+        assert callable(driver._sleep)
+    finally:
+        shared.close()
