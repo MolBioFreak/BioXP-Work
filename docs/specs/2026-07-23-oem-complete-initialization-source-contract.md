@@ -24,17 +24,28 @@ The current Linux handler, its tests, BMS controls, Linux observations, and gene
 
 ## 2. Sealed direct-OEM authority set
 
+> **Corpus-closure correction (2026-07-23):** The lower pipette/CAN, route-table,
+> camera/cover, chiller, and selected serial-206 configuration artifacts were already
+> present in the frozen SSD decode and the hash-locked live machine corpus. Earlier
+> wording in this document that described those artifacts as missing or still requiring
+> acquisition was wrong. The artifacts are available; the remaining work is exact
+> line-level extraction/mapping, Linux implementation, and validation.
+
 | OEM role | Source file | SHA-256 / status |
 |---|---|---|
 | Application startup / queue / terminal workflow | `decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs` | pinned source authority (`b288a45e…e904c`) |
 | Control lifecycle / tip remediation / inspection / parking | `decompiled_src/BioXPControlLib/ControlLib.cs` | pinned source authority (`f69b3529…f6c2`) |
 | Axis mapping, non-motion preparation, motor orchestration | `decompiled_src/BioXPControlLib/ClassControlInterface.cs` | pinned source authority (`86093e52…6e6e`) |
-| Pipette status and tip ejection | `decompiled_src/BioXPControlLib/ClassPipetteCollection.cs` | direct source located; body extraction required for implementation tranche |
-| Machine-setting field definitions | `decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs` | direct source located; serial-206 value binding required |
+| Pipette collection status and tip ejection | `decompiled_src/BioXPControlLib/ClassPipetteCollection.cs` | `ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e` |
+| Per-pipette command bodies | `decompiled_src_can/BioXPControlLib/ClassPipette.cs` | `681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957` |
+| CAN interface and Novo routing | `decompiled_src_can/ClassCanLib/InterfaceCAN.cs`, `ClassNovo.cs`; `decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs` | `aed90411d2966ae45142f8a988a2c6757011845c3ab2c5823c98090783419da1`; `11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06`; `e4cf1c311ed5ae79e9490564a48947bced5f46af36890cf4a77120a3b50ffb06` |
+| Machine-setting reader and field definitions | `decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs` | `08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41`; reader anchors `2516-2709`, `2843-3524` |
 | Head-axis board / Z-Y-gripper home primitive | `decompiled_src_can/ClassCanLib/ClassHeadBoard.cs` | `342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea` |
 | Thermal door board / dedicated door-home primitive | `decompiled_src_can/ClassCanLib/ClassThermalBoard.cs` | `23d50725da200044422fde56b00611df708b514cef0f3637b2ad8d19e0b23f26` |
 | Motor TMCL operations / switch semantics | `decompiled_src_can/ClassCanLib/ClassMotor.cs` | `9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99` |
-| Deck and chiller board activation/commands | `decompiled_src_can/ClassCanLib/ClassDeckBoard.cs`, `ClassChillerBoard.cs` | direct source located; activation/command bodies required where called |
+| Deck and chiller board activation/commands | `decompiled_src_can/ClassCanLib/ClassDeckBoard.cs`, `ClassChillerBoard.cs`, `ClassThermalControl.cs` | chiller sources sealed at `c048e2cdfcecc58c97f857e2c2bad85eb9766c2196981fa8fde67df7334981fd` and `fdefde9b38c70b9fec47e6ffdd4929ad8f25bc90c57c43baf03722addbe6cf25` |
+| Camera and pattern-matching implementation | `decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs`; captured `CVisionLib.dll` | source `6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501`; binary `84ab0c851f1bb418289035efd9fa84420e9ff82ea0a69ec0c00bb5d401e750f2` |
+| Exact live serial-206 machine corpus | `OEM_EVIDENCE_LOCK.json`; runtime projection in `src/bioxp/oem_machine_bundle.py` | acquisition `20260719T024740Z-4a7fe6783205846c`; machine serial `206`; closed-world lock `148b224828fc2a0437897b63b352efa7cb80715df8045d8aa8e19d6d8e7cb1fa` |
 
 A decompiled method is authoritative only through its mapped OEM binary. Any ambiguity in decompilation must be resolved against the captured DLL/IL before implementation.
 
@@ -202,7 +213,7 @@ catch Exception:
 
 | Code name | Direct OEM contract now sourced |
 |---|---|
-| `ClassPipetteCollection.queryTipStatus(int)` | `ClassPipetteCollection.cs:90-101,1336-1358`: aggregate query/TIP predicate is sourced; the lower `ClassPipette.QueryTipStatus()` transport body remains required. |
+| `ClassPipetteCollection.queryTipStatus(int)` | `ClassPipetteCollection.cs:90-101,1336-1358`: aggregate query/TIP predicate; lower `ClassPipette.QueryTipStatus()` is present in `decompiled_src_can/BioXPControlLib/ClassPipette.cs`. |
 | `ClassPipetteCollection.ejectAllTips(bool checkMissingTip=true, bool wait=true)` | `ClassPipetteCollection.cs:1176-1235`: selects active pipettes, queries tips, issues per-pipette `ejectTip`, waits up to 8000 ms when requested, checks missing-tip branch, calls `verifyEjectTip`, and resets `TipLocation=-1`. |
 | `ClassPipetteCollection.initiateGroup()` | `ClassPipetteCollection.cs:677-693`: reinitializes completed channels, waits `Reinitialize pipette` up to 10000 ms, enables pressure stream 1000 ms, then calculates pressure offset. |
 | `ClassPipetteCollection.checkedPipetteStatus()` | `ClassPipetteCollection.cs:726-748`: queries all four channels with 30 ms inter-command delays, sleeps 1 ms, then requires each error code to be zero. |
@@ -304,7 +315,7 @@ These are inside the normal `initializeSystem` path and are mandatory parts of a
 
 | Function | Direct anchor | Required specification scope |
 |---|---|---|
-| `ControlLib.selftest()` | `ControlLib.cs:10688-10785`; runs TC/RC/OC self-tests concurrently, closes thermal door, homes Z/X/Y, drives X/Y to `SelfTestXMax/YMax` then `HomeXY`, drives Z to `SelfTestZMax`, checks gripper against `m_gripperposition[2]`, parks/unlocks, waits up to 100000 ms for subsystem completion, restores chiller PWM, and updates SelfTestDate only on pass. The full `TCSelfTest`/`RCSelfTest`/`OCSelfTest` bodies remain required before implementation. |
+| `ControlLib.selftest()` | `ControlLib.cs:10688-10785`; runs TC/RC/OC self-tests concurrently, closes thermal door, homes Z/X/Y, drives X/Y to `SelfTestXMax/YMax` then `HomeXY`, drives Z to `SelfTestZMax`, checks gripper against `m_gripperposition[2]`, parks/unlocks, waits up to 100000 ms for subsystem completion, restores chiller PWM, and updates SelfTestDate only on pass. The direct `TCSelfTest`/`RCSelfTest`/`OCSelfTest` bodies and their `ClassChillerBoard`/`ClassThermalControl` dependencies are present in the frozen corpus. |
 | `ControlLib.CheckCamera()` | `ControlLib.cs:1929-1960` | white LED; camera settings; close door; move to location 23 at offsets 4738 then 1895; label checks/snapshots; LEDs off; `parkGantry`. |
 | `ControlLib.inspectCover()` | `ControlLib.cs:3663-3768` plus helper inspection methods | `ForceToHighHome`; `DeckInspection` branch; door close; cover recognition/rearrangement; `ErrorStatus`; physical camera/gantry motion. |
 | `ControlLib.parkGantry(bool)` | `ControlLib.cs:7071-7122` | stale-tip remediation; optionally `HomeXY` with ±100 lost-step branches; `scriptmoveTo(... locationID 28 ...)`; update location. |
@@ -313,7 +324,39 @@ These are inside the normal `initializeSystem` path and are mandatory parts of a
 
 ## 10. OEM configuration fields that must be bound for serial 206
 
-No runtime default may be promoted to serial-206 OEM truth. The implementation must source, hash, and bind the selected OEM configuration record for at least:
+No runtime default may be promoted to serial-206 OEM truth. The selected configuration
+is already proven by the live-machine evidence lock and `oem_machine_bundle.py`:
+
+```text
+OEM acquisition: 20260719T024740Z-4a7fe6783205846c
+OEM app root:     %LOCALAPPDATA%\Synthetic Genomics\GenBotApp
+config.xml:       33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475
+Operation params: d032d58c08312706892a2d5c7a9a319f817a6d9ef73e75d30dd933ae110c9685
+Inspection data:  d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7
+```
+
+`BioXPMainWindow.GetAppDir()` derives this root from `AssemblyCompany("Synthetic
+Genomics")` and assembly name `GenBotApp`. `ClassBioXPSettings.cs:2843-3524`
+loads the machine configuration and inspection settings; `2516-2709` loads
+`Operation_parameters.xml` using current-directory-first/AppData-second precedence.
+The acquisition contains no current-directory operation-policy override.
+
+The selected serial-206 values include:
+
+```text
+SerialNumber=206; ConfigVersion=3; GripperVersion=1; TroughVersion=1
+Calibrated=1; CameraInstalled=1; CameraCalibrated=True
+Operation Mode=WebMode; SelfTest=True; DeckInspection=True; CheckCamera=True
+TCDoorOpen=18500; TCDoorStallGuardThreshold=6
+TC_DOOR_VELOCITY=50; TC_DOOR_ACCELERATION=20; TC_DOOR_MAX_CURRENT=31
+Z_MOTOR_MAX_CURRENT_DOWN=25; Z_MOTOR_MAX_CURRENT_UP=31
+Z_MOTOR_STALL_GUARD_THRESHOLD=3
+X limits=0..90263; Y limits=0..102956; Z limits=0..160000; G limits=0..15000
+PositionTable=29 selected entries
+CAMERA_OFFSET: x=3499, y=-7744, zLow=3145, zDelta=6842
+```
+
+The runtime implementation must consume the immutable selected snapshot for at least:
 
 ```text
 SerialNumber
@@ -341,7 +384,8 @@ CameraXOffset / CameraYOffset / CameraZOffset
 DeckInspection / InspectionLogOnly
 ```
 
-**Configuration source:** `ClassBioXPSettings.cs` defines fields; the runtime-selected serialized configuration path and the serial-206 values must be proven from the OEM reader/call path before implementing physical stages.
+**Configuration source:** selection and values are proven. The implementation gate is
+now consumption of the locked snapshot without silent fallback, not further acquisition.
 
 ## 11. Complete OEM code-name acquisition ledger
 
@@ -376,17 +420,17 @@ ClassPipetteCollection.initiateGroup / checkedPipetteStatus / ejectAllTips
 ClassBioXPSettings field definitions
 ```
 
-### 11.2 Must be extracted and line-locked before the corresponding implementation tranche
+### 11.2 Recovered artifacts that must be line-locked into the implementation registry
 
 | OEM code name / artifact | Why it is still required |
 |---|---|
-| `ClassPipette` command bodies plus `InterfaceCAN`/`ClassNovo` routing | The collection-level `queryTipStatus`, `ejectAllTips`, `verifyEjectTip`, `initiateGroup`, and `checkedPipetteStatus` bodies are now sourced. Lower `ClassPipette.QueryTipStatus`, `ejectTip`, `initiate`, `QueryStatus`, completion/error and transport ownership remain required. |
-| `ClassControlInterface.scriptmoveTo`, location/position tables, `moveTo`, `moveX`, `moveZ` complete bodies | Required for post-home tip remediation, camera, cover, park, and movement constraints. `moveX`/`moveZ` definitions are located; each physical route must be line-locked with selected serial-206 configuration. |
-| `ControlLib.doorOpen`, `checkDoorStatus`, `inspectCover` helper methods (`checkChillerCover`, `InspectOutputLocation`, `checkRCCover`, `checkCoverStorage`, capture/release) | Top-level `doorOpen`, `checkDoorStatus`, and `inspectCover` bodies are sourced; nested helpers and their selected camera/configuration assets remain required for complete parity. |
-| `ControlLib.selftest`, `TCSelfTest`, `RCSelfTest`, `OCSelfTest` lower thermal/chiller dependencies | Top-level and named subtest bodies are sourced; their invoked thermal/chiller transport implementations remain required before an optional self-test can be implemented or exposed. |
-| `ControlLib.parkGantry` dependency bodies (`scriptmoveTo`, `HomeXY`, location table) | `parkGantry` body is sourced; its route/location dependencies must be line-locked before any park claim. |
-| `ClassDeckBoard`, `ClassChillerBoard`, `ClassThermalBoard` activation/transport methods | Direct source files are located. Each called activation/transport body must be extracted and mapped to its OEM binary before use. |
-| `ClassBioXPSettings` reader and selected serial-206 config file(s) | Required to bind all conditional/numeric settings and location/calibration data. |
+| `ClassPipette` command bodies plus `InterfaceCAN`/`ClassNovo` routing | All named sources are present and hash-sealed in §2. Extract exact command bytes, waits, completion/error ownership, and reply predicates into the tranche registry; this is no longer an acquisition blocker. |
+| `ClassControlInterface.scriptmoveTo`, `moveTo`, `moveX`, `moveZ`, `HomeXY`, `HomeAxis` | Bodies are present in `ClassControlInterface.cs`; the selected 29-entry serial-206 `PositionTable` and axis limits are sealed in `config.xml`. Line-lock each physical route before implementation. |
+| `ControlLib.doorOpen`, `checkDoorStatus`, `inspectCover` helpers | `checkChillerCover`, `InspectOutputLocation`, `checkRCCover`, `checkCoverStorage`, capture/release, `CheckCamera`, `AdjustCamera`, and `SnapshotImage` are present in `ControlLib.cs`; `ClassFrameGrabber.cs`, `CVisionLib.dll`, `InspectionSettings.xml`, and all required case-sensitive templates are captured and sealed. |
+| `ControlLib.selftest`, `TCSelfTest`, `RCSelfTest`, `OCSelfTest` dependencies | Named bodies are present in `ControlLib.cs`; lower chiller/thermal bodies are present in `ClassChillerBoard.cs` and `ClassThermalControl.cs`. Extract exact command/reply paths into the implementation registry. |
+| `ControlLib.parkGantry` dependencies | `parkGantry`, `scriptmoveTo`, `HomeXY`, and the selected location table are present. Line-locking remains; source acquisition does not. |
+| Board activation/transport methods | `ClassDeckBoard`, `ClassChillerBoard`, `ClassThermalBoard`, `ClassThermalControl`, `InterfaceCAN`, `ClassNovo`, and `ClassNovoCANUSB` are present. Map called bodies to binaries and runtime transport. |
+| `ClassBioXPSettings` and serial-206 corpus | Reader, selected paths, exact 19-file corpus, field provenance, values, hashes, and closed-world runtime projection are already established by `OEM_EVIDENCE_LOCK.json` and `oem_machine_bundle.py`. |
 | exact OEM DLL/IL map for every cited decompile | Required if any decompiler ambiguity affects a behavioral branch or literal. |
 
 ## 12. Source-shaped implementation tranches — no broad rewrite
@@ -462,7 +506,7 @@ This section reconciles an independent three-way direct-C# audit performed again
 
 ### 15.2 Full `initializeMotion()` pipette contract now source-anchored
 
-The exact pipette methods are present in `ClassPipetteCollection.cs`; this corrects the earlier acquisition ledger from “body extraction required” to “body anchored, lower `ClassPipette` command transport still required.”
+The collection and per-pipette methods are present in `ClassPipetteCollection.cs` and `decompiled_src_can/BioXPControlLib/ClassPipette.cs`; CAN/Novo transport ownership is present in `InterfaceCAN.cs`, `ClassNovo.cs`, and `ClassNovoCANUSB.cs`. This corrects the earlier acquisition ledger: exact implementation extraction remains, but source acquisition does not.
 
 | OEM code name | Exact direct behavior / anchor |
 |---|---|
@@ -484,14 +528,18 @@ The exact pipette methods are present in `ClassPipetteCollection.cs`; this corre
 
 No self-test control may exist until all three direct bodies and their thermal/chiller dependencies are implementation-complete.
 
-### 15.4 Concrete remaining OEM sources before full rework
+### 15.4 Corpus closure correction: no missing-data blocker
 
-The following are the actual residual dependencies, not a license to infer behavior:
+The recovered corpus contains every category previously mislabeled as absent:
 
-1. `ClassPipette` command bodies (`QueryTipStatus`, `ejectTip`, `initiate`, `QueryStatus`, completion/error semantics) and the `InterfaceCAN` / `ClassNovo` routing and reply ownership they use.
-2. Full line-level bodies and selected serial-206 settings for `scriptmoveTo`, location/position tables, `moveTo`, `doorOpen`, `closeThermalDoor`, `HomeXY`, `HomeAxis`, and all cover-inspection helpers.
-3. `ClassChillerBoard`/thermal lower-level command and reply bodies used by chiller rates and TC/RC/OC self-tests. The source-file names are located; each called body must be line-locked before the corresponding action tranche.
-4. OEM selected `ClassBioXPSettings` reader/configuration path and immutable serial-206 values for every field listed in §10.
-5. Exact binary/IL mapping where a decompiler projection is ambiguous.
+1. Per-pipette commands, CAN routing, Novo USB transport, completion and reply bodies.
+2. Route functions, the selected 29-entry serial-206 position table, axis limits, and camera offsets.
+3. Camera/cover helpers, `ClassFrameGrabber`, `CVisionLib.dll`, inspection profiles, and case-sensitive pattern assets.
+4. `ClassChillerBoard` and `ClassThermalControl` command/reply bodies used by chiller rates and TC/RC/OC self-tests.
+5. The exact `ClassBioXPSettings` reader path and immutable serial-206 live corpus with closed-world hashes and runtime projection.
 
-These are the remaining OEM code names/artifacts needed for **full** initialization implementation. They are explicit acquisition work, not runtime implementation work.
+The true remaining source-phase work is mechanical but mandatory: populate the
+source-to-binary/code-name registry with exact line ranges and resolve only concrete
+decompiler ambiguities against the already captured DLL/IL. It is **not** additional
+OEM data acquisition. Runtime semantic implementation, fake-transport validation,
+live-controller validation, and physical authorization remain separate later gates.
