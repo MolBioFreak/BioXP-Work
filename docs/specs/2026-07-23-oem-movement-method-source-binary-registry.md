@@ -1,7 +1,7 @@
 # BioXP3200 serial-206 OEM movement method/source/binary registry
 
 **Date:** 2026-07-23
-**Schema:** `bioxp.oem_movement_method_source_binary_registry.v1`
+**Schema:** `bioxp.oem_movement_method_source_binary_registry.v2`
 **Authority:** recovered OEM source/binaries and the canonical evidence lock only
 **Physical action:** none; this is a static evidence registry
 
@@ -42,6 +42,7 @@ The canonical corpus must be searched before any absence statement. `unreviewed`
 | Source ID | Recovered source | SHA-256 | Lines | Captured binary | Map status |
 |---|---|---|---:|---|---|
 | `base` | `decompiled_src_can/ClassCanLib/ClassBaseBoard.cs` | `2622aee1810b9a8a52bed54a49196d50e50751465608c8420dd1e5077d95dd5e` | 283 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
+| `camerasettings` | `decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs` | `cca71fc368eb4afd9e231926e37168136e9177f48d7489508e49134d1693e630` | 361 | `BioXPCommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `cci` | `decompiled_src/BioXPControlLib/ClassControlInterface.cs` | `86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e` | 5558 | `BioXPControlLib.dll` | `canonical_evidence_lock` |
 | `chiller` | `decompiled_src_can/ClassCanLib/ClassChillerBoard.cs` | `c048e2cdfcecc58c97f857e2c2bad85eb9766c2196981fa8fde67df7334981fd` | 595 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
 | `control` | `decompiled_src/BioXPControlLib/ControlLib.cs` | `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2` | 11220 | `BioXPControlLib.dll` | `canonical_evidence_lock` |
@@ -49,17 +50,23 @@ The canonical corpus must be searched before any absence statement. `unreviewed`
 | `defaults` | `decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs` | `04f53c129317f8ae508d6971d2cf9fb534e1bc8307b192f8db395cbbcdf64fd2` | 85 | `BioXPCommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `head` | `decompiled_src_can/ClassCanLib/ClassHeadBoard.cs` | `342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea` | 560 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
 | `ican` | `decompiled_src_can/ClassCanLib/InterfaceCAN.cs` | `aed90411d2966ae45142f8a988a2c6757011845c3ab2c5823c98090783419da1` | 32 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
+| `inspectionitems` | `decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs` | `1d11cd0b2371ad513ef226b543fc2c6b944a45087d81008e96ef72b355ce523e` | 24 | `BioXPCommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `io` | `decompiled_src_can/ClassCanLib/ClassIOControl.cs` | `cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f` | 205 | `ClassCanLib.dll` | `canonical_evidence_lock` |
+| `locationid` | `decompiled_src_commonlib/CommonLib/locationID.cs` | `e99a88c5cf114526c2a08fb1f57fc6ab8860cdda17f838c3f13b48f868f59031` | 52 | `CommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `main` | `decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs` | `b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c` | 4355 | `GenBotApp.exe` | `canonical_evidence_lock` |
 | `motor` | `decompiled_src_can/ClassCanLib/ClassMotor.cs` | `9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99` | 799 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
 | `novo` | `decompiled_src_can/ClassCanLib/ClassNovo.cs` | `11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06` | 232 | `ClassCanLib.dll` | `canonical_evidence_lock` |
 | `novousb` | `decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs` | `e4cf1c311ed5ae79e9490564a48947bced5f46af36890cf4a77120a3b50ffb06` | 1157 | `NovoCANUSBLib.dll` | `canonical_evidence_lock` |
+| `operationmode` | `decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs` | `efd41903654e20c1d3d23961c7d72ae1782efcdf5fed4038349e2719da0a17cb` | 9 | `BioXPCommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `pipette` | `decompiled_src_can/BioXPControlLib/ClassPipette.cs` | `681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957` | 821 | `BioXPControlLib.dll` | `canonical_evidence_lock` |
 | `pipettes` | `decompiled_src/BioXPControlLib/ClassPipetteCollection.cs` | `ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e` | 1481 | `BioXPControlLib.dll` | `canonical_evidence_lock` |
+| `platename` | `decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs` | `5819dd8a2bf7aa74787d88da74595eee81da9adfe15b0693a98cea249490a4a0` | 27 | `BioXPCommonLib.dll` | `registry_extension_from_captured_assembly` |
+| `positionstruct` | `decompiled_src_commonlib/CommonLib/positionStruct.cs` | `202d6082f3d37273a782a9c719b93dce5fcf0a3065bf53d0ce42de39c9a75bd3` | 18 | `CommonLib.dll` | `registry_extension_from_captured_assembly` |
 | `settings` | `decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs` | `08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41` | 7076 | `BioXPCommonLib.dll` | `canonical_evidence_lock` |
 | `thermal` | `decompiled_src_can/ClassCanLib/ClassThermalBoard.cs` | `23d50725da200044422fde56b00611df708b514cef0f3637b2ad8d19e0b23f26` | 1006 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
 | `thermalctl` | `decompiled_src_can/ClassCanLib/ClassThermalControl.cs` | `fdefde9b38c70b9fec47e6ffdd4929ad8f25bc90c57c43baf03722addbe6cf25` | 1257 | `ClassCanLib.dll` | `registry_extension_from_captured_assembly` |
 | `vision` | `decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs` | `6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501` | 14587 | `CVisionLib.dll` | `registry_extension_from_captured_assembly` |
+| `wellid` | `decompiled_src_commonlib/CommonLib/wellID.cs` | `e117e32acf2c61483c5033762d685e992e786d99e4d0ee1aff754b8edf9c6114` | 102 | `CommonLib.dll` | `registry_extension_from_captured_assembly` |
 
 `registry_extension_from_captured_assembly` does not mean uncertain binary ownership. It means the source was recovered after the original evidence-lock `decompile_binary_map` was authored; this registry pins it to the already captured assembly. Extending the canonical lock with these records is a pre-implementation acceptance gate.
 
@@ -78,6 +85,10 @@ The canonical corpus must be searched before any absence statement. `unreviewed`
 | `Calibrated` | `1` | `config.xml` | `6` | `/BioXPCommonLib/GenBot/Calibration/@Calibrated` |
 | `CameraInstalled` | `1` | `config.xml` | `7` | `/BioXPCommonLib/GenBot/CameraInstalled/@Camera` |
 | `CameraCalibrated` | `true` | `config.xml` | `7` | `/BioXPCommonLib/GenBot/CameraInstalled/@Cameracalibrated` |
+| `OriginOffsetG` | `4450` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_originOffsetG` |
+| `GripperClosePOS` | `27350` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperClosePOS` |
+| `GripperOpenPOS` | `31400` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperOpenPOS` |
+| `GripperOpenWide` | `32400` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperOpenWide` |
 | `TCDoorOpen` | `18500` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_TCDoorOpen` |
 | `TCDoorStallGuardThreshold` | `6` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_TCDoorStallGuardThreshold` |
 | `TC_DOOR_VELOCITY` | `50` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_TC_DOOR_VELOCITY` |
@@ -86,6 +97,8 @@ The canonical corpus must be searched before any absence statement. `unreviewed`
 | `Z_MOTOR_MAX_CURRENT_DOWN` | `25` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_Z_MOTOR_MAX_CURRENT_DOWN` |
 | `Z_MOTOR_MAX_CURRENT_UP` | `31` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_Z_MOTOR_MAX_CURRENT_UP` |
 | `Z_MOTOR_STALL_GUARD_THRESHOLD` | `3` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@m_Z_MOTOR_STALL_GUARD_THRESHOLD` |
+| `OutPutBufferatMS_Zlow` | `0` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@OutPutBufferatMS_Zlow` |
+| `OutlierRangeFactor` | `4` | `config.xml` | `15` | `/BioXPCommonLib/CalibrationFactors/Offsets/@OutlierRangeFactor` |
 | `ReagentChiller` | `{"FeedForward": 400, "MaxCoolingCurrent": -5, "MaxHeatingCurrent": 5, "Proportional": 1.5}` | `config.xml` | `17` | `/BioXPCommonLib/CalibrationFactors/ReagentChiller` |
 | `OutputChiller` | `{"FeedForward": 400, "MaxCoolingCurrent": -5, "MaxHeatingCurrent": 5, "Proportional": 1.5}` | `config.xml` | `18` | `/BioXPCommonLib/CalibrationFactors/OutputChiller` |
 | `X_limits` | `[0, 90263]` | `config.xml` | `25` | `/BioXPCommonLib/AxisLimits/X_limit` |
@@ -99,13 +112,19 @@ The canonical corpus must be searched before any absence statement. `unreviewed`
 | `InspectionLogOnly` | `false` | `Operation_parameters.xml` | `10` | `/OperationParameters/InspectionLogOnly/@InspectionLogOnly` |
 | `SelfTest` | `true` | `Operation_parameters.xml` | `11` | `/OperationParameters/SelfTest/@SelfTest` |
 | `CheckCamera` | `true` | `Operation_parameters.xml` | `17` | `/OperationParameters/CheckCamera/@CheckCamera` |
-| `InspectionSettings3200.CoverInspection` | `"selected camera-control block"` | `InspectionSettings.xml` | `[59, 68]` | `CameraSettings/Settings3200/*[Key=CoverInspection]` |
+| `InspectionSettings3200.CamereInitialCheck` | `{"Exposure": 1000, "Gain": 1000, "LED1": false, "LED2": false, "LED3": false}` | `InspectionSettings.xml` | `[32, 41]` | `CameraSettings/Settings3200/*[Key=CamereInitialCheck]` |
+| `InspectionSettings3200.CoverInspection` | `{"Exposure": 1000, "Gain": 1000, "LED1": false, "LED2": true, "LED3": false}` | `InspectionSettings.xml` | `[59, 68]` | `CameraSettings/Settings3200/*[Key=CoverInspection]` |
+| `InspectionSettings3200.OutputPlateInspection` | `{"Exposure": 1000, "Gain": 1000, "LED1": false, "LED2": false, "LED3": false, "pixelCount": 1000, "threshold": 60}` | `InspectionSettings.xml` | `[108, 126]` | `CameraSettings/Settings3200/*[Key=OutputPlateInspection]` |
+| `InspectionSettings3250.CamereInitialCheck` | `{"Exposure": -3, "Gain": 1000, "LED1": false, "LED2": false, "LED3": false}` | `InspectionSettings.xml` | `[279, 288]` | `CameraSettings/Settings3250/*[Key=CamereInitialCheck]` |
+| `InspectionSettings3250.CoverInspection` | `{"Exposure": -2, "Gain": 1000, "LED1": false, "LED2": true, "LED3": false}` | `InspectionSettings.xml` | `[306, 315]` | `CameraSettings/Settings3250/*[Key=CoverInspection]` |
+| `InspectionSettings3250.CoverStorageInspection` | `{"Exposure": -1, "Gain": 1000, "LED1": true, "LED2": true, "LED3": true}` | `InspectionSettings.xml` | `[333, 342]` | `CameraSettings/Settings3250/*[Key=CoverStorageInspection]` |
+| `InspectionSettings3250.OutputPlateInspection` | `{"Exposure": -2, "Gain": 1000, "LED1": true, "LED2": true, "LED3": true, "pixelCount": 1000, "threshold": 30}` | `InspectionSettings.xml` | `[366, 384]` | `CameraSettings/Settings3250/*[Key=OutputPlateInspection]` |
 
 The selected `PositionTable` is exactly lines 30–60 of `config.xml`: 29 entries, including all startup, cover, camera, press, waste, and park coordinates. It is data, not a future acquisition gap.
 
 ## 6. Exact method/member registry
 
-Total line-bounded methods/members: **299**.
+Total line-bounded methods/members: **341**.
 
 ### 6.1 `decompiled_src_can/ClassCanLib/ClassBaseBoard.cs`
 
@@ -142,7 +161,16 @@ Captured binary: `ClassCanLib.dll`
 | `ClassBaseBoard.startFanService@232` | `232–234` | `public virtual void startFanService()` | — | — |
 | `ClassBaseBoard.stopFanService@236` | `236–238` | `public virtual void stopFanService()` | — | — |
 
-### 6.2 `decompiled_src/BioXPControlLib/ClassControlInterface.cs`
+### 6.2 `decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs`
+
+Source SHA-256: `cca71fc368eb4afd9e231926e37168136e9177f48d7489508e49134d1693e630`
+Captured binary: `BioXPCommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `CameraSettings.GetCameraSettings@318` | `318–325` | `public CameraControlParameter GetCameraSettings(bool Is3250, InspectionItems inspectionItems)` | — | — |
+
+### 6.3 `decompiled_src/BioXPControlLib/ClassControlInterface.cs`
 
 Source SHA-256: `86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e`
 Captured binary: `BioXPControlLib.dll`
@@ -159,9 +187,14 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassControlInterface.getNestTemp@2875` | `2875–2883` | `public double getNestTemp(int nest)` | — | — |
 | `ClassControlInterface.GetLidTemperature@2885` | `2885–2894` | `public double GetLidTemperature()` | — | 2887 |
 | `ClassControlInterface.GetTCPedestalTemp@2896` | `2896–2905` | `public double GetTCPedestalTemp()` | — | 2898 |
+| `ClassControlInterface.SetTCTemperature@2971` | `2971–2989` | `public void SetTCTemperature(double Temperature, int duration, double rate)` | L2983=200ms | — |
 | `ClassControlInterface.SetTemperature@3007` | `3007–3014` | `public void SetTemperature(double Temperature, int duration, bool wait)` | — | 3009 |
+| `ClassControlInterface.SetLidTemperature@3016` | `3016–3037` | `public void SetLidTemperature(double Temperature, int duration, double rate, bool wait = true)` | — | 3018, 3019, 3020 |
+| `ClassControlInterface.SetLidTemperature@3039` | `3039–3046` | `public void SetLidTemperature(double Temperature)` | — | 3041 |
 | `ClassControlInterface.turnOffHeater@3057` | `3057–3067` | `public void turnOffHeater()` | — | 3059, 3060 |
 | `ClassControlInterface.setChillerPWM@3078` | `3078–3117` | `public void setChillerPWM(string chiller = null, int pwm = 0)` | — | 3080, 3081, 3082, 3083 |
+| `ClassControlInterface.setOutputChillerTemp@3119` | `3119–3129` | `public int setOutputChillerTemp(double temp)` | — | 3121 |
+| `ClassControlInterface.setReagentChillerTemp@3131` | `3131–3141` | `public int setReagentChillerTemp(double temp)` | — | 3133 |
 | `ClassControlInterface.readRCTemperature@3143` | `3143–3152` | `public double readRCTemperature()` | — | 3145 |
 | `ClassControlInterface.readOCTemperature@3154` | `3154–3163` | `public double readOCTemperature()` | — | 3156 |
 | `ClassControlInterface.initializeMotorsWithoutMotion@3181` | `3181–3265` | `public void initializeMotorsWithoutMotion()` | L3186=1ms, L3190=2ms, L3192=2ms, L3194=2ms, L3199=2ms, L3201=2ms, L3203=2ms, L3205=2ms, L3210=2ms, L3212=2ms, L3215=2ms, L3227=2ms, L3231=2ms, L3237=2ms, L3240=2ms, L3242=2ms, L3247=2ms, L3249=2ms, L3251=2ms, L3253=2ms, L3255=2ms | — |
@@ -169,6 +202,8 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassControlInterface.setChillerCoolRate@3423` | `3423–3438` | `public void setChillerCoolRate(string chiller, double rate = -0.025)` | — | 3425, 3426 |
 | `ClassControlInterface.activateBoard@3474` | `3474–3494` | `public void activateBoard()` | L3491=10ms | — |
 | `ClassControlInterface.deactivateBoard@3496` | `3496–3505` | `public void deactivateBoard()` | — | — |
+| `ClassControlInterface.waitForBoard@3507` | `3507–3534` | `public void waitForBoard()` | L3521=100ms | — |
+| `ClassControlInterface.OpenGripper@3536` | `3536–3567` | `public int OpenGripper(bool recover = false, bool openwide = false, bool resetSpeed = true, bool resetStallGThre = true)` | — | — |
 | `ClassControlInterface.CloseGripper@3569` | `3569–3593` | `public int CloseGripper(bool resetSpeed = true, bool resetStallGThre = true, int stallGuardThre = 5)` | — | — |
 | `ClassControlInterface.getCurrentPosition@3644` | `3644–3661` | `public void getCurrentPosition(out int x, out int y, out int z)` | — | — |
 | `ClassControlInterface.moveTo@3663` | `3663–3689` | `public int moveTo(locationID locationid, int column, int row, bool Tip10, bool highPos = true, bool runInParallel = true)` | — | 3665, 3666, 3667, 3668, 3669, 3670, 3671, 3672, 3673, 3674, 3675, 3676, 3677, 3678 |
@@ -181,8 +216,10 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassControlInterface.moveX@4233` | `4233–4244` | `public void moveX(int x, bool waitforstop = true, bool appAdjustment = true)` | — | — |
 | `ClassControlInterface.moveY@4246` | `4246–4252` | `public void moveY(int y, bool waitforstop = true, bool appAdjustment = true)` | — | — |
 | `ClassControlInterface.moveZ@4254` | `4254–4266` | `public void moveZ(int z, int motorCurrent = 31, bool appAdjustment = true, bool waitforstop = true)` | — | — |
+| `ClassControlInterface.moveXY@4285` | `4285–4367` | `public void moveXY(int x, int y)` | L4348=5ms | — |
 | `ClassControlInterface.moveTo@4463` | `4463–4621` | `public int moveTo(int x, int y, int z, bool runInParalel)` | L4538=1ms, L4559=600ms, L4600=300ms, L4612=1ms, L4613=1ms | 4465, 4466, 4467, 4468, 4469, 4470, 4471, 4472 |
 | `ClassControlInterface.MoveZHome@4623` | `4623–4632` | `public int MoveZHome(bool rehome = true)` | — | — |
+| `ClassControlInterface.setZaxisCurrentmax@4850` | `4850–4861` | `internal void setZaxisCurrentmax(int current = 100)` | — | — |
 | `ClassControlInterface.query24voltage@4944` | `4944–4953` | `internal int query24voltage()` | — | 4946 |
 | `ClassControlInterface.querydoorsensor@4955` | `4955–4964` | `internal int querydoorsensor()` | — | 4957 |
 | `ClassControlInterface.querylatchsensor@4966` | `4966–4975` | `internal int querylatchsensor()` | — | 4968 |
@@ -191,9 +228,12 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassControlInterface.HomeAxis@4997` | `4997–5052` | `internal int HomeAxis(string axis)` | — | — |
 | `ClassControlInterface.HomeXY@5054` | `5054–5070` | `internal int[] HomeXY()` | — | — |
 | `ClassControlInterface.moveAxis@5072` | `5072–5093` | `internal void moveAxis(string axis, int pos)` | — | — |
+| `ClassControlInterface.forceAbortMotion@5095` | `5095–5106` | `internal void forceAbortMotion()` | L5098=1ms | — |
+| `ClassControlInterface.getMidPoint@5254` | `5254–5366` | `private Point[] getMidPoint(int x, int y)` | — | 5256, 5257, 5258, 5259, 5260, 5261, 5262, 5263, 5264, 5265, 5266, 5267, 5268, 5269, 5270, 5271, 5272, 5273, 5274, 5275, 5276, 5277, 5278, 5279, 5280, 5281, 5282, 5283, 5284, 5285, 5286, 5287, 5288 |
 | `ClassControlInterface.setGripperCurrent@5392` | `5392–5398` | `internal void setGripperCurrent(int current)` | — | — |
+| `ClassControlInterface.resumeTemperature@5400` | `5400–5410` | `internal void resumeTemperature()` | — | — |
 
-### 6.3 `decompiled_src_can/ClassCanLib/ClassChillerBoard.cs`
+### 6.4 `decompiled_src_can/ClassCanLib/ClassChillerBoard.cs`
 
 Source SHA-256: `c048e2cdfcecc58c97f857e2c2bad85eb9766c2196981fa8fde67df7334981fd`
 Captured binary: `ClassCanLib.dll`
@@ -224,7 +264,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassChillerBoard.SetTimerInterval@578` | `578–582` | `public override void SetTimerInterval(int interval)` | — | — |
 | `ClassChillerBoard.resumeTempSetting@584` | `584–594` | `public override void resumeTempSetting()` | — | — |
 
-### 6.4 `decompiled_src/BioXPControlLib/ControlLib.cs`
+### 6.5 `decompiled_src/BioXPControlLib/ControlLib.cs`
 
 Source SHA-256: `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2`
 Captured binary: `BioXPControlLib.dll`
@@ -248,8 +288,12 @@ Captured binary: `BioXPControlLib.dll`
 | `ControlLib.setLIDTemperature@8658` | `8658–8668` | `private void setLIDTemperature(double temperature, int duration, double rate, string wait)` | — | — |
 | `ControlLib.checkDoorStatus@8670` | `8670–8726` | `public bool checkDoorStatus()` | L8673=500ms, L8679=800ms, L8703=300ms | — |
 | `ControlLib.initialCheck@8728` | `8728–8760` | `public bool initialCheck()` | L8734=200ms, L8749=50ms | — |
+| `ControlLib.queryDoorStatus@8762` | `8762–8771` | `public bool queryDoorStatus()` | — | — |
+| `ControlLib.rehome@8784` | `8784–8795` | `public void rehome()` | L8788=40ms | — |
 | `ControlLib.initializeMotion@8797` | `8797–8856` | `public void initializeMotion()` | L8806=500ms, L8818=100ms, L8831=2ms | — |
+| `ControlLib.startup@8872` | `8872–8949` | `public ErrorStatus startup(out string jobid_barcode, out string reagent_barcode)` | — | — |
 | `ControlLib.SnapshotImage@8951` | `8951–8994` | `public void SnapshotImage(string condition)` | — | — |
+| `ControlLib.ReadBarcode@9088` | `9088–9217` | `private bool ReadBarcode(BarCodeType codetype, string filename, out string barcode, bool read = true)` | L9140=200ms | 9090, 9091, 9092, 9093, 9094, 9095, 9096, 9097, 9098, 9099, 9100, 9101, 9102 |
 | `ControlLib.unlockDoor@10451` | `10451–10459` | `public void unlockDoor()` | — | — |
 | `ControlLib.setLEDColor@10559` | `10559–10562` | `public void setLEDColor(int Red, int Green, int Blue)` | — | — |
 | `ControlLib.forceAbortMotion@10564` | `10564–10610` | `public void forceAbortMotion(bool waitforpipette = false)` | — | — |
@@ -258,8 +302,9 @@ Captured binary: `BioXPControlLib.dll`
 | `ControlLib.RCSelfTest@10867` | `10867–10932` | `private void RCSelfTest(bool selftest = true)` | L10905=1ms | — |
 | `ControlLib.OCSelfTest@10934` | `10934–10999` | `private void OCSelfTest(bool selftest = true)` | L10972=1ms | — |
 | `ControlLib.waitforcompletion@11001` | `11001–11022` | `public bool waitforcompletion(int timeout = 4000)` | — | — |
+| `ControlLib.homeGripper@11037` | `11037–11043` | `public void homeGripper()` | — | — |
 
-### 6.5 `decompiled_src_can/ClassCanLib/ClassDeckBoard.cs`
+### 6.6 `decompiled_src_can/ClassCanLib/ClassDeckBoard.cs`
 
 Source SHA-256: `bcae5ce4662cb3208dbc2fdf6e4c7ad0e23774307b633fc7a9ce5b727318698f`
 Captured binary: `ClassCanLib.dll`
@@ -287,16 +332,17 @@ Captured binary: `ClassCanLib.dll`
 | `ClassDeckBoard.disableLeftSwitch@449` | `449–452` | `public override void disableLeftSwitch(int axis)` | — | — |
 | `ClassDeckBoard.setColor@465` | `465–470` | `public void setColor(byte r, byte g, byte b)` | — | — |
 
-### 6.6 `decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs`
+### 6.7 `decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs`
 
 Source SHA-256: `04f53c129317f8ae508d6971d2cf9fb534e1bc8307b192f8db395cbbcdf64fd2`
 Captured binary: `BioXPCommonLib.dll`
 
 | Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
 |---|---:|---|---|---|
+| `DefaultParameters.PSUDO_Z_HOME` | `47–59` | `Pseudo-Z constants and current selected pseudo-home` | — | — |
 | `DefaultParameters.ForceToHighHome@81` | `81–84` | `public static void ForceToHighHome()` | — | — |
 
-### 6.7 `decompiled_src_can/ClassCanLib/ClassHeadBoard.cs`
+### 6.8 `decompiled_src_can/ClassCanLib/ClassHeadBoard.cs`
 
 Source SHA-256: `342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea`
 Captured binary: `ClassCanLib.dll`
@@ -323,7 +369,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassHeadBoard.disableRightSwitch@513` | `513–516` | `public override void disableRightSwitch(int axis)` | — | — |
 | `ClassHeadBoard.disableLeftSwitch@518` | `518–521` | `public override void disableLeftSwitch(int axis)` | — | — |
 
-### 6.8 `decompiled_src_can/ClassCanLib/InterfaceCAN.cs`
+### 6.9 `decompiled_src_can/ClassCanLib/InterfaceCAN.cs`
 
 Source SHA-256: `aed90411d2966ae45142f8a988a2c6757011845c3ab2c5823c98090783419da1`
 Captured binary: `ClassCanLib.dll`
@@ -340,7 +386,16 @@ Captured binary: `ClassCanLib.dll`
 | `InterfaceCAN.calculatePressureoffset` | `29–29` | `Pipette pressure offset dispatch` | — | — |
 | `InterfaceCAN.close` | `31–31` | `Transport close` | — | — |
 
-### 6.9 `decompiled_src_can/ClassCanLib/ClassIOControl.cs`
+### 6.10 `decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs`
+
+Source SHA-256: `1d11cd0b2371ad513ef226b543fc2c6b944a45087d81008e96ef72b355ce523e`
+Captured binary: `BioXPCommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `InspectionItems` | `3–24` | `Camera inspection ordinal map` | — | — |
+
+### 6.11 `decompiled_src_can/ClassCanLib/ClassIOControl.cs`
 
 Source SHA-256: `cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f`
 Captured binary: `ClassCanLib.dll`
@@ -355,7 +410,16 @@ Captured binary: `ClassCanLib.dll`
 | `ClassIOControl.querLatchSensor@155` | `155–174` | `public int querLatchSensor()` | — | — |
 | `ClassIOControl.setSolenoidControl@176` | `176–204` | `public int setSolenoidControl(int onoff)` | — | — |
 
-### 6.10 `decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs`
+### 6.12 `decompiled_src_commonlib/CommonLib/locationID.cs`
+
+Source SHA-256: `e99a88c5cf114526c2a08fb1f57fc6ab8860cdda17f838c3f13b48f868f59031`
+Captured binary: `CommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `locationID` | `3–52` | `Logical route/location identifier map` | — | — |
+
+### 6.13 `decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs`
 
 Source SHA-256: `b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c`
 Captured binary: `GenBotApp.exe`
@@ -370,10 +434,14 @@ Captured binary: `GenBotApp.exe`
 | `BioXPMainWindow.PrepareToRunJob@1567` | `1567–1586` | `private ErrorStatus PrepareToRunJob(out string jobid_barcode, out string reagent_barcode)` | — | 1569, 1570, 1571, 1572, 1573 |
 | `BioXPMainWindow.PrepareToRunJob@1588` | `1588–1809` | `private ErrorStatus PrepareToRunJob()` | — | 1590, 1591, 1592, 1593, 1594, 1595, 1596, 1597, 1598, 1599, 1600, 1601, 1602, 1603, 1604, 1605, 1606, 1607, 1608, 1609, 1610, 1611, 1612, 1613, 1614 |
 | `BioXPMainWindow.motion_thread_process@2030` | `2030–2101` | `private void motion_thread_process()` | — | 2032, 2033, 2034, 2035, 2036, 2037, 2038 |
+| `BioXPMainWindow.wakefrompause@2103` | `2103–2129` | `private void wakefrompause()` | — | — |
+| `BioXPMainWindow.m_canControl_handleLatchEvent@2359` | `2359–2381` | `private void m_canControl_handleLatchEvent(bool dooropen)` | — | — |
+| `BioXPMainWindow.m_canControl_handleEnclosureDoorEvent@2383` | `2383–2416` | `private void m_canControl_handleEnclosureDoorEvent(bool dooropen)` | L2394=40ms, L2400=500ms | — |
+| `BioXPMainWindow.m_canControl_handleEnclosureDoorEventProcess@2428` | `2428–2512` | `private void m_canControl_handleEnclosureDoorEventProcess(bool dooropen)` | — | 2430, 2431 |
 | `BioXPMainWindow.m_pageWarning_buttonclicked@2611` | `2611–2844` | `private void m_pageWarning_buttonclicked(int button, WarningSituation STATUS)` | — | 2613, 2614 |
 | `BioXPMainWindow.UpdateCheck@4264` | `4264–4309` | `private bool UpdateCheck()` | — | — |
 
-### 6.11 `decompiled_src_can/ClassCanLib/ClassMotor.cs`
+### 6.14 `decompiled_src_can/ClassCanLib/ClassMotor.cs`
 
 Source SHA-256: `9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99`
 Captured binary: `ClassCanLib.dll`
@@ -408,7 +476,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassMotor.beyondLimit@774` | `774–788` | `public bool beyondLimit(int pos)` | — | — |
 | `ClassMotor.atTarget@790` | `790–798` | `internal bool atTarget(int position)` | — | — |
 
-### 6.12 `decompiled_src_can/ClassCanLib/ClassNovo.cs`
+### 6.15 `decompiled_src_can/ClassCanLib/ClassNovo.cs`
 
 Source SHA-256: `11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06`
 Captured binary: `ClassCanLib.dll`
@@ -425,7 +493,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassNovo.TransmitMessage@194` | `194–226` | `public byte[] TransmitMessage(byte SIDH, byte SIDL, byte[] CMD, string cmdMessage = "", int timeout = 60000)` | L199=1ms, L212=10ms | — |
 | `ClassNovo.calculatePressureoffset@228` | `228–231` | `public void calculatePressureoffset()` | — | — |
 
-### 6.13 `decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs`
+### 6.16 `decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs`
 
 Source SHA-256: `e4cf1c311ed5ae79e9490564a48947bced5f46af36890cf4a77120a3b50ffb06`
 Captured binary: `NovoCANUSBLib.dll`
@@ -448,7 +516,16 @@ Captured binary: `NovoCANUSBLib.dll`
 | `ClassNovoCANUSB.calculatePressureoffset@1135` | `1135–1151` | `public void calculatePressureoffset()` | — | — |
 | `ClassNovoCANUSB.closeDevice@1153` | `1153–1156` | `protected void closeDevice()` | — | — |
 
-### 6.14 `decompiled_src_can/BioXPControlLib/ClassPipette.cs`
+### 6.17 `decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs`
+
+Source SHA-256: `efd41903654e20c1d3d23961c7d72ae1782efcdf5fed4038349e2719da0a17cb`
+Captured binary: `BioXPCommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `OperationMode` | `3–9` | `StartMode terminal branch values` | — | — |
+
+### 6.18 `decompiled_src_can/BioXPControlLib/ClassPipette.cs`
 
 Source SHA-256: `681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957`
 Captured binary: `BioXPControlLib.dll`
@@ -467,7 +544,7 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassPipette.processMessage@638` | `638–745` | `public PipetteErrorCode processMessage(int dlc, byte[] msg)` | — | — |
 | `ClassPipette.enablePressureStream@757` | `757–772` | `public void enablePressureStream(bool enable)` | — | — |
 
-### 6.15 `decompiled_src/BioXPControlLib/ClassPipetteCollection.cs`
+### 6.19 `decompiled_src/BioXPControlLib/ClassPipetteCollection.cs`
 
 Source SHA-256: `ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e`
 Captured binary: `BioXPControlLib.dll`
@@ -488,18 +565,44 @@ Captured binary: `BioXPControlLib.dll`
 | `ClassPipetteCollection.queryIndividualTipStatus@1360` | `1360–1371` | `public bool[] queryIndividualTipStatus()` | — | — |
 | `ClassPipetteCollection.waitforcompletion@1425` | `1425–1461` | `internal bool waitforcompletion(string job, int timeout = 7000)` | — | — |
 
-### 6.16 `decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs`
+### 6.20 `decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs`
+
+Source SHA-256: `5819dd8a2bf7aa74787d88da74595eee81da9adfe15b0693a98cea249490a4a0`
+Captured binary: `BioXPCommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `plateName` | `3–27` | `Cover/plate state identifier map` | — | — |
+
+### 6.21 `decompiled_src_commonlib/CommonLib/positionStruct.cs`
+
+Source SHA-256: `202d6082f3d37273a782a9c719b93dce5fcf0a3065bf53d0ce42de39c9a75bd3`
+Captured binary: `CommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `positionStruct` | `3–18` | `Route coordinate payload` | — | — |
+
+### 6.22 `decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs`
 
 Source SHA-256: `08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41`
 Captured binary: `BioXPCommonLib.dll`
 
 | Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
 |---|---:|---|---|---|
+| `ClassBioXPSettings.SerialNumber` | `768–788` | `Serial-dependent door defaults` | — | — |
+| `ClassBioXPSettings.movement_configuration_fields` | `946–970` | `Selected door/Z movement property surface` | — | — |
+| `ClassBioXPSettings.StartMode` | `995–1005` | `Selected terminal startup mode` | — | — |
+| `ClassBioXPSettings.axis_limits_and_selftest` | `1277–1299` | `Selected self-test maxima and axis-limit properties` | — | — |
+| `ClassBioXPSettings.PositionTable` | `1389–1389` | `Selected route table property` | — | — |
 | `ClassBioXPSettings.ClassBioXPSettings@1411` | `1411–1489` | `public ClassBioXPSettings(ResourceManager rsManager, string appDir)` | — | 1413, 1414, 1415, 1416, 1417, 1418, 1419, 1420, 1421, 1422, 1423, 1424, 1425, 1426, 1427, 1428, 1429, 1430, 1431, 1432, 1433, 1434, 1435, 1436, 1437, 1438, 1439, 1440, 1441, 1442, 1443, 1444, 1445, 1446, 1447, 1448, 1449, 1450, 1451, 1452, 1453, 1454, 1455, 1456, 1457, 1458, 1459, 1460, 1461, 1462, 1463, 1464, 1465, 1466, 1467, 1468, 1469, 1470, 1471, 1472, 1473, 1474, 1475, 1476, 1477, 1478 |
+| `ClassBioXPSettings.createSetting@1491` | `1491–1835` | `private void createSetting()` | — | 1493, 1494, 1495, 1496, 1497, 1498, 1499, 1500, 1501, 1502, 1503, 1504, 1505, 1506, 1507, 1508, 1509, 1510, 1511, 1512, 1513, 1514, 1515, 1516, 1517, 1518, 1519, 1520, 1521, 1522, 1523, 1524, 1525, 1526, 1527, 1528, 1529, 1530, 1531, 1532, 1533, 1534, 1535, 1536, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 1544, 1545, 1546, 1547, 1548, 1549, 1550, 1551, 1552, 1553, 1554, 1555, 1556, 1557, 1558, 1559, 1560, 1561, 1562, 1563, 1564, 1565, 1566, 1567, 1568, 1569, 1570, 1571, 1572, 1573, 1574, 1575, 1576, 1577, 1578, 1579, 1580, 1581, 1582, 1583, 1584, 1585, 1586, 1587, 1588, 1589, 1590, 1591, 1592, 1593, 1594, 1595, 1596, 1597, 1598, 1599, 1600, 1601, 1602, 1603, 1604, 1605, 1606, 1607, 1608, 1609, 1610, 1611, 1612, 1613, 1614, 1615, 1616, 1617, 1618, 1619, 1620, 1621, 1622, 1623, 1624, 1625, 1626, 1627, 1628, 1629, 1630, 1631, 1632, 1633, 1634, 1635, 1636, 1637, 1638, 1639, 1640, 1641, 1642, 1643, 1644 |
 | `ClassBioXPSettings.loadOperationParameters@2516` | `2516–2709` | `public void loadOperationParameters()` | — | 2518, 2519 |
 | `ClassBioXPSettings.loadConfig@2798` | `2798–3530` | `public virtual void loadConfig()` | — | 2800, 2801, 2802, 2803, 2804, 2805, 2806, 2807, 2808, 2809, 2810, 2811, 2812, 2813, 2814, 2815, 2816, 2817, 2818, 2819, 2820, 2821, 2822, 2823, 2824, 2825, 2826, 2827, 2828, 2829, 2830, 2831, 2832, 2833, 2834, 2835, 2836, 2837, 2838, 2839, 2840, 2841, 2842 |
+| `ClassBioXPSettings.loadMasterPosition@3542` | `3542–3669` | `public void loadMasterPosition(string filename)` | — | 3544, 3545, 3546, 3547, 3548, 3549, 3550, 3551, 3552, 3553, 3554, 3555, 3556, 3557, 3558, 3559 |
+| `ClassBioXPSettings.readParameters@4059` | `4059–4080` | `private void readParameters(bool newblock)` | — | — |
 
-### 6.17 `decompiled_src_can/ClassCanLib/ClassThermalBoard.cs`
+### 6.23 `decompiled_src_can/ClassCanLib/ClassThermalBoard.cs`
 
 Source SHA-256: `23d50725da200044422fde56b00611df708b514cef0f3637b2ad8d19e0b23f26`
 Captured binary: `ClassCanLib.dll`
@@ -526,7 +629,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassThermalBoard.disableRightSwitch@494` | `494–497` | `public override void disableRightSwitch(int axis)` | — | — |
 | `ClassThermalBoard.disableLeftSwitch@499` | `499–502` | `public override void disableLeftSwitch(int axis)` | — | — |
 
-### 6.18 `decompiled_src_can/ClassCanLib/ClassThermalControl.cs`
+### 6.24 `decompiled_src_can/ClassCanLib/ClassThermalControl.cs`
 
 Source SHA-256: `fdefde9b38c70b9fec47e6ffdd4929ad8f25bc90c57c43baf03722addbe6cf25`
 Captured binary: `ClassCanLib.dll`
@@ -547,7 +650,7 @@ Captured binary: `ClassCanLib.dll`
 | `ClassThermalControl.getLidHeatRampRate@964` | `964–967` | `public double getLidHeatRampRate()` | — | — |
 | `ClassThermalControl.startFanService@1064` | `1064–1067` | `internal void startFanService()` | — | — |
 
-### 6.19 `decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs`
+### 6.25 `decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs`
 
 Source SHA-256: `6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501`
 Captured binary: `CVisionLib.dll`
@@ -555,14 +658,51 @@ Captured binary: `CVisionLib.dll`
 | Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
 |---|---:|---|---|---|
 | `ClassFrameGrabber.ClassFrameGrabber@28` | `28–34` | `public unsafe ClassFrameGrabber()` | — | — |
+| `ClassFrameGrabber.SaveImage@478` | `478–638` | `public unsafe void SaveImage(string fname)` | — | 581, 595, 616, 630 |
+| `ClassFrameGrabber.locateCover@4578` | `4578–5373` | `public unsafe bool locateCover(int corner, int xPos, int yPos, int cx, int cy, string fname, double* cDif, short* xDif, short* yDif, short* othereLines1, short* highFound)` | — | 4921, 4927, 4929, 4930, 4933, 4938, 5240, 5245, 5250, 5255, 5257, 5258, 5260 |
+| `ClassFrameGrabber.locateCover@5376` | `5376–5725` | `public unsafe bool locateCover(string fname)` | — | 5618, 5624, 5626, 5627, 5630, 5635, 5652, 5656, 5657 |
 | `ClassFrameGrabber.checkLabel@9284` | `9284–9859` | `public unsafe bool checkLabel(string fname)` | — | — |
 | `ClassFrameGrabber.matchPattern@12605` | `12605–12956` | `public unsafe double[] matchPattern(string fname, string templateImage, int match_method)` | — | — |
+| `ClassFrameGrabber.setExposure@13976` | `13976–13979` | `public void setExposure(double expo)` | — | — |
+| `ClassFrameGrabber.setAutoExposure@13991` | `13991–13994` | `public void setAutoExposure()` | — | — |
 
-## 7. Decompiler/binary-review boundary
+### 6.26 `decompiled_src_commonlib/CommonLib/wellID.cs`
+
+Source SHA-256: `e117e32acf2c61483c5033762d685e992e786d99e4d0ee1aff754b8edf9c6114`
+Captured binary: `CommonLib.dll`
+
+| Method/member ID | Inclusive lines | Declaration/member | Literal sleeps | Decompiler warning lines |
+|---|---:|---|---|---|
+| `wellID` | `3–102` | `Well-to-row/column identifier map` | — | — |
+
+## 7. Named source hazards and mandatory disposition
+
+| Hazard ID | Source reference | Mandatory disposition | Detail |
+|---|---|---|---|
+| `NOVO_PIPETTE_MASK_IMPOSSIBLE_PROJECTION` | `ClassNovoCANUSB.cs:481-484; compare 691` | `mandatory_raw_IL_resolution_before_transport_fixture_or_runtime_binding` | Projected (ID & 7) cannot equal 259/260; coherent later mask uses ID & 0x107. |
+| `MOTOR_NULL_SUCCESS_CONFLATION` | `ClassMotor.cs:492-517,641-689; board queryHome implementations` | `linux_must_require_controller_reply_and_physical_postcondition` | Null replies and success can collapse to the same scalar; setHome mutates host state after failed/null transport; uninitialized/null switch paths can be interpreted as home. |
+| `THERMAL_NULL_AND_STATUS_CONFLATION` | `ClassThermalControl.cs:384-464,638-646,1079-1084,1165-1210` | `linux_must_fail_closed_and_preserve_reply_status` | Null reads can return cached/default values; set target can return success-like zero on null; lid null branch dereferences array; wrapper PWM status is discarded. |
+| `ROUTE_ALWAYS_TRUE_LOCATION_TEST` | `ClassControlInterface.cs:3869,3877` | `mandatory_raw_IL_resolution_or_explicit_safety_deviation` | Projected (location != A || location != B) predicates are always true. |
+| `MOVE_XY_WRONG_NULL_BRANCH` | `ClassControlInterface.cs:4292-4295` | `mandatory_raw_IL_resolution_or_explicit_safety_deviation` | Projected null-X-board branch calls moveX(y) instead of moving Y. |
+| `DOOR_NULL_AND_CACHED_STATE_SUCCESS` | `ClassControlInterface.cs:2651-2712; ControlLib.cs:8541-8610` | `linux_requires_sensor_confirmed_postcondition` | Null door board can return true and ControlLib can cache requested state despite failed confirmation; close recovery homes without retrying close. |
+| `SETTINGS_SERIAL_SETTER_BYPASS` | `ClassBioXPSettings.cs:768-788,2861-2885,3128-3190` | `pin_explicit_serial_206_xml_values` | loadConfig assigns backing serial directly; selected XML door-open 18500 differs from setter default 16000. |
+| `SETTINGS_SELFTEST_AXIS_CROSS_ASSIGNMENT` | `ClassBioXPSettings.cs:3449-3450` | `preserve_source_semantics_in_fixture_and_record_any_safety_deviation` | Projected Y/Z existing-value branches use m_xSelfTestTravel. |
+| `SETTINGS_PERMISSIVE_FALLBACK` | `ClassBioXPSettings.cs:2855-2858,3542-3669,4059-4080` | `linux_live_path_must_fail_closed` | OEM logs and continues on missing config and suppresses master-position/offset errors; Linux may not silently activate defaults for serial 206. |
+| `MOTION_WORKER_NO_FINALLY` | `BioXPMainWindow.cs:2030-2101` | `persistent_state_machine_must_terminalize_or_block` | Exception can bypass GantryAvailable restoration. |
+| `INITIALIZE_GRIPPER_NULL_GUARD_ORDER` | `ClassControlInterface.cs:3355-3356` | `linux_must_admit_board_before_command` | Projected gripper +10000 move occurs before later null guard. |
+| `TURN_OFF_HEATER_DUPLICATE_TARGET` | `ClassControlInterface.cs:3057-3067` | `fixture_exact_duplicate_call_and_require_acknowledgements` | Both calls are identical setTCorLidPWM(0,0), not separate nest/lid selectors. |
+| `SELFTEST_ASYNC_REPORTING_AND_TIMEOUT_MODE` | `ControlLib.cs:10688-11022` | `ledger_reports_submission_separately_from_completion_and_pins_wait_mode` | Finished messages are emitted after queueing; STA applies timeout per handle while non-STA applies one WaitAll timeout. |
+| `VISION_INVALID_IL_REGIONS` | `ControlLib.cs:3665-3671,3780-3782,3827,3852-3858,3893-3899,7073-7078` | `mandatory_binary_disposition_before_executable_port` | Unsafe enum/cast regions are projection evidence, not recompilable authority. |
+| `CAMERA_GAIN_UNUSED_BY_ADJUSTER` | `ControlLib.cs:1883-1920; CameraSettings.cs:318-325` | `fixture_selected_gain_but_do_not_claim_it_was_applied` | CameraControlParameter.Gain is loaded from the selected profile but AdjustCamera does not apply it. |
+| `DOOR_24V_POLARITY_PROJECTION` | `ControlLib.cs:8670-8726` | `mandatory_raw_IL_and_controller_signal_resolution_before_physical_admission` | Projected nonzero query24voltage path clears EnclosureDoorClosed and returns false; only zero reaches true. |
+
+These are present-source hazards, not acquisition gaps. No hazard may be silently normalized into an inferred Linux behavior; it requires the recorded binary disposition or an explicit, reviewed fail-closed safety deviation.
+
+## 8. Decompiler/binary-review boundary
 
 Decompiler warning lines are recorded per method instead of being hidden. Before implementing any warning-bearing authority method, the tranche must resolve the affected predicate/control flow against the pinned captured binary or preserve a fail-closed blocker. Native `CVisionLib` projections must be tested against the captured DLL and templates; they must not be rewritten from apparent decompiler output alone.
 
-## 8. Registry acceptance rules
+## 9. Registry acceptance rules
 
 The registry is accepted only when automated validation proves:
 
@@ -574,7 +714,7 @@ The registry is accepted only when automated validation proves:
 6. serial-206 configuration values match the recorded XML lines/selectors;
 7. no method is promoted from static authority to implemented, controller-validated, or physically validated without separate evidence.
 
-## 9. Explicitly closed false gaps
+## 10. Explicitly closed false gaps
 
 - Lower `ClassPipette` command/reply bodies: present and line-bounded.
 - `InterfaceCAN`, `ClassNovo`, and `ClassNovoCANUSB` routing: present and line-bounded.

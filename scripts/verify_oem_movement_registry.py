@@ -25,6 +25,25 @@ REQUIRED_ANCHORS = {
     "turnOffHeater", "SetTemperature", "readRCTemperature", "readOCTemperature",
     "setLIDTemperature", "setThermalTemperature", "setChilerTemperature",
     "KeepTip", "terminatecommands", "queryIndividualTipStatus",
+    "m_canControl_handleLatchEvent", "m_canControl_handleEnclosureDoorEvent",
+    "m_canControl_handleEnclosureDoorEventProcess", "wakefrompause",
+    "queryDoorStatus", "rehome", "startup", "ReadBarcode", "homeGripper",
+    "moveXY", "getMidPoint", "setZaxisCurrentmax", "OpenGripper",
+    "SetTCTemperature", "SetLidTemperature", "setOutputChillerTemp",
+    "setReagentChillerTemp", "resumeTemperature", "waitForBoard",
+    "SaveImage", "locateCover", "setExposure", "setAutoExposure",
+    "createSetting", "loadMasterPosition", "readParameters", "GetCameraSettings",
+    "InspectionItems", "locationID", "positionStruct", "wellID", "plateName", "OperationMode",
+}
+REQUIRED_HAZARDS = {
+    "NOVO_PIPETTE_MASK_IMPOSSIBLE_PROJECTION", "MOTOR_NULL_SUCCESS_CONFLATION",
+    "THERMAL_NULL_AND_STATUS_CONFLATION", "ROUTE_ALWAYS_TRUE_LOCATION_TEST",
+    "MOVE_XY_WRONG_NULL_BRANCH", "DOOR_NULL_AND_CACHED_STATE_SUCCESS",
+    "SETTINGS_SERIAL_SETTER_BYPASS", "SETTINGS_SELFTEST_AXIS_CROSS_ASSIGNMENT",
+    "SETTINGS_PERMISSIVE_FALLBACK", "MOTION_WORKER_NO_FINALLY",
+    "INITIALIZE_GRIPPER_NULL_GUARD_ORDER", "TURN_OFF_HEATER_DUPLICATE_TARGET",
+    "SELFTEST_ASYNC_REPORTING_AND_TIMEOUT_MODE", "VISION_INVALID_IL_REGIONS",
+    "CAMERA_GAIN_UNUSED_BY_ADJUSTER", "DOOR_24V_POLARITY_PROJECTION",
 }
 
 def sha256(path: Path) -> str:
@@ -65,24 +84,41 @@ def check_field_line(record: dict, files: dict[str, Path], errors: list[str]) ->
     artifact=record['artifact']; path=files.get(artifact)
     if path is None: errors.append(f"configuration artifact not found in live corpus: {artifact}"); return
     lines=path.read_text(errors='replace').splitlines()
-    if 'line' not in record: return
-    line_no=record['line']
-    if not (1 <= line_no <= len(lines)):
-        errors.append(f"{artifact}:{line_no} outside file"); return
-    line=lines[line_no-1]
+    if 'line' in record:
+        line_no=record['line']
+        if not (1 <= line_no <= len(lines)):
+            errors.append(f"{artifact}:{line_no} outside file"); return
+        line=lines[line_no-1]
+        location=str(line_no)
+    elif 'line_range' in record:
+        start,end=record['line_range']
+        if not (1 <= start <= end <= len(lines)):
+            errors.append(f"{artifact}:{start}-{end} outside file"); return
+        line='\n'.join(lines[start-1:end])
+        location=f"{start}-{end}"
+    else:
+        errors.append(f"configuration record lacks line provenance: {record['field']}"); return
+    if record['field']=='PositionTable':
+        return
     value=record['value']
     values=[]
     if isinstance(value,dict): values=list(value.values())
     elif isinstance(value,list): values=value
     elif isinstance(value,(str,int,float,bool)): values=[value]
     for v in values:
-        token=str(v)
-        if isinstance(v,bool): token='True' if v else 'False'
-        if token not in line and value != 'selected camera-control block':
-            errors.append(f"{artifact}:{line_no} lacks selected value {token!r} for {record['field']}")
+        if isinstance(v,bool):
+            token='true' if v else 'false'
+            present=token in line.lower()
+        else:
+            token=str(v)
+            present=token in line
+        if not present:
+            errors.append(f"{artifact}:{location} lacks selected value {token!r} for {record['field']}")
 
 def verify(registry_path: Path) -> dict:
     errors=[]; d=json.loads(registry_path.read_text())
+    if d.get('schema_id') != 'bioxp.oem_movement_method_source_binary_registry.v2':
+        errors.append(f"unexpected registry schema: {d.get('schema_id')}")
     source_by={s['source_id']:s for s in d['sources']}
     binary_ids={b['binary_id'] for b in d['binaries']}
     for b in d['binaries']:
@@ -115,6 +151,12 @@ def verify(registry_path: Path) -> dict:
             if actual_end != end: errors.append(f"brace end mismatch: {m['method_id']} expected {end}, got {actual_end}")
     missing=sorted(REQUIRED_ANCHORS-names)
     if missing: errors.append('missing required call-graph anchors: '+', '.join(missing))
+    hazard_ids={h.get('hazard_id') for h in d.get('known_hazards',[])}
+    missing_hazards=sorted(REQUIRED_HAZARDS-hazard_ids)
+    if missing_hazards: errors.append('missing required source hazards: '+', '.join(missing_hazards))
+    if d.get('counts',{}).get('binaries') != len(d['binaries']): errors.append('binary count mismatch')
+    if d.get('counts',{}).get('sources') != len(d['sources']): errors.append('source count mismatch')
+    if d.get('counts',{}).get('methods_and_members') != len(d['methods']): errors.append('method/member count mismatch')
     lock_path=Path(d['authority']['evidence_lock_path']); lock=json.loads(lock_path.read_text())
     acq_root=Path(lock['acquisition']['root']); live_files={}
     records=d['live_machine_corpus']['records']

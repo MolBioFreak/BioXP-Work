@@ -45,10 +45,10 @@ Accepted registry baseline:
 
 ```text
 binaries=8
-sources=19
-methods_and_members=299
+sources=26
+methods_and_members=341
 live_machine_records=19
-required_call_graph_anchors=81
+required_call_graph_anchors=114
 OEM_MOVEMENT_REGISTRY=PASS
 ```
 
@@ -70,6 +70,19 @@ inclusive source lines
 captured binary and SHA-256
 selected configuration artifact/hash/selector when applicable
 known decompiler-warning boundary
+named source-hazard disposition
+```
+
+The source closure includes the route and policy data types consumed by the methods, not just executable bodies:
+
+```text
+CameraSettings.cs
+InspectionItems.cs
+locationID.cs
+positionStruct.cs
+wellID.cs
+plateName.cs
+OperationMode.cs
 ```
 
 `Not implemented`, `not line-extracted into a fixture`, and `not physically validated` must never be reported as source absence.
@@ -156,6 +169,10 @@ DeckInspection=True
 InspectionLogOnly=False
 CheckCamera=True
 
+OriginOffsetG=4450
+GripperClosePOS=27350
+GripperOpenPOS=31400
+GripperOpenWide=32400
 TCDoorOpen=18500
 TCDoorStallGuardThreshold=6
 TC_DOOR_VELOCITY=50
@@ -164,6 +181,8 @@ TC_DOOR_MAX_CURRENT=31
 Z_MOTOR_MAX_CURRENT_DOWN=25
 Z_MOTOR_MAX_CURRENT_UP=31
 Z_MOTOR_STALL_GUARD_THRESHOLD=3
+OutPutBufferatMS_Zlow=0
+OutlierRangeFactor=4
 
 X limits=0..90263
 Y limits=0..102956
@@ -375,6 +394,31 @@ Preserve:
 
 A safer Linux deviation must not be labeled literal OEM parity.
 
+### 6.4 Named source-hazard dispositions
+
+The independent source audits established the following mandatory design constraints. These are present-source hazards—not acquisition gaps:
+
+| Hazard | Required implementation disposition |
+|---|---|
+| `ClassNovoCANUSB.cs:481-484` projects `(ID & 7) == 259/260`, while line 691 coherently uses `ID & 0x107` | Resolve raw IL before creating the pipette transport fixture or enabling the path. Do not guess the mask. |
+| `ClassMotor` and board home methods conflate null/uninitialized replies with success-like values and can update host home state after failed transport | Require a matched controller reply, expected acknowledgement, switch/readback evidence, and physical postcondition before declaring home. |
+| `ClassThermalControl` can return cached/default temperatures, success-like zero on null, dereference a null lid reply, and discard PWM status through wrappers | Preserve raw replies/status; fail closed on null, stale, or unacknowledged values. |
+| `scriptmoveTo` projected location exclusions at `3869` and `3877` are always true | Resolve against raw IL or register an explicit reviewed safety deviation before porting those predicates. |
+| `moveXY` projected null-X-board branch at `4292-4295` calls `moveX(y)` | Resolve against raw IL or block the branch; never reproduce it as an inferred valid route. |
+| Thermal-door methods can return success with a null board and cache the requested state despite failed confirmation | Require board presence and both door-sensor postconditions. Homing without a confirmed retry does not prove closure. |
+| `loadConfig` bypasses the serial setter; serial-206 XML `TCDoorOpen=18500` differs from setter default `16000` | Pin the selected XML value and loader path; do not reconstruct it from the setter default. |
+| Self-test Y/Z travel projection uses X travel in existing-value branches at `3449-3450` | Preserve the projected fixture for comparison, but require an explicit safety disposition before physical self-test. |
+| OEM settings readers continue or suppress errors for missing config/master position/offset files | Linux production remains closed-world and fail-closed; no permissive fallback becomes authority. |
+| `motion_thread_process` can bypass `GantryAvailable=true` on exception | The persistent state machine must always terminalize or enter blocked recovery in a finalizer. |
+| Gripper `+10000` occurs before the later null guard in `initializeMotors` | Admission must prove the head/gripper board before issuing the command; record this as a safer explicit deviation. |
+| `turnOffHeater` sends identical `setTCorLidPWM(0,0)` calls twice | Golden fixture must preserve both calls; both need transport evidence. Do not relabel them as separate inferred selectors. |
+| Self-test emits “Finished” messages after queue submission and has STA/non-STA timeout differences | Ledger records submission separately from completion and pins one tested timeout model. |
+| Vision/cover routines contain explicit invalid-IL/unsafe projection regions | Resolve affected control flow against the pinned binary or retain a blocker; do not compile apparent decompiler output as authority. |
+| Selected camera profiles contain `Gain`, but `AdjustCamera` does not apply it | Pin the selected gain in provenance but do not claim it was applied; acceptance must verify only exposure/LED effects that the caller actually performs. |
+| `checkDoorStatus` projects nonzero `query24voltage()` as false/door-open and only zero as success | Resolve signal polarity against raw IL and controller evidence before physical admission; do not infer that nonzero means healthy or unhealthy from naming alone. |
+
+Every enabled stage must name its resolved hazard IDs in the program manifest. An unresolved applicable hazard is an admission blocker.
+
 ## 7. Admission and non-motion baseline
 
 ### 7.1 Existing accepted prerequisite
@@ -474,6 +518,45 @@ initializeEnvironment
 ```
 
 Only one `initializeSystem` run may be active. Duplicate requests return the existing run identifier and do not enqueue another physical sequence.
+
+The implementation must preserve the `initializeSystem(bool skipInitializeMotion=false)` branch matrix rather than flattening it into one happy path:
+
+```text
+re-entry:
+  if m_systemInmotion: do not start a second lifecycle
+
+skipInitializeMotion=false:
+  require initialCheck admission
+  run initializeMotion
+
+saved machine status 3 or 4:
+  run initializeMotion
+  run inspectCover
+  unlock/report the recovered branch and return
+  do not fall through to normal ready completion
+
+normal branch:
+  optional daily self-test only when SelfTest=true and elapsed days >1
+  optional camera check only when CheckCamera && CameraInstalled && !development
+  invoke inspectCover; DeckInspection=false can make its body return OK
+  on cover failure: park, unlock, persist blocked terminal state
+  on success: park before StartMode handling
+
+PARK/ship branch:
+  close thermal door using the registered movement path
+  publish a typed park/shutdown-ready terminal state
+  actual OS shutdown requires a separate reviewed deployment authorization
+
+communication/job-admission branch:
+  preserve the 5000-ms communication wait
+  end at typed job-admission readiness; general job execution remains excluded
+
+all exits:
+  clear running ownership in a finalizer
+  persist exact terminal state and blocker
+```
+
+The recovered application’s saved-status and PARK branches are OEM authority. The Linux finalizer and separate OS-shutdown authorization are explicit safety/reliability deviations and must be labeled as such.
 
 ### 8.2 `initializeMotors` exact order
 
@@ -690,6 +773,15 @@ CVisionLib.dll
 84ab0c851f1bb418289035efd9fa84420e9ff82ea0a69ec0c00bb5d401e750f2
 ```
 
+The camera adapter must select the commissioned profile exactly through `CameraSettings.GetCameraSettings(bool Is3250, InspectionItems)` at `CameraSettings.cs:318-325`. The run ledger must pin the `ScreenResolutionHigh`/`Is3250` branch and the selected ordinal (`CamereInitialCheck=4`). Commissioned initial-check profiles are:
+
+```text
+Settings3200: exposure=1000, gain=1000, LED1/2/3=false
+Settings3250: exposure=-3,   gain=1000, LED1/2/3=false
+```
+
+`AdjustCamera` applies exposure and LEDs but does not apply `Gain`; provenance must not be misreported as an applied camera setting.
+
 Do not rewrite `ClassFrameGrabber.checkLabel` or `matchPattern` from decompiler output. Use the captured binary in an isolated adapter, or preserve a fail-closed blocker until binary execution is accepted.
 
 ### 10.2 Cover inspection
@@ -714,16 +806,39 @@ update machine plate locations
 doors as specified
 ```
 
-The stage must use:
+The stage must select the exact commissioned algorithm/profile branch:
 
 ```text
-InspectionSettings.xml Settings3200 CoverInspection block
+ScreenResolutionHigh=false / Settings3200:
+  locations 17,19,20,18 use checkChillerCover → locateCover("")
+  CoverInspection: exposure=1000, gain=1000, LED2=true
+  OutputPlateInspection: exposure=1000, LEDs=false, threshold=60, pixelCount=1000
+
+ScreenResolutionHigh=true / Settings3250:
+  location 17 uses InspectOutputLocation
+  location 19 uses checkRCCover
+  locations 20 and 18 use checkCoverStorage
+  CoverInspection: exposure=-2, gain=1000, LED2=true
+  CoverStorageInspection: exposure=-1, all LEDs=true
+  OutputPlateInspection: exposure=-2, all LEDs=true, threshold=30, pixelCount=1000
+```
+
+Both branches must use the hash-locked assets appropriate to their registered callers:
+
+```text
+InspectionSettings.xml
 cover.jpg
 output.jpg
-other exact case-sensitive templates from the 19-file bundle
+outputw_foil.jpg
+output_empty.jpg
+reagentTray.jpg
+reagentEmpty.jpg
+EmptyStorage.jpg
 CAMERA_OFFSET from config.xml
 selected cover/storage PositionTable entries
 ```
+
+No branch may default to Settings3200 or Settings3250 merely because the runtime cannot prove `ScreenResolutionHigh`. An unproven branch blocks camera/cover execution.
 
 All image/template hashes and resulting measurements must be bound to the run. Generated snapshots are runtime outputs and must not mutate captured templates.
 
@@ -786,7 +901,7 @@ Creation request:
   "command": "initialize_oem_movement_lifecycle",
   "operator_ack": "INITIALIZE",
   "expected_machine_serial": 206,
-  "expected_registry_sha256": "ecf6635d43d520e39c8aee15ef20783d0d16fe5a5060c8cd011652392a91dd27"
+  "expected_registry_sha256": "005f8d501c2acf24b07519e2404a02988174c1025789db104bb16c076e5dd3d0"
 }
 ```
 

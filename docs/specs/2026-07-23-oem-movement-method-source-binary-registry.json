@@ -66,10 +66,108 @@
   "counts": {
     "binaries": 8,
     "live_machine_records": 19,
-    "methods_and_members": 299,
-    "sources": 19
+    "methods_and_members": 341,
+    "sources": 26
   },
   "created_date": "2026-07-23",
+  "known_hazards": [
+    {
+      "detail": "Projected (ID & 7) cannot equal 259/260; coherent later mask uses ID & 0x107.",
+      "disposition": "mandatory_raw_IL_resolution_before_transport_fixture_or_runtime_binding",
+      "hazard_id": "NOVO_PIPETTE_MASK_IMPOSSIBLE_PROJECTION",
+      "source_ref": "ClassNovoCANUSB.cs:481-484; compare 691"
+    },
+    {
+      "detail": "Null replies and success can collapse to the same scalar; setHome mutates host state after failed/null transport; uninitialized/null switch paths can be interpreted as home.",
+      "disposition": "linux_must_require_controller_reply_and_physical_postcondition",
+      "hazard_id": "MOTOR_NULL_SUCCESS_CONFLATION",
+      "source_ref": "ClassMotor.cs:492-517,641-689; board queryHome implementations"
+    },
+    {
+      "detail": "Null reads can return cached/default values; set target can return success-like zero on null; lid null branch dereferences array; wrapper PWM status is discarded.",
+      "disposition": "linux_must_fail_closed_and_preserve_reply_status",
+      "hazard_id": "THERMAL_NULL_AND_STATUS_CONFLATION",
+      "source_ref": "ClassThermalControl.cs:384-464,638-646,1079-1084,1165-1210"
+    },
+    {
+      "detail": "Projected (location != A || location != B) predicates are always true.",
+      "disposition": "mandatory_raw_IL_resolution_or_explicit_safety_deviation",
+      "hazard_id": "ROUTE_ALWAYS_TRUE_LOCATION_TEST",
+      "source_ref": "ClassControlInterface.cs:3869,3877"
+    },
+    {
+      "detail": "Projected null-X-board branch calls moveX(y) instead of moving Y.",
+      "disposition": "mandatory_raw_IL_resolution_or_explicit_safety_deviation",
+      "hazard_id": "MOVE_XY_WRONG_NULL_BRANCH",
+      "source_ref": "ClassControlInterface.cs:4292-4295"
+    },
+    {
+      "detail": "Null door board can return true and ControlLib can cache requested state despite failed confirmation; close recovery homes without retrying close.",
+      "disposition": "linux_requires_sensor_confirmed_postcondition",
+      "hazard_id": "DOOR_NULL_AND_CACHED_STATE_SUCCESS",
+      "source_ref": "ClassControlInterface.cs:2651-2712; ControlLib.cs:8541-8610"
+    },
+    {
+      "detail": "loadConfig assigns backing serial directly; selected XML door-open 18500 differs from setter default 16000.",
+      "disposition": "pin_explicit_serial_206_xml_values",
+      "hazard_id": "SETTINGS_SERIAL_SETTER_BYPASS",
+      "source_ref": "ClassBioXPSettings.cs:768-788,2861-2885,3128-3190"
+    },
+    {
+      "detail": "Projected Y/Z existing-value branches use m_xSelfTestTravel.",
+      "disposition": "preserve_source_semantics_in_fixture_and_record_any_safety_deviation",
+      "hazard_id": "SETTINGS_SELFTEST_AXIS_CROSS_ASSIGNMENT",
+      "source_ref": "ClassBioXPSettings.cs:3449-3450"
+    },
+    {
+      "detail": "OEM logs and continues on missing config and suppresses master-position/offset errors; Linux may not silently activate defaults for serial 206.",
+      "disposition": "linux_live_path_must_fail_closed",
+      "hazard_id": "SETTINGS_PERMISSIVE_FALLBACK",
+      "source_ref": "ClassBioXPSettings.cs:2855-2858,3542-3669,4059-4080"
+    },
+    {
+      "detail": "Exception can bypass GantryAvailable restoration.",
+      "disposition": "persistent_state_machine_must_terminalize_or_block",
+      "hazard_id": "MOTION_WORKER_NO_FINALLY",
+      "source_ref": "BioXPMainWindow.cs:2030-2101"
+    },
+    {
+      "detail": "Projected gripper +10000 move occurs before later null guard.",
+      "disposition": "linux_must_admit_board_before_command",
+      "hazard_id": "INITIALIZE_GRIPPER_NULL_GUARD_ORDER",
+      "source_ref": "ClassControlInterface.cs:3355-3356"
+    },
+    {
+      "detail": "Both calls are identical setTCorLidPWM(0,0), not separate nest/lid selectors.",
+      "disposition": "fixture_exact_duplicate_call_and_require_acknowledgements",
+      "hazard_id": "TURN_OFF_HEATER_DUPLICATE_TARGET",
+      "source_ref": "ClassControlInterface.cs:3057-3067"
+    },
+    {
+      "detail": "Finished messages are emitted after queueing; STA applies timeout per handle while non-STA applies one WaitAll timeout.",
+      "disposition": "ledger_reports_submission_separately_from_completion_and_pins_wait_mode",
+      "hazard_id": "SELFTEST_ASYNC_REPORTING_AND_TIMEOUT_MODE",
+      "source_ref": "ControlLib.cs:10688-11022"
+    },
+    {
+      "detail": "Unsafe enum/cast regions are projection evidence, not recompilable authority.",
+      "disposition": "mandatory_binary_disposition_before_executable_port",
+      "hazard_id": "VISION_INVALID_IL_REGIONS",
+      "source_ref": "ControlLib.cs:3665-3671,3780-3782,3827,3852-3858,3893-3899,7073-7078"
+    },
+    {
+      "detail": "CameraControlParameter.Gain is loaded from the selected profile but AdjustCamera does not apply it.",
+      "disposition": "fixture_selected_gain_but_do_not_claim_it_was_applied",
+      "hazard_id": "CAMERA_GAIN_UNUSED_BY_ADJUSTER",
+      "source_ref": "ControlLib.cs:1883-1920; CameraSettings.cs:318-325"
+    },
+    {
+      "detail": "Projected nonzero query24voltage path clears EnclosureDoorClosed and returns false; only zero reaches true.",
+      "disposition": "mandatory_raw_IL_and_controller_signal_resolution_before_physical_admission",
+      "hazard_id": "DOOR_24V_POLARITY_PROJECTION",
+      "source_ref": "ControlLib.cs:8670-8726"
+    }
+  ],
   "live_machine_corpus": {
     "contract_schema_id": "bioxp.live_machine_corpus.serial206.v1",
     "distinction": "This is the exact 19-file live AppData machine corpus. It is unrelated to historical v1\u2019s exact 19-row denominator: ten workflow rows and nine heterogeneous non-workflow rows, each hash-bound and dispositioned by schema v4 with zero silent exclusions.",
@@ -748,6 +846,19 @@
       "status": "present_hash_locked_and_line_bounded"
     },
     {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "public CameraControlParameter GetCameraSettings(bool Is3250, InspectionItems inspectionItems)",
+      "decompiler_warning_lines": [],
+      "end_line": 325,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "CameraSettings.GetCameraSettings@318",
+      "name": "GetCameraSettings",
+      "source_id": "camerasettings",
+      "start_line": 318,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
       "binary_id": "BioXPControlLib.dll",
       "declaration": "Logical axis/board/axis designator map",
       "decompiler_warning_lines": [],
@@ -1099,6 +1210,24 @@
     },
     {
       "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void SetTCTemperature(double Temperature, int duration, double rate)",
+      "decompiler_warning_lines": [],
+      "end_line": 2989,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 2983,
+          "milliseconds": 200
+        }
+      ],
+      "method_id": "ClassControlInterface.SetTCTemperature@2971",
+      "name": "SetTCTemperature",
+      "source_id": "cci",
+      "start_line": 2971,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
       "declaration": "public void SetTemperature(double Temperature, int duration, bool wait)",
       "decompiler_warning_lines": [
         3009
@@ -1110,6 +1239,38 @@
       "name": "SetTemperature",
       "source_id": "cci",
       "start_line": 3007,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void SetLidTemperature(double Temperature, int duration, double rate, bool wait = true)",
+      "decompiler_warning_lines": [
+        3018,
+        3019,
+        3020
+      ],
+      "end_line": 3037,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.SetLidTemperature@3016",
+      "name": "SetLidTemperature",
+      "source_id": "cci",
+      "start_line": 3016,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void SetLidTemperature(double Temperature)",
+      "decompiler_warning_lines": [
+        3041
+      ],
+      "end_line": 3046,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.SetLidTemperature@3039",
+      "name": "SetLidTemperature",
+      "source_id": "cci",
+      "start_line": 3039,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -1144,6 +1305,36 @@
       "name": "setChillerPWM",
       "source_id": "cci",
       "start_line": 3078,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public int setOutputChillerTemp(double temp)",
+      "decompiler_warning_lines": [
+        3121
+      ],
+      "end_line": 3129,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.setOutputChillerTemp@3119",
+      "name": "setOutputChillerTemp",
+      "source_id": "cci",
+      "start_line": 3119,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public int setReagentChillerTemp(double temp)",
+      "decompiler_warning_lines": [
+        3133
+      ],
+      "end_line": 3141,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.setReagentChillerTemp@3131",
+      "name": "setReagentChillerTemp",
+      "source_id": "cci",
+      "start_line": 3131,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -1341,6 +1532,37 @@
       "name": "deactivateBoard",
       "source_id": "cci",
       "start_line": 3496,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void waitForBoard()",
+      "decompiler_warning_lines": [],
+      "end_line": 3534,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 3521,
+          "milliseconds": 100
+        }
+      ],
+      "method_id": "ClassControlInterface.waitForBoard@3507",
+      "name": "waitForBoard",
+      "source_id": "cci",
+      "start_line": 3507,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public int OpenGripper(bool recover = false, bool openwide = false, bool resetSpeed = true, bool resetStallGThre = true)",
+      "decompiler_warning_lines": [],
+      "end_line": 3567,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.OpenGripper@3536",
+      "name": "OpenGripper",
+      "source_id": "cci",
+      "start_line": 3536,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -1631,6 +1853,24 @@
     },
     {
       "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void moveXY(int x, int y)",
+      "decompiler_warning_lines": [],
+      "end_line": 4367,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 4348,
+          "milliseconds": 5
+        }
+      ],
+      "method_id": "ClassControlInterface.moveXY@4285",
+      "name": "moveXY",
+      "source_id": "cci",
+      "start_line": 4285,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
       "declaration": "public int moveTo(int x, int y, int z, bool runInParalel)",
       "decompiler_warning_lines": [
         4465,
@@ -1683,6 +1923,19 @@
       "name": "MoveZHome",
       "source_id": "cci",
       "start_line": 4623,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "internal void setZaxisCurrentmax(int current = 100)",
+      "decompiler_warning_lines": [],
+      "end_line": 4861,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.setZaxisCurrentmax@4850",
+      "name": "setZaxisCurrentmax",
+      "source_id": "cci",
+      "start_line": 4850,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -1801,6 +2054,71 @@
     },
     {
       "binary_id": "BioXPControlLib.dll",
+      "declaration": "internal void forceAbortMotion()",
+      "decompiler_warning_lines": [],
+      "end_line": 5106,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 5098,
+          "milliseconds": 1
+        }
+      ],
+      "method_id": "ClassControlInterface.forceAbortMotion@5095",
+      "name": "forceAbortMotion",
+      "source_id": "cci",
+      "start_line": 5095,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "private Point[] getMidPoint(int x, int y)",
+      "decompiler_warning_lines": [
+        5256,
+        5257,
+        5258,
+        5259,
+        5260,
+        5261,
+        5262,
+        5263,
+        5264,
+        5265,
+        5266,
+        5267,
+        5268,
+        5269,
+        5270,
+        5271,
+        5272,
+        5273,
+        5274,
+        5275,
+        5276,
+        5277,
+        5278,
+        5279,
+        5280,
+        5281,
+        5282,
+        5283,
+        5284,
+        5285,
+        5286,
+        5287,
+        5288
+      ],
+      "end_line": 5366,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.getMidPoint@5254",
+      "name": "getMidPoint",
+      "source_id": "cci",
+      "start_line": 5254,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
       "declaration": "internal void setGripperCurrent(int current)",
       "decompiler_warning_lines": [],
       "end_line": 5398,
@@ -1810,6 +2128,19 @@
       "name": "setGripperCurrent",
       "source_id": "cci",
       "start_line": 5392,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "internal void resumeTemperature()",
+      "decompiler_warning_lines": [],
+      "end_line": 5410,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.resumeTemperature@5400",
+      "name": "resumeTemperature",
+      "source_id": "cci",
+      "start_line": 5400,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -2539,6 +2870,37 @@
     },
     {
       "binary_id": "BioXPControlLib.dll",
+      "declaration": "public bool queryDoorStatus()",
+      "decompiler_warning_lines": [],
+      "end_line": 8771,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.queryDoorStatus@8762",
+      "name": "queryDoorStatus",
+      "source_id": "control",
+      "start_line": 8762,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void rehome()",
+      "decompiler_warning_lines": [],
+      "end_line": 8795,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 8788,
+          "milliseconds": 40
+        }
+      ],
+      "method_id": "ControlLib.rehome@8784",
+      "name": "rehome",
+      "source_id": "control",
+      "start_line": 8784,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
       "declaration": "public void initializeMotion()",
       "decompiler_warning_lines": [],
       "end_line": 8856,
@@ -2565,6 +2927,19 @@
     },
     {
       "binary_id": "BioXPControlLib.dll",
+      "declaration": "public ErrorStatus startup(out string jobid_barcode, out string reagent_barcode)",
+      "decompiler_warning_lines": [],
+      "end_line": 8949,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.startup@8872",
+      "name": "startup",
+      "source_id": "control",
+      "start_line": 8872,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
       "declaration": "public void SnapshotImage(string condition)",
       "decompiler_warning_lines": [],
       "end_line": 8994,
@@ -2574,6 +2949,38 @@
       "name": "SnapshotImage",
       "source_id": "control",
       "start_line": 8951,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "private bool ReadBarcode(BarCodeType codetype, string filename, out string barcode, bool read = true)",
+      "decompiler_warning_lines": [
+        9090,
+        9091,
+        9092,
+        9093,
+        9094,
+        9095,
+        9096,
+        9097,
+        9098,
+        9099,
+        9100,
+        9101,
+        9102
+      ],
+      "end_line": 9217,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 9140,
+          "milliseconds": 200
+        }
+      ],
+      "method_id": "ControlLib.ReadBarcode@9088",
+      "name": "ReadBarcode",
+      "source_id": "control",
+      "start_line": 9088,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -2697,6 +3104,19 @@
       "name": "waitforcompletion",
       "source_id": "control",
       "start_line": 11001,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void homeGripper()",
+      "decompiler_warning_lines": [],
+      "end_line": 11043,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.homeGripper@11037",
+      "name": "homeGripper",
+      "source_id": "control",
+      "start_line": 11037,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -2967,6 +3387,19 @@
       "name": "setColor",
       "source_id": "deck",
       "start_line": 465,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Pseudo-Z constants and current selected pseudo-home",
+      "decompiler_warning_lines": [],
+      "end_line": 59,
+      "kind": "data_member",
+      "literal_sleeps": [],
+      "method_id": "DefaultParameters.PSUDO_Z_HOME",
+      "name": "PSUDO_Z_HOME",
+      "source_id": "defaults",
+      "start_line": 47,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -3365,6 +3798,19 @@
       "status": "present_hash_locked_and_line_bounded"
     },
     {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Camera inspection ordinal map",
+      "decompiler_warning_lines": [],
+      "end_line": 24,
+      "kind": "enum",
+      "literal_sleeps": [],
+      "method_id": "InspectionItems",
+      "name": "InspectionItems",
+      "source_id": "inspectionitems",
+      "start_line": 3,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
       "binary_id": "ClassCanLib.dll",
       "declaration": "public ClassIOControl(InterfaceCAN control, ushort canID)",
       "decompiler_warning_lines": [],
@@ -3453,6 +3899,19 @@
       "name": "setSolenoidControl",
       "source_id": "io",
       "start_line": 176,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CommonLib.dll",
+      "declaration": "Logical route/location identifier map",
+      "decompiler_warning_lines": [],
+      "end_line": 52,
+      "kind": "enum",
+      "literal_sleeps": [],
+      "method_id": "locationID",
+      "name": "locationID",
+      "source_id": "locationid",
+      "start_line": 3,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -3658,6 +4117,70 @@
       "name": "motion_thread_process",
       "source_id": "main",
       "start_line": 2030,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
+      "declaration": "private void wakefrompause()",
+      "decompiler_warning_lines": [],
+      "end_line": 2129,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "BioXPMainWindow.wakefrompause@2103",
+      "name": "wakefrompause",
+      "source_id": "main",
+      "start_line": 2103,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
+      "declaration": "private void m_canControl_handleLatchEvent(bool dooropen)",
+      "decompiler_warning_lines": [],
+      "end_line": 2381,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "BioXPMainWindow.m_canControl_handleLatchEvent@2359",
+      "name": "m_canControl_handleLatchEvent",
+      "source_id": "main",
+      "start_line": 2359,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
+      "declaration": "private void m_canControl_handleEnclosureDoorEvent(bool dooropen)",
+      "decompiler_warning_lines": [],
+      "end_line": 2416,
+      "kind": "method",
+      "literal_sleeps": [
+        {
+          "line": 2394,
+          "milliseconds": 40
+        },
+        {
+          "line": 2400,
+          "milliseconds": 500
+        }
+      ],
+      "method_id": "BioXPMainWindow.m_canControl_handleEnclosureDoorEvent@2383",
+      "name": "m_canControl_handleEnclosureDoorEvent",
+      "source_id": "main",
+      "start_line": 2383,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
+      "declaration": "private void m_canControl_handleEnclosureDoorEventProcess(bool dooropen)",
+      "decompiler_warning_lines": [
+        2430,
+        2431
+      ],
+      "end_line": 2512,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "BioXPMainWindow.m_canControl_handleEnclosureDoorEventProcess@2428",
+      "name": "m_canControl_handleEnclosureDoorEventProcess",
+      "source_id": "main",
+      "start_line": 2428,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -4406,6 +4929,19 @@
       "status": "present_hash_locked_and_line_bounded"
     },
     {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "StartMode terminal branch values",
+      "decompiler_warning_lines": [],
+      "end_line": 9,
+      "kind": "enum",
+      "literal_sleeps": [],
+      "method_id": "OperationMode",
+      "name": "OperationMode",
+      "source_id": "operationmode",
+      "start_line": 3,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
       "binary_id": "BioXPControlLib.dll",
       "declaration": "Per-channel tip state",
       "decompiler_warning_lines": [],
@@ -4778,6 +5314,97 @@
     },
     {
       "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Cover/plate state identifier map",
+      "decompiler_warning_lines": [],
+      "end_line": 27,
+      "kind": "enum",
+      "literal_sleeps": [],
+      "method_id": "plateName",
+      "name": "plateName",
+      "source_id": "platename",
+      "start_line": 3,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CommonLib.dll",
+      "declaration": "Route coordinate payload",
+      "decompiler_warning_lines": [],
+      "end_line": 18,
+      "kind": "struct",
+      "literal_sleeps": [],
+      "method_id": "positionStruct",
+      "name": "positionStruct",
+      "source_id": "positionstruct",
+      "start_line": 3,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Serial-dependent door defaults",
+      "decompiler_warning_lines": [],
+      "end_line": 788,
+      "kind": "property",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.SerialNumber",
+      "name": "SerialNumber",
+      "source_id": "settings",
+      "start_line": 768,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Selected door/Z movement property surface",
+      "decompiler_warning_lines": [],
+      "end_line": 970,
+      "kind": "data_member",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.movement_configuration_fields",
+      "name": "movement_configuration_fields",
+      "source_id": "settings",
+      "start_line": 946,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Selected terminal startup mode",
+      "decompiler_warning_lines": [],
+      "end_line": 1005,
+      "kind": "property",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.StartMode",
+      "name": "StartMode",
+      "source_id": "settings",
+      "start_line": 995,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Selected self-test maxima and axis-limit properties",
+      "decompiler_warning_lines": [],
+      "end_line": 1299,
+      "kind": "data_member",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.axis_limits_and_selftest",
+      "name": "axis_limits_and_selftest",
+      "source_id": "settings",
+      "start_line": 1277,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "Selected route table property",
+      "decompiler_warning_lines": [],
+      "end_line": 1389,
+      "kind": "property",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.PositionTable",
+      "name": "PositionTable",
+      "source_id": "settings",
+      "start_line": 1389,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
       "declaration": "public ClassBioXPSettings(ResourceManager rsManager, string appDir)",
       "decompiler_warning_lines": [
         1413,
@@ -4858,6 +5485,172 @@
     },
     {
       "binary_id": "BioXPCommonLib.dll",
+      "declaration": "private void createSetting()",
+      "decompiler_warning_lines": [
+        1493,
+        1494,
+        1495,
+        1496,
+        1497,
+        1498,
+        1499,
+        1500,
+        1501,
+        1502,
+        1503,
+        1504,
+        1505,
+        1506,
+        1507,
+        1508,
+        1509,
+        1510,
+        1511,
+        1512,
+        1513,
+        1514,
+        1515,
+        1516,
+        1517,
+        1518,
+        1519,
+        1520,
+        1521,
+        1522,
+        1523,
+        1524,
+        1525,
+        1526,
+        1527,
+        1528,
+        1529,
+        1530,
+        1531,
+        1532,
+        1533,
+        1534,
+        1535,
+        1536,
+        1537,
+        1538,
+        1539,
+        1540,
+        1541,
+        1542,
+        1543,
+        1544,
+        1545,
+        1546,
+        1547,
+        1548,
+        1549,
+        1550,
+        1551,
+        1552,
+        1553,
+        1554,
+        1555,
+        1556,
+        1557,
+        1558,
+        1559,
+        1560,
+        1561,
+        1562,
+        1563,
+        1564,
+        1565,
+        1566,
+        1567,
+        1568,
+        1569,
+        1570,
+        1571,
+        1572,
+        1573,
+        1574,
+        1575,
+        1576,
+        1577,
+        1578,
+        1579,
+        1580,
+        1581,
+        1582,
+        1583,
+        1584,
+        1585,
+        1586,
+        1587,
+        1588,
+        1589,
+        1590,
+        1591,
+        1592,
+        1593,
+        1594,
+        1595,
+        1596,
+        1597,
+        1598,
+        1599,
+        1600,
+        1601,
+        1602,
+        1603,
+        1604,
+        1605,
+        1606,
+        1607,
+        1608,
+        1609,
+        1610,
+        1611,
+        1612,
+        1613,
+        1614,
+        1615,
+        1616,
+        1617,
+        1618,
+        1619,
+        1620,
+        1621,
+        1622,
+        1623,
+        1624,
+        1625,
+        1626,
+        1627,
+        1628,
+        1629,
+        1630,
+        1631,
+        1632,
+        1633,
+        1634,
+        1635,
+        1636,
+        1637,
+        1638,
+        1639,
+        1640,
+        1641,
+        1642,
+        1643,
+        1644
+      ],
+      "end_line": 1835,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.createSetting@1491",
+      "name": "createSetting",
+      "source_id": "settings",
+      "start_line": 1491,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
       "declaration": "public void loadOperationParameters()",
       "decompiler_warning_lines": [
         2518,
@@ -4927,6 +5720,49 @@
       "name": "loadConfig",
       "source_id": "settings",
       "start_line": 2798,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "public void loadMasterPosition(string filename)",
+      "decompiler_warning_lines": [
+        3544,
+        3545,
+        3546,
+        3547,
+        3548,
+        3549,
+        3550,
+        3551,
+        3552,
+        3553,
+        3554,
+        3555,
+        3556,
+        3557,
+        3558,
+        3559
+      ],
+      "end_line": 3669,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.loadMasterPosition@3542",
+      "name": "loadMasterPosition",
+      "source_id": "settings",
+      "start_line": 3542,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "private void readParameters(bool newblock)",
+      "decompiler_warning_lines": [],
+      "end_line": 4080,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassBioXPSettings.readParameters@4059",
+      "name": "readParameters",
+      "source_id": "settings",
+      "start_line": 4059,
       "status": "present_hash_locked_and_line_bounded"
     },
     {
@@ -5375,6 +6211,74 @@
     },
     {
       "binary_id": "CVisionLib.dll",
+      "declaration": "public unsafe void SaveImage(string fname)",
+      "decompiler_warning_lines": [
+        581,
+        595,
+        616,
+        630
+      ],
+      "end_line": 638,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassFrameGrabber.SaveImage@478",
+      "name": "SaveImage",
+      "source_id": "vision",
+      "start_line": 478,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CVisionLib.dll",
+      "declaration": "public unsafe bool locateCover(int corner, int xPos, int yPos, int cx, int cy, string fname, double* cDif, short* xDif, short* yDif, short* othereLines1, short* highFound)",
+      "decompiler_warning_lines": [
+        4921,
+        4927,
+        4929,
+        4930,
+        4933,
+        4938,
+        5240,
+        5245,
+        5250,
+        5255,
+        5257,
+        5258,
+        5260
+      ],
+      "end_line": 5373,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassFrameGrabber.locateCover@4578",
+      "name": "locateCover",
+      "source_id": "vision",
+      "start_line": 4578,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CVisionLib.dll",
+      "declaration": "public unsafe bool locateCover(string fname)",
+      "decompiler_warning_lines": [
+        5618,
+        5624,
+        5626,
+        5627,
+        5630,
+        5635,
+        5652,
+        5656,
+        5657
+      ],
+      "end_line": 5725,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassFrameGrabber.locateCover@5376",
+      "name": "locateCover",
+      "source_id": "vision",
+      "start_line": 5376,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CVisionLib.dll",
       "declaration": "public unsafe bool checkLabel(string fname)",
       "decompiler_warning_lines": [],
       "end_line": 9859,
@@ -5398,9 +6302,48 @@
       "source_id": "vision",
       "start_line": 12605,
       "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CVisionLib.dll",
+      "declaration": "public void setExposure(double expo)",
+      "decompiler_warning_lines": [],
+      "end_line": 13979,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassFrameGrabber.setExposure@13976",
+      "name": "setExposure",
+      "source_id": "vision",
+      "start_line": 13976,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CVisionLib.dll",
+      "declaration": "public void setAutoExposure()",
+      "decompiler_warning_lines": [],
+      "end_line": 13994,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassFrameGrabber.setAutoExposure@13991",
+      "name": "setAutoExposure",
+      "source_id": "vision",
+      "start_line": 13991,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "CommonLib.dll",
+      "declaration": "Well-to-row/column identifier map",
+      "decompiler_warning_lines": [],
+      "end_line": 102,
+      "kind": "enum",
+      "literal_sleeps": [],
+      "method_id": "wellID",
+      "name": "wellID",
+      "source_id": "wellid",
+      "start_line": 3,
+      "status": "present_hash_locked_and_line_bounded"
     }
   ],
-  "schema_id": "bioxp.oem_movement_method_source_binary_registry.v1",
+  "schema_id": "bioxp.oem_movement_method_source_binary_registry.v2",
   "scope": "Complete OEM startup movement envelope: application admission and worker; no-motion motor setup; initializeMotors; initializeMotion stale-tip remediation; optional self-test movement; camera/cover movement; park; door/interlocks; terminal startup branches. General post-admission job execution is excluded.",
   "selected_machine_configuration": {
     "config_sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475",
@@ -5453,6 +6396,34 @@
         "line": 7,
         "selector": "/BioXPCommonLib/GenBot/CameraInstalled/@Cameracalibrated",
         "value": true
+      },
+      {
+        "artifact": "config.xml",
+        "field": "OriginOffsetG",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@m_originOffsetG",
+        "value": 4450
+      },
+      {
+        "artifact": "config.xml",
+        "field": "GripperClosePOS",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperClosePOS",
+        "value": 27350
+      },
+      {
+        "artifact": "config.xml",
+        "field": "GripperOpenPOS",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperOpenPOS",
+        "value": 31400
+      },
+      {
+        "artifact": "config.xml",
+        "field": "GripperOpenWide",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@m_GripperOpenWide",
+        "value": 32400
       },
       {
         "artifact": "config.xml",
@@ -5509,6 +6480,20 @@
         "line": 15,
         "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@m_Z_MOTOR_STALL_GUARD_THRESHOLD",
         "value": 3
+      },
+      {
+        "artifact": "config.xml",
+        "field": "OutPutBufferatMS_Zlow",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@OutPutBufferatMS_Zlow",
+        "value": 0
+      },
+      {
+        "artifact": "config.xml",
+        "field": "OutlierRangeFactor",
+        "line": 15,
+        "selector": "/BioXPCommonLib/CalibrationFactors/Offsets/@OutlierRangeFactor",
+        "value": 4
       },
       {
         "artifact": "config.xml",
@@ -5633,13 +6618,119 @@
       },
       {
         "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3200.CamereInitialCheck",
+        "line_range": [
+          32,
+          41
+        ],
+        "selector": "CameraSettings/Settings3200/*[Key=CamereInitialCheck]",
+        "value": {
+          "Exposure": 1000,
+          "Gain": 1000,
+          "LED1": false,
+          "LED2": false,
+          "LED3": false
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
         "field": "InspectionSettings3200.CoverInspection",
         "line_range": [
           59,
           68
         ],
         "selector": "CameraSettings/Settings3200/*[Key=CoverInspection]",
-        "value": "selected camera-control block"
+        "value": {
+          "Exposure": 1000,
+          "Gain": 1000,
+          "LED1": false,
+          "LED2": true,
+          "LED3": false
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3200.OutputPlateInspection",
+        "line_range": [
+          108,
+          126
+        ],
+        "selector": "CameraSettings/Settings3200/*[Key=OutputPlateInspection]",
+        "value": {
+          "Exposure": 1000,
+          "Gain": 1000,
+          "LED1": false,
+          "LED2": false,
+          "LED3": false,
+          "pixelCount": 1000,
+          "threshold": 60
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3250.CamereInitialCheck",
+        "line_range": [
+          279,
+          288
+        ],
+        "selector": "CameraSettings/Settings3250/*[Key=CamereInitialCheck]",
+        "value": {
+          "Exposure": -3,
+          "Gain": 1000,
+          "LED1": false,
+          "LED2": false,
+          "LED3": false
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3250.CoverInspection",
+        "line_range": [
+          306,
+          315
+        ],
+        "selector": "CameraSettings/Settings3250/*[Key=CoverInspection]",
+        "value": {
+          "Exposure": -2,
+          "Gain": 1000,
+          "LED1": false,
+          "LED2": true,
+          "LED3": false
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3250.CoverStorageInspection",
+        "line_range": [
+          333,
+          342
+        ],
+        "selector": "CameraSettings/Settings3250/*[Key=CoverStorageInspection]",
+        "value": {
+          "Exposure": -1,
+          "Gain": 1000,
+          "LED1": true,
+          "LED2": true,
+          "LED3": true
+        }
+      },
+      {
+        "artifact": "InspectionSettings.xml",
+        "field": "InspectionSettings3250.OutputPlateInspection",
+        "line_range": [
+          366,
+          384
+        ],
+        "selector": "CameraSettings/Settings3250/*[Key=OutputPlateInspection]",
+        "value": {
+          "Exposure": -2,
+          "Gain": 1000,
+          "LED1": true,
+          "LED2": true,
+          "LED3": true,
+          "pixelCount": 1000,
+          "threshold": 30
+        }
       }
     ],
     "inspection_settings_sha256": "d38220177e7e01b3d6d50892e0ffbbe27b1eb46087c4623cd6ca4757cc80b2d7",
@@ -5661,10 +6752,68 @@
         0,
         15000
       ],
+      "GripperClosePOS": 27350,
+      "GripperOpenPOS": 31400,
+      "GripperOpenWide": 32400,
       "GripperVersion": 1,
       "InspectionLogOnly": false,
-      "InspectionSettings3200.CoverInspection": "selected camera-control block",
+      "InspectionSettings3200.CamereInitialCheck": {
+        "Exposure": 1000,
+        "Gain": 1000,
+        "LED1": false,
+        "LED2": false,
+        "LED3": false
+      },
+      "InspectionSettings3200.CoverInspection": {
+        "Exposure": 1000,
+        "Gain": 1000,
+        "LED1": false,
+        "LED2": true,
+        "LED3": false
+      },
+      "InspectionSettings3200.OutputPlateInspection": {
+        "Exposure": 1000,
+        "Gain": 1000,
+        "LED1": false,
+        "LED2": false,
+        "LED3": false,
+        "pixelCount": 1000,
+        "threshold": 60
+      },
+      "InspectionSettings3250.CamereInitialCheck": {
+        "Exposure": -3,
+        "Gain": 1000,
+        "LED1": false,
+        "LED2": false,
+        "LED3": false
+      },
+      "InspectionSettings3250.CoverInspection": {
+        "Exposure": -2,
+        "Gain": 1000,
+        "LED1": false,
+        "LED2": true,
+        "LED3": false
+      },
+      "InspectionSettings3250.CoverStorageInspection": {
+        "Exposure": -1,
+        "Gain": 1000,
+        "LED1": true,
+        "LED2": true,
+        "LED3": true
+      },
+      "InspectionSettings3250.OutputPlateInspection": {
+        "Exposure": -2,
+        "Gain": 1000,
+        "LED1": true,
+        "LED2": true,
+        "LED3": true,
+        "pixelCount": 1000,
+        "threshold": 30
+      },
       "Mode": "WebMode",
+      "OriginOffsetG": 4450,
+      "OutPutBufferatMS_Zlow": 0,
+      "OutlierRangeFactor": 4,
       "OutputChiller": {
         "FeedForward": 400,
         "MaxCoolingCurrent": -5,
@@ -5713,6 +6862,16 @@
       "role": "board_base",
       "sha256": "2622aee1810b9a8a52bed54a49196d50e50751465608c8420dd1e5077d95dd5e",
       "source_id": "base"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
+      "binary_id": "BioXPCommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 361,
+      "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
+      "role": "camera_profile_selection",
+      "sha256": "cca71fc368eb4afd9e231926e37168136e9177f48d7489508e49134d1693e630",
+      "source_id": "camerasettings"
     },
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
@@ -5785,6 +6944,16 @@
       "source_id": "ican"
     },
     {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
+      "binary_id": "BioXPCommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 24,
+      "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
+      "role": "camera_inspection_ordinal_map",
+      "sha256": "1d11cd0b2371ad513ef226b543fc2c6b944a45087d81008e96ef72b355ce523e",
+      "source_id": "inspectionitems"
+    },
+    {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassIOControl.cs",
       "binary_id": "ClassCanLib.dll",
       "binary_map_status": "canonical_evidence_lock",
@@ -5793,6 +6962,16 @@
       "role": "interlock_io",
       "sha256": "cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f",
       "source_id": "io"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/locationID.cs",
+      "binary_id": "CommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 52,
+      "relative_path": "decompiled_src_commonlib/CommonLib/locationID.cs",
+      "role": "route_location_identifier_map",
+      "sha256": "e99a88c5cf114526c2a08fb1f57fc6ab8860cdda17f838c3f13b48f868f59031",
+      "source_id": "locationid"
     },
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs",
@@ -5835,6 +7014,16 @@
       "source_id": "novousb"
     },
     {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
+      "binary_id": "BioXPCommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 9,
+      "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
+      "role": "terminal_start_mode_map",
+      "sha256": "efd41903654e20c1d3d23961c7d72ae1782efcdf5fed4038349e2719da0a17cb",
+      "source_id": "operationmode"
+    },
+    {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/BioXPControlLib/ClassPipette.cs",
       "binary_id": "BioXPControlLib.dll",
       "binary_map_status": "canonical_evidence_lock",
@@ -5853,6 +7042,26 @@
       "role": "pipette_collection",
       "sha256": "ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e",
       "source_id": "pipettes"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs",
+      "binary_id": "BioXPCommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 27,
+      "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs",
+      "role": "cover_plate_state_map",
+      "sha256": "5819dd8a2bf7aa74787d88da74595eee81da9adfe15b0693a98cea249490a4a0",
+      "source_id": "platename"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/positionStruct.cs",
+      "binary_id": "CommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 18,
+      "relative_path": "decompiled_src_commonlib/CommonLib/positionStruct.cs",
+      "role": "route_coordinate_payload",
+      "sha256": "202d6082f3d37273a782a9c719b93dce5fcf0a3065bf53d0ce42de39c9a75bd3",
+      "source_id": "positionstruct"
     },
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
@@ -5893,6 +7102,16 @@
       "role": "vision_primitive",
       "sha256": "6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501",
       "source_id": "vision"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/wellID.cs",
+      "binary_id": "CommonLib.dll",
+      "binary_map_status": "registry_extension_from_captured_assembly",
+      "line_count": 102,
+      "relative_path": "decompiled_src_commonlib/CommonLib/wellID.cs",
+      "role": "well_identifier_map",
+      "sha256": "e117e32acf2c61483c5033762d685e992e786d99e4d0ee1aff754b8edf9c6114",
+      "source_id": "wellid"
     }
   ],
   "status_legend": {
