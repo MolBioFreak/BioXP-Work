@@ -413,24 +413,43 @@ class _LifecycleHardware:
         self.tester = tester
 
     def set_led_rgb(self, r: int, g: int, b: int) -> dict[str, Any]:
-        return self.tester.strip_set_rgb(int(r), int(g), int(b), reconnect_first=False)
+        return self.tester.strip_set_rgb(
+            int(r),
+            int(g),
+            int(b),
+            reconnect_first=False,
+            activate_first=False,
+            fail_fast=True,
+        )
 
     def query_door(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 1, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
+        return {
+            "ok": self.tester._tmcl_success(ack),
+            "value": None if ack is None else ack.get("value"),
+            "ack": ack,
+            "query": "door",
+        }
 
     def query_latch(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 3, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
+        return {
+            "ok": self.tester._tmcl_success(ack),
+            "value": None if ack is None else ack.get("value"),
+            "ack": ack,
+            "query": "latch",
+        }
 
     def set_solenoid(self, value: int) -> dict[str, Any]:
-        return self.tester.deck_io_set_type(2, int(value))
+        result = self.tester.deck_io_set_type(2, int(value))
+        return {**result, "ok": result.get("ok") is True}
 
     def query_voltage(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 0, 0, 0)
         status = None if ack is None else ack.get("status")
         value = None if ack is None or status != 100 else ack.get("value")
         return {
+            "ok": bool(ack is not None and status == 100 and value is not None),
             "payload_raw": value,
             "reply_present": ack is not None,
             "transport_outcome": "reply" if ack is not None else "no_reply",
@@ -439,10 +458,12 @@ class _LifecycleHardware:
         }
 
     def deactivate_boards(self) -> dict[str, Any]:
-        return self.tester.deactivate_boards(expect_reply=True)
+        acks = self.tester.deactivate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
     def activate_boards(self) -> dict[str, Any]:
-        return self.tester.activate_boards(expect_reply=True)
+        acks = self.tester.activate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
 
 def _can_ready_observation() -> bool | None:

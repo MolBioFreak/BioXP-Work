@@ -214,6 +214,19 @@ class CanonicalLifecycleOwner:
             started = clock()
             trace: list[dict[str, Any]] = []
             sleeps: list[int] = []
+
+            def fail(error: str, **evidence: Any) -> dict[str, Any]:
+                return {
+                    "ok": False,
+                    "error": error,
+                    "can_ready_attempts": len([value for value in sleeps if value == 200]),
+                    "sleep_count": len(sleeps),
+                    "sleeps_ms": list(sleeps),
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "trace": list(trace),
+                    **evidence,
+                }
+
             num = 0
             while can_ready() is not True:
                 sleep(0.200)
@@ -255,6 +268,8 @@ class CanonicalLifecycleOwner:
 
             led = hardware.set_led_rgb(255, 255, 255)
             trace.append({"step": "LED_white", "rgb": [255, 255, 255], "result": led})
+            if not _result_ok(led):
+                return fail("LED_white_failed", led=led)
             sleep(0.050)
             sleeps.append(50)
             trace.append({"step": "LED_white_wait", "sleep_ms": 50})
@@ -272,9 +287,22 @@ class CanonicalLifecycleOwner:
                 }
             deactivate = hardware.deactivate_boards()
             trace.append({"step": "deactivate_boards", "result": deactivate})
+            if not _result_ok(deactivate):
+                return fail(
+                    "deactivate_boards_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                )
             activate = hardware.activate_boards()
             trace.append({"step": "activate_boards", "result": activate})
-            ok = bool(_result_ok(led) and _result_ok(deactivate) and _result_ok(activate))
+            if not _result_ok(activate):
+                return fail(
+                    "activate_boards_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                    activate_boards=activate,
+                )
+            ok = True
             return {
                 "ok": ok,
                 "error": None if ok else "initialCheck_side_effect_failed",
@@ -333,8 +361,12 @@ class CanonicalLifecycleOwner:
         trace.append({"step": "checkDoorStatus_wait", "sleep_ms": 500})
         door = hardware.query_door()
         trace.append({"step": "query_door", "result": door})
+        if not _result_ok(door):
+            return {"ok": False, "error": "query_door_failed", "door": door}
         latch = hardware.query_latch()
         trace.append({"step": "query_latch", "result": latch})
+        if not _result_ok(latch):
+            return {"ok": False, "error": "query_latch_failed", "door": door, "latch": latch}
         latch_value = _observation_value(latch)
         latch_action = None
         door_requery = None
@@ -342,18 +374,56 @@ class CanonicalLifecycleOwner:
         if latch_value == 1:
             latch_action = hardware.set_solenoid(1)
             trace.append({"step": "set_solenoid", "value": 1, "result": latch_action})
+            if not _result_ok(latch_action):
+                return {
+                    "ok": False,
+                    "error": "set_solenoid_latch_failed",
+                    "door": door,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                }
             sleep(0.800)
             sleeps.append(800)
             trace.append({"step": "latch_wait", "sleep_ms": 800})
             door_requery = hardware.query_door()
             trace.append({"step": "requery_door", "result": door_requery})
+            if not _result_ok(door_requery):
+                return {
+                    "ok": False,
+                    "error": "requery_door_failed",
+                    "door": door,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                    "door_requery": door_requery,
+                }
             latch_requery = hardware.query_latch()
             trace.append({"step": "requery_latch", "result": latch_requery})
+            if not _result_ok(latch_requery):
+                return {
+                    "ok": False,
+                    "error": "requery_latch_failed",
+                    "door": door_requery,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                    "door_requery": door_requery,
+                    "latch_requery": latch_requery,
+                }
             door = door_requery
             latch_value = _observation_value(latch_requery)
         voltage = hardware.query_voltage()
         power = self.voltage_observation_from_result(voltage)
         trace.append({"step": "query_24V", "result": voltage, "observation": power})
+        if not _result_ok(voltage):
+            return {
+                "ok": False,
+                "error": "query_24V_failed",
+                "door": door,
+                "latch": latch,
+                "door_requery": door_requery,
+                "latch_requery": latch_requery,
+                "latch_action": latch_action,
+                "power": power,
+            }
         door_value = _observation_value(door)
         door_closed = None if door_value is None else bool(door_value)
         latch_closed = None if latch_value is None else bool(latch_value)
@@ -363,6 +433,18 @@ class CanonicalLifecycleOwner:
         if power["oem_no24v"] is True:
             release = hardware.set_solenoid(0)
             trace.append({"step": "set_solenoid", "value": 0, "result": release})
+            if not _result_ok(release):
+                return {
+                    "ok": False,
+                    "error": "set_solenoid_release_failed",
+                    "door": door,
+                    "latch": latch,
+                    "door_requery": door_requery,
+                    "latch_requery": latch_requery,
+                    "latch_action": latch_action,
+                    "low_voltage_release": release,
+                    "power": power,
+                }
             with self._lock:
                 self._record_door_locked(door_closed=False, latch_closed=latch_closed, source="initialCheck.low_24V")
             sleep(0.300)
@@ -491,7 +573,17 @@ def _observation_value(result: Any) -> Any:
 def _result_ok(result: Any) -> bool:
     if not isinstance(result, Mapping):
         return bool(result)
-    return bool(result.get("ok", "error" not in result) and "error" not in result)
+    if "error" in result:
+        return False
+    explicit = result.get("ok")
+    if isinstance(explicit, bool):
+        return explicit
+    ack = result.get("ack")
+    if isinstance(ack, Mapping):
+        return ack.get("status") == 100
+    if "oem_status" in result or "reply_present" in result:
+        return result.get("reply_present") is True and result.get("oem_status") == 100
+    return False
 
 
 lifecycle_state = CanonicalLifecycleOwner()

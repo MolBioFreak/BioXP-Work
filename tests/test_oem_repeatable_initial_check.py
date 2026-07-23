@@ -82,6 +82,91 @@ def test_initial_check_is_repeatable_and_does_not_consume_camera_dependency():
     assert [call[0] for call in hardware.calls].count("activate") == 2
 
 
+def test_initial_check_stops_immediately_after_failed_led_write():
+    class FailedLedHardware(_InitialCheckHardware):
+        def set_led_rgb(self, r, g, b):
+            self.calls.append(("led_failed", r, g, b))
+            return {"ok": False, "acks": {"r": {"status": 2}}, "sent": 1}
+
+    owner = _owner_ready_for_initial_check()
+    owner.bind_configuration(start_mode="API", board_test_mode=False, check_camera=False)
+    hardware = FailedLedHardware()
+
+    result = owner.run_initial_check(
+        hardware, can_ready=lambda: True, sleep=lambda _seconds: None
+    )
+
+    evidence = result["startup"]["stages"]["initial_check"]["evidence"]
+    assert evidence["error"] == "LED_white_failed"
+    assert hardware.calls == [("led_failed", 255, 255, 255)]
+
+
+def test_initial_check_does_not_activate_after_deactivation_failure():
+    class FailedDeactivateHardware(_InitialCheckHardware):
+        def deactivate_boards(self):
+            self.calls.append(("deactivate_failed",))
+            return {"ok": False, "acks": {4: None}}
+
+    owner = _owner_ready_for_initial_check()
+    owner.bind_configuration(start_mode="API", board_test_mode=False, check_camera=False)
+    hardware = FailedDeactivateHardware()
+
+    result = owner.run_initial_check(
+        hardware, can_ready=lambda: True, sleep=lambda _seconds: None
+    )
+
+    evidence = result["startup"]["stages"]["initial_check"]["evidence"]
+    assert evidence["error"] == "deactivate_boards_failed"
+    assert ("deactivate_failed",) in hardware.calls
+    assert not [call for call in hardware.calls if call[0] == "activate"]
+
+
+def test_initial_check_stops_after_failed_production_door_ack():
+    class FailedDoorHardware(_InitialCheckHardware):
+        def query_door(self):
+            self.calls.append(("door_failed",))
+            return {"ok": False, "value": None, "ack": {"status": 2}, "query": "door"}
+
+    owner = _owner_ready_for_initial_check()
+    owner.bind_configuration(start_mode="API", board_test_mode=False, check_camera=False)
+    hardware = FailedDoorHardware()
+
+    result = owner.run_initial_check(
+        hardware, can_ready=lambda: True, sleep=lambda _seconds: None
+    )
+
+    evidence = result["startup"]["stages"]["initial_check"]["evidence"]
+    assert evidence["error"] == "query_door_failed"
+    assert hardware.calls == [("led", 255, 255, 255), ("door_failed",)]
+
+
+def test_initial_check_failed_voltage_status_does_not_release_solenoid_or_cycle_boards():
+    class FailedVoltageHardware(_InitialCheckHardware):
+        def query_voltage(self):
+            self.calls.append(("voltage_failed",))
+            return {
+                "ok": False,
+                "payload_raw": None,
+                "reply_present": True,
+                "transport_outcome": "reply",
+                "oem_status": 2,
+                "ack": {"status": 2},
+            }
+
+    owner = _owner_ready_for_initial_check()
+    owner.bind_configuration(start_mode="API", board_test_mode=False, check_camera=False)
+    hardware = FailedVoltageHardware()
+
+    result = owner.run_initial_check(
+        hardware, can_ready=lambda: True, sleep=lambda _seconds: None
+    )
+
+    evidence = result["startup"]["stages"]["initial_check"]["evidence"]
+    assert evidence["error"] == "query_24V_failed"
+    assert ("voltage_failed",) in hardware.calls
+    assert not [call for call in hardware.calls if call[0] in {"solenoid", "deactivate", "activate"}]
+
+
 def test_camera_gate_is_evaluated_only_at_initialize_system_boundary():
     owner = _owner_ready_for_initial_check()
     owner.bind_configuration(start_mode="API", board_test_mode=False, check_camera=True)

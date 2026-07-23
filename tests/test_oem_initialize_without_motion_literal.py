@@ -99,6 +99,95 @@ def test_initialize_without_motion_emits_literal_oem_wire_order(monkeypatch):
     assert sleeps == [0.001] + [0.002] * 19
 
 
+def test_initialize_without_motion_issues_no_write_after_first_failed_ack(monkeypatch):
+    tester, wire, _ = _literal_tester(monkeypatch, gripper_version=1)
+
+    def fail_first(**row):
+        wire.append(row)
+        return {**row, "ack": {"status": 2}, "ok": False}
+
+    monkeypatch.setattr(tester, "_oem_no_motion_tmcl", fail_first)
+
+    result = tester.motor_oem_initialize_without_motion()
+
+    assert result["ok"] is False
+    assert [row["name"] for row in wire] == ["turnOffHeater.tc_pwm_0.first"]
+    assert result["failures"] == [
+        {"name": "turnOffHeater.tc_pwm_0.first", "ack": {"status": 2}}
+    ]
+
+
+def test_strict_startup_led_write_stops_without_fallback_or_later_channels(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+    writes = []
+
+    def failed_ack(board, command, cmd_type, motor, value, **_kwargs):
+        writes.append((board, command, cmd_type, motor, value))
+        return {"status": 2}
+
+    monkeypatch.setattr(tester, "send_tmcl_retry", failed_ack)
+    monkeypatch.setattr(
+        tester,
+        "send_tmcl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict startup LED must not issue a fallback write")
+        ),
+    )
+    monkeypatch.setattr(
+        tester,
+        "activate_boards",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("initialCheck LED write must not activate boards implicitly")
+        ),
+    )
+
+    result = tester.strip_set_rgb(
+        255, 255, 255, reconnect_first=False, activate_first=False, fail_fast=True
+    )
+
+    assert result["ok"] is False
+    assert len(writes) == 1
+    assert list(result["acks"]) == ["r"]
+    assert result["sent"] == 1
+
+
+def test_wait_for_board_activation_stops_after_first_failed_board(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+    tester._oem_initialized_boards = set()
+    writes = []
+    clock, sleep = _fake_clock()
+
+    monkeypatch.setattr(tester, "enable_motor_power", lambda: None)
+
+    def failed_ack(board, *_args, **_kwargs):
+        writes.append(board)
+        return None
+
+    monkeypatch.setattr(tester, "send_tmcl_retry", failed_ack)
+
+    result = tester.motor_oem_wait_for_board(
+        timeout_s=2.0,
+        poll_interval_s=0.1,
+        activation_every_polls=1,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "waitForBoard_activation_failed"
+    assert writes == [tester.BOARDS[0]]
+    assert list(result["activations"][0]) == [tester.BOARDS[0]]
+
+
+def test_non_chiller_thermal_activation_rejects_status_two(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+    monkeypatch.setattr(tester, "_send_thermal", lambda *_args, **_kwargs: {"status": 2})
+
+    result = tester.thermal_activate()
+
+    assert result == {"ack": {"status": 2}, "ok": False}
+
+
 def test_initialize_without_motion_preserves_gripper_version_zero_literals(monkeypatch):
     tester, wire, _ = _literal_tester(monkeypatch, gripper_version=0)
 
@@ -134,8 +223,8 @@ def test_wait_for_board_preserves_oem_100ms_poll_and_31_poll_reactivation(monkey
     activations = []
     clock, sleep = _fake_clock()
 
-    def activate(expect_reply=True):
-        activations.append(expect_reply)
+    def activate(expect_reply=True, fail_fast=False):
+        activations.append((expect_reply, fail_fast))
         tester._oem_initialized_boards = set(tester.BOARDS)
         return {board: {"status": 100} for board in tester.BOARDS}
 
@@ -146,7 +235,7 @@ def test_wait_for_board_preserves_oem_100ms_poll_and_31_poll_reactivation(monkey
     assert result["ok"] is True
     assert result["polls"] == 31
     assert result["missing_boards"] == []
-    assert activations == [True]
+    assert activations == [(True, True)]
 
 
 def test_wait_for_board_returns_immediately_when_already_ready(monkeypatch):
@@ -170,7 +259,10 @@ def test_wait_for_board_times_out_with_exact_missing_board_evidence(monkeypatch)
     monkeypatch.setattr(
         tester,
         "activate_boards",
-        lambda expect_reply=True: activations.append(expect_reply) or {},
+        lambda expect_reply=True, fail_fast=False: activations.append(
+            (expect_reply, fail_fast)
+        )
+        or {board: {"status": 100} for board in tester.BOARDS},
     )
 
     result = tester.motor_oem_wait_for_board(
@@ -187,7 +279,7 @@ def test_wait_for_board_times_out_with_exact_missing_board_evidence(monkeypatch)
     assert result["missing_boards"] == [5, 7]
     assert result["physical_motion"] is False
     assert result["motion_commanded"] is False
-    assert activations == [True, True]
+    assert activations == [(True, True), (True, True)]
 
 
 def test_initialize_without_motion_stops_before_writes_when_board_wait_fails(monkeypatch):

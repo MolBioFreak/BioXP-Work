@@ -194,24 +194,33 @@ class BioXpStartupHardware:
     # Canonical initialCheck adapter methods.  They are invoked only by an
     # explicit lifecycle stage; none is called during provider construction.
     def set_led_rgb(self, r: int, g: int, b: int) -> dict:
-        return self.tester.strip_set_rgb(int(r), int(g), int(b), reconnect_first=False)
+        return self.tester.strip_set_rgb(
+            int(r),
+            int(g),
+            int(b),
+            reconnect_first=False,
+            activate_first=False,
+            fail_fast=True,
+        )
 
     def query_door(self) -> dict:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 1, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
+        return {"ok": self.tester._tmcl_success(ack), "value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
 
     def query_latch(self) -> dict:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 3, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
+        return {"ok": self.tester._tmcl_success(ack), "value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
 
     def set_solenoid(self, value: int) -> dict:
-        return self.tester.deck_io_set_type(2, int(value))
+        result = self.tester.deck_io_set_type(2, int(value))
+        return {**result, "ok": result.get("ok") is True}
 
     def query_voltage(self) -> dict:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 0, 0, 0)
         status = None if ack is None else ack.get("status")
         voltage = None if ack is None or status != 100 else ack.get("value")
         return {
+            "ok": bool(ack is not None and status == 100 and voltage is not None),
             "payload_raw": voltage,
             "reply_present": ack is not None,
             "transport_outcome": "reply" if ack is not None else "no_reply",
@@ -220,10 +229,12 @@ class BioXpStartupHardware:
         }
 
     def deactivate_boards(self) -> dict:
-        return self.tester.deactivate_boards(expect_reply=True)
+        acks = self.tester.deactivate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
     def activate_boards(self) -> dict:
-        return self.tester.activate_boards(expect_reply=True)
+        acks = self.tester.activate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
     def initial_check(self, *, mode: str = "shadow") -> dict:
         tester = self.tester
