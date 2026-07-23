@@ -202,7 +202,7 @@ catch Exception:
 
 | Code name | Direct OEM contract now sourced |
 |---|---|
-| `ClassPipetteCollection.queryTipStatus(int)` | A direct called method whose concrete body still must be resolved from its implementing/inherited source before transport implementation; it is the authoritative `TipExist` producer. |
+| `ClassPipetteCollection.queryTipStatus(int)` | `ClassPipetteCollection.cs:90-101,1336-1358`: aggregate query/TIP predicate is sourced; the lower `ClassPipette.QueryTipStatus()` transport body remains required. |
 | `ClassPipetteCollection.ejectAllTips(bool checkMissingTip=true, bool wait=true)` | `ClassPipetteCollection.cs:1176-1235`: selects active pipettes, queries tips, issues per-pipette `ejectTip`, waits up to 8000 ms when requested, checks missing-tip branch, calls `verifyEjectTip`, and resets `TipLocation=-1`. |
 | `ClassPipetteCollection.initiateGroup()` | `ClassPipetteCollection.cs:677-693`: reinitializes completed channels, waits `Reinitialize pipette` up to 10000 ms, enables pressure stream 1000 ms, then calculates pressure offset. |
 | `ClassPipetteCollection.checkedPipetteStatus()` | `ClassPipetteCollection.cs:726-748`: queries all four channels with 30 ms inter-command delays, sleeps 1 ms, then requires each error code to be zero. |
@@ -380,12 +380,12 @@ ClassBioXPSettings field definitions
 
 | OEM code name / artifact | Why it is still required |
 |---|---|
-| `ClassPipetteCollection.queryTipStatus`, `ejectAllTips`, `initiateGroup`, `checkedPipetteStatus` bodies and transport predicates | Required to reproduce `initializeMotion` stale-tip branch; no replacement behavior may substitute. |
-| `ClassControlInterface.openThermalDoor`, `scriptmoveTo`, `moveTo`, `moveX`, `moveZ` complete bodies | Required for post-home tip remediation, camera, cover, park, and movement constraints. |
-| `ControlLib.doorOpen`, `checkDoorStatus`, `inspectCover` helper methods (`checkChillerCover`, `InspectOutputLocation`, `checkRCCover`, `checkCoverStorage`, capture/release) | Required for complete close/open, inspection, and cover-rearrangement behavior. |
-| `ControlLib.selftest`, `TCSelfTest`, `RCSelfTest`, `OCSelfTest` complete bodies | Required before optional self-test can be implemented or exposed. |
-| `ControlLib.parkGantry` dependency bodies (`scriptmoveTo`, `HomeXY`, location table) | Required before any park claim. |
-| `ClassDeckBoard`, `ClassChillerBoard`, `ClassThermalBoard` activation/transport methods | Required to recreate board initialization/thermal/chiller conditions. |
+| `ClassPipette` command bodies plus `InterfaceCAN`/`ClassNovo` routing | The collection-level `queryTipStatus`, `ejectAllTips`, `verifyEjectTip`, `initiateGroup`, and `checkedPipetteStatus` bodies are now sourced. Lower `ClassPipette.QueryTipStatus`, `ejectTip`, `initiate`, `QueryStatus`, completion/error and transport ownership remain required. |
+| `ClassControlInterface.scriptmoveTo`, location/position tables, `moveTo`, `moveX`, `moveZ` complete bodies | Required for post-home tip remediation, camera, cover, park, and movement constraints. `moveX`/`moveZ` definitions are located; each physical route must be line-locked with selected serial-206 configuration. |
+| `ControlLib.doorOpen`, `checkDoorStatus`, `inspectCover` helper methods (`checkChillerCover`, `InspectOutputLocation`, `checkRCCover`, `checkCoverStorage`, capture/release) | Top-level `doorOpen`, `checkDoorStatus`, and `inspectCover` bodies are sourced; nested helpers and their selected camera/configuration assets remain required for complete parity. |
+| `ControlLib.selftest`, `TCSelfTest`, `RCSelfTest`, `OCSelfTest` lower thermal/chiller dependencies | Top-level and named subtest bodies are sourced; their invoked thermal/chiller transport implementations remain required before an optional self-test can be implemented or exposed. |
+| `ControlLib.parkGantry` dependency bodies (`scriptmoveTo`, `HomeXY`, location table) | `parkGantry` body is sourced; its route/location dependencies must be line-locked before any park claim. |
+| `ClassDeckBoard`, `ClassChillerBoard`, `ClassThermalBoard` activation/transport methods | Direct source files are located. Each called activation/transport body must be extracted and mapped to its OEM binary before use. |
 | `ClassBioXPSettings` reader and selected serial-206 config file(s) | Required to bind all conditional/numeric settings and location/calibration data. |
 | exact OEM DLL/IL map for every cited decompile | Required if any decompiler ambiguity affects a behavioral branch or literal. |
 
@@ -444,3 +444,54 @@ constructor_pipette
 ```
 
 The next physical OEM boundary is the queued `initializeSystem` worker path. It is intentionally not implemented or run by this specification work.
+
+## 15. Independent direct-source reconciliation — exact additions
+
+This section reconciles an independent three-way direct-C# audit performed against the same pinned OEM corpus. It supersedes less-specific wording elsewhere in this contract.
+
+### 15.1 Application and lifecycle corrections
+
+- `OperationMode` is directly defined by `OperationMode.cs:3-9` as:
+  `0=DevMode`, `1=WebMode`, `2=LocalMode`, `3=TradeShowMode`.
+- `initializeEnvironment()` **calls but does not consume** the Boolean returned by `initialCheck()` (`BioXPMainWindow.cs:976-979`). Its queue admission is based on the subsequent enclosure/latch branches, not that return value.
+- `initialCheck()` polls a persistently unready CAN service for **12 × 200 ms = 2400 ms** before returning false (`ControlLib.cs:8728-8759`).
+- `checkDoorStatus()` is source-significant: it sleeps 500 ms, may actuate the solenoid for 800 ms on latch value 1, and its `query24voltage()` branch changes returned truth/status fields (`ControlLib.cs:8670-8726`). A replacement must reproduce or separately label this behavior; it must not reduce it to a generic door-read predicate.
+- `motion_thread_process()` has no dispatch-level `try/finally`; it sets `GantryAvailable=false` before dispatch and `true` after its switch (`BioXPMainWindow.cs:2039-2100`). `UpdateCheck()==true` skips queued `initializeSystem` execution (`4264-4309`).
+- The `ShipMode == "PARK"` branch returns before `initializeSystem()` reaches its `finally`; the direct source therefore leaves `m_systemInmotion=true` on that return (`1127-1134`). This is OEM behavior to preserve or explicitly intercept, not normalize silently.
+- There is a separate `WarningSituation.ENCLOSURE_OPEN` recovery path in `BioXPMainWindow.cs:2627-2661` that calls `initializeMotion()` directly after enclosure recovery. It is not the normal full `initializeSystem` continuation and must not be exposed as a parity-equivalent full-startup command.
+
+### 15.2 Full `initializeMotion()` pipette contract now source-anchored
+
+The exact pipette methods are present in `ClassPipetteCollection.cs`; this corrects the earlier acquisition ledger from “body extraction required” to “body anchored, lower `ClassPipette` command transport still required.”
+
+| OEM code name | Exact direct behavior / anchor |
+|---|---|
+| `queryTipStatus(-1)` / `TipExist` | `TipExist` is true when any of four underlying `ClassPipette.TipLoaded` values exceeds zero; the integer query result is not the `initializeMotion()` branch predicate. `ClassPipetteCollection.cs:90-101,1336-1358`. |
+| `ejectAllTips(false,true)` | `1176-1235`: selects one/all channels, calls each selected `ejectTip`, waits up to 8000 ms, disables the missing-tip callback because `checkMissingTip=false`, calls `verifyEjectTip`, then sets `TipLocation=-1`. |
+| `verifyEjectTip()` | `1265-1323`: if any tip remains, ejects all four, waits 6000 ms, re-queries, then unlocks door and throws on persistent tips. |
+| `initiateGroup()` | `677-693`: reinitializes eligible channels, waits 10000 ms, enables pressure streaming for 1000 ms, then calculates pressure offset. |
+| `checkedPipetteStatus()` | `726-748`: queries all four with 30 ms inter-command delay, then requires each error code to be zero. |
+
+`initializeMotion()` calls raw `ClassControlInterface.openThermalDoor()` and ignores its Boolean result before setting `ThermalDoorOpen=true` (`ControlLib.cs:8809-8814`). `openThermalDoor()` itself uses `TCDoorStallGuardThreshold+2`, `TC_DOOR_MAX_CURRENT`, `TCDoorOpen`, and for serial >9 returns true only when `tcDoorOpened && !tcDoorClosed` (`ClassControlInterface.cs:2651-2676`).
+
+### 15.3 Full optional self-test contract
+
+`ControlLib.selftest()` is not a superficial health check. It queues `TCSelfTest`, `RCSelfTest`, and `OCSelfTest` in parallel; closes the thermal door; homes/moves X/Y/Z/gripper; applies lost-step thresholds (X/Y/Z: 100; gripper: 500); parks/unlocks; then waits for subtest completion (`ControlLib.cs:10688-10785`).
+
+- `TCSelfTest`: source thresholds/timeouts include 150-second high/low/lid criteria (`10788-10865`).
+- `RCSelfTest` / `OCSelfTest`: 180-second cooldown criteria (`10867-10999`).
+- Aggregate completion is called as `waitforcompletion(100000)` and status-date update occurs only on pass.
+
+No self-test control may exist until all three direct bodies and their thermal/chiller dependencies are implementation-complete.
+
+### 15.4 Concrete remaining OEM sources before full rework
+
+The following are the actual residual dependencies, not a license to infer behavior:
+
+1. `ClassPipette` command bodies (`QueryTipStatus`, `ejectTip`, `initiate`, `QueryStatus`, completion/error semantics) and the `InterfaceCAN` / `ClassNovo` routing and reply ownership they use.
+2. Full line-level bodies and selected serial-206 settings for `scriptmoveTo`, location/position tables, `moveTo`, `doorOpen`, `closeThermalDoor`, `HomeXY`, `HomeAxis`, and all cover-inspection helpers.
+3. `ClassChillerBoard`/thermal lower-level command and reply bodies used by chiller rates and TC/RC/OC self-tests. The source-file names are located; each called body must be line-locked before the corresponding action tranche.
+4. OEM selected `ClassBioXPSettings` reader/configuration path and immutable serial-206 values for every field listed in §10.
+5. Exact binary/IL mapping where a decompiler projection is ambiguous.
+
+These are the remaining OEM code names/artifacts needed for **full** initialization implementation. They are explicit acquisition work, not runtime implementation work.
