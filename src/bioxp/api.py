@@ -4979,29 +4979,13 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
     interlock = tester.motor_prepare_motion_interlock(force_lock=True)
     # Keep each supervised step source-shaped to ClassControlInterface.initializeMotors().
     if step == "z-home":
-        # Harmonize the stepwise startup route with the full initializeMotors Z stage.
-        # OEM source says initializeMotors starts with MotorZ.axisSearchHome(1791), but on
-        # this live stack the reconstructed startup semantics for that stage are the proven
-        # Z reference contract: accept an already-established reference, otherwise return to
-        # controller reference 0 with the Z-only helper and then verify.
-        z_probe = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
-        z_reference = None
-        z_verify = None
-        z_ok = bool(isinstance(z_probe, dict) and z_probe.get("ok") is True)
-        if not z_ok:
-            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=min(float(timeout_s), 90.0))
-            if isinstance(z_reference, dict) and z_reference.get("ok") is True:
-                z_verify = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
-                z_ok = bool(isinstance(z_verify, dict) and z_verify.get("ok") is True)
-        result = {
-            "ok": bool(z_ok),
-            "home": z_verify if isinstance(z_verify, dict) else z_probe,
-            "z_axisSearchHome_1791_probe": z_probe,
-            "z_reference_return": z_reference,
-            "z_reference_verify_after_return": z_verify,
-            "z_reference_return_skipped": bool(z_ok and z_reference is None),
-            "oem_z_stage_contract": "initializeMotors Z startup stage mirrored from full init live-reference recovery",
-        }
+        # Direct OEM anchor: ClassControlInterface.initializeMotors() calls
+        # MotorZ.axisSearchHome(speed=1791).  Do not substitute a right-limit
+        # reference return or a pre-home coordinate probe for that source step.
+        home_axis = getattr(tester, "motor_oem_home_axis", None)
+        if not callable(home_axis):
+            raise HTTPException(status_code=503, detail="OEM axisSearchHome runtime binding is unavailable")
+        result = home_axis("z", startup=True, timeout_s=timeout_s)
     elif step == "gripper-clear":
         result = gripper_clear(
             tester,
@@ -5020,6 +5004,9 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
         result = tester.motor_oem_home_axis("x", startup=True, timeout_s=timeout_s)
     elif step == "x-park-6000":
         preset = tester._motion_oem_axis_profile("x", startup=True)
+        # ClassControlInterface.initializeMotors(): after X axisSearchHome(250),
+        # wait 20 ms before setting X home, then set speed 1700 and wait 40 ms.
+        time.sleep(0.02)
         sethome = tester.motor_set_home(preset["board"], motor=preset["motor"])
         set_speed = tester.motor_set_axis_param(preset["board"], 4, 1700, motor=preset["motor"])
         time.sleep(0.04)

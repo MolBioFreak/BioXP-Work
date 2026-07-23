@@ -355,7 +355,7 @@ class BioXpStartupHardware:
     def startup_homing_stepwise(self, *, mode: str = "shadow", step: str = "plan", execute: bool = False, preclear_abs: int | None = None, require_operator_observed: bool = True) -> dict:
         tester = self.tester
         steps = [
-            {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True, "live_semantic_correction": "2026-05-03: positive/down return to physical Z=0 requires right-limit mask on this unit"},
+            {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
             {"step": "gripper-clear", "oem_anchor": "initializeMotors: setGripperCurrent(31); MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
@@ -385,15 +385,11 @@ class BioXpStartupHardware:
         if not bool(execute):
             return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "planned only; no axis/home/move command issued"}
         if selected == "z-home":
-            if not bool(execute):
-                return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "OEM initializeMotors first step: MotorZ.axisSearchHome(speed=1791); live profile softened and right-mask reference return encoded from 2026-05-03 proof"}
-            z_home = tester.motor_oem_home_axis("z", startup=True)
-            z_reference = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=30.0)
+            z_home = tester.motor_oem_home_axis("z", startup=True, timeout_s=30.0)
             post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
             z_home_ok = bool((z_home.get("home") or {}).get("ok")) if isinstance(z_home, dict) else False
-            z_reference_ok = bool(z_reference.get("ok")) if isinstance(z_reference, dict) else False
             return {
-                "ok": bool(z_home_ok and z_reference_ok),
+                "ok": z_home_ok,
                 "mode": mode,
                 "execute": True,
                 "physical_motion": True,
@@ -401,7 +397,6 @@ class BioXpStartupHardware:
                 "pre_snapshot": pre,
                 "post_snapshot": post,
                 "z_home": z_home,
-                "z_reference_return": z_reference,
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
             }

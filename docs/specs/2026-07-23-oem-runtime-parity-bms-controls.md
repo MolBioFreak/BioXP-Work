@@ -297,7 +297,7 @@ BMS must render the robot-provided stage state and blockers rather than locally 
 
 1. **Stage ledger:** Persist expected-next step, completed step, transport evidence, operator-observed state, and immutable artifact reference.
 2. **Observation route:** Add a no-motion typed route to record the operator result of a completed physical stage. It cannot mutate a controller reference.
-3. **Source primitive dossier binding:** Close the missing `axisSearchHome`, `doorSearchHome`, `moveSteps`, `setHome`, and `moveX` semantics from OEM source/trace before any corresponding stage is admitted live.
+3. **Source-to-runtime primitive binding:** The direct C# bodies for `axisSearchHome`, `doorSearchHome`, `moveSteps`, `setHome`, and motor transport are now recovered and hashed. Before a corresponding live stage is admitted, bind its exact source semantics to the runtime—plus OEM configuration inputs and live evidence—without substituting a non-OEM primitive.
 4. **Bounded primitive contracts:** Enforce source-derived direction, predicate, stop behavior, timeout, and travel bound; never infer them from a generic home helper.
 5. **Full-stage implementations:** Implement post-home tip handling and terminal camera/cover/park/StartMode gates before showing end-to-end buttons.
 6. **Artifact index/read API:** Make the exact stage artifact available through a safe read-only robot route so BMS can display/link the result without filesystem access.

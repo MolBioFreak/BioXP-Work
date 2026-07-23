@@ -17,6 +17,9 @@
 | `BioXPControlLib/ClassControlInterface.cs` | `86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e` | motor configuration, full initialization order, post-home settings |
 | `BioXPControlLib/ControlLib.cs` | `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2` | CAN/door initial check, initializeMotion, tip-remediation branch |
 | `GenBotApp/BioXPMainWindow.cs` | `b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c` | application startup, door/latch gate, motion worker, initializeSystem branches |
+| `ClassCanLib/ClassHeadBoard.cs` | `342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea` | head-board `goHome`, `axisSearchHome`, `queryHome`, `moveSteps`, stop/reference behavior |
+| `ClassCanLib/ClassThermalBoard.cs` | `23d50725da200044422fde56b00611df708b514cef0f3637b2ad8d19e0b23f26` | thermal-door `doorSearchHome`, `axisSearchHome`, closed/open predicates |
+| `ClassCanLib/ClassMotor.cs` | `9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99` | OEM MoveLeft/MoveRight/StopMotor/setHome/query switch transport semantics |
 
 **Source locations**
 
@@ -24,6 +27,9 @@
 /home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs
 /home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs
 /home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs
+/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs
+/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassThermalBoard.cs
+/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs
 ```
 
 ## 2. Boundary already passed
@@ -100,23 +106,24 @@ The queue and worker boundary is mandatory; it is not an implementation convenie
 
 **Acceptance artifact:** an immutable, redacted configuration snapshot that identifies the OEM source of every input. A missing value is a **blocker**, not permission to select a default.
 
-### Phase 3 — Complete the source contract for board-level homing primitives
+### Phase 3 — Bind the recovered OEM board-level primitive contract
 
-**Objective:** Acquire the OEM implementation or an OEM trace for every called primitive whose behavior is not defined in the available authority set.
+**Objective:** Use the recovered hashed OEM board sources as the sole semantic authority for startup primitives. This phase replaces the prior evidence-acquisition blocker; it does **not** remove configuration binding or live physical-proof gates.
 
-**Required evidence before implementation/live enablement:**
+| Primitive | Direct OEM implementation | Binding contract |
+|---|---|---|
+| `axisSearchHome(axis, speed)` | `ClassHeadBoard.cs:368-415`; `ClassThermalBoard.cs:412-459` | `setHome`; record speed; if `queryHome` active, `moveToAbs(10000)` then sleep 500 ms; clear `MotorHome`; call `goHome(false, axis, speed)`. |
+| `goHome(rehome, axis, speed)` | `ClassHeadBoard.cs:60-119`; thermal equivalent `ClassThermalBoard.cs:118+` | `rehome=true` alone adds `moveToAbs(10000)`; startup calls `rehome=false`; issue `MoveLeft`; wait up to 30 s for stop; poll `queryHome`; stop; then `setHome`. Gripper timeout has its own recovery branch. |
+| `queryHome` / `queryRightSensor` | `ClassHeadBoard.cs:389-415`; `ClassThermalBoard.cs:433-459` | OEM home is **left switch** active: `queryLeftSwitchStatus() == 0`; right sensor is separate and is not interchangeable with home. |
+| motor transport primitives | `ClassMotor.cs:74-182, 231-260, 492-516, 641-688` | `MoveLeft` command 2; `MoveRight` command 1; `StopMotor` command 3 is transmitted twice; `setHome` command 5/1; left/right raw switch query commands 6/9 and 6/10 report active when reply byte 6 equals 1, while the OEM wrapper maps active to method return `0`. |
+| `doorSearchHome(axis, speed, stallGuard)` | `ClassThermalBoard.cs:364-410` | If already home or serial `<10`, set stall guard `+2` and `moveSteps(+2000)`; restore stall guard; `MoveLeft`; poll every 50 ms with counter 300, shortening to 80 after home; stop; `setHome` if home (or serial `<10`); otherwise fail only when camera calibrated. |
+| `moveSteps(gripper, 10000, true)` | `ClassHeadBoard.cs:231-286` | Enforce board limit check; relative move; wait up to 20 s when requested; error returns/throws are source-defined. |
+| `setHome(axis)` | `ClassMotor.cs:492-516` | Command 5/1 sets controller coordinate zero and local home/position-clean state. |
+| `moveX(6000)` | `ClassControlInterface.cs:4206-4248` | X is clamped to at least 60 then moved absolute using the board path; startup first sets X speed 1700 and sleeps 40 ms. |
 
-| Primitive | Called by | Available authority proves | Missing source evidence that must be acquired |
-|---|---|---|---|
-| `axisSearchHome(axis, speed)` | Z/G/X/Y startup calls | axis order and caller-supplied speeds | direction command, switch predicate/polarity, transition rule, timeout, stop behavior, reference-set semantics, failure return |
-| `doorSearchHome(axis, velocity, stallGuard)` | thermal-door startup call | call parameters and following closed-door branch | wire/stop/predicate semantics and failure return |
-| `moveSteps(gripper, 10000, true)` | gripper-clear step | exact signed value and boolean argument | motion completion/timeout/result contract |
-| `setHome(axis)` | X and Y post-search | exact placement in sequence | controller/reference completion semantics |
-| `moveX(6000)` | immediately after X set-home | exact position/order | completion and bounds semantics |
+**Hard source rule:** `ClassControlInterface.initializeMotors()` calls `axisSearchHome(Z, 1791)`. A right-limit reference return, coordinate-zero shortcut, or any other post-Z motion is not part of that stage and must be represented as a separate non-OEM diagnostic, never as OEM startup parity.
 
-The current three-file authority set calls these board primitives but does not define their bodies. Do **not** infer them from method names, generic driver behavior, or a prior Linux route. Acquire the OEM board-control assembly/decompilation or a captured OEM transport trace with request, response/event, order, and timing.
-
-**Acceptance artifact:** one source dossier per primitive: origin file/binary hash, method body or trace provenance, parameter semantics, success/failure observation, and the exact startup consumer.
+**Acceptance artifact:** source-to-runtime primitive matrix with file hash/lines, exact source behavior, runtime disposition, and explicit deviation status for every startup primitive.
 
 ### Phase 4 — Implement `initializeMotors()` in literal OEM order
 

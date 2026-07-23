@@ -4750,7 +4750,10 @@ class BioXpTester:
         preclear_threshold = None
         preclear_move = None
         preclear_wait = None
-        if (not bool(startup)) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
+        home_before_active = isinstance(home_before, dict) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        # The serial-<10 branch in ClassThermalBoard.doorSearchHome is withheld
+        # until the OEM configuration binder supplies a typed serial number.
+        if home_before_active:
             preclear_threshold = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold + 2, motor=motor)
             preclear_move = self.motor_move_relative(board, 2000, motor=motor)
             preclear_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 8.0))
@@ -5086,12 +5089,17 @@ class BioXpTester:
     def motor_oem_initialize_motors_full_sequence(self, *, timeout_s=120.0):
         """Source-shaped ClassControlInterface.initializeMotors() full homing sequence.
 
-        This is the OEM full initialization homing body, distinct from the separate
-        HomeXY helper.  Source order:
-        Z axisSearchHome(1791) -> G +10000 clear + G axisSearchHome ->
-        X axisSearchHome(250), setHome, setSpeed(1700), moveX(6000) ->
-        Y axisSearchHome(250) -> ThermalDoor.doorSearchHome.
+        The original body remains retained below for source-to-runtime rewrite work,
+        but is deliberately unreachable until every stage has passed direct-OEM review.
         """
+        return {
+            "ok": False,
+            "source_mode": "ClassControlInterface.initializeMotors",
+            "physical_motion_commanded": False,
+            "blocked": True,
+            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+        }
+
         t0 = time.time()
         out = {
             "ok": False,
@@ -5233,6 +5241,14 @@ class BioXpTester:
         so this wrapper keeps that distinction explicit and delegates the physical
         homing body to the source-shaped initializeMotors mimic.
         """
+        return {
+            "ok": False,
+            "source_mode": "ControlLib.rehome",
+            "physical_motion_commanded": False,
+            "blocked": True,
+            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+        }
+
         t0 = time.time()
         result = self.motor_startup_homing_mimic()
         door_state_save = self.motor_plan_thermal_door_restore(restore_requested=False)
