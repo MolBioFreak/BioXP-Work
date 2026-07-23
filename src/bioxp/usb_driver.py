@@ -50,6 +50,12 @@ class UvcXuControlQuery(ctypes.Structure):
     ]
 
 
+class BioXpConstructionCleanupError(RuntimeError):
+    def __init__(self, message, *, partial_owner):
+        super().__init__(message)
+        self.partial_owner = partial_owner
+
+
 class BioXpTester:
     BOARD_HEAD = 0x04
     BOARD_DECK = 0x05
@@ -404,8 +410,20 @@ class BioXpTester:
             "seq": 0,
         }
         self._motion_last_strict_init = None
-        self._connect()
-        self._led_state_cache = self.load_led_state()
+        try:
+            self._connect()
+            self._led_state_cache = self.load_led_state()
+        except Exception as exc:
+            try:
+                self._disconnect()
+            except Exception as cleanup_exc:
+                self._construction_cleanup_failed = True
+                error = BioXpConstructionCleanupError(
+                    f"BioXP construction failed and USB cleanup failed: {cleanup_exc}",
+                    partial_owner=self,
+                )
+                raise error from exc
+            raise
 
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
@@ -487,10 +505,15 @@ class BioXpTester:
 
     def _disconnect(self, dev=None, *, hard_reset=False, return_device=False):
         with self._transport_guard():
+            cleanup_errors = []
             router = getattr(self, "novo_router", None)
             if router is not None:
-                router.shutdown()
-                self.novo_router = None
+                try:
+                    router.shutdown()
+                except Exception as exc:
+                    cleanup_errors.append(f"router shutdown failed: {exc}")
+                finally:
+                    self.novo_router = None
             if dev is None:
                 dev = self.dev
             if dev is self.dev:
@@ -516,12 +539,14 @@ class BioXpTester:
             except Exception as exc:
                 summary["release_interface_ok"] = False
                 summary["release_interface_error"] = str(exc)
+                cleanup_errors.append(f"release interface failed: {exc}")
             try:
                 usb.util.dispose_resources(dev)
                 summary["dispose_resources_ok"] = True
             except Exception as exc:
                 summary["dispose_resources_ok"] = False
                 summary["dispose_resources_error"] = str(exc)
+                cleanup_errors.append(f"dispose resources failed: {exc}")
             if hard_reset:
                 try:
                     dev.reset()
@@ -529,6 +554,9 @@ class BioXpTester:
                 except Exception as exc:
                     summary["hard_reset_ok"] = False
                     summary["hard_reset_error"] = str(exc)
+                    cleanup_errors.append(f"hard reset failed: {exc}")
+            if cleanup_errors:
+                raise RuntimeError("; ".join(cleanup_errors))
             return dev if return_device else summary
 
     def _reset_transport_recovery_state(self):

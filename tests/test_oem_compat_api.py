@@ -210,6 +210,7 @@ def test_maintenance_usb_reconnect_is_localhost_only_and_recreates_runtime(monke
 
     monkeypatch.setattr(api, "BioXpTester", FakeTester)
     monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_quarantined_tester", None)
     monkeypatch.setattr(api, "_startup_error", "released")
     client = TestClient(api.app)
 
@@ -223,3 +224,302 @@ def test_maintenance_usb_reconnect_is_localhost_only_and_recreates_runtime(monke
     assert created == [1]
     assert isinstance(api._tester, FakeTester)
     assert api._startup_error is None
+
+
+def test_service_usb_activation_claims_ownership_without_snapshot_recovery_or_motion(monkeypatch):
+    import src.bioxp.api as api
+
+    created = []
+    shared_transport = object()
+
+    class FakeTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            created.append(alt)
+
+    monkeypatch.setattr(api, "BioXpTester", FakeTester)
+    monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: shared_transport)
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_quarantined_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "_startup_error", "generic lifespan unbound")
+    client = TestClient(api.app)
+
+    response = client.post("/oem/runtime/activate_service")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["usb_owner"] == "service"
+    assert body["snapshot_collected"] is False
+    assert body["motion_recovered"] is False
+    assert body["motion_commanded"] is False
+    assert created == [1]
+    assert isinstance(api._tester, FakeTester)
+    assert api._pipette_transport is shared_transport
+    assert api._startup_error is None
+    first_epoch = api.hardware_state.ownership_epoch
+    status = api._status_payload()
+    assert status["runtime_available"] is True
+    assert status["hardware_connected"] is None
+
+    repeated = client.post("/oem/runtime/activate_service")
+
+    assert repeated.status_code == 200
+    assert repeated.json()["already_active"] is True
+    assert api.hardware_state.ownership_epoch == first_epoch
+    assert created == [1]
+
+
+def test_service_usb_activation_disconnects_partial_owner_when_transport_build_fails(monkeypatch):
+    import src.bioxp.api as api
+
+    created = []
+    cleanup_wait_timeouts = []
+    original_wait_for = api.asyncio.wait_for
+
+    async def track_wait_for(awaitable, *, timeout):
+        if timeout == 20.0:
+            cleanup_wait_timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout=timeout)
+
+    class FakeTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            self.disconnected = False
+            created.append(self)
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    def fail_transport(*, shared_usb):
+        assert shared_usb is created[0]
+        raise RuntimeError("pipette transport failed")
+
+    monkeypatch.setattr(api, "BioXpTester", FakeTester)
+    monkeypatch.setattr(api, "build_default_pipette_transport", fail_transport)
+    monkeypatch.setattr(api.asyncio, "wait_for", track_wait_for)
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_quarantined_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "_startup_error", "generic lifespan unbound")
+    client = TestClient(api.app)
+
+    response = client.post("/oem/runtime/activate_service")
+
+    assert response.status_code == 503
+    assert created[0].disconnected is True
+    assert api._tester is None
+    assert api._pipette_transport is None
+    assert api._startup_error == "pipette transport failed"
+    assert cleanup_wait_timeouts == []
+
+
+def test_service_usb_activation_tracks_partial_owner_when_disconnect_fails(monkeypatch):
+    import pytest
+    import src.bioxp.api as api
+
+    created = []
+
+    class FakeTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            created.append(self)
+
+        def _disconnect(self):
+            raise RuntimeError("USB release failed")
+
+    def fail_transport(*, shared_usb):
+        raise RuntimeError("pipette transport failed")
+
+    monkeypatch.setattr(api, "BioXpTester", FakeTester)
+    monkeypatch.setattr(api, "build_default_pipette_transport", fail_transport)
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_quarantined_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    client = TestClient(api.app)
+
+    response = client.post("/oem/runtime/activate_service")
+
+    assert response.status_code == 503
+    assert api._tester is None
+    assert api._quarantined_tester is created[0]
+    assert api._pipette_transport is None
+    assert api._startup_error is not None
+    assert "partial USB owner cleanup failed: USB release failed" in api._startup_error
+
+    with pytest.raises(api.HTTPException, match="cleanup failed"):
+        api._get_tester()
+
+    repeated = client.post("/oem/runtime/activate_service")
+    assert repeated.status_code == 503
+    assert "cleanup failed" in repeated.json()["detail"]
+    assert len(created) == 1
+
+
+def test_service_usb_activation_rejects_inconsistent_partial_runtime(monkeypatch):
+    import src.bioxp.api as api
+
+    orphan_transport = object()
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_quarantined_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", orphan_transport)
+    monkeypatch.setattr(
+        api,
+        "BioXpTester",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not construct over partial state")),
+    )
+    client = TestClient(api.app)
+
+    response = client.post("/oem/runtime/activate_service")
+
+    assert response.status_code == 503
+    assert "internally inconsistent" in response.json()["detail"]
+
+
+def test_bioxp_tester_constructor_disconnects_if_connect_fails_after_usb_claim(monkeypatch):
+    import pytest
+    from src.bioxp.usb_driver import BioXpTester
+
+    disconnected = []
+
+    def fail_connect(self):
+        self.dev = object()
+        raise RuntimeError("connect failed after claim")
+
+    def record_disconnect(self):
+        disconnected.append(self.dev)
+        self.dev = None
+
+    monkeypatch.setattr(BioXpTester, "_connect", fail_connect)
+    monkeypatch.setattr(BioXpTester, "_disconnect", record_disconnect)
+
+    with pytest.raises(RuntimeError, match="connect failed after claim"):
+        BioXpTester(alt=1)
+
+    assert len(disconnected) == 1
+
+
+def test_bioxp_tester_constructor_exposes_quarantinable_owner_when_cleanup_fails(monkeypatch):
+    import pytest
+    import src.bioxp.usb_driver as usb_driver
+
+    class Router:
+        def shutdown(self):
+            raise RuntimeError("router did not stop")
+
+    device = object()
+    released = []
+
+    def fail_connect(self):
+        self.dev = device
+        self.ep_in = object()
+        self.ep_out = object()
+        self.novo_router = Router()
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(usb_driver.BioXpTester, "_connect", fail_connect)
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda dev, interface: released.append((dev, interface)))
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: released.append((dev, "disposed")))
+
+    with pytest.raises(usb_driver.BioXpConstructionCleanupError) as caught:
+        usb_driver.BioXpTester(alt=1)
+
+    owner = caught.value.partial_owner
+    assert owner.dev is None
+    assert owner.novo_router is None
+    assert owner._construction_cleanup_failed is True
+    assert released == [(device, 0), (device, "disposed")]
+
+
+def test_service_usb_activation_cancellation_drains_constructor_and_disconnects_candidate(monkeypatch):
+    import asyncio
+    import threading
+    import pytest
+    import src.bioxp.api as api
+
+    constructor_started = threading.Event()
+    constructor_release = threading.Event()
+    instances = []
+
+    class SlowTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            self.disconnected = False
+            instances.append(self)
+            constructor_started.set()
+            constructor_release.wait(timeout=2.0)
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    async def scenario():
+        monkeypatch.setattr(api, "BioXpTester", SlowTester)
+        monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: object())
+        monkeypatch.setattr(api, "_tester", None)
+        monkeypatch.setattr(api, "_quarantined_tester", None)
+        monkeypatch.setattr(api, "_pipette_transport", None)
+        task = asyncio.create_task(api.oem_runtime_activate_service())
+        assert await asyncio.to_thread(constructor_started.wait, 1.0)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert api._tester_lock.locked() is True
+        assert task.done() is False
+
+        constructor_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert instances[0].disconnected is True
+        assert api._tester is None
+        assert api._pipette_transport is None
+
+    asyncio.run(scenario())
+
+
+def test_service_usb_activation_cancellation_drains_failure_cleanup(monkeypatch):
+    import asyncio
+    import threading
+    import pytest
+    import src.bioxp.api as api
+
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    instances = []
+
+    class FakeTester:
+        def __init__(self, *, alt):
+            self.alt = alt
+            self.disconnected = False
+            instances.append(self)
+
+        def _disconnect(self):
+            cleanup_started.set()
+            cleanup_release.wait(timeout=2.0)
+            self.disconnected = True
+
+    def fail_transport(*, shared_usb):
+        raise RuntimeError("transport build failed")
+
+    async def scenario():
+        monkeypatch.setattr(api, "BioXpTester", FakeTester)
+        monkeypatch.setattr(api, "build_default_pipette_transport", fail_transport)
+        monkeypatch.setattr(api, "_tester", None)
+        monkeypatch.setattr(api, "_quarantined_tester", None)
+        monkeypatch.setattr(api, "_pipette_transport", None)
+        task = asyncio.create_task(api.oem_runtime_activate_service())
+        assert await asyncio.to_thread(cleanup_started.wait, 1.0)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert api._tester_lock.locked() is True
+        assert task.done() is False
+
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert instances[0].disconnected is True
+        assert api._tester is None
+        assert api._pipette_transport is None
+
+    asyncio.run(scenario())

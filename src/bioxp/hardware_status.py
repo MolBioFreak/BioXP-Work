@@ -95,7 +95,9 @@ class HardwareStateOwner:
             if router is not None:
                 self._ownership["router"] = str(router)
                 if str(router) == "running":
-                    self._ownership["CAN_READY"] = True
+                    # A running reader/router proves software ownership only.
+                    # CAN readiness remains unknown until explicit query evidence.
+                    self._ownership["CAN_READY"] = None
                 elif str(router) == "stopped":
                     self._ownership["CAN_READY"] = False
                 elif str(router) == "unbound":
