@@ -1,7 +1,7 @@
 # BioXP 3200 Complete OEM Initialization Contract — Source-Only
 
-**Date:** 2026-07-23  
-**Target:** BioXP 3200 serial 206  
+**Date:** 2026-07-23
+**Target:** BioXP 3200 serial 206
 **Status:** specification / source-extraction contract only — **no runtime implementation authorization**
 
 ## 1. Governing rule and claim boundary

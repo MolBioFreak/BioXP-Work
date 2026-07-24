@@ -419,8 +419,8 @@ def test_bioxp_tester_constructor_exposes_quarantinable_owner_when_cleanup_fails
         raise RuntimeError("connect failed")
 
     monkeypatch.setattr(usb_driver.BioXpTester, "_connect", fail_connect)
-    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda dev, interface: released.append((dev, interface)))
-    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: released.append((dev, "disposed")))
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda dev, interface: released.append((dev, interface)), raising=False)
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: released.append((dev, "disposed")), raising=False)
 
     with pytest.raises(usb_driver.BioXpConstructionCleanupError) as caught:
         usb_driver.BioXpTester(alt=1)

@@ -1012,21 +1012,21 @@ class OemHomeXYRequest(BaseModel):
 
 
 class OemRehomeRequest(BaseModel):
-    operator_ack: str = Field(..., description="Must be exactly REHOME for the direct ControlLib.rehome wrapper.")
-    run_homing: bool = Field(False, description="Default false returns fail-closed/no-motion route metadata; true runs the monolithic wrapper.")
+    operator_ack: str = Field(..., description="Must be exactly REHOME for the intentionally blocked ControlLib.rehome source-mode surface.")
+    run_homing: bool = Field(False, description="Default false returns fail-closed/no-motion route metadata; true reaches the intentionally blocked rehome surface and does not enable physical homing.")
     timeout_s: float = Field(120.0, gt=1.0, le=240.0)
 
 
 class OemInitializeMotionRequest(BaseModel):
-    operator_ack: str = Field(..., description="INITIALIZE for no-homing diagnostic; INITIALIZE_WITH_HOMING for homing body.")
-    run_homing: bool = Field(False, description="False calls initialize-without-motion only; true delegates to the homing/rehome wrapper.")
+    operator_ack: str = Field(..., description="INITIALIZE for no-homing diagnostic; INITIALIZE_WITH_HOMING reaches the intentionally blocked rehome surface.")
+    run_homing: bool = Field(False, description="False calls initialize-without-motion only; true delegates to intentionally blocked rehome and does not enable physical homing.")
     include_tip_pipette_cleanup: bool = Field(False, description="Reserved label only; cleanup remains not ported until source-equivalent primitives exist.")
     timeout_s: float = Field(120.0, gt=1.0, le=240.0)
 
 
 class OemInitializationRunRequest(BaseModel):
-    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing dry/controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING for live homing body.")
-    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true runs source-shaped homing/controller phases.")
+    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING acknowledges a request that remains fail-closed.")
+    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true is intentionally blocked and does not enable physical homing.")
     restore_door_state: bool = Field(False, description="Request explicit source-mode door restore policy after init. Open restore remains explicit, not silent.")
     include_tip_pipette_cleanup: bool = Field(False, description="Reserved label; cleanup remains explicitly unsupported until source-equivalent primitives exist.")
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
@@ -5078,10 +5078,13 @@ def _execute_oem_rehome(tester: BioXpTester, *, timeout_s: float) -> dict:
     result = tester.motor_oem_rehome(timeout_s=timeout_s)
     return {
         "ok": bool(isinstance(result, dict) and result.get("ok") is True),
+        "physical_motion_commanded": bool(
+            isinstance(result, dict) and result.get("physical_motion_commanded") is True
+        ),
         "source_mode": "ControlLib.rehome",
         "route_semantics": {
             "source_command": "ControlLib.rehome",
-            "home_semantics": "rehome_wrapper_over_initializeMotors",
+            "home_semantics": "rehome_intentionally_blocked_no_monolithic_live_homing",
             "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"],
             "raw_fastapi_route": "/motion/oem/rehome",
         },
@@ -5104,10 +5107,13 @@ def _execute_oem_initialize_motion(
     )
     return {
         "ok": bool(isinstance(result, dict) and result.get("ok") is True),
+        "physical_motion_commanded": bool(
+            isinstance(result, dict) and result.get("physical_motion_commanded") is True
+        ),
         "source_mode": "ControlLib.initializeMotion",
         "route_semantics": {
             "source_command": "ControlLib.initializeMotion",
-            "home_semantics": "initializeMotion_wrapper_run_homing_true_delegates_to_initializeMotors",
+            "home_semantics": "initializeMotion_homing_request_delegates_to_blocked_rehome_no_motion",
             "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"],
             "raw_fastapi_route": "/motion/oem/initialize_motion",
         },
@@ -5243,7 +5249,7 @@ async def motion_oem_rehome(req: OemRehomeRequest):
             "failed_closed": True,
             "source_mode": "ControlLib.rehome",
             "physical_motion_commanded": False,
-            "message": "Direct rehome wrapper is available, but run_homing=true is required to command monolithic live homing.",
+            "message": "Direct monolithic OEM rehome is intentionally blocked pending a literal source-equivalent stage rewrite; run_homing=true does not enable physical homing.",
             "route_semantics": {"raw_fastapi_route": "/motion/oem/rehome", "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"]},
         }
     _require_motion_route_ready()
@@ -5260,6 +5266,17 @@ async def motion_oem_initialization_run(req: OemInitializationRunRequest):
     expected_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if bool(req.run_homing) else "OEM_INITIALIZATION_RUN"
     if req.operator_ack != expected_ack:
         raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initialization controller run_homing={bool(req.run_homing)}")
+    if bool(req.run_homing):
+        return {
+            "ok": False,
+            "ready": False,
+            "failed_closed": True,
+            "physical_motion_commanded": False,
+            "source_mode": "GenBotApp.initializeSystem -> ControlLib.initializeMotion -> initializeMotors",
+            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+            "message": "Monolithic OEM initialization homing is intentionally blocked pending a literal source-equivalent stage rewrite; run_homing=true does not enable physical homing.",
+            "route_semantics": {"raw_fastapi_route": "/motion/oem/initialization/run", "not_equivalent_to": ["/motion/axis/home", "/motion/axis/zero", "/motion/oem/rehome monolith"]},
+        }
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(

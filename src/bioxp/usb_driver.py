@@ -3434,7 +3434,7 @@ class BioXpTester:
         # when physical motion doesn't match encoder feedback.
         renc = self.motor_set_axis_param(board_id, 212, 0, motor=motor)
         ops.append({"op": "sap212-max_enc_deviation", "ack": renc.get("ack"), "rb": renc.get("readback"), "set": 0})
-        
+
         if rdiv is not None:
             rrdiv = self.motor_set_axis_param(board_id, 153, int(rdiv), motor=motor)
             ops.append({"op": "sap153-rdiv", "ack": rrdiv.get("ack"), "rb": rrdiv.get("readback"), "set": int(rdiv)})
@@ -5236,10 +5236,10 @@ class BioXpTester:
     def motor_oem_rehome(self, *, timeout_s=120.0):
         """Direct source-mode surface for ControlLib.rehome().
 
-        The OEM wrapper saves/restores door state around initializeMotors().  The
-        current Linux stack does not expose a trusted door-state writeback primitive,
-        so this wrapper keeps that distinction explicit and delegates the physical
-        homing body to the source-shaped initializeMotors mimic.
+        The OEM wrapper saves/restores door state around initializeMotors(). The
+        current Linux stack intentionally blocks direct monolithic rehome pending
+        a literal source-equivalent stage rewrite; this surface never commands
+        physical homing.
         """
         return {
             "ok": False,
@@ -5249,26 +5249,13 @@ class BioXpTester:
             "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
         }
 
-        t0 = time.time()
-        result = self.motor_startup_homing_mimic()
-        door_state_save = self.motor_plan_thermal_door_restore(restore_requested=False)
-        return {
-            "ok": bool(isinstance(result, dict) and result.get("aborted_at") is None),
-            "source_mode": "ControlLib.rehome",
-            "oem_reference": "ControlLib.rehome save door state -> initializeMotors -> sleep/restore door state",
-            "door_state_save": door_state_save["capture"],
-            "initialize_motors": result,
-            "door_state_restore": door_state_save["restore_plan"],
-            "timeout_s": float(timeout_s),
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        }
-
     def motor_oem_initialize_motion(self, *, run_homing=False, timeout_s=120.0, include_tip_pipette_cleanup=False):
         """Direct source-mode surface for ControlLib.initializeMotion().
 
         run_homing=False is a no-motion diagnostic/prep surface. run_homing=True
-        delegates to the rehome/initializeMotors body and labels the remaining
-        tip/pipette cleanup as not yet ported rather than silently collapsing it.
+        delegates to the intentionally blocked rehome surface and therefore does
+        not command physical homing. Tip/pipette cleanup remains explicitly not
+        ported rather than silently collapsed.
         """
         t0 = time.time()
         flags = {
@@ -5290,7 +5277,9 @@ class BioXpTester:
             "source_mode": "ControlLib.initializeMotion",
             "oem_reference": "ControlLib.initializeMotion flags -> initializeMotors -> tip/pipette cleanup",
             "run_homing": bool(run_homing),
-            "physical_motion_commanded": bool(run_homing),
+            "physical_motion_commanded": bool(
+                isinstance(homing, dict) and homing.get("physical_motion_commanded") is True
+            ),
             "flags": flags,
             "initialize_motors_without_motion": prep,
             "rehome": homing,

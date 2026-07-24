@@ -303,8 +303,9 @@ def run_oem_initialization_controller(
 ) -> dict[str, Any]:
     """Run a first-class source-anchored OEM initialization controller.
 
-    This is the Phase-6 controller layer.  It orchestrates already-hardened lower
-    primitives and records every phase.  It does not hide unsupported semantics.
+    This is the Phase-6 controller layer. It orchestrates already-hardened lower
+    primitives and records every phase. Direct monolithic homing is intentionally
+    blocked pending a literal source-equivalent stage rewrite.
     """
     phases: list[dict[str, Any]] = []
     manifest = build_machine_calibration_manifest()
@@ -322,6 +323,19 @@ def run_oem_initialization_controller(
         return row
 
     add("accepted", {"ok": True, "run_homing": bool(run_homing), "restore_door_state": bool(restore_door_state), "include_tip_pipette_cleanup": bool(include_tip_pipette_cleanup)})
+
+    if bool(run_homing):
+        add(
+            "initialize_motors_full_sequence",
+            {
+                "ok": False,
+                "blocked": True,
+                "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+                "physical_motion_commanded": False,
+                "reason": "monolithic OEM initialization homing is intentionally blocked",
+            },
+        )
+        return _finalize_oem_initialization(False, phases, manifest, "initialize_motors_full_sequence")
 
     initial_check = _safe_call("initial_check", lambda: {"ok": True, "note": "API route preconditions/interlocks checked by caller when live"})
     add("initial_check", initial_check)
@@ -341,18 +355,8 @@ def run_oem_initialization_controller(
     if not door_capture.get("ok"):
         return _finalize_oem_initialization(False, phases, manifest, "door_state_capture")
 
-    if bool(run_homing):
-        full_init = _safe_call(
-            "initialize_motors_full_sequence",
-            lambda: tester.motor_oem_initialize_motors_full_sequence(timeout_s=timeout_s),
-            movement=True,
-        )
-        add("initialize_motors_full_sequence", full_init)
-        if not full_init.get("ok"):
-            return _finalize_oem_initialization(False, phases, manifest, "initialize_motors_full_sequence")
-    else:
-        for phase in ("z_reference", "g_reference", "home_xy", "door_home_or_restore"):
-            add(phase, {"ok": True, "skipped": True, "reason": "run_homing_false", "physical_motion_commanded": False})
+    for phase in ("z_reference", "g_reference", "home_xy", "door_home_or_restore"):
+        add(phase, {"ok": True, "skipped": True, "reason": "run_homing_false", "physical_motion_commanded": False})
 
     cleanup = {
         "ok": True,

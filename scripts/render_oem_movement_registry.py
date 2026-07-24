@@ -4,7 +4,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-repo=Path('/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/linux_runtime_acquisition_20260718/bioxp_re_working_copy')
+repo=Path(__file__).resolve().parents[1]
 jp=repo/'docs/specs/2026-07-23-oem-movement-method-source-binary-registry.json'
 out=repo/'docs/specs/2026-07-23-oem-movement-method-source-binary-registry.md'
 d=json.loads(jp.read_text())
