@@ -110,6 +110,7 @@ OperationMode.cs
 - cover inspection and cover relocation movements;
 - gantry parking;
 - terminal door and selected StartMode branches;
+- all reachable OEM startup/re-entry physical entries: CAN-ready startup queue, saved-status recovery, software-update failure/cancel queues, fetch queue, warning `initializeMotion`, door-queued `initializeSystem`, and `wakefrompause → rehome`;
 - persistent stage, frame, reply, state, provenance, and authorization ledger;
 - fixed robot API commands and BMS presentation;
 - fake-transport, controller, physical-stage, and full lifecycle acceptance.
@@ -362,7 +363,7 @@ Equivalent in-process validation must reject:
 - missing exact registry method/member IDs or overload identities;
 - missing or mismatched caller→callee edge lines;
 - altered ordered source sequence lines/tokens;
-- source-to-binary mapping not proven by the canonical evidence lock or exact project `AssemblyName`;
+- source-to-binary mapping absent from the canonical evidence lock, or lock schema/acquisition/SHA-256 drift;
 - XML selector/attribute/profile identity drift or self-test derivation drift;
 - a machine serial other than 206;
 - an unknown or non-accepted source mode;
@@ -1046,7 +1047,7 @@ Visible completion requires proof of the actual browser origin and serving workt
 Deliver:
 
 - current registry JSON/Markdown/verifier committed;
-- canonical evidence lock extended with registry-extension sources and `CVisionLib.dll`;
+- canonical evidence lock contains every registry source and all eight captured binaries, including `CVisionLib.dll`;
 - all semantic lock tests passing;
 - registry hash surfaced by runtime.
 
@@ -1083,7 +1084,7 @@ Deliver:
 - exact predecessor rules;
 - complete application-to-terminal graph;
 - dry-run planner emits the expected full stage sequence and no physical frames;
-- restart/recovery and cancellation tests.
+- terminalization and cancellation tests; no workflow pause/resume implementation in this OEM-parity tranche.
 
 Exit:
 

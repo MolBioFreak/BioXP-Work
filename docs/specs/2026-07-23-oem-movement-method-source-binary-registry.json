@@ -10,6 +10,7 @@
     ],
     "evidence_lock_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
     "evidence_lock_schema": "bioxp.oem_evidence_lock.v4",
+    "evidence_lock_sha256": "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c",
     "frozen_ssd_manifest_sha256": "ce5104c91f5149374910b0f4fca2aef1c49f42270d1c35ccd788da3ec63e818a"
   },
   "binaries": [
@@ -65,8 +66,12 @@
   "claim_boundary": "Static source/binary/configuration registry only; no deployment, transport, controller, or physical parity claim.",
   "counts": {
     "binaries": 8,
+    "known_hazards": 17,
     "live_machine_records": 19,
-    "methods_and_members": 392,
+    "methods_and_members": 394,
+    "ordered_call_sequences": 3,
+    "required_branch_outcomes": 7,
+    "required_call_edges": 76,
     "sources": 32
   },
   "created_date": "2026-07-23",
@@ -4623,6 +4628,32 @@
     },
     {
       "binary_id": "GenBotApp.exe",
+      "declaration": "private void m_pageSoftwareUpdate_Cancel_Click(object sender, RoutedEventArgs e)",
+      "decompiler_warning_lines": [],
+      "end_line": 2869,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "BioXPMainWindow.m_pageSoftwareUpdate_Cancel_Click@2861",
+      "name": "m_pageSoftwareUpdate_Cancel_Click",
+      "source_id": "main",
+      "start_line": 2861,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
+      "declaration": "private void btnFetch_Click(object sender, RoutedEventArgs e)",
+      "decompiler_warning_lines": [],
+      "end_line": 4066,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "BioXPMainWindow.btnFetch_Click@4050",
+      "name": "btnFetch_Click",
+      "source_id": "main",
+      "start_line": 4050,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "GenBotApp.exe",
       "declaration": "private void frmMain_Loaded(object sender, RoutedEventArgs e)",
       "decompiler_warning_lines": [
         4085
@@ -7184,6 +7215,11 @@
       "sequence_id": "initialize_motors_direct_oem",
       "steps": [
         {
+          "kind": "board_guard",
+          "line": 3350,
+          "token": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board] != null"
+        },
+        {
           "line": 3352,
           "token": "axisSearchHome"
         },
@@ -7196,6 +7232,16 @@
           "token": "moveSteps"
         },
         {
+          "kind": "board_guard",
+          "line": 3356,
+          "token": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board] != null"
+        },
+        {
+          "kind": "branch_predicate",
+          "line": 3358,
+          "token": "GripperVersion == 0"
+        },
+        {
           "line": 3360,
           "token": "axisSearchHome"
         },
@@ -7204,32 +7250,79 @@
           "token": "axisSearchHome"
         },
         {
+          "kind": "board_guard",
+          "line": 3367,
+          "token": "m_Boards[m_AxisIODesignater[\"MotorX\"].board] != null"
+        },
+        {
           "line": 3369,
           "token": "axisSearchHome"
+        },
+        {
+          "line": 3370,
+          "token": "Thread.Sleep(20)"
         },
         {
           "line": 3371,
           "token": "setHome"
         },
         {
+          "line": 3372,
+          "token": "setSpeed"
+        },
+        {
+          "line": 3373,
+          "token": "Thread.Sleep(40)"
+        },
+        {
           "line": 3374,
           "token": "moveX(6000)"
+        },
+        {
+          "kind": "board_guard",
+          "line": 3376,
+          "token": "m_Boards[m_AxisIODesignater[\"MotorY\"].board] != null"
         },
         {
           "line": 3378,
           "token": "axisSearchHome"
         },
         {
+          "kind": "board_guard",
+          "line": 3380,
+          "token": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board] != null"
+        },
+        {
           "line": 3382,
           "token": "doorSearchHome"
         },
         {
+          "kind": "branch_predicate",
           "line": 3384,
-          "token": "confirmAxis"
+          "token": "Convert.ToInt32(m_settingsWindow.SerialNumber) > 9"
+        },
+        {
+          "line": 3386,
+          "token": "openThermalDoor"
+        },
+        {
+          "kind": "failure_path",
+          "line": 3387,
+          "token": "throw new Exception"
+        },
+        {
+          "kind": "board_guard",
+          "line": 3389,
+          "token": "m_Boards[m_AxisIODesignater[\"MotorY\"].board] != null"
         },
         {
           "line": 3391,
           "token": "setHome"
+        },
+        {
+          "kind": "branch_predicate",
+          "line": 3393,
+          "token": "m_settingsWindow.Calibrated"
         },
         {
           "line": 3414,
@@ -7242,6 +7335,11 @@
         {
           "line": 3416,
           "token": "ClassStatusLog.setStatus"
+        },
+        {
+          "kind": "branch_predicate",
+          "line": 3417,
+          "token": "m_settingsWindow.GripperVersion == 1"
         },
         {
           "line": 3419,
@@ -7354,6 +7452,57 @@
       ]
     }
   ],
+  "required_branch_outcomes": [
+    {
+      "branch_id": "environment_can_ready_admission",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "line": 976,
+      "outcome": "only_CAN_READY_enters_initialCheck_and_door_branching",
+      "token": "m_control.m_canControl.CAN_READY"
+    },
+    {
+      "branch_id": "environment_not_ready_nonmanual_return",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "line": 1007,
+      "outcome": "CAN_not_ready_nonmanual_returns_without_initialization",
+      "token": "(int)m_settingsWindow.StartMode != 0"
+    },
+    {
+      "branch_id": "environment_not_ready_manual_profile",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "line": 1011,
+      "outcome": "CAN_not_ready_manual_selects_menu_by_resolution",
+      "token": "m_settingsWindow.ScreenResolutionHigh"
+    },
+    {
+      "branch_id": "environment_not_ready_manual_gantry",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "line": 1025,
+      "outcome": "CAN_not_ready_manual_marks_gantry_available_after_menu_navigation",
+      "token": "m_control.GantryAvailable = true"
+    },
+    {
+      "branch_id": "initial_check_can_wait",
+      "caller_method_id": "ControlLib.initialCheck@8728",
+      "line": 8732,
+      "outcome": "waits_for_CAN_readiness_before_board_or_door_operations",
+      "token": "while (!m_canControl.CAN_READY)"
+    },
+    {
+      "branch_id": "initial_check_can_timeout",
+      "caller_method_id": "ControlLib.initialCheck@8728",
+      "line": 8735,
+      "outcome": "returns_false_after_more_than_ten_200ms_wait_iterations",
+      "token": "if (num > 10)"
+    },
+    {
+      "branch_id": "initial_check_door_failure",
+      "caller_method_id": "ControlLib.initialCheck@8728",
+      "line": 8751,
+      "outcome": "returns_false_before_board_reset_when_door_check_fails",
+      "token": "if (!checkDoorStatus())"
+    }
+  ],
   "required_call_edges": [
     {
       "call_line": 581,
@@ -7382,6 +7531,20 @@
       "callee_token": "initialCheck",
       "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
       "edge_id": "environment_initial_check"
+    },
+    {
+      "call_line": 976,
+      "callee_method_id": "InterfaceCAN.CAN_READY",
+      "callee_token": "CAN_READY",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "edge_id": "environment_can_ready"
+    },
+    {
+      "call_line": 994,
+      "callee_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "callee_token": "name = \"initializeSystem\"",
+      "caller_method_id": "BioXPMainWindow.initializeEnvironment@973",
+      "edge_id": "environment_queue_initialize"
     },
     {
       "call_line": 2046,
@@ -7417,6 +7580,13 @@
       "callee_token": "ClassStatusLog.SavedStatus",
       "caller_method_id": "BioXPMainWindow.initializeSystem@1046",
       "edge_id": "initialize_saved_state"
+    },
+    {
+      "call_line": 1148,
+      "callee_method_id": "ControlLib.initializeMotion@8797",
+      "callee_token": "initializeMotion",
+      "caller_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "edge_id": "initialize_saved_recovery_motion"
     },
     {
       "call_line": 1159,
@@ -7480,6 +7650,188 @@
       "callee_token": "initializeMotors",
       "caller_method_id": "ControlLib.initializeMotion@8797",
       "edge_id": "motion_initialize_motors"
+    },
+    {
+      "call_line": 2622,
+      "callee_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "callee_token": "name = \"initializeSystem\"",
+      "caller_method_id": "BioXPMainWindow.m_pageWarning_buttonclicked@2611",
+      "edge_id": "warning_update_failure_queue_initialize"
+    },
+    {
+      "call_line": 2628,
+      "callee_method_id": "ControlLib.initialCheck@8728",
+      "callee_token": "initialCheck",
+      "caller_method_id": "BioXPMainWindow.m_pageWarning_buttonclicked@2611",
+      "edge_id": "warning_initial_check"
+    },
+    {
+      "call_line": 2635,
+      "callee_method_id": "ControlLib.initializeMotion@8797",
+      "callee_token": "initializeMotion",
+      "caller_method_id": "BioXPMainWindow.m_pageWarning_buttonclicked@2611",
+      "edge_id": "warning_initialize_motion"
+    },
+    {
+      "call_line": 2448,
+      "callee_method_id": "BioXPMainWindow.wakefrompause@2103",
+      "callee_token": "wakefrompause",
+      "caller_method_id": "BioXPMainWindow.m_canControl_handleEnclosureDoorEventProcess@2428",
+      "edge_id": "door_event_queue_wakefrompause"
+    },
+    {
+      "call_line": 2105,
+      "callee_method_id": "ControlLib.initialCheck@8728",
+      "callee_token": "initialCheck",
+      "caller_method_id": "BioXPMainWindow.wakefrompause@2103",
+      "edge_id": "wake_initial_check"
+    },
+    {
+      "call_line": 2106,
+      "callee_method_id": "ControlLib.rehome@8784",
+      "callee_token": "rehome",
+      "caller_method_id": "BioXPMainWindow.wakefrompause@2103",
+      "edge_id": "wake_rehome"
+    },
+    {
+      "call_line": 8787,
+      "callee_method_id": "ClassControlInterface.initializeMotors@3348",
+      "callee_token": "initializeMotors",
+      "caller_method_id": "ControlLib.rehome@8784",
+      "edge_id": "rehome_initialize_motors"
+    },
+    {
+      "call_line": 2493,
+      "callee_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "callee_token": "initializeSystem",
+      "caller_method_id": "BioXPMainWindow.m_canControl_handleEnclosureDoorEventProcess@2428",
+      "edge_id": "door_event_queue_initialize"
+    },
+    {
+      "call_line": 2866,
+      "callee_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "callee_token": "name = \"initializeSystem\"",
+      "caller_method_id": "BioXPMainWindow.m_pageSoftwareUpdate_Cancel_Click@2861",
+      "edge_id": "software_update_cancel_queue_initialize"
+    },
+    {
+      "call_line": 4056,
+      "callee_method_id": "BioXPMainWindow.initializeSystem@1046",
+      "callee_token": "name = \"initializeSystem\"",
+      "caller_method_id": "BioXPMainWindow.btnFetch_Click@4050",
+      "edge_id": "fetch_queue_initialize"
+    },
+    {
+      "call_line": 3352,
+      "callee_method_id": "ClassBaseBoard.axisSearchHome@204",
+      "callee_token": "axisSearchHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_z_home"
+    },
+    {
+      "call_line": 3354,
+      "callee_method_id": "ClassControlInterface.setGripperCurrent@5392",
+      "callee_token": "setGripperCurrent",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_gripper_current"
+    },
+    {
+      "call_line": 3355,
+      "callee_method_id": "ClassControlInterface.moveSteps@4165",
+      "callee_token": "moveSteps",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_gripper_clear"
+    },
+    {
+      "call_line": 3369,
+      "callee_method_id": "ClassBaseBoard.axisSearchHome@204",
+      "callee_token": "axisSearchHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_x_home"
+    },
+    {
+      "call_line": 3371,
+      "callee_method_id": "ClassBaseBoard.setHome@209",
+      "callee_token": "setHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_x_set_home"
+    },
+    {
+      "call_line": 3372,
+      "callee_method_id": "ClassBaseBoard.setSpeed@166",
+      "callee_token": "setSpeed",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_x_speed"
+    },
+    {
+      "call_line": 3374,
+      "callee_method_id": "ClassControlInterface.moveX@4206",
+      "callee_token": "moveX",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_x_park"
+    },
+    {
+      "call_line": 3378,
+      "callee_method_id": "ClassBaseBoard.axisSearchHome@204",
+      "callee_token": "axisSearchHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_y_home"
+    },
+    {
+      "call_line": 3382,
+      "callee_method_id": "ClassBaseBoard.doorSearchHome@148",
+      "callee_token": "doorSearchHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_door_home"
+    },
+    {
+      "call_line": 3384,
+      "callee_method_id": "ClassControlInterface.confirmAxis@2714",
+      "callee_token": "confirmAxis",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_door_predicate"
+    },
+    {
+      "call_line": 3386,
+      "callee_method_id": "ClassControlInterface.openThermalDoor@2651",
+      "callee_token": "openThermalDoor",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_door_failure_open"
+    },
+    {
+      "call_line": 3391,
+      "callee_method_id": "ClassBaseBoard.setHome@209",
+      "callee_token": "setHome",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_y_set_home"
+    },
+    {
+      "call_line": 3414,
+      "callee_method_id": "ClassControlInterface.setChillerCoolRate@3423",
+      "callee_token": "setChillerCoolRate",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_output_chiller"
+    },
+    {
+      "call_line": 3415,
+      "callee_method_id": "ClassControlInterface.setChillerCoolRate@3423",
+      "callee_token": "setChillerCoolRate",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_reagent_chiller"
+    },
+    {
+      "call_line": 3416,
+      "callee_method_id": "ClassStatusLog.setStatus@96",
+      "callee_token": "ClassStatusLog.setStatus",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_status"
+    },
+    {
+      "call_line": 3419,
+      "callee_method_id": "ClassControlInterface.setGripperCurrent@5392",
+      "callee_token": "setGripperCurrent",
+      "caller_method_id": "ClassControlInterface.initializeMotors@3348",
+      "edge_id": "initmotors_gripper_idle"
     },
     {
       "call_line": 8805,
@@ -8246,14 +8598,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassBaseBoard.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassBaseBoard.cs"
       },
       "line_count": 283,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassBaseBoard.cs",
@@ -8264,14 +8614,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs"
       },
       "line_count": 361,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
@@ -8298,14 +8646,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/CanPacket.cs",
       "binary_id": "Novo.Devices.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "Novo.Devices",
         "binary_id": "Novo.Devices.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/Novo.Devices.dll.csproj",
-        "relative_path": "decompiled_src_novodevices/Novo.Devices.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/CanPacket.cs"
       },
       "line_count": 45,
       "relative_path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/CanPacket.cs",
@@ -8332,14 +8678,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassChillerBoard.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassChillerBoard.cs"
       },
       "line_count": 595,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassChillerBoard.cs",
@@ -8382,14 +8726,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs"
       },
       "line_count": 85,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs",
@@ -8400,14 +8742,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassHeadBoard.cs"
       },
       "line_count": 560,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
@@ -8418,14 +8758,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/InterfaceCAN.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/InterfaceCAN.cs"
       },
       "line_count": 32,
       "relative_path": "decompiled_src_can/ClassCanLib/InterfaceCAN.cs",
@@ -8436,14 +8774,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/ICanPacket.cs",
       "binary_id": "Novo.Devices.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "Novo.Devices",
         "binary_id": "Novo.Devices.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/Novo.Devices.dll.csproj",
-        "relative_path": "decompiled_src_novodevices/Novo.Devices.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/ICanPacket.cs"
       },
       "line_count": 14,
       "relative_path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/ICanPacket.cs",
@@ -8454,14 +8790,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs"
       },
       "line_count": 24,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
@@ -8488,14 +8822,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/locationID.cs",
       "binary_id": "CommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "CommonLib",
         "binary_id": "CommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib.dll.csproj",
-        "relative_path": "decompiled_src_commonlib/CommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_commonlib/CommonLib/locationID.cs"
       },
       "line_count": 52,
       "relative_path": "decompiled_src_commonlib/CommonLib/locationID.cs",
@@ -8522,14 +8854,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassMotor.cs"
       },
       "line_count": 799,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassMotor.cs",
@@ -8588,14 +8918,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs"
       },
       "line_count": 9,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
@@ -8638,14 +8966,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs"
       },
       "line_count": 27,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs",
@@ -8656,14 +8982,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/positionStruct.cs",
       "binary_id": "CommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "CommonLib",
         "binary_id": "CommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib.dll.csproj",
-        "relative_path": "decompiled_src_commonlib/CommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_commonlib/CommonLib/positionStruct.cs"
       },
       "line_count": 18,
       "relative_path": "decompiled_src_commonlib/CommonLib/positionStruct.cs",
@@ -8690,14 +9014,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/ClassStatusLog.cs",
       "binary_id": "BioXPCommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "BioXPCommonLib",
         "binary_id": "BioXPCommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj",
-        "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassStatusLog.cs"
       },
       "line_count": 392,
       "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassStatusLog.cs",
@@ -8708,14 +9030,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassThermalBoard.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassThermalBoard.cs"
       },
       "line_count": 1006,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassThermalBoard.cs",
@@ -8726,14 +9046,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassThermalControl.cs",
       "binary_id": "ClassCanLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "ClassCanLib",
         "binary_id": "ClassCanLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib.dll.csproj",
-        "relative_path": "decompiled_src_can/ClassCanLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_can/ClassCanLib/ClassThermalControl.cs"
       },
       "line_count": 1257,
       "relative_path": "decompiled_src_can/ClassCanLib/ClassThermalControl.cs",
@@ -8744,14 +9062,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs",
       "binary_id": "CVisionLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "CVisionLib",
         "binary_id": "CVisionLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_vision/CVisionLib.dll.csproj",
-        "relative_path": "decompiled_src_vision/CVisionLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs"
       },
       "line_count": 14587,
       "relative_path": "decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs",
@@ -8762,14 +9078,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib/wellID.cs",
       "binary_id": "CommonLib.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "CommonLib",
         "binary_id": "CommonLib.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_commonlib/CommonLib.dll.csproj",
-        "relative_path": "decompiled_src_commonlib/CommonLib.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_commonlib/CommonLib/wellID.cs"
       },
       "line_count": 102,
       "relative_path": "decompiled_src_commonlib/CommonLib/wellID.cs",
@@ -8780,14 +9094,12 @@
     {
       "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/WinUsb/WinUsbCommunications.cs",
       "binary_id": "Novo.Devices.dll",
-      "binary_map_status": "registry_extension_from_captured_assembly",
+      "binary_map_status": "canonical_evidence_lock",
       "binary_mapping_evidence": {
-        "assembly_name": "Novo.Devices",
         "binary_id": "Novo.Devices.dll",
-        "kind": "decompiled_project_assembly_name",
-        "line": 3,
-        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_novodevices/Novo.Devices.dll.csproj",
-        "relative_path": "decompiled_src_novodevices/Novo.Devices.dll.csproj"
+        "kind": "evidence_lock_decompile_binary_map",
+        "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+        "source_relative_path": "decompiled_src_novodevices/WinUsb/WinUsbCommunications.cs"
       },
       "line_count": 755,
       "relative_path": "decompiled_src_novodevices/WinUsb/WinUsbCommunications.cs",
@@ -8797,7 +9109,6 @@
     }
   ],
   "status_legend": {
-    "present_hash_locked_and_line_bounded": "Source bytes hashed, captured binary pinned, and declaration/member has an exact inclusive line range.",
-    "registry_extension_from_captured_assembly": "Source was recovered after the original lock map; this registry pins it to the captured assembly. Canonical evidence-lock extension is a pre-implementation gate."
+    "present_hash_locked_and_line_bounded": "Source bytes hashed, captured binary pinned, canonical source-to-binary evidence-lock mapping present, and declaration/member has an exact inclusive line range."
   }
 }

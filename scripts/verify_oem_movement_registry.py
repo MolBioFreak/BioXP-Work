@@ -60,8 +60,39 @@ REQUIRED_EDGE_IDS = {
     "wire_bulk_send", "wire_bulk_receive", "wire_decode", "wire_receive_packet",
     "settings_load_config", "settings_load_operation", "settings_select_screen_profile",
     "settings_derive_x_selftest", "status_restore_saved_state",
+    "environment_can_ready", "environment_queue_initialize", "initialize_saved_recovery_motion",
+    "warning_update_failure_queue_initialize", "warning_initial_check", "warning_initialize_motion",
+    "door_event_queue_wakefrompause", "wake_initial_check", "wake_rehome",
+    "rehome_initialize_motors", "door_event_queue_initialize",
+    "software_update_cancel_queue_initialize", "fetch_queue_initialize",
+    "initmotors_z_home", "initmotors_gripper_current", "initmotors_gripper_clear",
+    "initmotors_x_home", "initmotors_x_set_home", "initmotors_x_speed", "initmotors_x_park",
+    "initmotors_y_home", "initmotors_door_home", "initmotors_door_predicate",
+    "initmotors_door_failure_open", "initmotors_y_set_home", "initmotors_output_chiller",
+    "initmotors_reagent_chiller", "initmotors_status", "initmotors_gripper_idle",
 }
 REQUIRED_SEQUENCE_IDS = {"initialize_motors_direct_oem", "initialize_motion_stale_tip", "novo_usb_tx_frame"}
+REQUIRED_BRANCH_IDS = {
+    "environment_can_ready_admission", "environment_not_ready_nonmanual_return",
+    "environment_not_ready_manual_profile", "environment_not_ready_manual_gantry",
+    "initial_check_can_wait", "initial_check_can_timeout", "initial_check_door_failure",
+}
+REQUIRED_SEQUENCE_STEPS = {
+    "initialize_motors_direct_oem": {
+        (3350, 'm_Boards[m_AxisIODesignater["MotorZ"].board] != null'), (3352, 'axisSearchHome'),
+        (3354, 'setGripperCurrent(31)'), (3355, 'moveSteps'), (3356, 'm_Boards[m_AxisIODesignater["MotorGrip"].board] != null'),
+        (3358, 'GripperVersion == 0'), (3360, 'axisSearchHome'), (3364, 'axisSearchHome'),
+        (3367, 'm_Boards[m_AxisIODesignater["MotorX"].board] != null'), (3369, 'axisSearchHome'),
+        (3370, 'Thread.Sleep(20)'), (3371, 'setHome'), (3372, 'setSpeed'), (3373, 'Thread.Sleep(40)'),
+        (3374, 'moveX(6000)'), (3376, 'm_Boards[m_AxisIODesignater["MotorY"].board] != null'),
+        (3378, 'axisSearchHome'), (3380, 'm_Boards[m_AxisIODesignater["ThermalDoor"].board] != null'),
+        (3382, 'doorSearchHome'), (3384, 'Convert.ToInt32(m_settingsWindow.SerialNumber) > 9'),
+        (3386, 'openThermalDoor'), (3387, 'throw new Exception'), (3389, 'm_Boards[m_AxisIODesignater["MotorY"].board] != null'),
+        (3391, 'setHome'), (3393, 'm_settingsWindow.Calibrated'), (3414, 'setChillerCoolRate("OC")'),
+        (3415, 'setChillerCoolRate("RC")'), (3416, 'ClassStatusLog.setStatus'),
+        (3417, 'm_settingsWindow.GripperVersion == 1'), (3419, 'setGripperCurrent(10)'),
+    },
+}
 REQUIRED_HAZARDS = {
     "NOVO_PIPETTE_MASK_IMPOSSIBLE_PROJECTION", "MOTOR_NULL_SUCCESS_CONFLATION",
     "THERMAL_NULL_AND_STATUS_CONFLATION", "ROUTE_ALWAYS_TRUE_LOCATION_TEST",
@@ -174,6 +205,12 @@ def verify(registry_path: Path) -> dict:
     if d.get('schema_id') != 'bioxp.oem_movement_method_source_binary_registry.v3':
         errors.append(f"unexpected registry schema: {d.get('schema_id')}")
     lock_path=Path(d['authority']['evidence_lock_path']); lock=json.loads(lock_path.read_text())
+    if d['authority'].get('evidence_lock_schema') != lock.get('schema_id'):
+        errors.append('evidence lock schema mismatch')
+    if d['authority'].get('evidence_lock_sha256') != sha256(lock_path):
+        errors.append('evidence lock hash mismatch')
+    if d['authority'].get('acquisition_session_id') != lock.get('acquisition',{}).get('session_id'):
+        errors.append('evidence lock acquisition-session mismatch')
     lock_map={p:b for b,paths in lock['decompile_binary_map'].items() for p in paths}
     source_by={s['source_id']:s for s in d['sources']}
     missing_sources=sorted(REQUIRED_SOURCE_IDS-set(source_by))
@@ -202,20 +239,7 @@ def verify(registry_path: Path) -> dict:
             if evidence.get('source_relative_path')!=rel or evidence.get('binary_id')!=s['binary_id']:
                 errors.append(f"canonical mapping evidence fields mismatch: {s['source_id']}")
         else:
-            if status!='registry_extension_from_captured_assembly' or evidence.get('kind')!='decompiled_project_assembly_name':
-                errors.append(f"extension mapping lacks project AssemblyName evidence: {s['source_id']}")
-            project=Path(evidence.get('path','')); line_no=evidence.get('line')
-            if not project.is_file() or not isinstance(line_no,int):
-                errors.append(f"invalid project mapping evidence path/line: {s['source_id']}")
-            else:
-                project_lines=project.read_text(errors='replace').splitlines()
-                assembly=evidence.get('assembly_name')
-                expected=f'<AssemblyName>{assembly}</AssemblyName>'
-                if not (1 <= line_no <= len(project_lines)) or expected not in project_lines[line_no-1]:
-                    errors.append(f"project AssemblyName evidence mismatch: {s['source_id']}")
-                expected_binary=assembly + ('.exe' if s['binary_id'].endswith('.exe') else '.dll')
-                if expected_binary != s['binary_id'] or evidence.get('binary_id')!=s['binary_id']:
-                    errors.append(f"project assembly/binary identity mismatch: {s['source_id']}")
+            errors.append(f"source absent from canonical evidence lock: {s['source_id']} ({rel})")
     seen=set(); names=set(); method_by={}
     for m in d['methods']:
         if m['method_id'] in seen: errors.append(f"duplicate method_id: {m['method_id']}")
@@ -247,6 +271,22 @@ def verify(registry_path: Path) -> dict:
             errors.append(f"edge source token mismatch: {edge_id} at {caller['source_id']}:{call_line}")
     missing_edges=sorted(REQUIRED_EDGE_IDS-edge_ids)
     if missing_edges: errors.append('missing required exact call edges: '+', '.join(missing_edges))
+    branch_ids=set()
+    for branch in d.get('required_branch_outcomes',[]):
+        branch_id=branch.get('branch_id')
+        if branch_id in branch_ids: errors.append(f"duplicate required branch: {branch_id}")
+        branch_ids.add(branch_id)
+        caller=method_by.get(branch.get('caller_method_id'))
+        if caller is None: errors.append(f"branch caller not registered: {branch_id}"); continue
+        line_no=branch.get('line'); token=branch.get('token',''); lines=lines_by_source.get(caller['source_id'],[])
+        if not isinstance(line_no,int) or not (caller['start_line'] <= line_no <= caller['end_line']):
+            errors.append(f"branch line outside exact caller: {branch_id}"); continue
+        if line_no > len(lines) or token not in lines[line_no-1]:
+            errors.append(f"branch source token mismatch: {branch_id} at {caller['source_id']}:{line_no}")
+        if not branch.get('outcome'):
+            errors.append(f"branch outcome missing: {branch_id}")
+    missing_branches=sorted(REQUIRED_BRANCH_IDS-branch_ids)
+    if missing_branches: errors.append('missing required branch outcomes: '+', '.join(missing_branches))
     sequence_ids=set()
     for sequence in d.get('ordered_call_sequences',[]):
         sequence_id=sequence.get('sequence_id')
@@ -262,6 +302,12 @@ def verify(registry_path: Path) -> dict:
             previous=line_no
             if line_no > len(lines) or token not in lines[line_no-1]:
                 errors.append(f"ordered sequence source token mismatch: {sequence_id} at {caller['source_id']}:{line_no}")
+        expected_steps=REQUIRED_SEQUENCE_STEPS.get(sequence_id)
+        if expected_steps is not None:
+            actual_steps={(step.get('line'),step.get('token')) for step in sequence.get('steps',[])}
+            missing_steps=sorted(expected_steps-actual_steps)
+            if missing_steps:
+                errors.append(f"ordered sequence required steps missing: {sequence_id} {missing_steps}")
     missing_sequences=sorted(REQUIRED_SEQUENCE_IDS-sequence_ids)
     if missing_sequences: errors.append('missing required ordered sequences: '+', '.join(missing_sequences))
     missing=sorted(REQUIRED_ANCHORS-names)
@@ -272,6 +318,10 @@ def verify(registry_path: Path) -> dict:
     if d.get('counts',{}).get('binaries') != len(d['binaries']): errors.append('binary count mismatch')
     if d.get('counts',{}).get('sources') != len(d['sources']): errors.append('source count mismatch')
     if d.get('counts',{}).get('methods_and_members') != len(d['methods']): errors.append('method/member count mismatch')
+    if d.get('counts',{}).get('required_call_edges') != len(d.get('required_call_edges',[])): errors.append('required-call-edge count mismatch')
+    if d.get('counts',{}).get('required_branch_outcomes') != len(d.get('required_branch_outcomes',[])): errors.append('required-branch-outcome count mismatch')
+    if d.get('counts',{}).get('ordered_call_sequences') != len(d.get('ordered_call_sequences',[])): errors.append('ordered-sequence count mismatch')
+    if d.get('counts',{}).get('known_hazards') != len(d.get('known_hazards',[])): errors.append('known-hazard count mismatch')
     acq_root=Path(lock['acquisition']['root']); live_files={}
     records=d['live_machine_corpus']['records']
     if len(records) != 19: errors.append(f"live corpus count is {len(records)}, expected 19")
