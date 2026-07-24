@@ -6,13 +6,16 @@ from src.bioxp.oem_homing_spec import get_program
 
 
 def test_initialize_motors_spec_preserves_direct_oem_waits_failure_branch_and_tail():
-    """ClassControlInterface.initializeMotors:3350-3419, not a Linux reconstruction."""
+    """ClassControlInterface.initializeMotors:3348-3421, not a Linux reconstruction."""
     program = get_program("initialize_motors")
+    assert {step.source.sha256 for step in program.steps} == {
+        "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
+    }
     ids = [step.step_id for step in program.steps]
 
     assert ids == [
         "z.axisSearchHome",
-        "g.setMaxCurrent.before_clear",
+        "g.setGripperCurrent.before_clear",
         "g.clear.moveSteps",
         "g.axisSearchHome",
         "x.axisSearchHome",
@@ -130,6 +133,14 @@ def test_fake_trace_preserves_oem_board_motor_identity_and_null_guard_branch():
     assert ui_row["params"] == {"x": "0", "y": "0", "z": "0", "z_write_count": 2}
     assert ui_row["transport_ack"] is None
 
+    v0 = OemHomingDryRunRuntime().run("initialize_motors", simulation={"gripper_version": 0})
+    v1 = OemHomingDryRunRuntime().run("initialize_motors", simulation={"gripper_version": 1})
+    tail0 = next(row for row in v0["steps_executed"] if row["step_id"] == "g.restore_current.version1")
+    tail1 = next(row for row in v1["steps_executed"] if row["step_id"] == "g.restore_current.version1")
+    assert tail0["execution"] == "branch_not_taken"
+    assert tail1["execution"] == "simulated"
+    assert tail1["operation"] == "setGripperCurrent"
+
 
 def test_initialize_motion_fake_trace_exercises_source_stale_tip_success_and_return_branches():
     successful = OemHomingDryRunRuntime().run(
@@ -150,3 +161,87 @@ def test_initialize_motion_fake_trace_exercises_source_stale_tip_success_and_ret
     assert returned["ok"] is True
     assert ids[-1] == "initializeMotion.return.eject_failed_without_handler"
     assert "initializeMotion.tip_dirty_false" not in ids
+
+
+def test_initialize_motion_outer_catch_rethrows_only_when_error_handler_exists():
+    handler = OemHomingDryRunRuntime().run(
+        "initialize_motion",
+        simulation={
+            "tip_exists": True,
+            "tip_exists_after_eject": True,
+            "error_event_present": True,
+        },
+    )
+    assert handler["ok"] is False
+    assert handler["failure"]["step_id"] == "initializeMotion.catch.rethrow"
+    assert [row["step_id"] for row in handler["steps_executed"][-2:]] == [
+        "initializeMotion.catch.error_event",
+        "initializeMotion.catch.rethrow",
+    ]
+
+    swallowed = OemHomingDryRunRuntime().run(
+        "initialize_motion",
+        simulation={"tip_exists": True, "tip_exists_after_eject": True},
+    )
+    assert swallowed["ok"] is True
+    assert swallowed["steps_executed"][-1]["step_id"] == "initializeMotion.return.eject_failed_without_handler"
+
+
+def test_initialize_motion_retry_and_composite_exceptions_follow_nested_oem_catch_paths():
+    no_tip = OemHomingDryRunRuntime().run(
+        "initialize_motion", simulation={"pipette_initial_failed": True, "pipette_retry_failed": True}
+    )
+    assert all(
+        row["execution"] == "branch_not_taken"
+        for row in no_tip["steps_executed"]
+        if row["step_id"] in {
+            "initializeMotion.initiateGroup.retry",
+            "initializeMotion.checkedPipetteStatus.retry",
+            "initializeMotion.error_event.eject_failed_after_retry",
+            "initializeMotion.throw.eject_failed_after_retry",
+        }
+    )
+
+    contradictory_tip_state = OemHomingDryRunRuntime().run(
+        "initialize_motion", simulation={"tip_exists": False, "tip_exists_after_eject": True, "error_event_present": True}
+    )
+    assert contradictory_tip_state["ok"] is True
+    assert all(
+        row["execution"] == "branch_not_taken"
+        for row in contradictory_tip_state["steps_executed"]
+        if row["step_id"] in {
+            "initializeMotion.pause_scripts.eject_failed",
+            "initializeMotion.error_event.eject_failed",
+            "initializeMotion.throw.eject_failed",
+            "initializeMotion.return.eject_failed_without_handler",
+        }
+    )
+    post_query = contradictory_tip_state["steps_executed"][
+        next(
+            index
+            for index, row in enumerate(contradictory_tip_state["steps_executed"])
+            if row["step_id"] == "initializeMotion.sleep.after_tip_query"
+        )
+        + 1 :
+    ]
+    assert [row["step_id"] for row in post_query if row["execution"] == "simulated"] == [
+        "initializeMotion.tip_loaded_false.no_tip"
+    ]
+
+    retry_without_handler = OemHomingDryRunRuntime().run(
+        "initialize_motion",
+        simulation={
+            "tip_exists": True,
+            "tip_exists_after_eject": False,
+            "pipette_initial_failed": True,
+            "pipette_retry_failed": True,
+        },
+    )
+    assert retry_without_handler["ok"] is True
+    assert retry_without_handler["steps_executed"][-1]["step_id"] == "initializeMotion.catch.swallow_without_handler"
+    assert retry_without_handler["steps_executed"][-2]["execution"] == "source_exception"
+
+    composite_with_handler = OemHomingDryRunRuntime().run(
+        "initialize_motion", simulation={"initialize_motors_exception": True, "error_event_present": True}
+    )
+    assert composite_with_handler["failure"]["step_id"] == "initializeMotion.catch.rethrow"

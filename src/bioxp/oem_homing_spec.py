@@ -13,8 +13,17 @@ CCI = "BioXPControlLib/ClassControlInterface.cs"
 CL = "BioXPControlLib/ControlLib.cs"
 
 
+CCI_SHA256 = "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
+CL_SHA256 = "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+
+
 def A(file: str, symbol: str, lines: str) -> OemSourceAnchor:
-    return OemSourceAnchor(file=file, symbol=symbol, lines=lines)
+    return OemSourceAnchor(
+        file=file,
+        symbol=symbol,
+        lines=lines,
+        sha256=CCI_SHA256 if symbol.startswith("ClassControlInterface") else CL_SHA256,
+    )
 
 
 def S(
@@ -74,25 +83,25 @@ init_without_motion_steps = (
 
 initialize_motors_steps = (
     S("z.axisSearchHome", "ClassControlInterface.initializeMotors", "3350-3353", "axisSearchHome", axis="z", board="head", motor=1, params={"speed": 1791}, branch_condition="board_present:z"),
-    S("g.setMaxCurrent.before_clear", "ClassControlInterface.initializeMotors", "3354", "setMaxCurrent", axis="g", board="head", motor=2, params={"run_current": 31}, safety_deviations=(G_IDLE_DEVIATION,)),
+    S("g.setGripperCurrent.before_clear", "ClassControlInterface.initializeMotors", "3354", "setGripperCurrent", axis="g", board="head", motor=2, params={"run_current": 31}, safety_deviations=(G_IDLE_DEVIATION,)),
     S("g.clear.moveSteps", "ClassControlInterface.initializeMotors", "3355", "moveSteps", axis="g", board="head", motor=2, params={"steps": 10000, "waitforstop": True}, safety_deviations=(G_IDLE_DEVIATION,)),
     S("g.axisSearchHome", "ClassControlInterface.initializeMotors", "3356-3365", "axisSearchHome", axis="g", board="head", motor=2, params={"speed": "600 if GripperVersion==0 else 200"}, branch_condition="board_present:g", safety_deviations=(G_IDLE_DEVIATION,)),
     S("x.axisSearchHome", "ClassControlInterface.initializeMotors", "3367-3369", "axisSearchHome", axis="x", board="head", motor=0, params={"speed": 250}, branch_condition="board_present:x"),
-    S("x.sleep.after_home", "ClassControlInterface.initializeMotors", "3370", "sleep", wait_ms=20),
-    S("x.setHome", "ClassControlInterface.initializeMotors", "3371", "setHome", axis="x"),
-    S("x.setSpeed.restore", "ClassControlInterface.initializeMotors", "3372", "setSpeed", axis="x", params={"speed": 1700}),
-    S("x.sleep.after_speed", "ClassControlInterface.initializeMotors", "3373", "sleep", wait_ms=40),
-    S("x.park_6000", "ClassControlInterface.initializeMotors", "3374", "moveX", axis="x", params={"position": 6000}),
+    S("x.sleep.after_home", "ClassControlInterface.initializeMotors", "3370", "sleep", wait_ms=20, branch_condition="board_present:x"),
+    S("x.setHome", "ClassControlInterface.initializeMotors", "3371", "setHome", axis="x", board="head", motor=0, branch_condition="board_present:x"),
+    S("x.setSpeed.restore", "ClassControlInterface.initializeMotors", "3372", "setSpeed", axis="x", board="head", motor=0, params={"speed": 1700}, branch_condition="board_present:x"),
+    S("x.sleep.after_speed", "ClassControlInterface.initializeMotors", "3373", "sleep", wait_ms=40, branch_condition="board_present:x"),
+    S("x.park_6000", "ClassControlInterface.initializeMotors", "3374", "moveX", axis="x", board="head", motor=0, params={"position": 6000}, branch_condition="board_present:x"),
     S("y.axisSearchHome", "ClassControlInterface.initializeMotors", "3376-3379", "axisSearchHome", axis="y", board="head", motor=0, params={"speed": 250}, branch_condition="board_present:y"),
     S("door.doorSearchHome", "ClassControlInterface.initializeMotors", "3380-3383", "doorSearchHome", axis="door", board="thermal", motor=0, params={"speed": "TC_DOOR_VELOCITY", "stallguard": "TCDoorStallGuardThreshold"}, branch_condition="board_present:door"),
     S("door.open_after_failed_close", "ClassControlInterface.initializeMotors", "3384-3386", "openThermalDoor", axis="door", branch_condition="SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated"),
     S("door.throw_after_failed_close", "ClassControlInterface.initializeMotors", "3387", "throw", branch_condition="SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated", blockers_note="Cannot close thermal cycler door!"),
-    S("y.setHome.final", "ClassControlInterface.initializeMotors", "3389-3392", "setHome", axis="y"),
+    S("y.setHome.final", "ClassControlInterface.initializeMotors", "3389-3392", "setHome", axis="y", board="head", motor=0, branch_condition="board_present:y"),
     S("ui.zero_calibrated_positions", "ClassControlInterface.initializeMotors", "3393-3413", "setUiPositionText", params={"x": "0", "y": "0", "z": "0", "z_write_count": 2}, branch_condition="Calibrated"),
     S("chiller.setCoolRate.OC", "ClassControlInterface.initializeMotors", "3414", "setChillerCoolRate", params={"chiller": "OC"}),
     S("chiller.setCoolRate.RC", "ClassControlInterface.initializeMotors", "3415", "setChillerCoolRate", params={"chiller": "RC"}),
     S("status.initialized", "ClassControlInterface.initializeMotors", "3416", "setStatus", params={"system_status": 1, "ready": True}),
-    S("g.restore_current.version1", "ClassControlInterface.initializeMotors", "3417-3420", "setMaxCurrent", axis="g", params={"run_current": 10, "condition": "GripperVersion==1"}, safety_deviations=(G_IDLE_DEVIATION,)),
+    S("g.restore_current.version1", "ClassControlInterface.initializeMotors", "3417-3420", "setGripperCurrent", axis="g", board="head", motor=2, params={"run_current": 10}, branch_condition="GripperVersion==1", safety_deviations=(G_IDLE_DEVIATION,)),
 )
 
 
@@ -140,20 +149,23 @@ PROGRAMS = {
             S("initializeMotion.moveX.tip_exists", "ControlLib.initializeMotion", "8816", "moveX", axis="x", params={"position": 79000}, branch_condition="TipExist"),
             S("initializeMotion.queryTipStatus.after_eject", "ControlLib.initializeMotion", "8817", "queryTipStatus", params={"index": -1}, branch_condition="TipExist"),
             S("initializeMotion.sleep.after_eject_query", "ControlLib.initializeMotion", "8818", "sleep", wait_ms=100, branch_condition="TipExist"),
-            S("initializeMotion.pause_scripts.eject_failed", "ControlLib.initializeMotion", "8819-8821", "setFlag", params={"m_pauseScripts": True}, branch_condition="TipExistAfterEject"),
-            S("initializeMotion.error_event.eject_failed", "ControlLib.initializeMotion", "8822-8825", "emitError", params={"message": "Eject tip failed"}, branch_condition="TipExistAfterEject && errorEvent!=null"),
-            S("initializeMotion.throw.eject_failed", "ControlLib.initializeMotion", "8825", "throw", branch_condition="TipExistAfterEject && errorEvent!=null", blockers_note="Eject tip failed"),
-            S("initializeMotion.return.eject_failed_without_handler", "ControlLib.initializeMotion", "8827", "return", branch_condition="TipExistAfterEject && errorEvent==null"),
+            S("initializeMotion.pause_scripts.eject_failed", "ControlLib.initializeMotion", "8819-8821", "setFlag", params={"m_pauseScripts": True}, branch_condition="TipExist && TipExistAfterEject"),
+            S("initializeMotion.error_event.eject_failed", "ControlLib.initializeMotion", "8822-8825", "emitError", params={"message": "Eject tip failed"}, branch_condition="TipExist && TipExistAfterEject && errorEvent!=null"),
+            S("initializeMotion.throw.eject_failed", "ControlLib.initializeMotion", "8825", "throw", branch_condition="TipExist && TipExistAfterEject && errorEvent!=null", blockers_note="Eject tip failed"),
+            S("initializeMotion.return.eject_failed_without_handler", "ControlLib.initializeMotion", "8827", "return", branch_condition="TipExist && TipExistAfterEject && errorEvent==null"),
             S("initializeMotion.tip_dirty_false", "ControlLib.initializeMotion", "8829", "setMachineStatus", params={"TipDirty": False}, branch_condition="TipExist && !TipExistAfterEject"),
             S("initializeMotion.tip_loaded_false.after_eject", "ControlLib.initializeMotion", "8830", "setMachineStatus", params={"TipLoaded": False}, branch_condition="TipExist && !TipExistAfterEject"),
             S("initializeMotion.sleep.before_initiate_group", "ControlLib.initializeMotion", "8831", "sleep", wait_ms=2, branch_condition="TipExist && !TipExistAfterEject"),
             S("initializeMotion.initiateGroup.initial", "ControlLib.initializeMotion", "8832", "initiateGroup", branch_condition="TipExist && !TipExistAfterEject"),
             S("initializeMotion.checkedPipetteStatus.initial", "ControlLib.initializeMotion", "8833", "checkedPipetteStatus", branch_condition="TipExist && !TipExistAfterEject"),
-            S("initializeMotion.initiateGroup.retry", "ControlLib.initializeMotion", "8834-8835", "initiateGroup", branch_condition="PipetteStatusInitialFailed"),
-            S("initializeMotion.checkedPipetteStatus.retry", "ControlLib.initializeMotion", "8836", "checkedPipetteStatus", branch_condition="PipetteStatusInitialFailed"),
-            S("initializeMotion.error_event.eject_failed_after_retry", "ControlLib.initializeMotion", "8837-8839", "emitError", params={"message": "Eject tip failed"}, branch_condition="PipetteStatusRetryFailed"),
-            S("initializeMotion.throw.eject_failed_after_retry", "ControlLib.initializeMotion", "8839", "throw", branch_condition="PipetteStatusRetryFailed", blockers_note="Eject tip failed"),
+            S("initializeMotion.initiateGroup.retry", "ControlLib.initializeMotion", "8834-8835", "initiateGroup", branch_condition="TipExist && !TipExistAfterEject && PipetteStatusInitialFailed"),
+            S("initializeMotion.checkedPipetteStatus.retry", "ControlLib.initializeMotion", "8836", "checkedPipetteStatus", branch_condition="TipExist && !TipExistAfterEject && PipetteStatusInitialFailed"),
+            S("initializeMotion.error_event.eject_failed_after_retry", "ControlLib.initializeMotion", "8837-8839", "emitError", params={"message": "Eject tip failed"}, branch_condition="TipExist && !TipExistAfterEject && PipetteStatusInitialFailed && PipetteStatusRetryFailed"),
+            S("initializeMotion.throw.eject_failed_after_retry", "ControlLib.initializeMotion", "8839", "throw", branch_condition="TipExist && !TipExistAfterEject && PipetteStatusInitialFailed && PipetteStatusRetryFailed", blockers_note="Eject tip failed"),
             S("initializeMotion.tip_loaded_false.no_tip", "ControlLib.initializeMotion", "8843-8846", "setMachineStatus", params={"TipLoaded": False}, branch_condition="!TipExist"),
+            S("initializeMotion.catch.error_event", "ControlLib.initializeMotion", "8848-8852", "emitError", params={"message": "exception.Message"}, branch_condition="Exception && errorEvent!=null"),
+            S("initializeMotion.catch.rethrow", "ControlLib.initializeMotion", "8853", "rethrow", branch_condition="Exception && errorEvent!=null", blockers_note="initializeMotion_exception_rethrown"),
+            S("initializeMotion.catch.swallow_without_handler", "ControlLib.initializeMotion", "8848-8855", "swallowException", branch_condition="Exception && errorEvent==null"),
         ),
         G_ARTIFACT_FIELDS,
         ("pipette_cleanup_not_ported", "vision_inspection_not_ported"),

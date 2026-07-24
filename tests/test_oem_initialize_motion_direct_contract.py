@@ -2,8 +2,11 @@ from src.bioxp.oem_homing_spec import get_program
 
 
 def test_initialize_motion_spec_preserves_direct_control_lib_order_and_tip_branches():
-    """ControlLib.initializeMotion:8799-8846 is modeled, never inferred from Linux routes."""
+    """ControlLib.initializeMotion:8797-8856 is modeled, never inferred from Linux routes."""
     program = get_program("initialize_motion")
+    assert {step.source.sha256 for step in program.steps} == {
+        "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+    }
     ids = [step.step_id for step in program.steps]
 
     assert ids == [
@@ -37,6 +40,9 @@ def test_initialize_motion_spec_preserves_direct_control_lib_order_and_tip_branc
         "initializeMotion.error_event.eject_failed_after_retry",
         "initializeMotion.throw.eject_failed_after_retry",
         "initializeMotion.tip_loaded_false.no_tip",
+        "initializeMotion.catch.error_event",
+        "initializeMotion.catch.rethrow",
+        "initializeMotion.catch.swallow_without_handler",
     ]
     steps = {step.step_id: step for step in program.steps}
     assert steps["initializeMotion.sleep.after_tip_query"].wait_ms == 500
@@ -50,6 +56,11 @@ def test_initialize_motion_spec_preserves_direct_control_lib_order_and_tip_branc
         "row": 0,
     }
     assert steps["initializeMotion.throw.eject_failed"].branch_condition == (
-        "TipExistAfterEject && errorEvent!=null"
+        "TipExist && TipExistAfterEject && errorEvent!=null"
     )
-    assert steps["initializeMotion.throw.eject_failed_after_retry"].branch_condition == "PipetteStatusRetryFailed"
+    retry_condition = "TipExist && !TipExistAfterEject && PipetteStatusInitialFailed"
+    assert steps["initializeMotion.initiateGroup.retry"].branch_condition == retry_condition
+    assert steps["initializeMotion.checkedPipetteStatus.retry"].branch_condition == retry_condition
+    retry_failure_condition = f"{retry_condition} && PipetteStatusRetryFailed"
+    assert steps["initializeMotion.error_event.eject_failed_after_retry"].branch_condition == retry_failure_condition
+    assert steps["initializeMotion.throw.eject_failed_after_retry"].branch_condition == retry_failure_condition
