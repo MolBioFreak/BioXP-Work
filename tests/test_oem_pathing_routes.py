@@ -90,6 +90,6 @@ def test_scriptmove_execute_live_requires_explicit_ack(tmp_path, monkeypatch):
         }))
     except HTTPException as exc:
         assert exc.status_code == 409
-        assert "operator_ack" in str(exc.detail)
+        assert "quarantined" in str(exc.detail).lower()
     else:
         raise AssertionError("live execution without ack should fail closed")

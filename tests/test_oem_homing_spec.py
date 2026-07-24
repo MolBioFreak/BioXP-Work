@@ -28,18 +28,26 @@ def test_initialize_motors_spec_preserves_oem_order_and_g_current_invariant():
     from bioxp.oem_homing_spec import get_program
     prog = get_program("initialize_motors")
     assert prog.live_allowed_default is False
-    assert [s.step_id for s in prog.steps[:12]] == [
+    assert [s.step_id for s in prog.steps] == [
         "z.axisSearchHome",
         "g.setMaxCurrent.before_clear",
         "g.clear.moveSteps",
         "g.axisSearchHome",
         "x.axisSearchHome",
+        "x.sleep.after_home",
         "x.setHome",
         "x.setSpeed.restore",
+        "x.sleep.after_speed",
         "x.park_6000",
         "y.axisSearchHome",
         "door.doorSearchHome",
+        "door.open_after_failed_close",
+        "door.throw_after_failed_close",
         "y.setHome.final",
+        "ui.zero_calibrated_positions",
+        "chiller.setCoolRate.OC",
+        "chiller.setCoolRate.RC",
+        "status.initialized",
         "g.restore_current.version1",
     ]
     assert "g_current_invariant" in prog.required_artifact_fields

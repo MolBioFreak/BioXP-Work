@@ -51,6 +51,7 @@ def test_rendered_markdown_is_current_and_deterministic() -> None:
 @pytest.mark.parametrize(
     "edge_id",
     [
+        "environment_can_ready",
         "environment_queue_initialize",
         "warning_update_failure_queue_initialize",
         "software_update_cancel_queue_initialize",
