@@ -10,7 +10,7 @@ from .oem_runtime_commands import OEMRuntimeCommandHandlers
 from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
 from .oem_runtime_store import OEMRuntimeStore
-from .oem_runtime_types import OEMCommandName, OEMRuntimeCommand
+from .oem_runtime_types import OEMCommandName, OEMRuntimeCommand, new_id
 from .lifecycle_state import lifecycle_state
 
 router = APIRouter(prefix="/oem/runtime", tags=["OEM runtime app parity"])
@@ -74,6 +74,19 @@ def _require_runtime():
     return _store, _worker, _events, _status
 
 
+def _runtime_artifact_root() -> str:
+    base = (
+        os.environ.get("BIOXP_OEM_RUNTIME_ARTIFACT_ROOT")
+        or os.path.join(
+            os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
+            or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
+            or "/tmp/bioxp-oem-runtime",
+            "artifacts",
+        )
+    )
+    return os.path.join(base, new_id("startupHomingStepwise"))
+
+
 def _runtime_unavailable(component: str) -> dict[str, Any]:
     lifecycle = lifecycle_state.projection()
     return {
@@ -91,8 +104,12 @@ def _runtime_unavailable(component: str) -> dict[str, Any]:
 
 def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
     _, worker, _, _ = _require_runtime()
+    artifact_root = req.artifact_root
+    if name == OEMCommandName.STARTUP_HOMING_STEPWISE.value:
+        # The robot, not a remote BMS client, owns artifact filesystem paths.
+        artifact_root = _runtime_artifact_root()
     try:
-        cmd = OEMRuntimeCommand(name=name, mode=req.mode, source=req.source, params=req.params, operator_ack=req.operator_ack, artifact_root=req.artifact_root, timeout_s=req.timeout_s)
+        cmd = OEMRuntimeCommand(name=name, mode=req.mode, source=req.source, params=req.params, operator_ack=req.operator_ack, artifact_root=artifact_root, timeout_s=req.timeout_s)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return worker.enqueue(cmd)

@@ -88,6 +88,7 @@ from .services.vision_service import (
 BMS_COMMISSIONING_CAPABILITIES = (
     "collect_hardware_snapshot",
     "initialize_oem_environment",
+    "run_oem_motor_stage",
 )
 
 # Explicit camera routes own camera evidence. A generic hardware snapshot must
@@ -311,6 +312,11 @@ async def lifespan(app: FastAPI):
         usb="unbound",
         router="unbound",
     )
+    configure_oem_runtime(
+        startup_program_factory=_get_live_oem_startup_program,
+        store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
+        autostart=True,
+    )
     try:
         yield
     finally:
@@ -382,6 +388,12 @@ def _get_oem_startup_program(*, dry_safe: bool = False) -> OEMStartupProgram:
 def _get_existing_oem_startup_program() -> OEMStartupProgram:
     if _oem_startup_program is not None:
         return _oem_startup_program
+    return _get_oem_startup_program(dry_safe=False)
+
+
+def _get_live_oem_startup_program() -> OEMStartupProgram:
+    # Runtime workers are live-only. A prior dry-run request may have cached
+    # DryRunStartupHardware, so this factory always uses the upgrading path.
     return _get_oem_startup_program(dry_safe=False)
 
 
@@ -980,7 +992,8 @@ class OemStartupStepRequest(BaseModel):
     step: str = Field(
         ...,
         pattern=(
-            r"^(z-home|gripper-current-31|gripper-clear-10000|gripper-home|x-home|x-park-6000|"
+            r"^(z-home|gripper-current-31|gripper-clear-10000|gripper-home|x-home|x-home-settle|"
+            r"x-set-home|x-speed-1700|x-speed-settle|x-park-6000|"
             r"y-home|door-home|door-closed-predicate|y-set-home|ui-zero-calibrated|"
             r"chiller-oc-cool-rate|chiller-rc-cool-rate|system-status-initialized|gripper-idle-current-10)$"
         ),

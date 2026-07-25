@@ -469,7 +469,11 @@ class BioXpStartupHardware:
             {"step": "gripper-clear-10000", "oem_anchor": "initializeMotors: MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
-            {"step": "x-park-6000", "oem_anchor": "initializeMotors: setHome(X); setSpeed(X,1700); moveX(6000)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
+            {"step": "x-home-settle", "oem_anchor": "initializeMotors: sleep(20ms)", "axis": "x", "requires_operator_observation": True},
+            {"step": "x-set-home", "oem_anchor": "initializeMotors: setHome(X)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
+            {"step": "x-speed-1700", "oem_anchor": "initializeMotors: setSpeed(X,1700)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
+            {"step": "x-speed-settle", "oem_anchor": "initializeMotors: sleep(40ms)", "axis": "x", "requires_operator_observation": True},
+            {"step": "x-park-6000", "oem_anchor": "initializeMotors: moveX(6000)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "y-home", "oem_anchor": "initializeMotors: MotorY.axisSearchHome(speed=250)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
             {"step": "door-home", "oem_anchor": "initializeMotors: ThermalDoor.doorSearchHome(...) ", "axis": "door", "board": int(tester.BOARD_THERMAL), "motor": 0, "requires_operator_observation": True},
             {"step": "door-closed-predicate", "oem_anchor": "initializeMotors: !confirmAxis(tcDoorClosed) failure branch", "axis": "door", "requires_operator_observation": True},
@@ -658,12 +662,26 @@ class BioXpStartupHardware:
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
             }
+        if selected == "x-home-settle":
+            time.sleep(0.020)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": True, "mode": mode, "execute": True, "physical_motion": False, "hardware_touched": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "settle_ms": 20, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "x-set-home":
+            profile = tester._motion_oem_axis_profile("x", startup=True)
+            set_home = tester.motor_set_home(profile["board"], motor=profile["motor"])
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": bool(set_home.get("ok")), "mode": mode, "execute": True, "physical_motion": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "x_set_home": set_home, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "x-speed-1700":
+            profile = tester._motion_oem_axis_profile("x", startup=True)
+            set_speed = tester.motor_set_axis_param(profile["board"], 4, 1700, motor=profile["motor"])
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": bool(set_speed.get("ok")), "mode": mode, "execute": True, "physical_motion": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "x_speed_1700": set_speed, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "x-speed-settle":
+            time.sleep(0.040)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": True, "mode": mode, "execute": True, "physical_motion": False, "hardware_touched": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "settle_ms": 40, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
         if selected == "x-park-6000":
             profile = tester._motion_oem_axis_profile("x", startup=True)
-            time.sleep(0.020)
-            set_home = tester.motor_set_home(profile["board"], motor=profile["motor"])
-            set_speed = tester.motor_set_axis_param(profile["board"], 4, 1700, motor=profile["motor"])
-            time.sleep(0.040)
             move = tester.motor_move_absolute(profile["board"], 6000, motor=profile["motor"])
             wait = tester.motor_wait_stopped(
                 profile["board"],
@@ -672,9 +690,7 @@ class BioXpStartupHardware:
                 require_seen_nonzero=True,
             )
             ok = bool(
-                set_home.get("ok")
-                and set_speed.get("ok")
-                and move.get("ok")
+                move.get("ok")
                 and wait.get("stopped") is True
             )
             post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
@@ -682,11 +698,15 @@ class BioXpStartupHardware:
                 "ok": ok,
                 "mode": mode,
                 "execute": True,
-                "physical_motion": bool(move.get("ok")),
+                "physical_motion": True,
+                "motion_command_attempted": True,
+                "controller_acknowledged": move.get("ok") is True,
+                "stopped_observed": wait.get("stopped") is True,
+                "physical_effect_verified": False,
                 "step": row,
                 "pre_snapshot": pre,
                 "post_snapshot": post,
-                "x_park_6000": {"set_home": set_home, "set_speed_1700": set_speed, "move_x_6000": move, "wait": wait},
+                "x_park_6000": {"move_x_6000": move, "wait": wait},
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
             }

@@ -54,6 +54,10 @@ def test_stepwise_plan_is_oem_initialize_motors_order_not_head_clearance_replace
         "gripper-clear-10000",
         "gripper-home",
         "x-home",
+        "x-home-settle",
+        "x-set-home",
+        "x-speed-1700",
+        "x-speed-settle",
         "x-park-6000",
         "y-home",
         "door-home",
@@ -307,11 +311,19 @@ def test_stepwise_x_home_and_park_preserve_literal_oem_calls_and_waits(monkeypat
             return {"stopped": True, "seen_nonzero": True}
 
     hardware = BioXpStartupHardware(lambda: Tester())
-    x_home = hardware.startup_homing_stepwise(mode="live", step="x-home", execute=True)
-    x_park = hardware.startup_homing_stepwise(mode="live", step="x-park-6000", execute=True)
+    results = [
+        hardware.startup_homing_stepwise(mode="live", step=stage, execute=True)
+        for stage in (
+            "x-home",
+            "x-home-settle",
+            "x-set-home",
+            "x-speed-1700",
+            "x-speed-settle",
+            "x-park-6000",
+        )
+    ]
 
-    assert x_home["ok"] is True
-    assert x_park["ok"] is True
+    assert all(result["ok"] is True for result in results)
     assert calls == [
         ("home", "x", True, 250, 30.0),
         ("set_home", 5, 0),
@@ -319,7 +331,30 @@ def test_stepwise_x_home_and_park_preserve_literal_oem_calls_and_waits(monkeypat
         ("move_absolute", 5, 6000, 0),
         ("wait", 5, 0, {"timeout_s": 12.0, "require_seen_nonzero": True}),
     ]
-    assert sleeps == [0.02, 0.04]
+    assert sleeps == [0.020, 0.040]
+
+
+def test_x_park_reports_attempted_motion_separately_from_ack_and_effect():
+    class Tester(_FakeTester):
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            return {"board": 5, "motor": 0}
+
+        def motor_move_absolute(self, board, value, motor=0):
+            return {"ok": False, "error": "reply_lost"}
+
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            return {"stopped": False, "error": "status_unavailable"}
+
+    result = BioXpStartupHardware(lambda: Tester()).startup_homing_stepwise(
+        mode="live", step="x-park-6000", execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["physical_motion"] is True
+    assert result["motion_command_attempted"] is True
+    assert result["controller_acknowledged"] is False
+    assert result["stopped_observed"] is False
+    assert result["physical_effect_verified"] is False
 
 
 def test_stepwise_y_door_and_y_set_home_use_their_distinct_oem_primitives():

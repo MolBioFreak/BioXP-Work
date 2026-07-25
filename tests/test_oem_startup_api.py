@@ -159,4 +159,21 @@ def test_status_advertises_only_current_bms_commissioning_capabilities(monkeypat
     assert response.json()["capabilities"] == [
         "collect_hardware_snapshot",
         "initialize_oem_environment",
+        "run_oem_motor_stage",
     ]
+
+
+def test_runtime_factory_upgrades_a_cached_dry_startup_provider(monkeypatch):
+    from src.bioxp import api as api_module
+    from src.bioxp.oem_startup_program import BioXpStartupHardware, DryRunStartupHardware
+
+    monkeypatch.setattr(api_module, "_oem_startup_program", None)
+    monkeypatch.setattr(api_module, "_tester", None)
+    dry = api_module._get_oem_startup_program(dry_safe=True)
+    assert isinstance(dry.hardware, DryRunStartupHardware)
+
+    monkeypatch.setattr(api_module, "_tester", object())
+    live = api_module._get_live_oem_startup_program()
+
+    assert live is not dry
+    assert isinstance(live.hardware, BioXpStartupHardware)

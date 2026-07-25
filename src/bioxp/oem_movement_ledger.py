@@ -33,8 +33,24 @@ OEM_INITIALIZE_MOTORS_STAGES: tuple[dict[str, Any], ...] = (
         "source_anchor": "ClassControlInterface.initializeMotors:3348-3421; M05 MotorX.axisSearchHome(speed=250)",
     },
     {
+        "key": "x-home-settle",
+        "source_anchor": "ClassControlInterface.initializeMotors:3370; M06 sleep(20ms)",
+    },
+    {
+        "key": "x-set-home",
+        "source_anchor": "ClassControlInterface.initializeMotors:3371; M07 setHome(X)",
+    },
+    {
+        "key": "x-speed-1700",
+        "source_anchor": "ClassControlInterface.initializeMotors:3372; M08 setSpeed(X,1700)",
+    },
+    {
+        "key": "x-speed-settle",
+        "source_anchor": "ClassControlInterface.initializeMotors:3373; M09 sleep(40ms)",
+    },
+    {
         "key": "x-park-6000",
-        "source_anchor": "ClassControlInterface.initializeMotors:3348-3421; M06 sleep(20ms); M07 setHome(X); M08 setSpeed(X,1700); M09 sleep(40ms); M10 moveX(6000)",
+        "source_anchor": "ClassControlInterface.initializeMotors:3374; M10 moveX(6000)",
     },
     {
         "key": "y-home",
@@ -129,6 +145,12 @@ class OemMovementLedger:
         ledger.setdefault("robot_state", {})
         rows = ledger.get("stages")
         if not isinstance(rows, dict):
+            ledger["compatibility_blocker"] = "oem_initializeMotors_ledger_stage_schema_incompatible"
+            ledger["terminal_state"] = "failed_closed"
+            return ledger
+        if set(rows) != set(OEM_INITIALIZE_MOTORS_STAGE_KEYS):
+            ledger["compatibility_blocker"] = "oem_initializeMotors_ledger_stage_schema_incompatible"
+            ledger["terminal_state"] = "failed_closed"
             return ledger
         for stage in OEM_INITIALIZE_MOTORS_STAGES:
             row = rows.get(stage["key"])
@@ -151,6 +173,14 @@ class OemMovementLedger:
         with self._lock:
             ledger = self._load()
             selected = str(stage).strip().lower()
+            compatibility_blocker = ledger.get("compatibility_blocker")
+            if compatibility_blocker:
+                return {
+                    "ok": False,
+                    "blocker": str(compatibility_blocker),
+                    "expected_next_stage": ledger.get("expected_next_stage"),
+                    "ledger": self._save(ledger),
+                }
             expected = ledger["expected_next_stage"]
             if selected != expected:
                 return {
@@ -226,6 +256,19 @@ class OemMovementLedger:
     def record_observation(self, *, stage: str, observed_pass: bool, note: str | None, command_id: str) -> dict[str, Any]:
         with self._lock:
             ledger = self._load()
+            if type(observed_pass) is not bool:
+                return {
+                    "ok": False,
+                    "blocker": "oem_initializeMotors_observed_pass_must_be_boolean",
+                    "ledger": ledger,
+                }
+            if not isinstance(note, str) or not note.strip():
+                return {
+                    "ok": False,
+                    "blocker": "oem_initializeMotors_operator_note_required",
+                    "ledger": ledger,
+                }
+            note = note.strip()
             selected = str(stage).strip().lower()
             expected = ledger["expected_next_stage"]
             if selected != expected:
@@ -250,8 +293,8 @@ class OemMovementLedger:
                     "expected_next_stage": expected,
                     "ledger": ledger,
                 }
-            row["observation"] = {"command_id": str(command_id), "observed_pass": bool(observed_pass), "note": note}
-            if not bool(observed_pass):
+            row["observation"] = {"command_id": str(command_id), "observed_pass": observed_pass, "note": note}
+            if observed_pass is False:
                 row["state"] = "failed"
                 ledger["terminal_state"] = "failed_closed"
                 return {"ok": False, "blocker": f"oem_initializeMotors_operator_observation_failed_{selected}", "ledger": self._save(ledger)}
