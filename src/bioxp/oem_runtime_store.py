@@ -20,7 +20,7 @@ class OEMRuntimeStore:
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._seq = self._load_seq()
 
     def _load_seq(self) -> int:
@@ -63,6 +63,20 @@ class OEMRuntimeStore:
         if not p.exists():
             return None
         return json.loads(p.read_text())
+
+    def write_oem_movement_ledger(self, ledger: dict[str, Any]) -> dict[str, Any]:
+        """Persist the robot-owned initializeMotors source-order ledger atomically."""
+        payload = dict(ledger)
+        with self._lock:
+            payload["sequence"] = self.next_seq()
+            _atomic_json(self.root / "oem_initialize_motors_ledger.json", payload)
+        return payload
+
+    def read_oem_movement_ledger(self) -> dict[str, Any] | None:
+        path = self.root / "oem_initialize_motors_ledger.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
 
     def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = dict(payload)

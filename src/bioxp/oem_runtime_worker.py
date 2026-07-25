@@ -103,7 +103,7 @@ class OEMRuntimeWorker:
                 reason=f"runtime_command_{'completed' if handler_ok else 'failed'}:{cmd.name}",
             )
             lifecycle = lifecycle_state.projection()
-            result["state"] = lifecycle["operation_state"]
+            result["state"] = handler_state or lifecycle["operation_state"]
             result["operation_state"] = lifecycle["operation_state"]
             result["startup"] = lifecycle["startup"]
             if handler_state is not None:

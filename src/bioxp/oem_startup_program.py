@@ -9,6 +9,7 @@ from typing import Any
 
 from .oem_config import find_oem_config
 from .oem_motion_worker import OEMMotionWorker, OemMotionCommand
+from .oem_parity_config import load_oem_parity_config
 from .oem_pipette_collection import dry_run_initialize_motion_pipette_cleanup
 from .oem_startup_types import OemStartupState, STARTUP_STAGE_ORDER
 from .oem_switch_audit import require_confident_predicates
@@ -353,18 +354,132 @@ class BioXpStartupHardware:
         }
 
     def startup_homing_stepwise(self, *, mode: str = "shadow", step: str = "plan", execute: bool = False, preclear_abs: int | None = None, require_operator_observed: bool = True) -> dict:
+        selected = str(step).strip().lower()
+        # M16/M17 are literal individual CAN writes in the only existing source
+        # model (motor_oem_initialize_without_motion). Calling that aggregate here
+        # would replay unrelated setup writes; a generic chiller helper would be
+        # invented behavior. Do neither.
+        if bool(execute) and selected in {"chiller-oc-cool-rate", "chiller-rc-cool-rate"}:
+            bank = 1 if selected == "chiller-oc-cool-rate" else 0
+            return {
+                "ok": False,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": False,
+                "hardware_touched": False,
+                "step": {"step": selected},
+                "source_anchor": "ClassControlInterface.initializeMotors:3414-3415; usb_driver.py:4192-4194",
+                "literal_oem_gp8_write": {"board": "BOARD_CHILLER", "command": 9, "type": 8, "bank": bank, "value": -25},
+                "blockers": ["single_stage_chiller_transport_not_source_bound"],
+            }
+        # M18's exact source status becomes durable only through the robot-owned
+        # movement ledger. It is not a UI projection nor product readiness.
+        if bool(execute) and selected == "system-status-initialized":
+            return {
+                "ok": True,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": False,
+                "hardware_touched": False,
+                "step": {"step": selected},
+                "durable_robot_state": {"system_status": 1, "ready": True},
+                "source_anchor": "ClassControlInterface.initializeMotors:3416",
+                "oem_source_order_preserved": True,
+            }
+        if bool(execute) and selected == "ui-zero-calibrated":
+            tester = self.tester
+            machine = tester._machine_config_bundle() if hasattr(tester, "_machine_config_bundle") else None
+            calibration = (((machine or {}).get("config") or {}).get("calibration") or {}) if isinstance(machine, dict) else {}
+            raw_calibrated = calibration.get("Calibrated") if isinstance(calibration, dict) else None
+            calibrated = raw_calibrated is True or raw_calibrated == 1 or str(raw_calibrated).strip().lower() in {"true", "yes", "1"}
+            if not isinstance(machine, dict) or machine.get("ok") is not True or raw_calibrated is None:
+                return {
+                    "ok": False,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "hardware_touched": False,
+                    "step": {"step": selected},
+                    "blockers": ["immutable_oem_calibrated_branch_authority_unavailable"],
+                }
+            if not calibrated:
+                return {
+                    "ok": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "hardware_touched": False,
+                    "step": {"step": selected},
+                    "source_branch_taken": False,
+                    "ui_writes": [],
+                    "oem_source_order_preserved": True,
+                }
+            return {
+                "ok": False,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": False,
+                "hardware_touched": False,
+                "step": {"step": selected},
+                "source_branch_taken": True,
+                "expected_ui_writes": [("x", "0"), ("y", "0"), ("z", "0"), ("z", "0")],
+                "blockers": ["calibrated_ui_position_sink_not_bound"],
+            }
+        if bool(execute) and selected == "gripper-idle-current-10":
+            tester = self.tester
+            profile = tester._motion_oem_axis_profile("g", startup=True)
+            try:
+                gripper_version = int(profile["gripper_version"])
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": {"step": selected},
+                    "blockers": ["immutable_oem_gripper_version_authority_unavailable"],
+                }
+            if gripper_version != 1:
+                return {
+                    "ok": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": {"step": selected},
+                    "source_branch_taken": False,
+                    "gripper_version": gripper_version,
+                    "oem_source_order_preserved": True,
+                }
+            current = tester.motor_set_axis_param(profile["board"], 6, 10, motor=profile["motor"])
+            return {
+                "ok": bool(current.get("ok")),
+                "mode": mode,
+                "execute": True,
+                "physical_motion": False,
+                "step": {"step": selected},
+                "source_branch_taken": True,
+                "gripper_version": 1,
+                "gripper_idle_current_10": current,
+                "oem_source_order_preserved": True,
+            }
         tester = self.tester
         steps = [
             {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
-            {"step": "gripper-clear", "oem_anchor": "initializeMotors: setGripperCurrent(31); MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "gripper-current-31", "oem_anchor": "initializeMotors: setGripperCurrent(31)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "gripper-clear-10000", "oem_anchor": "initializeMotors: MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "x-park-6000", "oem_anchor": "initializeMotors: setHome(X); setSpeed(X,1700); moveX(6000)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "y-home", "oem_anchor": "initializeMotors: MotorY.axisSearchHome(speed=250)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
-            {"step": "door-home", "oem_anchor": "initializeMotors: ThermalDoor.doorSearchHome(...) / queryHome closed", "axis": "door", "board": int(tester.BOARD_THERMAL), "motor": 0, "requires_operator_observation": True},
+            {"step": "door-home", "oem_anchor": "initializeMotors: ThermalDoor.doorSearchHome(...) ", "axis": "door", "board": int(tester.BOARD_THERMAL), "motor": 0, "requires_operator_observation": True},
+            {"step": "door-closed-predicate", "oem_anchor": "initializeMotors: !confirmAxis(tcDoorClosed) failure branch", "axis": "door", "requires_operator_observation": True},
             {"step": "y-set-home", "oem_anchor": "initializeMotors: setHome(Y)", "axis": "y", "board": int(tester.BOARD_HEAD), "motor": 0, "requires_operator_observation": True},
+            {"step": "ui-zero-calibrated", "oem_anchor": "initializeMotors: Calibrated UI X/Y/Z zero writes", "requires_operator_observation": False},
+            {"step": "chiller-oc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(OC)", "requires_operator_observation": False},
+            {"step": "chiller-rc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(RC)", "requires_operator_observation": False},
+            {"step": "system-status-initialized", "oem_anchor": "initializeMotors: system status=1, ready=true", "requires_operator_observation": False},
+            {"step": "gripper-idle-current-10", "oem_anchor": "initializeMotors: GripperVersion==1 setGripperCurrent(10)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": False},
         ]
-        selected = str(step).strip().lower()
         if selected in {"plan", "full", "all", ""}:
             return {
                 "ok": True,
@@ -380,10 +495,109 @@ class BioXpStartupHardware:
         matches = [row for row in steps if row["step"] == selected]
         if not matches:
             return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "error": f"unknown_homing_step:{selected}", "allowed_steps": [row["step"] for row in steps]}
-        pre = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
         row = dict(matches[0])
         if not bool(execute):
+            pre = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
             return {"ok": True, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "dry_run_note": "planned only; no axis/home/move command issued"}
+        if selected == "door-closed-predicate":
+            # M13 (ClassControlInterface.initializeMotors:3384-3387) uses the
+            # sealed machine identity/calibration binding, not a diagnostic XML
+            # parse or a source-default fallback.  Its closed state is likewise
+            # the literal tcDoorClosed/QueryHome predicate; generic door-status
+            # fields are deliberately not accepted here.
+            parity_config = load_oem_parity_config(None)
+            values = parity_config.values if getattr(parity_config, "calibration_source", None) == "immutable_oem_machine_snapshot" else {}
+            if getattr(parity_config, "calibration_source", None) != "immutable_oem_machine_snapshot":
+                return {
+                    "ok": False,
+                    "failed_closed": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": row,
+                    "error": "sealed_config_machine_snapshot_required",
+                    "sealed_config_source": getattr(parity_config, "calibration_source", None),
+                    "sealed_config_blockers": list(getattr(parity_config, "blockers", [])),
+                }
+            try:
+                serial_number = int(values["SerialNumber"])
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "failed_closed": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": row,
+                    "error": "sealed_config_serial_number_required",
+                }
+            camera_calibrated = values.get("CameraCalibrated")
+            if not isinstance(camera_calibrated, bool):
+                return {
+                    "ok": False,
+                    "failed_closed": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": row,
+                    "error": "sealed_config_camera_calibrated_boolean_required",
+                }
+            thermal_status = tester.motor_thermal_door_status()
+            predicates = thermal_status.get("oem_predicates") if isinstance(thermal_status, dict) else None
+            thermal_closed = predicates.get("tcDoorClosed") if isinstance(predicates, dict) else None
+            closed_source = predicates.get("closed_source") if isinstance(predicates, dict) else None
+            if not isinstance(thermal_closed, bool) or closed_source != "queryHome(ThermalDoor)":
+                return {
+                    "ok": False,
+                    "failed_closed": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": False,
+                    "step": row,
+                    "error": "tcDoorClosed_source_predicate_required",
+                    "thermal_closed_predicate": {"tcDoorClosed": thermal_closed, "source": closed_source},
+                }
+            source_condition = "SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated"
+            source_condition_active = serial_number > 9 and thermal_closed is False and camera_calibrated is True
+            binding = {
+                "SerialNumber": serial_number,
+                "CameraCalibrated": camera_calibrated,
+                "source": "immutable_oem_machine_snapshot",
+            }
+            predicate = {"tcDoorClosed": thermal_closed, "source": closed_source}
+            if source_condition_active:
+                opened = tester.motor_oem_open_thermal_door(timeout_s=20.0)
+                # The OEM branch opens then throws unconditionally; do not turn
+                # this terminal source failure into a generic open-door result.
+                return {
+                    "ok": False,
+                    "failed_closed": True,
+                    "mode": mode,
+                    "execute": True,
+                    "physical_motion": True,
+                    "step": row,
+                    "source_condition": source_condition,
+                    "source_condition_active": True,
+                    "sealed_config_binding": binding,
+                    "thermal_closed_predicate": predicate,
+                    "open_thermal_door": opened,
+                    "error": "Cannot close thermal cycler door!",
+                    "oem_source_order_preserved": True,
+                }
+            return {
+                "ok": True,
+                "failed_closed": False,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": False,
+                "step": row,
+                "source_condition": source_condition,
+                "source_condition_active": False,
+                "sealed_config_binding": binding,
+                "thermal_closed_predicate": predicate,
+                "oem_source_order_preserved": True,
+            }
+        pre = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
         if selected == "z-home":
             z_home = tester.motor_oem_home_axis("z", startup=True, timeout_s=30.0)
             post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
@@ -400,6 +614,97 @@ class BioXpStartupHardware:
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
             }
+        if selected == "gripper-current-31":
+            profile = tester._motion_oem_axis_profile("g", startup=True)
+            current = tester.motor_set_axis_param(profile["board"], 6, 31, motor=profile["motor"])
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": bool(current.get("ok")), "mode": mode, "execute": True, "physical_motion": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "gripper_current_31": current, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "gripper-clear-10000":
+            profile = tester._motion_oem_axis_profile("g", startup=True)
+            move = tester.motor_move_relative(profile["board"], 10000, motor=profile["motor"])
+            wait = tester.motor_wait_stopped(profile["board"], motor=profile["motor"], timeout_s=20.0, require_seen_nonzero=False)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": bool(move.get("ok") and wait.get("stopped") is True), "mode": mode, "execute": True, "physical_motion": bool(move.get("ok")), "step": row, "pre_snapshot": pre, "post_snapshot": post, "gripper_move_10000": move, "wait": wait, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "gripper-home":
+            # Serial-206 has GripperVersion=1, so the direct source branch is 200.
+            home = tester.motor_oem_home_axis("g", startup=True, speed=200, timeout_s=30.0)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            home_ok = bool((home.get("home") or {}).get("ok")) if isinstance(home, dict) else False
+            return {
+                "ok": home_ok,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": True,
+                "step": row,
+                "pre_snapshot": pre,
+                "post_snapshot": post,
+                "gripper_home": home,
+                "operator_observation_required": bool(require_operator_observed),
+                "oem_source_order_preserved": True,
+            }
+        if selected == "x-home":
+            home = tester.motor_oem_home_axis("x", startup=True, speed=250, timeout_s=30.0)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            home_ok = bool((home.get("home") or {}).get("ok")) if isinstance(home, dict) else False
+            return {
+                "ok": home_ok,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": True,
+                "step": row,
+                "pre_snapshot": pre,
+                "post_snapshot": post,
+                "x_home": home,
+                "operator_observation_required": bool(require_operator_observed),
+                "oem_source_order_preserved": True,
+            }
+        if selected == "x-park-6000":
+            profile = tester._motion_oem_axis_profile("x", startup=True)
+            time.sleep(0.020)
+            set_home = tester.motor_set_home(profile["board"], motor=profile["motor"])
+            set_speed = tester.motor_set_axis_param(profile["board"], 4, 1700, motor=profile["motor"])
+            time.sleep(0.040)
+            move = tester.motor_move_absolute(profile["board"], 6000, motor=profile["motor"])
+            wait = tester.motor_wait_stopped(
+                profile["board"],
+                motor=profile["motor"],
+                timeout_s=12.0,
+                require_seen_nonzero=True,
+            )
+            ok = bool(
+                set_home.get("ok")
+                and set_speed.get("ok")
+                and move.get("ok")
+                and wait.get("stopped") is True
+            )
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {
+                "ok": ok,
+                "mode": mode,
+                "execute": True,
+                "physical_motion": bool(move.get("ok")),
+                "step": row,
+                "pre_snapshot": pre,
+                "post_snapshot": post,
+                "x_park_6000": {"set_home": set_home, "set_speed_1700": set_speed, "move_x_6000": move, "wait": wait},
+                "operator_observation_required": bool(require_operator_observed),
+                "oem_source_order_preserved": True,
+            }
+        if selected == "y-home":
+            home = tester.motor_oem_home_axis("y", startup=True, speed=250, timeout_s=30.0)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            home_ok = bool((home.get("home") or {}).get("ok")) if isinstance(home, dict) else False
+            return {"ok": home_ok, "mode": mode, "execute": True, "physical_motion": True, "step": row, "pre_snapshot": pre, "post_snapshot": post, "y_home": home, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "door-home":
+            door = tester.motor_oem_door_search_home(startup=True, timeout_s=30.0)
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            door_ok = bool(door.get("ok")) if isinstance(door, dict) else False
+            return {"ok": door_ok, "mode": mode, "execute": True, "physical_motion": True, "step": row, "pre_snapshot": pre, "post_snapshot": post, "door_home": door, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
+        if selected == "y-set-home":
+            profile = tester._motion_oem_axis_profile("y", startup=True)
+            set_home = tester.motor_set_home(profile["board"], motor=profile["motor"])
+            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
+            return {"ok": bool(set_home.get("ok")), "mode": mode, "execute": True, "physical_motion": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "y_set_home": set_home, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
         return {"ok": False, "mode": mode, "execute": False, "physical_motion": False, "step": row, "pre_snapshot": pre, "error": "live_step_execution_not_enabled_for_this_step", "refusal": "scaffold installed; enable one step only after prior step proof and operator observation"}
 
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:

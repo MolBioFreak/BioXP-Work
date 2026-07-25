@@ -977,7 +977,14 @@ class MaintenanceRecoverMotionRequest(BaseModel):
 
 
 class OemStartupStepRequest(BaseModel):
-    step: str = Field(..., pattern=r"^(z-home|gripper-clear|gripper-home|x-home|x-park-6000|y-home|door-home|y-set-home)$")
+    step: str = Field(
+        ...,
+        pattern=(
+            r"^(z-home|gripper-current-31|gripper-clear-10000|gripper-home|x-home|x-park-6000|"
+            r"y-home|door-home|door-closed-predicate|y-set-home|ui-zero-calibrated|"
+            r"chiller-oc-cool-rate|chiller-rc-cool-rate|system-status-initialized|gripper-idle-current-10)$"
+        ),
+    )
     timeout_s: float = Field(25.0, gt=0.1, le=90.0)
 
 

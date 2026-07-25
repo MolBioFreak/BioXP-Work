@@ -46,8 +46,8 @@ def test_runtime_initial_check_shadow_uses_bound_provider_and_stays_not_ready(tm
     worker.enqueue(OEMRuntimeCommand(name="initializeSystem", params={"run_initial_check": True}))
     result = worker.run_next_for_tests()
     assert result["ok"] is True
-    assert calls == ["shadow"]
-    assert result["result"]["state"] == "initial_check_passed"
+    assert calls == []
+    assert result["result"]["state"] == "diagnostic_complete"
     assert result["result"]["ready"] is False
     assert "initializeMotion_not_executed_from_runtime_worker" in result["result"]["blockers"]
 
@@ -71,12 +71,38 @@ def test_runtime_initial_check_live_requires_initialize_ack_in_handler(tmp_path)
     assert "operator_ack_INITIALIZE_required_for_live_initialCheck" in result["result"]["blockers"]
 
 
-def test_runtime_initial_check_live_writes_artifact(tmp_path):
+def test_runtime_initial_check_live_writes_artifact(tmp_path, monkeypatch):
+    from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from src.bioxp import lifecycle_state as lifecycle_module
     from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
 
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transport_changed(True, reason="test_transport_owned")
+    lifecycle.run_stage("constructor_pipette_stage", lambda: {"ok": True})
+    lifecycle.run_stage("initialization_without_motion", lambda: {"ok": True})
+    monkeypatch.setattr(lifecycle_module, "lifecycle_state", lifecycle)
+
     class Hardware:
-        def initial_check(self, *, mode="shadow"):
-            return {"ok": True, "sequence": ["backend_ready", "led_white", "door_latch_before", "deactivate_boards", "activate_boards", "door_latch_final"], "door_latch": {"door_closed": True, "latch_closed": True}}
+        def set_led_rgb(self, _r, _g, _b):
+            return {"ok": True}
+
+        def query_door(self):
+            return {"value": 1, "ack": {"status": 100}}
+
+        def query_latch(self):
+            return {"value": 0, "ack": {"status": 100}}
+
+        def set_solenoid(self, _value):
+            return {"ok": True}
+
+        def query_voltage(self):
+            return {"payload_raw": 0, "reply_present": True, "transport_outcome": "reply", "oem_status": 100}
+
+        def deactivate_boards(self):
+            return {"ok": True}
+
+        def activate_boards(self):
+            return {"ok": True}
 
     class Program:
         hardware = Hardware()
@@ -189,8 +215,17 @@ def test_worker_fails_closed_when_handler_missing(tmp_path):
     assert worker.snapshot()["gantry_available"] is True
     assert store.read_journal("runtime_errors.jsonl")
 
-def test_runtime_oem_initialize_motors_step_requires_home_ack_and_passes_step(tmp_path):
+def test_runtime_oem_initialize_motors_step_requires_home_ack_and_passes_step(tmp_path, monkeypatch):
+    from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from src.bioxp import lifecycle_state as lifecycle_module
     from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transport_changed(True, reason="test_transport_owned")
+    lifecycle.run_stage("constructor_pipette_stage", lambda: {"ok": True})
+    lifecycle.run_stage("initialization_without_motion", lambda: {"ok": True})
+    lifecycle.run_stage("initial_check", lambda: {"ok": True})
+    monkeypatch.setattr(lifecycle_module, "lifecycle_state", lifecycle)
 
     calls = []
 
@@ -217,3 +252,143 @@ def test_runtime_oem_initialize_motors_step_requires_home_ack_and_passes_step(tm
     assert result["result"]["state"] == "stepwise_homing_step_complete"
     assert calls == [("live", "z-home", True, None, True)]
     assert (root / "runtime_stepwise_homing_z-home.json").exists()
+
+
+def test_runtime_stepwise_homing_rejects_out_of_order_stage_and_persists_expected_next(tmp_path, monkeypatch):
+    """OEM initializeMotors must admit Z home before any later physical stage."""
+    from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from src.bioxp import lifecycle_state as lifecycle_module
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transport_changed(True, reason="test_transport_owned")
+    lifecycle.run_stage("constructor_pipette_stage", lambda: {"ok": True})
+    lifecycle.run_stage("initialization_without_motion", lambda: {"ok": True})
+    lifecycle.run_stage("initial_check", lambda: {"ok": True})
+    monkeypatch.setattr(lifecycle_module, "lifecycle_state", lifecycle)
+
+    calls = []
+
+    class Hardware:
+        def startup_homing_stepwise(self, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "physical_motion": True, "step": {"step": kwargs["step"]}}
+
+    class Program:
+        hardware = Hardware()
+
+    store = OEMRuntimeStore(tmp_path / "store")
+    worker = OEMRuntimeWorker(
+        store=store,
+        handlers=OEMRuntimeCommandHandlers(startup_program=Program(), store=store).handlers(),
+    )
+    worker.enqueue(
+        OEMRuntimeCommand(
+            name="initializeSystem",
+            mode="live",
+            operator_ack="HOME",
+            artifact_root=str(tmp_path / "artifact"),
+            params={"run_stepwise_homing": True, "homing_step": "gripper-clear"},
+        )
+    )
+
+    result = worker.run_next_for_tests()
+
+    assert result["ok"] is False
+    assert "oem_initializeMotors_expected_next_stage_z-home" in result["result"]["blockers"]
+    assert calls == []
+    ledger = store.read_oem_movement_ledger()
+    assert ledger["expected_next_stage"] == "z-home"
+    assert ledger["stages"]["z-home"]["state"] == "pending"
+
+
+def test_runtime_stepwise_homing_requires_observation_before_admitting_next_stage(tmp_path, monkeypatch):
+    """Acknowledge and physical observation are distinct OEM-stage gates."""
+    from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from src.bioxp import lifecycle_state as lifecycle_module
+    from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
+
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transport_changed(True, reason="test_transport_owned")
+    lifecycle.run_stage("constructor_pipette_stage", lambda: {"ok": True})
+    lifecycle.run_stage("initialization_without_motion", lambda: {"ok": True})
+    lifecycle.run_stage("initial_check", lambda: {"ok": True})
+    monkeypatch.setattr(lifecycle_module, "lifecycle_state", lifecycle)
+
+    calls = []
+
+    class Hardware:
+        def startup_homing_stepwise(self, **kwargs):
+            calls.append(kwargs["step"])
+            return {"ok": True, "physical_motion": True, "step": {"step": kwargs["step"]}}
+
+    class Program:
+        hardware = Hardware()
+
+    store = OEMRuntimeStore(tmp_path / "store")
+    worker = OEMRuntimeWorker(
+        store=store,
+        handlers=OEMRuntimeCommandHandlers(startup_program=Program(), store=store).handlers(),
+    )
+    root = tmp_path / "artifact"
+
+    worker.enqueue(OEMRuntimeCommand(
+        name="initializeSystem", mode="live", operator_ack="HOME", artifact_root=str(root),
+        params={"run_stepwise_homing": True, "homing_step": "z-home"},
+    ))
+    z_result = worker.run_next_for_tests()
+    assert z_result["ok"] is True
+    assert store.read_oem_movement_ledger()["stages"]["z-home"]["state"] == "acknowledged"
+
+    worker.enqueue(OEMRuntimeCommand(
+        name="initializeSystem", mode="live", operator_ack="HOME", artifact_root=str(root),
+        params={"run_stepwise_homing": True, "homing_step": "gripper-current-31"},
+    ))
+    blocked = worker.run_next_for_tests()
+    assert blocked["ok"] is False
+    assert calls == ["z-home"]
+
+    worker.enqueue(OEMRuntimeCommand(
+        name="initializeSystem", mode="live", operator_ack="OBSERVE", artifact_root=str(root),
+        params={"run_stepwise_homing": True, "homing_step": "z-home", "record_stage_observation": True, "observed_pass": True},
+    ))
+    observed = worker.run_next_for_tests()
+
+    assert observed["ok"] is True
+    ledger = store.read_oem_movement_ledger()
+    assert ledger["stages"]["z-home"]["state"] == "operator_observed"
+    assert ledger["expected_next_stage"] == "gripper-current-31"
+
+
+def test_terminal_system_status_is_persisted_in_robot_owned_ledger_not_ui_state(tmp_path):
+    from src.bioxp.oem_movement_ledger import OemMovementLedger, OEM_INITIALIZE_MOTORS_STAGE_KEYS
+
+    store = OEMRuntimeStore(tmp_path / "store")
+    ledger = OemMovementLedger(store)
+    target = "system-status-initialized"
+    for stage in OEM_INITIALIZE_MOTORS_STAGE_KEYS:
+        command_id = f"test-{stage}"
+        admitted = ledger.admit(stage=stage, command_id=command_id)
+        assert admitted["ok"] is True
+        result = {"ok": True}
+        if stage == target:
+            result["durable_robot_state"] = {"system_status": 1, "ready": True}
+        completed = ledger.record_result(stage=stage, command_id=command_id, result=result, artifact_path=None)
+        if stage == target:
+            assert completed["robot_state"] == {
+                "system_status": 1,
+                "ready": True,
+                "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 and ready=true",
+            }
+            break
+        if completed["stages"][stage]["requires_operator_observation"]:
+            observed = ledger.record_observation(stage=stage, observed_pass=True, note=None, command_id=command_id)
+            assert observed["ok"] is True
+
+    persisted = store.read_oem_movement_ledger()
+    assert persisted["robot_state"] == {
+        "system_status": 1,
+        "ready": True,
+        "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 and ready=true",
+    }
+    assert "ui_positions" not in persisted["robot_state"]
