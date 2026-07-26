@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -23,7 +23,21 @@ from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_stat
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
 from .runtime_state import configure_oem_runtime_state_from_env
-from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gripper_idle_current
+from .oem_axis_diagnostics import (
+    AxisDiagnosticContractError,
+    diagnostic_catalog,
+    resolve_axis_diagnostic,
+)
+from .oem_gripper import (
+    gripper_clear,
+    gripper_close,
+    gripper_commission_home,
+    gripper_home,
+    gripper_open,
+    gripper_open_wide,
+    gripper_status,
+    restore_gripper_idle_current,
+)
 from .oem_initialization import run_oem_initialization_controller
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
@@ -36,7 +50,7 @@ from .oem_runtime_api import (
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import OfflineSwitchAuditFixture, interpret_home_predicate, run_switch_audit
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
@@ -94,6 +108,9 @@ BMS_COMMISSIONING_CAPABILITIES = (
     "collect_hardware_snapshot",
     "initialize_oem_environment",
     "run_oem_motor_stage",
+    "collect_axis_diagnostics",
+    "run_axis_diagnostic",
+    "stop_axis_diagnostic",
 )
 
 # Explicit camera routes own camera evidence. A generic hardware snapshot must
@@ -998,10 +1015,10 @@ class OemStartupStepRequest(BaseModel):
     step: str = Field(
         ...,
         pattern=(
-            r"^(z-home|gripper-current-31|gripper-clear-10000|gripper-home|x-home|x-home-settle|"
+            r"^(z-home|gripper-commission-home|x-home|x-home-settle|"
             r"x-set-home|x-speed-1700|x-speed-settle|x-park-6000|"
             r"y-home|door-home|door-closed-predicate|y-set-home|ui-zero-calibrated|"
-            r"chiller-oc-cool-rate|chiller-rc-cool-rate|system-status-initialized|gripper-idle-current-10)$"
+            r"chiller-oc-cool-rate|chiller-rc-cool-rate|system-status-initialized)$"
         ),
     )
     timeout_s: float = Field(25.0, gt=0.1, le=90.0)
@@ -1017,6 +1034,35 @@ class GripperActionRequest(BaseModel):
 
 class GripperRestoreIdleRequest(BaseModel):
     reason: str = Field("operator_restore_idle_current", max_length=2000)
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
+class AxisDiagnosticExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+    operation: Literal[
+        "move-negative",
+        "move-positive",
+        "home",
+        "park-6000",
+        "commission-home",
+        "close",
+        "open",
+        "open-wide",
+    ]
+    operator_ack: Literal["RUN_AXIS_DIAGNOSTIC"]
+    reason: str = Field(..., min_length=1, max_length=2000)
+    timeout_s: float = Field(25.0, gt=0.1, le=90.0)
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
+class AxisDiagnosticStopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+    operator_ack: Literal["STOP_AXIS"]
+    reason: str = Field(..., min_length=1, max_length=2000)
     operator: Optional[str] = Field("bms-cockpit", max_length=200)
 
 
@@ -5170,6 +5216,208 @@ def _execute_oem_initialize_motion(
         },
         "result": result,
     }
+
+
+def _collect_axis_diagnostic_status(tester: BioXpTester, axes: tuple[str, ...] = ("x", "y", "z", "g", "door")) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for axis in axes:
+        if axis == "g":
+            rows[axis] = gripper_status(tester)
+            continue
+        profile = tester._motion_oem_axis_profile(axis, startup=False)
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        status = tester.motor_axis_status(board, motor=motor)
+        query_home = tester.motor_query_home_switch(board, motor=motor)
+        rows[axis] = {
+            "ok": True,
+            "axis": axis,
+            "board": board,
+            "motor": motor,
+            "profile": profile,
+            "status": status,
+            "query_home": query_home,
+            "physical_motion": False,
+            "motion_commanded": False,
+        }
+    return {
+        "ok": True,
+        "schema": "bioxp.oem_axis_diagnostic_status.v1",
+        "physical_motion": False,
+        "motion_commanded": False,
+        "catalog": diagnostic_catalog(),
+        "rows": rows,
+        "reference_state": _reference_state_store.snapshot([AxisName(axis) for axis in axes]),
+    }
+
+
+@app.get("/motion/diagnostics/catalog")
+async def motion_diagnostics_catalog():
+    return diagnostic_catalog()
+
+
+@app.get("/motion/diagnostics/status")
+async def motion_diagnostics_status():
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM axis diagnostic live status",
+        lambda: _collect_axis_diagnostic_status(tester),
+        timeout_s=45.0,
+    )
+
+
+@app.post("/motion/diagnostics/execute")
+async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
+    _require_motion_route_ready(req)
+    try:
+        action = resolve_axis_diagnostic(req.axis, req.operation)
+    except AxisDiagnosticContractError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "unsupported_axis_diagnostic", "message": str(exc), "motion_commanded": False},
+        ) from exc
+    if action.executor in {"status", "stop"}:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "wrong_diagnostic_route", "motion_commanded": False},
+        )
+
+    if action.executor == "relative":
+        result = await move_axis_relative(
+            MoveRelativeRequest(
+                axis=AxisName(action.axis),
+                steps=int(action.value or 0),
+                wait_timeout_s=min(float(req.timeout_s), 60.0),
+                operator_note=req.reason,
+            )
+        )
+    elif action.executor == "absolute":
+        result = await move_axis_absolute(
+            MoveAbsoluteRequest(
+                axis=AxisName(action.axis),
+                position_steps=int(action.value or 0),
+                wait_timeout_s=min(float(req.timeout_s), 60.0),
+                operator_note=req.reason,
+            )
+        )
+    elif action.executor == "home":
+        result = await home_axis(
+            HomeAxisRequest(
+                axis=AxisName(action.axis),
+                timeout_s=req.timeout_s,
+                operator_note=req.reason,
+                allow_implementation_mapped_predicate=False,
+            )
+        )
+    elif action.executor == "gripper-commission-home":
+        tester = _get_tester()
+        result = await _run_blocking(
+            "OEM gripper commission/home diagnostic",
+            lambda: gripper_commission_home(
+                tester,
+                operator_ack="GRIPPER_COMMISSION_HOME",
+                reason=req.reason,
+                timeout_s=req.timeout_s,
+            ),
+            timeout_s=min(max(float(req.timeout_s) * 2.0 + 20.0, 45.0), 180.0),
+        )
+    elif action.executor in {"gripper-close", "gripper-open", "gripper-open-wide"}:
+        tester = _get_tester()
+        fn, ack = {
+            "gripper-close": (gripper_close, "GRIPPER_CLOSE"),
+            "gripper-open": (gripper_open, "GRIPPER_OPEN"),
+            "gripper-open-wide": (gripper_open_wide, "GRIPPER_OPEN_WIDE"),
+        }[action.executor]
+        result = await _run_blocking(
+            f"OEM {action.executor} diagnostic",
+            lambda: fn(tester, operator_ack=ack, reason=req.reason, timeout_s=req.timeout_s),
+            timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 120.0),
+        )
+    elif action.executor in {"door-home", "door-open", "door-close"}:
+        door_request = ThermalDoorActionRequest(
+            operator_ack={
+                "door-home": "HOME_THERMAL_DOOR",
+                "door-open": "OPEN_THERMAL_DOOR",
+                "door-close": "CLOSE_THERMAL_DOOR",
+            }[action.executor],
+            reason=req.reason,
+            timeout_s=min(float(req.timeout_s), 60.0),
+        )
+        result = await {
+            "door-home": motion_thermal_door_home,
+            "door-open": motion_thermal_door_open,
+            "door-close": motion_thermal_door_close,
+        }[action.executor](door_request)
+    else:  # pragma: no cover - registry and dispatcher must evolve together
+        raise HTTPException(status_code=500, detail="axis diagnostic registry executor is not wired")
+
+    tester = _get_tester()
+    terminal_status = await _run_blocking(
+        f"OEM {req.axis} terminal diagnostic status",
+        lambda: _collect_axis_diagnostic_status(tester, (req.axis,)),
+        timeout_s=20.0,
+    )
+    return {
+        "ok": bool(isinstance(result, dict) and result.get("ok") is not False),
+        "schema": "bioxp.oem_axis_diagnostic_result.v1",
+        "axis": req.axis,
+        "operation": req.operation,
+        "action": {
+            "executor": action.executor,
+            "robot_owned_value": action.value,
+            "caller_supplied_motion_values": False,
+        },
+        "result": result,
+        "terminal_status": terminal_status,
+    }
+
+
+@app.post("/motion/diagnostics/stop")
+async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
+    try:
+        action = resolve_axis_diagnostic(req.axis, "stop")
+    except AxisDiagnosticContractError as exc:  # pragma: no cover - literal axis already restricts this
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    tester = _get_tester()
+
+    def stop_and_verify() -> dict[str, Any]:
+        profile = tester._motion_oem_axis_profile(req.axis, startup=False)
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        stop = tester.motor_stop(board, motor=motor)
+        restore_idle = None
+        if req.axis == "g":
+            restore_idle = restore_gripper_idle_current(tester, reason="axis_diagnostic_stop")
+        terminal = _collect_axis_diagnostic_status(tester, (req.axis,))
+        row = terminal["rows"][req.axis]
+        if req.axis == "g":
+            speed = ((row.get("speed") or {}).get("speed")) if isinstance(row, dict) else None
+            idle_verified = bool(((row.get("current") or {}).get("run_current_param6")) == 10 and ((row.get("current") or {}).get("standby_current_param7")) == 10)
+        else:
+            speed = ((((row.get("status") or {}).get("speed") or {}).get("speed"))) if isinstance(row, dict) else None
+            idle_verified = None
+        verified_stopped = speed == 0
+        payload = {
+            "ok": bool(verified_stopped and (idle_verified is not False)),
+            "schema": "bioxp.oem_axis_diagnostic_stop.v1",
+            "axis": req.axis,
+            "operation": "stop",
+            "executor": action.executor,
+            "stop": stop,
+            "restore_idle": restore_idle,
+            "verified_stopped": verified_stopped,
+            "idle_restore_verified": idle_verified,
+            "terminal_status": terminal,
+        }
+        if not payload["ok"]:
+            raise HTTPException(status_code=409, detail=payload)
+        return payload
+
+    return await _run_blocking(
+        f"OEM {req.axis} diagnostic stop",
+        stop_and_verify,
+        timeout_s=25.0,
+    )
 
 
 @app.get("/motion/gripper/status")

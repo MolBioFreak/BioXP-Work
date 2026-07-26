@@ -50,9 +50,7 @@ def test_stepwise_plan_is_oem_initialize_motors_order_not_head_clearance_replace
     assert result["ok"] is True
     assert [row["step"] for row in result["steps"]] == [
         "z-home",
-        "gripper-current-31",
-        "gripper-clear-10000",
-        "gripper-home",
+        "gripper-commission-home",
         "x-home",
         "x-home-settle",
         "x-set-home",
@@ -67,7 +65,7 @@ def test_stepwise_plan_is_oem_initialize_motors_order_not_head_clearance_replace
         "chiller-oc-cool-rate",
         "chiller-rc-cool-rate",
         "system-status-initialized",
-        "gripper-idle-current-10",
+
     ]
     assert "head-clearance-z-up" not in [row["step"] for row in result["steps"]]
     assert result["oem_sequence_anchor"].endswith("ClassControlInterface.initializeMotors lines 3348-3421")
@@ -141,37 +139,19 @@ def test_stepwise_z_plan_does_not_describe_a_non_oem_right_limit_correction():
     assert "live_semantic_correction" not in z_step
 
 
-def test_stepwise_gripper_current_and_clear_are_distinct_oem_stages():
-    calls = []
-
-    class Tester(_FakeTester):
-        def _motion_oem_axis_profile(self, axis, *, startup=False):
-            assert (axis, startup) == ("g", True)
-            return {"board": 4, "motor": 2}
-
-        def motor_set_axis_param(self, board, param, value, motor=0):
-            calls.append(("set_param", board, param, value, motor))
-            return {"ok": True}
-
-        def motor_move_relative(self, board, steps, motor=0):
-            calls.append(("move_relative", board, steps, motor))
-            return {"ok": True}
-
-        def motor_wait_stopped(self, board, motor=0, **kwargs):
-            calls.append(("wait", board, motor, kwargs))
-            return {"stopped": True}
-
-    hardware = BioXpStartupHardware(lambda: Tester())
-    current = hardware.startup_homing_stepwise(mode="live", step="gripper-current-31", execute=True)
-    clear = hardware.startup_homing_stepwise(mode="live", step="gripper-clear-10000", execute=True)
-
-    assert current["ok"] is True
-    assert clear["ok"] is True
-    assert calls == [
-        ("set_param", 4, 6, 31, 2),
-        ("move_relative", 4, 10000, 2),
-        ("wait", 4, 2, {"timeout_s": 20.0, "require_seen_nonzero": False}),
-    ]
+def test_stepwise_gripper_source_stages_are_one_cleanup_safe_operator_transaction():
+    plan = BioXpStartupHardware(lambda: _FakeTester()).startup_homing_stepwise(
+        mode="shadow", step="plan", execute=False
+    )
+    names = [row["step"] for row in plan["steps"]]
+    assert "gripper-commission-home" in names
+    assert "gripper-current-31" not in names
+    assert "gripper-clear-10000" not in names
+    assert "gripper-home" not in names
+    assert "gripper-idle-current-10" not in names
+    gripper = next(row for row in plan["steps"] if row["step"] == "gripper-commission-home")
+    assert gripper["temporary_action_current_internal"] == 31
+    assert gripper["required_terminal_idle_current"] == {"run": 10, "standby": 10}
 
 
 def test_terminal_ui_zero_is_only_a_calibrated_source_branch_and_never_a_durable_claim():
@@ -259,23 +239,17 @@ def test_terminal_gripper_idle_current_uses_10_only_for_gripper_version_one():
     assert calls == [(4, 6, 10, 2)]
 
 
-def test_stepwise_gripper_home_uses_serial_206_version_1_oem_search_speed():
-    calls = []
-
-    class Tester(_FakeTester):
-        def motor_oem_home_axis(self, axis, *, startup=False, speed=None, timeout_s=0):
-            calls.append((axis, startup, speed, timeout_s))
-            return {"axis": axis, "startup": startup, "home": {"ok": True}}
-
-    result = BioXpStartupHardware(lambda: Tester()).startup_homing_stepwise(
+def test_standalone_gripper_home_is_retired_from_stepwise_operator_contract():
+    result = BioXpStartupHardware(lambda: _FakeTester()).startup_homing_stepwise(
         mode="live",
         step="gripper-home",
         execute=True,
     )
 
-    assert result["ok"] is True
-    assert result["step"]["oem_anchor"].endswith("speed=600|200)")
-    assert calls == [("g", True, 200, 30.0)]
+    assert result["ok"] is False
+    assert "gripper-home" not in result["allowed_steps"]
+    assert "gripper-commission-home" in result["allowed_steps"]
+
 
 
 def test_stepwise_x_home_and_park_preserve_literal_oem_calls_and_waits(monkeypatch):

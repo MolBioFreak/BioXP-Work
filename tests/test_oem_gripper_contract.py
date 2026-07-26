@@ -200,3 +200,78 @@ def test_gripper_clear_masks_both_g_limits_while_moving_off_home():
     assert any(call == ("set", 4, 13, 1, 2) for call in tester.calls)
     assert payload["limit_mask"]["disable_right_restore"]["value"] == 0
     assert payload["limit_mask"]["disable_left_restore"]["value"] == 0
+
+
+def test_gripper_commission_home_orders_clear_then_home_and_verifies_idle_readback():
+    from src.bioxp.oem_gripper import gripper_commission_home
+
+    tester = FakeTester(left=0, right=0, run=10, standby=10)
+
+    payload = gripper_commission_home(
+        tester,
+        operator_ack="GRIPPER_COMMISSION_HOME",
+        reason="operator-supervised axis block test",
+    )
+
+    assert payload["ok"] is True
+    assert payload["ordered_steps"] == ["preflight", "clear", "home", "restore-idle", "verify-idle"]
+    clear_index = next(index for index, call in enumerate(tester.calls) if call[0] == "move_relative")
+    home_index = next(index for index, call in enumerate(tester.calls) if call[0] == "home")
+    assert clear_index < home_index
+    assert payload["idle_restore_verified"] is True
+    assert payload["final_status"]["current"]["run_current_param6"] == 10
+    assert payload["final_status"]["current"]["standby_current_param7"] == 10
+
+
+def test_gripper_commission_home_restores_and_reports_final_status_when_home_fails():
+    from src.bioxp.oem_gripper import gripper_commission_home
+
+    class FailingHomeTester(FakeTester):
+        def motor_oem_home_axis(self, axis, startup=False, timeout_s=15.0):
+            self.calls.append(("home", axis, startup, timeout_s))
+            raise RuntimeError("injected home failure")
+
+    tester = FailingHomeTester(left=0, right=0, run=10, standby=10)
+
+    with pytest.raises(HTTPException) as exc_info:
+        gripper_commission_home(
+            tester,
+            operator_ack="GRIPPER_COMMISSION_HOME",
+            reason="failure injection",
+        )
+
+    detail = exc_info.value.detail
+    assert detail["ok"] is False
+    assert detail["failed_step"] == "home"
+    assert detail["idle_restore_verified"] is True
+    assert detail["final_status"]["current"]["run_current_param6"] == 10
+    assert detail["final_status"]["current"]["standby_current_param7"] == 10
+    assert tester.current[(4, 6, 2)] == 10
+    assert tester.current[(4, 7, 2)] == 10
+
+
+def test_gripper_commission_home_fails_closed_when_idle_readback_is_not_exact_10_10():
+    from src.bioxp.oem_gripper import gripper_commission_home
+
+    class BadRestoreTester(FakeTester):
+        def motor_restore_gripper_idle_current(self, reason=""):
+            self.calls.append(("restore_idle", reason))
+            self.current[(4, 7, 2)] = 10
+            self.current[(4, 6, 2)] = 31
+            return {"ok": False, "reason": reason}
+
+    tester = BadRestoreTester(left=0, right=0, run=10, standby=10)
+
+    with pytest.raises(HTTPException) as exc_info:
+        gripper_commission_home(
+            tester,
+            operator_ack="GRIPPER_COMMISSION_HOME",
+            reason="bad restore injection",
+        )
+
+    detail = exc_info.value.detail
+    assert detail["ok"] is False
+    assert detail["failed_step"] == "verify-idle"
+    assert detail["idle_restore_verified"] is False
+    assert detail["final_status"]["current"]["run_current_param6"] == 31
+    assert detail["final_status"]["current"]["standby_current_param7"] == 10

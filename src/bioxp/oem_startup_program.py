@@ -13,6 +13,7 @@ from .oem_parity_config import load_oem_parity_config
 from .oem_pipette_collection import dry_run_initialize_motion_pipette_cleanup
 from .oem_startup_types import OemStartupState, STARTUP_STAGE_ORDER
 from .oem_switch_audit import require_confident_predicates
+from .oem_gripper import GRIPPER_COMMISSION_HOME_ACK, gripper_commission_home
 
 SOURCE_ANCHORS = {
     "config": "ClassBioXPSettings config.xml load paths lines 2847-2857",
@@ -465,9 +466,16 @@ class BioXpStartupHardware:
         tester = self.tester
         steps = [
             {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
-            {"step": "gripper-current-31", "oem_anchor": "initializeMotors: setGripperCurrent(31)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": False},
-            {"step": "gripper-clear-10000", "oem_anchor": "initializeMotors: MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
-            {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {
+                "step": "gripper-commission-home",
+                "oem_anchor": "initializeMotors M02-M04: setGripperCurrent(31); moveSteps(10000,true); axisSearchHome(speed=600|200)",
+                "axis": "g",
+                "board": int(tester.BOARD_HEAD),
+                "motor": 2,
+                "requires_operator_observation": True,
+                "temporary_action_current_internal": 31,
+                "required_terminal_idle_current": {"run": 10, "standby": 10},
+            },
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
             {"step": "x-home-settle", "oem_anchor": "initializeMotors: sleep(20ms)", "axis": "x", "requires_operator_observation": True},
             {"step": "x-set-home", "oem_anchor": "initializeMotors: setHome(X)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
@@ -482,7 +490,7 @@ class BioXpStartupHardware:
             {"step": "chiller-oc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(OC)", "requires_operator_observation": False},
             {"step": "chiller-rc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(RC)", "requires_operator_observation": False},
             {"step": "system-status-initialized", "oem_anchor": "initializeMotors: system status=1, ready=true", "requires_operator_observation": False},
-            {"step": "gripper-idle-current-10", "oem_anchor": "initializeMotors: GripperVersion==1 setGripperCurrent(10)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": False},
+
         ]
         if selected in {"plan", "full", "all", ""}:
             return {
@@ -618,33 +626,26 @@ class BioXpStartupHardware:
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
             }
-        if selected == "gripper-current-31":
-            profile = tester._motion_oem_axis_profile("g", startup=True)
-            current = tester.motor_set_axis_param(profile["board"], 6, 31, motor=profile["motor"])
+        if selected == "gripper-commission-home":
+            result = gripper_commission_home(
+                tester,
+                operator_ack=GRIPPER_COMMISSION_HOME_ACK,
+                reason="OEM initializeMotors M02-M04 supervised transaction",
+                timeout_s=30.0,
+            )
             post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
-            return {"ok": bool(current.get("ok")), "mode": mode, "execute": True, "physical_motion": False, "step": row, "pre_snapshot": pre, "post_snapshot": post, "gripper_current_31": current, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
-        if selected == "gripper-clear-10000":
-            profile = tester._motion_oem_axis_profile("g", startup=True)
-            move = tester.motor_move_relative(profile["board"], 10000, motor=profile["motor"])
-            wait = tester.motor_wait_stopped(profile["board"], motor=profile["motor"], timeout_s=20.0, require_seen_nonzero=False)
-            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
-            return {"ok": bool(move.get("ok") and wait.get("stopped") is True), "mode": mode, "execute": True, "physical_motion": bool(move.get("ok")), "step": row, "pre_snapshot": pre, "post_snapshot": post, "gripper_move_10000": move, "wait": wait, "operator_observation_required": bool(require_operator_observed), "oem_source_order_preserved": True}
-        if selected == "gripper-home":
-            # Serial-206 has GripperVersion=1, so the direct source branch is 200.
-            home = tester.motor_oem_home_axis("g", startup=True, speed=200, timeout_s=30.0)
-            post = self.initialize_motion_diagnostic(mode="shadow", run_homing=False)
-            home_ok = bool((home.get("home") or {}).get("ok")) if isinstance(home, dict) else False
             return {
-                "ok": home_ok,
+                "ok": bool(result.get("ok")),
                 "mode": mode,
                 "execute": True,
-                "physical_motion": True,
+                "physical_motion": bool(result.get("motion_commanded")),
                 "step": row,
                 "pre_snapshot": pre,
                 "post_snapshot": post,
-                "gripper_home": home,
+                "gripper_commission_home": result,
                 "operator_observation_required": bool(require_operator_observed),
                 "oem_source_order_preserved": True,
+                "operator_surface_collapses_source_stages": ["M02", "M03", "M04", "M19"],
             }
         if selected == "x-home":
             home = tester.motor_oem_home_axis("x", startup=True, speed=250, timeout_s=30.0)
