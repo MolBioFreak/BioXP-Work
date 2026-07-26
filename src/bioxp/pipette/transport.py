@@ -568,6 +568,96 @@ class FourPipetteTransport:
         }
         return dict(self._last_group_transaction)
 
+    def query_tip_status_all(self) -> dict[str, Any]:
+        """Return exact four-channel OEM `?31` hardware readback."""
+        channels: list[dict[str, Any]] = []
+        for channel, transport in enumerate(self._transports):
+            result = transport._get_driver().query_tip_status()
+            if (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or type(result.get("tip_loaded")) is not bool
+            ):
+                raise PipetteCommandError(
+                    "Pipette hardware tip-status query did not return exact four-channel readback.",
+                    details={"channel": channel, "result": result},
+                )
+            loaded = result["tip_loaded"]
+            transport._last_tip_status = dict(result)
+            transport._tip_loaded = loaded
+            channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
+        loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
+        return {
+            "ok": True,
+            "tip_count": len(loaded_channels),
+            "channels_with_tips": loaded_channels,
+            "channels": channels,
+            "hardware_query_verified": True,
+            "physical_effect_verified": False,
+            "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
+        }
+
+    def eject_all_tips_for_oem_startup(
+        self,
+        *,
+        operator_ack: str,
+        expected_channels_with_tips: list[int],
+    ) -> dict[str, Any]:
+        """Fixed startup-only E1R sequence with mandatory postcondition readback."""
+        if type(operator_ack) is not str or operator_ack != "EJECT_STALE_STARTUP_TIPS":
+            raise PipetteCommandError("Literal startup-tip operator acknowledgement is required.")
+        if (
+            not isinstance(expected_channels_with_tips, list)
+            or any(type(channel) is not int or channel not in self.CHANNELS for channel in expected_channels_with_tips)
+            or len(set(expected_channels_with_tips)) != len(expected_channels_with_tips)
+        ):
+            raise PipetteCommandError("Expected startup tip channels must be unique exact integers 0..3.")
+        expected = sorted(expected_channels_with_tips)
+        before = self.query_tip_status_all()
+        actual = before["channels_with_tips"]
+        if actual != expected:
+            raise PipetteCommandError(
+                "Pipette tip state changed since authorization; refusing startup ejection.",
+                details={"expected_channels_with_tips": expected, "actual_channels_with_tips": actual},
+            )
+        sends: list[dict[str, Any]] = []
+        for channel in expected:
+            driver = self._transports[channel]._get_driver()
+            result = driver.pipette_eject_tip()
+            if (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or not isinstance(result.get("ack"), dict)
+                or result["ack"].get("outcome") != "ack"
+            ):
+                raise PipetteCommandError(
+                    "Pipette eject did not receive an exact immediate acknowledgement.",
+                    details={"channel": channel, "result": result, "physical_effect_verified": False},
+                )
+            sends.append({"channel": channel, "result": result})
+        after = self.query_tip_status_all()
+        if after["tip_count"] != 0:
+            raise PipetteCommandError(
+                "Post-eject hardware readback still reports loaded tips.",
+                details={"after": after, "sends": sends, "physical_effect_verified": False},
+            )
+        return {
+            "ok": True,
+            "outcome": "verified_empty",
+            "channels_targeted": expected,
+            "before": before,
+            "sends": sends,
+            "after": after,
+            "immediate_acknowledgements_verified": True,
+            "hardware_postcondition_verified": True,
+            "physical_effect_verified": True,
+            "oem_source_anchors": [
+                "ClassPipetteCollection.ejectAllTips:1176-1235",
+                "ClassPipetteCollection.verifyEjectTip:1265-1323",
+                "ClassPipetteCollection.queryTipStatus:1336-1357",
+            ],
+        }
+
     @staticmethod
     def _mutation_blocked(operation: str) -> dict[str, Any]:
         raise PipetteCommandError(

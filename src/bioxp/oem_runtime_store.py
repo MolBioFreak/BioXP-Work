@@ -78,6 +78,40 @@ class OEMRuntimeStore:
             return None
         return json.loads(path.read_text())
 
+    def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Persist one full OEM movement-lifecycle run atomically.
+
+        Run files are immutable by identity but replaceable by monotonic state
+        updates.  The robot owns the directory and run identifier; callers do
+        not supply paths.
+        """
+        payload = dict(run)
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
+            raise ValueError("valid robot-owned run_id required")
+        with self._lock:
+            payload["sequence"] = self.next_seq()
+            _atomic_json(self.root / "movement_runs" / f"{run_id}.json", payload)
+        return payload
+
+    def read_oem_full_lifecycle_run(self, run_id: str) -> dict[str, Any] | None:
+        selected = str(run_id).strip()
+        if not selected or "/" in selected or "\\" in selected or selected in {".", ".."}:
+            raise ValueError("valid robot-owned run_id required")
+        path = self.root / "movement_runs" / f"{selected}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def list_oem_full_lifecycle_runs(self) -> list[dict[str, Any]]:
+        root = self.root / "movement_runs"
+        if not root.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for path in sorted(root.glob("*.json")):
+            rows.append(json.loads(path.read_text()))
+        return rows
+
     def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = dict(payload)
         row.setdefault("created_at", utc_ts())

@@ -4,8 +4,9 @@ import os
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from .oem_full_lifecycle import OemFullLifecycleError, OemFullLifecycleRuns
 from .oem_runtime_commands import OEMRuntimeCommandHandlers
 from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
@@ -20,6 +21,18 @@ _worker = None
 _events: OEMRuntimeEventRouter | None = None
 _status: OEMRuntimeStatusService | None = None
 _startup_program_factory = None
+_full_lifecycle_runs: OemFullLifecycleRuns | None = None
+
+
+class FullLifecycleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str
+    operator_ack: str
+    expected_machine_serial: int
+    expected_registry_sha256: str
+    idempotency_key: str
+    mode: str = "dry_run"
 
 
 class RuntimeCommandRequest(BaseModel):
@@ -46,7 +59,7 @@ class DoorEventRequest(BaseModel):
 
 
 def configure_runtime(*, startup_program_factory=None, store_root: str | None = None, autostart: bool = True):
-    global _store, _worker, _events, _status, _startup_program_factory
+    global _store, _worker, _events, _status, _startup_program_factory, _full_lifecycle_runs
     _startup_program_factory = startup_program_factory
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
     # Do not call startup_program_factory during API startup: on robot it may open USB.
@@ -60,7 +73,8 @@ def configure_runtime(*, startup_program_factory=None, store_root: str | None = 
     _worker = OEMRuntimeWorker(store=_store, handlers=handlers.handlers(), autostart=autostart)
     _events = OEMRuntimeEventRouter(store=_store, worker=_worker)
     _status = OEMRuntimeStatusService(store=_store, worker=_worker)
-    return {"store": _store, "worker": _worker, "events": _events, "status": _status}
+    _full_lifecycle_runs = OemFullLifecycleRuns(_store)
+    return {"store": _store, "worker": _worker, "events": _events, "status": _status, "full_lifecycle_runs": _full_lifecycle_runs}
 
 
 def shutdown_runtime():
@@ -113,6 +127,99 @@ def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return worker.enqueue(cmd)
+
+
+def _derive_full_lifecycle_inputs() -> dict[str, Any]:
+    """Derive branch predicates from robot-owned state only.
+
+    Missing or non-exact predicates block creation.  The request model has no
+    fields through which BMS can select a stage or supply movement parameters.
+    """
+    from .hardware_status import hardware_state
+    from .oem_machine_bundle import get_active_oem_machine_snapshot
+
+    try:
+        snapshot = get_active_oem_machine_snapshot()
+    except Exception as exc:
+        raise OemFullLifecycleError(f"serial-206 OEM machine snapshot is not bound: {exc}") from exc
+    if _status is None or _store is None or _store.read_state() is None:
+        raise OemFullLifecycleError("OEM runtime status is not durably available")
+    status = _status.status()
+    machine = status.get("machine_status")
+    if not isinstance(machine, dict):
+        raise OemFullLifecycleError("robot-owned machine status is unavailable")
+
+    tip_present = machine.get("tip_loaded")
+    self_test_due = machine.get("self_test_due")
+    saved_status = machine.get("saved_status")
+    ship_mode = machine.get("ship_mode")
+    for field, value in (("tip_loaded", tip_present), ("self_test_due", self_test_due)):
+        if type(value) is not bool:
+            raise OemFullLifecycleError(f"robot-owned {field} must be an exact boolean")
+    if type(saved_status) is not int:
+        raise OemFullLifecycleError("robot-owned saved_status must be an integer")
+    if not isinstance(ship_mode, str):
+        raise OemFullLifecycleError("robot-owned ship_mode must be a string")
+    camera_installed = snapshot.fields["machine.camera_installed"].value
+    check_camera = snapshot.operation_parameters["CheckCamera"]
+    if type(camera_installed) is not bool or type(check_camera) is not bool:
+        raise OemFullLifecycleError("selected CameraInstalled/CheckCamera values must be exact booleans")
+    camera_required = check_camera and camera_installed
+    deck_inspection = snapshot.operation_parameters["DeckInspection"]
+    if type(deck_inspection) is not bool:
+        raise OemFullLifecycleError("selected DeckInspection value must be an exact boolean")
+    return {
+        "ownership_generation": int(hardware_state.ownership_epoch),
+        "saved_status": saved_status,
+        "ship_mode": ship_mode,
+        "start_mode": snapshot.startup_mode,
+        "tip_present": tip_present,
+        "self_test_due": self_test_due,
+        "camera_required": camera_required,
+        "deck_inspection": deck_inspection,
+    }
+
+
+def _require_full_lifecycle_runs() -> OemFullLifecycleRuns:
+    global _full_lifecycle_runs
+    if _full_lifecycle_runs is None:
+        _require_runtime()
+    assert _full_lifecycle_runs is not None
+    return _full_lifecycle_runs
+
+
+@router.post("/movement-runs")
+def create_full_lifecycle_run(req: FullLifecycleCreateRequest):
+    runs = _require_full_lifecycle_runs()
+    try:
+        inputs = _derive_full_lifecycle_inputs()
+        return runs.create({**req.model_dump(), "inputs": inputs})
+    except OemFullLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/movement-runs/{run_id}")
+def get_full_lifecycle_run(run_id: str):
+    try:
+        return _require_full_lifecycle_runs().get(run_id)
+    except OemFullLifecycleError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/movement-runs/{run_id}/ledger")
+def get_full_lifecycle_ledger(run_id: str):
+    try:
+        return _require_full_lifecycle_runs().get(run_id)
+    except OemFullLifecycleError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/movement-runs/{run_id}/cancel")
+def cancel_full_lifecycle_run(run_id: str):
+    try:
+        return _require_full_lifecycle_runs().cancel(run_id)
+    except OemFullLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/status")
