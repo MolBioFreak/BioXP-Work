@@ -38,6 +38,7 @@ class FullLifecycleCreateRequest(BaseModel):
     command: str
     operator_ack: str
     expected_generation: StrictInt = Field(ge=1)
+    bms_connection_generation: StrictInt = Field(ge=1)
     expected_machine_serial: int
     expected_registry_sha256: str
     expected_evidence_lock_sha256: str
@@ -49,6 +50,7 @@ class FullLifecycleCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_generation: StrictInt = Field(ge=1)
+    bms_connection_generation: StrictInt = Field(ge=1)
     expected_machine_serial: int
     expected_registry_sha256: str
     expected_evidence_lock_sha256: str
@@ -271,11 +273,18 @@ def _full_lifecycle_plan_blockers() -> list[str]:
 @router.get("/movement-runs/contract")
 def full_lifecycle_contract():
     authority = current_authority_identity()
-    plan_blockers = _full_lifecycle_plan_blockers()
+    try:
+        lifecycle_inputs = _derive_full_lifecycle_inputs()
+        plan_blockers: list[str] = []
+        ownership_generation: int | None = lifecycle_inputs["ownership_generation"]
+    except OemFullLifecycleError as exc:
+        plan_blockers = [str(exc)]
+        ownership_generation = None
     return {
         "schema_version": "bioxp.oem_full_lifecycle_contract.v1",
         "command": "initialize_oem_movement_lifecycle",
         "machine_serial": 206,
+        "ownership_generation": ownership_generation,
         "registry_sha256": current_registry_sha256(),
         **authority,
         "evidence_lock_verified": authority["evidence_lock_identity_verified"],

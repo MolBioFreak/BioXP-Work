@@ -73,7 +73,10 @@ Movement registry: `docs/specs/2026-07-23-oem-movement-method-source-binary-regi
 - fixed command `initialize_oem_movement_lifecycle`;
 - `operator_ack=INITIALIZE`;
 - expected machine serial;
+- exact current robot ownership generation (`expected_generation`);
+- the distinct BMS connection-lease generation (`bms_connection_generation`);
 - expected movement-registry SHA-256;
+- expected evidence-lock SHA-256;
 - idempotency key;
 - `mode=dry_run`.
 

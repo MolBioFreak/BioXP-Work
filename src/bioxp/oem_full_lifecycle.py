@@ -102,6 +102,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "command",
         "operator_ack",
         "expected_generation",
+        "bms_connection_generation",
         "expected_machine_serial",
         "expected_registry_sha256",
         "expected_evidence_lock_sha256",
@@ -381,6 +382,8 @@ class OemFullLifecycleRuns:
             raise OemFullLifecycleError("operator_ack INITIALIZE required")
         if type(request.get("expected_generation")) is not int or request["expected_generation"] < 1:
             raise OemFullLifecycleError("expected_generation must be a positive integer")
+        if type(request.get("bms_connection_generation")) is not int or request["bms_connection_generation"] < 1:
+            raise OemFullLifecycleError("bms_connection_generation must be a positive integer")
         if type(request.get("expected_machine_serial")) is not int or request.get("expected_machine_serial") != OEM_MACHINE_SERIAL:
             raise OemFullLifecycleError(f"expected machine serial must be {OEM_MACHINE_SERIAL}")
         actual_registry = current_registry_sha256()
@@ -404,6 +407,8 @@ class OemFullLifecycleRuns:
             raise OemFullLifecycleError(f"missing lifecycle input(s): {sorted(missing_inputs)}")
         if type(inputs["ownership_generation"]) is not int or inputs["ownership_generation"] < 0:
             raise OemFullLifecycleError("ownership_generation must be a nonnegative integer")
+        if request["expected_generation"] != inputs["ownership_generation"]:
+            raise OemFullLifecycleError("expected_generation does not match current robot ownership generation")
         if type(inputs["saved_status"]) is not int:
             raise OemFullLifecycleError("saved_status must be an integer")
         if inputs["ship_mode"] not in {"", "PARK"}:
@@ -571,6 +576,7 @@ class OemFullLifecycleRuns:
                 raise OemFullLifecycleError("persisted lifecycle request is malformed")
             for field in (
                 "expected_generation",
+                "bms_connection_generation",
                 "expected_machine_serial",
                 "expected_registry_sha256",
                 "expected_evidence_lock_sha256",

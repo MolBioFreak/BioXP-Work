@@ -21,7 +21,8 @@ def _request(**overrides):
     payload = {
         "command": "initialize_oem_movement_lifecycle",
         "operator_ack": "INITIALIZE",
-        "expected_generation": 77,
+        "expected_generation": 41,
+        "bms_connection_generation": 77,
         "expected_machine_serial": OEM_MACHINE_SERIAL,
         "expected_registry_sha256": current_registry_sha256(),
         "expected_evidence_lock_sha256": current_authority_identity()["evidence_lock_sha256"],
@@ -58,6 +59,7 @@ def _cancel(runs, run_id):
         field: request[field]
         for field in (
             "expected_generation",
+            "bms_connection_generation",
             "expected_machine_serial",
             "expected_registry_sha256",
             "expected_evidence_lock_sha256",

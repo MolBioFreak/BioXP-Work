@@ -51,7 +51,8 @@ def _request(**overrides):
     payload = {
         "command": "initialize_oem_movement_lifecycle",
         "operator_ack": "INITIALIZE",
-        "expected_generation": 77,
+        "expected_generation": 7,
+        "bms_connection_generation": 77,
         "expected_machine_serial": 206,
         "expected_registry_sha256": current_registry_sha256(),
         "expected_evidence_lock_sha256": current_authority_identity()["evidence_lock_sha256"],
@@ -64,7 +65,8 @@ def _request(**overrides):
 
 def _cancel_request(**overrides):
     payload = {
-        "expected_generation": 77,
+        "expected_generation": 7,
+        "bms_connection_generation": 77,
         "expected_machine_serial": 206,
         "expected_registry_sha256": current_registry_sha256(),
         "expected_evidence_lock_sha256": current_authority_identity()["evidence_lock_sha256"],
@@ -126,7 +128,8 @@ def test_fixed_movement_run_api_creates_robot_owned_plan_and_gets_ledger(tmp_pat
     created = response.json()
     assert created["run_state"] == "planned"
     assert created["machine_configuration_verified"] is True
-    assert created["request"]["expected_generation"] == 77
+    assert created["request"]["expected_generation"] == 7
+    assert created["request"]["bms_connection_generation"] == 77
     assert created["request"]["expected_evidence_lock_sha256"] == current_authority_identity()["evidence_lock_sha256"]
     assert created["ownership_generation"] == 7
     assert created["expected_next_stage"] == "construct_control_lib"
@@ -151,6 +154,16 @@ def test_fixed_movement_run_api_rejects_live_until_commissioned_provider_exists(
     response = client.post("/oem/runtime/movement-runs", json=_request(mode="live", idempotency_key="live-blocked"))
     assert response.status_code == 409
     assert "commission" in response.json()["detail"].lower()
+
+
+def test_fixed_movement_run_api_rejects_unrelated_robot_ownership_generation(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    response = client.post(
+        "/oem/runtime/movement-runs",
+        json=_request(expected_generation=77, bms_connection_generation=77),
+    )
+    assert response.status_code == 409
+    assert "ownership generation" in response.json()["detail"].lower()
 
 
 def test_configure_runtime_automatically_blocks_interrupted_lifecycle_run(tmp_path, monkeypatch):
@@ -193,7 +206,8 @@ def test_cancel_rejects_mismatched_admission_generation_or_authority(tmp_path, m
     created = client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="cancel-bound")).json()
     route = f"/oem/runtime/movement-runs/{created['run_id']}/cancel"
 
-    assert client.post(route, json=_cancel_request(expected_generation=78)).status_code == 409
+    assert client.post(route, json=_cancel_request(expected_generation=8)).status_code == 409
+    assert client.post(route, json=_cancel_request(bms_connection_generation=78)).status_code == 409
     assert client.post(route, json=_cancel_request(expected_registry_sha256="9" * 64)).status_code == 409
     assert client.post(route, json=_cancel_request(expected_evidence_lock_sha256="8" * 64)).status_code == 409
     assert client.get(f"/oem/runtime/movement-runs/{created['run_id']}").json()["run_state"] == "planned"

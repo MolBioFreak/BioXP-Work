@@ -151,6 +151,30 @@ def test_self_test_concurrency_requires_unique_tasks_and_source_ordered_join():
     assert result["production_admission_pass"] is False
 
 
+def test_self_test_rejects_declared_wait_that_contradicts_join_timestamps():
+    receipt = passing_receipt()
+    receipt["concurrency"]["join_completed_at_ms"] = 200_000
+    receipt["concurrency"]["thermal_wait_completed_within_ms"] = 299
+
+    result = evaluate_oem_self_test_receipt(receipt)
+
+    assert result["receipt_validation_pass"] is False
+    assert "parallel_completion_timeout" in result["failures"]
+    assert "thermal_wait_duration_mismatch" in result["failures"]
+
+
+def test_self_test_rejects_branch_submission_order_that_differs_from_oem_source():
+    receipt = passing_receipt()
+    receipt["concurrency"]["branch_tasks"]["tc"]["submitted_at_ms"] = 2
+    receipt["concurrency"]["branch_tasks"]["rc"]["submitted_at_ms"] = 1
+    receipt["concurrency"]["branch_tasks"]["oc"]["submitted_at_ms"] = 0
+
+    result = evaluate_oem_self_test_receipt(receipt)
+
+    assert result["receipt_validation_pass"] is False
+    assert "thermal_branch_submission_order_invalid" in result["failures"]
+
+
 def test_self_test_receipt_rejects_truthy_and_missing_values():
     receipt = passing_receipt()
     receipt["tc"]["lid_reached_target"] = 1

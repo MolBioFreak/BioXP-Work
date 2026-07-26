@@ -243,8 +243,15 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         failures.append("join_completion_precedes_join_start")
     if concurrency["join_completed_at_ms"] < max(task["completed_at_ms"] for task in task_rows.values()):
         failures.append("join_completed_before_thermal_tasks")
-    if concurrency["thermal_wait_completed_within_ms"] > 100_000:
+    declared_wait_ms = concurrency["thermal_wait_completed_within_ms"]
+    derived_wait_ms = concurrency["join_completed_at_ms"] - concurrency["join_started_at_ms"]
+    if declared_wait_ms != derived_wait_ms:
+        failures.append("thermal_wait_duration_mismatch")
+    if max(declared_wait_ms, derived_wait_ms) > 100_000:
         failures.append("parallel_completion_timeout")
+    submitted = [task_rows[branch]["submitted_at_ms"] for branch in ("tc", "rc", "oc")]
+    if not (submitted[0] < submitted[1] < submitted[2]):
+        failures.append("thermal_branch_submission_order_invalid")
     if not final_pwm:
         failures.append("final_chiller_pwm_not_reset")
 
