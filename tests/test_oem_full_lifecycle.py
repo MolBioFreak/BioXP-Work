@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -429,3 +430,15 @@ def test_persisted_json_contains_no_fake_completion_claims(tmp_path):
     assert '"controller_acknowledged": true' not in raw
     assert '"physical_effect_verified": true' not in raw
     assert '"postcondition_verified": true' not in raw
+
+
+def test_authority_identity_uses_deployed_lock_environment(tmp_path, monkeypatch):
+    workstation_identity = current_authority_identity()
+    deployed_lock = tmp_path / "OEM_EVIDENCE_LOCK.json"
+    deployed_lock.write_bytes(Path(workstation_identity["evidence_lock_path"]).read_bytes())
+    monkeypatch.setenv("BIOXP_OEM_MACHINE_BUNDLE_LOCK", str(deployed_lock))
+
+    deployed_identity = current_authority_identity()
+
+    assert deployed_identity["evidence_lock_path"] == str(deployed_lock)
+    assert deployed_identity["evidence_lock_sha256"] == workstation_identity["evidence_lock_sha256"]

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .oem_machine_bundle import (
     OEM_ACQUISITION_ID,
     OEM_LOCK_SHA256,
+    OEM_MACHINE_BUNDLE_LOCK_ENV,
     OEM_MACHINE_SERIAL,
 )
 from .oem_movement_ledger import OEM_INITIALIZE_MOTORS_STAGES
@@ -50,7 +52,9 @@ def current_authority_identity() -> dict[str, Any]:
     try:
         registry = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
         authority = registry["authority"]
-        lock_path = Path(authority["evidence_lock_path"])
+        lock_path = Path(
+            os.environ.get(OEM_MACHINE_BUNDLE_LOCK_ENV, str(authority["evidence_lock_path"]))
+        )
         expected = authority["evidence_lock_sha256"]
         lock_bytes = lock_path.read_bytes()
         lock = json.loads(lock_bytes)
