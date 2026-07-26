@@ -39,10 +39,22 @@ def passing_receipt():
             "door_open_verified": True,
         },
         "concurrency": {
-            "tc_started": True,
-            "rc_started": True,
-            "oc_started": True,
-            "thermal_wait_completed_within_ms": 100_000,
+            "branch_tasks": {
+                "tc": {"task_id": "tc-task-1", "submitted_at_ms": 0, "started_at_ms": 10, "completed_at_ms": 800},
+                "rc": {"task_id": "rc-task-1", "submitted_at_ms": 1, "started_at_ms": 11, "completed_at_ms": 700},
+                "oc": {"task_id": "oc-task-1", "submitted_at_ms": 2, "started_at_ms": 12, "completed_at_ms": 900},
+            },
+            "motion_task_id": "motion-task-1",
+            "motion_started_at_ms": 20,
+            "motion_completed_at_ms": 600,
+            "join_started_at_ms": 601,
+            "join_completed_at_ms": 900,
+            "thermal_wait_completed_within_ms": 299,
+        },
+        "provider_identity": {
+            "provider_id": "self-test-provider-1",
+            "provider_run_id": "self-test-run-1",
+            "binding_generation": 3,
         },
         "launched_branch_results": {"tc": True, "rc": True, "oc": True},
         "final_chiller_pwm_reset_acknowledged": True,
@@ -73,9 +85,11 @@ def test_self_test_contract_locks_exact_oem_thresholds_and_cleanup():
 def test_passing_self_test_receipt_requires_all_hardware_postconditions():
     result = evaluate_oem_self_test_receipt(passing_receipt())
     assert result["ok"] is True
+    assert result["receipt_validation_pass"] is True
     assert result["oem_effective_pass"] is True
-    assert result["production_admission_pass"] is True
-    assert result["physical_effect_verified"] is True
+    assert result["production_admission_pass"] is False
+    assert result["physical_effect_verified"] is False
+    assert result["provider_live_bound"] is False
     assert result["failures"] == []
 
 
@@ -91,6 +105,7 @@ def test_passing_self_test_receipt_requires_all_hardware_postconditions():
         (lambda r: r["motion"].update(z_home_residual_steps=-101), "z_home_residual_exceeded"),
         (lambda r: r["motion"].update(gripper_home_residual_steps=501), "gripper_home_residual_exceeded"),
         (lambda r: r["concurrency"].update(thermal_wait_completed_within_ms=100_001), "parallel_completion_timeout"),
+        (lambda r: r["concurrency"]["branch_tasks"]["rc"].update(started_at_ms=601), "rc_did_not_overlap_motion"),
     ],
 )
 def test_self_test_threshold_failures_are_exact(mutate, failure):
@@ -120,6 +135,20 @@ def test_false_launched_task_result_fails_even_when_derived_metrics_pass():
     assert result["ok"] is False
     assert "rc_launched_result_false" in result["failures"]
     assert result["physical_effect_verified"] is False
+
+
+def test_self_test_concurrency_requires_unique_tasks_and_source_ordered_join():
+    duplicate = passing_receipt()
+    duplicate["concurrency"]["branch_tasks"]["oc"]["task_id"] = "rc-task-1"
+    with pytest.raises(OemSelfTestReceiptError, match="task identities"):
+        evaluate_oem_self_test_receipt(duplicate)
+
+    early_join = passing_receipt()
+    early_join["concurrency"]["join_started_at_ms"] = 599
+    result = evaluate_oem_self_test_receipt(early_join)
+    assert result["receipt_validation_pass"] is False
+    assert "join_started_before_motion_completed" in result["failures"]
+    assert result["production_admission_pass"] is False
 
 
 def test_self_test_receipt_rejects_truthy_and_missing_values():

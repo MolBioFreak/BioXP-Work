@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.bioxp import oem_runtime_api
-from src.bioxp.oem_full_lifecycle import current_registry_sha256
+from src.bioxp.oem_full_lifecycle import current_authority_identity, current_registry_sha256
 
 
 def _robot_inputs():
@@ -14,6 +14,8 @@ def _robot_inputs():
         "board_test_mode": False,
         "pipette_exists": None,
         "initialize_system_producer": "initializeEnvironment",
+        "update_check_suppresses_initialize_system": False,
+        "system_in_motion_at_entry": False,
         "enclosure_door_closed": True,
         "latch_closed": True,
         "saved_status": 1,
@@ -21,7 +23,9 @@ def _robot_inputs():
         "start_mode": "WebMode",
         "tip_present": False,
         "self_test_due": True,
-        "camera_required": True,
+        "check_camera": True,
+        "camera_installed": True,
+        "is_development_machine": False,
         "deck_inspection": True,
     }
 
@@ -47,10 +51,23 @@ def _request(**overrides):
     payload = {
         "command": "initialize_oem_movement_lifecycle",
         "operator_ack": "INITIALIZE",
+        "expected_generation": 77,
         "expected_machine_serial": 206,
         "expected_registry_sha256": current_registry_sha256(),
+        "expected_evidence_lock_sha256": current_authority_identity()["evidence_lock_sha256"],
         "idempotency_key": "api-dry-run",
         "mode": "dry_run",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _cancel_request(**overrides):
+    payload = {
+        "expected_generation": 77,
+        "expected_machine_serial": 206,
+        "expected_registry_sha256": current_registry_sha256(),
+        "expected_evidence_lock_sha256": current_authority_identity()["evidence_lock_sha256"],
     }
     payload.update(overrides)
     return payload
@@ -73,7 +90,8 @@ def test_contract_reports_partial_provider_truth_and_blocks_live(tmp_path, monke
     assert response.status_code == 200
     body = response.json()
     assert body["plan_available"] is True
-    assert body["source_authority_verified"] is True
+    assert body["evidence_lock_identity_verified"] is True
+    assert body["source_authority_verified"] is False
     assert body["evidence_lock_sha256"] == "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
     assert len(body["initialize_system_producers"]) == 5
     assert body["live_creation_enabled"] is False
@@ -97,7 +115,7 @@ def test_lifecycle_mutations_require_token_file_authorization(tmp_path, monkeypa
     ).status_code == 403
 
     run_id = authorized.post("/oem/runtime/movement-runs", json=_request()).json()["run_id"]
-    assert raw.post(f"/oem/runtime/movement-runs/{run_id}/cancel").status_code == 403
+    assert raw.post(f"/oem/runtime/movement-runs/{run_id}/cancel", json=_cancel_request()).status_code == 403
 
 
 def test_fixed_movement_run_api_creates_robot_owned_plan_and_gets_ledger(tmp_path, monkeypatch):
@@ -107,6 +125,9 @@ def test_fixed_movement_run_api_creates_robot_owned_plan_and_gets_ledger(tmp_pat
     assert response.status_code == 200
     created = response.json()
     assert created["run_state"] == "planned"
+    assert created["machine_configuration_verified"] is True
+    assert created["request"]["expected_generation"] == 77
+    assert created["request"]["expected_evidence_lock_sha256"] == current_authority_identity()["evidence_lock_sha256"]
     assert created["ownership_generation"] == 7
     assert created["expected_next_stage"] == "construct_control_lib"
 
@@ -162,6 +183,17 @@ def test_fixed_movement_run_api_cancel_is_robot_owned(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     created = client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="cancel-api")).json()
 
-    cancelled = client.post(f"/oem/runtime/movement-runs/{created['run_id']}/cancel")
+    cancelled = client.post(f"/oem/runtime/movement-runs/{created['run_id']}/cancel", json=_cancel_request())
     assert cancelled.status_code == 200
     assert cancelled.json()["run_state"] == "cancelled"
+
+
+def test_cancel_rejects_mismatched_admission_generation_or_authority(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    created = client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="cancel-bound")).json()
+    route = f"/oem/runtime/movement-runs/{created['run_id']}/cancel"
+
+    assert client.post(route, json=_cancel_request(expected_generation=78)).status_code == 409
+    assert client.post(route, json=_cancel_request(expected_registry_sha256="9" * 64)).status_code == 409
+    assert client.post(route, json=_cancel_request(expected_evidence_lock_sha256="8" * 64)).status_code == 409
+    assert client.get(f"/oem/runtime/movement-runs/{created['run_id']}").json()["run_state"] == "planned"

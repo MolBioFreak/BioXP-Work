@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -86,12 +87,16 @@ class OEMRuntimeStore:
         if not isinstance(key, str) or not key or len(key) > 128:
             raise ValueError("valid bounded idempotency_key required")
         with self._lock:
-            for existing in self.list_oem_full_lifecycle_runs():
+            existing_runs = self.list_oem_full_lifecycle_runs()
+            for existing in existing_runs:
                 if existing.get("idempotency_key") != key:
                     continue
                 if existing.get("request") != request:
                     raise ValueError("idempotency_key is already bound to a different request")
                 return existing
+            active_states = {"planned", "running", "admitted", "acknowledged", "blocked", "reconciliation_required"}
+            if any(existing.get("run_state") in active_states for existing in existing_runs):
+                raise ValueError("another active OEM lifecycle run already owns the robot lifecycle")
             return self.write_oem_full_lifecycle_run(payload)
 
     def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
@@ -109,6 +114,18 @@ class OEMRuntimeStore:
             payload["sequence"] = self.next_seq()
             _atomic_json(self.root / "movement_runs" / f"{run_id}.json", payload)
         return payload
+
+    def mutate_oem_full_lifecycle_run(
+        self,
+        run_id: str,
+        mutation: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Read, validate, and replace one run under the runtime-owner lock."""
+        with self._lock:
+            payload = self.read_oem_full_lifecycle_run(run_id)
+            if payload is None:
+                raise ValueError(f"full OEM lifecycle run {run_id!r} not found")
+            return self.write_oem_full_lifecycle_run(mutation(payload))
 
     def read_oem_full_lifecycle_run(self, run_id: str) -> dict[str, Any] | None:
         selected = str(run_id).strip()

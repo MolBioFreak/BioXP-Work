@@ -13,6 +13,16 @@ def receipt(detections, relocations, *, observed_locations=(17, 19, 20, 18)):
         "18": "checkCoverStorage",
     }
     return {
+        "force_to_high_home": {
+            "provider_id": "unbound-cover-provider",
+            "command_id": "force-high-home-1",
+            "attempted": True,
+            "controller_acknowledged": True,
+            "postcondition_verified": True,
+            "attempted_at_ms": 10,
+            "acknowledged_at_ms": 20,
+            "postcondition_verified_at_ms": 30,
+        },
         "deck_inspection": True,
         "screen_resolution_high": True,
         "observed_locations": list(observed_locations),
@@ -36,6 +46,9 @@ def test_cover_inspection_exact_two_in_chillers_requires_source_order_relocation
     )
     result = evaluate_inspect_cover_receipt(value)
     assert result["ok"] is True
+    assert result["receipt_validation_pass"] is True
+    assert result["production_admission_pass"] is False
+    assert result["physical_effect_verified"] is False
     assert result["cover_count"] == 2
     assert result["expected_relocations"] == value["relocations"]
 
@@ -116,4 +129,27 @@ def test_cover_inspection_disabled_returns_after_force_high_home_without_camera_
     result = evaluate_inspect_cover_receipt(value)
     assert result["ok"] is True
     assert result["outcome"] == "deck_inspection_disabled_after_force_high_home"
+    assert result["receipt_validation_pass"] is True
+    assert result["production_admission_pass"] is False
     assert result["physical_effect_verified"] is False
+
+
+def test_disabled_cover_inspection_requires_force_high_home_attempt_ack_and_postcondition():
+    for field in ("attempted", "controller_acknowledged", "postcondition_verified"):
+        value = receipt({17: False, 19: False, 20: False, 18: False}, [])
+        value.update(
+            deck_inspection=False,
+            inspection_methods={},
+            observed_locations=[],
+            cover_detected={},
+            final_cover_locations=None,
+            door_closed_verified=False,
+            door_open_verified=False,
+        )
+        value["force_to_high_home"][field] = False
+        result = evaluate_inspect_cover_receipt(value)
+        assert result["ok"] is False
+        assert result["receipt_validation_pass"] is False
+        assert f"force_to_high_home_{field}_false" in result["failures"]
+        assert result["production_admission_pass"] is False
+        assert result["physical_effect_verified"] is False

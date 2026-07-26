@@ -75,9 +75,13 @@ def evaluate_park_gantry_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         production_pass = bool(persisted and not tip_present)
         return {
             "ok": production_pass,
+            "status": "receipt_valid" if production_pass else "receipt_rejected",
+            "receipt_validation_pass": production_pass,
             "outcome": "already_parked" if production_pass else "already_parked_with_unresolved_tip_state",
             "oem_effective_pass": True,
-            "production_admission_pass": production_pass,
+            "production_admission_pass": False,
+            "provider_live_bound": False,
+            "physical_motion_commanded": False,
             "physical_effect_verified": False,
             "failures": [] if production_pass else ["tip_present_in_oem_early_return"],
             "source_anchor": SOURCE_ANCHOR,
@@ -133,9 +137,13 @@ def evaluate_park_gantry_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     ok = not failures
     return {
         "ok": ok,
+        "status": "receipt_valid" if ok else "receipt_rejected",
+        "receipt_validation_pass": ok,
         "outcome": "park_verified" if ok else "park_failed_closed",
-        "production_admission_pass": ok,
-        "physical_effect_verified": ok,
+        "production_admission_pass": False,
+        "provider_live_bound": False,
+        "physical_motion_commanded": False,
+        "physical_effect_verified": False,
         "failures": failures,
         "source_anchor": SOURCE_ANCHOR,
         "final_location": 28 if ok else None,

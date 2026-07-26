@@ -101,8 +101,12 @@ def evaluate_check_camera_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     ok = bool(label_detected and not cleanup_failures)
     return {
         "ok": ok,
-        "production_admission_pass": ok,
-        "physical_effect_verified": ok,
+        "status": "receipt_valid" if ok else "receipt_rejected",
+        "receipt_validation_pass": ok,
+        "production_admission_pass": False,
+        "provider_live_bound": False,
+        "physical_motion_commanded": False,
+        "physical_effect_verified": False,
         "label_detected": label_detected,
         "attempt_count": len(attempts),
         "failure": failure,
@@ -117,11 +121,37 @@ def evaluate_check_camera_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
 INSPECT_COVER_SOURCE_ANCHOR = "ControlLib.inspectCover:3663-3768"
 
 
+def _validate_force_to_high_home(value: Any) -> list[str]:
+    force = _mapping(
+        value,
+        "force_to_high_home",
+        {
+            "provider_id", "command_id", "attempted", "controller_acknowledged",
+            "postcondition_verified", "attempted_at_ms", "acknowledged_at_ms",
+            "postcondition_verified_at_ms",
+        },
+    )
+    for field in ("provider_id", "command_id"):
+        if not isinstance(force[field], str) or not force[field].strip() or len(force[field]) > 128:
+            raise OemVisionReceiptError(f"force_to_high_home.{field} must be a bounded nonblank identifier")
+    for field in ("attempted_at_ms", "acknowledged_at_ms", "postcondition_verified_at_ms"):
+        if type(force[field]) is not int or force[field] < 0:
+            raise OemVisionReceiptError(f"force_to_high_home.{field} must be an exact nonnegative integer")
+    if not (force["attempted_at_ms"] <= force["acknowledged_at_ms"] <= force["postcondition_verified_at_ms"]):
+        raise OemVisionReceiptError("force_to_high_home timestamps must preserve attempt/ack/postcondition order")
+    failures: list[str] = []
+    for field in ("attempted", "controller_acknowledged", "postcondition_verified"):
+        if not _exact_bool(force[field], f"force_to_high_home.{field}"):
+            failures.append(f"force_to_high_home_{field}_false")
+    return failures
+
+
 def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     row = _mapping(
         receipt,
         "receipt",
         {
+            "force_to_high_home",
             "deck_inspection",
             "screen_resolution_high",
             "observed_locations",
@@ -134,6 +164,7 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
             "inspection_log_only",
         },
     )
+    force_failures = _validate_force_to_high_home(row["force_to_high_home"])
     enabled = _exact_bool(row["deck_inspection"], "deck_inspection")
     high_resolution = _exact_bool(row["screen_resolution_high"], "screen_resolution_high")
     inspection_log_only = _exact_bool(row["inspection_log_only"], "inspection_log_only")
@@ -151,12 +182,18 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
             raise OemVisionReceiptError("disabled deck inspection must not contain camera or movement evidence")
         if row["final_cover_locations"] is not None or door_closed or door_open:
             raise OemVisionReceiptError("disabled deck inspection cannot claim door or cover effects")
+        receipt_validation_pass = not force_failures
         return {
-            "ok": True,
+            "ok": receipt_validation_pass,
+            "status": "receipt_valid" if receipt_validation_pass else "receipt_rejected",
             "outcome": "deck_inspection_disabled_after_force_high_home",
-            "production_admission_pass": True,
-            "oem_effective_pass": True,
+            "receipt_validation_pass": receipt_validation_pass,
+            "production_admission_pass": False,
+            "provider_live_bound": False,
+            "physical_motion_commanded": False,
+            "oem_effective_pass": receipt_validation_pass,
             "physical_effect_verified": False,
+            "failures": force_failures,
             "terminal_after_location": None,
             "source_anchor": INSPECT_COVER_SOURCE_ANCHOR,
             "camera_session_disposition": "not_released_by_inspectCover",
@@ -221,8 +258,8 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     if row["relocations"] != expected_relocations:
         raise OemVisionReceiptError("relocations do not match the exact OEM detected/empty list order")
 
-    production_pass = error_status is None and cover_count == 2
-    if production_pass:
+    semantic_pass = error_status is None and cover_count == 2
+    if semantic_pass:
         if row["final_cover_locations"] != {"output": 18, "reagent": 20}:
             raise OemVisionReceiptError("final_cover_locations must be output=18 and reagent=20")
         if not door_open:
@@ -233,13 +270,22 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         if door_open:
             raise OemVisionReceiptError("failed cover path cannot claim the successful door-open terminal")
 
-    oem_effective_pass = production_pass or bool(inspection_log_only and error_status is not None)
+    failures = list(force_failures)
+    if not semantic_pass and error_status is not None:
+        failures.append(error_status.lower())
+    receipt_validation_pass = semantic_pass and not force_failures
+    oem_effective_pass = not force_failures and (semantic_pass or bool(inspection_log_only and error_status is not None))
     return {
-        "ok": production_pass,
-        "outcome": "covers_canonicalized" if production_pass else "cover_inspection_failed",
-        "production_admission_pass": production_pass,
+        "ok": receipt_validation_pass,
+        "status": "receipt_valid" if receipt_validation_pass else "receipt_rejected",
+        "outcome": "covers_canonicalized" if semantic_pass else "cover_inspection_failed",
+        "receipt_validation_pass": receipt_validation_pass,
+        "production_admission_pass": False,
+        "provider_live_bound": False,
+        "physical_motion_commanded": False,
         "oem_effective_pass": oem_effective_pass,
-        "physical_effect_verified": production_pass,
+        "physical_effect_verified": False,
+        "failures": failures,
         "cover_count": cover_count,
         "error_status": error_status,
         "terminal_after_location": terminal_after_location,

@@ -35,8 +35,10 @@ def receipt(*, first=True, second_attempted=False, second=False):
 def test_camera_accepts_first_label_and_exact_cleanup():
     result = evaluate_check_camera_receipt(receipt())
     assert result["ok"] is True
-    assert result["production_admission_pass"] is True
-    assert result["physical_effect_verified"] is True
+    assert result["receipt_validation_pass"] is True
+    assert result["production_admission_pass"] is False
+    assert result["physical_effect_verified"] is False
+    assert result["provider_live_bound"] is False
     assert result["attempt_count"] == 1
     assert result["camera_session_disposition"] == "not_released_by_CheckCamera"
 

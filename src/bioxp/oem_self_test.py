@@ -1,4 +1,8 @@
-"""Strict acceptance of source-shaped BioXP OEM startup self-test receipts."""
+"""Strict semantic validation of source-shaped BioXP OEM self-test receipts.
+
+A supplied receipt can validate the closed schema, OEM thresholds, ordering, and
+postconditions.  It cannot bind a live provider or establish a physical effect.
+"""
 from __future__ import annotations
 
 import math
@@ -77,6 +81,12 @@ def _number(value: Any, name: str) -> float:
     return float(value)
 
 
+def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise OemSelfTestReceiptError(f"{name} must be an exact integer >= {minimum}")
+    return value
+
+
 def _integer_or_none(value: Any, name: str) -> int | None:
     if value is None:
         return None
@@ -85,14 +95,20 @@ def _integer_or_none(value: Any, name: str) -> int | None:
     return value
 
 
+def _identifier(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise OemSelfTestReceiptError(f"{name} must be a bounded nonblank identifier")
+    return value
+
+
 def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     top = _mapping(
         receipt,
         "receipt",
         {
-            "tc", "rc", "oc", "motion", "concurrency",
-            "launched_branch_results",
-            "final_chiller_pwm_reset_acknowledged", "inspection_log_only",
+            "tc", "rc", "oc", "motion", "concurrency", "provider_identity",
+            "launched_branch_results", "final_chiller_pwm_reset_acknowledged",
+            "inspection_log_only",
         },
     )
     tc = _mapping(
@@ -111,13 +127,44 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     concurrency = _mapping(
         top["concurrency"],
         "concurrency",
-        {"tc_started", "rc_started", "oc_started", "thermal_wait_completed_within_ms"},
+        {
+            "branch_tasks", "motion_task_id", "motion_started_at_ms",
+            "motion_completed_at_ms", "join_started_at_ms", "join_completed_at_ms",
+            "thermal_wait_completed_within_ms",
+        },
     )
-    launched_results = _mapping(
-        top["launched_branch_results"],
-        "launched_branch_results",
-        {"tc", "rc", "oc"},
+    branch_tasks = _mapping(concurrency["branch_tasks"], "concurrency.branch_tasks", {"tc", "rc", "oc"})
+    task_rows: dict[str, dict[str, Any]] = {}
+    task_ids: list[str] = []
+    for branch in ("tc", "rc", "oc"):
+        task = _mapping(
+            branch_tasks[branch],
+            f"concurrency.branch_tasks.{branch}",
+            {"task_id", "submitted_at_ms", "started_at_ms", "completed_at_ms"},
+        )
+        task_ids.append(_identifier(task["task_id"], f"concurrency.branch_tasks.{branch}.task_id"))
+        for field in ("submitted_at_ms", "started_at_ms", "completed_at_ms"):
+            _integer(task[field], f"concurrency.branch_tasks.{branch}.{field}")
+        task_rows[branch] = task
+    motion_task_id = _identifier(concurrency["motion_task_id"], "concurrency.motion_task_id")
+    if len(set([*task_ids, motion_task_id])) != 4:
+        raise OemSelfTestReceiptError("self-test task identities must be unique")
+    for field in (
+        "motion_started_at_ms", "motion_completed_at_ms", "join_started_at_ms",
+        "join_completed_at_ms", "thermal_wait_completed_within_ms",
+    ):
+        _integer(concurrency[field], f"concurrency.{field}")
+
+    provider = _mapping(
+        top["provider_identity"],
+        "provider_identity",
+        {"provider_id", "provider_run_id", "binding_generation"},
     )
+    _identifier(provider["provider_id"], "provider_identity.provider_id")
+    _identifier(provider["provider_run_id"], "provider_identity.provider_run_id")
+    _integer(provider["binding_generation"], "provider_identity.binding_generation")
+
+    launched_results = _mapping(top["launched_branch_results"], "launched_branch_results", {"tc", "rc", "oc"})
     inspection_log_only = _bool(top["inspection_log_only"], "inspection_log_only")
     final_pwm = _bool(top["final_chiller_pwm_reset_acknowledged"], "final_chiller_pwm_reset_acknowledged")
 
@@ -126,6 +173,7 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     for branch in ("tc", "rc", "oc"):
         if not _bool(launched_results[branch], f"launched_branch_results.{branch}"):
             failures.append(f"{branch}_launched_result_false")
+
     for field, label in (
         ("high_leg_s", "tc_high_temperature_timeout"),
         ("low_leg_s", "tc_low_temperature_timeout"),
@@ -180,23 +228,39 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     if not _bool(motion["door_open_verified"], "motion.door_open_verified"):
         failures.append("door_open_not_verified")
 
-    for field in ("tc_started", "rc_started", "oc_started"):
-        if not _bool(concurrency[field], f"concurrency.{field}"):
-            failures.append(f"{field}_false")
-    if _number(concurrency["thermal_wait_completed_within_ms"], "concurrency.thermal_wait_completed_within_ms") > 100_000:
+    motion_start = concurrency["motion_started_at_ms"]
+    motion_complete = concurrency["motion_completed_at_ms"]
+    if motion_complete < motion_start:
+        failures.append("motion_completion_precedes_start")
+    for branch, task in task_rows.items():
+        if task["started_at_ms"] < task["submitted_at_ms"] or task["completed_at_ms"] < task["started_at_ms"]:
+            failures.append(f"{branch}_task_timestamp_order_invalid")
+        if not (task["started_at_ms"] < motion_complete and task["completed_at_ms"] > motion_start):
+            failures.append(f"{branch}_did_not_overlap_motion")
+    if concurrency["join_started_at_ms"] < motion_complete:
+        failures.append("join_started_before_motion_completed")
+    if concurrency["join_completed_at_ms"] < concurrency["join_started_at_ms"]:
+        failures.append("join_completion_precedes_join_start")
+    if concurrency["join_completed_at_ms"] < max(task["completed_at_ms"] for task in task_rows.values()):
+        failures.append("join_completed_before_thermal_tasks")
+    if concurrency["thermal_wait_completed_within_ms"] > 100_000:
         failures.append("parallel_completion_timeout")
     if not final_pwm:
         failures.append("final_chiller_pwm_not_reset")
 
     failures = thermal_failures + failures
-    production_pass = not failures
+    receipt_validation_pass = not failures
     nonthermal_failures = [failure for failure in failures if failure not in thermal_failures]
-    oem_effective_pass = production_pass or bool(inspection_log_only and thermal_failures and not nonthermal_failures)
+    oem_effective_pass = receipt_validation_pass or bool(inspection_log_only and thermal_failures and not nonthermal_failures)
     return {
-        "ok": production_pass,
+        "ok": receipt_validation_pass,
+        "status": "receipt_valid" if receipt_validation_pass else "receipt_rejected",
+        "receipt_validation_pass": receipt_validation_pass,
         "oem_effective_pass": oem_effective_pass,
-        "production_admission_pass": production_pass,
-        "physical_effect_verified": production_pass,
+        "production_admission_pass": False,
+        "provider_live_bound": False,
+        "physical_motion_commanded": False,
+        "physical_effect_verified": False,
         "failures": failures,
         "thermal_failures": thermal_failures,
         "inspection_log_only": inspection_log_only,

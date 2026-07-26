@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .oem_full_lifecycle import (
     INITIALIZE_SYSTEM_PRODUCERS,
@@ -37,10 +37,21 @@ class FullLifecycleCreateRequest(BaseModel):
 
     command: str
     operator_ack: str
+    expected_generation: StrictInt = Field(ge=1)
     expected_machine_serial: int
     expected_registry_sha256: str
+    expected_evidence_lock_sha256: str
     idempotency_key: str = Field(min_length=1, max_length=128)
     mode: str = "dry_run"
+
+
+class FullLifecycleCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_generation: StrictInt = Field(ge=1)
+    expected_machine_serial: int
+    expected_registry_sha256: str
+    expected_evidence_lock_sha256: str
 
 
 class RuntimeCommandRequest(BaseModel):
@@ -162,6 +173,9 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     self_test_due = machine.get("self_test_due")
     saved_status = machine.get("saved_status")
     ship_mode = machine.get("ship_mode")
+    update_check_suppresses = machine.get("update_check_suppresses_initialize_system")
+    system_in_motion = machine.get("system_in_motion")
+    is_development_machine = machine.get("is_development_machine")
     hardware = status.get("hardware")
     can_ready = hardware.get("can_ready") if isinstance(hardware, dict) else None
     lifecycle = lifecycle_state.projection()
@@ -181,6 +195,9 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
         ("latch_closed", latch_closed),
         ("tip_loaded", tip_present),
         ("self_test_due", self_test_due),
+        ("update_check_suppresses_initialize_system", update_check_suppresses),
+        ("system_in_motion", system_in_motion),
+        ("is_development_machine", is_development_machine),
     ):
         if type(value) is not bool:
             raise OemFullLifecycleError(f"robot-owned {field} must be an exact boolean")
@@ -192,7 +209,6 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     check_camera = snapshot.operation_parameters["CheckCamera"]
     if type(camera_installed) is not bool or type(check_camera) is not bool:
         raise OemFullLifecycleError("selected CameraInstalled/CheckCamera values must be exact booleans")
-    camera_required = check_camera and camera_installed
     deck_inspection = snapshot.operation_parameters["DeckInspection"]
     if type(deck_inspection) is not bool:
         raise OemFullLifecycleError("selected DeckInspection value must be an exact boolean")
@@ -202,6 +218,8 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
         "board_test_mode": board_test_mode,
         "pipette_exists": pipette_exists,
         "initialize_system_producer": "initializeEnvironment",
+        "update_check_suppresses_initialize_system": update_check_suppresses,
+        "system_in_motion_at_entry": system_in_motion,
         "enclosure_door_closed": enclosure_door_closed,
         "latch_closed": latch_closed,
         "saved_status": saved_status,
@@ -209,7 +227,9 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
         "start_mode": snapshot.startup_mode,
         "tip_present": tip_present,
         "self_test_due": self_test_due,
-        "camera_required": camera_required,
+        "check_camera": check_camera,
+        "camera_installed": camera_installed,
+        "is_development_machine": is_development_machine,
         "deck_inspection": deck_inspection,
     }
 
@@ -258,7 +278,10 @@ def full_lifecycle_contract():
         "machine_serial": 206,
         "registry_sha256": current_registry_sha256(),
         **authority,
-        "source_authority_verified": True,
+        "evidence_lock_verified": authority["evidence_lock_identity_verified"],
+        "source_registry_identity_verified": True,
+        "machine_configuration_verified": not plan_blockers,
+        "source_authority_verified": False,
         "initialize_system_producers": list(INITIALIZE_SYSTEM_PRODUCERS),
         "plan_available": not plan_blockers,
         "plan_blockers": plan_blockers,
@@ -290,7 +313,10 @@ def create_full_lifecycle_run(request: FullLifecycleCreateRequest):
     runs = _require_full_lifecycle_runs()
     try:
         inputs = _derive_full_lifecycle_inputs()
-        return runs.create({**request.model_dump(), "inputs": inputs})
+        return runs.create(
+            {**request.model_dump(), "inputs": inputs},
+            machine_configuration_verified=True,
+        )
     except OemFullLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -312,9 +338,9 @@ def get_full_lifecycle_ledger(run_id: str):
 
 
 @router.post("/movement-runs/{run_id}/cancel", dependencies=[Depends(_require_lifecycle_mutation_auth)])
-def cancel_full_lifecycle_run(run_id: str):
+def cancel_full_lifecycle_run(run_id: str, request: FullLifecycleCancelRequest):
     try:
-        return _require_full_lifecycle_runs().cancel(run_id)
+        return _require_full_lifecycle_runs().cancel(run_id, request.model_dump())
     except OemFullLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

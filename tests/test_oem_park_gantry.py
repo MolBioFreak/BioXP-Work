@@ -30,15 +30,19 @@ def test_already_parked_is_exact_noop():
     )
     result = evaluate_park_gantry_receipt(value)
     assert result["ok"] is True
+    assert result["receipt_validation_pass"] is True
     assert result["outcome"] == "already_parked"
+    assert result["production_admission_pass"] is False
     assert result["physical_effect_verified"] is False
 
 
 def test_normal_park_requires_profile_two_and_persisted_location():
     result = evaluate_park_gantry_receipt(base_receipt())
     assert result["ok"] is True
+    assert result["receipt_validation_pass"] is True
     assert result["outcome"] == "park_verified"
-    assert result["physical_effect_verified"] is True
+    assert result["production_admission_pass"] is False
+    assert result["physical_effect_verified"] is False
 
 
 def test_rehome_branch_requires_preliminary_route_and_exact_residual_limits():

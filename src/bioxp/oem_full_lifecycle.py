@@ -68,6 +68,7 @@ def current_authority_identity() -> dict[str, Any]:
         "evidence_lock_sha256": actual,
         "evidence_lock_schema": "bioxp.oem_evidence_lock.v4",
         "acquisition_id": OEM_ACQUISITION_ID,
+        "evidence_lock_identity_verified": True,
     }
 
 
@@ -80,6 +81,8 @@ _ALLOWED_INPUTS = frozenset(
         "board_test_mode",
         "pipette_exists",
         "initialize_system_producer",
+        "update_check_suppresses_initialize_system",
+        "system_in_motion_at_entry",
         "enclosure_door_closed",
         "latch_closed",
         "saved_status",
@@ -87,7 +90,9 @@ _ALLOWED_INPUTS = frozenset(
         "start_mode",
         "tip_present",
         "self_test_due",
-        "camera_required",
+        "check_camera",
+        "camera_installed",
+        "is_development_machine",
         "deck_inspection",
     }
 )
@@ -96,8 +101,10 @@ _ALLOWED_REQUEST_KEYS = frozenset(
     {
         "command",
         "operator_ack",
+        "expected_generation",
         "expected_machine_serial",
         "expected_registry_sha256",
+        "expected_evidence_lock_sha256",
         "idempotency_key",
         "mode",
         "inputs",
@@ -221,24 +228,44 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
         producer=inputs["initialize_system_producer"],
     )
     add(
-        "worker_claim_initialize_system",
-        "BioXPMainWindow:2030-2051",
-        update_check_semantics="UpdateCheck true suppresses initializeSystem; outcome must be captured by the live worker",
+        "worker_update_check_gate",
+        "BioXPMainWindow.motion_thread_process:2030-2051;BioXPMainWindow.UpdateCheck:4264-4309",
+        source_predicate="!UpdateCheck()",
     )
+    if inputs["update_check_suppresses_initialize_system"]:
+        add(
+            "worker_update_check_suppressed_initialize_system",
+            "BioXPMainWindow.motion_thread_process:2030-2051;BioXPMainWindow.UpdateCheck:4264-4309",
+            result_semantics="queued initializeSystem is not called when UpdateCheck() returns true",
+        )
+        return stages, "oem_initialize_system_suppressed_by_update_check"
     add("initialize_system_reentry_guard", "BioXPMainWindow:1094-1100")
+    if inputs["system_in_motion_at_entry"]:
+        add(
+            "initialize_system_reentry_return",
+            "BioXPMainWindow.initializeSystem:1094-1098",
+            result_semantics="return_before_m_systemInmotion_assignment",
+        )
+        return stages, "oem_initialize_system_reentry_suppressed"
+    add(
+        "initialize_system_latch_set",
+        "BioXPMainWindow.initializeSystem:1099-1100",
+        host_state="m_systemInmotion=true",
+    )
     if inputs["ship_mode"] == "PARK":
         add(
-            "ship_mode_close_door_before_shutdown",
+            "ship_mode_close_door_result_ignored",
             "BioXPMainWindow.initializeSystem:1127-1133;ControlLib.doorOpen",
             hardware=True,
-            result_required=True,
-            possible_terminals=[
-                "oem_shipping_poweroff_required",
-                "oem_shipping_blocked_door_close_failure",
-            ],
-            execution_semantics="doorOpen(false,false) must verify door/latch closure before warning and OS shutdown",
+            result_semantics="boolean_result_ignored_by_oem_caller",
         )
-        return stages, "oem_shipping_handoff_pending_door_close"
+        add(
+            "ship_mode_shutdown_requested",
+            "BioXPMainWindow.initializeSystem:1129-1135",
+            hardware=True,
+            execution_semantics="OEM requests Windows shutdown and returns before the later try/finally",
+        )
+        return stages, "oem_shipping_shutdown_requested_latch_remains_set"
 
     add(
         "initialize_system_initial_check",
@@ -250,6 +277,11 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
         add("saved_status_initialize_motion", "BioXPMainWindow:1144-1150", hardware=True, motion=True)
         add("saved_status_inspect_cover", "BioXPMainWindow:1144-1150", hardware=True, motion=True)
         add("saved_status_unlock_warning_return", "BioXPMainWindow:1152-1156", hardware=True)
+        add(
+            "initialize_system_latch_cleared_finally",
+            "BioXPMainWindow.initializeSystem:1335-1340",
+            host_state="m_systemInmotion=false",
+        )
         return stages, "oem_movement_blocked_saved_status_recovery"
 
     add("initialize_motion_flags", "ControlLib.initializeMotion:8797-8804")
@@ -260,6 +292,8 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
             hardware=True,
             motion=True,
             movement_ledger_stage=source_stage["key"],
+            movement_ledger_stage_id=f"M{number:02d}",
+            movement_ledger_schema="bioxp.oem_initialize_motors_ledger.v1",
         )
     add("initialize_motion_tip_query", "ControlLib.initializeMotion:8805-8807", hardware=True)
     if inputs["tip_present"]:
@@ -300,8 +334,12 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
             cleanup="setChillerPWM",
         )
 
-    add("camera_gate", "BioXPMainWindow:1172-1181")
-    if inputs["camera_required"]:
+    add(
+        "camera_gate",
+        "BioXPMainWindow:1172-1181",
+        source_predicate="CheckCamera && CameraInstalled && !IsDevelopmentMachine()",
+    )
+    if inputs["check_camera"] and inputs["camera_installed"] and not inputs["is_development_machine"]:
         add("camera_check", "BioXPMainWindow.initializeSystem:1172-1181;ControlLib.CheckCamera:1929-1960", hardware=True, motion=True)
 
     # inspectCover always calls ForceToHighHome before its DeckInspection early return.
@@ -313,7 +351,16 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
     add("gantry_park", "BioXPMainWindow.initializeSystem:1203-1204;ControlLib.parkGantry:7071-7122", hardware=True, motion=True)
 
     terminal = _terminal_for_start_mode(inputs["start_mode"])
-    add(f"start_mode_{inputs['start_mode'].lower()}_terminal", "BioXPMainWindow:1204-1307")
+    add(
+        f"start_mode_{inputs['start_mode'].lower()}_terminal",
+        "BioXPMainWindow:1204-1307",
+        hardware=True,
+    )
+    add(
+        "initialize_system_latch_cleared_finally",
+        "BioXPMainWindow.initializeSystem:1335-1340",
+        host_state="m_systemInmotion=false",
+    )
     return stages, terminal
 
 
@@ -332,11 +379,15 @@ class OemFullLifecycleRuns:
             raise OemFullLifecycleError(f"command must be {FULL_LIFECYCLE_COMMAND!r}")
         if request.get("operator_ack") != "INITIALIZE":
             raise OemFullLifecycleError("operator_ack INITIALIZE required")
+        if type(request.get("expected_generation")) is not int or request["expected_generation"] < 1:
+            raise OemFullLifecycleError("expected_generation must be a positive integer")
         if type(request.get("expected_machine_serial")) is not int or request.get("expected_machine_serial") != OEM_MACHINE_SERIAL:
             raise OemFullLifecycleError(f"expected machine serial must be {OEM_MACHINE_SERIAL}")
         actual_registry = current_registry_sha256()
         if request.get("expected_registry_sha256") != actual_registry:
             raise OemFullLifecycleError("expected registry SHA-256 does not match frozen runtime registry")
+        if request.get("expected_evidence_lock_sha256") != current_authority_identity()["evidence_lock_sha256"]:
+            raise OemFullLifecycleError("expected evidence-lock SHA-256 does not match canonical OEM authority")
         if request.get("mode") != "dry_run":
             raise OemFullLifecycleError("full lifecycle physical execution is blocked until commissioned providers are bound")
         key = request.get("idempotency_key")
@@ -373,14 +424,25 @@ class OemFullLifecycleRuns:
             "latch_closed",
             "tip_present",
             "self_test_due",
-            "camera_required",
+            "check_camera",
+            "camera_installed",
+            "is_development_machine",
+            "update_check_suppresses_initialize_system",
+            "system_in_motion_at_entry",
             "deck_inspection",
         ):
             if type(inputs[field]) is not bool:
                 raise OemFullLifecycleError(f"{field} must be an exact boolean")
         return {**dict(request), "idempotency_key": key.strip(), "inputs": dict(inputs)}
 
-    def create(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def create(
+        self,
+        request: Mapping[str, Any],
+        *,
+        machine_configuration_verified: bool = False,
+    ) -> dict[str, Any]:
+        if type(machine_configuration_verified) is not bool:
+            raise OemFullLifecycleError("machine configuration verification must be an exact internal boolean")
         req = self._validate_request(request)
         authority = current_authority_identity()
         stages, planned_terminal = _source_parity_plan(req["inputs"])
@@ -398,8 +460,13 @@ class OemFullLifecycleRuns:
             "current_stage": None,
             "expected_next_stage": stages[0]["stage_id"] if stages else None,
             "blocked_reason": None,
-            "source_authority_verified": True,
-            "configuration_verified": True,
+            # Lock/registry identity verification is not closed-world source,
+            # live-provider, machine-configuration, or physical-effect proof.
+            "source_authority_verified": False,
+            "configuration_verified": False,
+            "evidence_lock_verified": authority["evidence_lock_identity_verified"],
+            "source_registry_identity_verified": True,
+            "machine_configuration_verified": machine_configuration_verified,
             "transport_owner_verified": False,
             "controller_acknowledged": False,
             "postcondition_verified": False,
@@ -416,6 +483,13 @@ class OemFullLifecycleRuns:
             "created_at": now,
             "updated_at": now,
         }
+        if req["inputs"]["ship_mode"] == "PARK":
+            payload["safety_deviation"] = [{
+                "deviation_id": "ship_mode_shutdown_interlock",
+                "oem_semantics": "doorOpen(false,false) result ignored; shutdown requested; m_systemInmotion remains true",
+                "linux_safety_policy": "never request OS shutdown or infer door closure from an unbound dry-run provider",
+                "live_execution_blocked": True,
+            }]
         try:
             return self.store.create_oem_full_lifecycle_run_once(payload)
         except ValueError as exc:
@@ -445,7 +519,7 @@ class OemFullLifecycleRuns:
             payload["updated_at"] = utc_ts()
             self.store.write_oem_full_lifecycle_run(payload)
             # Deliberately no provider or transport call here.
-            row["status"] = "completed"
+            row["status"] = "dry_run_simulated"
             row["completed_at"] = utc_ts()
             payload["expected_next_stage"] = (
                 payload["stages"][index + 1]["stage_id"]
@@ -455,8 +529,8 @@ class OemFullLifecycleRuns:
             payload["updated_at"] = utc_ts()
             self.store.write_oem_full_lifecycle_run(payload)
         payload["current_stage"] = None
-        payload["run_state"] = "dry_run_complete"
-        payload["terminal_state"] = payload["planned_terminal_state"]
+        payload["run_state"] = "dry_run_non_ready"
+        payload["terminal_state"] = "dry_run_non_readiness_terminal"
         payload["updated_at"] = utc_ts()
         return self.store.write_oem_full_lifecycle_run(payload)
 
@@ -489,16 +563,35 @@ class OemFullLifecycleRuns:
             return self.store.write_oem_full_lifecycle_run(payload)
         return payload
 
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        payload = self.get(run_id)
-        if payload["run_state"] != "planned" or payload.get("current_stage") is not None:
-            raise OemFullLifecycleError("run is not at a safe cancellation boundary")
-        payload.update(
-            {
+    def cancel(self, run_id: str, expected: Mapping[str, Any]) -> dict[str, Any]:
+        def mutation(payload: dict[str, Any]) -> dict[str, Any]:
+            request = payload.get("request")
+            authority = current_authority_identity()
+            if not isinstance(request, Mapping):
+                raise OemFullLifecycleError("persisted lifecycle request is malformed")
+            for field in (
+                "expected_generation",
+                "expected_machine_serial",
+                "expected_registry_sha256",
+                "expected_evidence_lock_sha256",
+            ):
+                if request.get(field) != expected.get(field):
+                    raise OemFullLifecycleError(f"cancel {field} does not match the admitted lifecycle request")
+            if expected.get("expected_registry_sha256") != current_registry_sha256():
+                raise OemFullLifecycleError("cancel registry authority is no longer current")
+            if expected.get("expected_evidence_lock_sha256") != authority["evidence_lock_sha256"]:
+                raise OemFullLifecycleError("cancel evidence-lock authority is no longer current")
+            if payload["run_state"] != "planned" or payload.get("current_stage") is not None:
+                raise OemFullLifecycleError("run is not at a safe cancellation boundary")
+            payload.update({
                 "run_state": "cancelled",
                 "terminal_state": "cancelled",
                 "expected_next_stage": None,
                 "updated_at": utc_ts(),
-            }
-        )
-        return self.store.write_oem_full_lifecycle_run(payload)
+            })
+            return payload
+
+        try:
+            return self.store.mutate_oem_full_lifecycle_run(run_id, mutation)
+        except ValueError as exc:
+            raise OemFullLifecycleError(str(exc)) from exc
