@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -25,6 +26,9 @@ def _request(**overrides):
         "mode": "dry_run",
         "inputs": {
             "ownership_generation": 41,
+            "can_ready": True,
+            "enclosure_door_closed": True,
+            "latch_closed": True,
             "saved_status": 1,
             "ship_mode": "",
             "start_mode": "WebMode",
@@ -59,24 +63,29 @@ def test_full_happy_path_dry_run_is_robot_owned_and_emits_no_physical_frames(tmp
         for number, row in enumerate(OEM_INITIALIZE_MOTORS_STAGES, start=1)
     ]
     assert [row["stage_id"] for row in finished["stages"]] == [
+        "construct_control_lib",
+        "constructor_pipette_initialize_and_status",
+        "configure_motors_without_motion",
         "initialize_environment",
+        "initialize_environment_initial_check",
         "enqueue_initialize_system",
         "worker_claim_initialize_system",
         "initialize_system_reentry_guard",
         "initialize_system_initial_check",
-        "configure_motors_without_motion",
         "initialize_motion_flags",
         *expected_movement_stages,
         "initialize_motion_tip_query",
         "initialize_motion_no_tip",
         "self_test_gate",
-        "self_test_tc_rc_oc",
-        "self_test_motion",
+        "self_test_launch_tc_rc_oc",
+        "self_test_motion_while_thermal_running",
+        "self_test_join_and_reset_chillers",
         "camera_gate",
         "camera_check",
+        "cover_force_high_home",
         "cover_inspection",
         "gantry_park",
-        "start_mode_web_job_admission",
+        "start_mode_webmode_terminal",
     ]
     assert all(row["status"] == "completed" for row in finished["stages"])
     assert all(row["physical_motion_commanded"] is False for row in finished["stages"])
@@ -111,10 +120,12 @@ def test_stale_tip_branch_and_not_due_self_test_preserve_exact_branch_order(tmp_
         "tip_verify_empty",
         "pipette_reinitialize_retry_once",
     ]
-    assert "self_test_tc_rc_oc" not in stage_ids
+    assert "self_test_launch_tc_rc_oc" not in stage_ids
     assert "camera_check" not in stage_ids
+    assert "cover_force_high_home" in stage_ids
     assert "cover_inspection" not in stage_ids
-    assert finished["terminal_state"] == "oem_movement_ready_manual"
+    assert "cover_inspection_disabled_return_ok" in stage_ids
+    assert finished["terminal_state"] == "oem_movement_ready_development"
 
 
 def test_saved_status_recovery_returns_before_normal_camera_cover_park_and_start_mode(tmp_path):
@@ -137,11 +148,66 @@ def test_saved_status_recovery_returns_before_normal_camera_cover_park_and_start
     assert finished["terminal_state"] == "oem_movement_blocked_saved_status_recovery"
 
 
+def test_application_admission_branches_before_enqueue_and_motor_config_is_constructor_ordered(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    open_request = _request(
+        idempotency_key="door-open-admission",
+        inputs={
+            **_request()["inputs"],
+            "enclosure_door_closed": False,
+            "latch_closed": False,
+        },
+    )
+    payload = runs.create(open_request)
+    stage_ids = [row["stage_id"] for row in payload["stages"]]
+    assert stage_ids == [
+        "construct_control_lib",
+        "constructor_pipette_initialize_and_status",
+        "configure_motors_without_motion",
+        "initialize_environment",
+        "initialize_environment_initial_check",
+        "admission_warning_enclosure_open",
+    ]
+    assert "enqueue_initialize_system" not in stage_ids
+    assert payload["planned_terminal_state"] == "oem_waiting_enclosure_open"
+
+
+def test_initial_check_and_self_test_metadata_preserve_hardware_and_parallel_truth(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    payload = runs.create(_request(idempotency_key="source-semantics"))
+    by_id = {row["stage_id"]: row for row in payload["stages"]}
+    assert by_id["initialize_environment_initial_check"]["would_command_hardware"] is True
+    assert by_id["initialize_environment_initial_check"]["result_semantics"] == "return_value_ignored_by_oem_caller"
+    assert by_id["initialize_system_initial_check"]["would_command_hardware"] is True
+    assert by_id["self_test_launch_tc_rc_oc"]["parallel_branches"] == ["TC", "RC", "OC"]
+    assert by_id["self_test_motion_while_thermal_running"]["would_command_physical_motion"] is True
+    assert by_id["self_test_join_and_reset_chillers"]["join_timeout_ms"] == 100000
+
+
+def test_can_unavailable_branch_never_enqueues_or_configures_motors(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    request = _request(
+        idempotency_key="can-unavailable",
+        inputs={**_request()["inputs"], "can_ready": False, "start_mode": "WebMode"},
+    )
+    payload = runs.create(request)
+    stage_ids = [row["stage_id"] for row in payload["stages"]]
+    assert "configure_motors_without_motion" not in stage_ids
+    assert "initialize_environment_initial_check" not in stage_ids
+    assert "enqueue_initialize_system" not in stage_ids
+    assert payload["planned_terminal_state"] == "oem_blocked_can_unavailable"
+
+
 def test_creation_is_idempotent_and_rejects_authority_or_arbitrary_input(tmp_path):
     runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
     first = runs.create(_request())
     second = runs.create(_request())
     assert first["run_id"] == second["run_id"]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        raced = list(pool.map(lambda _index: runs.create(_request()), range(32)))
+    assert {row["run_id"] for row in raced} == {first["run_id"]}
+    assert len(runs.store.list_oem_full_lifecycle_runs()) == 1
 
     with pytest.raises(OemFullLifecycleError, match="machine serial"):
         runs.create(_request(idempotency_key="wrong-serial", expected_machine_serial=3250))
@@ -149,6 +215,15 @@ def test_creation_is_idempotent_and_rejects_authority_or_arbitrary_input(tmp_pat
         runs.create(_request(idempotency_key="wrong-registry", expected_registry_sha256="0" * 64))
     with pytest.raises(OemFullLifecycleError, match="unknown lifecycle input"):
         runs.create(_request(idempotency_key="raw-motion", inputs={**_request()["inputs"], "axis": "z"}))
+
+
+def test_atomic_idempotency_reservation_converges_first_concurrent_creators(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    request = _request(idempotency_key="first-concurrent-create")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        raced = list(pool.map(lambda _index: runs.create(request), range(32)))
+    assert len({row["run_id"] for row in raced}) == 1
+    assert len(runs.store.list_oem_full_lifecycle_runs()) == 1
 
 
 def test_restart_during_running_stage_blocks_and_never_auto_resumes(tmp_path):

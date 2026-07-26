@@ -78,6 +78,22 @@ class OEMRuntimeStore:
             return None
         return json.loads(path.read_text())
 
+    def create_oem_full_lifecycle_run_once(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Atomically converge same-key creators within the single runtime owner."""
+        payload = dict(run)
+        key = payload.get("idempotency_key")
+        request = payload.get("request")
+        if not isinstance(key, str) or not key or len(key) > 128:
+            raise ValueError("valid bounded idempotency_key required")
+        with self._lock:
+            for existing in self.list_oem_full_lifecycle_runs():
+                if existing.get("idempotency_key") != key:
+                    continue
+                if existing.get("request") != request:
+                    raise ValueError("idempotency_key is already bound to a different request")
+                return existing
+            return self.write_oem_full_lifecycle_run(payload)
+
     def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
         """Persist one full OEM movement-lifecycle run atomically.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any, Callable, Protocol
 
@@ -393,6 +394,7 @@ class FourPipetteTransport:
             raise ValueError("OEM production pipette collection requires exactly four channels")
         self._transports = list(transports)
         self._sleep = sleep
+        self._transaction_lock = threading.RLock()
         self._last_group_transaction: dict[str, Any] | None = None
 
     def _channel_status(self, channel: int, transport: CanPipetteTransport) -> dict[str, Any]:
@@ -570,32 +572,35 @@ class FourPipetteTransport:
 
     def query_tip_status_all(self) -> dict[str, Any]:
         """Return exact four-channel OEM `?31` hardware readback."""
-        channels: list[dict[str, Any]] = []
-        for channel, transport in enumerate(self._transports):
-            result = transport._get_driver().query_tip_status()
-            if (
-                not isinstance(result, dict)
-                or result.get("ok") is not True
-                or type(result.get("tip_loaded")) is not bool
-            ):
-                raise PipetteCommandError(
-                    "Pipette hardware tip-status query did not return exact four-channel readback.",
-                    details={"channel": channel, "result": result},
-                )
-            loaded = result["tip_loaded"]
-            transport._last_tip_status = dict(result)
-            transport._tip_loaded = loaded
-            channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
-        loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
-        return {
-            "ok": True,
-            "tip_count": len(loaded_channels),
-            "channels_with_tips": loaded_channels,
-            "channels": channels,
-            "hardware_query_verified": True,
-            "physical_effect_verified": False,
-            "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
-        }
+        with self._transaction_lock:
+            channels: list[dict[str, Any]] = []
+            for channel, transport in enumerate(self._transports):
+                result = transport._get_driver().query_tip_status()
+                if (
+                    not isinstance(result, dict)
+                    or result.get("ok") is not True
+                    or result.get("semantic_ok") is not True
+                    or result.get("hardware_truth_level") != "hardware_query"
+                    or type(result.get("tip_loaded")) is not bool
+                ):
+                    raise PipetteCommandError(
+                        "Pipette hardware tip-status query did not return exact four-channel readback.",
+                        details={"channel": channel, "result": result},
+                    )
+                loaded = result["tip_loaded"]
+                transport._last_tip_status = dict(result)
+                transport._tip_loaded = loaded
+                channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
+            loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
+            return {
+                "ok": True,
+                "tip_count": len(loaded_channels),
+                "channels_with_tips": loaded_channels,
+                "channels": channels,
+                "hardware_query_verified": True,
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
+            }
 
     def eject_all_tips_for_oem_startup(
         self,
@@ -604,6 +609,18 @@ class FourPipetteTransport:
         expected_channels_with_tips: list[int],
     ) -> dict[str, Any]:
         """Fixed startup-only E1R sequence with mandatory postcondition readback."""
+        with self._transaction_lock:
+            return self._eject_all_tips_for_oem_startup_locked(
+                operator_ack=operator_ack,
+                expected_channels_with_tips=expected_channels_with_tips,
+            )
+
+    def _eject_all_tips_for_oem_startup_locked(
+        self,
+        *,
+        operator_ack: str,
+        expected_channels_with_tips: list[int],
+    ) -> dict[str, Any]:
         if type(operator_ack) is not str or operator_ack != "EJECT_STALE_STARTUP_TIPS":
             raise PipetteCommandError("Literal startup-tip operator acknowledgement is required.")
         if (
@@ -630,9 +647,22 @@ class FourPipetteTransport:
                 or not isinstance(result.get("ack"), dict)
                 or result["ack"].get("outcome") != "ack"
             ):
+                post_attempt_readback = None
+                post_attempt_error = None
+                try:
+                    post_attempt_readback = self.query_tip_status_all()
+                except PipetteCommandError as exc:
+                    post_attempt_error = exc.to_payload()
                 raise PipetteCommandError(
                     "Pipette eject did not receive an exact immediate acknowledgement.",
-                    details={"channel": channel, "result": result, "physical_effect_verified": False},
+                    details={
+                        "failed_channel": channel,
+                        "result": result,
+                        "sends": sends,
+                        "post_attempt_readback": post_attempt_readback,
+                        "post_attempt_readback_error": post_attempt_error,
+                        "physical_effect_verified": False,
+                    },
                 )
             sends.append({"channel": channel, "result": result})
         after = self.query_tip_status_all()

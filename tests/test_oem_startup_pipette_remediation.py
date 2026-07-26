@@ -52,6 +52,18 @@ def test_query_tip_status_all_requires_exact_hardware_readback():
     assert result["hardware_query_verified"] is True
 
 
+def test_query_tip_status_rejects_software_shadow_or_semantic_failure():
+    fixture = build_collection([[True], [False], [False], [False]])
+    fixture.drivers[0].query_tip_status = lambda: {
+        "ok": True,
+        "tip_loaded": True,
+        "semantic_ok": False,
+        "hardware_truth_level": "software_shadow",
+    }
+    with pytest.raises(PipetteCommandError, match="hardware tip-status"):
+        fixture.collection.query_tip_status_all()
+
+
 def test_startup_eject_targets_loaded_channels_and_verifies_empty():
     fixture = build_collection([[True, False], [False], [True, False], [False]])
     result = fixture.collection.eject_all_tips_for_oem_startup(
@@ -86,6 +98,25 @@ def test_startup_eject_requires_literal_operator_ack_without_transmit():
             expected_channels_with_tips=[0],
         )
     assert all(driver.commands == [] for driver in fixture.drivers)
+
+
+def test_partial_ejection_failure_reports_prior_mutations_and_fresh_post_attempt_readback():
+    fixture = build_collection(
+        [[True, False], [False], [True, True], [False]],
+        eject_ok_channel=2,
+    )
+    with pytest.raises(PipetteCommandError, match="immediate acknowledgement") as captured:
+        fixture.collection.eject_all_tips_for_oem_startup(
+            operator_ack="EJECT_STALE_STARTUP_TIPS",
+            expected_channels_with_tips=[0, 2],
+        )
+    details = captured.value.details
+    assert [row["channel"] for row in details["sends"]] == [0]
+    assert details["failed_channel"] == 2
+    assert details["post_attempt_readback"]["channels_with_tips"] == [2]
+    assert details["physical_effect_verified"] is False
+    assert fixture.drivers[0].commands == ["?31", "E1R", "?31"]
+    assert fixture.drivers[2].commands == ["?31", "E1R", "?31"]
 
 
 def test_startup_eject_fails_closed_on_missing_ack_or_nonempty_postcondition():

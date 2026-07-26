@@ -42,6 +42,9 @@ def current_registry_sha256() -> str:
 _ALLOWED_INPUTS = frozenset(
     {
         "ownership_generation",
+        "can_ready",
+        "enclosure_door_closed",
+        "latch_closed",
         "saved_status",
         "ship_mode",
         "start_mode",
@@ -92,125 +95,163 @@ def _stage(
     }
 
 
-def _base_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str]:
-    stages = [
-        _stage("initialize_environment", "BioXPMainWindow.cs:973-1027"),
-        _stage("enqueue_initialize_system", "BioXPMainWindow.cs:989-1003"),
-        _stage("worker_claim_initialize_system", "BioXPMainWindow.cs:2030-2100"),
-        _stage("initialize_system_reentry_guard", "BioXPMainWindow.cs:1046-1058"),
-    ]
-
-    if inputs["ship_mode"] == "PARK":
-        stages.append(
-            _stage(
-                "ship_mode_park_shutdown_ready",
-                "BioXPMainWindow.cs:1127-1134",
-                would_command_physical_motion=True,
-                branch="ship_mode_park",
-            )
-        )
-        return stages, "oem_movement_blocked_ship_mode_shutdown_ready"
-
-    stages.append(_stage("initialize_system_initial_check", "BioXPMainWindow.cs:1140-1144"))
-
-    if inputs["saved_status"] in {3, 4}:
-        stages.extend(
-            [
-                _stage(
-                    "saved_status_initialize_motion",
-                    "BioXPMainWindow.cs:1146-1148; ControlLib.cs:8797-8856",
-                    would_command_physical_motion=True,
-                    branch="saved_status_recovery",
-                ),
-                _stage(
-                    "saved_status_inspect_cover",
-                    "BioXPMainWindow.cs:1149; ControlLib.cs:3663-3768",
-                    would_command_physical_motion=True,
-                    branch="saved_status_recovery",
-                ),
-                _stage(
-                    "saved_status_unlock_warning_return",
-                    "BioXPMainWindow.cs:1146-1155",
-                    would_command_physical_motion=True,
-                    branch="saved_status_recovery",
-                ),
-            ]
-        )
-        return stages, "oem_movement_blocked_saved_status_recovery"
-
-    stages.extend(
-        [
-            _stage(
-                "configure_motors_without_motion",
-                "ClassControlInterface.initializeMotorsWithoutMotion:3181-3265",
-                would_command_hardware=True,
-            ),
-            _stage("initialize_motion_flags", "ControlLib.cs:8797-8804"),
-        ]
-    )
-    for number, movement in enumerate(OEM_INITIALIZE_MOTORS_STAGES, start=1):
-        movement_key = str(movement["key"])
-        stages.append(
-            _stage(
-                f"initialize_motors_m{number:02d}_{movement_key.replace('-', '_')}",
-                str(movement["source_anchor"]),
-                would_command_hardware=movement_key not in {"ui-zero-calibrated", "system-status-initialized"},
-                would_command_physical_motion=bool(movement.get("requires_operator_observation", True)),
-                movement_ledger_stage=movement_key,
-            )
-        )
-    stages.append(_stage("initialize_motion_tip_query", "ControlLib.cs:8806-8813", would_command_hardware=True))
-
-    if inputs["tip_present"] is True:
-        stages.extend(
-            [
-                _stage("tip_open_thermal_door", "ControlLib.cs:8814-8818", would_command_physical_motion=True, branch="stale_tip"),
-                _stage("tip_route_park_to_waste", "ControlLib.cs:8819-8825", would_command_physical_motion=True, branch="stale_tip"),
-                _stage("tip_eject_all", "ClassPipetteCollection.cs:1176-1323", would_command_physical_motion=True, branch="stale_tip"),
-                _stage("tip_move_z_80000", "ControlLib.cs:8835-8836", would_command_physical_motion=True, branch="stale_tip"),
-                _stage("tip_move_x_79000", "ControlLib.cs:8837-8838", would_command_physical_motion=True, branch="stale_tip"),
-                _stage("tip_verify_empty", "ControlLib.cs:8839-8845; ClassPipetteCollection.cs:1336-1358", branch="stale_tip"),
-                _stage("pipette_reinitialize_retry_once", "ControlLib.cs:8846-8856; ClassPipetteCollection.cs:677-748", branch="stale_tip"),
-            ]
-        )
-    else:
-        stages.append(_stage("initialize_motion_no_tip", "ControlLib.cs:8854-8856", branch="no_tip"))
-
-    stages.append(_stage("self_test_gate", "BioXPMainWindow.cs:1163-1171"))
-    if inputs["self_test_due"] is True:
-        stages.extend(
-            [
-                _stage("self_test_tc_rc_oc", "ControlLib.cs:10688-10999", would_command_physical_motion=True, branch="self_test_due"),
-                _stage("self_test_motion", "ControlLib.cs:10688-10785", would_command_physical_motion=True, branch="self_test_due"),
-            ]
-        )
-
-    stages.append(_stage("camera_gate", "BioXPMainWindow.cs:1172-1180"))
-    if inputs["camera_required"] is True:
-        stages.append(
-            _stage("camera_check", "ControlLib.cs:1929-1960", would_command_physical_motion=True, branch="camera_required")
-        )
-
-    if inputs["deck_inspection"] is True:
-        stages.append(
-            _stage("cover_inspection", "ControlLib.cs:3663-3768", would_command_physical_motion=True, branch="deck_inspection")
-        )
-
-    stages.append(_stage("gantry_park", "ControlLib.cs:7071-7122", would_command_physical_motion=True))
-
-    mode = str(inputs["start_mode"])
-    terminal_by_mode = {
-        "DevMode": ("start_mode_manual_ready", "oem_movement_ready_manual", "BioXPMainWindow.cs:1203-1212"),
-        "TradeShowMode": ("start_mode_trade_show_ready", "oem_movement_ready_trade_show", "BioXPMainWindow.cs:1213-1221"),
-        "WebMode": ("start_mode_web_job_admission", "oem_movement_ready_job_admission", "BioXPMainWindow.cs:1222-1295"),
-        "LocalMode": ("start_mode_local_job_admission", "oem_movement_ready_job_admission", "BioXPMainWindow.cs:1222-1295"),
-    }
+def _terminal_for_start_mode(mode: str) -> str:
     try:
-        terminal_stage, terminal_state, source = terminal_by_mode[mode]
+        return {
+            "DevMode": "oem_movement_ready_development",
+            "WebMode": "oem_movement_ready_job_admission",
+            "LocalMode": "oem_movement_ready_local_job_admission",
+            "TradeShowMode": "oem_movement_ready_trade_show",
+        }[mode]
     except KeyError as exc:
         raise OemFullLifecycleError(f"unsupported source StartMode {mode!r}") from exc
-    stages.append(_stage(terminal_stage, source, would_command_physical_motion=True, branch=mode))
-    return stages, terminal_state
+
+
+def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """Build the selected OEM path in literal constructor→environment→worker order."""
+    stages: list[dict[str, Any]] = []
+
+    def add(
+        stage_id: str,
+        anchor: str,
+        *,
+        hardware: bool = False,
+        motion: bool = False,
+        **evidence: Any,
+    ) -> None:
+        row = _stage(
+            stage_id,
+            anchor,
+            would_command_hardware=hardware,
+            would_command_physical_motion=motion,
+        )
+        row.update(evidence)
+        stages.append(row)
+
+    # ControlLib is constructed before BioXPMainWindow.initializeEnvironment().
+    add("construct_control_lib", "BioXPMainWindow:672-675")
+    add(
+        "constructor_pipette_initialize_and_status",
+        "ControlLib:963-983",
+        hardware=True,
+        execution_semantics="CAN_READY-conditional constructor work; group init/status precedes motor configuration",
+    )
+    if inputs["can_ready"] is True:
+        add("configure_motors_without_motion", "ControlLib:963-984;ClassControlInterface:3181-3265", hardware=True)
+    add("initialize_environment", "BioXPMainWindow:973-1026")
+
+    if inputs["can_ready"] is not True:
+        if inputs["start_mode"] == "DevMode":
+            add("can_unavailable_development_ready", "BioXPMainWindow:1005-1026")
+            return stages, "oem_ready_without_can_development"
+        add("can_unavailable_nonmanual_return", "BioXPMainWindow:1005-1010")
+        return stages, "oem_blocked_can_unavailable"
+
+    add(
+        "initialize_environment_initial_check",
+        "BioXPMainWindow:976-979;ControlLib:5652-5714",
+        hardware=True,
+        result_semantics="return_value_ignored_by_oem_caller",
+    )
+    door_closed = inputs["enclosure_door_closed"]
+    latch_closed = inputs["latch_closed"]
+    if door_closed is False and latch_closed is False:
+        add("admission_warning_enclosure_open", "BioXPMainWindow:979-982")
+        return stages, "oem_waiting_enclosure_open"
+    if door_closed is False and latch_closed is True:
+        add("admission_unlock_and_retry", "BioXPMainWindow:983-988", hardware=True)
+        return stages, "oem_waiting_door_close_retry"
+    if door_closed is not True or latch_closed is not True:
+        add("admission_unlock_ready_fallback", "BioXPMainWindow:998-1003", hardware=True)
+        return stages, "oem_ready_admission_fallback"
+
+    add("enqueue_initialize_system", "BioXPMainWindow:989-997")
+    add(
+        "worker_claim_initialize_system",
+        "BioXPMainWindow:2030-2051",
+        update_check_semantics="UpdateCheck true suppresses initializeSystem; outcome must be captured by the live worker",
+    )
+    add("initialize_system_reentry_guard", "BioXPMainWindow:1094-1100")
+    if inputs["ship_mode"] == "PARK":
+        add("ship_mode_door_open", "BioXPMainWindow:1127-1133", hardware=True)
+        add("ship_mode_shutdown_handoff", "BioXPMainWindow:1127-1133")
+        return stages, "oem_shipping_poweroff_required"
+
+    add(
+        "initialize_system_initial_check",
+        "BioXPMainWindow:1140-1144;ControlLib:5652-5714",
+        hardware=True,
+        result_semantics="return_value_ignored_by_oem_caller",
+    )
+    if inputs["saved_status"] in {3, 4}:
+        add("saved_status_initialize_motion", "BioXPMainWindow:1144-1150", hardware=True, motion=True)
+        add("saved_status_inspect_cover", "BioXPMainWindow:1144-1150", hardware=True, motion=True)
+        add("saved_status_unlock_warning_return", "BioXPMainWindow:1152-1156", hardware=True)
+        return stages, "oem_movement_blocked_saved_status_recovery"
+
+    add("initialize_motion_flags", "ControlLib:4363-4377")
+    for number, source_stage in enumerate(OEM_INITIALIZE_MOTORS_STAGES, start=1):
+        add(
+            f"initialize_motors_m{number:02d}_{source_stage['key'].replace('-', '_')}",
+            source_stage["source_anchor"],
+            hardware=True,
+            motion=True,
+            source_stage_key=source_stage["key"],
+        )
+    add("initialize_motion_tip_query", "ControlLib:4377-4382", hardware=True)
+    if inputs["tip_present"]:
+        for stage_id, anchor, motion in (
+            ("tip_open_thermal_door", "ControlLib:4379-4385", False),
+            ("tip_route_park_to_waste", "ControlLib:4385-4393", True),
+            ("tip_eject_all", "ControlLib:4385-4393", False),
+            ("tip_move_z_80000", "ControlLib:4393-4397", True),
+            ("tip_move_x_79000", "ControlLib:4393-4397", True),
+            ("tip_verify_empty", "ControlLib:4398-4402", False),
+            ("pipette_reinitialize_retry_once", "ClassPipetteCollection:907-928", False),
+        ):
+            add(stage_id, anchor, hardware=True, motion=motion)
+    else:
+        add("initialize_motion_no_tip", "ControlLib:4377-4382")
+
+    add("self_test_gate", "BioXPMainWindow:1163-1171")
+    if inputs["self_test_due"]:
+        add(
+            "self_test_launch_tc_rc_oc",
+            "ControlLib:10688-10712",
+            hardware=True,
+            execution_semantics="three ThreadPool thermal/chiller branches launched before motion self-test",
+            parallel_branches=["TC", "RC", "OC"],
+        )
+        add(
+            "self_test_motion_while_thermal_running",
+            "ControlLib:10713-10761",
+            hardware=True,
+            motion=True,
+            execution_semantics="motion self-test overlaps TC/RC/OC branches",
+        )
+        add(
+            "self_test_join_and_reset_chillers",
+            "ControlLib:10762-10785",
+            hardware=True,
+            join_timeout_ms=100000,
+            cleanup="setChillerPWM",
+        )
+
+    add("camera_gate", "BioXPMainWindow:1172-1181")
+    if inputs["camera_required"]:
+        add("camera_check", "BioXPMainWindow:1172-1181;ControlLib:5788-5863", hardware=True, motion=True)
+
+    # inspectCover always calls ForceToHighHome before its DeckInspection early return.
+    add("cover_force_high_home", "ControlLib:3663-3677", hardware=True, motion=True)
+    if inputs["deck_inspection"]:
+        add("cover_inspection", "BioXPMainWindow:1182-1203;ControlLib:3663-3768", hardware=True, motion=True)
+    else:
+        add("cover_inspection_disabled_return_ok", "ControlLib:3672-3677")
+    add("gantry_park", "BioXPMainWindow:1203-1204;ControlLib:7361-7392", hardware=True, motion=True)
+
+    terminal = _terminal_for_start_mode(inputs["start_mode"])
+    add(f"start_mode_{inputs['start_mode'].lower()}_terminal", "BioXPMainWindow:1204-1307")
+    return stages, terminal
 
 
 class OemFullLifecycleRuns:
@@ -236,8 +277,8 @@ class OemFullLifecycleRuns:
         if request.get("mode") != "dry_run":
             raise OemFullLifecycleError("full lifecycle physical execution is blocked until commissioned providers are bound")
         key = request.get("idempotency_key")
-        if not isinstance(key, str) or not key.strip():
-            raise OemFullLifecycleError("nonblank idempotency_key required")
+        if not isinstance(key, str) or not key.strip() or len(key.strip()) > 128:
+            raise OemFullLifecycleError("nonblank idempotency_key of at most 128 characters required")
         inputs = request.get("inputs")
         if not isinstance(inputs, Mapping):
             raise OemFullLifecycleError("typed lifecycle inputs required")
@@ -251,23 +292,26 @@ class OemFullLifecycleRuns:
             raise OemFullLifecycleError("ownership_generation must be a nonnegative integer")
         if type(inputs["saved_status"]) is not int:
             raise OemFullLifecycleError("saved_status must be an integer")
-        if not isinstance(inputs["ship_mode"], str):
-            raise OemFullLifecycleError("ship_mode must be a string")
-        if not isinstance(inputs["start_mode"], str):
-            raise OemFullLifecycleError("start_mode must be a string")
-        for field in ("tip_present", "self_test_due", "camera_required", "deck_inspection"):
+        if inputs["ship_mode"] not in {"", "PARK"}:
+            raise OemFullLifecycleError("ship_mode must be the exact OEM value '' or 'PARK'")
+        if inputs["start_mode"] not in {"DevMode", "WebMode", "LocalMode", "TradeShowMode"}:
+            raise OemFullLifecycleError("start_mode must be an exact OEM OperationMode name")
+        for field in (
+            "can_ready",
+            "enclosure_door_closed",
+            "latch_closed",
+            "tip_present",
+            "self_test_due",
+            "camera_required",
+            "deck_inspection",
+        ):
             if type(inputs[field]) is not bool:
                 raise OemFullLifecycleError(f"{field} must be an exact boolean")
         return {**dict(request), "idempotency_key": key.strip(), "inputs": dict(inputs)}
 
     def create(self, request: Mapping[str, Any]) -> dict[str, Any]:
         req = self._validate_request(request)
-        for existing in self.store.list_oem_full_lifecycle_runs():
-            if existing.get("idempotency_key") == req["idempotency_key"]:
-                if existing.get("request") != req:
-                    raise OemFullLifecycleError("idempotency_key is already bound to a different request")
-                return existing
-        stages, planned_terminal = _base_plan(req["inputs"])
+        stages, planned_terminal = _source_parity_plan(req["inputs"])
         run_id = new_id("oem_move")
         now = utc_ts()
         payload = {
@@ -300,10 +344,16 @@ class OemFullLifecycleRuns:
             "created_at": now,
             "updated_at": now,
         }
-        return self.store.write_oem_full_lifecycle_run(payload)
+        try:
+            return self.store.create_oem_full_lifecycle_run_once(payload)
+        except ValueError as exc:
+            raise OemFullLifecycleError(str(exc)) from exc
 
     def get(self, run_id: str) -> dict[str, Any]:
-        payload = self.store.read_oem_full_lifecycle_run(run_id)
+        try:
+            payload = self.store.read_oem_full_lifecycle_run(run_id)
+        except ValueError as exc:
+            raise OemFullLifecycleError(str(exc)) from exc
         if payload is None:
             raise OemFullLifecycleError(f"full OEM lifecycle run {run_id!r} not found")
         return payload
@@ -337,6 +387,14 @@ class OemFullLifecycleRuns:
         payload["terminal_state"] = payload["planned_terminal_state"]
         payload["updated_at"] = utc_ts()
         return self.store.write_oem_full_lifecycle_run(payload)
+
+    def recover_all(self) -> list[dict[str, Any]]:
+        recovered: list[dict[str, Any]] = []
+        for payload in self.store.list_oem_full_lifecycle_runs():
+            run_id = payload.get("run_id")
+            if isinstance(run_id, str):
+                recovered.append(self.recover(run_id))
+        return recovered
 
     def recover(self, run_id: str) -> dict[str, Any]:
         payload = self.get(run_id)

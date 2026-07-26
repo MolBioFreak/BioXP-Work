@@ -1,0 +1,219 @@
+"""Acceptance contracts for OEM CheckCamera and CVision startup operations."""
+from __future__ import annotations
+
+from typing import Any
+
+
+class OemVisionReceiptError(ValueError):
+    pass
+
+
+CHECK_CAMERA_SOURCE_ANCHOR = "ControlLib.CheckCamera:1929-1960"
+
+
+def _exact_bool(value: Any, name: str) -> bool:
+    if type(value) is not bool:
+        raise OemVisionReceiptError(f"{name} must be an exact bool")
+    return value
+
+
+def _mapping(value: Any, name: str, keys: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OemVisionReceiptError(f"{name} must be an object")
+    missing = sorted(keys - set(value))
+    extra = sorted(set(value) - keys)
+    if missing:
+        raise OemVisionReceiptError(f"{name} missing fields: {missing}")
+    if extra:
+        raise OemVisionReceiptError(f"{name} has unexpected fields: {extra}")
+    return value
+
+
+def _validate_attempt(attempt: Any, *, index: int, expected_offset_x: int) -> tuple[bool, bool]:
+    row = _mapping(
+        attempt,
+        f"attempts[{index}]",
+        {"location_id", "offset_x", "offset_y", "check_label", "failure_snapshot_written"},
+    )
+    if type(row["location_id"]) is not int or row["location_id"] != 23:
+        raise OemVisionReceiptError(f"attempts[{index}].location_id must be exact OEM location 23")
+    if type(row["offset_x"]) is not int or type(row["offset_y"]) is not int:
+        raise OemVisionReceiptError(f"attempts[{index}] offsets must be exact integers")
+    if row["offset_x"] != expected_offset_x or row["offset_y"] != 0:
+        ordinal = "first" if index == 0 else "second"
+        raise OemVisionReceiptError(f"{ordinal} camera attempt does not match the OEM offset")
+    detected = _exact_bool(row["check_label"], f"attempts[{index}].check_label")
+    snapshot = _exact_bool(row["failure_snapshot_written"], f"attempts[{index}].failure_snapshot_written")
+    if detected and snapshot:
+        raise OemVisionReceiptError(f"attempts[{index}] cannot write a failure snapshot after success")
+    if not detected and not snapshot:
+        raise OemVisionReceiptError(f"attempts[{index}] must persist the OEM failure snapshot")
+    return detected, snapshot
+
+
+def evaluate_check_camera_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    row = _mapping(
+        receipt,
+        "receipt",
+        {
+            "camera_owner",
+            "settings_item",
+            "led_white_acknowledged",
+            "door_closed_verified",
+            "attempts",
+            "location_23_persisted",
+            "all_leds_off_acknowledged",
+            "gantry_park_verified",
+            "camera_session_released",
+        },
+    )
+    if row["camera_owner"] != "oem_full_lifecycle":
+        raise OemVisionReceiptError("camera_owner must be the robot-owned full lifecycle")
+    if type(row["settings_item"]) is not int or row["settings_item"] != 4:
+        raise OemVisionReceiptError("settings_item must be OEM InspectionItems value 4")
+    led_white = _exact_bool(row["led_white_acknowledged"], "led_white_acknowledged")
+    door_closed = _exact_bool(row["door_closed_verified"], "door_closed_verified")
+    attempts = row["attempts"]
+    if not isinstance(attempts, list) or len(attempts) not in {1, 2}:
+        raise OemVisionReceiptError("attempts must contain one or two OEM camera attempts")
+    first_detected, _ = _validate_attempt(attempts[0], index=0, expected_offset_x=4738)
+    if first_detected and len(attempts) != 1:
+        raise OemVisionReceiptError("CheckCamera must stop after first success")
+    if not first_detected and len(attempts) != 2:
+        raise OemVisionReceiptError("CheckCamera requires the exact second attempt after first failure")
+    second_detected = False
+    if len(attempts) == 2:
+        second_detected, _ = _validate_attempt(attempts[1], index=1, expected_offset_x=1895)
+
+    cleanup_failures: list[str] = []
+    for field, failure in (
+        ("location_23_persisted", "location_23_not_persisted"),
+        ("all_leds_off_acknowledged", "all_leds_off_not_verified"),
+        ("gantry_park_verified", "gantry_park_not_verified"),
+        ("camera_session_released", "camera_session_not_released"),
+    ):
+        if not _exact_bool(row[field], field):
+            cleanup_failures.append(failure)
+    if not led_white:
+        cleanup_failures.append("white_led_not_verified")
+    if not door_closed:
+        cleanup_failures.append("door_closed_not_verified")
+    label_detected = first_detected or second_detected
+    failure = None if label_detected else "camera_label_not_detected"
+    ok = bool(label_detected and not cleanup_failures)
+    return {
+        "ok": ok,
+        "production_admission_pass": ok,
+        "physical_effect_verified": ok,
+        "label_detected": label_detected,
+        "attempt_count": len(attempts),
+        "failure": failure,
+        "cleanup_verified": not cleanup_failures,
+        "cleanup_failures": cleanup_failures,
+        "source_anchor": CHECK_CAMERA_SOURCE_ANCHOR,
+        "exact_attempt_offsets_x": [4738, 1895],
+    }
+
+
+INSPECT_COVER_SOURCE_ANCHOR = "ControlLib.inspectCover:3663-3768"
+
+
+def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    row = _mapping(
+        receipt,
+        "receipt",
+        {
+            "deck_inspection",
+            "screen_resolution_high",
+            "inspection_methods",
+            "cover_detected",
+            "relocations",
+            "final_cover_locations",
+            "door_open_verified",
+            "all_leds_off_acknowledged",
+            "camera_session_released",
+            "inspection_log_only",
+        },
+    )
+    enabled = _exact_bool(row["deck_inspection"], "deck_inspection")
+    inspection_log_only = _exact_bool(row["inspection_log_only"], "inspection_log_only")
+    if not enabled:
+        if row["inspection_methods"] != {} or row["cover_detected"] != {} or row["relocations"] != []:
+            raise OemVisionReceiptError("disabled deck inspection must not contain camera or movement evidence")
+        if row["final_cover_locations"] is not None:
+            raise OemVisionReceiptError("disabled deck inspection cannot claim final cover locations")
+        _exact_bool(row["door_open_verified"], "door_open_verified")
+        _exact_bool(row["all_leds_off_acknowledged"], "all_leds_off_acknowledged")
+        _exact_bool(row["camera_session_released"], "camera_session_released")
+        return {
+            "ok": True,
+            "outcome": "deck_inspection_disabled",
+            "production_admission_pass": True,
+            "physical_effect_verified": False,
+            "source_anchor": INSPECT_COVER_SOURCE_ANCHOR,
+        }
+
+    high_resolution = _exact_bool(row["screen_resolution_high"], "screen_resolution_high")
+    expected_methods = (
+        {"17": "InspectOutputLocation(1)", "19": "checkRCCover", "20": "checkCoverStorage", "18": "checkCoverStorage"}
+        if high_resolution
+        else {"17": "checkChillerCover", "19": "checkChillerCover", "20": "checkChillerCover", "18": "checkChillerCover"}
+    )
+    if row["inspection_methods"] != expected_methods:
+        raise OemVisionReceiptError("inspection_methods do not match the selected OEM resolution branch")
+    detected = _mapping(row["cover_detected"], "cover_detected", {"17", "19", "20", "18"})
+    detected_bool = {int(location): _exact_bool(value, f"cover_detected.{location}") for location, value in detected.items()}
+    cover_count = sum(1 for value in detected_bool.values() if value)
+
+    found_chillers = [location for location in (17, 19) if detected_bool[location]]
+    empty_storage = [location for location in (20, 18) if not detected_bool[location]]
+    expected_relocations: list[dict[str, Any]] = []
+    if cover_count == 2:
+        if len(found_chillers) != len(empty_storage):
+            raise OemVisionReceiptError("cover topology cannot be paired by the OEM source order")
+        for source, destination in zip(found_chillers, empty_storage):
+            expected_relocations.append(
+                {"cover": "reagent" if source == 19 else "output", "from": source, "to": destination}
+            )
+    if row["relocations"] != expected_relocations:
+        raise OemVisionReceiptError("relocations do not match the exact OEM detected/empty list order")
+
+    led_cleanup = _exact_bool(row["all_leds_off_acknowledged"], "all_leds_off_acknowledged")
+    session_released = _exact_bool(row["camera_session_released"], "camera_session_released")
+    door_open = _exact_bool(row["door_open_verified"], "door_open_verified")
+    cleanup_failures: list[str] = []
+    if not led_cleanup:
+        cleanup_failures.append("all_leds_off_not_verified")
+    if not session_released:
+        cleanup_failures.append("camera_session_not_released")
+
+    error_status: str | None = None
+    if cover_count < 2:
+        error_status = "SHORT_CHILLER_COVER"
+    elif cover_count > 2:
+        error_status = "OVER_CHILLER_COVER"
+    if cover_count == 2:
+        if row["final_cover_locations"] != {"output": 18, "reagent": 20}:
+            raise OemVisionReceiptError("final_cover_locations must be output=18 and reagent=20")
+        if not door_open:
+            cleanup_failures.append("door_open_not_verified")
+    else:
+        if row["final_cover_locations"] is not None:
+            raise OemVisionReceiptError("failed cover count cannot claim final cover locations")
+        if door_open:
+            raise OemVisionReceiptError("failed cover count cannot claim the successful door-open terminal")
+
+    production_pass = bool(error_status is None and not cleanup_failures)
+    oem_effective_pass = production_pass or bool(inspection_log_only and error_status is not None and not cleanup_failures)
+    return {
+        "ok": production_pass,
+        "outcome": "covers_canonicalized" if production_pass else "cover_inspection_failed",
+        "production_admission_pass": production_pass,
+        "oem_effective_pass": oem_effective_pass,
+        "physical_effect_verified": production_pass,
+        "cover_count": cover_count,
+        "error_status": error_status,
+        "expected_relocations": expected_relocations,
+        "cleanup_failures": cleanup_failures,
+        "source_anchor": INSPECT_COVER_SOURCE_ANCHOR,
+    }

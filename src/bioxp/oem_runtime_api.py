@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hmac
 import os
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .oem_full_lifecycle import OemFullLifecycleError, OemFullLifecycleRuns
+from .oem_full_lifecycle import OemFullLifecycleError, OemFullLifecycleRuns, current_registry_sha256
 from .oem_runtime_commands import OEMRuntimeCommandHandlers
 from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
@@ -31,7 +33,7 @@ class FullLifecycleCreateRequest(BaseModel):
     operator_ack: str
     expected_machine_serial: int
     expected_registry_sha256: str
-    idempotency_key: str
+    idempotency_key: str = Field(min_length=1, max_length=128)
     mode: str = "dry_run"
 
 
@@ -70,10 +72,11 @@ def configure_runtime(*, startup_program_factory=None, store_root: str | None = 
         store=_store,
     )
     from .oem_runtime_worker import OEMRuntimeWorker
+    _full_lifecycle_runs = OemFullLifecycleRuns(_store)
+    _full_lifecycle_runs.recover_all()
     _worker = OEMRuntimeWorker(store=_store, handlers=handlers.handlers(), autostart=autostart)
     _events = OEMRuntimeEventRouter(store=_store, worker=_worker)
     _status = OEMRuntimeStatusService(store=_store, worker=_worker)
-    _full_lifecycle_runs = OemFullLifecycleRuns(_store)
     return {"store": _store, "worker": _worker, "events": _events, "status": _status, "full_lifecycle_runs": _full_lifecycle_runs}
 
 
@@ -153,7 +156,17 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     self_test_due = machine.get("self_test_due")
     saved_status = machine.get("saved_status")
     ship_mode = machine.get("ship_mode")
-    for field, value in (("tip_loaded", tip_present), ("self_test_due", self_test_due)):
+    hardware = status.get("hardware")
+    can_ready = hardware.get("can_ready") if isinstance(hardware, dict) else None
+    enclosure_door_closed = machine.get("enclosure_door_closed")
+    latch_closed = machine.get("latch_closed")
+    for field, value in (
+        ("can_ready", can_ready),
+        ("enclosure_door_closed", enclosure_door_closed),
+        ("latch_closed", latch_closed),
+        ("tip_loaded", tip_present),
+        ("self_test_due", self_test_due),
+    ):
         if type(value) is not bool:
             raise OemFullLifecycleError(f"robot-owned {field} must be an exact boolean")
     if type(saved_status) is not int:
@@ -170,6 +183,9 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
         raise OemFullLifecycleError("selected DeckInspection value must be an exact boolean")
     return {
         "ownership_generation": int(hardware_state.ownership_epoch),
+        "can_ready": can_ready,
+        "enclosure_door_closed": enclosure_door_closed,
+        "latch_closed": latch_closed,
         "saved_status": saved_status,
         "ship_mode": ship_mode,
         "start_mode": snapshot.startup_mode,
@@ -180,6 +196,24 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     }
 
 
+def _require_lifecycle_mutation_auth(
+    supplied_token: str | None = Header(default=None, alias="X-BioXP-OEM-Token"),
+) -> None:
+    token_path_raw = os.environ.get("BIOXP_OEM_RUNTIME_TOKEN_FILE", "").strip()
+    if not token_path_raw:
+        raise HTTPException(status_code=503, detail="OEM lifecycle mutation authorization is not configured")
+    token_path = Path(token_path_raw)
+    try:
+        stat = token_path.stat()
+        expected = token_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="OEM lifecycle mutation authorization is unavailable") from exc
+    if not token_path.is_file() or stat.st_mode & 0o077 or len(expected) < 32:
+        raise HTTPException(status_code=503, detail="OEM lifecycle mutation authorization is unsafe")
+    if supplied_token is None or not hmac.compare_digest(supplied_token, expected):
+        raise HTTPException(status_code=403, detail="OEM lifecycle mutation authorization failed")
+
+
 def _require_full_lifecycle_runs() -> OemFullLifecycleRuns:
     global _full_lifecycle_runs
     if _full_lifecycle_runs is None:
@@ -188,12 +222,53 @@ def _require_full_lifecycle_runs() -> OemFullLifecycleRuns:
     return _full_lifecycle_runs
 
 
-@router.post("/movement-runs")
-def create_full_lifecycle_run(req: FullLifecycleCreateRequest):
+def _full_lifecycle_plan_blockers() -> list[str]:
+    try:
+        _derive_full_lifecycle_inputs()
+    except OemFullLifecycleError as exc:
+        return [str(exc)]
+    return []
+
+
+@router.get("/movement-runs/contract")
+def full_lifecycle_contract():
+    plan_blockers = _full_lifecycle_plan_blockers()
+    return {
+        "schema_version": "bioxp.oem_full_lifecycle_contract.v1",
+        "command": "initialize_oem_movement_lifecycle",
+        "machine_serial": 206,
+        "registry_sha256": current_registry_sha256(),
+        "plan_available": not plan_blockers,
+        "plan_blockers": plan_blockers,
+        "live_creation_enabled": False,
+        "physical_commissioning_complete": False,
+        "providers": {
+            "initial_check": {"source_contract": True, "implemented": True, "live_bound": True, "commissioned": False},
+            "configure_motors_without_motion": {"source_contract": True, "implemented": True, "live_bound": True, "commissioned": False},
+            "initialize_motors_m01_m19": {"source_contract": True, "implemented": True, "live_bound": True, "commissioned": False},
+            "pipette_tip_query_and_remediation": {"source_contract": True, "implemented": True, "live_bound": False, "commissioned": False},
+            "tc_rc_oc_motion_self_test": {"source_contract": True, "implemented": "receipt_evaluator", "live_bound": False, "commissioned": False},
+            "check_camera": {"source_contract": True, "implemented": "receipt_evaluator", "live_bound": False, "commissioned": False},
+            "inspect_cover": {"source_contract": True, "implemented": "receipt_evaluator", "live_bound": False, "commissioned": False},
+            "park_gantry": {"source_contract": True, "implemented": "receipt_evaluator", "live_bound": False, "commissioned": False},
+            "start_mode_terminal": {"source_contract": True, "implemented": "typed_plan", "live_bound": False, "commissioned": False},
+            "shutdown_camera_disposal": {"source_contract": True, "implemented": False, "live_bound": False, "commissioned": False},
+        },
+        "safety_boundary": {
+            "caller_supplied_motion_parameters": False,
+            "dry_run_commands_hardware": False,
+            "queue_acceptance_is_execution": False,
+            "physical_effect_verified": False,
+        },
+    }
+
+
+@router.post("/movement-runs", dependencies=[Depends(_require_lifecycle_mutation_auth)])
+def create_full_lifecycle_run(request: FullLifecycleCreateRequest):
     runs = _require_full_lifecycle_runs()
     try:
         inputs = _derive_full_lifecycle_inputs()
-        return runs.create({**req.model_dump(), "inputs": inputs})
+        return runs.create({**request.model_dump(), "inputs": inputs})
     except OemFullLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -214,7 +289,7 @@ def get_full_lifecycle_ledger(run_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/movement-runs/{run_id}/cancel")
+@router.post("/movement-runs/{run_id}/cancel", dependencies=[Depends(_require_lifecycle_mutation_auth)])
 def cancel_full_lifecycle_run(run_id: str):
     try:
         return _require_full_lifecycle_runs().cancel(run_id)
