@@ -5090,6 +5090,15 @@ def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) 
             reason="OEM startup_step gripper-clear",
             timeout_s=timeout_s,
         )
+    elif step == "gripper-commission-home":
+        result = gripper_commission_home(
+            tester,
+            operator_ack="GRIPPER_COMMISSION_HOME",
+            reason="OEM startup_step gripper-commission-home",
+            timeout_s=timeout_s,
+        )
+        if not (isinstance(result, dict) and result.get("ok") is True):
+            raise HTTPException(status_code=409, detail=f"OEM gripper commission/home failed: {result}")
     elif step == "gripper-home":
         result = gripper_home(
             tester,

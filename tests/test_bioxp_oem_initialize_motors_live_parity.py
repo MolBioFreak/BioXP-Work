@@ -154,6 +154,38 @@ def test_stepwise_gripper_source_stages_are_one_cleanup_safe_operator_transactio
     assert gripper["required_terminal_idle_current"] == {"run": 10, "standby": 10}
 
 
+def test_semantic_gripper_commission_step_dispatches_as_one_transaction(monkeypatch):
+    from src.bioxp import api
+
+    calls = []
+
+    def fake_commission(tester, *, operator_ack, reason, timeout_s):
+        calls.append((tester, operator_ack, reason, timeout_s))
+        return {"ok": True, "idle_current_restored": True}
+
+    class Tester:
+        def motion_arm_state(self):
+            return {"armed": True}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=False):
+            return {"ok": expect_reply is True}
+
+        def motor_prepare_motion_interlock(self, force_lock=False):
+            return {"ok": force_lock is True}
+
+    tester = Tester()
+    monkeypatch.setattr(api, "gripper_commission_home", fake_commission)
+    result = api._execute_oem_startup_step(cast(api.BioXpTester, tester), "gripper-commission-home", 12.0)
+
+    assert result["ok"] is True
+    assert result["step"] == "gripper-commission-home"
+    assert result["result"]["idle_current_restored"] is True
+    assert calls == [(tester, "GRIPPER_COMMISSION_HOME", "OEM startup_step gripper-commission-home", 12.0)]
+
+
 def test_terminal_ui_zero_is_only_a_calibrated_source_branch_and_never_a_durable_claim():
     class Tester(_FakeTester):
         def _machine_config_bundle(self):
