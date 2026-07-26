@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .oem_machine_bundle import (
     OEM_ACQUISITION_ID,
@@ -445,6 +445,7 @@ class OemFullLifecycleRuns:
         request: Mapping[str, Any],
         *,
         machine_configuration_verified: bool = False,
+        current_ownership_generation: Callable[[], int] | None = None,
     ) -> dict[str, Any]:
         if type(machine_configuration_verified) is not bool:
             raise OemFullLifecycleError("machine configuration verification must be an exact internal boolean")
@@ -496,7 +497,10 @@ class OemFullLifecycleRuns:
                 "live_execution_blocked": True,
             }]
         try:
-            return self.store.create_oem_full_lifecycle_run_once(payload)
+            return self.store.create_oem_full_lifecycle_run_once(
+                payload,
+                current_ownership_generation=current_ownership_generation,
+            )
         except ValueError as exc:
             raise OemFullLifecycleError(str(exc)) from exc
 
@@ -568,7 +572,13 @@ class OemFullLifecycleRuns:
             return self.store.write_oem_full_lifecycle_run(payload)
         return payload
 
-    def cancel(self, run_id: str, expected: Mapping[str, Any]) -> dict[str, Any]:
+    def cancel(
+        self,
+        run_id: str,
+        expected: Mapping[str, Any],
+        *,
+        current_ownership_generation: Callable[[], int] | None = None,
+    ) -> dict[str, Any]:
         def mutation(payload: dict[str, Any]) -> dict[str, Any]:
             request = payload.get("request")
             authority = current_authority_identity()
@@ -587,6 +597,41 @@ class OemFullLifecycleRuns:
                 raise OemFullLifecycleError("cancel registry authority is no longer current")
             if expected.get("expected_evidence_lock_sha256") != authority["evidence_lock_sha256"]:
                 raise OemFullLifecycleError("cancel evidence-lock authority is no longer current")
+            if current_ownership_generation is not None and expected.get("expected_generation") != current_ownership_generation():
+                raise OemFullLifecycleError("cancel robot ownership generation is no longer current")
+            inputs = request.get("inputs")
+            if not isinstance(inputs, Mapping):
+                raise OemFullLifecycleError("persisted lifecycle inputs are malformed")
+            if (
+                payload.get("registry_sha256") != expected.get("expected_registry_sha256")
+                or payload.get("evidence_lock_sha256") != expected.get("expected_evidence_lock_sha256")
+                or payload.get("ownership_generation") != expected.get("expected_generation")
+                or inputs.get("ownership_generation") != expected.get("expected_generation")
+                or payload.get("evidence_lock_verified") is not True
+                or payload.get("evidence_lock_identity_verified") is not True
+                or payload.get("source_registry_identity_verified") is not True
+                or payload.get("source_authority_verified") is not False
+                or payload.get("configuration_verified") is not False
+                or payload.get("transport_owner_verified") is not False
+                or payload.get("controller_acknowledged") is not False
+                or payload.get("postcondition_verified") is not False
+                or payload.get("physical_motion_commanded") is not False
+                or payload.get("physical_effect_verified") is not False
+                or payload.get("transport_frames") != []
+                or payload.get("terminal_state") is not None
+            ):
+                raise OemFullLifecycleError("persisted lifecycle authority or no-effect evidence is contradictory")
+            stages = payload.get("stages")
+            if not isinstance(stages, list) or any(
+                not isinstance(stage, Mapping)
+                or stage.get("status") != "pending"
+                or stage.get("physical_motion_commanded") is not False
+                or stage.get("controller_acknowledged") is not False
+                or stage.get("postcondition_verified") is not False
+                or stage.get("physical_effect_verified") is not False
+                for stage in stages
+            ):
+                raise OemFullLifecycleError("persisted lifecycle stage evidence is contradictory")
             if payload["run_state"] != "planned" or payload.get("current_stage") is not None:
                 raise OemFullLifecycleError("run is not at a safe cancellation boundary")
             payload.update({

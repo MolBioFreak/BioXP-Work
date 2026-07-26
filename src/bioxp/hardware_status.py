@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from contextlib import contextmanager
 import time
 import uuid
 from dataclasses import dataclass
@@ -68,6 +69,12 @@ class HardwareStateOwner:
     def ownership_epoch(self) -> int:
         with self._lock:
             return self._epoch
+
+    @contextmanager
+    def ownership_lease(self):
+        """Hold the ownership epoch stable across an authority-bearing mutation."""
+        with self._lock:
+            yield self
 
     def ownership_projection(self) -> dict[str, Any]:
         with self._lock:

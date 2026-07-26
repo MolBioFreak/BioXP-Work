@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from threading import Event, Thread
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.bioxp import oem_runtime_api
-from src.bioxp.oem_full_lifecycle import current_authority_identity, current_registry_sha256
+from src.bioxp.hardware_status import HardwareStateOwner
+from src.bioxp.oem_full_lifecycle import (
+    OemFullLifecycleError,
+    OemFullLifecycleRuns,
+    current_authority_identity,
+    current_registry_sha256,
+)
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
 
 
 def _robot_inputs():
@@ -34,12 +44,17 @@ TEST_MUTATION_TOKEN = "test-only-lifecycle-token-0000000000000000"
 
 
 def _client(tmp_path, monkeypatch):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     token_path = tmp_path / "lifecycle.token"
     token_path.write_text(TEST_MUTATION_TOKEN, encoding="utf-8")
     token_path.chmod(0o600)
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_TOKEN_FILE", str(token_path))
     oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
     monkeypatch.setattr(oem_runtime_api, "_derive_full_lifecycle_inputs", _robot_inputs)
+    owner = HardwareStateOwner()
+    with owner.ownership_lease():
+        owner._epoch = 7
+    monkeypatch.setattr(oem_runtime_api, "hardware_state", owner)
     app = FastAPI()
     app.include_router(oem_runtime_api.router)
     client = TestClient(app)
@@ -211,3 +226,65 @@ def test_cancel_rejects_mismatched_admission_generation_or_authority(tmp_path, m
     assert client.post(route, json=_cancel_request(expected_registry_sha256="9" * 64)).status_code == 409
     assert client.post(route, json=_cancel_request(expected_evidence_lock_sha256="8" * 64)).status_code == 409
     assert client.get(f"/oem/runtime/movement-runs/{created['run_id']}").json()["run_state"] == "planned"
+
+
+def test_ownership_transition_cannot_interleave_with_durable_reservation(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    runs = oem_runtime_api._require_full_lifecycle_runs()
+    original = runs.store.create_oem_full_lifecycle_run_once
+    transition_started = Event()
+    transition_done = Event()
+    threads = []
+
+    def wrapped(*args, **kwargs):
+        def transition():
+            transition_started.set()
+            oem_runtime_api.hardware_state.change_ownership(reason="reviewer-race")
+            transition_done.set()
+
+        thread = Thread(target=transition)
+        threads.append(thread)
+        thread.start()
+        assert transition_started.wait(1)
+        assert not transition_done.wait(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runs.store, "create_oem_full_lifecycle_run_once", wrapped)
+    response = client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="atomic-owner"))
+    assert response.status_code == 200
+    for thread in threads:
+        thread.join(1)
+    assert transition_done.is_set()
+    assert response.json()["ownership_generation"] == 7
+    assert oem_runtime_api.hardware_state.ownership_epoch == 8
+
+
+def test_create_and_cancel_reject_current_robot_ownership_change(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    runs = oem_runtime_api._require_full_lifecycle_runs()
+    original = runs.store.create_oem_full_lifecycle_run_once
+
+    def advance_before_reservation(*args, **kwargs):
+        oem_runtime_api.hardware_state.change_ownership(reason="reentrant-reviewer-race")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runs.store, "create_oem_full_lifecycle_run_once", advance_before_reservation)
+    assert client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="stale-create")).status_code == 409
+
+    client = _client(tmp_path / "cancel", monkeypatch)
+    created = client.post("/oem/runtime/movement-runs", json=_request(idempotency_key="stale-cancel")).json()
+    oem_runtime_api.hardware_state.change_ownership(reason="stale-before-cancel")
+    response = client.post(f"/oem/runtime/movement-runs/{created['run_id']}/cancel", json=_cancel_request())
+    assert response.status_code == 409
+
+
+def test_cancel_rejects_persisted_stage_corruption(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    request = _request(idempotency_key="persisted-corruption")
+    request["inputs"] = _robot_inputs()
+    created = runs.create(request)
+    payload = runs.get(created["run_id"])
+    payload["stages"][0]["status"] = "completed"
+    runs.store.write_oem_full_lifecycle_run(payload)
+    with pytest.raises(OemFullLifecycleError, match="stage evidence"):
+        runs.cancel(created["run_id"], _cancel_request())

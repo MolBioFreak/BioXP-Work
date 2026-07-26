@@ -79,7 +79,12 @@ class OEMRuntimeStore:
             return None
         return json.loads(path.read_text())
 
-    def create_oem_full_lifecycle_run_once(self, run: dict[str, Any]) -> dict[str, Any]:
+    def create_oem_full_lifecycle_run_once(
+        self,
+        run: dict[str, Any],
+        *,
+        current_ownership_generation: Callable[[], int] | None = None,
+    ) -> dict[str, Any]:
         """Atomically converge same-key creators within the single runtime owner."""
         payload = dict(run)
         key = payload.get("idempotency_key")
@@ -87,6 +92,10 @@ class OEMRuntimeStore:
         if not isinstance(key, str) or not key or len(key) > 128:
             raise ValueError("valid bounded idempotency_key required")
         with self._lock:
+            if current_ownership_generation is not None:
+                expected = request.get("expected_generation") if isinstance(request, dict) else None
+                if expected != current_ownership_generation():
+                    raise ValueError("expected_generation no longer matches current robot ownership generation")
             existing_runs = self.list_oem_full_lifecycle_runs()
             for existing in existing_runs:
                 if existing.get("idempotency_key") != key:

@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from .hardware_status import hardware_state
+
 from .oem_full_lifecycle import (
     INITIALIZE_SYSTEM_PRODUCERS,
     OemFullLifecycleError,
@@ -157,7 +159,6 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     Missing or non-exact predicates block creation.  The request model has no
     fields through which BMS can select a stage or supply movement parameters.
     """
-    from .hardware_status import hardware_state
     from .oem_machine_bundle import get_active_oem_machine_snapshot
 
     try:
@@ -321,11 +322,13 @@ def full_lifecycle_contract():
 def create_full_lifecycle_run(request: FullLifecycleCreateRequest):
     runs = _require_full_lifecycle_runs()
     try:
-        inputs = _derive_full_lifecycle_inputs()
-        return runs.create(
-            {**request.model_dump(), "inputs": inputs},
-            machine_configuration_verified=True,
-        )
+        with hardware_state.ownership_lease():
+            inputs = _derive_full_lifecycle_inputs()
+            return runs.create(
+                {**request.model_dump(), "inputs": inputs},
+                machine_configuration_verified=True,
+                current_ownership_generation=lambda: hardware_state.ownership_epoch,
+            )
     except OemFullLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -349,7 +352,12 @@ def get_full_lifecycle_ledger(run_id: str):
 @router.post("/movement-runs/{run_id}/cancel", dependencies=[Depends(_require_lifecycle_mutation_auth)])
 def cancel_full_lifecycle_run(run_id: str, request: FullLifecycleCancelRequest):
     try:
-        return _require_full_lifecycle_runs().cancel(run_id, request.model_dump())
+        with hardware_state.ownership_lease():
+            return _require_full_lifecycle_runs().cancel(
+                run_id,
+                request.model_dump(),
+                current_ownership_generation=lambda: hardware_state.ownership_epoch,
+            )
     except OemFullLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
