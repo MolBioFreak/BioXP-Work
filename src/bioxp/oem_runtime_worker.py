@@ -10,12 +10,21 @@ from .oem_runtime_types import OEMRuntimeCommand, OEMRuntimeSnapshot, OEMRuntime
 from .lifecycle_state import lifecycle_state
 
 Handler = Callable[[OEMRuntimeCommand], dict[str, Any]]
+TerminalSnapshotHook = Callable[[OEMRuntimeCommand, dict[str, Any]], dict[str, Any]]
 
 
 class OEMRuntimeWorker:
-    def __init__(self, *, store: OEMRuntimeStore, handlers: dict[str, Handler] | None = None, autostart: bool = False):
+    def __init__(
+        self,
+        *,
+        store: OEMRuntimeStore,
+        handlers: dict[str, Handler] | None = None,
+        terminal_snapshot_hook: TerminalSnapshotHook | None = None,
+        autostart: bool = False,
+    ):
         self.store = store
         self.handlers = handlers or {}
+        self.terminal_snapshot_hook = terminal_snapshot_hook
         self._queue: queue.Queue[OEMRuntimeCommand] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -108,6 +117,7 @@ class OEMRuntimeWorker:
             result["startup"] = lifecycle["startup"]
             if handler_state is not None:
                 result["handler_outcome"] = handler_state
+            self._attach_terminal_hardware_snapshot(cmd, result)
             history.update({"ok": handler_ok, "result": result, "finished_at": utc_ts()})
             if not history["ok"]:
                 self.state = OEMWorkerStateName.FAILED.value
@@ -116,7 +126,9 @@ class OEMRuntimeWorker:
             return {"ok": history["ok"], "ran": True, "result": result, "worker": self.snapshot()}
         except Exception as exc:
             self.state = OEMWorkerStateName.FAILED.value
-            row = {**history, "ok": False, "error": str(exc), "finished_at": utc_ts()}
+            failed_result = {"ok": False, "error": str(exc)}
+            self._attach_terminal_hardware_snapshot(cmd, failed_result)
+            row = {**history, "ok": False, "error": str(exc), "result": failed_result, "finished_at": utc_ts()}
             self.store.append_command_history(row)
             self.store.append_error({"error_situation": "initialization_failure" if cmd.name == "initializeSystem" else "command_error", "command": cmd.to_dict(), "error": str(exc)})
             lifecycle_state.transition("error", reason=f"runtime_worker_failed:{cmd.name}")
@@ -129,6 +141,23 @@ class OEMRuntimeWorker:
                     self.state = OEMWorkerStateName.IDLE.value
                     lifecycle_state.transition("stopped", reason=f"runtime_worker_completed:{cmd.name}")
                 self._write_snapshot(OEMRuntimeStateName.IDLE_NOT_READY.value)
+
+    def _attach_terminal_hardware_snapshot(self, cmd: OEMRuntimeCommand, result: dict[str, Any]) -> None:
+        """Publish query-only terminal evidence without changing command truth."""
+        hook = self.terminal_snapshot_hook
+        if hook is None:
+            return
+        try:
+            snapshot = hook(cmd, dict(result))
+            if not isinstance(snapshot, dict):
+                raise TypeError("terminal hardware snapshot hook did not return an object")
+            result["automatic_hardware_snapshot"] = snapshot
+        except Exception as exc:
+            result["automatic_hardware_snapshot"] = {
+                "ok": False,
+                "error": str(exc) or exc.__class__.__name__,
+                "query_only": True,
+            }
 
     def _write_snapshot(self, runtime_state: str) -> None:
         snap = OEMRuntimeSnapshot(runtime_state=runtime_state)

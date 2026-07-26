@@ -18,6 +18,7 @@ from .oem_full_lifecycle import (
     current_registry_sha256,
 )
 from .oem_runtime_commands import OEMRuntimeCommandHandlers
+from .oem_movement_ledger import OemMovementLedger
 from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
 from .oem_runtime_store import OEMRuntimeStore
@@ -81,7 +82,13 @@ class DoorEventRequest(BaseModel):
     artifact_root: str | None = None
 
 
-def configure_runtime(*, startup_program_factory=None, store_root: str | None = None, autostart: bool = True):
+def configure_runtime(
+    *,
+    startup_program_factory=None,
+    store_root: str | None = None,
+    terminal_snapshot_hook=None,
+    autostart: bool = True,
+):
     global _store, _worker, _events, _status, _startup_program_factory, _full_lifecycle_runs
     _startup_program_factory = startup_program_factory
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
@@ -95,7 +102,12 @@ def configure_runtime(*, startup_program_factory=None, store_root: str | None = 
     from .oem_runtime_worker import OEMRuntimeWorker
     _full_lifecycle_runs = OemFullLifecycleRuns(_store)
     _full_lifecycle_runs.recover_all()
-    _worker = OEMRuntimeWorker(store=_store, handlers=handlers.handlers(), autostart=autostart)
+    _worker = OEMRuntimeWorker(
+        store=_store,
+        handlers=handlers.handlers(),
+        terminal_snapshot_hook=terminal_snapshot_hook,
+        autostart=autostart,
+    )
     _events = OEMRuntimeEventRouter(store=_store, worker=_worker)
     _status = OEMRuntimeStatusService(store=_store, worker=_worker)
     return {"store": _store, "worker": _worker, "events": _events, "status": _status, "full_lifecycle_runs": _full_lifecycle_runs}
@@ -104,6 +116,15 @@ def configure_runtime(*, startup_program_factory=None, store_root: str | None = 
 def shutdown_runtime():
     if _worker is not None:
         _worker.stop()
+
+
+def movement_ledger_projection() -> dict[str, Any] | None:
+    if _store is None:
+        return None
+    stored = _store.read_oem_movement_ledger()
+    if stored is None:
+        return None
+    return OemMovementLedger(_store).projection()
 
 
 def _require_runtime():
@@ -392,6 +413,23 @@ def runtime_commands_history(limit: int = 50):
     if _store is None:
         return {**_runtime_unavailable("commands"), "commands": []}
     return {"ok": True, "commands": _store.read_journal("command_history.jsonl", limit=limit)}
+
+
+@router.get("/commands/{command_id}")
+def runtime_command_result(command_id: str):
+    if _store is None or _worker is None:
+        return _runtime_unavailable("command_result")
+    for row in reversed(_store.read_journal("command_history.jsonl", limit=500)):
+        command = row.get("command") if isinstance(row, dict) else None
+        if isinstance(command, dict) and command.get("command_id") == command_id:
+            return {"ok": True, "state": "terminal", "terminal": row}
+    active = _worker.active_command
+    if active is not None and active.command_id == command_id:
+        return {"ok": True, "state": "running", "command": active.to_dict()}
+    for command in reversed(_store.read_journal("command_queue.jsonl", limit=500)):
+        if isinstance(command, dict) and command.get("command_id") == command_id:
+            return {"ok": True, "state": "queued", "command": command}
+    raise HTTPException(status_code=404, detail="OEM runtime command id was not found")
 
 
 @router.get("/worker/status")

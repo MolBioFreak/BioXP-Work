@@ -19,6 +19,7 @@ OEM_INITIALIZE_MOTORS_STAGES: tuple[dict[str, Any], ...] = (
     {
         "key": "gripper-current-31",
         "source_anchor": "ClassControlInterface.initializeMotors:3354; M02 setGripperCurrent(31)",
+        "requires_operator_observation": False,
     },
     {
         "key": "gripper-clear-10000",
@@ -134,7 +135,10 @@ class OemMovementLedger:
         if self._store is not None:
             stored = self._store.read_oem_movement_ledger()
             if stored is not None:
-                return self._normalize(copy.deepcopy(stored))
+                normalized = self._normalize(copy.deepcopy(stored))
+                if normalized != stored:
+                    return self._save(normalized)
+                return normalized
         if self._memory is None:
             self._memory = self._new()
         return self._normalize(copy.deepcopy(self._memory))
@@ -155,7 +159,17 @@ class OemMovementLedger:
         for stage in OEM_INITIALIZE_MOTORS_STAGES:
             row = rows.get(stage["key"])
             if isinstance(row, dict):
-                row.setdefault("requires_operator_observation", bool(stage.get("requires_operator_observation", True)))
+                # Observation policy is source/runtime contract metadata, not a
+                # durable operator fact. Correct legacy rows when that policy is
+                # narrowed for a controller-verifiable, non-motion stage.
+                row["requires_operator_observation"] = bool(stage.get("requires_operator_observation", True))
+        expected = ledger.get("expected_next_stage")
+        if isinstance(expected, str) and expected in rows:
+            row = rows[expected]
+            if row.get("state") == "acknowledged" and row.get("requires_operator_observation") is False:
+                row["state"] = "completed"
+                OemMovementLedger._advance_after_completed_stage(ledger, expected)
+                ledger["contract_migration"] = "controller_verifiable_stage_auto_completed"
         return ledger
 
     def _save(self, ledger: Mapping[str, Any]) -> dict[str, Any]:

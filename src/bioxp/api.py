@@ -27,7 +27,12 @@ from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gr
 from .oem_initialization import run_oem_initialization_controller
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
-from .oem_runtime_api import configure_runtime as configure_oem_runtime, router as oem_runtime_router, shutdown_runtime as shutdown_oem_runtime
+from .oem_runtime_api import (
+    configure_runtime as configure_oem_runtime,
+    movement_ledger_projection as oem_movement_ledger_projection,
+    router as oem_runtime_router,
+    shutdown_runtime as shutdown_oem_runtime,
+)
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import OfflineSwitchAuditFixture, interpret_home_predicate, run_switch_audit
@@ -315,6 +320,7 @@ async def lifespan(app: FastAPI):
     configure_oem_runtime(
         startup_program_factory=_get_live_oem_startup_program,
         store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
+        terminal_snapshot_hook=_collect_oem_runtime_terminal_snapshot,
         autostart=True,
     )
     try:
@@ -3071,6 +3077,7 @@ def _status_payload() -> dict:
         "operation_state": lifecycle["operation_state"],
         "startup": lifecycle["startup"],
         "lifecycle": lifecycle,
+        "oem_initialize_motors": oem_movement_ledger_projection(),
     }
 
 
@@ -4505,27 +4512,51 @@ def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
     return True
 
 
+def _collect_and_publish_hardware_snapshot(
+    requested: list[str],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    tester = _get_tester()
+    result = hardware_state.collect(requested, _hardware_collectors(tester))
+    snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
+    if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
+        return result
+    promotion = hardware_state.publish_can_ready_from_snapshot(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        reason=reason,
+    )
+    if promotion.get("published"):
+        result["snapshot"] = promotion["snapshot"]
+        result["can_ready_published"] = True
+    return result
+
+
+def _collect_oem_runtime_terminal_snapshot(command, _result: dict[str, Any]) -> dict[str, Any]:
+    """Collect canonical query-only evidence after a runtime command terminates."""
+    collected = _collect_and_publish_hardware_snapshot(
+        list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS),
+        reason=f"automatic_oem_runtime_terminal_snapshot:{command.name}",
+    )
+    collected["automatic"] = True
+    collected["query_only"] = True
+    collected["trigger_command_id"] = command.command_id
+    collected["trigger_command"] = command.name
+    return collected
+
+
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
-    tester = _get_tester()
     requested = (payload or {}).get("domains") or list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS)
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:
         def collect_and_publish() -> dict[str, Any]:
-            result = hardware_state.collect(requested, _hardware_collectors(tester))
-            snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
-            if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
-                return result
-            promotion = hardware_state.publish_can_ready_from_snapshot(
-                snapshot_id=str(snapshot["snapshot_id"]),
+            return _collect_and_publish_hardware_snapshot(
+                requested,
                 reason="explicit_query_only_snapshot_can_ready",
             )
-            if promotion.get("published"):
-                result["snapshot"] = promotion["snapshot"]
-                result["can_ready_published"] = True
-            return result
         return await _run_blocking(
             "Canonical hardware snapshot collection",
             collect_and_publish,

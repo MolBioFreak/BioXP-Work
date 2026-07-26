@@ -78,3 +78,31 @@ def test_runtime_api_accepts_typed_stage_name_and_binds_robot_owned_artifact_roo
     assert captured[0].params == {"homing_step": "z-home"}
     assert captured[0].artifact_root.startswith(str(tmp_path / "artifacts"))
     assert captured[0].artifact_root != req.artifact_root
+
+
+def test_runtime_api_exposes_exact_command_terminal_result_by_id(tmp_path):
+    runtime = oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
+    client = TestClient(app)
+    queued = client.post(
+        "/oem/runtime/commands/initializeSystem",
+        json={"mode": "dry_run", "params": {"run_homing": False}},
+    ).json()
+    command_id = queued["command"]["command_id"]
+
+    waiting = client.get(f"/oem/runtime/commands/{command_id}")
+    assert waiting.status_code == 200
+    assert waiting.json()["state"] == "queued"
+
+    assert runtime["worker"].run_next_for_tests()["ok"] is True
+    terminal = client.get(f"/oem/runtime/commands/{command_id}")
+
+    assert terminal.status_code == 200
+    assert terminal.json()["state"] == "terminal"
+    assert terminal.json()["terminal"]["ok"] is True
+
+
+def test_runtime_api_exact_command_result_does_not_guess_unknown_ids(tmp_path):
+    oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
+    response = TestClient(app).get("/oem/runtime/commands/not-a-real-command")
+
+    assert response.status_code == 404

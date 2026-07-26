@@ -465,7 +465,7 @@ class BioXpStartupHardware:
         tester = self.tester
         steps = [
             {"step": "z-home", "oem_anchor": "initializeMotors: MotorZ.axisSearchHome(speed=1791)", "axis": "z", "board": int(tester.BOARD_HEAD), "motor": 1, "requires_operator_observation": True},
-            {"step": "gripper-current-31", "oem_anchor": "initializeMotors: setGripperCurrent(31)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
+            {"step": "gripper-current-31", "oem_anchor": "initializeMotors: setGripperCurrent(31)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": False},
             {"step": "gripper-clear-10000", "oem_anchor": "initializeMotors: MotorGrip.moveSteps(10000,true)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "gripper-home", "oem_anchor": "initializeMotors: MotorGrip.axisSearchHome(speed=600|200)", "axis": "g", "board": int(tester.BOARD_HEAD), "motor": 2, "requires_operator_observation": True},
             {"step": "x-home", "oem_anchor": "initializeMotors: MotorX.axisSearchHome(speed=250)", "axis": "x", "board": int(tester.BOARD_DECK), "motor": 0, "requires_operator_observation": True},
