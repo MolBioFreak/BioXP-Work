@@ -44,6 +44,7 @@ def passing_receipt():
             "oc_started": True,
             "thermal_wait_completed_within_ms": 100_000,
         },
+        "launched_branch_results": {"tc": True, "rc": True, "oc": True},
         "final_chiller_pwm_reset_acknowledged": True,
         "inspection_log_only": False,
     }
@@ -110,6 +111,15 @@ def test_inspection_log_only_preserves_oem_override_but_never_production_admissi
     assert result["production_admission_pass"] is False
     assert result["ok"] is False
     assert "tc_lid_target_not_reached" in result["failures"]
+
+
+def test_false_launched_task_result_fails_even_when_derived_metrics_pass():
+    receipt = passing_receipt()
+    receipt["launched_branch_results"]["rc"] = False
+    result = evaluate_oem_self_test_receipt(receipt)
+    assert result["ok"] is False
+    assert "rc_launched_result_false" in result["failures"]
+    assert result["physical_effect_verified"] is False
 
 
 def test_self_test_receipt_rejects_truthy_and_missing_values():

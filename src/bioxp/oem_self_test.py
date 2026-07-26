@@ -89,7 +89,11 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     top = _mapping(
         receipt,
         "receipt",
-        {"tc", "rc", "oc", "motion", "concurrency", "final_chiller_pwm_reset_acknowledged", "inspection_log_only"},
+        {
+            "tc", "rc", "oc", "motion", "concurrency",
+            "launched_branch_results",
+            "final_chiller_pwm_reset_acknowledged", "inspection_log_only",
+        },
     )
     tc = _mapping(
         top["tc"],
@@ -109,11 +113,19 @@ def evaluate_oem_self_test_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         "concurrency",
         {"tc_started", "rc_started", "oc_started", "thermal_wait_completed_within_ms"},
     )
+    launched_results = _mapping(
+        top["launched_branch_results"],
+        "launched_branch_results",
+        {"tc", "rc", "oc"},
+    )
     inspection_log_only = _bool(top["inspection_log_only"], "inspection_log_only")
     final_pwm = _bool(top["final_chiller_pwm_reset_acknowledged"], "final_chiller_pwm_reset_acknowledged")
 
     failures: list[str] = []
     thermal_failures: list[str] = []
+    for branch in ("tc", "rc", "oc"):
+        if not _bool(launched_results[branch], f"launched_branch_results.{branch}"):
+            failures.append(f"{branch}_launched_result_false")
     for field, label in (
         ("high_leg_s", "tc_high_temperature_timeout"),
         ("low_leg_s", "tc_low_temperature_timeout"),

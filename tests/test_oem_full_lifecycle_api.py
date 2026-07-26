@@ -11,6 +11,9 @@ def _robot_inputs():
     return {
         "ownership_generation": 7,
         "can_ready": True,
+        "board_test_mode": False,
+        "pipette_exists": None,
+        "initialize_system_producer": "initializeEnvironment",
         "enclosure_door_closed": True,
         "latch_closed": True,
         "saved_status": 1,
@@ -70,6 +73,9 @@ def test_contract_reports_partial_provider_truth_and_blocks_live(tmp_path, monke
     assert response.status_code == 200
     body = response.json()
     assert body["plan_available"] is True
+    assert body["source_authority_verified"] is True
+    assert body["evidence_lock_sha256"] == "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
+    assert len(body["initialize_system_producers"]) == 5
     assert body["live_creation_enabled"] is False
     assert body["physical_commissioning_complete"] is False
     assert body["providers"]["initialize_motors_m01_m19"]["implemented"] is True

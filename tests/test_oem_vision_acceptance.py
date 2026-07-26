@@ -29,7 +29,6 @@ def receipt(*, first=True, second_attempted=False, second=False):
         "location_23_persisted": True,
         "all_leds_off_acknowledged": True,
         "gantry_park_verified": True,
-        "camera_session_released": True,
     }
 
 
@@ -39,6 +38,7 @@ def test_camera_accepts_first_label_and_exact_cleanup():
     assert result["production_admission_pass"] is True
     assert result["physical_effect_verified"] is True
     assert result["attempt_count"] == 1
+    assert result["camera_session_disposition"] == "not_released_by_CheckCamera"
 
 
 def test_camera_accepts_exact_second_attempt_after_first_failure():

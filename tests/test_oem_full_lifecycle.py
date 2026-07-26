@@ -27,6 +27,9 @@ def _request(**overrides):
         "inputs": {
             "ownership_generation": 41,
             "can_ready": True,
+            "board_test_mode": False,
+            "pipette_exists": None,
+            "initialize_system_producer": "initializeEnvironment",
             "enclosure_door_closed": True,
             "latch_closed": True,
             "saved_status": 1,
@@ -64,7 +67,7 @@ def test_full_happy_path_dry_run_is_robot_owned_and_emits_no_physical_frames(tmp
     ]
     assert [row["stage_id"] for row in finished["stages"]] == [
         "construct_control_lib",
-        "constructor_pipette_initialize_and_status",
+        "constructor_pipette_initiate_status_retry",
         "configure_motors_without_motion",
         "initialize_environment",
         "initialize_environment_initial_check",
@@ -162,7 +165,7 @@ def test_application_admission_branches_before_enqueue_and_motor_config_is_const
     stage_ids = [row["stage_id"] for row in payload["stages"]]
     assert stage_ids == [
         "construct_control_lib",
-        "constructor_pipette_initialize_and_status",
+        "constructor_pipette_initiate_status_retry",
         "configure_motors_without_motion",
         "initialize_environment",
         "initialize_environment_initial_check",
@@ -182,6 +185,63 @@ def test_initial_check_and_self_test_metadata_preserve_hardware_and_parallel_tru
     assert by_id["self_test_launch_tc_rc_oc"]["parallel_branches"] == ["TC", "RC", "OC"]
     assert by_id["self_test_motion_while_thermal_running"]["would_command_physical_motion"] is True
     assert by_id["self_test_join_and_reset_chillers"]["join_timeout_ms"] == 100000
+    assert by_id["initialize_motion_flags"]["source_anchor"] == "ControlLib.initializeMotion:8797-8804"
+    assert by_id["initialize_motion_tip_query"]["source_anchor"] == "ControlLib.initializeMotion:8805-8807"
+    assert by_id["camera_check"]["source_anchor"].endswith("ControlLib.CheckCamera:1929-1960")
+    movement_rows = [row for row in payload["stages"] if row["stage_id"].startswith("initialize_motors_m")]
+    assert len(movement_rows) == 19
+    assert all(row["movement_ledger_stage"] for row in movement_rows)
+
+
+def test_constructor_branch_nesting_matches_can_and_board_test_mode(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    normal = runs.create(_request(idempotency_key="constructor-normal"))
+    normal_ids = [row["stage_id"] for row in normal["stages"]]
+    assert normal_ids[1:3] == [
+        "constructor_pipette_initiate_status_retry",
+        "configure_motors_without_motion",
+    ]
+
+    board = runs.create(_request(
+        idempotency_key="constructor-board-test",
+        inputs={**_request()["inputs"], "board_test_mode": True, "pipette_exists": True},
+    ))
+    board_ids = [row["stage_id"] for row in board["stages"]]
+    assert board_ids[1:3] == [
+        "constructor_board_test_pipette_initiate_pressure",
+        "configure_motors_without_motion",
+    ]
+
+    no_can = runs.create(_request(
+        idempotency_key="constructor-no-can",
+        inputs={**_request()["inputs"], "can_ready": False},
+    ))
+    no_can_ids = [row["stage_id"] for row in no_can["stages"]]
+    assert not [stage for stage in no_can_ids if stage.startswith("constructor_") and stage != "construct_control_lib"]
+
+
+def test_ship_mode_requires_door_close_result_before_shutdown_handoff(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    payload = runs.create(_request(
+        idempotency_key="ship-mode",
+        inputs={**_request()["inputs"], "ship_mode": "PARK"},
+    ))
+    row = payload["stages"][-1]
+    assert row["stage_id"] == "ship_mode_close_door_before_shutdown"
+    assert row["result_required"] is True
+    assert row["possible_terminals"] == [
+        "oem_shipping_poweroff_required",
+        "oem_shipping_blocked_door_close_failure",
+    ]
+    assert payload["planned_terminal_state"] == "oem_shipping_handoff_pending_door_close"
+
+
+def test_plan_binds_current_evidence_lock_and_selected_producer(tmp_path):
+    runs = OemFullLifecycleRuns(OEMRuntimeStore(tmp_path))
+    payload = runs.create(_request(idempotency_key="authority-producer"))
+    assert payload["evidence_lock_sha256"] == "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
+    enqueue = next(row for row in payload["stages"] if row["stage_id"] == "enqueue_initialize_system")
+    assert enqueue["producer"] == "initializeEnvironment"
 
 
 def test_can_unavailable_branch_never_enqueues_or_configures_motors(tmp_path):

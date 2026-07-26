@@ -8,6 +8,7 @@ providers are attached only after their individual commissioning gates pass.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,6 +24,13 @@ from .oem_runtime_types import new_id, utc_ts
 
 FULL_LIFECYCLE_SCHEMA = "bioxp.oem_full_movement_lifecycle.v1"
 FULL_LIFECYCLE_COMMAND = "initialize_oem_movement_lifecycle"
+INITIALIZE_SYSTEM_PRODUCERS = (
+    {"producer": "initializeEnvironment", "source_anchor": "BioXPMainWindow.initializeEnvironment:989-997"},
+    {"producer": "door_close_event", "source_anchor": "BioXPMainWindow.m_canControl_handleEnclosureDoorEventProcess:2487-2495"},
+    {"producer": "optional_update_download_failure", "source_anchor": "BioXPMainWindow.m_pageWarning_buttonclicked:2617-2625"},
+    {"producer": "software_update_cancel", "source_anchor": "BioXPMainWindow.m_pageSoftwareUpdate_Cancel_Click:2861-2868"},
+    {"producer": "fetch_button", "source_anchor": "BioXPMainWindow.btnFetch_Click:4050-4058"},
+)
 _REGISTRY_PATH = (
     Path(__file__).resolve().parents[2]
     / "docs/specs/2026-07-23-oem-movement-method-source-binary-registry.json"
@@ -37,12 +45,41 @@ def current_registry_sha256() -> str:
     return hashlib.sha256(_REGISTRY_PATH.read_bytes()).hexdigest()
 
 
+def current_authority_identity() -> dict[str, Any]:
+    """Verify the registry-selected lock bytes before publishing provenance."""
+    try:
+        registry = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+        authority = registry["authority"]
+        lock_path = Path(authority["evidence_lock_path"])
+        expected = authority["evidence_lock_sha256"]
+        lock_bytes = lock_path.read_bytes()
+        lock = json.loads(lock_bytes)
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise OemFullLifecycleError(f"canonical OEM evidence authority unavailable: {exc}") from exc
+    actual = hashlib.sha256(lock_bytes).hexdigest()
+    if expected != OEM_LOCK_SHA256 or actual != expected:
+        raise OemFullLifecycleError("canonical OEM evidence lock identity mismatch")
+    if lock.get("schema_id") != "bioxp.oem_evidence_lock.v4" or lock.get("schema_version") != 4:
+        raise OemFullLifecycleError("canonical OEM evidence lock schema mismatch")
+    if lock.get("acquisition", {}).get("session_id") != OEM_ACQUISITION_ID:
+        raise OemFullLifecycleError("canonical OEM acquisition identity mismatch")
+    return {
+        "evidence_lock_path": str(lock_path),
+        "evidence_lock_sha256": actual,
+        "evidence_lock_schema": "bioxp.oem_evidence_lock.v4",
+        "acquisition_id": OEM_ACQUISITION_ID,
+    }
+
+
 # The request carries only lifecycle predicates read by the robot.  It cannot
 # carry an axis, board, position, speed, current, timeout, frame, or stage name.
 _ALLOWED_INPUTS = frozenset(
     {
         "ownership_generation",
         "can_ready",
+        "board_test_mode",
+        "pipette_exists",
+        "initialize_system_producer",
         "enclosure_door_closed",
         "latch_closed",
         "saved_status",
@@ -130,14 +167,27 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
 
     # ControlLib is constructed before BioXPMainWindow.initializeEnvironment().
     add("construct_control_lib", "BioXPMainWindow:672-675")
-    add(
-        "constructor_pipette_initialize_and_status",
-        "ControlLib:963-983",
-        hardware=True,
-        execution_semantics="CAN_READY-conditional constructor work; group init/status precedes motor configuration",
-    )
     if inputs["can_ready"] is True:
-        add("configure_motors_without_motion", "ControlLib:963-984;ClassControlInterface:3181-3265", hardware=True)
+        if inputs["board_test_mode"]:
+            if inputs["pipette_exists"]:
+                add(
+                    "constructor_board_test_pipette_initiate_pressure",
+                    "ControlLib..ctor:963-972",
+                    hardware=True,
+                    execution_semantics="BoardTestMode and pipetteExist nested branch: initiateGroup then ReadPressure",
+                )
+        else:
+            add(
+                "constructor_pipette_initiate_status_retry",
+                "ControlLib..ctor:973-982",
+                hardware=True,
+                execution_semantics="initiateGroup; checkedPipetteCondition; checkedPipetteStatus; one retry on false",
+            )
+        add(
+            "configure_motors_without_motion",
+            "ControlLib..ctor:983;ClassControlInterface.initializeMotorsWithoutMotion:3181-3265",
+            hardware=True,
+        )
     add("initialize_environment", "BioXPMainWindow:973-1026")
 
     if inputs["can_ready"] is not True:
@@ -149,7 +199,7 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
 
     add(
         "initialize_environment_initial_check",
-        "BioXPMainWindow:976-979;ControlLib:5652-5714",
+        "BioXPMainWindow:976-979;ControlLib:8728-8795",
         hardware=True,
         result_semantics="return_value_ignored_by_oem_caller",
     )
@@ -165,7 +215,11 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
         add("admission_unlock_ready_fallback", "BioXPMainWindow:998-1003", hardware=True)
         return stages, "oem_ready_admission_fallback"
 
-    add("enqueue_initialize_system", "BioXPMainWindow:989-997")
+    add(
+        "enqueue_initialize_system",
+        "BioXPMainWindow.initializeEnvironment:989-997",
+        producer=inputs["initialize_system_producer"],
+    )
     add(
         "worker_claim_initialize_system",
         "BioXPMainWindow:2030-2051",
@@ -173,13 +227,22 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
     )
     add("initialize_system_reentry_guard", "BioXPMainWindow:1094-1100")
     if inputs["ship_mode"] == "PARK":
-        add("ship_mode_door_open", "BioXPMainWindow:1127-1133", hardware=True)
-        add("ship_mode_shutdown_handoff", "BioXPMainWindow:1127-1133")
-        return stages, "oem_shipping_poweroff_required"
+        add(
+            "ship_mode_close_door_before_shutdown",
+            "BioXPMainWindow.initializeSystem:1127-1133;ControlLib.doorOpen",
+            hardware=True,
+            result_required=True,
+            possible_terminals=[
+                "oem_shipping_poweroff_required",
+                "oem_shipping_blocked_door_close_failure",
+            ],
+            execution_semantics="doorOpen(false,false) must verify door/latch closure before warning and OS shutdown",
+        )
+        return stages, "oem_shipping_handoff_pending_door_close"
 
     add(
         "initialize_system_initial_check",
-        "BioXPMainWindow:1140-1144;ControlLib:5652-5714",
+        "BioXPMainWindow:1140-1144;ControlLib:8728-8795",
         hardware=True,
         result_semantics="return_value_ignored_by_oem_caller",
     )
@@ -189,29 +252,29 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
         add("saved_status_unlock_warning_return", "BioXPMainWindow:1152-1156", hardware=True)
         return stages, "oem_movement_blocked_saved_status_recovery"
 
-    add("initialize_motion_flags", "ControlLib:4363-4377")
+    add("initialize_motion_flags", "ControlLib.initializeMotion:8797-8804")
     for number, source_stage in enumerate(OEM_INITIALIZE_MOTORS_STAGES, start=1):
         add(
             f"initialize_motors_m{number:02d}_{source_stage['key'].replace('-', '_')}",
             source_stage["source_anchor"],
             hardware=True,
             motion=True,
-            source_stage_key=source_stage["key"],
+            movement_ledger_stage=source_stage["key"],
         )
-    add("initialize_motion_tip_query", "ControlLib:4377-4382", hardware=True)
+    add("initialize_motion_tip_query", "ControlLib.initializeMotion:8805-8807", hardware=True)
     if inputs["tip_present"]:
         for stage_id, anchor, motion in (
-            ("tip_open_thermal_door", "ControlLib:4379-4385", False),
-            ("tip_route_park_to_waste", "ControlLib:4385-4393", True),
-            ("tip_eject_all", "ControlLib:4385-4393", False),
-            ("tip_move_z_80000", "ControlLib:4393-4397", True),
-            ("tip_move_x_79000", "ControlLib:4393-4397", True),
-            ("tip_verify_empty", "ControlLib:4398-4402", False),
-            ("pipette_reinitialize_retry_once", "ClassPipetteCollection:907-928", False),
+            ("tip_open_thermal_door", "ControlLib.initializeMotion:8808-8811", False),
+            ("tip_route_park_to_waste", "ControlLib.initializeMotion:8812-8813", True),
+            ("tip_eject_all", "ControlLib.initializeMotion:8814", False),
+            ("tip_move_z_80000", "ControlLib.initializeMotion:8815", True),
+            ("tip_move_x_79000", "ControlLib.initializeMotion:8816", True),
+            ("tip_verify_empty", "ControlLib.initializeMotion:8817-8828", False),
+            ("pipette_reinitialize_retry_once", "ControlLib.initializeMotion:8829-8841", False),
         ):
             add(stage_id, anchor, hardware=True, motion=motion)
     else:
-        add("initialize_motion_no_tip", "ControlLib:4377-4382")
+        add("initialize_motion_no_tip", "ControlLib.initializeMotion:8843-8846")
 
     add("self_test_gate", "BioXPMainWindow:1163-1171")
     if inputs["self_test_due"]:
@@ -239,7 +302,7 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
 
     add("camera_gate", "BioXPMainWindow:1172-1181")
     if inputs["camera_required"]:
-        add("camera_check", "BioXPMainWindow:1172-1181;ControlLib:5788-5863", hardware=True, motion=True)
+        add("camera_check", "BioXPMainWindow.initializeSystem:1172-1181;ControlLib.CheckCamera:1929-1960", hardware=True, motion=True)
 
     # inspectCover always calls ForceToHighHome before its DeckInspection early return.
     add("cover_force_high_home", "ControlLib:3663-3677", hardware=True, motion=True)
@@ -247,7 +310,7 @@ def _source_parity_plan(inputs: Mapping[str, Any]) -> tuple[list[dict[str, Any]]
         add("cover_inspection", "BioXPMainWindow:1182-1203;ControlLib:3663-3768", hardware=True, motion=True)
     else:
         add("cover_inspection_disabled_return_ok", "ControlLib:3672-3677")
-    add("gantry_park", "BioXPMainWindow:1203-1204;ControlLib:7361-7392", hardware=True, motion=True)
+    add("gantry_park", "BioXPMainWindow.initializeSystem:1203-1204;ControlLib.parkGantry:7071-7122", hardware=True, motion=True)
 
     terminal = _terminal_for_start_mode(inputs["start_mode"])
     add(f"start_mode_{inputs['start_mode'].lower()}_terminal", "BioXPMainWindow:1204-1307")
@@ -296,6 +359,14 @@ class OemFullLifecycleRuns:
             raise OemFullLifecycleError("ship_mode must be the exact OEM value '' or 'PARK'")
         if inputs["start_mode"] not in {"DevMode", "WebMode", "LocalMode", "TradeShowMode"}:
             raise OemFullLifecycleError("start_mode must be an exact OEM OperationMode name")
+        if inputs["initialize_system_producer"] != "initializeEnvironment":
+            raise OemFullLifecycleError("this application-start route requires initializeEnvironment producer identity")
+        if type(inputs["board_test_mode"]) is not bool:
+            raise OemFullLifecycleError("board_test_mode must be an exact boolean")
+        if inputs["board_test_mode"] and type(inputs["pipette_exists"]) is not bool:
+            raise OemFullLifecycleError("robot-owned pipette_exists must be an exact boolean in BoardTestMode")
+        if not inputs["board_test_mode"] and inputs["pipette_exists"] is not None:
+            raise OemFullLifecycleError("pipette_exists is only consumed by the BoardTestMode constructor branch")
         for field in (
             "can_ready",
             "enclosure_door_closed",
@@ -311,6 +382,7 @@ class OemFullLifecycleRuns:
 
     def create(self, request: Mapping[str, Any]) -> dict[str, Any]:
         req = self._validate_request(request)
+        authority = current_authority_identity()
         stages, planned_terminal = _source_parity_plan(req["inputs"])
         run_id = new_id("oem_move")
         now = utc_ts()
@@ -335,7 +407,7 @@ class OemFullLifecycleRuns:
             "physical_effect_verified": False,
             "safety_deviation": [],
             "registry_sha256": current_registry_sha256(),
-            "evidence_lock_sha256": OEM_LOCK_SHA256,
+            **authority,
             "acquisition_id": OEM_ACQUISITION_ID,
             "machine_serial": OEM_MACHINE_SERIAL,
             "ownership_generation": req["inputs"]["ownership_generation"],

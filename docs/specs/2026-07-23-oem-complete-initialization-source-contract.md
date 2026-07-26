@@ -45,7 +45,7 @@ The current Linux handler, its tests, BMS controls, Linux observations, and gene
 | Motor TMCL operations / switch semantics | `decompiled_src_can/ClassCanLib/ClassMotor.cs` | `9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99` |
 | Deck and chiller board activation/commands | `decompiled_src_can/ClassCanLib/ClassDeckBoard.cs`, `ClassChillerBoard.cs`, `ClassThermalControl.cs` | chiller sources sealed at `c048e2cdfcecc58c97f857e2c2bad85eb9766c2196981fa8fde67df7334981fd` and `fdefde9b38c70b9fec47e6ffdd4929ad8f25bc90c57c43baf03722addbe6cf25` |
 | Camera and pattern-matching implementation | `decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs`; captured `CVisionLib.dll` | source `6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501`; binary `84ab0c851f1bb418289035efd9fa84420e9ff82ea0a69ec0c00bb5d401e750f2` |
-| Exact live serial-206 machine corpus | `OEM_EVIDENCE_LOCK.json`; runtime projection in `src/bioxp/oem_machine_bundle.py` | acquisition `20260719T024740Z-4a7fe6783205846c`; machine serial `206`; closed-world lock `148b224828fc2a0437897b63b352efa7cb80715df8045d8aa8e19d6d8e7cb1fa` |
+| Exact live serial-206 machine corpus | `OEM_EVIDENCE_LOCK.json`; runtime projection in `src/bioxp/oem_machine_bundle.py` | acquisition `20260719T024740Z-4a7fe6783205846c`; machine serial `206`; registry-selected current lock `a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c`; historical acceptance-package lock bytes were `148b224828fc2a0437897b63b352efa7cb80715df8045d8aa8e19d6d8e7cb1fa` |
 
 A decompiled method is authoritative only through its mapped OEM binary. Any ambiguity in decompilation must be resolved against the captured DLL/IL before implementation.
 

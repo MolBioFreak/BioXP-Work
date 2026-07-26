@@ -5,22 +5,23 @@ import pytest
 from src.bioxp.oem_vision_acceptance import OemVisionReceiptError, evaluate_inspect_cover_receipt
 
 
-def receipt(detections, relocations):
+def receipt(detections, relocations, *, observed_locations=(17, 19, 20, 18)):
+    methods = {
+        "17": "InspectOutputLocation(1)",
+        "19": "checkRCCover",
+        "20": "checkCoverStorage",
+        "18": "checkCoverStorage",
+    }
     return {
         "deck_inspection": True,
         "screen_resolution_high": True,
-        "inspection_methods": {
-            "17": "InspectOutputLocation(1)",
-            "19": "checkRCCover",
-            "20": "checkCoverStorage",
-            "18": "checkCoverStorage",
-        },
-        "cover_detected": {str(key): value for key, value in detections.items()},
+        "observed_locations": list(observed_locations),
+        "inspection_methods": {str(key): methods[str(key)] for key in observed_locations},
+        "cover_detected": {str(key): detections[key] for key in observed_locations},
         "relocations": relocations,
         "final_cover_locations": {"output": 18, "reagent": 20},
+        "door_closed_verified": True,
         "door_open_verified": True,
-        "all_leds_off_acknowledged": True,
-        "camera_session_released": True,
         "inspection_log_only": False,
     }
 
@@ -70,6 +71,20 @@ def test_cover_count_failures_and_inspection_override_do_not_admit_production():
     assert result["production_admission_pass"] is False
 
 
+def test_non_log_only_over_count_returns_at_location_20_without_fake_location_18_evidence():
+    value = receipt(
+        {17: True, 19: True, 20: True},
+        [],
+        observed_locations=(17, 19, 20),
+    )
+    value["door_open_verified"] = False
+    value["final_cover_locations"] = None
+    result = evaluate_inspect_cover_receipt(value)
+    assert result["ok"] is False
+    assert result["error_status"] == "OVER_CHILLER_COVER"
+    assert result["terminal_after_location"] == 20
+
+
 def test_cover_inspection_rejects_wrong_method_or_relocation_order():
     wrong_method = receipt({17: False, 19: False, 20: True, 18: True}, [])
     wrong_method["inspection_methods"]["17"] = "checkChillerCover"
@@ -87,16 +102,18 @@ def test_cover_inspection_rejects_wrong_method_or_relocation_order():
         evaluate_inspect_cover_receipt(wrong_move)
 
 
-def test_cover_inspection_disabled_is_a_typed_noop():
+def test_cover_inspection_disabled_returns_after_force_high_home_without_camera_path():
     value = receipt({17: False, 19: False, 20: False, 18: False}, [])
     value.update(
         deck_inspection=False,
         inspection_methods={},
+        observed_locations=[],
         cover_detected={},
         final_cover_locations=None,
+        door_closed_verified=False,
         door_open_verified=False,
     )
     result = evaluate_inspect_cover_receipt(value)
     assert result["ok"] is True
-    assert result["outcome"] == "deck_inspection_disabled"
+    assert result["outcome"] == "deck_inspection_disabled_after_force_high_home"
     assert result["physical_effect_verified"] is False

@@ -8,7 +8,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .oem_full_lifecycle import OemFullLifecycleError, OemFullLifecycleRuns, current_registry_sha256
+from .oem_full_lifecycle import (
+    INITIALIZE_SYSTEM_PRODUCERS,
+    OemFullLifecycleError,
+    OemFullLifecycleRuns,
+    current_authority_identity,
+    current_registry_sha256,
+)
 from .oem_runtime_commands import OEMRuntimeCommandHandlers
 from .oem_runtime_events import OEMRuntimeEventRouter
 from .oem_runtime_status import OEMRuntimeStatusService
@@ -158,6 +164,15 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     ship_mode = machine.get("ship_mode")
     hardware = status.get("hardware")
     can_ready = hardware.get("can_ready") if isinstance(hardware, dict) else None
+    lifecycle = lifecycle_state.projection()
+    board_test_mode = lifecycle.get("board_test_mode")
+    if type(board_test_mode) is not bool:
+        raise OemFullLifecycleError("robot-owned board_test_mode must be an exact boolean")
+    pipette_exists = None
+    if board_test_mode:
+        pipette_exists = hardware.get("pipette_exists") if isinstance(hardware, dict) else None
+        if type(pipette_exists) is not bool:
+            raise OemFullLifecycleError("robot-owned pipette_exists must be an exact boolean in BoardTestMode")
     enclosure_door_closed = machine.get("enclosure_door_closed")
     latch_closed = machine.get("latch_closed")
     for field, value in (
@@ -184,6 +199,9 @@ def _derive_full_lifecycle_inputs() -> dict[str, Any]:
     return {
         "ownership_generation": int(hardware_state.ownership_epoch),
         "can_ready": can_ready,
+        "board_test_mode": board_test_mode,
+        "pipette_exists": pipette_exists,
+        "initialize_system_producer": "initializeEnvironment",
         "enclosure_door_closed": enclosure_door_closed,
         "latch_closed": latch_closed,
         "saved_status": saved_status,
@@ -232,12 +250,16 @@ def _full_lifecycle_plan_blockers() -> list[str]:
 
 @router.get("/movement-runs/contract")
 def full_lifecycle_contract():
+    authority = current_authority_identity()
     plan_blockers = _full_lifecycle_plan_blockers()
     return {
         "schema_version": "bioxp.oem_full_lifecycle_contract.v1",
         "command": "initialize_oem_movement_lifecycle",
         "machine_serial": 206,
         "registry_sha256": current_registry_sha256(),
+        **authority,
+        "source_authority_verified": True,
+        "initialize_system_producers": list(INITIALIZE_SYSTEM_PRODUCERS),
         "plan_available": not plan_blockers,
         "plan_blockers": plan_blockers,
         "live_creation_enabled": False,
