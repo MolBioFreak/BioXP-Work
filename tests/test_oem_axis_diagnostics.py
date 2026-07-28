@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 from fastapi import HTTPException
@@ -182,3 +183,57 @@ def test_diagnostic_missing_literal_success_is_rejected(monkeypatch):
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["ok"] is False
     assert exc_info.value.detail["physical_effect_verified"] is False
+
+
+def test_diagnostic_stop_preempts_inflight_normal_tester_lock(monkeypatch):
+    from src.bioxp import api
+
+    stop_called = threading.Event()
+
+    class Tester:
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            assert axis == "x"
+            return {"board": 3, "motor": 0}
+
+        def motor_stop(self, board, motor):
+            stop_called.set()
+            return {"ok": True, "board": board, "motor": motor}
+
+        def motor_axis_status(self, board, motor):
+            return {"ok": True, "speed": {"speed": 0}}
+
+        def motor_query_home_switch(self, board, motor):
+            return {"ok": True, "active": False}
+
+    monkeypatch.setattr(api, "_get_tester", lambda: Tester())
+
+    async def scenario():
+        lock_held = asyncio.Event()
+        release_normal_lane = asyncio.Event()
+
+        async def hold_normal_lane():
+            async with api._tester_lock:
+                lock_held.set()
+                await release_normal_lane.wait()
+
+        holder = asyncio.create_task(hold_normal_lane())
+        await lock_held.wait()
+        stop_task = asyncio.create_task(
+            api.motion_diagnostics_stop(
+                api.AxisDiagnosticStopRequest(
+                    axis="x",
+                    operator_ack="STOP_AXIS",
+                    reason="preempt blocked diagnostic",
+                    operator="independent safety regression",
+                )
+            )
+        )
+        called_before_release = await asyncio.to_thread(stop_called.wait, 0.15)
+        release_normal_lane.set()
+        await holder
+        result = await stop_task
+        return called_before_release, result
+
+    called_before_release, result = asyncio.run(scenario())
+    assert called_before_release is True
+    assert result["verified_stopped"] is True

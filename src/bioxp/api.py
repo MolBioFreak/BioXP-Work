@@ -189,6 +189,8 @@ RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
 MAINTENANCE_STATE_SCHEMA_VERSION = "bioxp.maintenance_state.v1"
 MAINTENANCE_RECOVERY_ACK = "RECOVER"
 MOTION_RECOVERY_ACK = "RECOVER_MOTION"
+_maintenance_state_lock = threading.RLock()
+_maintenance_latch_generation = 0
 _maintenance_state: dict[str, Any] = {
     "schema_version": MAINTENANCE_STATE_SCHEMA_VERSION,
     "usb_owner": "service",
@@ -222,14 +224,16 @@ def _reset_provenance(*, subsystem: str, source: str, reset_scope: str, **extra:
 
 
 def _maintenance_state_payload() -> dict[str, Any]:
-    return dict(_maintenance_state)
+    with _maintenance_state_lock:
+        return dict(_maintenance_state)
 
 
 def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]:
-    _maintenance_state.update(updates)
-    _maintenance_state["last_transition"] = str(transition)
-    _maintenance_state["last_transition_at"] = _now_utc()
-    return _maintenance_state_payload()
+    with _maintenance_state_lock:
+        _maintenance_state.update(updates)
+        _maintenance_state["last_transition"] = str(transition)
+        _maintenance_state["last_transition_at"] = _now_utc()
+        return dict(_maintenance_state)
 
 
 def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
@@ -255,38 +259,62 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
 
 
 def _mark_post_maintenance_motion_block(*, source: str, reason: str, **extra: Any) -> dict[str, Any]:
-    payload = {
-        "usb_owner": extra.pop("usb_owner", _maintenance_state.get("usb_owner", "service")),
-        "motion_blocked": True,
-        "recovery_required": True,
-        "block_reason": str(reason),
-        "recovery_hint": (
-            "Run non-homing strict startup or localhost-only POST /maintenance/usb/recover_motion "
-            "before any axis/home/clear-lock motion."
-        ),
-        "blocked_by": str(source),
-    }
-    payload.update(extra)
-    return _set_maintenance_state(transition=source, **payload)
+    global _maintenance_latch_generation
+    with _maintenance_state_lock:
+        _maintenance_latch_generation += 1
+        payload = {
+            "usb_owner": extra.pop("usb_owner", _maintenance_state.get("usb_owner", "service")),
+            "motion_blocked": True,
+            "recovery_required": True,
+            "block_reason": str(reason),
+            "recovery_hint": (
+                "Run non-homing strict startup or localhost-only POST /maintenance/usb/recover_motion "
+                "before any axis/home/clear-lock motion."
+            ),
+            "blocked_by": str(source),
+        }
+        payload.update(extra)
+        return _set_maintenance_state(transition=source, **payload)
 
 
-def _clear_post_maintenance_motion_block(*, source: str, evidence: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    return _set_maintenance_state(
-        transition=source,
-        usb_owner="service",
-        motion_blocked=False,
-        recovery_required=False,
-        block_reason=None,
-        recovery_hint=None,
-        blocked_by=None,
-        last_recovery={"source": str(source), "at": _now_utc(), "evidence": evidence or {}},
-    )
+def _clear_post_maintenance_motion_block(
+    *,
+    source: str,
+    expected_latch_generation: int,
+    evidence: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    with _maintenance_state_lock:
+        if (
+            _maintenance_latch_generation != expected_latch_generation
+            or _maintenance_state.get("motion_blocked") is not True
+            or _maintenance_state.get("recovery_required") is not True
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "motion_recovery_latch_changed",
+                    "message": "Maintenance state changed while recovery was running; the current motion latch remains authoritative.",
+                    "hardware_motion_commanded": False,
+                    "maintenance_state": dict(_maintenance_state),
+                },
+            )
+        return _set_maintenance_state(
+            transition=source,
+            usb_owner="service",
+            motion_blocked=False,
+            recovery_required=False,
+            block_reason=None,
+            recovery_hint=None,
+            blocked_by=None,
+            last_recovery={"source": str(source), "at": _now_utc(), "evidence": evidence or {}},
+        )
 
 
 def _complete_non_homing_motion_recovery(
     recovery: Any,
     *,
     source: str,
+    expected_latch_generation: int,
     evidence: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Clear the maintenance block only from exact, non-homing live proof."""
@@ -318,16 +346,21 @@ def _complete_non_homing_motion_recovery(
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    return _clear_post_maintenance_motion_block(source=source, evidence=evidence)
+    return _clear_post_maintenance_motion_block(
+        source=source,
+        expected_latch_generation=expected_latch_generation,
+        evidence=evidence,
+    )
 
 
-def _require_non_homing_motion_recovery_pending() -> None:
+def _require_non_homing_motion_recovery_pending() -> int:
     """Admit strict-startup recovery only for an explicit active latch."""
-    if (
-        _maintenance_state.get("motion_blocked") is True
-        and _maintenance_state.get("recovery_required") is True
-    ):
-        return
+    with _maintenance_state_lock:
+        if (
+            _maintenance_state.get("motion_blocked") is True
+            and _maintenance_state.get("recovery_required") is True
+        ):
+            return _maintenance_latch_generation
     raise HTTPException(
         status_code=409,
         detail={
@@ -3795,6 +3828,14 @@ async def _run_blocking(label: str, func, timeout_s: float = 30.0):
             raise HTTPException(status_code=504, detail=f"{label} timed out after {timeout_s:.0f}s") from exc
 
 
+async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0):
+    """Run a stop/E-stop lane without waiting for the normal tester-operation lock."""
+    try:
+        return await asyncio.wait_for(run_in_threadpool(func), timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=f"{label} timed out after {timeout_s:.0f}s") from exc
+
+
 def _pick_capture_device(tester: BioXpTester, preferred: str) -> dict:
     pick = tester.camera_wait_pick_device(
         preferred=preferred,
@@ -4534,7 +4575,7 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    _require_non_homing_motion_recovery_pending()
+    latch_generation = _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     recovery = await _run_blocking(
         "Post-maintenance motion recovery",
@@ -4554,6 +4595,7 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
     maintenance = _complete_non_homing_motion_recovery(
         recovery,
         source="maintenance_usb_recover_motion",
+        expected_latch_generation=latch_generation,
         evidence=evidence,
     )
     return {
@@ -4709,7 +4751,7 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    _require_non_homing_motion_recovery_pending()
+    latch_generation = _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
@@ -4719,6 +4761,7 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
     maintenance = _complete_non_homing_motion_recovery(
         response,
         source="motion_arm_strict_startup",
+        expected_latch_generation=latch_generation,
         evidence={
             "strict_startup": response,
             "run_homing": False,
@@ -5212,7 +5255,7 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
             raise HTTPException(status_code=409, detail=payload)
         return payload
 
-    return await _run_blocking(
+    return await _run_safety_interrupt_blocking(
         f"OEM {req.axis} diagnostic stop",
         stop_and_verify,
         timeout_s=25.0,
@@ -5833,7 +5876,8 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
 
 @app.get("/camera/status", response_model=CameraStatusResponse)
 async def camera_status():
-    return _camera_provider.status().to_payload()
+    status = await run_in_threadpool(_camera_provider.status)
+    return status.to_payload()
 
 
 @app.get("/camera/frame/latest")

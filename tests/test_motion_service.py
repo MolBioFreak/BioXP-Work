@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -1066,6 +1067,48 @@ def test_remote_strict_startup_valid_result_clears_block_and_capability_is_adver
     assert result["maintenance_state"]["last_recovery"]["evidence"]["operator_reason"] == (
         "supervised non-homing recovery after maintenance"
     )
+
+
+def test_remote_strict_startup_cannot_clear_newer_maintenance_block(monkeypatch):
+    api = load_api(monkeypatch)
+    recovery_started = threading.Event()
+    allow_recovery_to_finish = threading.Event()
+
+    class FakeTester:
+        def motion_arm_strict_startup(self, *, run_homing=False):
+            assert run_homing is False
+            recovery_started.set()
+            assert allow_recovery_to_finish.wait(timeout=2.0)
+            return _successful_non_homing_recovery_result()
+
+    api._tester = FakeTester()
+    api._mark_post_maintenance_motion_block(source="older-maintenance", reason="older latch")
+
+    async def scenario():
+        task = asyncio.create_task(
+            api.motion_arm_strict_startup(
+                api.MotionArmStartupRequest(
+                    run_homing=False,
+                    operator_ack="RECOVER_MOTION",
+                    operator_reason="recover only the observed older latch",
+                )
+            )
+        )
+        assert await asyncio.to_thread(recovery_started.wait, 1.0)
+        api._mark_post_maintenance_motion_block(source="newer-maintenance", reason="newer latch")
+        allow_recovery_to_finish.set()
+        with pytest.raises(HTTPException) as exc_info:
+            await task
+        return exc_info.value
+
+    exc = asyncio.run(scenario())
+    assert exc.status_code == 409
+    assert exc.detail["error"] == "motion_recovery_latch_changed"
+    assert exc.detail["hardware_motion_commanded"] is False
+    state = api._maintenance_state_payload()
+    assert state["motion_blocked"] is True
+    assert state["recovery_required"] is True
+    assert state["blocked_by"] == "newer-maintenance"
 
 
 def test_protocol_live_move_is_blocked_after_maintenance_before_executor(monkeypatch):

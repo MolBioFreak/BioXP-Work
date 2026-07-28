@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,3 +134,24 @@ def test_snapshot_route_returns_exact_provider_owned_jpeg_and_integrity_headers(
     assert response.headers["content-length"] == str(len(content))
     assert response.headers["etag"] == f'"{digest}"'
     assert response.headers["x-content-sha256"] == digest
+
+
+def test_camera_status_does_not_block_event_loop(monkeypatch):
+    from src.bioxp import api
+
+    class Provider:
+        def status(self):
+            time.sleep(0.2)
+            return SimpleNamespace(to_payload=lambda: {"available": False})
+
+    monkeypatch.setattr(api, "_camera_provider", Provider())
+
+    async def scenario():
+        started = time.perf_counter()
+        task = asyncio.create_task(api.camera_status())
+        await asyncio.sleep(0.02)
+        event_loop_delay = time.perf_counter() - started
+        await task
+        return event_loop_delay
+
+    assert asyncio.run(scenario()) < 0.1
