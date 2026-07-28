@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -116,6 +116,7 @@ from .vision.barcode import BarcodeReadCommand
 from .vision.inspection import InspectionCommand
 
 _tester: Optional[BioXpTester] = None
+_quarantined_tester: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
@@ -282,7 +283,7 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    global _tester, _startup_error, _pipette_transport
+    global _tester, _startup_error, _pipette_transport, _quarantined_tester
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)
@@ -318,12 +319,16 @@ async def lifespan(app: FastAPI):
         close_fn = getattr(_pipette_transport, "close", None)
         if callable(close_fn):
             close_fn()
-        tester = _tester
-        if tester is not None:
+        testers = [tester for tester in (_tester, _quarantined_tester) if tester is not None]
+        for tester in testers:
             disconnect = getattr(tester, "_disconnect", None)
             if callable(disconnect):
-                disconnect()
+                try:
+                    disconnect()
+                except Exception:
+                    pass
         _tester = None
+        _quarantined_tester = None
         _pipette_transport = None
         _ownership_changed(
             reason="generic_lifespan_shutdown",
@@ -345,6 +350,11 @@ app.include_router(oem_homing_router)
 
 
 def _get_tester() -> BioXpTester:
+    if _quarantined_tester is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=_startup_error or "BioXP USB runtime is quarantined after cleanup failure.",
+        )
     if _tester is None:
         raise HTTPException(
             status_code=503,
@@ -413,24 +423,43 @@ class _LifecycleHardware:
         self.tester = tester
 
     def set_led_rgb(self, r: int, g: int, b: int) -> dict[str, Any]:
-        return self.tester.strip_set_rgb(int(r), int(g), int(b), reconnect_first=False)
+        return self.tester.strip_set_rgb(
+            int(r),
+            int(g),
+            int(b),
+            reconnect_first=False,
+            activate_first=False,
+            fail_fast=True,
+        )
 
     def query_door(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 1, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "door"}
+        return {
+            "ok": self.tester._tmcl_success(ack),
+            "value": None if ack is None else ack.get("value"),
+            "ack": ack,
+            "query": "door",
+        }
 
     def query_latch(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 3, 0, 0)
-        return {"value": None if ack is None else ack.get("value"), "ack": ack, "query": "latch"}
+        return {
+            "ok": self.tester._tmcl_success(ack),
+            "value": None if ack is None else ack.get("value"),
+            "ack": ack,
+            "query": "latch",
+        }
 
     def set_solenoid(self, value: int) -> dict[str, Any]:
-        return self.tester.deck_io_set_type(2, int(value))
+        result = self.tester.deck_io_set_type(2, int(value))
+        return {**result, "ok": result.get("ok") is True}
 
     def query_voltage(self) -> dict[str, Any]:
         ack = self.tester.query_only_tmcl(self.tester.BOARD_DECK, 15, 0, 0, 0)
         status = None if ack is None else ack.get("status")
         value = None if ack is None or status != 100 else ack.get("value")
         return {
+            "ok": bool(ack is not None and status == 100 and value is not None),
             "payload_raw": value,
             "reply_present": ack is not None,
             "transport_outcome": "reply" if ack is not None else "no_reply",
@@ -439,10 +468,12 @@ class _LifecycleHardware:
         }
 
     def deactivate_boards(self) -> dict[str, Any]:
-        return self.tester.deactivate_boards(expect_reply=True)
+        acks = self.tester.deactivate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
     def activate_boards(self) -> dict[str, Any]:
-        return self.tester.activate_boards(expect_reply=True)
+        acks = self.tester.activate_boards(expect_reply=True, fail_fast=True)
+        return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
 
 def _can_ready_observation() -> bool | None:
@@ -2994,13 +3025,21 @@ def _status_payload() -> dict:
     can_ready = transport.get("CAN_READY") if isinstance(transport, dict) else None
     if can_ready is None:
         can_ready = (projection.get("ownership") or {}).get("CAN_READY")
+    ownership = projection.get("ownership") or {}
+    runtime_available = bool(
+        _tester is not None
+        and _pipette_transport is not None
+        and ownership.get("transport") == "owned"
+        and ownership.get("usb") == "service"
+        and ownership.get("router") == "running"
+    )
     lifecycle = lifecycle_state.projection()
     return {
         **projection,
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
         "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
-        "runtime_available": transport.get("runtime_available") if isinstance(transport, dict) else None,
+        "runtime_available": runtime_available,
         "hardware_connected": can_ready,
         "hardware_connected_deprecated": "maps only to OEM CAN_READY",
         "startup_error": _startup_error,
@@ -4418,6 +4457,34 @@ async def get_status():
     return _status_payload()
 
 
+def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
+    """Require live transport ownership plus successful board replies.
+
+    A generic snapshot is not readiness proof.  The proof must originate from
+    the same atomic collection and include the query-only transport's live
+    CAN result as well as every collected board response.
+    """
+    domains = snapshot.get("domains")
+    if not isinstance(domains, Mapping):
+        return False
+    transport_row = domains.get("transport")
+    boards_row = domains.get("boards")
+    transport = transport_row.get("observation") if isinstance(transport_row, Mapping) else None
+    boards = boards_row.get("observation") if isinstance(boards_row, Mapping) else None
+    internal = transport.get("transport_internal_observation") if isinstance(transport, Mapping) else None
+    if not isinstance(internal, Mapping) or internal.get("CAN_READY") is not True:
+        return False
+    if internal.get("usb_bound") is not True or internal.get("router_running") is not True:
+        return False
+    if not isinstance(boards, Mapping) or not boards:
+        return False
+    for row in boards.values():
+        ack = row.get("ack") if isinstance(row, Mapping) else None
+        if not isinstance(ack, Mapping) or ack.get("status") != 100:
+            return False
+    return True
+
+
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
@@ -4426,9 +4493,22 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:
+        def collect_and_publish() -> dict[str, Any]:
+            result = hardware_state.collect(requested, _hardware_collectors(tester))
+            snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
+            if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
+                return result
+            promotion = hardware_state.publish_can_ready_from_snapshot(
+                snapshot_id=str(snapshot["snapshot_id"]),
+                reason="explicit_query_only_snapshot_can_ready",
+            )
+            if promotion.get("published"):
+                result["snapshot"] = promotion["snapshot"]
+                result["can_ready_published"] = True
+            return result
         return await _run_blocking(
             "Canonical hardware snapshot collection",
-            lambda: hardware_state.collect(requested, _hardware_collectors(tester)),
+            collect_and_publish,
             timeout_s=max(30.0, 15.0 * float(len(requested))),
         )
     except ValueError as exc:
@@ -4509,6 +4589,93 @@ async def maintenance_usb_reconnect(request: Request):
             usb_owner="service",
         )
     return {"ok": True, "mode": "maintenance", "usb_owner": "service", "message": "USB runtime reconnected; motion is blocked until recovery.", "maintenance_state": maintenance}
+
+
+async def _oem_runtime_activate_service_transaction(abort_requested: threading.Event) -> dict[str, Any]:
+    global _tester, _startup_error, _pipette_transport, _quarantined_tester
+    async with _tester_lock:
+        if _quarantined_tester is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=_startup_error or "BioXP USB runtime is quarantined after cleanup failure",
+            )
+        if (_tester is None) != (_pipette_transport is None):
+            raise HTTPException(status_code=503, detail="BioXP runtime ownership is internally inconsistent")
+        already_active = _tester is not None and _pipette_transport is not None
+        if _tester is None:
+            candidate = None
+            try:
+                alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
+                candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
+                if abort_requested.is_set():
+                    disconnect = getattr(candidate, "_disconnect", None)
+                    if callable(disconnect):
+                        await run_in_threadpool(disconnect)
+                    raise asyncio.CancelledError
+                candidate_transport = build_default_pipette_transport(shared_usb=candidate)
+                _tester = candidate
+                _pipette_transport = candidate_transport
+                _startup_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                candidate = candidate or getattr(exc, "partial_owner", None)
+                cleanup_error = None
+                disconnect = getattr(candidate, "_disconnect", None)
+                if callable(disconnect):
+                    try:
+                        await run_in_threadpool(disconnect)
+                    except Exception as cleanup_exc:
+                        cleanup_error = str(cleanup_exc)
+                cleanup_failed = bool(cleanup_error or getattr(candidate, "_construction_cleanup_failed", False))
+                _tester = None
+                _quarantined_tester = candidate if cleanup_failed else None
+                _pipette_transport = None
+                _startup_error = str(exc)
+                if cleanup_error:
+                    _startup_error = f"{_startup_error}; partial USB owner cleanup failed: {cleanup_error}"
+                raise HTTPException(status_code=503, detail=_startup_error) from exc
+        elif not already_active:
+            raise HTTPException(status_code=503, detail="BioXP runtime ownership is internally inconsistent")
+        if already_active:
+            maintenance = _maintenance_state_payload()
+        else:
+            _ownership_changed(
+                reason="oem_runtime_activate_service",
+                transport="owned",
+                usb="service",
+                router="running",
+            )
+            maintenance = _mark_post_maintenance_motion_block(
+                source="oem_runtime_activate_service",
+                reason="Service USB ownership activated; motion remains blocked.",
+                usb_owner="service",
+            )
+    return {
+        "ok": True,
+        "usb_owner": "service",
+        "snapshot_collected": False,
+        "motion_recovered": False,
+        "motion_commanded": False,
+        "already_active": already_active,
+        "maintenance_state": maintenance,
+    }
+
+
+@app.post("/oem/runtime/activate_service")
+async def oem_runtime_activate_service():
+    """Claim service USB ownership without snapshot, recovery, homing, or motion."""
+    abort_requested = threading.Event()
+    transaction = asyncio.create_task(_oem_runtime_activate_service_transaction(abort_requested))
+    try:
+        return await asyncio.shield(transaction)
+    except asyncio.CancelledError as cancellation:
+        abort_requested.set()
+        try:
+            await asyncio.shield(transaction)
+        except BaseException:
+            pass
+        raise cancellation
 
 
 @app.post("/maintenance/usb/recover_motion")

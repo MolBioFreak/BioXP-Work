@@ -50,6 +50,12 @@ class UvcXuControlQuery(ctypes.Structure):
     ]
 
 
+class BioXpConstructionCleanupError(RuntimeError):
+    def __init__(self, message, *, partial_owner):
+        super().__init__(message)
+        self.partial_owner = partial_owner
+
+
 class BioXpTester:
     BOARD_HEAD = 0x04
     BOARD_DECK = 0x05
@@ -404,8 +410,20 @@ class BioXpTester:
             "seq": 0,
         }
         self._motion_last_strict_init = None
-        self._connect()
-        self._led_state_cache = self.load_led_state()
+        try:
+            self._connect()
+            self._led_state_cache = self.load_led_state()
+        except Exception as exc:
+            try:
+                self._disconnect()
+            except Exception as cleanup_exc:
+                self._construction_cleanup_failed = True
+                error = BioXpConstructionCleanupError(
+                    f"BioXP construction failed and USB cleanup failed: {cleanup_exc}",
+                    partial_owner=self,
+                )
+                raise error from exc
+            raise
 
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
@@ -487,10 +505,15 @@ class BioXpTester:
 
     def _disconnect(self, dev=None, *, hard_reset=False, return_device=False):
         with self._transport_guard():
+            cleanup_errors = []
             router = getattr(self, "novo_router", None)
             if router is not None:
-                router.shutdown()
-                self.novo_router = None
+                try:
+                    router.shutdown()
+                except Exception as exc:
+                    cleanup_errors.append(f"router shutdown failed: {exc}")
+                finally:
+                    self.novo_router = None
             if dev is None:
                 dev = self.dev
             if dev is self.dev:
@@ -516,12 +539,14 @@ class BioXpTester:
             except Exception as exc:
                 summary["release_interface_ok"] = False
                 summary["release_interface_error"] = str(exc)
+                cleanup_errors.append(f"release interface failed: {exc}")
             try:
                 usb.util.dispose_resources(dev)
                 summary["dispose_resources_ok"] = True
             except Exception as exc:
                 summary["dispose_resources_ok"] = False
                 summary["dispose_resources_error"] = str(exc)
+                cleanup_errors.append(f"dispose resources failed: {exc}")
             if hard_reset:
                 try:
                     dev.reset()
@@ -529,6 +554,9 @@ class BioXpTester:
                 except Exception as exc:
                     summary["hard_reset_ok"] = False
                     summary["hard_reset_error"] = str(exc)
+                    cleanup_errors.append(f"hard reset failed: {exc}")
+            if cleanup_errors:
+                raise RuntimeError("; ".join(cleanup_errors))
             return dev if return_device else summary
 
     def _reset_transport_recovery_state(self):
@@ -990,7 +1018,21 @@ class BioXpTester:
         else:
             initialized.discard(int(board_id))
 
-    def _set_boards_active(self, active: bool, expect_reply=True):
+    def _oem_board_activation_ack_success(self, board_id, ack):
+        status = int(ack.get("status", -1)) if isinstance(ack, dict) else -1
+        return status == 100 or (int(board_id) == int(self.BOARD_CHILLER) and status == 2)
+
+    def _oem_board_activation_map_success(self, rows):
+        return bool(
+            isinstance(rows, dict)
+            and all(int(board) in rows for board in self.BOARDS)
+            and all(
+                self._oem_board_activation_ack_success(board, rows.get(int(board)))
+                for board in self.BOARDS
+            )
+        )
+
+    def _set_boards_active(self, active: bool, expect_reply=True, fail_fast=False):
         if active:
             self.enable_motor_power()
         out = {}
@@ -1016,20 +1058,22 @@ class BioXpTester:
             out[bid] = ack
             if expect_reply:
                 self._record_oem_board_activation(bid, active=active, ack=ack)
+                if fail_fast and not self._oem_board_activation_ack_success(bid, ack):
+                    break
             time.sleep(0.005)
         return out
 
-    def activate_boards(self, expect_reply=True):
-        return self._set_boards_active(True, expect_reply=expect_reply)
+    def activate_boards(self, expect_reply=True, fail_fast=False):
+        return self._set_boards_active(True, expect_reply=expect_reply, fail_fast=fail_fast)
 
-    def deactivate_boards(self, expect_reply=True):
+    def deactivate_boards(self, expect_reply=True, fail_fast=False):
         """OEM initialCheck board-cycle counterpart to activate_boards().
 
         Command 64 value 0 places the motion/auxiliary boards into inactive state.
         This is intentionally explicit because live OEM initialCheck requires a
         deactivate -> activate cycle rather than silently skipping the first half.
         """
-        return self._set_boards_active(False, expect_reply=expect_reply)
+        return self._set_boards_active(False, expect_reply=expect_reply, fail_fast=fail_fast)
 
     def board_activate(self, board_id):
         ack = self.send_tmcl_retry(
@@ -1896,7 +1940,16 @@ class BioXpTester:
                     time.sleep(0.03)
         return {"status": st, "rows": rows}
 
-    def strip_set_rgb(self, r, g, b, reconnect_first=True):
+    def strip_set_rgb(
+        self,
+        r,
+        g,
+        b,
+        reconnect_first=True,
+        *,
+        activate_first=True,
+        fail_fast=False,
+    ):
         """
         Main strip control using the proven visible path (RGB channels 0/1/2).
         """
@@ -1908,8 +1961,9 @@ class BioXpTester:
 
         if reconnect_first:
             self.reconnect()
-        self.activate_boards(expect_reply=False)
-        sent += len(self.BOARDS)
+        if activate_first:
+            self.activate_boards(expect_reply=False)
+            sent += len(self.BOARDS)
 
         acks = {}
         for mask, level, key in ((0, r, "r"), (1, g, "g"), (2, b, "b")):
@@ -1928,14 +1982,18 @@ class BioXpTester:
                 strict_match=True,
             )
             sent += 1
-            if ack is None:
+            accepted = self._tmcl_success(ack)
+            if ack is None and not fail_fast:
                 # Fallback write when ack path is flaky.
                 self.send_tmcl(self.BOARD_DECK, 50, 0, mask, sval, wait_reply=False, write_timeout_ms=25)
                 sent += 1
             acks[key] = ack
+            if fail_fast and not accepted:
+                break
             time.sleep(0.04)
 
         return {
+            "ok": bool(len(acks) == 3 and all(self._tmcl_success(ack) for ack in acks.values())),
             "rgb": (r, g, b),
             "tmcl": (
                 self._led_scale_to_tmcl(r),
@@ -3954,7 +4012,24 @@ class BioXpTester:
             activation_counter += 1
             if activation_counter >= activation_every_polls:
                 activation_counter = 0
-                activations.append(self.activate_boards(expect_reply=True))
+                activation = self.activate_boards(expect_reply=True, fail_fast=True)
+                activations.append(activation)
+                if not self._oem_board_activation_map_success(activation):
+                    return {
+                        "ok": False,
+                        "error": "waitForBoard_activation_failed",
+                        "polls": polls,
+                        "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                        "timeout_s": timeout_s,
+                        "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                        "initialized_boards": sorted(initialized),
+                        "missing_boards": missing,
+                        "activations": activations,
+                        "physical_motion": False,
+                        "motion_commanded": False,
+                        "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                        "linux_guardrail": "fail_fast_board_activation",
+                    }
 
     def _oem_no_motion_tmcl(self, *, name, board, command, cmd_type, motor, value):
         ack = self.send_tmcl(
@@ -3997,6 +4072,16 @@ class BioXpTester:
             return row
 
         def tx(name, board, command, cmd_type, motor, value):
+            # The aggregate startup contract is stricter than the historical
+            # best-effort helper: once a controller rejects a write, no later
+            # hardware operation may be issued in this stage.
+            if failures:
+                return {
+                    "name": str(name),
+                    "ok": False,
+                    "skipped": True,
+                    "blocked_by": failures[0].get("name"),
+                }
             return record(
                 self._oem_no_motion_tmcl(
                     name=name,
@@ -6833,7 +6918,9 @@ class BioXpTester:
             strict_match=True,
             post_delay_s=self.THERMAL_WRITE_SETTLE_S,
         )
-        return {"ack": ack, "ok": self._tmcl_success_or_invalid(ack)}
+        # Status 2 is an OEM exception only for ClassChillerBoard activation.
+        # The thermal board is a distinct controller and must acknowledge 100.
+        return {"ack": ack, "ok": self._tmcl_success(ack)}
 
     def thermal_query_firmware(self):
         ack = self._send_thermal(
