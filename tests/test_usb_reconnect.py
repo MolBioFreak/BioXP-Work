@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -44,6 +46,28 @@ def _make_tester(connect_outcomes):
 
     tester._connect = fake_connect
     return tester, connect_calls
+
+
+@pytest.mark.parametrize("failed_step", ["release", "dispose"])
+def test_disconnect_report_is_not_ok_when_any_usb_release_step_fails(monkeypatch, failed_step):
+    tester, _ = _make_tester([])
+
+    def release(dev, iface):
+        if failed_step == "release":
+            raise RuntimeError("release failed")
+
+    def dispose(dev):
+        if failed_step == "dispose":
+            raise RuntimeError("dispose failed")
+
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", release)
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", dispose)
+
+    report = tester._disconnect()
+
+    assert report["ok"] is False
+    assert report["release_interface_ok"] is (failed_step != "release")
+    assert report["dispose_resources_ok"] is (failed_step != "dispose")
 
 
 def test_reconnect_prefers_soft_rebind_before_usb_reset(monkeypatch):

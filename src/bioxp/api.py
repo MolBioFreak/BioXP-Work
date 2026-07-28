@@ -477,6 +477,17 @@ def _get_tester() -> BioXpTester:
     return _tester
 
 
+def _require_complete_disconnect_report(report: Any) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        raise RuntimeError("USB disconnect returned no authoritative completion report")
+    required = ("ok", "release_interface_ok", "dispose_resources_ok")
+    if any(report.get(field) is not True for field in required):
+        raise RuntimeError(f"USB disconnect was incomplete: {report}")
+    if report.get("hard_reset_requested") is True and report.get("hard_reset_ok") is not True:
+        raise RuntimeError(f"USB hard reset was incomplete: {report}")
+    return report
+
+
 def _get_oem_startup_program(*, dry_safe: bool = False) -> OEMStartupProgram:
     global _oem_startup_program
     base = os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE") or "/tmp/bioxp-live-runs"
@@ -4616,19 +4627,27 @@ async def maintenance_usb_release(request: Request):
         tester = _tester
         quarantined = _tester_quarantine
         if tester is not None or quarantined is not None:
-            def disconnect_owned_runtime():
+            failed_owner = quarantined or tester
+            try:
                 close_fn = getattr(_pipette_transport, "close", None)
                 if callable(close_fn):
-                    close_fn()
+                    await run_in_threadpool(close_fn)
                 owners = (tester,) if quarantined is tester else (tester, quarantined)
                 for owner in owners:
                     if owner is None:
                         continue
+                    failed_owner = owner
                     disconnect = getattr(owner, "_disconnect", None)
-                    if callable(disconnect):
-                        disconnect()
-
-            await run_in_threadpool(disconnect_owned_runtime)
+                    if not callable(disconnect):
+                        raise RuntimeError("USB owner has no authoritative disconnect operation")
+                    report = await run_in_threadpool(disconnect)
+                    _require_complete_disconnect_report(report)
+            except Exception as exc:
+                _tester = None
+                _tester_quarantine = failed_owner
+                _pipette_transport = None
+                _startup_error = f"BioXP USB release incomplete; owner quarantined: {exc}"
+                raise HTTPException(status_code=503, detail=_startup_error) from exc
         _tester = None
         _tester_quarantine = None
         _pipette_transport = None
@@ -4673,10 +4692,14 @@ async def maintenance_usb_reconnect(request: Request):
                 disconnect = getattr(candidate, "_disconnect", None)
                 if callable(disconnect):
                     try:
-                        await run_in_threadpool(disconnect)
+                        report = await run_in_threadpool(disconnect)
+                        _require_complete_disconnect_report(report)
                     except Exception as cleanup_exc:
                         cleanup_error = cleanup_exc
                         _tester_quarantine = candidate
+                else:
+                    cleanup_error = RuntimeError("USB candidate has no authoritative disconnect operation")
+                    _tester_quarantine = candidate
             _tester = None
             _pipette_transport = None
             _startup_error = str(exc)

@@ -10,6 +10,13 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 
+@pytest.fixture(autouse=True)
+def isolate_tester_quarantine(monkeypatch):
+    from src.bioxp import api
+
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+
+
 def test_catalog_exposes_complete_finite_robot_owned_actions():
     from src.bioxp.oem_axis_diagnostics import AXIS_DIAGNOSTIC_CATALOG, diagnostic_catalog
 
@@ -267,6 +274,7 @@ def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
 
         def _disconnect(self):
             self.disconnected = True
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
     tester = Tester()
     monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
@@ -313,6 +321,7 @@ def test_interrupt_timeout_keeps_connection_lease_until_worker_exits(monkeypatch
 
         def _disconnect(self):
             self.disconnected = True
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
     tester = Tester()
     monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
@@ -361,6 +370,7 @@ def test_cancelled_maintenance_release_retains_leases_until_disconnect_exits(mon
         def _disconnect(self):
             disconnect_entered.set()
             assert allow_disconnect_exit.wait(1.0)
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
         def _motion_oem_axis_profile(self, axis, startup=False):
             return {"board": 3, "motor": 0}
@@ -625,6 +635,7 @@ def test_maintenance_reconnect_disconnects_candidate_when_wrapper_build_fails(mo
 
         def _disconnect(self):
             self.disconnected = True
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
     def fail_wrapper_build(*, shared_usb):
         raise RuntimeError("wrapper construction failed")
@@ -687,3 +698,68 @@ def test_failed_reconnect_cleanup_quarantines_owner_and_blocks_retry(monkeypatch
     assert retry_error.value.status_code == 503
     assert len(candidates) == 1
     assert api._tester_quarantine is candidates[0]
+
+
+def test_structured_reconnect_cleanup_failure_quarantines_owner_and_blocks_retry(monkeypatch):
+    from src.bioxp import api
+
+    candidates = []
+
+    class Tester:
+        def __init__(self, *, alt):
+            candidates.append(self)
+
+        def _disconnect(self):
+            return {"ok": False, "release_interface_ok": False, "dispose_resources_ok": True}
+
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "BioXpTester", Tester)
+    monkeypatch.setattr(
+        api,
+        "build_default_pipette_transport",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("wrapper construction failed")),
+    )
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    with pytest.raises(HTTPException) as first_error:
+        asyncio.run(api.maintenance_usb_reconnect(request))
+    assert first_error.value.status_code == 503
+    assert api._tester is None
+    assert api._tester_quarantine is candidates[0]
+
+    with pytest.raises(HTTPException):
+        asyncio.run(api.maintenance_usb_reconnect(request))
+    assert len(candidates) == 1
+
+
+def test_structured_maintenance_release_failure_retains_quarantine(monkeypatch):
+    from src.bioxp import api
+
+    class Tester:
+        def _disconnect(self):
+            return {"ok": False, "release_interface_ok": True, "dispose_resources_ok": False}
+
+    tester = Tester()
+    ownership_events = []
+    maintenance_marks = []
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "_ownership_changed", lambda **kwargs: ownership_events.append(kwargs))
+    monkeypatch.setattr(api, "_mark_post_maintenance_motion_block", lambda **kwargs: maintenance_marks.append(kwargs))
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.maintenance_usb_release(request))
+
+    assert exc_info.value.status_code == 503
+    assert api._tester is None
+    assert api._tester_quarantine is tester
+    assert ownership_events == []
+    assert maintenance_marks == []

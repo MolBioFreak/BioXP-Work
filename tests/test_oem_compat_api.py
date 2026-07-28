@@ -166,9 +166,11 @@ def test_maintenance_usb_release_is_localhost_only_and_disconnects_owned_runtime
 
         def _disconnect(self):
             self.disconnected = True
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
     fake = FakeTester()
     monkeypatch.setattr(api, "_tester", fake)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
     monkeypatch.setattr(api, "_startup_error", None)
     client = TestClient(api.app)
 
@@ -210,6 +212,7 @@ def test_maintenance_usb_reconnect_is_localhost_only_and_recreates_runtime(monke
 
     monkeypatch.setattr(api, "BioXpTester", FakeTester)
     monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
     monkeypatch.setattr(api, "_startup_error", "released")
     client = TestClient(api.app)
 

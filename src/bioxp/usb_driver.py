@@ -529,7 +529,15 @@ class BioXpTester:
                 except Exception as exc:
                     summary["hard_reset_ok"] = False
                     summary["hard_reset_error"] = str(exc)
-            return dev if return_device else summary
+            required = [summary["release_interface_ok"], summary["dispose_resources_ok"]]
+            if hard_reset:
+                required.append(summary["hard_reset_ok"])
+            summary["ok"] = all(value is True for value in required)
+            if return_device:
+                if summary["ok"] is not True:
+                    raise RuntimeError(f"USB disconnect was incomplete: {summary}")
+                return dev
+            return summary
 
     def _reset_transport_recovery_state(self):
         self._chiller_noresp_streak = 0

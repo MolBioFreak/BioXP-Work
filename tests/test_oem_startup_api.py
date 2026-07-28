@@ -40,6 +40,7 @@ def test_oem_switch_audit_api_status_mode(monkeypatch, tmp_path):
 
     monkeypatch.setenv("BIOXP_OEM_STARTUP_ARTIFACT_BASE", str(tmp_path))
     monkeypatch.setattr(api, "_tester", object())
+    monkeypatch.setattr(api, "_tester_quarantine", None)
     monkeypatch.setattr(api, "_startup_error", None)
     monkeypatch.setattr(api, "_BioXpSwitchAuditHardware", lambda tester: OfflineSwitchAuditFixture())
     client = TestClient(api.app)

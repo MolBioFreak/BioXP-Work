@@ -831,11 +831,14 @@ def test_maintenance_usb_release_blocks_live_axis_motion_until_recovery(monkeypa
     class FakeTester:
         def _disconnect(self):
             disconnected.append("disconnect")
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
 
     async def fake_runner(*args, **kwargs):
         raise AssertionError("live motion runner must not be called while maintenance recovery is required")
 
-    api._tester = FakeTester()
+    monkeypatch.setattr(api, "_tester", FakeTester())
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
     result = asyncio.run(api.maintenance_usb_release(_LocalRequest()))
 
     assert disconnected == ["disconnect"]

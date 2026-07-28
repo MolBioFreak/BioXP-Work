@@ -1,5 +1,6 @@
 import json
 
+from src.bioxp import usb_driver
 from src.bioxp.usb_driver import BioXpTester
 
 
@@ -27,12 +28,14 @@ def test_disconnect_default_result_is_json_serializable_for_artifacts():
     assert tester.ep_in is None
 
 
-def test_disconnect_can_preserve_device_return_for_reconnect_recovery():
+def test_disconnect_can_preserve_device_return_for_reconnect_recovery(monkeypatch):
     tester = object.__new__(BioXpTester)
     fake = FakeUsbDevice()
     tester.dev = fake
     tester.ep_out = object()
     tester.ep_in = object()
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda dev, iface: None)
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: None)
 
     result = tester._disconnect(return_device=True)
 
