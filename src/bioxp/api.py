@@ -139,6 +139,7 @@ from .vision.barcode import BarcodeReadCommand
 from .vision.inspection import InspectionCommand
 
 _tester: Optional[BioXpTester] = None
+_tester_quarantine: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 # Connection ownership transitions share this lease with the safety-interrupt
@@ -463,6 +464,11 @@ app.include_router(oem_homing_router)
 
 
 def _get_tester() -> BioXpTester:
+    if _tester_quarantine is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=_startup_error or "BioXP USB runtime has a quarantined partial owner requiring maintenance release.",
+        )
     if _tester is None:
         raise HTTPException(
             status_code=503,
@@ -4603,22 +4609,28 @@ async def maintenance_usb_state():
 @app.post("/maintenance/usb/release")
 async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
 
     async def transition():
-        global _tester, _startup_error, _pipette_transport
+        global _tester, _tester_quarantine, _startup_error, _pipette_transport
         tester = _tester
-        if tester is not None:
+        quarantined = _tester_quarantine
+        if tester is not None or quarantined is not None:
             def disconnect_owned_runtime():
                 close_fn = getattr(_pipette_transport, "close", None)
                 if callable(close_fn):
                     close_fn()
-                disconnect = getattr(tester, "_disconnect", None)
-                if callable(disconnect):
-                    disconnect()
+                owners = (tester,) if quarantined is tester else (tester, quarantined)
+                for owner in owners:
+                    if owner is None:
+                        continue
+                    disconnect = getattr(owner, "_disconnect", None)
+                    if callable(disconnect):
+                        disconnect()
 
             await run_in_threadpool(disconnect_owned_runtime)
         _tester = None
+        _tester_quarantine = None
         _pipette_transport = None
         _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
         _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
@@ -4635,21 +4647,41 @@ async def maintenance_usb_release(request: Request):
 @app.post("/maintenance/usb/reconnect")
 async def maintenance_usb_reconnect(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
 
     async def transition():
-        global _tester, _startup_error, _pipette_transport
+        global _tester, _tester_quarantine, _startup_error, _pipette_transport
+        if _tester_quarantine is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=_startup_error or "BioXP USB runtime has a quarantined partial owner requiring maintenance release.",
+            )
         if _tester is not None:
             return _maintenance_state_payload()
+        candidate = None
         try:
             alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
-            _tester = await run_in_threadpool(lambda: BioXpTester(alt=alt))
-            _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
+            candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
+            transport = build_default_pipette_transport(shared_usb=candidate)
+            _tester = candidate
+            _pipette_transport = transport
             _startup_error = None
             _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
         except Exception as exc:
+            cleanup_error = None
+            if candidate is not None:
+                disconnect = getattr(candidate, "_disconnect", None)
+                if callable(disconnect):
+                    try:
+                        await run_in_threadpool(disconnect)
+                    except Exception as cleanup_exc:
+                        cleanup_error = cleanup_exc
+                        _tester_quarantine = candidate
             _tester = None
+            _pipette_transport = None
             _startup_error = str(exc)
+            if cleanup_error is not None:
+                _startup_error = f"{_startup_error}; candidate cleanup failed: {cleanup_error}"
             raise HTTPException(status_code=503, detail=_startup_error) from exc
         return _mark_post_maintenance_motion_block(
             source="maintenance_usb_reconnect",
@@ -4875,31 +4907,34 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
 
 @app.post("/motion/hard_reset")
 async def motion_hard_reset(req: MotionHardResetRequest):
-    tester = _get_tester()
-    response = await _run_blocking(
+    async def transition():
+        tester = _get_tester()
+        response = await run_in_threadpool(lambda: tester.motor_hard_reset(rounds=req.rounds))
+        _ownership_changed(reason="motion_hard_reset", transport="owned", usb="service", router="running")
+        for axis in AxisName:
+            _reference_state_store.mark_desynced(
+                MarkAxisDesyncedCommand(
+                    axis=axis,
+                    reason="Motion hard reset executed; reference must be re-established.",
+                    source="motion_hard_reset",
+                    motion_kind="hard_reset",
+                )
+            )
+        maintenance = _mark_post_maintenance_motion_block(
+            source="motion_hard_reset",
+            reason="Motion hard reset executed; non-homing strict startup/recovery is required before live axis motion.",
+            usb_owner="service",
+        )
+        if isinstance(response, dict):
+            response = dict(response)
+            response["maintenance_state"] = maintenance
+        return response
+
+    return await _run_tester_transition(
         "Motion hard reset",
-        lambda: tester.motor_hard_reset(rounds=req.rounds),
+        transition,
         timeout_s=max(45.0, 20.0 * float(req.rounds)),
     )
-    _ownership_changed(reason="motion_hard_reset", transport="owned", usb="service", router="running")
-    for axis in AxisName:
-        _reference_state_store.mark_desynced(
-            MarkAxisDesyncedCommand(
-                axis=axis,
-                reason="Motion hard reset executed; reference must be re-established.",
-                source="motion_hard_reset",
-                motion_kind="hard_reset",
-            )
-        )
-    maintenance = _mark_post_maintenance_motion_block(
-        source="motion_hard_reset",
-        reason="Motion hard reset executed; non-homing strict startup/recovery is required before live axis motion.",
-        usb_owner="service",
-    )
-    if isinstance(response, dict):
-        response = dict(response)
-        response["maintenance_state"] = maintenance
-    return response
 
 
 @app.post("/motion/clear_lock")
@@ -5813,10 +5848,13 @@ async def thermal_fast_profile():
 
 @app.post("/thermal/hard_reset")
 async def thermal_hard_reset():
-    tester = _get_tester()
-    result = await _run_blocking("Thermal hard reset", tester.thermal_hard_reset, timeout_s=40.0)
-    _ownership_changed(reason="thermal_hard_reset", transport="owned", usb="service", router="running")
-    return result
+    async def transition():
+        tester = _get_tester()
+        result = await run_in_threadpool(tester.thermal_hard_reset)
+        _ownership_changed(reason="thermal_hard_reset", transport="owned", usb="service", router="running")
+        return result
+
+    return await _run_tester_transition("Thermal hard reset", transition, timeout_s=40.0)
 
 
 @app.post("/chiller/baseline")
@@ -5892,10 +5930,13 @@ async def set_chiller_rates(req: ChillerRatesRequest):
 
 @app.post("/chiller/hard_reset")
 async def chiller_hard_reset():
-    tester = _get_tester()
-    result = await _run_blocking("Chiller hard reset", tester.chiller_hard_reset, timeout_s=40.0)
-    _ownership_changed(reason="chiller_hard_reset", transport="owned", usb="service", router="running")
-    return result
+    async def transition():
+        tester = _get_tester()
+        result = await run_in_threadpool(tester.chiller_hard_reset)
+        _ownership_changed(reason="chiller_hard_reset", transport="owned", usb="service", router="running")
+        return result
+
+    return await _run_tester_transition("Chiller hard reset", transition, timeout_s=40.0)
 
 
 async def camera_devices():

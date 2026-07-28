@@ -343,18 +343,19 @@ def test_motion_hard_reset_marks_all_axes_desynced(monkeypatch):
     api = load_api(monkeypatch)
     recorded = []
 
-    async def fake_run_blocking(label, func, timeout_s=30.0):
-        del label, timeout_s
-        return {"ok": True, "rounds": 2}
+    class FakeTester:
+        def motor_hard_reset(self, *, rounds):
+            return {"ok": True, "rounds": rounds}
 
     class FakeStore:
         def mark_desynced(self, command):
             recorded.append(command)
             return {"ok": True}
 
-    monkeypatch.setattr(api, "_run_blocking", fake_run_blocking)
-    monkeypatch.setattr(api, "_get_tester", lambda: object())
+    monkeypatch.setattr(api, "_get_tester", lambda: FakeTester())
     monkeypatch.setattr(api, "_reference_state_store", FakeStore())
+    monkeypatch.setattr(api, "_ownership_changed", lambda **kwargs: None)
+    monkeypatch.setattr(api, "_mark_post_maintenance_motion_block", lambda **kwargs: {})
 
     result = asyncio.run(api.motion_hard_reset(api.MotionHardResetRequest(rounds=2)))
 

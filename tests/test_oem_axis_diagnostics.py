@@ -526,3 +526,164 @@ def test_public_reconnect_holds_transition_lease_against_stop(monkeypatch):
         assert stop_result["verified_stopped"] is True
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("route_name", ["motion", "thermal", "chiller"])
+def test_transport_replacing_hard_reset_holds_transition_lease_against_stop(monkeypatch, route_name):
+    from src.bioxp import api
+
+    reset_entered = threading.Event()
+    allow_reset_exit = threading.Event()
+    stop_called = threading.Event()
+
+    class Tester:
+        def _hard_reset(self):
+            reset_entered.set()
+            assert allow_reset_exit.wait(1.0)
+            return {"ok": True}
+
+        def motor_hard_reset(self, *, rounds):
+            return self._hard_reset()
+
+        def thermal_hard_reset(self):
+            return self._hard_reset()
+
+        def chiller_hard_reset(self):
+            return self._hard_reset()
+
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            return {"board": 3, "motor": 0}
+
+        def motor_stop(self, board, motor):
+            stop_called.set()
+            return {"ok": True, "board": board, "motor": motor}
+
+        def motor_axis_status(self, board, motor):
+            return {"ok": True, "speed": {"speed": 0}}
+
+        def motor_query_home_switch(self, board, motor):
+            return {"ok": True, "active": False}
+
+    class ReferenceStore:
+        def mark_desynced(self, command):
+            return {"ok": True}
+
+        def snapshot(self, axes):
+            return {"axes": [axis.value for axis in axes]}
+
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "_reference_state_store", ReferenceStore())
+    monkeypatch.setattr(api, "_ownership_changed", lambda **kwargs: None)
+    monkeypatch.setattr(api, "_mark_post_maintenance_motion_block", lambda **kwargs: {})
+
+    async def scenario():
+        if route_name == "motion":
+            reset_task = asyncio.create_task(api.motion_hard_reset(api.MotionHardResetRequest(rounds=1)))
+        elif route_name == "thermal":
+            reset_task = asyncio.create_task(api.thermal_hard_reset())
+        else:
+            reset_task = asyncio.create_task(api.chiller_hard_reset())
+
+        assert await asyncio.to_thread(reset_entered.wait, 1.0)
+        stop_task = asyncio.create_task(
+            api.motion_diagnostics_stop(
+                api.AxisDiagnosticStopRequest(
+                    axis="x",
+                    operator_ack="STOP_AXIS",
+                    reason=f"{route_name} hard reset transition lease regression",
+                    operator="independent safety regression",
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        stop_completed_during_reset = stop_task.done()
+        allow_reset_exit.set()
+        reset_result = await reset_task
+        stop_result = await stop_task
+        return stop_completed_during_reset, reset_result, stop_result
+
+    stop_completed, reset_result, stop_result = asyncio.run(scenario())
+    assert stop_completed is False
+    assert reset_result["ok"] is True
+    assert stop_result["verified_stopped"] is True
+    assert stop_called.is_set() is True
+
+
+def test_maintenance_reconnect_disconnects_candidate_when_wrapper_build_fails(monkeypatch):
+    from src.bioxp import api
+
+    candidates = []
+
+    class Tester:
+        def __init__(self, *, alt):
+            self.disconnected = False
+            candidates.append(self)
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    def fail_wrapper_build(*, shared_usb):
+        raise RuntimeError("wrapper construction failed")
+
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "BioXpTester", Tester)
+    monkeypatch.setattr(api, "build_default_pipette_transport", fail_wrapper_build)
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.maintenance_usb_reconnect(request))
+
+    assert exc_info.value.status_code == 503
+    assert len(candidates) == 1
+    assert candidates[0].disconnected is True
+    assert api._tester is None
+    assert api._pipette_transport is None
+
+
+def test_failed_reconnect_cleanup_quarantines_owner_and_blocks_retry(monkeypatch):
+    from src.bioxp import api
+
+    candidates = []
+
+    class Tester:
+        def __init__(self, *, alt):
+            candidates.append(self)
+
+        def _disconnect(self):
+            raise RuntimeError("USB release failed")
+
+    def fail_wrapper_build(*, shared_usb):
+        raise RuntimeError("wrapper construction failed")
+
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_tester_quarantine", None, raising=False)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "BioXpTester", Tester)
+    monkeypatch.setattr(api, "build_default_pipette_transport", fail_wrapper_build)
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    with pytest.raises(HTTPException) as first_error:
+        asyncio.run(api.maintenance_usb_reconnect(request))
+    assert first_error.value.status_code == 503
+    assert len(candidates) == 1
+    assert api._tester is None
+    assert api._tester_quarantine is candidates[0]
+
+    with pytest.raises(HTTPException) as getter_error:
+        api._get_tester()
+    assert getter_error.value.status_code == 503
+
+    with pytest.raises(HTTPException) as retry_error:
+        asyncio.run(api.maintenance_usb_reconnect(request))
+    assert retry_error.value.status_code == 503
+    assert len(candidates) == 1
+    assert api._tester_quarantine is candidates[0]
