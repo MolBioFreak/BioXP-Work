@@ -3882,6 +3882,36 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         ) from exc
 
 
+async def _run_tester_transition(label: str, operation, timeout_s: float | None = None):
+    """Run one complete tester ownership transition under cancellation-safe leases."""
+
+    async def leased_transition():
+        async with _tester_lock:
+            async with _tester_transition_lock:
+                return await operation()
+
+    worker = asyncio.create_task(leased_transition(), name=f"bioxp-transition:{label}")
+    try:
+        waiter = asyncio.shield(worker)
+        if timeout_s is None:
+            return await waiter
+        return await asyncio.wait_for(waiter, timeout=timeout_s)
+    except asyncio.CancelledError:
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise
+    except asyncio.TimeoutError as exc:
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "tester_transition_completion_ambiguous",
+                "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
+                "completion_ambiguous": True,
+                "connection_transition_blocked_until_worker_exit": True,
+            },
+        ) from exc
+
+
 def _pick_capture_device(tester: BioXpTester, preferred: str) -> dict:
     pick = tester.camera_wait_pick_device(
         preferred=preferred,
@@ -4535,18 +4565,28 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
 @app.post("/reconnect")
 async def reconnect_runtime():
     global _pipette_transport
-    tester = _get_tester()
-    close_fn = getattr(_pipette_transport, "close", None)
-    if callable(close_fn):
-        close_fn()
-    await _run_blocking("BioXP reconnect", tester.reconnect, timeout_s=20.0)
-    _pipette_transport = build_default_pipette_transport(shared_usb=tester)
-    _ownership_changed(reason="runtime_reconnect", transport="owned", usb="service", router="running")
-    maintenance = _mark_post_maintenance_motion_block(
-        source="runtime_reconnect",
-        reason="USB runtime reconnect completed; non-homing motion recovery is required before live motion.",
-        usb_owner="service",
-    )
+
+    async def transition():
+        global _pipette_transport
+        tester = _get_tester()
+
+        def reconnect_and_rebuild():
+            close_fn = getattr(_pipette_transport, "close", None)
+            if callable(close_fn):
+                close_fn()
+            reconnect_fn = getattr(tester, "reconnect")
+            reconnect_fn()
+            return build_default_pipette_transport(shared_usb=tester)
+
+        _pipette_transport = await run_in_threadpool(reconnect_and_rebuild)
+        _ownership_changed(reason="runtime_reconnect", transport="owned", usb="service", router="running")
+        return _mark_post_maintenance_motion_block(
+            source="runtime_reconnect",
+            reason="USB runtime reconnect completed; non-homing motion recovery is required before live motion.",
+            usb_owner="service",
+        )
+
+    maintenance = await _run_tester_transition("BioXP reconnect", transition, timeout_s=20.0)
     return {
         "ok": True,
         "message": "USB runtime reconnect requested; motion is blocked until recovery.",
@@ -4564,25 +4604,31 @@ async def maintenance_usb_state():
 async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
     global _tester, _startup_error, _pipette_transport
-    async with _tester_lock:
-        async with _tester_transition_lock:
-            tester = _tester
-            if tester is not None:
+
+    async def transition():
+        global _tester, _startup_error, _pipette_transport
+        tester = _tester
+        if tester is not None:
+            def disconnect_owned_runtime():
                 close_fn = getattr(_pipette_transport, "close", None)
                 if callable(close_fn):
                     close_fn()
                 disconnect = getattr(tester, "_disconnect", None)
                 if callable(disconnect):
-                    await run_in_threadpool(disconnect)
-            _tester = None
-            _pipette_transport = None
-            _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
-            _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
-            maintenance = _mark_post_maintenance_motion_block(
-                source="maintenance_usb_release",
-                reason="USB runtime was manually released for direct maintenance testing; service motion is blocked until recovery.",
-                usb_owner="released",
-            )
+                    disconnect()
+
+            await run_in_threadpool(disconnect_owned_runtime)
+        _tester = None
+        _pipette_transport = None
+        _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
+        _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
+        return _mark_post_maintenance_motion_block(
+            source="maintenance_usb_release",
+            reason="USB runtime was manually released for direct maintenance testing; service motion is blocked until recovery.",
+            usb_owner="released",
+        )
+
+    maintenance = await _run_tester_transition("maintenance USB release", transition)
     return {"ok": True, "mode": "maintenance", "usb_owner": "released", "message": _startup_error, "maintenance_state": maintenance}
 
 
@@ -4590,23 +4636,28 @@ async def maintenance_usb_release(request: Request):
 async def maintenance_usb_reconnect(request: Request):
     _require_local_maintenance_client(request)
     global _tester, _startup_error, _pipette_transport
-    async with _tester_lock:
-        async with _tester_transition_lock:
-            try:
-                alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
-                _tester = await run_in_threadpool(lambda: BioXpTester(alt=alt))
-                _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
-                _startup_error = None
-                _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
-            except Exception as exc:
-                _tester = None
-                _startup_error = str(exc)
-                raise HTTPException(status_code=503, detail=_startup_error) from exc
-            maintenance = _mark_post_maintenance_motion_block(
-                source="maintenance_usb_reconnect",
-                reason="USB runtime was reconnected after maintenance; non-homing motion recovery is required before live motion.",
-                usb_owner="service",
-            )
+
+    async def transition():
+        global _tester, _startup_error, _pipette_transport
+        if _tester is not None:
+            return _maintenance_state_payload()
+        try:
+            alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
+            _tester = await run_in_threadpool(lambda: BioXpTester(alt=alt))
+            _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
+            _startup_error = None
+            _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
+        except Exception as exc:
+            _tester = None
+            _startup_error = str(exc)
+            raise HTTPException(status_code=503, detail=_startup_error) from exc
+        return _mark_post_maintenance_motion_block(
+            source="maintenance_usb_reconnect",
+            reason="USB runtime was reconnected after maintenance; non-homing motion recovery is required before live motion.",
+            usb_owner="service",
+        )
+
+    maintenance = await _run_tester_transition("maintenance USB reconnect", transition)
     return {"ok": True, "mode": "maintenance", "usb_owner": "service", "message": "USB runtime reconnected; motion is blocked until recovery.", "maintenance_state": maintenance}
 
 

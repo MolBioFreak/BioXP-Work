@@ -348,3 +348,181 @@ def test_interrupt_timeout_keeps_connection_lease_until_worker_exits(monkeypatch
     assert release_completed is False
     assert release_result["usb_owner"] == "released"
     assert tester.disconnected is True
+
+
+def test_cancelled_maintenance_release_retains_leases_until_disconnect_exits(monkeypatch):
+    from src.bioxp import api
+
+    disconnect_entered = threading.Event()
+    allow_disconnect_exit = threading.Event()
+    stop_called = threading.Event()
+
+    class Tester:
+        def _disconnect(self):
+            disconnect_entered.set()
+            assert allow_disconnect_exit.wait(1.0)
+
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            return {"board": 3, "motor": 0}
+
+        def motor_stop(self, board, motor):
+            stop_called.set()
+            return {"ok": True, "board": board, "motor": motor}
+
+        def motor_axis_status(self, board, motor):
+            return {"ok": True, "speed": {"speed": 0}}
+
+        def motor_query_home_switch(self, board, motor):
+            return {"ok": True, "active": False}
+
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+
+    async def scenario():
+        release_task = asyncio.create_task(
+            api.maintenance_usb_release(cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))))
+        )
+        assert await asyncio.to_thread(disconnect_entered.wait, 1.0)
+        release_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+        assert api._tester_lock.locked() is True
+        assert api._tester_transition_lock.locked() is True
+
+        stop_task = asyncio.create_task(
+            api.motion_diagnostics_stop(
+                api.AxisDiagnosticStopRequest(
+                    axis="x",
+                    operator_ack="STOP_AXIS",
+                    reason="disconnect cancellation lease regression",
+                    operator="independent safety regression",
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert stop_called.is_set() is False
+        assert stop_task.done() is False
+
+        allow_disconnect_exit.set()
+        with pytest.raises(HTTPException) as exc_info:
+            await stop_task
+        assert exc_info.value.status_code == 503
+        for _ in range(50):
+            if not api._tester_lock.locked() and not api._tester_transition_lock.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert api._tester is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_maintenance_reconnect_cannot_construct_a_second_owner(monkeypatch):
+    from src.bioxp import api
+
+    first_constructor_entered = threading.Event()
+    allow_first_constructor_exit = threading.Event()
+    constructor_calls: list[object] = []
+
+    class Tester:
+        pass
+
+    def construct(*, alt):
+        candidate = Tester()
+        constructor_calls.append(candidate)
+        if len(constructor_calls) == 1:
+            first_constructor_entered.set()
+            assert allow_first_constructor_exit.wait(1.0)
+        return candidate
+
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "BioXpTester", construct)
+    monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: {"tester": shared_usb})
+
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    async def scenario():
+        first = asyncio.create_task(api.maintenance_usb_reconnect(request))
+        assert await asyncio.to_thread(first_constructor_entered.wait, 1.0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert api._tester_lock.locked() is True
+        assert api._tester_transition_lock.locked() is True
+
+        second = asyncio.create_task(api.maintenance_usb_reconnect(request))
+        await asyncio.sleep(0.05)
+        assert len(constructor_calls) == 1
+        assert second.done() is False
+
+        allow_first_constructor_exit.set()
+        second_result = await second
+        assert len(constructor_calls) == 1
+        assert api._tester is constructor_calls[0]
+        assert second_result["usb_owner"] == "service"
+
+    asyncio.run(scenario())
+
+
+def test_public_reconnect_holds_transition_lease_against_stop(monkeypatch):
+    from src.bioxp import api
+
+    reconnect_entered = threading.Event()
+    allow_reconnect_exit = threading.Event()
+    stop_called = threading.Event()
+
+    class Tester:
+        def reconnect(self):
+            reconnect_entered.set()
+            assert allow_reconnect_exit.wait(1.0)
+            return {"ok": True}
+
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            return {"board": 3, "motor": 0}
+
+        def motor_stop(self, board, motor):
+            stop_called.set()
+            return {"ok": True, "board": board, "motor": motor}
+
+        def motor_axis_status(self, board, motor):
+            return {"ok": True, "speed": {"speed": 0}}
+
+        def motor_query_home_switch(self, board, motor):
+            return {"ok": True, "active": False}
+
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: {"tester": shared_usb})
+    monkeypatch.setattr(api, "_status_payload", lambda: {"available": True})
+
+    async def scenario():
+        reconnect_task = asyncio.create_task(api.reconnect_runtime())
+        assert await asyncio.to_thread(reconnect_entered.wait, 1.0)
+        stop_task = asyncio.create_task(
+            api.motion_diagnostics_stop(
+                api.AxisDiagnosticStopRequest(
+                    axis="x",
+                    operator_ack="STOP_AXIS",
+                    reason="public reconnect transition lease regression",
+                    operator="independent safety regression",
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert stop_called.is_set() is False
+        assert stop_task.done() is False
+        allow_reconnect_exit.set()
+        reconnect_result = await reconnect_task
+        stop_result = await stop_task
+        assert reconnect_result["ok"] is True
+        assert stop_result["verified_stopped"] is True
+
+    asyncio.run(scenario())
