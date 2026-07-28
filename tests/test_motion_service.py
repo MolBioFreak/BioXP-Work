@@ -873,6 +873,16 @@ def test_maintenance_block_allows_validation_only_dry_run_bundle(monkeypatch):
     assert result["dry_run"] is True
 
 
+def _successful_non_homing_recovery_result():
+    return {
+        "ok": True,
+        "run_homing": False,
+        "homing": None,
+        "arm_state": {"armed": True},
+        "final_gate": {"ok": True},
+    }
+
+
 def test_post_maintenance_recover_motion_requires_ack_and_clears_block_without_homing(monkeypatch):
     api = load_api(monkeypatch)
     calls = []
@@ -880,7 +890,7 @@ def test_post_maintenance_recover_motion_requires_ack_and_clears_block_without_h
     class FakeTester:
         def motion_arm_strict_startup(self, *, run_homing=False):
             calls.append(("strict_startup", run_homing))
-            return {"ok": True, "run_homing": run_homing}
+            return _successful_non_homing_recovery_result()
 
     api._tester = FakeTester()
     api._mark_post_maintenance_motion_block(source="test", reason="blocked before recovery")
@@ -906,6 +916,156 @@ def test_post_maintenance_recover_motion_requires_ack_and_clears_block_without_h
     assert calls == [("strict_startup", False)]
     assert result["maintenance_state"]["motion_blocked"] is False
     assert result["maintenance_state"]["last_recovery"]["evidence"]["strict_startup"]["run_homing"] is False
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        None,
+        {},
+        {"ok": 1, "homing": None, "arm_state": {"armed": True}, "final_gate": {"ok": True}},
+        {"ok": True, "homing": None, "arm_state": {"armed": 1}, "final_gate": {"ok": True}},
+        {"ok": True, "homing": None, "arm_state": {"armed": True}, "final_gate": {"ok": 1}},
+        {"ok": True, "homing": {"z_home": {}}, "arm_state": {"armed": True}, "final_gate": {"ok": True}},
+    ],
+)
+def test_post_maintenance_recovery_failure_preserves_block_and_fails_closed(monkeypatch, recovery):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motion_arm_strict_startup(self, *, run_homing=False):
+            assert run_homing is False
+            return recovery
+
+    api._tester = FakeTester()
+    api._mark_post_maintenance_motion_block(source="test", reason="blocked before failed recovery")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            api.maintenance_usb_recover_motion(
+                api.MaintenanceRecoverMotionRequest(
+                    operator_ack=api.MAINTENANCE_RECOVERY_ACK,
+                    include_diag=False,
+                ),
+                _LocalRequest(),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "motion_recovery_failed_closed"
+    assert exc_info.value.detail["hardware_motion_commanded"] is False
+    assert exc_info.value.detail["maintenance_state"]["motion_blocked"] is True
+    assert api._maintenance_state_payload()["motion_blocked"] is True
+
+
+def test_remote_strict_startup_requires_recover_motion_ack_before_hardware(monkeypatch):
+    api = load_api(monkeypatch)
+    api._tester = object()
+    api._mark_post_maintenance_motion_block(source="test", reason="blocked before remote recovery")
+    monkeypatch.setattr(api, "_get_tester", lambda: (_ for _ in ()).throw(AssertionError("hardware accessed")))
+
+    for request in (
+        api.MotionArmStartupRequest(
+            run_homing=False,
+            operator_ack="WRONG",
+            operator_reason="supervised post-maintenance recovery",
+        ),
+        api.MotionArmStartupRequest(
+            run_homing=False,
+            operator_ack="RECOVER_MOTION",
+            operator_reason=None,
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(api.motion_arm_strict_startup(request))
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["expected_operator_ack"] == "RECOVER_MOTION"
+        assert exc_info.value.detail["operator_reason_required"] is True
+        assert exc_info.value.detail["hardware_motion_commanded"] is False
+    assert api._maintenance_state_payload()["motion_blocked"] is True
+
+
+def test_remote_strict_startup_rejects_when_recovery_is_not_pending_before_hardware(monkeypatch):
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(api, "_get_tester", lambda: (_ for _ in ()).throw(AssertionError("hardware accessed")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            api.motion_arm_strict_startup(
+                api.MotionArmStartupRequest(
+                    run_homing=False,
+                    operator_ack="RECOVER_MOTION",
+                    operator_reason="invalid duplicate recovery attempt",
+                )
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "motion_recovery_not_required"
+    assert exc_info.value.detail["hardware_motion_commanded"] is False
+
+
+def test_remote_strict_startup_failed_result_preserves_block(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motion_arm_strict_startup(self, *, run_homing=False):
+            assert run_homing is False
+            return {
+                "ok": False,
+                "homing": None,
+                "arm_state": {"armed": False},
+                "final_gate": {"ok": False},
+            }
+
+    api._tester = FakeTester()
+    api._mark_post_maintenance_motion_block(source="test", reason="blocked before remote recovery")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            api.motion_arm_strict_startup(
+                api.MotionArmStartupRequest(
+                    run_homing=False,
+                    operator_ack="RECOVER_MOTION",
+                    operator_reason="supervised failed recovery proof test",
+                )
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "motion_recovery_failed_closed"
+    assert exc_info.value.detail["hardware_motion_commanded"] is False
+    assert api._maintenance_state_payload()["motion_blocked"] is True
+
+
+def test_remote_strict_startup_valid_result_clears_block_and_capability_is_advertised(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motion_arm_strict_startup(self, *, run_homing=False):
+            assert run_homing is False
+            return _successful_non_homing_recovery_result()
+
+    api._tester = FakeTester()
+    api._mark_post_maintenance_motion_block(source="test", reason="blocked before remote recovery")
+
+    result = asyncio.run(
+        api.motion_arm_strict_startup(
+            api.MotionArmStartupRequest(
+                run_homing=False,
+                operator_ack="RECOVER_MOTION",
+                operator_reason="supervised non-homing recovery after maintenance",
+            )
+        )
+    )
+
+    assert result["maintenance_state"]["motion_blocked"] is False
+    assert "recover_motion_non_homing" in api.BMS_COMMISSIONING_CAPABILITIES
+    assert "recover_motion" not in api.BMS_COMMISSIONING_CAPABILITIES
+    assert result["maintenance_state"]["last_recovery"]["evidence"]["operator_reason"] == (
+        "supervised non-homing recovery after maintenance"
+    )
 
 
 def test_protocol_live_move_is_blocked_after_maintenance_before_executor(monkeypatch):

@@ -29,6 +29,11 @@ def test_gv1_startup_profile_is_idle_safe_until_home_window(monkeypatch):
         lambda key: {"board": 4, "motor": 2, "speed": 600, "acc": 5, "standby_current": 10},
     )
     monkeypatch.setattr(tester, "_motion_oem_gripper_version", lambda: 1)
+    monkeypatch.setattr(
+        tester,
+        "_machine_config_axis_max",
+        lambda axis, fallback: (15000, "immutable_oem_machine_snapshot"),
+    )
 
     profile = tester._motion_oem_axis_profile("g", startup=True)
 

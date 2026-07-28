@@ -3,3 +3,4 @@ uvicorn[standard]
 python-can
 pydantic
 pyusb
+pillow

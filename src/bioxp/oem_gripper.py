@@ -585,3 +585,99 @@ def gripper_open_wide(
         reason=reason,
         timeout_s=timeout_s,
     )
+
+
+GRIPPER_COMMISSION_HOME_ACK = "GRIPPER_COMMISSION_HOME"
+
+
+def _exception_payload(exc: Exception) -> Any:
+    if isinstance(exc, HTTPException):
+        return exc.detail
+    return {"type": type(exc).__name__, "message": str(exc)}
+
+
+def gripper_commission_home(
+    tester: Any,
+    *,
+    operator_ack: str | None,
+    reason: str | None,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    """Run the source-ordered clear/home block with unconditional idle cleanup.
+
+    This is the semantic operator action that replaces separately exposing the
+    OEM internal action-current write. Sub-operations retain their own cleanup
+    guards and this outer transaction restores and verifies exact 10/10 current
+    on every exit path.
+    """
+
+    _require_action(operator_ack, GRIPPER_COMMISSION_HOME_ACK, reason)
+    ordered_steps = ["preflight", "clear", "home", "restore-idle", "verify-idle"]
+    before: dict[str, Any] | None = None
+    clear_result: dict[str, Any] | None = None
+    home_result: dict[str, Any] | None = None
+    restore_result: dict[str, Any] | None = None
+    final_status: dict[str, Any] | None = None
+    operation_error: Any = None
+    cleanup_error: Any = None
+    failed_step: str | None = None
+
+    try:
+        failed_step = "preflight"
+        before = gripper_status(tester)
+        failed_step = "clear"
+        clear_result = gripper_clear(
+            tester,
+            operator_ack=GRIPPER_CLEAR_ACK,
+            reason=f"{reason}: ordered gripper clear",
+            timeout_s=min(float(timeout_s), 20.0),
+        )
+        failed_step = "home"
+        home_result = gripper_home(
+            tester,
+            operator_ack=GRIPPER_HOME_ACK,
+            reason=f"{reason}: ordered gripper home",
+            timeout_s=min(float(timeout_s), 30.0),
+        )
+    except Exception as exc:  # preserve cleanup and terminal evidence
+        operation_error = _exception_payload(exc)
+    finally:
+        try:
+            restore_result = _restore_idle(tester, "gripper_commission_home_finally")
+        except Exception as exc:  # pragma: no cover - live transport failure guard
+            cleanup_error = _exception_payload(exc)
+        try:
+            final_status = gripper_status(tester)
+        except Exception as exc:  # pragma: no cover - live transport failure guard
+            if cleanup_error is None:
+                cleanup_error = {"final_status_error": _exception_payload(exc)}
+
+    current = final_status.get("current", {}) if isinstance(final_status, dict) else {}
+    run_current = _int_or_none(current.get("run_current_param6"))
+    standby_current = _int_or_none(current.get("standby_current_param7"))
+    idle_restore_verified = bool(run_current == OEM_IDLE_CURRENT and standby_current == OEM_IDLE_CURRENT)
+    if operation_error is None and (cleanup_error is not None or not idle_restore_verified):
+        failed_step = "verify-idle"
+    elif operation_error is None:
+        failed_step = None
+
+    payload: dict[str, Any] = {
+        "ok": bool(operation_error is None and cleanup_error is None and idle_restore_verified),
+        "schema": "bioxp.oem_gripper_commission_home.v1",
+        "motion_commanded": bool(clear_result is not None or home_result is not None or operation_error is not None),
+        "ordered_steps": ordered_steps,
+        "temporary_action_current_internal": True,
+        "required_idle_readback": {"run": OEM_IDLE_CURRENT, "standby": OEM_IDLE_CURRENT},
+        "before": before,
+        "clear": clear_result,
+        "home": home_result,
+        "restore_idle": restore_result,
+        "final_status": final_status,
+        "idle_restore_verified": idle_restore_verified,
+        "failed_step": failed_step,
+        "operation_error": operation_error,
+        "cleanup_error": cleanup_error,
+    }
+    if not payload["ok"]:
+        raise HTTPException(status_code=409, detail=payload)
+    return payload

@@ -12,18 +12,31 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
+from .camera_provider import CameraError, CameraFrame, CameraProvider
 from .oem_config import harmonized_motion_config
 from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_state
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
 from .runtime_state import configure_oem_runtime_state_from_env
-from .oem_gripper import gripper_clear, gripper_home, gripper_status, restore_gripper_idle_current
+from .oem_axis_diagnostics import AxisDiagnosticContractError, diagnostic_catalog, resolve_axis_diagnostic
+from .oem_gripper import (
+    gripper_clear,
+    gripper_close,
+    gripper_commission_home,
+    gripper_home,
+    gripper_open,
+    gripper_open_wide,
+    gripper_status,
+    restore_gripper_idle_current,
+)
 from .oem_initialization import run_oem_initialization_controller
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
@@ -31,10 +44,20 @@ from .oem_runtime_api import configure_runtime as configure_oem_runtime, router 
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import OfflineSwitchAuditFixture, interpret_home_predicate, run_switch_audit
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
@@ -90,6 +113,10 @@ BMS_COMMISSIONING_CAPABILITIES = (
     "construct_pipettes",
     "initialize_without_motion",
     "run_initial_check",
+    "recover_motion_non_homing",
+    "collect_axis_diagnostics",
+    "run_axis_diagnostic",
+    "stop_axis_diagnostic",
 )
 
 try:
@@ -116,6 +143,7 @@ _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
 _oem_startup_program: Optional[OEMStartupProgram] = None
+_camera_provider = CameraProvider()
 
 
 def _default_reference_state_path() -> str:
@@ -160,6 +188,7 @@ USB_SNIFF_PROFILES = {"passive", "manual_observe", "debug"}
 RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
 MAINTENANCE_STATE_SCHEMA_VERSION = "bioxp.maintenance_state.v1"
 MAINTENANCE_RECOVERY_ACK = "RECOVER"
+MOTION_RECOVERY_ACK = "RECOVER_MOTION"
 _maintenance_state: dict[str, Any] = {
     "schema_version": MAINTENANCE_STATE_SCHEMA_VERSION,
     "usb_owner": "service",
@@ -251,6 +280,62 @@ def _clear_post_maintenance_motion_block(*, source: str, evidence: Optional[dict
         recovery_hint=None,
         blocked_by=None,
         last_recovery={"source": str(source), "at": _now_utc(), "evidence": evidence or {}},
+    )
+
+
+def _complete_non_homing_motion_recovery(
+    recovery: Any,
+    *,
+    source: str,
+    evidence: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Clear the maintenance block only from exact, non-homing live proof."""
+    failures: list[str] = []
+    if not isinstance(recovery, Mapping):
+        failures.append("result_not_mapping")
+    else:
+        arm_state = recovery.get("arm_state")
+        final_gate = recovery.get("final_gate")
+        if recovery.get("ok") is not True:
+            failures.append("ok_not_literal_true")
+        if not isinstance(arm_state, Mapping) or arm_state.get("armed") is not True:
+            failures.append("arm_state_armed_not_literal_true")
+        if not isinstance(final_gate, Mapping) or final_gate.get("ok") is not True:
+            failures.append("final_gate_ok_not_literal_true")
+        if "homing" not in recovery or recovery.get("homing") is not None:
+            failures.append("non_homing_evidence_missing")
+        if "run_homing" in recovery and recovery.get("run_homing") is not False:
+            failures.append("run_homing_not_literal_false")
+    if failures:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "motion_recovery_failed_closed",
+                "message": "Strict startup did not provide exact armed, final-gate, non-homing recovery proof; motion remains blocked.",
+                "failure_reasons": failures,
+                "hardware_motion_commanded": False,
+                "recovery": recovery,
+                "maintenance_state": _maintenance_state_payload(),
+            },
+        )
+    return _clear_post_maintenance_motion_block(source=source, evidence=evidence)
+
+
+def _require_non_homing_motion_recovery_pending() -> None:
+    """Admit strict-startup recovery only for an explicit active latch."""
+    if (
+        _maintenance_state.get("motion_blocked") is True
+        and _maintenance_state.get("recovery_required") is True
+    ):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "motion_recovery_not_required",
+            "message": "Non-homing recovery is available only while the maintenance motion latch explicitly requires recovery.",
+            "hardware_motion_commanded": False,
+            "maintenance_state": _maintenance_state_payload(),
+        },
     )
 
 
@@ -796,7 +881,19 @@ class MotionHardResetRequest(BaseModel):
 
 
 class MotionArmStartupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     run_homing: bool = False
+    operator_ack: Optional[str] = Field(
+        None,
+        description=f"Must be exactly {MOTION_RECOVERY_ACK!r} for remote non-homing motion recovery.",
+    )
+    operator_reason: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=2000,
+        description="Required operator reason for remote non-homing motion recovery.",
+    )
 
 
 class MotionInterlockOverrideRequest(BaseModel):
@@ -846,6 +943,35 @@ class GripperActionRequest(BaseModel):
 
 class GripperRestoreIdleRequest(BaseModel):
     reason: str = Field("operator_restore_idle_current", max_length=2000)
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
+class AxisDiagnosticExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+    operation: Literal[
+        "move-negative",
+        "move-positive",
+        "home",
+        "park-6000",
+        "commission-home",
+        "close",
+        "open",
+        "open-wide",
+    ]
+    operator_ack: Literal["RUN_AXIS_DIAGNOSTIC"]
+    reason: str = Field(..., min_length=1, max_length=2000)
+    timeout_s: float = Field(25.0, gt=0.1, le=90.0)
+    operator: Optional[str] = Field("bms-cockpit", max_length=200)
+
+
+class AxisDiagnosticStopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+    operator_ack: Literal["STOP_AXIS"]
+    reason: str = Field(..., min_length=1, max_length=2000)
     operator: Optional[str] = Field("bms-cockpit", max_length=200)
 
 
@@ -969,7 +1095,53 @@ class ChillerRequest(BaseModel):
 
 
 class CameraSnapshotRequest(BaseModel):
-    device: str = Field("/dev/video0", description="Preferred V4L2 device")
+    """Finite snapshot command: the provider owns all camera identity and settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CameraStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["bioxp.camera_status.v1"]
+    available: StrictBool
+    frame_sequence: StrictInt | None = Field(default=None, ge=0)
+    frame_captured_at: datetime | None
+    frame_age_seconds: StrictFloat | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    freshness_budget_seconds: StrictFloat = Field(..., gt=0.0, le=60.0, allow_inf_nan=False)
+    provider_generation: StrictInt = Field(..., ge=0)
+    dropped_frames: StrictInt = Field(..., ge=0)
+    content_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    detail: StrictStr = Field(max_length=1000)
+
+    @field_validator("frame_captured_at", mode="before")
+    @classmethod
+    def require_aware_utc_timestamp_string(cls, value: object) -> object:
+        if value is None:
+            return value
+        if type(value) is not str or "T" not in value:
+            raise ValueError("frame_captured_at must be an aware UTC ISO-8601 string")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("frame_captured_at must be an aware UTC ISO-8601 string") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+            raise ValueError("frame_captured_at must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def require_coherent_frame_metadata(self) -> "CameraStatusResponse":
+        frame_values = (
+            self.frame_sequence,
+            self.frame_captured_at,
+            self.frame_age_seconds,
+            self.content_sha256,
+        )
+        if self.available and any(value is None for value in frame_values):
+            raise ValueError("available camera status requires complete frame metadata")
+        if not self.available and any(value is not None for value in frame_values):
+            raise ValueError("unavailable camera status cannot claim frame metadata")
+        return self
 
 
 class CameraHealthRequest(BaseModel):
@@ -4362,6 +4534,7 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
+    _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     recovery = await _run_blocking(
         "Post-maintenance motion recovery",
@@ -4378,7 +4551,11 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
             )
         except Exception as exc:
             evidence["motion_power_status_error"] = str(exc)
-    maintenance = _clear_post_maintenance_motion_block(source="maintenance_usb_recover_motion", evidence=evidence)
+    maintenance = _complete_non_homing_motion_recovery(
+        recovery,
+        source="maintenance_usb_recover_motion",
+        evidence=evidence,
+    )
     return {
         "ok": True,
         "message": "Post-maintenance motion recovery completed; live motion routes are unblocked.",
@@ -4520,15 +4697,33 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
                 "and USB-busy emergency-stop failure. Use scripts/bioxp_supervised_oem_startup_homing_stepwise.sh."
             ),
         )
+    operator_reason = str(req.operator_reason or "").strip()
+    if req.operator_ack != MOTION_RECOVERY_ACK or not operator_reason:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "operator_recovery_authorization_required",
+                "expected_operator_ack": MOTION_RECOVERY_ACK,
+                "operator_reason_required": True,
+                "hardware_motion_commanded": False,
+                "maintenance_state": _maintenance_state_payload(),
+            },
+        )
+    _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
         lambda: tester.motion_arm_strict_startup(run_homing=False),
         timeout_s=90.0,
     )
-    maintenance = _clear_post_maintenance_motion_block(
+    maintenance = _complete_non_homing_motion_recovery(
+        response,
         source="motion_arm_strict_startup",
-        evidence={"strict_startup": response, "run_homing": False},
+        evidence={
+            "strict_startup": response,
+            "run_homing": False,
+            "operator_reason": operator_reason,
+        },
     )
     if isinstance(response, dict):
         response = dict(response)
@@ -4797,6 +4992,231 @@ def _execute_oem_initialize_motion(
         },
         "result": result,
     }
+
+
+def _collect_axis_diagnostic_status(
+    tester: BioXpTester,
+    axes: tuple[str, ...] = ("x", "y", "z", "g", "door"),
+) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for axis in axes:
+        if axis == "g":
+            rows[axis] = gripper_status(tester)
+            continue
+        profile = tester._motion_oem_axis_profile(axis, startup=False)
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        status = tester.motor_axis_status(board, motor=motor)
+        query_home = tester.motor_query_home_switch(board, motor=motor)
+        rows[axis] = {
+            "ok": True,
+            "axis": axis,
+            "board": board,
+            "motor": motor,
+            "profile": profile,
+            "status": status,
+            "query_home": query_home,
+            "physical_motion": False,
+            "motion_commanded": False,
+        }
+    return {
+        "ok": True,
+        "schema": "bioxp.oem_axis_diagnostic_status.v1",
+        "physical_motion": False,
+        "motion_commanded": False,
+        "catalog": diagnostic_catalog(),
+        "rows": rows,
+        "reference_state": _reference_state_store.snapshot([AxisName(axis) for axis in axes]),
+    }
+
+
+@app.get("/motion/diagnostics/catalog")
+async def motion_diagnostics_catalog():
+    return diagnostic_catalog()
+
+
+@app.get("/motion/diagnostics/status")
+async def motion_diagnostics_status():
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM axis diagnostic live status",
+        lambda: _collect_axis_diagnostic_status(tester),
+        timeout_s=45.0,
+    )
+
+
+@app.post("/motion/diagnostics/execute")
+async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
+    try:
+        action = resolve_axis_diagnostic(req.axis, req.operation)
+    except AxisDiagnosticContractError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unsupported_axis_diagnostic",
+                "message": str(exc),
+                "motion_commanded": False,
+            },
+        ) from exc
+    _require_motion_route_ready()
+    if action.executor in {"status", "stop"}:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "wrong_diagnostic_route", "motion_commanded": False},
+        )
+
+    if action.executor == "relative":
+        result = await move_axis_relative(
+            MoveRelativeRequest(
+                axis=AxisName(action.axis),
+                steps=int(action.value or 0),
+                wait_timeout_s=min(float(req.timeout_s), 60.0),
+                operator_note=req.reason,
+            )
+        )
+    elif action.executor == "absolute":
+        result = await move_axis_absolute(
+            MoveAbsoluteRequest(
+                axis=AxisName(action.axis),
+                position_steps=int(action.value or 0),
+                wait_timeout_s=min(float(req.timeout_s), 60.0),
+                operator_note=req.reason,
+            )
+        )
+    elif action.executor == "home":
+        result = await home_axis(
+            HomeAxisRequest(
+                axis=AxisName(action.axis),
+                timeout_s=req.timeout_s,
+                operator_note=req.reason,
+                allow_implementation_mapped_predicate=False,
+            )
+        )
+    elif action.executor == "gripper-commission-home":
+        tester = _get_tester()
+        result = await _run_blocking(
+            "OEM gripper commission/home diagnostic",
+            lambda: gripper_commission_home(
+                tester,
+                operator_ack="GRIPPER_COMMISSION_HOME",
+                reason=req.reason,
+                timeout_s=req.timeout_s,
+            ),
+            timeout_s=min(max(float(req.timeout_s) * 2.0 + 20.0, 45.0), 180.0),
+        )
+    elif action.executor in {"gripper-close", "gripper-open", "gripper-open-wide"}:
+        tester = _get_tester()
+        fn, ack = {
+            "gripper-close": (gripper_close, "GRIPPER_CLOSE"),
+            "gripper-open": (gripper_open, "GRIPPER_OPEN"),
+            "gripper-open-wide": (gripper_open_wide, "GRIPPER_OPEN_WIDE"),
+        }[action.executor]
+        result = await _run_blocking(
+            f"OEM {action.executor} diagnostic",
+            lambda: fn(
+                tester,
+                operator_ack=ack,
+                reason=req.reason,
+                timeout_s=req.timeout_s,
+            ),
+            timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 120.0),
+        )
+    elif action.executor in {"door-home", "door-open", "door-close"}:
+        door_request = ThermalDoorActionRequest(
+            operator_ack={
+                "door-home": "HOME_THERMAL_DOOR",
+                "door-open": "OPEN_THERMAL_DOOR",
+                "door-close": "CLOSE_THERMAL_DOOR",
+            }[action.executor],
+            reason=req.reason,
+            timeout_s=min(float(req.timeout_s), 60.0),
+        )
+        result = await {
+            "door-home": motion_thermal_door_home,
+            "door-open": motion_thermal_door_open,
+            "door-close": motion_thermal_door_close,
+        }[action.executor](door_request)
+    else:  # pragma: no cover - registry and dispatcher must evolve together
+        raise HTTPException(status_code=500, detail="axis diagnostic registry executor is not wired")
+
+    tester = _get_tester()
+    terminal_status = await _run_blocking(
+        f"OEM {req.axis} terminal diagnostic status",
+        lambda: _collect_axis_diagnostic_status(tester, (req.axis,)),
+        timeout_s=20.0,
+    )
+    payload = {
+        "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
+        "schema": "bioxp.oem_axis_diagnostic_result.v1",
+        "axis": req.axis,
+        "operation": req.operation,
+        "action": {
+            "executor": action.executor,
+            "robot_owned_value": action.value,
+            "caller_supplied_motion_values": False,
+        },
+        "result": result,
+        "terminal_status": terminal_status,
+        "physical_effect_verified": False,
+    }
+    if payload["ok"] is not True:
+        raise HTTPException(status_code=409, detail=payload)
+    return payload
+
+
+@app.post("/motion/diagnostics/stop")
+async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
+    try:
+        action = resolve_axis_diagnostic(req.axis, "stop")
+    except AxisDiagnosticContractError as exc:  # pragma: no cover - literal axis restricts this
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    tester = _get_tester()
+
+    def stop_and_verify() -> dict[str, Any]:
+        profile = tester._motion_oem_axis_profile(req.axis, startup=False)
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        stop = tester.motor_stop(board, motor=motor)
+        restore_idle = None
+        if req.axis == "g":
+            restore_idle = restore_gripper_idle_current(tester, reason="axis_diagnostic_stop")
+        terminal = _collect_axis_diagnostic_status(tester, (req.axis,))
+        row = terminal["rows"][req.axis]
+        if req.axis == "g":
+            speed = ((row.get("speed") or {}).get("speed")) if isinstance(row, dict) else None
+            idle_verified = bool(
+                ((row.get("current") or {}).get("run_current_param6")) == 10
+                and ((row.get("current") or {}).get("standby_current_param7")) == 10
+            )
+        else:
+            speed = (
+                (((row.get("status") or {}).get("speed") or {}).get("speed"))
+                if isinstance(row, dict)
+                else None
+            )
+            idle_verified = None
+        verified_stopped = speed == 0
+        payload = {
+            "ok": bool(verified_stopped and (idle_verified is not False)),
+            "schema": "bioxp.oem_axis_diagnostic_stop.v1",
+            "axis": req.axis,
+            "operation": "stop",
+            "executor": action.executor,
+            "stop": stop,
+            "restore_idle": restore_idle,
+            "verified_stopped": verified_stopped,
+            "idle_restore_verified": idle_verified,
+            "terminal_status": terminal,
+        }
+        if not payload["ok"]:
+            raise HTTPException(status_code=409, detail=payload)
+        return payload
+
+    return await _run_blocking(
+        f"OEM {req.axis} diagnostic stop",
+        stop_and_verify,
+        timeout_s=25.0,
+    )
 
 
 @app.get("/motion/gripper/status")
@@ -5337,14 +5757,12 @@ async def chiller_hard_reset():
     return result
 
 
-@app.get("/camera/devices")
 async def camera_devices():
     envelope = _camera_cache_envelope(_camera_probe_cache)
     probe = envelope.get("probe") or {}
     return {**envelope, "ok": envelope.get("available", False), "rows": probe.get("rows", []), "preferred_device": probe.get("preferred_device")}
 
 
-@app.get("/camera/controls")
 async def camera_controls(device: str = "/dev/video0"):
     envelope = _camera_cache_envelope(_camera_probe_cache)
     probe = envelope.get("probe") or {}
@@ -5352,7 +5770,6 @@ async def camera_controls(device: str = "/dev/video0"):
     return {**envelope, "ok": controls is not None, "device": device, "rows": [] if controls is None else controls.get("rows", []), "error": "camera controls not present in explicit probe cache" if controls is None else controls.get("error")}
 
 
-@app.post("/camera/probe")
 async def camera_probe(payload: dict[str, Any] | None = None):
     global _camera_probe_cache
     if _camera_process_active():
@@ -5376,14 +5793,12 @@ async def camera_probe(payload: dict[str, Any] | None = None):
         return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
 
 
-@app.post("/camera/stream/start")
 async def camera_stream_start(payload: dict[str, Any] | None = None):
     result = await _start_owned_camera_session(payload or {})
     lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("ok")), "provenance": "POST /camera/stream/start"})
     return result
 
 
-@app.post("/camera/control")
 async def camera_control(req: CameraControlRequest):
     global _camera_probe_cache
     tester = _get_tester()
@@ -5403,10 +5818,42 @@ async def camera_control(req: CameraControlRequest):
     return result
 
 
+def _camera_jpeg_response(frame: CameraFrame) -> Response:
+    return Response(
+        content=frame.content,
+        media_type="image/jpeg",
+        headers={
+            "Content-Length": str(len(frame.content)),
+            "ETag": f'"{frame.content_sha256}"',
+            "X-Content-SHA256": frame.content_sha256,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/camera/status", response_model=CameraStatusResponse)
+async def camera_status():
+    return _camera_provider.status().to_payload()
+
+
+@app.get("/camera/frame/latest")
+async def camera_frame_latest():
+    try:
+        frame = await run_in_threadpool(_camera_provider.latest)
+    except CameraError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return _camera_jpeg_response(frame)
+
+
 @app.post("/camera/snapshot")
-async def camera_snapshot(req: CameraSnapshotRequest):
-    tester = _get_tester()
-    return await _run_blocking("Camera snapshot", lambda: _camera_snapshot_with_data(tester, req.device), timeout_s=20.0)
+async def camera_snapshot(req: CameraSnapshotRequest = CameraSnapshotRequest()):
+    """Capture through the fixed provider identity/capability admission boundary."""
+    del req
+    try:
+        frame = await run_in_threadpool(_camera_provider.capture)
+    except CameraError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return _camera_jpeg_response(frame)
 
 
 @app.post("/vision/inspect")
@@ -5414,7 +5861,7 @@ async def vision_inspect(req: InspectionRequest):
     return await run_inspection_command(
         InspectionCommand.from_request(req),
         get_capabilities=_get_vision_capabilities,
-        capture_snapshot=lambda device: _camera_snapshot_with_data(_get_tester(), device),
+        capture_snapshot=lambda _device: _camera_provider.capture_snapshot(),
         run_blocking=_run_blocking,
     )
 
@@ -5424,12 +5871,11 @@ async def vision_barcode_read(req: BarcodeReadRequest):
     return await run_barcode_read_command(
         BarcodeReadCommand.from_request(req),
         get_capabilities=_get_vision_capabilities,
-        capture_snapshot=lambda device: _camera_snapshot_with_data(_get_tester(), device),
+        capture_snapshot=lambda _device: _camera_provider.capture_snapshot(),
         run_blocking=_run_blocking,
     )
 
 
-@app.post("/camera/stream_health")
 async def camera_stream_health(req: CameraHealthRequest):
     tester = _get_tester()
     return await _run_blocking(
@@ -5439,7 +5885,6 @@ async def camera_stream_health(req: CameraHealthRequest):
     )
 
 
-@app.post("/camera/auto_recover")
 async def camera_auto_recover(req: CameraRecoverRequest):
     if _camera_process_active():
         return {
@@ -5460,26 +5905,22 @@ async def camera_auto_recover(req: CameraRecoverRequest):
     return {**result, "camera_ownership": ownership}
 
 
-@app.post("/camera/reset")
 async def camera_reset(req: CameraSnapshotRequest):
     stopped = await _stop_owned_camera_session(reason="explicit reset")
     reset = await run_in_threadpool(_camera_reset_local, req.device)
     return {**reset, "owned_session": stopped}
 
 
-@app.post("/camera/stop")
 async def camera_stop(req: CameraSnapshotRequest):
     del req
     return await _stop_owned_camera_session(reason="explicit stop")
 
 
-@app.get("/camera/stream_state")
 async def camera_stream_state():
     _, projection = _camera_session_projection()
     return {**projection, **_camera_stream_state_payload()}
 
 
-@app.get("/camera/mjpeg")
 async def camera_mjpeg(
     device: str = "/dev/video0",
     fps: int = Query(8, ge=1, le=30),
