@@ -761,5 +761,76 @@ def test_structured_maintenance_release_failure_retains_quarantine(monkeypatch):
     assert exc_info.value.status_code == 503
     assert api._tester is None
     assert api._tester_quarantine is tester
-    assert ownership_events == []
-    assert maintenance_marks == []
+    assert ownership_events == [
+        {
+            "reason": "maintenance_usb_release_incomplete",
+            "transport": "quarantined",
+            "usb": "quarantined",
+            "router": "stopped",
+        }
+    ]
+    assert maintenance_marks == [
+        {
+            "source": "maintenance_usb_release_incomplete",
+            "reason": api._startup_error,
+            "usb_owner": "quarantined",
+            "quarantine_active": True,
+        }
+    ]
+
+
+def test_quarantined_release_invalidates_fresh_snapshot_and_blocks_motion(monkeypatch):
+    from src.bioxp import api
+    from src.bioxp.hardware_status import HardwareStateOwner
+
+    class Tester:
+        def _disconnect(self):
+            return {"ok": False, "release_interface_ok": True, "dispose_resources_ok": False}
+
+    state = HardwareStateOwner(fresh_for_s=30.0)
+    monkeypatch.setattr(api, "hardware_state", state)
+    monkeypatch.setattr(api, "_maintenance_state", dict(api._maintenance_state))
+    monkeypatch.setattr(api, "_maintenance_latch_generation", 0)
+    api._ownership_changed(reason="test_ready", transport="owned", usb="service", router="running")
+    published = state.collect(
+        ("transport", "boards", "latch", "chiller"),
+        {
+            "transport": lambda ctx: {"runtime_available": True, "CAN_READY": True},
+            "boards": lambda ctx: {3: {"ok": True}},
+            "latch": lambda ctx: {"snapshot": {"door": 1}},
+            "chiller": lambda ctx: {"alive": True},
+        },
+    )
+    assert published["published"] is True
+    api._set_maintenance_state(
+        transition="test_ready",
+        usb_owner="service",
+        motion_blocked=False,
+        recovery_required=False,
+        block_reason=None,
+        recovery_hint=None,
+        blocked_by=None,
+    )
+    before = api._status_payload()
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.maintenance_usb_release(request))
+
+    after = api._status_payload()
+    assert exc_info.value.status_code == 503
+    assert before["available"] is True and before["cache_state"] == "fresh"
+    assert after["snapshot_id"] is None
+    assert after["available"] is False and after["cache_state"] == "missing"
+    assert after["runtime_available"] is None
+    assert after["hardware_connected"] is False
+    assert after["ownership"] == {"transport": "quarantined", "usb": "quarantined", "router": "stopped", "CAN_READY": False}
+    assert after["maintenance_state"]["usb_owner"] == "quarantined"
+    assert after["maintenance_state"]["motion_blocked"] is True
+    assert after["maintenance_state"]["recovery_required"] is True
+    assert api._tester is None
+    assert api._tester_quarantine is tester

@@ -282,6 +282,22 @@ def _mark_post_maintenance_motion_block(*, source: str, reason: str, **extra: An
         return _set_maintenance_state(transition=source, **payload)
 
 
+def _publish_quarantined_owner(*, source: str, reason: str) -> dict[str, Any]:
+    """Invalidate stale readiness and publish the fail-closed quarantine latch."""
+    _ownership_changed(
+        reason=source,
+        transport="quarantined",
+        usb="quarantined",
+        router="stopped",
+    )
+    return _mark_post_maintenance_motion_block(
+        source=source,
+        reason=reason,
+        usb_owner="quarantined",
+        quarantine_active=True,
+    )
+
+
 def _clear_post_maintenance_motion_block(
     *,
     source: str,
@@ -4647,6 +4663,10 @@ async def maintenance_usb_release(request: Request):
                 _tester_quarantine = failed_owner
                 _pipette_transport = None
                 _startup_error = f"BioXP USB release incomplete; owner quarantined: {exc}"
+                _publish_quarantined_owner(
+                    source="maintenance_usb_release_incomplete",
+                    reason=_startup_error,
+                )
                 raise HTTPException(status_code=503, detail=_startup_error) from exc
         _tester = None
         _tester_quarantine = None
@@ -4705,6 +4725,22 @@ async def maintenance_usb_reconnect(request: Request):
             _startup_error = str(exc)
             if cleanup_error is not None:
                 _startup_error = f"{_startup_error}; candidate cleanup failed: {cleanup_error}"
+                _publish_quarantined_owner(
+                    source="maintenance_usb_reconnect_cleanup_incomplete",
+                    reason=_startup_error,
+                )
+            else:
+                _ownership_changed(
+                    reason="maintenance_usb_reconnect_failed",
+                    transport="unbound",
+                    usb="released",
+                    router="stopped",
+                )
+                _mark_post_maintenance_motion_block(
+                    source="maintenance_usb_reconnect_failed",
+                    reason=_startup_error,
+                    usb_owner="released",
+                )
             raise HTTPException(status_code=503, detail=_startup_error) from exc
         return _mark_post_maintenance_motion_block(
             source="maintenance_usb_reconnect",
