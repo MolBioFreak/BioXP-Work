@@ -141,6 +141,10 @@ from .vision.inspection import InspectionCommand
 _tester: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
 _tester_lock = asyncio.Lock()
+# Connection ownership transitions share this lease with the safety-interrupt
+# lane. Normal tester work deliberately does not, so a stop can still preempt
+# an in-flight diagnostic without racing release/rebind.
+_tester_transition_lock = asyncio.Lock()
 _camera_stream_lock = asyncio.Lock()
 _oem_startup_program: Optional[OEMStartupProgram] = None
 _camera_provider = CameraProvider()
@@ -3821,19 +3825,61 @@ _usb_sniff_manager = UsbSniffManager()
 
 
 async def _run_blocking(label: str, func, timeout_s: float = 30.0):
-    async with _tester_lock:
-        try:
-            return await asyncio.wait_for(run_in_threadpool(func), timeout=timeout_s)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=f"{label} timed out after {timeout_s:.0f}s") from exc
+    async def leased_operation():
+        async with _tester_lock:
+            return await run_in_threadpool(func)
+
+    worker = asyncio.create_task(leased_operation(), name=f"bioxp-tester:{label}")
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
+    except asyncio.CancelledError:
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise
+    except asyncio.TimeoutError as exc:
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "tester_operation_completion_ambiguous",
+                "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
+                "completion_ambiguous": True,
+                "connection_transition_blocked_until_worker_exit": True,
+            },
+        ) from exc
 
 
 async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0):
-    """Run a stop/E-stop lane without waiting for the normal tester-operation lock."""
+    """Run a tester-bound interrupt while retaining connection ownership.
+
+    The inner task owns the transition lease. Shielding it is intentional:
+    timing out or cancelling the HTTP waiter must not let release/rebind race a
+    worker thread that cannot itself be cancelled.
+    """
+
+    async def leased_interrupt():
+        async with _tester_transition_lock:
+            tester = _get_tester()
+            return await run_in_threadpool(func, tester)
+
+    worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
     try:
-        return await asyncio.wait_for(run_in_threadpool(func), timeout=timeout_s)
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
+    except asyncio.CancelledError:
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise
     except asyncio.TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=f"{label} timed out after {timeout_s:.0f}s") from exc
+        # Retrieve a later exception without cancelling the task. The worker
+        # retains the transition lease until its non-cancellable thread exits.
+        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "safety_interrupt_completion_ambiguous",
+                "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
+                "completion_ambiguous": True,
+                "connection_transition_blocked_until_worker_exit": True,
+            },
+        ) from exc
 
 
 def _pick_capture_device(tester: BioXpTester, preferred: str) -> dict:
@@ -4519,23 +4565,24 @@ async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
     global _tester, _startup_error, _pipette_transport
     async with _tester_lock:
-        tester = _tester
-        if tester is not None:
-            close_fn = getattr(_pipette_transport, "close", None)
-            if callable(close_fn):
-                close_fn()
-            disconnect = getattr(tester, "_disconnect", None)
-            if callable(disconnect):
-                await asyncio.wait_for(run_in_threadpool(disconnect), timeout=20.0)
-        _tester = None
-        _pipette_transport = None
-        _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
-        _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
-        maintenance = _mark_post_maintenance_motion_block(
-            source="maintenance_usb_release",
-            reason="USB runtime was manually released for direct maintenance testing; service motion is blocked until recovery.",
-            usb_owner="released",
-        )
+        async with _tester_transition_lock:
+            tester = _tester
+            if tester is not None:
+                close_fn = getattr(_pipette_transport, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                disconnect = getattr(tester, "_disconnect", None)
+                if callable(disconnect):
+                    await run_in_threadpool(disconnect)
+            _tester = None
+            _pipette_transport = None
+            _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
+            _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
+            maintenance = _mark_post_maintenance_motion_block(
+                source="maintenance_usb_release",
+                reason="USB runtime was manually released for direct maintenance testing; service motion is blocked until recovery.",
+                usb_owner="released",
+            )
     return {"ok": True, "mode": "maintenance", "usb_owner": "released", "message": _startup_error, "maintenance_state": maintenance}
 
 
@@ -4544,21 +4591,22 @@ async def maintenance_usb_reconnect(request: Request):
     _require_local_maintenance_client(request)
     global _tester, _startup_error, _pipette_transport
     async with _tester_lock:
-        try:
-            alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
-            _tester = await asyncio.wait_for(run_in_threadpool(lambda: BioXpTester(alt=alt)), timeout=20.0)
-            _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
-            _startup_error = None
-            _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
-        except Exception as exc:
-            _tester = None
-            _startup_error = str(exc)
-            raise HTTPException(status_code=503, detail=_startup_error) from exc
-        maintenance = _mark_post_maintenance_motion_block(
-            source="maintenance_usb_reconnect",
-            reason="USB runtime was reconnected after maintenance; non-homing motion recovery is required before live motion.",
-            usb_owner="service",
-        )
+        async with _tester_transition_lock:
+            try:
+                alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
+                _tester = await run_in_threadpool(lambda: BioXpTester(alt=alt))
+                _pipette_transport = build_default_pipette_transport(shared_usb=_tester)
+                _startup_error = None
+                _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
+            except Exception as exc:
+                _tester = None
+                _startup_error = str(exc)
+                raise HTTPException(status_code=503, detail=_startup_error) from exc
+            maintenance = _mark_post_maintenance_motion_block(
+                source="maintenance_usb_reconnect",
+                reason="USB runtime was reconnected after maintenance; non-homing motion recovery is required before live motion.",
+                usb_owner="service",
+            )
     return {"ok": True, "mode": "maintenance", "usb_owner": "service", "message": "USB runtime reconnected; motion is blocked until recovery.", "maintenance_state": maintenance}
 
 
@@ -5213,9 +5261,8 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
         action = resolve_axis_diagnostic(req.axis, "stop")
     except AxisDiagnosticContractError as exc:  # pragma: no cover - literal axis restricts this
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    tester = _get_tester()
 
-    def stop_and_verify() -> dict[str, Any]:
+    def stop_and_verify(tester) -> dict[str, Any]:
         profile = tester._motion_oem_axis_profile(req.axis, startup=False)
         board = int(profile["board"])
         motor = int(profile["motor"])

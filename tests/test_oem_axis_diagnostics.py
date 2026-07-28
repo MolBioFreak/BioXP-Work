@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from fastapi import HTTPException
@@ -237,3 +239,112 @@ def test_diagnostic_stop_preempts_inflight_normal_tester_lock(monkeypatch):
     called_before_release, result = asyncio.run(scenario())
     assert called_before_release is True
     assert result["verified_stopped"] is True
+
+
+def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
+    from src.bioxp import api
+
+    stop_entered = threading.Event()
+    allow_stop = threading.Event()
+
+    class Tester:
+        disconnected = False
+
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            return {"board": 3, "motor": 0}
+
+        def motor_stop(self, board, motor):
+            stop_entered.set()
+            assert allow_stop.wait(1.0)
+            assert self.disconnected is False
+            return {"ok": True, "board": board, "motor": motor}
+
+        def motor_axis_status(self, board, motor):
+            return {"ok": True, "speed": {"speed": 0}}
+
+        def motor_query_home_switch(self, board, motor):
+            return {"ok": True, "active": False}
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+
+    async def scenario():
+        stop_task = asyncio.create_task(
+            api.motion_diagnostics_stop(
+                api.AxisDiagnosticStopRequest(
+                    axis="x",
+                    operator_ack="STOP_AXIS",
+                    reason="connection lease regression",
+                    operator="independent safety regression",
+                )
+            )
+        )
+        assert await asyncio.to_thread(stop_entered.wait, 1.0)
+        release_task = asyncio.create_task(
+            api.maintenance_usb_release(cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))))
+        )
+        await asyncio.sleep(0.05)
+        release_completed_while_stop_blocked = release_task.done()
+        allow_stop.set()
+        stop_result = await stop_task
+        release_result = await release_task
+        return release_completed_while_stop_blocked, stop_result, release_result
+
+    release_completed, stop_result, release_result = asyncio.run(scenario())
+    assert release_completed is False
+    assert stop_result["verified_stopped"] is True
+    assert release_result["usb_owner"] == "released"
+    assert tester.disconnected is True
+
+
+def test_interrupt_timeout_keeps_connection_lease_until_worker_exits(monkeypatch):
+    from src.bioxp import api
+
+    worker_entered = threading.Event()
+    allow_worker_exit = threading.Event()
+
+    class Tester:
+        disconnected = False
+
+        def _disconnect(self):
+            self.disconnected = True
+
+    tester = Tester()
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+
+    def blocked_interrupt(active_tester):
+        assert active_tester is tester
+        worker_entered.set()
+        assert allow_worker_exit.wait(1.0)
+        assert tester.disconnected is False
+        return {"ok": True}
+
+    async def scenario():
+        with pytest.raises(HTTPException) as exc_info:
+            await api._run_safety_interrupt_blocking(
+                "timeout lease regression",
+                blocked_interrupt,
+                timeout_s=0.05,
+            )
+        assert exc_info.value.status_code == 504
+        assert await asyncio.to_thread(worker_entered.wait, 1.0)
+        release_task = asyncio.create_task(
+            api.maintenance_usb_release(cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))))
+        )
+        await asyncio.sleep(0.05)
+        release_completed_before_worker_exit = release_task.done()
+        allow_worker_exit.set()
+        release_result = await release_task
+        return release_completed_before_worker_exit, release_result
+
+    release_completed, release_result = asyncio.run(scenario())
+    assert release_completed is False
+    assert release_result["usb_owner"] == "released"
+    assert tester.disconnected is True
