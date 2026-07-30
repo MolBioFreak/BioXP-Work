@@ -23,7 +23,7 @@ from src.bioxp.services.motion_service import (
 )
 
 
-def load_api(monkeypatch):
+def load_api(monkeypatch, *, startup_recovered=True):
     usb_pkg = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
     usb_util = types.ModuleType("usb.util")
@@ -41,7 +41,17 @@ def load_api(monkeypatch):
         "src.bioxp",
     ]:
         sys.modules.pop(name, None)
-    return importlib.import_module("src.bioxp.api")
+    api = importlib.import_module("src.bioxp.api")
+    if startup_recovered:
+        api._set_maintenance_state(
+            transition="test_startup_recovered",
+            motion_blocked=False,
+            recovery_required=False,
+            block_reason=None,
+            recovery_hint=None,
+            blocked_by=None,
+        )
+    return api
 
 
 async def _fake_run_blocking(label, func, timeout_s=30.0):
@@ -962,6 +972,17 @@ def test_post_maintenance_recovery_failure_preserves_block_and_fails_closed(monk
     assert api._maintenance_state_payload()["motion_blocked"] is True
 
 
+def test_service_start_defaults_to_pending_non_homing_recovery(monkeypatch):
+    api = load_api(monkeypatch, startup_recovered=False)
+
+    state = api._maintenance_state_payload()
+
+    assert state["motion_blocked"] is True
+    assert state["recovery_required"] is True
+    assert state["blocked_by"] == "service_start"
+    assert api._require_non_homing_motion_recovery_pending() == 1
+
+
 def test_remote_strict_startup_requires_recover_motion_ack_before_hardware(monkeypatch):
     api = load_api(monkeypatch)
     api._tester = object()
@@ -992,6 +1013,14 @@ def test_remote_strict_startup_requires_recover_motion_ack_before_hardware(monke
 
 def test_remote_strict_startup_rejects_when_recovery_is_not_pending_before_hardware(monkeypatch):
     api = load_api(monkeypatch)
+    api._set_maintenance_state(
+        transition="test_recovery_complete",
+        motion_blocked=False,
+        recovery_required=False,
+        block_reason=None,
+        recovery_hint=None,
+        blocked_by=None,
+    )
     monkeypatch.setattr(api, "_get_tester", lambda: (_ for _ in ()).throw(AssertionError("hardware accessed")))
 
     with pytest.raises(HTTPException) as exc_info:

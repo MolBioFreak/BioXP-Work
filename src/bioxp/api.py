@@ -195,19 +195,28 @@ MAINTENANCE_STATE_SCHEMA_VERSION = "bioxp.maintenance_state.v1"
 MAINTENANCE_RECOVERY_ACK = "RECOVER"
 MOTION_RECOVERY_ACK = "RECOVER_MOTION"
 _maintenance_state_lock = threading.RLock()
-_maintenance_latch_generation = 0
-_maintenance_state: dict[str, Any] = {
-    "schema_version": MAINTENANCE_STATE_SCHEMA_VERSION,
-    "usb_owner": "service",
-    "motion_blocked": False,
-    "recovery_required": False,
-    "block_reason": None,
-    "recovery_hint": None,
-    "blocked_by": None,
-    "last_transition": "service_start",
-    "last_transition_at": None,
-    "last_recovery": None,
-}
+
+
+def _initial_maintenance_state() -> dict[str, Any]:
+    return {
+        "schema_version": MAINTENANCE_STATE_SCHEMA_VERSION,
+        "usb_owner": "service",
+        "motion_blocked": True,
+        "recovery_required": True,
+        "block_reason": "Service startup requires explicit non-homing motion recovery.",
+        "recovery_hint": (
+            "Run non-homing strict startup or localhost-only POST /maintenance/usb/recover_motion "
+            "before any axis/home/clear-lock motion."
+        ),
+        "blocked_by": "service_start",
+        "last_transition": "service_start",
+        "last_transition_at": None,
+        "last_recovery": None,
+    }
+
+
+_maintenance_latch_generation = 1
+_maintenance_state: dict[str, Any] = _initial_maintenance_state()
 
 
 def _now_utc() -> str:
