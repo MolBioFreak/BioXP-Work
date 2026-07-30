@@ -21,9 +21,11 @@ def test_disconnect_default_result_is_json_serializable_for_artifacts():
     result = tester._disconnect()
 
     json.dumps({"disconnect": result}, sort_keys=True)
+    assert isinstance(result, dict)
     assert result["device"] == "fake-novo-usb"
     assert result["hard_reset_requested"] is False
-    assert tester.dev is None
+    assert result["ok"] is False
+    assert tester.dev is fake
     assert tester.ep_out is None
     assert tester.ep_in is None
 

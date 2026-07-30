@@ -50,6 +50,15 @@ class UvcXuControlQuery(ctypes.Structure):
     ]
 
 
+class BioXpConstructionError(RuntimeError):
+    """A constructor failed after acquiring an owner that was not fully released."""
+
+    def __init__(self, message, *, partial_owner, cleanup_report):
+        super().__init__(message)
+        self.partial_owner = partial_owner
+        self.cleanup_report = cleanup_report
+
+
 class BioXpTester:
     BOARD_HEAD = 0x04
     BOARD_DECK = 0x05
@@ -404,8 +413,21 @@ class BioXpTester:
             "seq": 0,
         }
         self._motion_last_strict_init = None
-        self._connect()
-        self._led_state_cache = self.load_led_state()
+        try:
+            self._connect()
+            self._led_state_cache = self.load_led_state()
+        except Exception as exc:
+            try:
+                cleanup_report = self._disconnect()
+            except Exception as cleanup_exc:
+                cleanup_report = {"ok": False, "cleanup_error": str(cleanup_exc)}
+            if isinstance(cleanup_report, dict) and cleanup_report.get("ok") is True:
+                raise
+            raise BioXpConstructionError(
+                f"BioXP constructor failed and USB cleanup was incomplete: {exc}",
+                partial_owner=self,
+                cleanup_report=cleanup_report,
+            ) from exc
 
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
@@ -488,26 +510,34 @@ class BioXpTester:
     def _disconnect(self, dev=None, *, hard_reset=False, return_device=False):
         with self._transport_guard():
             router = getattr(self, "novo_router", None)
-            if router is not None:
-                router.shutdown()
-                self.novo_router = None
             if dev is None:
                 dev = self.dev
-            if dev is self.dev:
-                self.ep_out = None
-                self.ep_in = None
-                self.dev = None
-
             summary = {
                 "ok": True,
                 "device": self._device_label(dev),
                 "device_present": dev is not None,
                 "hard_reset_requested": bool(hard_reset),
+                "router_shutdown_ok": None,
                 "release_interface_ok": None,
                 "dispose_resources_ok": None,
                 "hard_reset_ok": None,
             }
+            if router is not None:
+                try:
+                    router.shutdown()
+                    summary["router_shutdown_ok"] = True
+                    self.novo_router = None
+                except Exception as exc:
+                    summary["router_shutdown_ok"] = False
+                    summary["router_shutdown_error"] = str(exc)
+            if dev is self.dev:
+                # Disable I/O immediately, but retain the device handle until
+                # release and disposal are authoritatively complete. Quarantine
+                # cleanup must be able to retry a failed release in-process.
+                self.ep_out = None
+                self.ep_in = None
             if dev is None:
+                summary["ok"] = router is None or summary["router_shutdown_ok"] is True
                 return None if return_device else summary
 
             try:
@@ -530,9 +560,13 @@ class BioXpTester:
                     summary["hard_reset_ok"] = False
                     summary["hard_reset_error"] = str(exc)
             required = [summary["release_interface_ok"], summary["dispose_resources_ok"]]
+            if router is not None:
+                required.append(summary["router_shutdown_ok"])
             if hard_reset:
                 required.append(summary["hard_reset_ok"])
             summary["ok"] = all(value is True for value in required)
+            if summary["ok"] is True and dev is self.dev:
+                self.dev = None
             if return_device:
                 if summary["ok"] is not True:
                     raise RuntimeError(f"USB disconnect was incomplete: {summary}")

@@ -141,6 +141,7 @@ from .vision.inspection import InspectionCommand
 _tester: Optional[BioXpTester] = None
 _tester_quarantine: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
+_generic_lifespan_claim_pending = False
 _tester_lock = asyncio.Lock()
 # Connection ownership transitions share this lease with the safety-interrupt
 # lane. Normal tester work deliberately does not, so a stop can still preempt
@@ -426,7 +427,8 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    global _tester, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
+    _generic_lifespan_claim_pending = False
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)
@@ -444,6 +446,7 @@ async def lifespan(app: FastAPI):
         print(f"[WARN] {_startup_error}")
     else:
         _tester = None
+        _generic_lifespan_claim_pending = True
         _startup_error = (
             "USB transport is intentionally unbound during generic API lifespan; "
             "use an explicit ownership POST before hardware collection."
@@ -457,24 +460,66 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await _stop_owned_camera_session(reason="lifespan shutdown")
-        shutdown_oem_runtime()
-        close_fn = getattr(_pipette_transport, "close", None)
-        if callable(close_fn):
-            close_fn()
-        tester = _tester
-        if tester is not None:
-            disconnect = getattr(tester, "_disconnect", None)
-            if callable(disconnect):
-                disconnect()
-        _tester = None
-        _pipette_transport = None
-        _ownership_changed(
-            reason="generic_lifespan_shutdown",
-            transport="unbound",
-            usb="unbound",
-            router="stopped",
-        )
+        # Close admission immediately, then drain the same ownership leases used
+        # by reconnect. A shielded constructor may outlive its cancelled HTTP
+        # waiter, but it cannot publish an owner after this shutdown completes.
+        _generic_lifespan_claim_pending = False
+        async with _tester_lock:
+            async with _tester_transition_lock:
+                shutdown_errors = []
+                try:
+                    await _stop_owned_camera_session(reason="lifespan shutdown")
+                except Exception as exc:
+                    shutdown_errors.append(f"camera shutdown: {exc}")
+                try:
+                    shutdown_oem_runtime()
+                except Exception as exc:
+                    shutdown_errors.append(f"OEM runtime shutdown: {exc}")
+                cleanup_errors = list(shutdown_errors)
+                failed_owner = None
+                close_fn = getattr(_pipette_transport, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception as exc:
+                        cleanup_errors.append(f"pipette transport close: {exc}")
+                owners = (_tester,) if _tester_quarantine is _tester else (_tester, _tester_quarantine)
+                for owner in owners:
+                    if owner is None:
+                        continue
+                    try:
+                        disconnect = getattr(owner, "_disconnect", None)
+                        if not callable(disconnect):
+                            raise RuntimeError("USB owner has no authoritative disconnect operation")
+                        _require_complete_disconnect_report(disconnect())
+                    except Exception as exc:
+                        if failed_owner is None:
+                            failed_owner = owner
+                        cleanup_errors.append(f"USB owner disconnect: {exc}")
+                if failed_owner is not None:
+                    _tester = None
+                    _tester_quarantine = failed_owner
+                    _pipette_transport = None
+                    _startup_error = (
+                        "BioXP lifespan shutdown cleanup incomplete; owner quarantined: "
+                        + "; ".join(cleanup_errors)
+                    )
+                    _publish_quarantined_owner(
+                        source="generic_lifespan_shutdown_incomplete",
+                        reason=_startup_error,
+                    )
+                else:
+                    _tester = None
+                    _tester_quarantine = None
+                    _pipette_transport = None
+                    _ownership_changed(
+                        reason="generic_lifespan_shutdown",
+                        transport="unbound",
+                        usb="unbound",
+                        router="stopped",
+                    )
+                    if cleanup_errors:
+                        _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
 
 
 app = FastAPI(
@@ -4604,12 +4649,92 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+async def _claim_service_usb_runtime(*, source: str) -> dict[str, Any]:
+    """Construct the managed USB owner from an intentionally unbound state.
+
+    The caller must hold ``_tester_transition_lock`` through
+    ``_run_tester_transition``.  Both the remote managed reconnect route and
+    the localhost maintenance route use this one quarantine-aware path.
+    """
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
+    if _tester_quarantine is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=_startup_error or "BioXP USB runtime has a quarantined partial owner requiring maintenance release.",
+        )
+    if _tester is not None:
+        return _maintenance_state_payload()
+    candidate = None
+    try:
+        alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
+        candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
+        transport = build_default_pipette_transport(shared_usb=candidate)
+        _tester = candidate
+        _pipette_transport = transport
+        _startup_error = None
+        _ownership_changed(reason=source, transport="owned", usb="service", router="running")
+        _generic_lifespan_claim_pending = False
+    except Exception as exc:
+        cleanup_error = None
+        partial_owner = getattr(exc, "partial_owner", None)
+        constructor_cleanup_report = getattr(exc, "cleanup_report", None)
+        if candidate is None and partial_owner is not None:
+            candidate = partial_owner
+            cleanup_error = RuntimeError(
+                f"constructor cleanup was incomplete: {constructor_cleanup_report}"
+            )
+            _tester_quarantine = candidate
+        if candidate is not None:
+            disconnect = getattr(candidate, "_disconnect", None)
+            if cleanup_error is not None:
+                pass
+            elif callable(disconnect):
+                try:
+                    report = await run_in_threadpool(disconnect)
+                    _require_complete_disconnect_report(report)
+                except Exception as cleanup_exc:
+                    cleanup_error = cleanup_exc
+                    _tester_quarantine = candidate
+            else:
+                cleanup_error = RuntimeError("USB candidate has no authoritative disconnect operation")
+                _tester_quarantine = candidate
+        _tester = None
+        _pipette_transport = None
+        _startup_error = str(exc)
+        if cleanup_error is not None:
+            _startup_error = f"{_startup_error}; candidate cleanup failed: {cleanup_error}"
+            _publish_quarantined_owner(
+                source=f"{source}_cleanup_incomplete",
+                reason=_startup_error,
+            )
+        else:
+            _ownership_changed(
+                reason=f"{source}_failed",
+                transport="unbound",
+                usb="released",
+                router="stopped",
+            )
+            _mark_post_maintenance_motion_block(
+                source=f"{source}_failed",
+                reason=_startup_error,
+                usb_owner="released",
+            )
+        raise HTTPException(status_code=503, detail=_startup_error) from exc
+    return _mark_post_maintenance_motion_block(
+        source=source,
+        reason="USB runtime was reconnected; non-homing motion recovery is required before live motion.",
+        usb_owner="service",
+    )
+
+
 @app.post("/reconnect")
 async def reconnect_runtime():
-    global _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
 
     async def transition():
-        global _pipette_transport
+        global _tester, _tester_quarantine, _startup_error, _pipette_transport
+        if _tester is None and _generic_lifespan_claim_pending:
+            return await _claim_service_usb_runtime(source="runtime_reconnect")
         tester = _get_tester()
 
         def reconnect_and_rebuild():
@@ -4620,7 +4745,18 @@ async def reconnect_runtime():
             reconnect_fn()
             return build_default_pipette_transport(shared_usb=tester)
 
-        _pipette_transport = await run_in_threadpool(reconnect_and_rebuild)
+        try:
+            _pipette_transport = await run_in_threadpool(reconnect_and_rebuild)
+        except Exception as exc:
+            _tester = None
+            _tester_quarantine = tester
+            _pipette_transport = None
+            _startup_error = f"BioXP USB reconnect failed; uncertain owner quarantined: {exc}"
+            _publish_quarantined_owner(
+                source="runtime_reconnect_failed",
+                reason=_startup_error,
+            )
+            raise HTTPException(status_code=503, detail=_startup_error) from exc
         _ownership_changed(reason="runtime_reconnect", transport="owned", usb="service", router="running")
         return _mark_post_maintenance_motion_block(
             source="runtime_reconnect",
@@ -4645,48 +4781,60 @@ async def maintenance_usb_state():
 @app.post("/maintenance/usb/release")
 async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
 
     async def transition():
-        global _tester, _tester_quarantine, _startup_error, _pipette_transport
+        global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
         tester = _tester
         quarantined = _tester_quarantine
+        cleanup_warnings = []
         if tester is not None or quarantined is not None:
-            failed_owner = quarantined or tester
-            try:
-                close_fn = getattr(_pipette_transport, "close", None)
-                if callable(close_fn):
+            cleanup_errors = cleanup_warnings
+            failed_owner = None
+            close_fn = getattr(_pipette_transport, "close", None)
+            if callable(close_fn):
+                try:
                     await run_in_threadpool(close_fn)
-                owners = (tester,) if quarantined is tester else (tester, quarantined)
-                for owner in owners:
-                    if owner is None:
-                        continue
-                    failed_owner = owner
+                except Exception as exc:
+                    cleanup_errors.append(f"pipette transport close: {exc}")
+            owners = (tester,) if quarantined is tester else (tester, quarantined)
+            for owner in owners:
+                if owner is None:
+                    continue
+                try:
                     disconnect = getattr(owner, "_disconnect", None)
                     if not callable(disconnect):
                         raise RuntimeError("USB owner has no authoritative disconnect operation")
                     report = await run_in_threadpool(disconnect)
                     _require_complete_disconnect_report(report)
-            except Exception as exc:
+                except Exception as exc:
+                    if failed_owner is None:
+                        failed_owner = owner
+                    cleanup_errors.append(f"USB owner disconnect: {exc}")
+            if failed_owner is not None:
                 _tester = None
                 _tester_quarantine = failed_owner
                 _pipette_transport = None
-                _startup_error = f"BioXP USB release incomplete; owner quarantined: {exc}"
+                _startup_error = "BioXP USB release incomplete; owner quarantined: " + "; ".join(cleanup_errors)
                 _publish_quarantined_owner(
                     source="maintenance_usb_release_incomplete",
                     reason=_startup_error,
                 )
-                raise HTTPException(status_code=503, detail=_startup_error) from exc
+                raise HTTPException(status_code=503, detail=_startup_error)
         _tester = None
         _tester_quarantine = None
         _pipette_transport = None
+        _generic_lifespan_claim_pending = False
         _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
         _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
-        return _mark_post_maintenance_motion_block(
+        maintenance = _mark_post_maintenance_motion_block(
             source="maintenance_usb_release",
             reason="USB runtime was manually released for direct maintenance testing; service motion is blocked until recovery.",
             usb_owner="released",
         )
+        if cleanup_warnings:
+            maintenance = {**maintenance, "cleanup_warnings": tuple(cleanup_warnings)}
+        return maintenance
 
     maintenance = await _run_tester_transition("maintenance USB release", transition)
     return {"ok": True, "mode": "maintenance", "usb_owner": "released", "message": _startup_error, "maintenance_state": maintenance}
@@ -4695,67 +4843,9 @@ async def maintenance_usb_release(request: Request):
 @app.post("/maintenance/usb/reconnect")
 async def maintenance_usb_reconnect(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport
 
     async def transition():
-        global _tester, _tester_quarantine, _startup_error, _pipette_transport
-        if _tester_quarantine is not None:
-            raise HTTPException(
-                status_code=503,
-                detail=_startup_error or "BioXP USB runtime has a quarantined partial owner requiring maintenance release.",
-            )
-        if _tester is not None:
-            return _maintenance_state_payload()
-        candidate = None
-        try:
-            alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
-            candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
-            transport = build_default_pipette_transport(shared_usb=candidate)
-            _tester = candidate
-            _pipette_transport = transport
-            _startup_error = None
-            _ownership_changed(reason="maintenance_usb_reconnect", transport="owned", usb="service", router="running")
-        except Exception as exc:
-            cleanup_error = None
-            if candidate is not None:
-                disconnect = getattr(candidate, "_disconnect", None)
-                if callable(disconnect):
-                    try:
-                        report = await run_in_threadpool(disconnect)
-                        _require_complete_disconnect_report(report)
-                    except Exception as cleanup_exc:
-                        cleanup_error = cleanup_exc
-                        _tester_quarantine = candidate
-                else:
-                    cleanup_error = RuntimeError("USB candidate has no authoritative disconnect operation")
-                    _tester_quarantine = candidate
-            _tester = None
-            _pipette_transport = None
-            _startup_error = str(exc)
-            if cleanup_error is not None:
-                _startup_error = f"{_startup_error}; candidate cleanup failed: {cleanup_error}"
-                _publish_quarantined_owner(
-                    source="maintenance_usb_reconnect_cleanup_incomplete",
-                    reason=_startup_error,
-                )
-            else:
-                _ownership_changed(
-                    reason="maintenance_usb_reconnect_failed",
-                    transport="unbound",
-                    usb="released",
-                    router="stopped",
-                )
-                _mark_post_maintenance_motion_block(
-                    source="maintenance_usb_reconnect_failed",
-                    reason=_startup_error,
-                    usb_owner="released",
-                )
-            raise HTTPException(status_code=503, detail=_startup_error) from exc
-        return _mark_post_maintenance_motion_block(
-            source="maintenance_usb_reconnect",
-            reason="USB runtime was reconnected after maintenance; non-homing motion recovery is required before live motion.",
-            usb_owner="service",
-        )
+        return await _claim_service_usb_runtime(source="maintenance_usb_reconnect")
 
     maintenance = await _run_tester_transition("maintenance USB reconnect", transition)
     return {"ok": True, "mode": "maintenance", "usb_owner": "service", "message": "USB runtime reconnected; motion is blocked until recovery.", "maintenance_state": maintenance}

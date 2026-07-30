@@ -22,6 +22,116 @@ class ConnectFailure(RuntimeError):
     pass
 
 
+def test_constructor_endpoint_failure_releases_claimed_interface(monkeypatch):
+    released = []
+    disposed = []
+
+    class PartialDev:
+        label = "partial-constructor"
+
+        def is_kernel_driver_active(self, interface):
+            return False
+
+        def set_configuration(self):
+            return None
+
+        def set_interface_altsetting(self, *, interface, alternate_setting):
+            return None
+
+        def get_active_configuration(self):
+            return {(0, 1): object()}
+
+    dev = PartialDev()
+    monkeypatch.setattr(usb_driver.usb.core, "find", lambda **kwargs: dev)
+    monkeypatch.setattr(usb_driver.usb.util, "claim_interface", lambda value, iface: None)
+    monkeypatch.setattr(usb_driver.usb.util, "find_descriptor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        usb_driver.usb.util,
+        "release_interface",
+        lambda value, iface: released.append((value, iface)),
+    )
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda value: disposed.append(value))
+
+    with pytest.raises(ValueError, match="endpoints were not found"):
+        usb_driver.BioXpTester(alt=1)
+
+    assert released == [(dev, 0)]
+    assert disposed == [dev]
+
+
+def test_constructor_router_start_failure_shuts_down_and_releases_usb(monkeypatch):
+    released = []
+    disposed = []
+    router_events = []
+
+    class PartialDev:
+        label = "partial-router"
+
+        def is_kernel_driver_active(self, interface):
+            return False
+
+        def set_configuration(self):
+            return None
+
+        def set_interface_altsetting(self, *, interface, alternate_setting):
+            return None
+
+        def get_active_configuration(self):
+            return {(0, 1): object()}
+
+    class PartialRouter:
+        def __init__(self, **kwargs):
+            router_events.append("constructed")
+
+        def start(self):
+            router_events.append("start")
+            raise RuntimeError("router startup failed")
+
+        def shutdown(self):
+            router_events.append("shutdown")
+
+    dev = PartialDev()
+    endpoints = iter([object(), object()])
+    monkeypatch.setattr(usb_driver.usb.core, "find", lambda **kwargs: dev)
+    monkeypatch.setattr(usb_driver.usb.util, "claim_interface", lambda value, iface: None)
+    monkeypatch.setattr(usb_driver.usb.util, "find_descriptor", lambda *args, **kwargs: next(endpoints))
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda value, iface: released.append((value, iface)))
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda value: disposed.append(value))
+    monkeypatch.setattr(usb_driver, "NovoRouter", PartialRouter)
+
+    with pytest.raises(RuntimeError, match="router startup failed"):
+        usb_driver.BioXpTester(alt=1)
+
+    assert router_events == ["constructed", "start", "shutdown"]
+    assert released == [(dev, 0)]
+    assert disposed == [dev]
+
+
+def test_constructor_incomplete_cleanup_exposes_partial_owner_for_quarantine(monkeypatch):
+    owners = []
+
+    def fail_after_claim(self):
+        owners.append(self)
+        self.dev = FakeDev("partial-owner")
+        raise RuntimeError("constructor failed after claim")
+
+    def incomplete_cleanup(self):
+        return {
+            "ok": False,
+            "release_interface_ok": False,
+            "dispose_resources_ok": True,
+        }
+
+    monkeypatch.setattr(usb_driver.BioXpTester, "_connect", fail_after_claim)
+    monkeypatch.setattr(usb_driver.BioXpTester, "_disconnect", incomplete_cleanup)
+
+    with pytest.raises(usb_driver.BioXpConstructionError) as captured:
+        usb_driver.BioXpTester(alt=1)
+
+    assert captured.value.partial_owner is owners[0]
+    assert captured.value.cleanup_report["ok"] is False
+
+
 def _make_tester(connect_outcomes):
     tester = usb_driver.BioXpTester.__new__(usb_driver.BioXpTester)
     tester.dev = FakeDev("initial")
@@ -68,6 +178,57 @@ def test_disconnect_report_is_not_ok_when_any_usb_release_step_fails(monkeypatch
     assert report["ok"] is False
     assert report["release_interface_ok"] is (failed_step != "release")
     assert report["dispose_resources_ok"] is (failed_step != "dispose")
+
+
+def test_failed_release_retains_device_handle_for_authoritative_cleanup_retry(monkeypatch):
+    tester, _ = _make_tester([])
+    original = tester.dev
+    release_calls = []
+
+    def release(dev, iface):
+        release_calls.append((dev, iface))
+        if len(release_calls) == 1:
+            raise RuntimeError("transient release failure")
+
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", release)
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: None)
+
+    first = tester._disconnect()
+    assert first["ok"] is False
+    assert tester.dev is original
+
+    second = tester._disconnect()
+    assert second["ok"] is True
+    assert tester.dev is None
+    assert release_calls == [(original, 0), (original, 0)]
+
+
+def test_failed_router_shutdown_retains_router_handle_for_cleanup_retry(monkeypatch):
+    tester, _ = _make_tester([])
+
+    class RetryableRouter:
+        def __init__(self):
+            self.calls = 0
+
+        def shutdown(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient router shutdown failure")
+
+    router = RetryableRouter()
+    tester.novo_router = router
+    monkeypatch.setattr(usb_driver.usb.util, "release_interface", lambda dev, iface: None)
+    monkeypatch.setattr(usb_driver.usb.util, "dispose_resources", lambda dev: None)
+
+    first = tester._disconnect()
+    assert first["ok"] is False
+    assert tester.novo_router is router
+
+    second = tester._disconnect()
+    assert second["ok"] is True
+    assert tester.novo_router is None
+    assert tester.dev is None
+    assert router.calls == 2
 
 
 def test_reconnect_prefers_soft_rebind_before_usb_reset(monkeypatch):
