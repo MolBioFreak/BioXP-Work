@@ -18,11 +18,38 @@ def _write_bundle(root: Path) -> None:
         (root / name).write_text("<x />")
 
 
+def _bind_snapshot(root: Path, monkeypatch) -> None:
+    from src.bioxp import oem_machine_bundle
+    from src.bioxp.oem_config import parse_oem_machine_config_bundle
+    from src.bioxp.oem_machine_bundle import OemMachineSnapshot
+
+    parsed = parse_oem_machine_config_bundle(root)
+    snapshot = OemMachineSnapshot(
+        acquisition_id="test-acquisition",
+        machine_serial=206,
+        lock_sha256="0" * 64,
+        bundle_root=root,
+        records={},
+        fields={},
+        axis_limits=parsed["config"]["axis_limits"],
+        position_table=tuple(parsed["config"]["position_table"]),
+        config_sections={},
+        operation_parameters={"Mode": "test", "DeckInspection": False, "CheckCamera": False},
+        inspection_profile_name="Settings3200",
+        inspection_profile={},
+        calibration_comparison={},
+        process_times={},
+        mutable_seeds={},
+        operator_label_matched=True,
+    )
+    monkeypatch.setattr(oem_machine_bundle, "_active_snapshot", snapshot)
+
+
 def test_bound_position_table_uses_oem_z_high_and_increment_formula(tmp_path, monkeypatch):
     from src.bioxp.oem_compat.position_table import load_bound_oem_position_table
 
     _write_bundle(tmp_path)
-    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
+    _bind_snapshot(tmp_path, monkeypatch)
     table = load_bound_oem_position_table()
     plan = table.compile_move_to("LOC_MS", column=2, row=3, high_pos=True)
 
@@ -39,7 +66,7 @@ def test_bound_position_table_script_move_to_uses_oem_pseudo_z_and_tip_adjust(tm
     from src.bioxp.oem_compat.position_table import load_bound_oem_position_table
 
     _write_bundle(tmp_path)
-    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
+    _bind_snapshot(tmp_path, monkeypatch)
     table = load_bound_oem_position_table()
     plan = table.compile_script_move_to("LOC_MS", column=1, row=4, positionflag=0, tip_location=1)
 
@@ -57,7 +84,7 @@ def test_position_table_routes_are_read_only(tmp_path, monkeypatch):
     import asyncio
 
     _write_bundle(tmp_path)
-    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
+    _bind_snapshot(tmp_path, monkeypatch)
 
     rows = asyncio.run(get_oem_position_table())
     assert rows["position_table_count"] == 2

@@ -1,5 +1,6 @@
 from src.bioxp.oem_runtime_status import OEMRuntimeStatusService
 from src.bioxp.oem_runtime_store import OEMRuntimeStore
+from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
 
 
 class Worker:
@@ -13,10 +14,17 @@ class Worker:
         }
 
 
-def test_runtime_status_corrects_stale_shutdown_when_worker_is_alive(tmp_path):
+def test_runtime_status_overlays_stale_shutdown_with_canonical_lifecycle(tmp_path, monkeypatch):
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transition("waiting", reason="test_waiting")
+    monkeypatch.setattr("src.bioxp.lifecycle_state.lifecycle_state", lifecycle)
+
     store = OEMRuntimeStore(tmp_path)
-    store.write_state({"runtime_state": "shutdown", "worker": {"state": "stopped"}})
+    (tmp_path / "runtime_state.json").write_text(
+        '{"runtime_state":"shutdown","worker":{"state":"stopped"}}'
+    )
     status = OEMRuntimeStatusService(store=store, worker=Worker()).status()
-    assert status["runtime_state"] == "idle_not_ready"
-    assert status["stale_runtime_state_corrected"] == "shutdown"
+    assert status["runtime_state"] == "waiting"
+    assert status["operation_state"] == "waiting"
+    assert "stale_runtime_state_corrected" not in status
     assert status["worker"]["state"] == "idle"

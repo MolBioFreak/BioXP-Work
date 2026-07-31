@@ -423,7 +423,12 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
     mode = str(payload.get("mode") or "dry_run").strip().lower()
     if mode not in {"dry_run", "preview", "live"}:
         raise HTTPException(status_code=400, detail=f"unsupported scriptmove_execute mode: {mode}")
-    live_enabled = mode == "live"
+    if mode == "live":
+        raise HTTPException(
+            status_code=409,
+            detail="legacy generic scriptmove live execution is quarantined; only typed OEM lifecycle parity work is permitted",
+        )
+    live_enabled = False
     if live_enabled and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
         raise HTTPException(status_code=409, detail="operator_ack OEM_PATH_EXECUTE required for live OEM path execution")
     reason = str(payload.get("reason") or payload.get("operator_note") or "").strip()
@@ -550,7 +555,12 @@ async def dry_run_oem_homing_program(program_name: str, payload: dict[str, Any] 
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     runtime = OemHomingDryRunRuntime(artifact_root=Path(artifact_root) if artifact_root else None)
-    return runtime.run(program_name, write_artifact=bool(artifact_root), operator_ack=payload.get("operator_ack"))
+    return runtime.run(
+        program_name,
+        write_artifact=bool(artifact_root),
+        operator_ack=payload.get("operator_ack"),
+        simulation=dict(payload.get("simulation") or {}),
+    )
 
 
 class _ApiShadowReadbackProvider:

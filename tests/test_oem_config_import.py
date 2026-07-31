@@ -74,26 +74,24 @@ def test_parse_oem_config_extracts_axislimits_overrides(tmp_path):
     assert loaded["axis_limits"]["g"]["max_steps"] == 15500
 
     harmonized = harmonized_motion_config(loaded)
-    assert harmonized["source"] == "config_xml"
+    assert harmonized["source"] == "non_authoritative_diagnostic_config_xml"
     assert harmonized["axis_limits"]["x"]["max_steps"] == 91000
     assert harmonized["source_evidence"]["absolute_clamp"]
+    assert harmonized["live_ready"] is False
 
 
-def test_harmonized_motion_config_uses_oem_defaults_when_config_missing(tmp_path):
+def test_harmonized_motion_config_does_not_promote_defaults_when_diagnostic_config_missing(tmp_path):
     from src.bioxp.oem_config import find_oem_config, harmonized_motion_config
 
     missing = find_oem_config([tmp_path / "missing"])
     harmonized = harmonized_motion_config(missing)
 
     assert missing["status"] == "missing"
-    assert harmonized["source"] == "oem_defaults_no_config_xml_found"
-    assert harmonized["axis_limits"]["x"]["max_steps"] == 91919
-    assert harmonized["axis_limits"]["y"]["max_steps"] == 95247
-    assert harmonized["axis_limits"]["z"]["max_steps"] == 160000
-    assert harmonized["axis_limits"]["g"]["max_steps"] == 15000
+    assert harmonized["source"] == "diagnostic_config_unavailable"
+    assert harmonized["axis_limits"] == {}
     assert harmonized["source_evidence"]["config_loader"]
+    assert harmonized["live_ready"] is False
     assert harmonized["deck_coordinate_extents"]["x"]["max_steps"] == 91919
     assert harmonized["deck_coordinate_extents"]["y"]["max_steps"] == 95247
-    assert harmonized["axis_limit_diagnostics"]["x"]["default_limit_below_deck_extent"] is False
-    assert harmonized["axis_limit_diagnostics"]["y"]["default_limit_below_deck_extent"] is False
-    assert harmonized["axis_limit_diagnostics"]["x"]["recommended_status"] == "config_or_default_consistent_with_known_deck_extent"
+    assert harmonized["axis_limit_diagnostics"]["x"]["configured_max_steps"] is None
+    assert harmonized["axis_limit_diagnostics"]["y"]["configured_max_steps"] is None

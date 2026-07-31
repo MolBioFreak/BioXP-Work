@@ -1,14 +1,23 @@
 from src.bioxp.oem_runtime_store import OEMRuntimeStore
 from src.bioxp.oem_runtime_types import OEMRuntimeSnapshot
+from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
 
 
-def test_runtime_store_writes_state_and_journals_with_sequence(tmp_path):
+def test_runtime_store_writes_state_and_journals_with_sequence(tmp_path, monkeypatch):
+    lifecycle = CanonicalLifecycleOwner()
+    lifecycle.transition("waiting", reason="test_waiting")
+    monkeypatch.setattr("src.bioxp.lifecycle_state.lifecycle_state", lifecycle)
+
     store = OEMRuntimeStore(tmp_path)
     state = store.write_state(OEMRuntimeSnapshot())
     event = store.append_event({"event_type": "door"})
     hist = store.append_command_history({"command": {"name": "initializeSystem"}})
     assert state["sequence"] < event["sequence"] < hist["sequence"]
-    assert store.read_state()["runtime_state"] == "idle_not_ready"
+    assert state["runtime_state"] == "waiting"
+    saved = store.read_state()
+    assert saved is not None
+    assert saved["runtime_state"] == "waiting"
+    assert saved["operation_state"] == "waiting"
     assert store.read_journal("event_journal.jsonl")[0]["event_type"] == "door"
 
 

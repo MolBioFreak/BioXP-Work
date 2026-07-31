@@ -580,6 +580,7 @@ class BioXpTester:
         self._thermal_last_tx_ts = 0.0
         self._motor_last_tx_ts = {int(bid): 0.0 for bid in self.MOTOR_BOARDS}
         self._motor_noresp_streak = {int(bid): 0 for bid in self.MOTOR_BOARDS}
+        self._oem_initialized_boards = set()
 
     def reconnect(self, *, hard_reset=False):
         with self._transport_guard():
@@ -879,6 +880,7 @@ class BioXpTester:
         read_timeout_ms=30,
         max_reads=12,
         strict_match=True,
+        require_command_echo=True,
     ):
         with self._transport_guard():
             return self._send_tmcl_locked(
@@ -892,6 +894,7 @@ class BioXpTester:
                 read_timeout_ms=read_timeout_ms,
                 max_reads=max_reads,
                 strict_match=strict_match,
+                require_command_echo=require_command_echo,
             )
 
     def _send_tmcl_locked(
@@ -906,6 +909,7 @@ class BioXpTester:
         read_timeout_ms=30,
         max_reads=12,
         strict_match=True,
+        require_command_echo=True,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
         self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
@@ -915,7 +919,16 @@ class BioXpTester:
         try:
             transaction = router.transact(
                 bytes(frame),
-                matcher=(router.tmcl_matcher(board_id=int(board_id), command=int(command), strict=bool(strict_match)) if wait_reply else None),
+                matcher=(
+                    router.tmcl_matcher(
+                        board_id=int(board_id),
+                        command=int(command),
+                        strict=bool(strict_match),
+                        require_command_echo=bool(require_command_echo),
+                    )
+                    if wait_reply
+                    else None
+                ),
                 matcher_name=f"tmcl:{int(board_id)}:{int(command)}",
                 timeout_s=max(0.10, (int(read_timeout_ms) * int(max_reads)) / 1000.0) if wait_reply else 0.0,
                 write_timeout_ms=int(write_timeout_ms),
@@ -1004,13 +1017,45 @@ class BioXpTester:
         self.send_tmcl(self.BOARD_DECK, 14, 1, 2, 1, wait_reply=False, write_timeout_ms=30)
         time.sleep(0.01)
 
-    def _set_boards_active(self, active: bool, expect_reply=True):
+    def _record_oem_board_activation(self, board_id, *, active, ack):
+        """Own IsInitialized evidence only at the OEM activate/deactivate boundary."""
+        status = int(ack.get("status", -1)) if isinstance(ack, dict) else -1
+        accepted = status == 100 or (int(board_id) == int(self.BOARD_CHILLER) and status == 2)
+        if not accepted:
+            return
+        initialized = getattr(self, "_oem_initialized_boards", None)
+        if not isinstance(initialized, set):
+            initialized = set()
+            self._oem_initialized_boards = initialized
+        state = self._oem_board_state()
+        if active:
+            initialized.add(int(board_id))
+            state[int(board_id)] = True
+        else:
+            initialized.discard(int(board_id))
+            state[int(board_id)] = False
+
+    def _oem_board_activation_ack_success(self, board_id, ack):
+        status = int(ack.get("status", -1)) if isinstance(ack, dict) else -1
+        return status == 100 or (int(board_id) == int(self.BOARD_CHILLER) and status == 2)
+
+    def _oem_board_activation_map_success(self, rows):
+        return bool(
+            isinstance(rows, dict)
+            and all(int(board) in rows for board in self.BOARDS)
+            and all(
+                self._oem_board_activation_ack_success(board, rows.get(int(board)))
+                for board in self.BOARDS
+            )
+        )
+
+    def _set_boards_active(self, active: bool, expect_reply=True, fail_fast=False):
         if active:
             self.enable_motor_power()
         out = {}
         value = 1 if active else 0
         for bid in self.BOARDS:
-            out[bid] = self.send_tmcl_retry(
+            ack = self.send_tmcl_retry(
                 bid,
                 64,
                 0,
@@ -1022,7 +1067,16 @@ class BioXpTester:
                 read_timeout_ms=30,
                 max_reads=12,
                 strict_match=True,
+                # OEM ClassChillerBoard.activateBoard() checks the returned
+                # status byte (100 or 2), not an echoed command byte. Preserve
+                # strict board identity while matching that literal contract.
+                require_command_echo=int(bid) != int(self.BOARD_CHILLER),
             )
+            out[bid] = ack
+            if expect_reply:
+                self._record_oem_board_activation(bid, active=active, ack=ack)
+                if fail_fast and not self._oem_board_activation_ack_success(bid, ack):
+                    break
             time.sleep(0.005)
         return out
 
@@ -1185,13 +1239,14 @@ class BioXpTester:
             bid, 64, 0, 0, 1,
             attempts=1, wait_reply=True, write_timeout_ms=80,
             read_timeout_ms=100, max_reads=10, strict_match=True,
+            require_command_echo=bid != self.BOARD_CHILLER,
         )
         status = None if ack is None else ack.get("status")
         initialized = int(status) == 100 if status is not None else False
         if bid == self.BOARD_CHILLER and status is not None and int(status) == 2:
             initialized = True
         if initialized:
-            self._oem_board_state()[bid] = True
+            self._record_oem_board_activation(bid, active=True, ack=ack)
         return {"board": bid, "ack": ack, "initialized": bool(self._oem_board_state().get(bid, False))}
 
     def oem_activate_uninitialized_boards(self):
@@ -1206,36 +1261,97 @@ class BioXpTester:
                 rows.append({"board": int(bid), "activation": activation, "fan_service": fan_service, "post_activate_sleep_ms": 10})
         return {"boards": rows, "initialized": dict(state)}
 
-    def oem_wait_for_board(self):
-        """Literal ClassControlInterface.waitForBoard() (including its unbounded loop)."""
-        pending = True
-        counter = 0
-        trace = []
-        state = self._oem_board_state()
+    def motor_oem_wait_for_board(
+        self,
+        *,
+        timeout_s=15.0,
+        poll_interval_s=0.100,
+        activation_every_polls=31,
+        clock=time.monotonic,
+        sleep=time.sleep,
+    ):
+        """Bound the OEM waitForBoard loop and report exact missing boards."""
+        timeout_s = max(0.0, float(timeout_s))
+        poll_interval_s = max(0.001, float(poll_interval_s))
+        activation_every_polls = max(1, int(activation_every_polls))
+        started = clock()
+        activation_counter = 0
+        polls = 0
+        activations = []
         while True:
-            pending = any(self._oem_board_present(bid) and not bool(state.get(int(bid), False)) for bid in self.BOARDS)
-            time.sleep(0.100)
-            trace.append({"pending": bool(pending), "counter_before_increment": int(counter), "sleep_ms": 100, "initialized": dict(state)})
-            if pending:
-                counter += 1
-                if counter > 30:
-                    counter = 0
-                    trace.append({"activateBoard": self.oem_activate_uninitialized_boards()})
-                continue
-            break
-        return {"ok": True, "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534", "trace": trace, "initialized": dict(state)}
+            initialized = {
+                int(board) for board in getattr(self, "_oem_initialized_boards", set())
+            }
+            missing = [int(board) for board in self.BOARDS if int(board) not in initialized]
+            if not missing:
+                return {
+                    "ok": True,
+                    "polls": polls,
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "timeout_s": timeout_s,
+                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                    "initialized_boards": sorted(initialized),
+                    "missing_boards": [],
+                    "activations": activations,
+                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                    "linux_guardrail": "bounded_wait_for_board",
+                }
+            elapsed = clock() - started
+            if elapsed >= timeout_s:
+                return {
+                    "ok": False,
+                    "error": "waitForBoard_timeout",
+                    "polls": polls,
+                    "elapsed_ms": int(round(elapsed * 1000.0)),
+                    "timeout_s": timeout_s,
+                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                    "initialized_boards": sorted(initialized),
+                    "missing_boards": missing,
+                    "activations": activations,
+                    "physical_motion": False,
+                    "motion_commanded": False,
+                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                    "linux_guardrail": "bounded_wait_for_board",
+                }
+            sleep(min(poll_interval_s, max(0.0, timeout_s - elapsed)))
+            polls += 1
+            activation_counter += 1
+            if activation_counter >= activation_every_polls:
+                activation_counter = 0
+                activation = self.activate_boards(expect_reply=True, fail_fast=True)
+                activations.append(activation)
+                if not self._oem_board_activation_map_success(activation):
+                    return {
+                        "ok": False,
+                        "error": "waitForBoard_activation_failed",
+                        "polls": polls,
+                        "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                        "timeout_s": timeout_s,
+                        "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                        "initialized_boards": sorted(initialized),
+                        "missing_boards": missing,
+                        "activations": activations,
+                        "physical_motion": False,
+                        "motion_commanded": False,
+                        "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                        "linux_guardrail": "fail_fast_board_activation",
+                    }
 
-    def activate_boards(self, expect_reply=True):
-        return self._set_boards_active(True, expect_reply=expect_reply)
+    def oem_wait_for_board(self, **kwargs):
+        """Compatibility name for the bounded Linux OEM wait contract."""
+        return self.motor_oem_wait_for_board(**kwargs)
 
-    def deactivate_boards(self, expect_reply=True):
+    def activate_boards(self, expect_reply=True, fail_fast=False):
+        return self._set_boards_active(True, expect_reply=expect_reply, fail_fast=fail_fast)
+
+    def deactivate_boards(self, expect_reply=True, fail_fast=False):
         """OEM initialCheck board-cycle counterpart to activate_boards().
 
         Command 64 value 0 places the motion/auxiliary boards into inactive state.
         This is intentionally explicit because live OEM initialCheck requires a
         deactivate -> activate cycle rather than silently skipping the first half.
         """
-        return self._set_boards_active(False, expect_reply=expect_reply)
+        return self._set_boards_active(False, expect_reply=expect_reply, fail_fast=fail_fast)
 
     def board_activate(self, board_id):
         ack = self.send_tmcl_retry(
@@ -2102,7 +2218,16 @@ class BioXpTester:
                     time.sleep(0.03)
         return {"status": st, "rows": rows}
 
-    def strip_set_rgb(self, r, g, b, reconnect_first=True):
+    def strip_set_rgb(
+        self,
+        r,
+        g,
+        b,
+        reconnect_first=True,
+        *,
+        activate_first=True,
+        fail_fast=False,
+    ):
         """
         Main strip control using the proven visible path (RGB channels 0/1/2).
         """
@@ -2114,8 +2239,9 @@ class BioXpTester:
 
         if reconnect_first:
             self.reconnect()
-        self.activate_boards(expect_reply=False)
-        sent += len(self.BOARDS)
+        if activate_first:
+            self.activate_boards(expect_reply=False)
+            sent += len(self.BOARDS)
 
         acks = {}
         for mask, level, key in ((0, r, "r"), (1, g, "g"), (2, b, "b")):
@@ -2134,14 +2260,18 @@ class BioXpTester:
                 strict_match=True,
             )
             sent += 1
-            if ack is None:
+            accepted = self._tmcl_success(ack)
+            if ack is None and not fail_fast:
                 # Fallback write when ack path is flaky.
                 self.send_tmcl(self.BOARD_DECK, 50, 0, mask, sval, wait_reply=False, write_timeout_ms=25)
                 sent += 1
             acks[key] = ack
+            if fail_fast and not accepted:
+                break
             time.sleep(0.04)
 
         return {
+            "ok": bool(len(acks) == 3 and all(self._tmcl_success(ack) for ack in acks.values())),
             "rgb": (r, g, b),
             "tmcl": (
                 self._led_scale_to_tmcl(r),
@@ -3949,12 +4079,7 @@ class BioXpTester:
         extents after a machine-specific OEM config has been bound.
         """
         key = str(axis_key).strip().lower()
-        result = None
-        if find_oem_machine_config_bundle is not None:
-            try:
-                result = find_oem_machine_config_bundle()
-            except Exception:
-                result = None
+        result = self._machine_config_bundle()
         if isinstance(result, dict) and result.get("ok") is True:
             axis_limits = (((result.get("config") or {}).get("axis_limits") or {}))
             row = axis_limits.get(key) if isinstance(axis_limits, dict) else None
@@ -4093,37 +4218,170 @@ class BioXpTester:
         })
         return preset
 
+    def _oem_no_motion_tmcl(self, *, name, board, command, cmd_type, motor, value):
+        ack = self.send_tmcl(
+            int(board),
+            int(command),
+            int(cmd_type),
+            int(motor),
+            int(value),
+            wait_reply=True,
+            write_timeout_ms=1000,
+            read_timeout_ms=1000,
+            max_reads=256,
+            strict_match=True,
+        )
+        return {
+            "name": str(name),
+            "board": int(board),
+            "command": int(command),
+            "cmd_type": int(cmd_type),
+            "motor": int(motor),
+            "value": int(value),
+            "ack": ack,
+            "ok": self._tmcl_success(ack),
+        }
+
     def motor_oem_initialize_without_motion(self):
-        axes = {}
+        """Run the literal OEM no-motion configuration in fail-fast wire order."""
+        operations = []
         failures = []
-        for axis_key in ("x", "y", "z", "g", "door"):
-            preset = self._motion_oem_axis_profile(axis_key)
-            row = self.motor_prepare_axis(
-                preset["board"],
-                motor=preset["motor"],
-                run_current=preset.get("run_current"),
-                standby_current=preset.get("standby_current"),
-                speed=preset.get("speed"),
-                acc=preset.get("acc"),
-                stall_guard=preset.get("stall_guard"),
-                ramp_mode=preset.get("ramp_mode"),
-                disable_right=preset.get("disable_right"),
-                disable_left=preset.get("disable_left"),
-                rdiv=preset.get("rdiv"),
-                pdiv=preset.get("pdiv"),
-                warm_enable=bool(preset.get("warm_enable", False)),
-            )
-            axes[axis_key] = row
-            for op in row.get("ops", []) if isinstance(row, dict) else []:
-                ack = op.get("ack") if isinstance(op, dict) else None
-                if ack is not None and not self._tmcl_success(ack):
-                    failures.append({"axis": axis_key, "op": op.get("op"), "ack": ack})
+
+        def record(row):
+            operations.append(row)
+            if isinstance(row, dict) and row.get("ok") is False:
+                failures.append({"name": row.get("name"), "ack": row.get("ack")})
+            return row
+
+        def tx(name, board, command, cmd_type, motor, value):
+            if failures:
+                return {"name": str(name), "ok": False, "skipped": True, "blocked_by": failures[0].get("name")}
+            return record(self._oem_no_motion_tmcl(
+                name=name,
+                board=board,
+                command=command,
+                cmd_type=cmd_type,
+                motor=motor,
+                value=value,
+            ))
+
+        def sap(name, board, motor, param, value):
+            return tx(name, board, 5, param, motor, value)
+
+        def gap(name, board, motor, param):
+            return tx(name, board, 6, param, motor, 0)
+
+        def speed_acc(prefix, board, motor, speed, acc):
+            sap(f"{prefix}.setMaxSpeed", board, motor, 4, speed)
+            sap(f"{prefix}.setMaxAcc", board, motor, 5, acc)
+
+        wait = self.motor_oem_wait_for_board()
+        record({"name": "waitForBoard", **wait})
+        if not wait.get("ok"):
+            return {
+                "ok": False,
+                "error": str(wait.get("error") or "waitForBoard_failed"),
+                "physical_motion": False,
+                "motion_commanded": False,
+                "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion lines 3181-3265",
+                "wire_contract": "literal_oem_order_no_generic_axis_helper",
+                "operations": operations,
+                "failures": failures,
+                "blocked_before_configuration_writes": True,
+                "wait_for_board": wait,
+            }
+
+        tx("turnOffHeater.tc_pwm_0.first", self.BOARD_THERMAL, 144, 0, 0, 0)
+        tx("turnOffHeater.tc_pwm_0.second", self.BOARD_THERMAL, 144, 0, 0, 0)
+        tx("setChillerPWM.OC", self.BOARD_CHILLER, 144, 0, 1, 0)
+        tx("setChillerPWM.RC", self.BOARD_CHILLER, 144, 0, 0, 0)
+        time.sleep(0.001)
+
+        x = self.motor_function_preset("x")
+        speed_acc("x", x["board"], x["motor"], 1700, 350)
+        time.sleep(0.002)
+        sap("x.setMaxCurrent", x["board"], x["motor"], 6, 31)
+        time.sleep(0.002)
+        sap("x.setStallGuardThreshold", x["board"], x["motor"], 205, 16)
+        time.sleep(0.002)
+
+        y = self.motor_function_preset("y")
+        speed_acc("y", y["board"], y["motor"], 1800, 400)
+        time.sleep(0.002)
+        sap("y.setMaxCurrent", y["board"], y["motor"], 6, 31)
+        time.sleep(0.002)
+        sap("y.setStallGuardThreshold", y["board"], y["motor"], 205, 16)
+        time.sleep(0.002)
+        sap("y.disableRightSwitch", y["board"], y["motor"], 12, 1)
+        time.sleep(0.002)
+
+        z = self.motor_function_preset("z")
+        z_current, z_current_source = self._machine_config_offset_int("m_Z_MOTOR_MAX_CURRENT_UP", None)
+        z_stall, z_stall_source = self._machine_config_offset_int("m_Z_MOTOR_STALL_GUARD_THRESHOLD", None)
+        speed_acc("z", z["board"], z["motor"], 1791, 576)
+        time.sleep(0.002)
+        sap("z.setMaxCurrent", z["board"], z["motor"], 6, z_current)
+        time.sleep(0.002)
+        gap("z.readMaxCurrent", z["board"], z["motor"], 6)
+        sap("z.setStallGuardThreshold", z["board"], z["motor"], 205, z_stall)
+        time.sleep(0.002)
+
+        g = self.motor_function_preset("g")
+        gripper_version = self._motion_oem_gripper_version()
+        if gripper_version == 0:
+            g_speed, g_acc, g_current, g_stall = 600, 5, 31, 5
+        else:
+            g_speed, g_acc, g_current, g_stall = 1500, 20, 10, 20
+        speed_acc("g", g["board"], g["motor"], g_speed, g_acc)
+        time.sleep(0.002)
+        sap("g.setMaxCurrent", g["board"], g["motor"], 6, g_current)
+        time.sleep(0.002)
+        sap("g.setStallGuardThreshold", g["board"], g["motor"], 205, g_stall)
+        time.sleep(0.002)
+        sap("g.setRdiv", g["board"], g["motor"], 153, 6)
+        sap("g.setPdiv", g["board"], g["motor"], 154, 2)
+        time.sleep(0.002)
+
+        door = self.motor_function_preset("door")
+        door_speed, door_speed_source = self._machine_config_offset_int("m_TC_DOOR_VELOCITY", None)
+        door_acc, door_acc_source = self._machine_config_offset_int("m_TC_DOOR_ACCELERATION", None)
+        door_current, door_current_source = self._machine_config_offset_int("m_TC_DOOR_MAX_CURRENT", None)
+        door_stall, door_stall_source = self._machine_config_offset_int("m_TCDoorStallGuardThreshold", None)
+        speed_acc("door", door["board"], door["motor"], door_speed, door_acc)
+        time.sleep(0.002)
+        sap("door.setMaxCurrent", door["board"], door["motor"], 6, door_current)
+        time.sleep(0.002)
+        sap("door.setStallGuardThreshold", door["board"], door["motor"], 205, door_stall)
+        time.sleep(0.002)
+        sap("door.disableRightSwitch", door["board"], door["motor"], 12, 1)
+        time.sleep(0.002)
+        sap("door.disableLeftSwitch", door["board"], door["motor"], 13, 1)
+        time.sleep(0.002)
+
+        tx("setChillerCoolRate.OC", self.BOARD_CHILLER, 9, 8, 1, -25)
+        tx("setChillerCoolRate.RC", self.BOARD_CHILLER, 9, 8, 0, -25)
+        tx("thermal.setTCHeatRate", self.BOARD_THERMAL, 9, 7, 0, 2500)
+        tx("thermal.setTCCoolRate", self.BOARD_THERMAL, 9, 8, 0, -2000)
+        for mask, channel in ((0, "r"), (1, "g"), (2, "b")):
+            tx(f"setColor.white.{channel}", self.BOARD_DECK, 50, 0, mask, 1024)
+
         return {
             "ok": not failures,
             "physical_motion": False,
+            "motion_commanded": False,
             "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion lines 3181-3265",
-            "axes": axes,
-            "axis_failures": failures,
+            "wire_contract": "literal_oem_order_no_generic_axis_helper",
+            "gripper_version": gripper_version,
+            "machine_values": {
+                "z_max_current_up": {"value": z_current, "source": z_current_source},
+                "z_stall_guard": {"value": z_stall, "source": z_stall_source},
+                "thermal_door_velocity": {"value": door_speed, "source": door_speed_source},
+                "thermal_door_acceleration": {"value": door_acc, "source": door_acc_source},
+                "thermal_door_max_current": {"value": door_current, "source": door_current_source},
+                "thermal_door_stall_guard": {"value": door_stall, "source": door_stall_source},
+            },
+            "operations": operations,
+            "failures": failures,
         }
 
     def oem_initialize_without_motion_test_case(self):
@@ -4768,11 +5026,11 @@ class BioXpTester:
     def motor_oem_door_search_home(self, *, timeout_s=20.0, startup=False):
         """OEM thermal-door search-home.
 
-        Startup initializeMotors() calls doorSearchHome(...) directly and then
-        confirms tcDoorClosed. Manual HomeAxis("D") has an additional preclear
-        branch when the closed predicate is already active. Keep those modes
-        separate so startup parity does not inherit manual-home-only preclear
-        behavior or unbounded proxy-visible waits.
+        Both startup initializeMotors() and manual HomeAxis("D") delegate to
+        ClassThermalBoard.doorSearchHome(). That board primitive pre-clears
+        +2000 whenever queryHome is active (or serial <10), independent of its
+        caller. Serial 206 therefore preserves the active-home preclear in both
+        modes while retaining separately bounded waits.
         """
         preset = self._motion_oem_axis_profile("door")
         board = int(preset["board"])
@@ -4784,7 +5042,7 @@ class BioXpTester:
         preclear_threshold = None
         preclear_move = None
         preclear_wait = None
-        if (not bool(startup)) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
+        if isinstance(home_before, dict) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
             preclear_threshold = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold + 2, motor=motor)
             preclear_move = self.motor_move_relative(board, 2000, motor=motor)
             preclear_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 8.0))
@@ -5118,6 +5376,16 @@ class BioXpTester:
         return out
 
     def motor_oem_initialize_motors_full_sequence(self, *, timeout_s=120.0):
+        """Fail closed: the monolithic live OEM meta-action is not accepted."""
+        return {
+            "ok": False,
+            "source_mode": "ClassControlInterface.initializeMotors",
+            "physical_motion_commanded": False,
+            "blocked": True,
+            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+        }
+
+    def _quarantined_oem_initialize_motors_full_sequence(self, *, timeout_s=120.0):
         """Source-shaped ClassControlInterface.initializeMotors() full homing sequence.
 
         This is the OEM full initialization homing body, distinct from the separate
@@ -5260,6 +5528,16 @@ class BioXpTester:
         return out
 
     def motor_oem_rehome(self, *, timeout_s=120.0):
+        """Fail closed until the literal initializeMotors body is accepted."""
+        return {
+            "ok": False,
+            "source_mode": "ControlLib.rehome",
+            "physical_motion_commanded": False,
+            "blocked": True,
+            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+        }
+
+    def _quarantined_oem_rehome(self, *, timeout_s=120.0):
         """Direct source-mode surface for ControlLib.rehome().
 
         The OEM wrapper saves/restores door state around initializeMotors().  The
@@ -5304,11 +5582,15 @@ class BioXpTester:
             "reason": "tip/pipette cleanup and park-related motion are kept separate until source-equivalent primitives are ported",
         }
         return {
-            "ok": bool((not run_homing) or (isinstance(homing, dict) and homing.get("ok") is True)),
+            "ok": bool(
+                isinstance(prep, dict)
+                and prep.get("ok") is True
+                and ((not run_homing) or (isinstance(homing, dict) and homing.get("ok") is True))
+            ),
             "source_mode": "ControlLib.initializeMotion",
             "oem_reference": "ControlLib.initializeMotion flags -> initializeMotors -> tip/pipette cleanup",
             "run_homing": bool(run_homing),
-            "physical_motion_commanded": bool(run_homing),
+            "physical_motion_commanded": False,
             "flags": flags,
             "initialize_motors_without_motion": prep,
             "rehome": homing,
@@ -6727,9 +7009,6 @@ class BioXpTester:
             time.sleep(self.CHILLER_VERIFY_SETTLE_S)
             ref = self.chiller_gp_read(22, bank)
             verified = bool(ref.get("ok") and int(ref.get("value")) == raw)
-        if self._tmcl_success(ack):
-            # ClassThermalControl.setChillerTemperature assigns TC_Target_Temp.
-            self._oem_fan_set_target(self.BOARD_CHILLER, axis, temp_c)
         return {
             "bank": bank,
             "axis": axis,
@@ -6805,8 +7084,6 @@ class BioXpTester:
             time.sleep(self.CHILLER_VERIFY_SETTLE_S)
             rb = self.chiller_gp_read(23, bank)
             verified = bool(rb.get("ok") and int(rb.get("value")) == pwm)
-        if self._tmcl_success(ack) and pwm == 0:
-            self._oem_fan_turn_off(self.BOARD_CHILLER, axis)
         return {
             "bank": bank,
             "axis": axis,
@@ -6957,7 +7234,9 @@ class BioXpTester:
             strict_match=True,
             post_delay_s=self.THERMAL_WRITE_SETTLE_S,
         )
-        return {"ack": ack, "ok": self._tmcl_success_or_invalid(ack)}
+        # Status 2 is an OEM exception only for ClassChillerBoard activation.
+        # The thermal board is a distinct controller and must acknowledge 100.
+        return {"ack": ack, "ok": self._tmcl_success(ack)}
 
     def thermal_query_firmware(self):
         ack = self._send_thermal(
@@ -7117,8 +7396,6 @@ class BioXpTester:
             time.sleep(self.THERMAL_VERIFY_SETTLE_S)
             ref = self.thermal_gp_read(22, bank)
             verified = bool(ref.get("ok") and int(ref.get("value")) == raw)
-        if self._tmcl_success(ack) and bank == self.THERMAL_BANK_NEST:
-            self._oem_fan_set_target(self.BOARD_THERMAL, 0, temp_c)
         return {
             "bank": bank,
             "target_c": temp_c,

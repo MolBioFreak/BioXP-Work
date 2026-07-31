@@ -6,6 +6,7 @@ from typing import Any
 
 from .oem_runtime_types import OEMRuntimeCommand
 from .oem_initialization import run_oem_initialization_controller
+from .oem_movement_ledger import OemMovementLedger
 
 
 PREPARE_TO_RUN_JOB_READINESS_SCHEMA_VERSION = "bioxp.oem_runtime.prepare_to_run_job_readiness.v1"
@@ -34,9 +35,10 @@ PREPARE_TO_RUN_JOB_READINESS_STEPS = [
 
 
 class OEMRuntimeCommandHandlers:
-    def __init__(self, *, startup_program=None, startup_program_factory=None):
+    def __init__(self, *, startup_program=None, startup_program_factory=None, store=None):
         self.startup_program = startup_program
         self.startup_program_factory = startup_program_factory
+        self.movement_ledger = OemMovementLedger(store)
 
     def _startup_program(self):
         if self.startup_program is None and self.startup_program_factory is not None:
@@ -46,12 +48,17 @@ class OEMRuntimeCommandHandlers:
     def handlers(self) -> dict[str, Any]:
         return {
             "initializeSystem": self.handle_initialize_system,
+            "startupHomingStepwise": self.handle_startup_homing_stepwise,
             "unlockProcess": self.handle_unimplemented_source_blocked,
             "PrepareToRunJob": self.handle_prepare_to_run_job_readiness,
             "abortjob": self.handle_abortjob,
             "validateJob": self.handle_unimplemented_source_blocked,
             "wakefrompause": self.handle_wakefrompause,
         }
+
+    def handle_startup_homing_stepwise(self, command: OEMRuntimeCommand) -> dict[str, Any]:
+        """Execute or observe exactly one ledger-bound initializeMotors stage."""
+        return self._handle_stepwise_homing_stage(command, dict(command.params or {}))
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
@@ -122,6 +129,70 @@ class OEMRuntimeCommandHandlers:
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
         tmp.replace(artifact_path)
         return str(artifact_path)
+
+    def _fail_stepwise_after_admission(
+        self,
+        command: OEMRuntimeCommand,
+        step: str,
+        exc: Exception,
+        *,
+        executor_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        failure: dict[str, Any] = {
+            "ok": False,
+            "error": str(exc),
+            "exception_type": exc.__class__.__name__,
+            "physical_effect_verified": False,
+        }
+        if executor_result is not None:
+            # Never copy raw executor output into the terminal fallback. This
+            # path may have been entered precisely because that output could
+            # not be JSON-serialized; the authoritative ledger and worker
+            # journal must remain independently writable.
+            failure["executor_result_omitted"] = True
+            failure["executor_result_summary"] = {
+                "reported_ok": executor_result.get("ok") is True,
+                "motion_command_attempted": executor_result.get("motion_command_attempted") is True,
+                "controller_acknowledged": executor_result.get("controller_acknowledged") is True,
+                "reported_physical_effect_verified": executor_result.get("physical_effect_verified") is True,
+            }
+        artifact_path = None
+        try:
+            artifact_path = self._write_stage_artifact(
+                command,
+                f"runtime_stepwise_homing_{step}_failure.json",
+                {"command": command.to_dict(), "stepwise_homing": failure},
+            )
+        except Exception as artifact_exc:
+            failure["failure_artifact_error"] = str(artifact_exc)
+            failure["failure_artifact_exception_type"] = artifact_exc.__class__.__name__
+        try:
+            movement_ledger = self.movement_ledger.record_result(
+                stage=step,
+                command_id=command.command_id,
+                result=failure,
+                artifact_path=artifact_path,
+            ) if command.mode == "live" else self.movement_ledger.projection()
+        except Exception as ledger_exc:
+            failure["ledger_failure_error"] = str(ledger_exc)
+            failure["ledger_failure_exception_type"] = ledger_exc.__class__.__name__
+            try:
+                movement_ledger = self.movement_ledger.projection()
+            except Exception:
+                movement_ledger = None
+        return {
+            "ok": False,
+            "ready": False,
+            "state": "failed_closed",
+            "command": command.name,
+            "stage": "startupHomingStepwise",
+            "mode": "live" if command.mode == "live" else "shadow",
+            "homing_step": step,
+            "stepwise_homing": failure,
+            "oem_movement_ledger": movement_ledger,
+            "artifact_path": artifact_path,
+            "blockers": ["stepwise_homing_stage_exception", "physical_state_requires_operator_review"],
+        }
 
     def _handle_oem_initialization_controller_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         run_homing = bool(params.get("run_homing", False))
@@ -196,7 +267,7 @@ class OEMRuntimeCommandHandlers:
                 "blockers": ["initialCheck_provider_not_bound"],
             }
         hardware = program.hardware
-        if not hasattr(hardware, "initial_check"):
+        if command.mode != "live" and not hasattr(hardware, "initial_check"):
             return {
                 "ok": False,
                 "ready": False,
@@ -334,29 +405,96 @@ class OEMRuntimeCommandHandlers:
     def _handle_stepwise_homing_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         from .lifecycle_state import lifecycle_state
 
-        lifecycle = lifecycle_state.projection()
-        if lifecycle["startup"]["stages"]["initial_check"]["state"] != "passed":
+        # Shadow planning is source inspection and requires no completed live
+        # predecessor. Live acknowledgement is validated before lifecycle or
+        # provider access, then the canonical initialCheck gate is enforced.
+        step = str(params.get("homing_step", "plan")).strip().lower()
+        observation_requested = params.get("record_stage_observation", False)
+        if type(observation_requested) is not bool:
             return {
-                "ok": False,
+                "ok": False, "ready": False, "state": "failed_closed",
+                "command": command.name, "stage": "startupHomingStepwise",
+                "blockers": ["record_stage_observation_must_be_boolean"],
+            }
+        if observation_requested is True:
+            if command.mode != "live" or command.operator_ack != "OBSERVE":
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "startupHomingStepwise",
+                    "blockers": ["operator_ack_OBSERVE_required_for_oem_initializeMotors_stage_observation"],
+                }
+            observed_pass = params.get("observed_pass")
+            operator_note = params.get("operator_note")
+            if type(observed_pass) is not bool:
+                return {
+                    "ok": False, "ready": False, "state": "failed_closed",
+                    "command": command.name, "stage": "startupHomingStepwise",
+                    "blockers": ["observed_pass_must_be_boolean"],
+                }
+            if not isinstance(operator_note, str) or not operator_note.strip():
+                return {
+                    "ok": False, "ready": False, "state": "failed_closed",
+                    "command": command.name, "stage": "startupHomingStepwise",
+                    "blockers": ["operator_note_required_for_stage_observation"],
+                }
+            observation = self.movement_ledger.record_observation(
+                stage=step,
+                observed_pass=observed_pass,
+                note=operator_note.strip(),
+                command_id=command.command_id,
+            )
+            return {
+                "ok": bool(observation.get("ok")),
                 "ready": False,
-                "state": "failed_closed",
+                "state": "oem_initializeMotors_stage_observed" if observation.get("ok") else "failed_closed",
                 "command": command.name,
                 "stage": "startupHomingStepwise",
-                "blockers": ["canonical_initial_check_predecessor_not_passed"],
-                "startup": lifecycle["startup"],
+                "homing_step": step,
+                "oem_movement_ledger": observation.get("ledger"),
+                "blockers": [] if observation.get("ok") else [str(observation.get("blocker") or "oem_initializeMotors_observation_failed")],
             }
-        step = str(params.get("homing_step", "plan")).strip().lower()
         required_ack = "HOME"
         if command.mode == "live" and command.operator_ack != required_ack:
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["operator_ack_HOME_required_for_live_oem_initializeMotors_step"]}
         if command.mode == "live" and step in {"plan", "full", "all"}:
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["live_stepwise_homing_requires_single_homing_step"]}
+        if command.mode == "live":
+            from .lifecycle_state import lifecycle_state
+
+            lifecycle = lifecycle_state.projection()
+            if lifecycle["startup"]["stages"]["initial_check"]["state"] != "passed":
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "startupHomingStepwise",
+                    "blockers": ["canonical_initial_check_predecessor_not_passed"],
+                    "startup": lifecycle["startup"],
+                }
         program = self._startup_program()
         if program is None or not hasattr(program, "hardware"):
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["stepwise_homing_provider_not_bound"]}
         hardware = program.hardware
         if not hasattr(hardware, "startup_homing_stepwise"):
             return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "stage": "startupHomingStepwise", "blockers": ["startup_homing_stepwise_method_unavailable"]}
+        admission = None
+        if command.mode == "live":
+            admission = self.movement_ledger.admit(stage=step, command_id=command.command_id)
+            if not admission.get("ok"):
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "startupHomingStepwise",
+                    "homing_step": step,
+                    "oem_movement_ledger": admission.get("ledger"),
+                    "blockers": [str(admission["blocker"])],
+                }
         stage_kwargs = {
             "mode": ("live" if command.mode == "live" else "shadow"),
             "step": step,
@@ -364,14 +502,29 @@ class OEMRuntimeCommandHandlers:
             "preclear_abs": params.get("preclear_abs"),
             "require_operator_observed": bool(params.get("require_operator_observed", True)),
         }
+        result = None
         try:
-            result = hardware.startup_homing_stepwise(**stage_kwargs)
-        except TypeError as exc:
-            if "unexpected keyword" not in str(exc):
-                raise
-            result = hardware.startup_homing_stepwise(mode=stage_kwargs["mode"], step=step, execute=command.mode == "live")
-        artifact_path = self._write_stage_artifact(command, f"runtime_stepwise_homing_{step}.json", {"command": command.to_dict(), "stepwise_homing": result})
-        ok = bool(result.get("ok"))
+            try:
+                result = hardware.startup_homing_stepwise(**stage_kwargs)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                result = hardware.startup_homing_stepwise(mode=stage_kwargs["mode"], step=step, execute=command.mode == "live")
+            artifact_path = self._write_stage_artifact(command, f"runtime_stepwise_homing_{step}.json", {"command": command.to_dict(), "stepwise_homing": result})
+            ok = bool(result.get("ok"))
+            movement_ledger = self.movement_ledger.record_result(
+                stage=step,
+                command_id=command.command_id,
+                result=result,
+                artifact_path=artifact_path,
+            ) if command.mode == "live" else self.movement_ledger.projection()
+        except Exception as exc:
+            return self._fail_stepwise_after_admission(
+                command,
+                step,
+                exc,
+                executor_result=result if isinstance(result, dict) else None,
+            )
         return {
             "ok": ok,
             "ready": False,
@@ -381,6 +534,7 @@ class OEMRuntimeCommandHandlers:
             "mode": "live" if command.mode == "live" else "shadow",
             "homing_step": step,
             "stepwise_homing": result,
+            "oem_movement_ledger": movement_ledger,
             "artifact_path": artifact_path,
             "blockers": ([] if ok else ["stepwise_homing_stage_failed"]) + [
                 "physical_observation_required_for_each_live_oem_initializeMotors_step",

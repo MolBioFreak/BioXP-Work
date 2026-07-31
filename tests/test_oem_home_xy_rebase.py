@@ -1,6 +1,7 @@
 import threading
 
 from src.bioxp.usb_driver import BioXpTester
+from support_oem_machine_bundle import serial_206_immutable_machine_bundle
 
 
 class FakeHomeXYTester(BioXpTester):
@@ -12,6 +13,9 @@ class FakeHomeXYTester(BioXpTester):
     def __init__(self):
         self.positions = {("x", 0x05, 0): 1253, ("y", 0x04, 0): 0}
         self.calls = []
+
+    def _machine_config_bundle(self):
+        return serial_206_immutable_machine_bundle()
 
     def _axis_for(self, board):
         return "x" if board == 0x05 else "y"

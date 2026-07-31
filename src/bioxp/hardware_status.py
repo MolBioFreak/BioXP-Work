@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from contextlib import contextmanager
 import time
 import uuid
 from dataclasses import dataclass
@@ -69,6 +70,12 @@ class HardwareStateOwner:
         with self._lock:
             return self._epoch
 
+    @contextmanager
+    def ownership_lease(self):
+        """Hold the ownership epoch stable across an authority-bearing mutation."""
+        with self._lock:
+            yield self
+
     def ownership_projection(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -95,7 +102,10 @@ class HardwareStateOwner:
             if router is not None:
                 self._ownership["router"] = str(router)
                 if str(router) == "running":
-                    self._ownership["CAN_READY"] = True
+                    # A running reader/router proves software ownership only.
+                    # CAN readiness remains unknown until transport and board
+                    # evidence from one completed snapshot is promoted.
+                    self._ownership["CAN_READY"] = None
                 elif str(router) == "stopped":
                     self._ownership["CAN_READY"] = False
                 elif str(router) == "unbound":
@@ -117,6 +127,34 @@ class HardwareStateOwner:
     def completed_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
             return copy.deepcopy(self._snapshot)
+
+    def publish_can_ready_from_snapshot(self, *, snapshot_id: str, reason: str) -> dict[str, Any]:
+        """Promote explicit same-epoch snapshot evidence into canonical ownership.
+
+        Callers must independently validate the transport and board evidence
+        before requesting promotion.  This method only accepts the currently
+        published snapshot, never cached or ownership-only state.
+        """
+        with self._lock:
+            snapshot = self._snapshot
+            if not isinstance(snapshot, dict) or snapshot.get("snapshot_id") != snapshot_id:
+                return {"published": False, "reason": "snapshot_not_current"}
+            if snapshot.get("ownership_epoch") != self._epoch:
+                return {"published": False, "reason": "ownership_epoch_changed"}
+            already_ready = self._ownership.get("CAN_READY") is True
+            self._ownership["CAN_READY"] = True
+            snapshot["ownership"] = copy.deepcopy(self._ownership)
+            transport = ((snapshot.get("domains") or {}).get("transport") or {}).get("observation")
+            if isinstance(transport, dict):
+                transport["CAN_READY"] = True
+                transport["can_ready_evidence"] = "explicit_transport_and_board_snapshot"
+            # Bind canonical readiness and lifecycle state to this exact evidence.
+            lifecycle_state.transport_changed(True, reason=str(reason))
+            return {
+                "published": True,
+                "already_ready": already_ready,
+                "snapshot": copy.deepcopy(snapshot),
+            }
 
     def _cache_state(self, snapshot: dict[str, Any] | None, domains: Iterable[str]) -> tuple[str, float | None]:
         if snapshot is None or snapshot.get("ownership_epoch") != self._epoch:

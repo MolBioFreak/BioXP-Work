@@ -92,56 +92,27 @@ def test_scriptmove_execute_live_requires_reason_before_executor():
         )
 
     assert exc.value.status_code == 409
-    assert "reason" in str(exc.value.detail).lower()
+    assert "quarantined" in str(exc.value.detail).lower()
     assert executor.calls == []
 
 
-def test_scriptmove_execute_live_runs_planned_move_steps_in_order():
+def test_scriptmove_execute_live_is_quarantined_before_executor():
+    """Strict OEM startup is typed; generic scriptmove execution has no live lane."""
     executor = FakeExecutor()
 
-    payload = asyncio.run(
-        routes._execute_oem_scriptmove_path_impl(
-            {
-                "location_id": "LOC_PARK",
-                "mode": "live",
-                "operator_ack": "OEM_PATH_EXECUTE",
-                "reason": "supervised OEM parity commissioning",
-                "wait_timeout_s": 7.5,
-            },
-            motion_executor=executor,
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            routes._execute_oem_scriptmove_path_impl(
+                {
+                    "location_id": "LOC_PARK",
+                    "mode": "live",
+                    "operator_ack": "OEM_PATH_EXECUTE",
+                    "reason": "previous generic commissioning path",
+                },
+                motion_executor=executor,
+            )
         )
-    )
 
-    assert payload["ok"] is True
-    assert payload["executor_status"] == "live_step_execution_complete"
-    assert payload["opened_usb"] is True
-    assert payload["motion_commanded"] is True
-    assert payload["physical_motion"] is False
-    assert payload["execution_results"][0]["ok"] is True
-    assert executor.calls == [
-        ("absolute", "x", 1506, None, None, 7.5),
-        ("absolute", "y", 71, None, None, 7.5),
-        ("absolute", "z", 65000, None, None, 7.5),
-    ]
-
-
-def test_scriptmove_execute_live_fails_closed_on_first_step_failure():
-    executor = FakeExecutor(fail_axis="y")
-
-    payload = asyncio.run(
-        routes._execute_oem_scriptmove_path_impl(
-            {
-                "location_id": "LOC_PARK",
-                "mode": "live",
-                "operator_ack": "OEM_PATH_EXECUTE",
-                "reason": "supervised OEM parity commissioning",
-            },
-            motion_executor=executor,
-        )
-    )
-
-    assert payload["ok"] is False
-    assert payload["failed_closed"] is True
-    assert payload["executor_status"] == "failed_closed_step_error"
-    assert payload["motion_commanded"] is True
-    assert [call[1] for call in executor.calls] == ["x", "y"]
+    assert exc.value.status_code == 409
+    assert "quarantined" in str(exc.value.detail).lower()
+    assert executor.calls == []

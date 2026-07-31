@@ -121,6 +121,8 @@ class NovoRouter:
             )
         }
         self._diagnostics: deque[dict[str, Any]] = deque(maxlen=int(queue_size))
+        self._pressure_epoch = 0
+        self._pressure_epoch_started_at: float | None = None
         self._reader_generation = 0
 
     @property
@@ -336,6 +338,8 @@ class NovoRouter:
     def calculate_pressure_offsets(self) -> dict[int, float]:
         samples: dict[int, list[float]] = {channel: [] for channel in range(4)}
         for frame in self._queues["pressure"]:
+            if self._pressure_epoch_started_at is not None and frame.received_at < self._pressure_epoch_started_at:
+                continue
             channel = (frame.arbitration_id & 0x78) >> 3
             data = frame.data
             if not data or not (ord("0") < data[0] <= ord("3")):
@@ -349,6 +353,16 @@ class NovoRouter:
         return {
             channel: (sum(values) / len(values) if values else 0.0)
             for channel, values in samples.items()
+        }
+
+    def begin_pressure_epoch(self) -> dict[str, Any]:
+        """Start the OEM stream-on pressure-offset sample window."""
+        self._pressure_epoch += 1
+        self._pressure_epoch_started_at = self._clock()
+        self._queues["pressure"].clear()
+        return {
+            "epoch": self._pressure_epoch,
+            "started_at": self._pressure_epoch_started_at,
         }
 
     def prepare_pipette_completion(self, channel: int, timeout_s: float) -> None:
@@ -391,11 +405,19 @@ class NovoRouter:
         }
 
     @staticmethod
-    def tmcl_matcher(*, board_id: int, command: int, strict: bool = True) -> Callable[[NovoFrame], MatchResult]:
+    def tmcl_matcher(
+        *,
+        board_id: int,
+        command: int,
+        strict: bool = True,
+        require_command_echo: bool = True,
+    ) -> Callable[[NovoFrame], MatchResult]:
         def match(frame: NovoFrame) -> MatchResult:
             if frame.classification != "tmcl" or len(frame.data) != 8:
                 return MatchResult(False, classification=frame.classification)
-            if strict and (frame.data[0] != int(board_id) or frame.data[2] != int(command)):
+            if strict and frame.data[0] != int(board_id):
+                return MatchResult(False, classification="tmcl_wrong_board_or_command")
+            if strict and require_command_echo and frame.data[2] != int(command):
                 return MatchResult(False, classification="tmcl_wrong_board_or_command")
             return MatchResult(True, terminal=True, classification="tmcl", outcome="completion")
         return match

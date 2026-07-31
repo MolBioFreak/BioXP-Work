@@ -8,10 +8,13 @@ __all__ = [
     "BioXpCanDriver",
     "BoardAssy",
     "MotorAxis",
+    "lifecycle_state",
 ]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "lifecycle_state":
+        return import_module(".lifecycle_state", __name__)
     if name == "BioXpTester":
         return import_module(".usb_driver", __name__).BioXpTester
     if name in {"BioXpCanDriver", "BoardAssy", "MotorAxis"}:

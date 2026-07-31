@@ -143,7 +143,7 @@
     {
       "deviations": [
         "Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.",
-        "Live adaptations exist for axes whose raw switches were non-informative."
+        "The z-home step is explicitly harmonized to the same live-reference contract used by the initializeMotors Z stage."
       ],
       "source_mode": "initializeMotors/startup_step",
       "target_file": "src/bioxp/api.py",
@@ -195,33 +195,39 @@
     },
     {
       "deviations": [
-        "No direct parallel HomeXY source-mode implementation identified in current live code."
+        "Direct HomeXY label/setup/restore surface exists.",
+        "X and Y goHome(false, axis, 200, true) are launched concurrently to match OEM Task.Run/WaitAll semantics.",
+        "This is a source-parity surface, not a manual single-axis home or controller-zero route."
       ],
       "source_mode": "HomeXY",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 0,
-      "target_status": "missing_direct_port",
-      "target_symbol": "no direct one-to-one function found"
+      "target_line": 3925,
+      "target_status": "direct_oem_parallel_task_run_waitall",
+      "target_symbol": "BioXpTester.motor_oem_home_xy / motion_oem_home_xy"
     },
     {
       "deviations": [
-        "Door-state save/restore wrapper semantics are not represented as a clean ControlLib.rehome port."
+        "Source-mode surface is present, but direct monolithic rehome is intentionally blocked pending a literal source-equivalent stage rewrite.",
+        "run_homing=true does not enable physical homing.",
+        "Door-state save/restore remains unimplemented because no trusted Linux setter/source-equivalent primitive is exposed."
       ],
       "source_mode": "ControlLib.rehome",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 4003,
-      "target_status": "approximated_by_stepwise_startup_not_rehome_wrapper",
-      "target_symbol": "motor_startup_homing_mimic / startup_step routes"
+      "target_line": 3975,
+      "target_status": "intentionally_blocked_no_monolithic_live_homing",
+      "target_symbol": "BioXpTester.motor_oem_rehome / motion_oem_rehome"
     },
     {
       "deviations": [
-        "Includes artifacts/readiness gates and separates live motion; not a full OEM initializeMotion clone."
+        "No-homing initialize-without-motion surface is direct.",
+        "run_homing=true delegates to the intentionally blocked rehome surface and therefore does not command physical homing.",
+        "Tip/pipette cleanup remains labeled as not ported, not silently collapsed."
       ],
       "source_mode": "ControlLib.initializeMotion",
-      "target_file": "src/bioxp/oem_startup_program.py",
-      "target_line": 461,
-      "target_status": "artifact_state_machine_not_full_live_motion_equivalent",
-      "target_symbol": "OEMStartupProgram.request_startup"
+      "target_file": "src/bioxp/usb_driver.py",
+      "target_line": 3996,
+      "target_status": "direct_wrapper_no_homing_diagnostic_only",
+      "target_symbol": "BioXpTester.motor_oem_initialize_motion / motion_oem_initialize_motion"
     }
   ],
   "manual_home": {
@@ -373,6 +379,30 @@
       "path": "/motion/oem/startup_step"
     },
     {
+      "classification": "direct HomeXY mode surface; guarded X/Y switch-search",
+      "methods": "POST",
+      "name": "motion_oem_home_xy",
+      "path": "/motion/oem/home_xy"
+    },
+    {
+      "classification": "ControlLib.rehome source-mode surface; intentionally blocked with no monolithic live homing",
+      "methods": "POST",
+      "name": "motion_oem_rehome",
+      "path": "/motion/oem/rehome"
+    },
+    {
+      "classification": "direct ControlLib.initializeMotion wrapper; no-homing diagnostic by default",
+      "methods": "POST",
+      "name": "motion_oem_initialize_motion",
+      "path": "/motion/oem/initialize_motion"
+    },
+    {
+      "classification": "OEM initialization controller; run_homing=true intentionally blocked with no monolithic live homing",
+      "methods": "POST",
+      "name": "motion_oem_initialization_run",
+      "path": "/motion/oem/initialization/run"
+    },
+    {
       "classification": "manual/goHome-style route",
       "methods": "POST",
       "name": "home_axis",
@@ -425,6 +455,50 @@
         "Use this for supervised OEM startup steps, not as a generic Home button."
       ],
       "route": "/motion/oem/startup_step",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "not-equivalent-to-single-axis-home-or-zero",
+      "maps_to": "direct HomeXY mode surface",
+      "method": "POST",
+      "notes": [
+        "Preserves HomeXY source-mode label and launches X/Y goHome concurrently like OEM Task.Run/WaitAll.",
+        "This is not manual single-axis Home and not controller Zero."
+      ],
+      "route": "/motion/oem/home_xy",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
+      "maps_to": "ControlLib.rehome source-mode surface",
+      "method": "POST",
+      "notes": [
+        "Direct monolithic rehome is intentionally blocked; run_homing=true does not enable physical homing.",
+        "Door save/restore gap remains explicit."
+      ],
+      "route": "/motion/oem/rehome",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
+      "maps_to": "ControlLib.initializeMotion source-mode surface",
+      "method": "POST",
+      "notes": [
+        "No-homing diagnostic by default; run_homing=true reaches intentionally blocked rehome and does not enable physical homing.",
+        "Tip/pipette cleanup is labeled not ported."
+      ],
+      "route": "/motion/oem/initialize_motion",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
+      "maps_to": "OEM initialization controller",
+      "method": "POST",
+      "notes": [
+        "No-homing controller pass is available; run_homing=true returns fail-closed before controller or tester access.",
+        "This is not a physical initializeMotors/rehome monolith."
+      ],
+      "route": "/motion/oem/initialization/run",
       "surface": "raw-fastapi"
     },
     {

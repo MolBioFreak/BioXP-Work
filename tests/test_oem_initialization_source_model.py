@@ -1,8 +1,9 @@
-from src.bioxp.oem_initialization import (
+from bioxp.oem_initialization import (
     SOURCE_ANCHORS,
     build_machine_calibration_manifest,
     oem_initialization_phase_catalog,
 )
+from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
 
 
 def _val(row):
@@ -35,12 +36,13 @@ def test_phase_catalog_models_init_as_controller_not_single_home_call():
     assert len(names) >= 10
 
 
-def test_machine_manifest_prefers_original_ssd_config_values():
+def test_machine_manifest_prefers_original_ssd_config_values(monkeypatch):
+    bind_serial206_oem_snapshot(monkeypatch)
     manifest = build_machine_calibration_manifest()
     assert manifest["ok"] is True
     assert manifest["config_path"] and manifest["config_path"].endswith("config.xml")
     assert _val(manifest["thermal_door"]["TCDoorOpen"]) == 18500
-    assert manifest["thermal_door"]["TCDoorOpen"]["source"] == "original_ssd_machine_config"
+    assert manifest["thermal_door"]["TCDoorOpen"]["source"] == "immutable_oem_machine_snapshot"
     assert manifest["thermal_door"]["TCDoorOpen"]["fallback"] is False
 
     assert _val(manifest["gripper"]["originOffsetG"]) == 4450

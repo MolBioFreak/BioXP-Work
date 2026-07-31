@@ -10,13 +10,21 @@ def test_startup_homing_stepwise_plan_is_oem_order_and_non_motion():
     assert result["not_a_replacement_sequence"] is True
     assert [row["step"] for row in result["steps"]] == [
         "z-home",
-        "gripper-clear",
-        "gripper-home",
+        "gripper-commission-home",
         "x-home",
+        "x-home-settle",
+        "x-set-home",
+        "x-speed-1700",
+        "x-speed-settle",
         "x-park-6000",
         "y-home",
         "door-home",
+        "door-closed-predicate",
         "y-set-home",
+        "ui-zero-calibrated",
+        "chiller-oc-cool-rate",
+        "chiller-rc-cool-rate",
+        "system-status-initialized",
     ]
 
 

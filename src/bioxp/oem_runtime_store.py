@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ class OEMRuntimeStore:
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._seq = self._load_seq()
 
     def _load_seq(self) -> int:
@@ -63,6 +64,95 @@ class OEMRuntimeStore:
         if not p.exists():
             return None
         return json.loads(p.read_text())
+
+    def write_oem_movement_ledger(self, ledger: dict[str, Any]) -> dict[str, Any]:
+        """Persist the robot-owned initializeMotors source-order ledger atomically."""
+        payload = dict(ledger)
+        with self._lock:
+            payload["sequence"] = self.next_seq()
+            _atomic_json(self.root / "oem_initialize_motors_ledger.json", payload)
+        return payload
+
+    def read_oem_movement_ledger(self) -> dict[str, Any] | None:
+        path = self.root / "oem_initialize_motors_ledger.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def create_oem_full_lifecycle_run_once(
+        self,
+        run: dict[str, Any],
+        *,
+        current_ownership_generation: Callable[[], int] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically converge same-key creators within the single runtime owner."""
+        payload = dict(run)
+        key = payload.get("idempotency_key")
+        request = payload.get("request")
+        if not isinstance(key, str) or not key or len(key) > 128:
+            raise ValueError("valid bounded idempotency_key required")
+        with self._lock:
+            if current_ownership_generation is not None:
+                expected = request.get("expected_generation") if isinstance(request, dict) else None
+                if expected != current_ownership_generation():
+                    raise ValueError("expected_generation no longer matches current robot ownership generation")
+            existing_runs = self.list_oem_full_lifecycle_runs()
+            for existing in existing_runs:
+                if existing.get("idempotency_key") != key:
+                    continue
+                if existing.get("request") != request:
+                    raise ValueError("idempotency_key is already bound to a different request")
+                return existing
+            active_states = {"planned", "running", "admitted", "acknowledged", "blocked", "reconciliation_required"}
+            if any(existing.get("run_state") in active_states for existing in existing_runs):
+                raise ValueError("another active OEM lifecycle run already owns the robot lifecycle")
+            return self.write_oem_full_lifecycle_run(payload)
+
+    def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Persist one full OEM movement-lifecycle run atomically.
+
+        Run files are immutable by identity but replaceable by monotonic state
+        updates.  The robot owns the directory and run identifier; callers do
+        not supply paths.
+        """
+        payload = dict(run)
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
+            raise ValueError("valid robot-owned run_id required")
+        with self._lock:
+            payload["sequence"] = self.next_seq()
+            _atomic_json(self.root / "movement_runs" / f"{run_id}.json", payload)
+        return payload
+
+    def mutate_oem_full_lifecycle_run(
+        self,
+        run_id: str,
+        mutation: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Read, validate, and replace one run under the runtime-owner lock."""
+        with self._lock:
+            payload = self.read_oem_full_lifecycle_run(run_id)
+            if payload is None:
+                raise ValueError(f"full OEM lifecycle run {run_id!r} not found")
+            return self.write_oem_full_lifecycle_run(mutation(payload))
+
+    def read_oem_full_lifecycle_run(self, run_id: str) -> dict[str, Any] | None:
+        selected = str(run_id).strip()
+        if not selected or "/" in selected or "\\" in selected or selected in {".", ".."}:
+            raise ValueError("valid robot-owned run_id required")
+        path = self.root / "movement_runs" / f"{selected}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def list_oem_full_lifecycle_runs(self) -> list[dict[str, Any]]:
+        root = self.root / "movement_runs"
+        if not root.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for path in sorted(root.glob("*.json")):
+            rows.append(json.loads(path.read_text()))
+        return rows
 
     def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = dict(payload)

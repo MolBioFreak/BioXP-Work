@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any, Callable, Protocol
 
@@ -393,6 +394,7 @@ class FourPipetteTransport:
             raise ValueError("OEM production pipette collection requires exactly four channels")
         self._transports = list(transports)
         self._sleep = sleep
+        self._transaction_lock = threading.RLock()
         self._last_group_transaction: dict[str, Any] | None = None
 
     def _channel_status(self, channel: int, transport: CanPipetteTransport) -> dict[str, Any]:
@@ -431,12 +433,28 @@ class FourPipetteTransport:
             "liquid_mutation_enabled": False,
         }
 
-    def _run_group_cycle(self, *, cycle: str) -> dict[str, Any]:
+    def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
-            result = transport._get_driver().pipette_initiate_group()
+            driver = transport._get_driver()
+            if transport._initialized:
+                # ClassPipette.initiate(false) skips the wake frame once initialized,
+                # but still waits 100 ms and transmits WR.
+                self._sleep(0.100)
+                driver_result = driver.pipette_initiate_group()
+                result = {
+                    **transport._status_payload(
+                        command="initialize",
+                        driver_result=driver_result,
+                        requested=command.to_payload(),
+                        hardware_truth_level="acknowledged_command",
+                    ),
+                    "driver_result": driver_result,
+                }
+            else:
+                result = transport.initialize(command)
             sends.append({"channel": channel, "result": result})
-            if not result.get("immediate_ack_received"):
+            if not result.get("driver_result", {}).get("immediate_ack_received"):
                 for registered in range(channel + 1):
                     self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
                 return {
@@ -455,6 +473,7 @@ class FourPipetteTransport:
             remaining = max(0.0, deadline - time.monotonic())
             result = transport._get_driver().wait_pipette_initialization_completion(remaining)
             completions.append({"channel": channel, "result": result})
+            transport._initialized = bool(result.get("ok"))
         if not all(row["result"].get("ok") for row in completions):
             return {
                 "ok": False,
@@ -465,6 +484,9 @@ class FourPipetteTransport:
                 "completion_timeout_ms": 10_000,
             }
 
+        first_driver = self._transports[0]._get_driver()
+        router = getattr(getattr(first_driver, "bus", None), "router", None)
+        pressure_epoch = router.begin_pressure_epoch() if router is not None else None
         stream_on = [
             {"channel": channel, "result": transport._get_driver().enable_pressure_stream(True)}
             for channel, transport in enumerate(self._transports)
@@ -474,8 +496,6 @@ class FourPipetteTransport:
             {"channel": channel, "result": transport._get_driver().enable_pressure_stream(False)}
             for channel, transport in enumerate(self._transports)
         ]
-        first_driver = self._transports[0]._get_driver()
-        router = getattr(getattr(first_driver, "bus", None), "router", None)
         pressure_offsets = router.calculate_pressure_offsets() if router is not None else {}
         stream_ok = all(row["result"].get("ok") for row in stream_on + stream_off)
         return {
@@ -486,8 +506,9 @@ class FourPipetteTransport:
             "delayed_completions": completions,
             "completion_timeout_ms": 10_000,
             "pressure_stream": {"on": stream_on, "wait_ms": 1_000, "off": stream_off},
+            "pressure_epoch": pressure_epoch,
             "pressure_offsets": pressure_offsets,
-            "pressure_offset_order": "stream_on_1000ms_stream_off_calculate_from_router_samples",
+            "pressure_offset_order": "new_epoch_stream_on_1000ms_stream_off_calculate",
         }
 
     def _query_condition(self) -> list[dict[str, Any]]:
@@ -506,48 +527,13 @@ class FourPipetteTransport:
 
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
         started = time.monotonic()
-        initialized = []
-        for channel, transport in enumerate(self._transports):
-            result = transport.initialize(command)
-            initialized.append({"channel": channel, "result": result})
-            if not result.get("driver_result", {}).get("immediate_ack_received"):
-                for registered in range(channel + 1):
-                    self._transports[registered]._get_driver().wait_pipette_initialization_completion(0.0)
-                self._last_group_transaction = {
-                    "ok": False, "outcome": "invalid_or_missing_immediate_ack", "channels": initialized,
-                    "group_wait_ms": 10_000,
-                }
-                return dict(self._last_group_transaction)
-
-        # Each constructor initiation has the exact OEM 60,000 ms delayed-
-        # completion contract.  The empty ACK above is never completion proof.
-        completion_deadline = time.monotonic() + 60.0
-        completions = []
-        for channel, transport in enumerate(self._transports):
-            remaining = max(0.0, completion_deadline - time.monotonic())
-            result = transport._get_driver().wait_pipette_initialization_completion(remaining)
-            completions.append({"channel": channel, "result": result})
-            transport._initialized = bool(result.get("ok"))
-        if not all(row["result"].get("ok") for row in completions):
-            self._last_group_transaction = {
-                "ok": False,
-                "outcome": "invalid_or_missing_delayed_completion",
-                "channels": initialized,
-                "delayed_completions": completions,
-                "completion_timeout_ms": 60_000,
-                "group_wait_ms": 10_000,
-            }
-            return dict(self._last_group_transaction)
-
-        initial_group = self._run_group_cycle(cycle="constructor_initiateGroup")
+        initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup")
         if not initial_group.get("ok"):
             self._last_group_transaction = {
                 "ok": False,
                 "outcome": "initial_group_cycle_failed",
-                "channels": initialized,
-                "constructor_delayed_completions": completions,
+                "channels": initial_group.get("sends", []),
                 "initial_group": initial_group,
-                "completion_timeout_ms": 60_000,
                 "group_wait_ms": 10_000,
                 "liquid_mutation_enabled": False,
             }
@@ -560,7 +546,7 @@ class FourPipetteTransport:
         retry_group = None
         retry_status = None
         if condition_ok and not first_status_ok:
-            retry_group = self._run_group_cycle(cycle="single_conditional_status_retry")
+            retry_group = self._run_group_cycle(command, cycle="single_conditional_status_retry")
             if retry_group.get("ok"):
                 retry_status = self._query_status()
         final_status = retry_status if retry_status is not None else first_status
@@ -569,8 +555,7 @@ class FourPipetteTransport:
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
-            "channels": initialized,
-            "constructor_delayed_completions": completions,
+            "channels": initial_group.get("sends", []),
             "initial_group": initial_group,
             "condition_readback": condition,
             "status_readback_first": first_status,
@@ -579,11 +564,129 @@ class FourPipetteTransport:
             "status_readback_retry": retry_status,
             "status_readback_final": final_status,
             "group_wait_ms": 10_000,
-            "completion_timeout_ms": 60_000,
+            "pipette_transaction_timeout_ms": 60_000,
             "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),
             "liquid_mutation_enabled": False,
         }
         return dict(self._last_group_transaction)
+
+    def query_tip_status_all(self) -> dict[str, Any]:
+        """Return exact four-channel OEM `?31` hardware readback."""
+        with self._transaction_lock:
+            channels: list[dict[str, Any]] = []
+            for channel, transport in enumerate(self._transports):
+                result = transport._get_driver().query_tip_status()
+                if (
+                    not isinstance(result, dict)
+                    or result.get("ok") is not True
+                    or result.get("semantic_ok") is not True
+                    or result.get("hardware_truth_level") != "hardware_query"
+                    or type(result.get("tip_loaded")) is not bool
+                ):
+                    raise PipetteCommandError(
+                        "Pipette hardware tip-status query did not return exact four-channel readback.",
+                        details={"channel": channel, "result": result},
+                    )
+                loaded = result["tip_loaded"]
+                transport._last_tip_status = dict(result)
+                transport._tip_loaded = loaded
+                channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
+            loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
+            return {
+                "ok": True,
+                "tip_count": len(loaded_channels),
+                "channels_with_tips": loaded_channels,
+                "channels": channels,
+                "hardware_query_verified": True,
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
+            }
+
+    def eject_all_tips_for_oem_startup(
+        self,
+        *,
+        operator_ack: str,
+        expected_channels_with_tips: list[int],
+    ) -> dict[str, Any]:
+        """Fixed startup-only E1R sequence with mandatory postcondition readback."""
+        with self._transaction_lock:
+            return self._eject_all_tips_for_oem_startup_locked(
+                operator_ack=operator_ack,
+                expected_channels_with_tips=expected_channels_with_tips,
+            )
+
+    def _eject_all_tips_for_oem_startup_locked(
+        self,
+        *,
+        operator_ack: str,
+        expected_channels_with_tips: list[int],
+    ) -> dict[str, Any]:
+        if type(operator_ack) is not str or operator_ack != "EJECT_STALE_STARTUP_TIPS":
+            raise PipetteCommandError("Literal startup-tip operator acknowledgement is required.")
+        if (
+            not isinstance(expected_channels_with_tips, list)
+            or any(type(channel) is not int or channel not in self.CHANNELS for channel in expected_channels_with_tips)
+            or len(set(expected_channels_with_tips)) != len(expected_channels_with_tips)
+        ):
+            raise PipetteCommandError("Expected startup tip channels must be unique exact integers 0..3.")
+        expected = sorted(expected_channels_with_tips)
+        before = self.query_tip_status_all()
+        actual = before["channels_with_tips"]
+        if actual != expected:
+            raise PipetteCommandError(
+                "Pipette tip state changed since authorization; refusing startup ejection.",
+                details={"expected_channels_with_tips": expected, "actual_channels_with_tips": actual},
+            )
+        sends: list[dict[str, Any]] = []
+        for channel in expected:
+            driver = self._transports[channel]._get_driver()
+            result = driver.pipette_eject_tip()
+            if (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or not isinstance(result.get("ack"), dict)
+                or result["ack"].get("outcome") != "ack"
+            ):
+                post_attempt_readback = None
+                post_attempt_error = None
+                try:
+                    post_attempt_readback = self.query_tip_status_all()
+                except PipetteCommandError as exc:
+                    post_attempt_error = exc.to_payload()
+                raise PipetteCommandError(
+                    "Pipette eject did not receive an exact immediate acknowledgement.",
+                    details={
+                        "failed_channel": channel,
+                        "result": result,
+                        "sends": sends,
+                        "post_attempt_readback": post_attempt_readback,
+                        "post_attempt_readback_error": post_attempt_error,
+                        "physical_effect_verified": False,
+                    },
+                )
+            sends.append({"channel": channel, "result": result})
+        after = self.query_tip_status_all()
+        if after["tip_count"] != 0:
+            raise PipetteCommandError(
+                "Post-eject hardware readback still reports loaded tips.",
+                details={"after": after, "sends": sends, "physical_effect_verified": False},
+            )
+        return {
+            "ok": True,
+            "outcome": "verified_empty",
+            "channels_targeted": expected,
+            "before": before,
+            "sends": sends,
+            "after": after,
+            "immediate_acknowledgements_verified": True,
+            "hardware_postcondition_verified": True,
+            "physical_effect_verified": True,
+            "oem_source_anchors": [
+                "ClassPipetteCollection.ejectAllTips:1176-1235",
+                "ClassPipetteCollection.verifyEjectTip:1265-1323",
+                "ClassPipetteCollection.queryTipStatus:1336-1357",
+            ],
+        }
 
     @staticmethod
     def _mutation_blocked(operation: str) -> dict[str, Any]:

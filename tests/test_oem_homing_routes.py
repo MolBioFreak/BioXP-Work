@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 
 from bioxp.api import app
+from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
 
 
 def _route(path: str, method: str):
@@ -48,39 +49,20 @@ def test_dry_run_endpoint_returns_artifact_shape(tmp_path):
 
 
 
-def test_machine_config_route_is_registered_and_read_only(tmp_path, monkeypatch):
-    root = tmp_path / "bundle"
-    root.mkdir()
-    (root / "config.xml").write_text(
-        """
-        <BioXPCommonLib>
-          <GenBot>
-            <SerialNumber GenBot="206" />
-            <Config Version="3" GripperVersion="1" />
-            <Calibration Calibrated="1" />
-            <CameraInstalled Camera="1" Cameracalibrated="True" />
-            <Server Password="changeit" Host="customer.example" />
-          </GenBot>
-          <AxisLimits>
-            <X_limit minSteps="0" maxSteps="90263" />
-            <Y_limit minSteps="0" maxSteps="102956" />
-            <Z_limit minSteps="0" maxSteps="160000" />
-            <G_limit minSteps="0" maxSteps="15000" />
-          </AxisLimits>
-          <PositionTable><LOC_PARK x="1506" y="71" zLow="114092" zDelta="114092" inc_factor="0" /></PositionTable>
-        </BioXPCommonLib>
-        """.strip()
-    )
-    monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(root))
+def test_machine_config_route_is_registered_and_read_only(monkeypatch):
+    bind_serial206_oem_snapshot(monkeypatch)
     endpoint = _route("/motion/oem/machine_config", "GET").endpoint
 
     body = asyncio.run(endpoint())
 
     assert body["ok"] is True
-    assert body["runtime_binding"] == "read_only"
+    assert body["accepted_live_mode"] is True
+    assert body["runtime_binding"] == "read_only_immutable_evidence"
     assert body["opened_usb"] is False
     assert body["physical_motion"] is False
     assert body["motion_commanded"] is False
-    assert body["config"]["server_redacted"]["Password"] == "[REDACTED]"
+    assert body["config"]["server_redacted"] == {}
     assert body["config"]["serial_redacted"] == "[REDACTED]"
     assert body["config"]["axis_limits"]["x"]["max_steps"] == 90263
+    assert body["snapshot_status"]["serial"] == 206
+    assert body["snapshot_status"]["mutation_authorized"] is False

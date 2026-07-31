@@ -1,5 +1,21 @@
+from typing import cast
+
 from src.bioxp.oem_startup_program import BioXpStartupHardware
 from src.bioxp.usb_driver import BioXpTester
+
+
+def _bound_oem_machine_config():
+    return {
+        "ok": True,
+        "config": {
+            "axis_limits": {
+                "x": {"max_steps": 91919},
+                "y": {"max_steps": 95247},
+                "z": {"max_steps": 160000},
+                "g": {"max_steps": 15000},
+            }
+        },
+    }
 
 
 class _FakeTester:
@@ -35,13 +51,22 @@ def test_stepwise_plan_is_oem_initialize_motors_order_not_head_clearance_replace
     assert result["ok"] is True
     assert [row["step"] for row in result["steps"]] == [
         "z-home",
-        "gripper-clear",
-        "gripper-home",
+        "gripper-commission-home",
         "x-home",
+        "x-home-settle",
+        "x-set-home",
+        "x-speed-1700",
+        "x-speed-settle",
         "x-park-6000",
         "y-home",
         "door-home",
+        "door-closed-predicate",
         "y-set-home",
+        "ui-zero-calibrated",
+        "chiller-oc-cool-rate",
+        "chiller-rc-cool-rate",
+        "system-status-initialized",
+
     ]
     assert "head-clearance-z-up" not in [row["step"] for row in result["steps"]]
     assert result["oem_sequence_anchor"].endswith("ClassControlInterface.initializeMotors lines 3348-3421")
@@ -58,8 +83,9 @@ def test_stepwise_plan_steps_are_accepted_by_direct_supervised_api_schema():
         assert parsed.step == row["step"]
 
 
-def test_oem_startup_profiles_preserve_literal_xy_constants_and_masks():
+def test_oem_startup_profiles_preserve_literal_xy_constants_and_masks(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
+    monkeypatch.setattr(tester, "_machine_config_bundle", _bound_oem_machine_config)
 
     x = tester._motion_oem_axis_profile("x", startup=True)
     y = tester._motion_oem_axis_profile("y", startup=True)
@@ -79,40 +105,304 @@ def test_oem_startup_profiles_preserve_literal_xy_constants_and_masks():
     assert "disable_left" not in y
 
 
-def test_initialize_without_motion_dispatches_literal_xy_profiles_without_x_mask_writes(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-    captured = {}
-    original_profile = tester._motion_oem_axis_profile
 
-    def profile(axis):
-        if axis in {"x", "y"}:
-            return original_profile(axis, startup=True)
-        return {"board": 4, "motor": 2, "run_current": 10}
+def test_stepwise_z_home_executes_only_the_oem_axis_search_home_primitive():
+    calls = []
 
-    def prepare(board, *, motor=0, **kwargs):
-        axis = "x" if board == tester.BOARD_DECK else ("y" if motor == 0 else f"other-{motor}")
-        captured[axis] = kwargs
-        return {"ok": True, "ops": []}
+    class Tester(_FakeTester):
+        def motor_oem_home_axis(self, axis, *, startup=False, timeout_s=0):
+            calls.append(("motor_oem_home_axis", axis, startup, timeout_s))
+            return {"axis": axis, "startup": startup, "home": {"ok": True}}
 
-    monkeypatch.setattr(tester, "_motion_oem_axis_profile", profile)
-    monkeypatch.setattr(tester, "motor_prepare_axis", prepare)
+        def motor_oem_move_z_to_reference(self, *args, **kwargs):  # pragma: no cover - forbidden by OEM stage contract
+            raise AssertionError("Z reference-return is not part of ClassControlInterface.initializeMotors")
 
-    result = tester.motor_oem_initialize_without_motion()
+    result = BioXpStartupHardware(lambda: Tester()).startup_homing_stepwise(
+        mode="live",
+        step="z-home",
+        execute=True,
+    )
 
     assert result["ok"] is True
-    assert captured["x"]["speed"] == 1700
-    assert captured["x"]["acc"] == 350
-    assert captured["x"]["disable_right"] is None
-    assert captured["x"]["disable_left"] is None
-    assert captured["y"]["speed"] == 1800
-    assert captured["y"]["acc"] == 400
-    assert captured["y"]["disable_right"] is True
-    assert captured["y"]["disable_left"] is None
+    assert result["step"]["oem_anchor"] == "initializeMotors: MotorZ.axisSearchHome(speed=1791)"
+    assert calls == [("motor_oem_home_axis", "z", True, 30.0)]
+    assert "z_reference_return" not in result
 
 
-def test_z_home_step_uses_full_init_z_reference_contract_when_probe_fails():
-    from src.bioxp.api import _execute_oem_startup_step
+def test_stepwise_z_plan_does_not_describe_a_non_oem_right_limit_correction():
+    plan = BioXpStartupHardware(lambda: _FakeTester()).startup_homing_stepwise(
+        mode="shadow",
+        step="plan",
+        execute=False,
+    )
 
+    z_step = next(row for row in plan["steps"] if row["step"] == "z-home")
+    assert "live_semantic_correction" not in z_step
+
+
+def test_stepwise_gripper_source_stages_are_one_cleanup_safe_operator_transaction():
+    plan = BioXpStartupHardware(lambda: _FakeTester()).startup_homing_stepwise(
+        mode="shadow", step="plan", execute=False
+    )
+    names = [row["step"] for row in plan["steps"]]
+    assert "gripper-commission-home" in names
+    assert "gripper-current-31" not in names
+    assert "gripper-clear-10000" not in names
+    assert "gripper-home" not in names
+    assert "gripper-idle-current-10" not in names
+    gripper = next(row for row in plan["steps"] if row["step"] == "gripper-commission-home")
+    assert gripper["temporary_action_current_internal"] == 31
+    assert gripper["required_terminal_idle_current"] == {"run": 10, "standby": 10}
+
+
+def test_semantic_gripper_commission_step_dispatches_as_one_transaction(monkeypatch):
+    from src.bioxp import api
+
+    calls = []
+
+    def fake_commission(tester, *, operator_ack, reason, timeout_s):
+        calls.append((tester, operator_ack, reason, timeout_s))
+        return {"ok": True, "idle_current_restored": True}
+
+    class Tester:
+        def motion_arm_state(self):
+            return {"armed": True}
+
+        def motion_gate_live_snapshot(self):
+            return {"ok": True}
+
+        def activate_boards(self, expect_reply=False):
+            return {"ok": expect_reply is True}
+
+        def motor_prepare_motion_interlock(self, force_lock=False):
+            return {"ok": force_lock is True}
+
+    tester = Tester()
+    monkeypatch.setattr(api, "gripper_commission_home", fake_commission)
+    result = api._execute_oem_startup_step(cast(api.BioXpTester, tester), "gripper-commission-home", 12.0)
+
+    assert result["ok"] is True
+    assert result["step"] == "gripper-commission-home"
+    assert result["result"]["idle_current_restored"] is True
+    assert calls == [(tester, "GRIPPER_COMMISSION_HOME", "OEM startup_step gripper-commission-home", 12.0)]
+
+
+def test_terminal_ui_zero_is_only_a_calibrated_source_branch_and_never_a_durable_claim():
+    class Tester(_FakeTester):
+        def _machine_config_bundle(self):
+            return {"ok": True, "config": {"calibration": {"Calibrated": 0}}}
+
+    uncalibrated = BioXpStartupHardware(lambda: Tester()).startup_homing_stepwise(
+        mode="live", step="ui-zero-calibrated", execute=True
+    )
+
+    assert uncalibrated["ok"] is True
+    assert uncalibrated["source_branch_taken"] is False
+    assert uncalibrated["ui_writes"] == []
+    assert "durable_robot_state" not in uncalibrated
+
+    class CalibratedTester(Tester):
+        def _machine_config_bundle(self):
+            return {"ok": True, "config": {"calibration": {"Calibrated": 1}}}
+
+    blocked = BioXpStartupHardware(lambda: CalibratedTester()).startup_homing_stepwise(
+        mode="live", step="ui-zero-calibrated", execute=True
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["source_branch_taken"] is True
+    assert blocked["expected_ui_writes"] == [("x", "0"), ("y", "0"), ("z", "0"), ("z", "0")]
+    assert blocked["physical_motion"] is False
+    assert "calibrated_ui_position_sink_not_bound" in blocked["blockers"]
+
+
+def test_terminal_chiller_stages_fail_closed_with_distinct_literal_gp8_minus_25_contracts():
+    opened = []
+
+    class Tester(_FakeTester):
+        pass
+
+    def factory():
+        opened.append(True)
+        return Tester()
+
+    hardware = BioXpStartupHardware(factory)
+    oc = hardware.startup_homing_stepwise(mode="live", step="chiller-oc-cool-rate", execute=True)
+    rc = hardware.startup_homing_stepwise(mode="live", step="chiller-rc-cool-rate", execute=True)
+
+    assert opened == []
+    assert oc["ok"] is False
+    assert rc["ok"] is False
+    assert oc["literal_oem_gp8_write"] == {"board": "BOARD_CHILLER", "command": 9, "type": 8, "bank": 1, "value": -25}
+    assert rc["literal_oem_gp8_write"] == {"board": "BOARD_CHILLER", "command": 9, "type": 8, "bank": 0, "value": -25}
+    assert oc["blockers"] == ["single_stage_chiller_transport_not_source_bound"]
+    assert rc["blockers"] == ["single_stage_chiller_transport_not_source_bound"]
+
+
+def test_terminal_gripper_idle_current_uses_10_only_for_gripper_version_one():
+    calls = []
+
+    class VersionOneTester(_FakeTester):
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            assert (axis, startup) == ("g", True)
+            return {"board": 4, "motor": 2, "gripper_version": 1}
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            calls.append((board, param, value, motor))
+            return {"ok": True}
+
+    current = BioXpStartupHardware(lambda: VersionOneTester()).startup_homing_stepwise(
+        mode="live", step="gripper-idle-current-10", execute=True
+    )
+
+    assert current["ok"] is True
+    assert current["source_branch_taken"] is True
+    assert calls == [(4, 6, 10, 2)]
+
+    class VersionZeroTester(VersionOneTester):
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            return {"board": 4, "motor": 2, "gripper_version": 0}
+
+    skipped = BioXpStartupHardware(lambda: VersionZeroTester()).startup_homing_stepwise(
+        mode="live", step="gripper-idle-current-10", execute=True
+    )
+
+    assert skipped["ok"] is True
+    assert skipped["source_branch_taken"] is False
+    assert calls == [(4, 6, 10, 2)]
+
+
+def test_standalone_gripper_home_is_retired_from_stepwise_operator_contract():
+    result = BioXpStartupHardware(lambda: _FakeTester()).startup_homing_stepwise(
+        mode="live",
+        step="gripper-home",
+        execute=True,
+    )
+
+    assert result["ok"] is False
+    assert "gripper-home" not in result["allowed_steps"]
+    assert "gripper-commission-home" in result["allowed_steps"]
+
+
+
+def test_stepwise_x_home_and_park_preserve_literal_oem_calls_and_waits(monkeypatch):
+    from src.bioxp import oem_startup_program
+
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(oem_startup_program.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    class Tester(_FakeTester):
+        def motor_oem_home_axis(self, axis, *, startup=False, speed=None, timeout_s=0):
+            calls.append(("home", axis, startup, speed, timeout_s))
+            return {"axis": axis, "home": {"ok": True}}
+
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            assert (axis, startup) == ("x", True)
+            return {"board": 5, "motor": 0}
+
+        def motor_set_home(self, board, motor=0):
+            calls.append(("set_home", board, motor))
+            return {"ok": True}
+
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            calls.append(("set_param", board, param, value, motor))
+            return {"ok": True}
+
+        def motor_move_absolute(self, board, value, motor=0):
+            calls.append(("move_absolute", board, value, motor))
+            return {"ok": True}
+
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            calls.append(("wait", board, motor, kwargs))
+            return {"stopped": True, "seen_nonzero": True}
+
+    hardware = BioXpStartupHardware(lambda: Tester())
+    results = [
+        hardware.startup_homing_stepwise(mode="live", step=stage, execute=True)
+        for stage in (
+            "x-home",
+            "x-home-settle",
+            "x-set-home",
+            "x-speed-1700",
+            "x-speed-settle",
+            "x-park-6000",
+        )
+    ]
+
+    assert all(result["ok"] is True for result in results)
+    assert calls == [
+        ("home", "x", True, 250, 30.0),
+        ("set_home", 5, 0),
+        ("set_param", 5, 4, 1700, 0),
+        ("move_absolute", 5, 6000, 0),
+        ("wait", 5, 0, {"timeout_s": 12.0, "require_seen_nonzero": True}),
+    ]
+    assert sleeps == [0.020, 0.040]
+
+
+def test_x_park_reports_attempted_motion_separately_from_ack_and_effect():
+    class Tester(_FakeTester):
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            return {"board": 5, "motor": 0}
+
+        def motor_move_absolute(self, board, value, motor=0):
+            return {"ok": False, "error": "reply_lost"}
+
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            return {"stopped": False, "error": "status_unavailable"}
+
+    result = BioXpStartupHardware(lambda: Tester()).startup_homing_stepwise(
+        mode="live", step="x-park-6000", execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["physical_motion"] is True
+    assert result["motion_command_attempted"] is True
+    assert result["controller_acknowledged"] is False
+    assert result["stopped_observed"] is False
+    assert result["physical_effect_verified"] is False
+
+
+def test_stepwise_y_door_and_y_set_home_use_their_distinct_oem_primitives():
+    calls = []
+
+    class Tester(_FakeTester):
+        def motor_oem_home_axis(self, axis, *, startup=False, speed=None, timeout_s=0):
+            calls.append(("axis_home", axis, startup, speed, timeout_s))
+            return {"axis": axis, "home": {"ok": True}}
+
+        def motor_oem_door_search_home(self, *, startup=False, timeout_s=0):
+            calls.append(("door_search", startup, timeout_s))
+            return {"ok": True, "home": {"ok": True}}
+
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            assert (axis, startup) == ("y", True)
+            return {"board": 4, "motor": 0}
+
+        def motor_set_home(self, board, motor=0):
+            calls.append(("set_home", board, motor))
+            return {"ok": True}
+
+    hardware = BioXpStartupHardware(lambda: Tester())
+    y_home = hardware.startup_homing_stepwise(mode="live", step="y-home", execute=True)
+    door = hardware.startup_homing_stepwise(mode="live", step="door-home", execute=True)
+    y_set = hardware.startup_homing_stepwise(mode="live", step="y-set-home", execute=True)
+
+    assert y_home["ok"] is True
+    assert door["ok"] is True
+    assert y_set["ok"] is True
+    assert calls == [
+        ("axis_home", "y", True, 250, 30.0),
+        ("door_search", True, 30.0),
+        ("set_home", 4, 0),
+    ]
+
+
+def test_raw_z_home_step_executes_only_oem_axis_search_home(monkeypatch):
+    from src.bioxp import api
+
+    monkeypatch.setattr(api, "_require_motion_not_blocked_by_maintenance", lambda: None)
     calls = []
 
     class Tester:
@@ -130,34 +420,33 @@ def test_z_home_step_uses_full_init_z_reference_contract_when_probe_fails():
             calls.append(("interlock", force_lock))
             return {"ok": True}
 
+        def motor_oem_home_axis(self, axis, *, startup=False, timeout_s=0):
+            calls.append(("motor_oem_home_axis", axis, startup, timeout_s))
+            return {"axis": axis, "home": {"ok": True}}
+
         def motor_oem_axis_already_home(self, axis, tolerance_steps=0):
-            calls.append(("probe", axis, tolerance_steps))
-            if sum(1 for c in calls if c[0] == "probe") == 1:
-                return {"ok": False, "position": {"position": -12345}, "home": {"value": 0}}
-            return {"ok": True, "position": {"position": 0}, "home": {"value": 1}}
+            assert any(call[0] == "motor_oem_home_axis" for call in calls), "pre-home probe is not part of OEM initializeMotors Z stage"
+            return {"ok": True}
 
-        def motor_oem_move_z_to_reference(self, *args, **kwargs):
-            calls.append(("z_reference", args, kwargs))
-            return {"ok": True, "target_position": 0}
+        def motor_oem_move_z_to_reference(self, *args, **kwargs):  # pragma: no cover - forbidden by source contract
+            raise AssertionError("Z reference-return is not part of ClassControlInterface.initializeMotors")
 
-        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):  # pragma: no cover - must not run
-            raise AssertionError(f"generic startup home route must not run for z-home: {axis} {startup} {timeout_s}")
+    result = api._execute_oem_startup_step(cast(api.BioXpTester, Tester()), "z-home", timeout_s=30.0)
 
-    result = _execute_oem_startup_step(Tester(), "z-home", timeout_s=10)
-
-    assert result["result"]["ok"] is True
-    assert result["result"]["z_axisSearchHome_1791_probe"]["ok"] is False
-    assert result["result"]["z_reference_return"]["ok"] is True
-    assert result["result"]["z_reference_verify_after_return"]["ok"] is True
-    assert any(call[0] == "z_reference" for call in calls)
+    assert result["result"]["home"]["ok"] is True
+    assert calls == [
+        ("activate", True),
+        ("interlock", True),
+        ("motor_oem_home_axis", "z", True, 30.0),
+    ]
 
 
-def test_z_home_step_fails_closed_when_reference_return_does_not_verify_home():
-    import pytest
-    from fastapi import HTTPException
-    from src.bioxp.api import _execute_oem_startup_step
+def test_raw_x_park_preserves_oem_pre_sethome_and_pre_move_delays(monkeypatch):
+    from src.bioxp import api
 
-    calls = []
+    monkeypatch.setattr(api, "_require_motion_not_blocked_by_maintenance", lambda: None)
+    sleeps = []
+    monkeypatch.setattr(api.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     class Tester:
         def motion_arm_state(self):
@@ -167,33 +456,101 @@ def test_z_home_step_fails_closed_when_reference_return_does_not_verify_home():
             return {"ok": True}
 
         def activate_boards(self, expect_reply=False):
-            calls.append(("activate", expect_reply))
             return {"ok": True}
 
         def motor_prepare_motion_interlock(self, force_lock=False):
-            calls.append(("interlock", force_lock))
             return {"ok": True}
 
-        def motor_oem_axis_already_home(self, axis, tolerance_steps=0):
-            calls.append(("probe", axis, tolerance_steps))
-            return {"ok": False, "position": {"position": -12345}, "home": {"value": 0}}
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            assert (axis, startup) == ("x", True)
+            return {"board": 5, "motor": 0}
 
-        def motor_oem_move_z_to_reference(self, *args, **kwargs):
-            calls.append(("z_reference", args, kwargs))
-            return {"ok": True, "target_position": 0}
+        def motor_set_home(self, board, motor=0):
+            assert (board, motor) == (5, 0)
+            return {"ok": True}
 
-        def motor_oem_home_axis(self, axis, startup=False, timeout_s=0):  # pragma: no cover - must not run
-            raise AssertionError(f"generic startup home route must not run for z-home: {axis} {startup} {timeout_s}")
+        def motor_set_axis_param(self, board, param, value, motor=0):
+            assert (board, param, value, motor) == (5, 4, 1700, 0)
+            return {"ok": True}
 
-    with pytest.raises(HTTPException) as exc_info:
-        _execute_oem_startup_step(Tester(), "z-home", timeout_s=10)
+        def motor_move_absolute(self, board, value, motor=0):
+            assert (board, value, motor) == (5, 6000, 0)
+            return {"ok": True}
 
-    assert exc_info.value.status_code == 409
-    assert "did not confirm" in str(exc_info.value.detail)
-    assert any(call[0] == "z_reference" for call in calls)
+        def motor_wait_stopped(self, board, motor=0, **kwargs):
+            return {"stopped": True}
+
+    result = api._execute_oem_startup_step(cast(api.BioXpTester, Tester()), "x-park-6000", timeout_s=30.0)
+
+    assert result["result"]["move_x_6000"]["ok"] is True
+    assert sleeps == [0.02, 0.04]
 
 
-def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y():
+def test_monolithic_full_initialize_motors_is_fail_closed_pending_literal_oem_rewrite(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+
+    def forbidden_profile(*_args, **_kwargs):  # pragma: no cover - must never be reached by a blocked surface
+        raise AssertionError("blocked full sequence must not inspect/configure an axis or command motion")
+
+    monkeypatch.setattr(tester, "_motion_oem_axis_profile", forbidden_profile)
+
+    result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=30.0)
+
+    assert result == {
+        "ok": False,
+        "source_mode": "ClassControlInterface.initializeMotors",
+        "physical_motion_commanded": False,
+        "blocked": True,
+        "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+    }
+
+
+def test_oem_rehome_is_fail_closed_pending_literal_oem_rewrite(monkeypatch):
+    tester = BioXpTester.__new__(BioXpTester)
+    monkeypatch.setattr(tester, "motor_startup_homing_mimic", lambda: (_ for _ in ()).throw(AssertionError("must not call legacy mimic")))
+
+    result = tester.motor_oem_rehome(timeout_s=30.0)
+
+    assert result == {
+        "ok": False,
+        "source_mode": "ControlLib.rehome",
+        "physical_motion_commanded": False,
+        "blocked": True,
+        "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+    }
+
+
+def test_startup_door_search_home_preserves_oem_active_home_preclear(monkeypatch):
+    """ClassThermalBoard.doorSearchHome pre-clears +2000 when queryHome is active."""
+    tester = BioXpTester.__new__(BioXpTester)
+    tester.MOTOR_SWITCH_ACTIVE_VALUE = 1
+    calls = []
+
+    monkeypatch.setattr(
+        tester,
+        "_motion_oem_axis_profile",
+        lambda axis: {"board": 6, "motor": 0, "stall_guard": 9, "stall_guard_param": 205, "home_speed": 600},
+    )
+    monkeypatch.setattr(tester, "motor_thermal_door_status", lambda: {"home": {"value": 1}, "closed": True, "opened": False, "switches": {}})
+    monkeypatch.setattr(tester, "motor_set_axis_param", lambda board, param, value, motor=0: calls.append(("stall", board, param, value, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_move_relative", lambda board, steps, motor=0: calls.append(("relative", board, steps, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_move_left", lambda board, speed, motor=0: calls.append(("left", board, speed, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_wait_stopped", lambda *args, **kwargs: {"stopped": True, "ambiguous_no_motion": False})
+    monkeypatch.setattr(tester, "motor_stop", lambda board, motor=0: calls.append(("stop", board, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_set_home", lambda board, motor=0: calls.append(("set_home", board, motor)) or {"ok": True})
+
+    result = tester.motor_oem_door_search_home(startup=True)
+
+    assert result["ok"] is True
+    assert calls[:4] == [
+        ("stall", 6, 205, 11, 0),
+        ("relative", 6, 2000, 0),
+        ("stall", 6, 205, 9, 0),
+        ("left", 6, 600, 0),
+    ]
+
+
+def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y(monkeypatch):
     calls = []
 
     class Tester(BioXpTester):
@@ -238,6 +595,7 @@ def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y(
             return {"no24v": False}
 
     tester = Tester.__new__(Tester)
+    monkeypatch.setattr(tester, "_machine_config_bundle", _bound_oem_machine_config)
 
     result = tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=10)
 
@@ -253,6 +611,7 @@ def test_z_reference_return_masks_and_restores_right_limit_without_changing_x_y(
 
 def test_z_reference_return_rejects_untrusted_coordinate_before_any_command(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
+    monkeypatch.setattr(tester, "_machine_config_bundle", _bound_oem_machine_config)
     calls = []
     monkeypatch.setattr(
         tester,
@@ -324,90 +683,6 @@ def test_z_reference_return_requires_observed_motion_and_verified_post_target(mo
     assert result["completion_evidence"]["target_position_confirmed"] is False
 
 
-def test_initialize_without_motion_keeps_gripper_v1_at_idle_current(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-    prepared = []
-
-    def fake_prepare(board, *, motor=0, **kwargs):
-        prepared.append({"board": board, "motor": motor, **kwargs})
-        return {"ops": [{"op": "prepare", "ack": {"status": 100}}]}
-
-    monkeypatch.setattr(tester, "motor_prepare_axis", fake_prepare)
-
-    result = tester.motor_oem_initialize_without_motion()
-
-    assert result["ok"] is True
-    gripper = next(row for row in prepared if row["board"] == tester.BOARD_HEAD and row["motor"] == 2)
-    assert gripper["run_current"] == 10
-    assert gripper["standby_current"] == 10
-
-
-
-
-
-def test_full_init_uses_oem_xy_axis_search_not_controller_zero(monkeypatch):
-    from src.bioxp.usb_driver import BioXpTester
-
-    calls = []
-
-    class Tester(BioXpTester):
-        def _motion_oem_axis_profile(self, axis, startup=False):
-            return {
-                'x': {'board':5,'motor':0},
-                'y': {'board':4,'motor':0,'disable_right': True},
-                'z': {'board':4,'motor':1},
-                'g': {'board':4,'motor':2,'run_current':31,'standby_current':10,'restore_current':10},
-                'door': {'board':6,'motor':0},
-            }[axis]
-
-        def motor_oem_axis_already_home(self, axis, tolerance_steps=2):
-            return {'ok': True, 'axis': axis}
-
-        def motor_oem_verify_z_clearance_for_xy(self, **kwargs):
-            return {'ok': True}
-
-        def motor_oem_axis_search_home(self, axis, **kwargs):
-            calls.append(('axis_search_home', axis, kwargs))
-            return {'ok': True, 'axis': axis, 'switch_transition': True, 'set_home': {'ok': True}}
-
-        def motor_set_home(self, board, motor=0):
-            calls.append(('set_home', board, motor))
-            return {'ok': True}
-
-        def motor_set_axis_param(self, board, param, value, motor=0):
-            calls.append(('set_axis_param', board, motor, param, value))
-            return {'ok': True}
-
-        def motor_move_absolute(self, board, position, motor=0):
-            calls.append(('move_absolute', board, motor, position))
-            return {'ok': True}
-
-        def motor_wait_stopped(self, board, motor=0, **kwargs):
-            calls.append(('wait_stopped', board, motor, kwargs))
-            return {'stopped': True}
-
-        def motor_oem_door_search_home(self, **kwargs):
-            calls.append(('door_home', kwargs))
-            return {'ok': True}
-
-    import src.bioxp.oem_gripper as og
-    monkeypatch.setattr(og, 'gripper_status', lambda tester: {'ok': True, 'oem_home_predicate': {'oem_confirmed_home': True}})
-
-    tester = Tester.__new__(Tester)
-    result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=30)
-
-    assert result['ok'] is True
-    assert result['failed_at'] is None
-    assert result['steps'][-6:] == ['x_axisSearchHome_250', 'x_setHome', 'x_setSpeed_1700', 'x_moveX_6000', 'y_axisSearchHome_250', 'thermal_door_doorSearchHome', 'y_setHome'][-6:]
-    axis_searches = [call for call in calls if call[0] == 'axis_search_home']
-    assert axis_searches[0][1:] == ('z', {'speed': 1791, 'timeout_s': 30.0, 'max_search_abs_delta': None})
-    assert axis_searches[1][1:] == ('x', {'speed': 250, 'timeout_s': 30.0, 'max_search_abs_delta': None})
-    assert axis_searches[2][1:] == ('y', {'speed': 250, 'timeout_s': 30.0, 'max_search_abs_delta': None})
-    # The only absolute move allowed in this phase is the OEM X park to 6000.
-    assert ('move_absolute', 5, 0, 0) not in calls
-    assert ('move_absolute', 4, 0, 0) not in calls
-    assert ('move_absolute', 5, 0, 6000) in calls
-
 
 
 def test_axis_search_home_uses_oem_sethome_and_queryhome_contract_for_x(monkeypatch):
@@ -437,58 +712,3 @@ def test_axis_search_home_uses_oem_sethome_and_queryhome_contract_for_x(monkeypa
     assert recorded["require_switch_transition"] is True
     assert recorded["max_search_abs_delta"] == 91919
     assert result["ok"] is True
-
-
-def test_full_initialize_motors_passes_bounded_x_and_y_search(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-    calls = []
-
-    monkeypatch.setattr(tester, "motor_oem_axis_already_home", lambda axis, tolerance_steps=2: {"ok": True})
-    monkeypatch.setattr(tester, "motor_oem_verify_z_clearance_for_xy", lambda **kwargs: {"ok": True})
-
-    import src.bioxp.oem_gripper as oem_gripper
-    monkeypatch.setattr(oem_gripper, "gripper_status", lambda tester_arg: {"ok": True, "oem_home_predicate": {"oem_confirmed_home": True}})
-
-    def fake_profile(axis, startup=True):
-        limits = {"x": 91919, "y": 95247, "z": 160000, "g": 15000, "door": 18500}
-        return {"board": 5 if axis == "x" else 4, "motor": 0, "home_search_max_abs_delta": limits[axis]}
-
-    monkeypatch.setattr(tester, "_motion_oem_axis_profile", fake_profile)
-
-    def fake_axis_search(axis, **kwargs):
-        calls.append((axis, kwargs))
-        return {"ok": True, "home_after": {"value": 1}, "set_home": {"ok": True}}
-
-    monkeypatch.setattr(tester, "motor_oem_axis_search_home", fake_axis_search)
-    monkeypatch.setattr(tester, "motor_set_home", lambda board, motor=0: {"ok": True})
-    monkeypatch.setattr(tester, "motor_set_axis_param", lambda board, param, value, motor=0: {"ok": True})
-    monkeypatch.setattr(tester, "motor_move_absolute", lambda board, position, motor=0: {"ok": True})
-    monkeypatch.setattr(tester, "motor_wait_stopped", lambda board, motor=0, **kwargs: {"stopped": True})
-    monkeypatch.setattr(tester, "motor_oem_door_search_home", lambda **kwargs: {"ok": True})
-
-    result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=90)
-
-    assert result["ok"] is True
-    assert ("x", {"speed": 250, "timeout_s": 45.0, "max_search_abs_delta": 91919}) in calls
-    assert ("y", {"speed": 250, "timeout_s": 45.0, "max_search_abs_delta": 95247}) in calls
-
-
-def test_initialize_without_motion_has_top_level_ok(monkeypatch):
-    tester = BioXpTester.__new__(BioXpTester)
-
-    profiles = {
-        "x": {"board": 5, "motor": 0},
-        "y": {"board": 4, "motor": 0},
-        "z": {"board": 4, "motor": 1},
-        "g": {"board": 4, "motor": 2},
-        "door": {"board": 6, "motor": 0},
-    }
-    monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis: profiles[axis])
-    monkeypatch.setattr(tester, "motor_prepare_axis", lambda board, **kwargs: {"board": board, "ops": [{"op": "sap6", "ack": {"status": 100}}]})
-    monkeypatch.setattr(tester, "_tmcl_success", lambda ack: ack.get("status") == 100)
-
-    result = tester.motor_oem_initialize_without_motion()
-
-    assert result["ok"] is True
-    assert result["physical_motion"] is False
-    assert set(result["axes"]) == {"x", "y", "z", "g", "door"}

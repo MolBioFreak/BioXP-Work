@@ -1,7 +1,7 @@
 
 import json
-from bioxp.oem_homing_spec import get_program
-from bioxp.oem_parity_artifacts import build_artifact, validate_artifact
+from src.bioxp.oem_homing_spec import get_program
+from src.bioxp.oem_parity_artifacts import build_artifact, validate_artifact
 
 
 def test_build_artifact_has_required_truth_and_safety_fields():

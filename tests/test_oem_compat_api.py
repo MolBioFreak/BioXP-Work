@@ -620,3 +620,46 @@ def test_pipette_close_error_cannot_skip_authoritative_usb_disconnect(monkeypatc
     assert api._tester is None
     assert api._tester_quarantine is None
     assert api.hardware_state.ownership_projection()["ownership"]["transport"] == "unbound"
+
+
+def test_lifespan_configures_oem_runtime_lazily_without_terminal_snapshot_hook(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    import src.bioxp.api as api
+
+    configured = []
+    shutdown = []
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        api,
+        "configure_oem_machine_snapshot_from_env",
+        lambda **kwargs: SimpleNamespace(startup_mode="normal", operation_parameters={"CheckCamera": False}),
+    )
+    monkeypatch.setattr(api, "configure_oem_runtime_state_from_env", lambda snapshot: None)
+    monkeypatch.setattr(api, "configure_oem_runtime", lambda **kwargs: configured.append(kwargs))
+    monkeypatch.setattr(api, "shutdown_oem_runtime", lambda: shutdown.append(True))
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    monkeypatch.setattr(api, "_pipette_transport", None)
+
+    async def no_camera(**kwargs):
+        return None
+
+    monkeypatch.setattr(api, "_stop_owned_camera_session", no_camera)
+
+    async def scenario():
+        async with api.lifespan(api.app):
+            assert api._tester is None
+
+    asyncio.run(scenario())
+
+    assert configured == [
+        {
+            "startup_program_factory": api._get_live_oem_startup_program,
+            "store_root": str(tmp_path),
+            "autostart": True,
+        }
+    ]
+    assert "terminal_snapshot_hook" not in configured[0]
+    assert shutdown == [True]

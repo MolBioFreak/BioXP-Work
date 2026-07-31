@@ -1,7 +1,8 @@
 from src.bioxp.usb_driver import BioXpTester
+from support_oem_machine_bundle import serial_206_immutable_machine_bundle
 
 
-def test_full_initialize_motors_dispatches_literal_z_axis_search_home(monkeypatch):
+def test_full_initialize_motors_meta_action_remains_blocked_before_motion(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
     calls = []
 
@@ -38,20 +39,16 @@ def test_full_initialize_motors_dispatches_literal_z_axis_search_home(monkeypatc
     result = tester.motor_oem_initialize_motors_full_sequence(timeout_s=123)
 
     assert result["ok"] is False
-    assert result["failed_at"] == "z_clearance_for_xy"
-    assert "z_axisSearchHome_1791" in result["steps"]
-    assert not any(step.startswith("z_return_to_live_reference") for step in result["steps"])
-    assert calls[0] == (
-        "axis_search_home",
-        "z",
-        {"speed": 1791, "timeout_s": 90.0, "max_search_abs_delta": 160000},
-    )
+    assert result["blocked"] is True
+    assert result["blocked_reason"] == "literal_direct_oem_stage_rewrite_pending"
+    assert result["physical_motion_commanded"] is False
+    assert calls == []
 
 
 def test_z_oem_profile_is_literal_and_has_no_live_mask_substitution(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
     monkeypatch.setattr(tester, "motor_function_preset", lambda key: {"board": 4, "motor": 1, "speed": 1791, "acc": 576, "standby_current": 10})
-    monkeypatch.setattr(tester, "_machine_config_axis_max", lambda axis, fallback: (160000, "test"))
+    monkeypatch.setattr(tester, "_machine_config_bundle", serial_206_immutable_machine_bundle)
 
     profile = tester._motion_oem_axis_profile("z", startup=True)
 
@@ -67,7 +64,7 @@ def test_z_oem_profile_is_literal_and_has_no_live_mask_substitution(monkeypatch)
 def test_z_already_home_accepts_controller_zero_gap10_live_reference(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
     monkeypatch.setattr(tester, "motor_function_preset", lambda key: {"board": 4, "motor": 1, "speed": 1791, "acc": 576, "standby_current": 10})
-    monkeypatch.setattr(tester, "_machine_config_axis_max", lambda axis, fallback: (160000, "test"))
+    monkeypatch.setattr(tester, "_machine_config_bundle", serial_206_immutable_machine_bundle)
     monkeypatch.setattr(tester, "motor_get_position", lambda board, motor=0: {"position": 0})
     monkeypatch.setattr(tester, "motor_get_speed", lambda board, motor=0: {"speed": 0})
     monkeypatch.setattr(tester, "motor_query_home_switch", lambda board, motor=0: {"value": 0})

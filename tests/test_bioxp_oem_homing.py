@@ -1,8 +1,11 @@
 import importlib
+import asyncio
+import json
 import sys
 import types
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -14,10 +17,11 @@ def _load_usb_driver(monkeypatch):
     usb_util = types.ModuleType("usb.util")
     usb_pkg.core = usb_core
     usb_pkg.util = usb_util
+    setattr(usb_util, "release_interface", lambda dev, interface: None)
+    setattr(usb_util, "dispose_resources", lambda dev: None)
     monkeypatch.setitem(sys.modules, "usb", usb_pkg)
     monkeypatch.setitem(sys.modules, "usb.core", usb_core)
     monkeypatch.setitem(sys.modules, "usb.util", usb_util)
-    sys.modules.pop("src.bioxp.usb_driver", None)
     return importlib.import_module("src.bioxp.usb_driver")
 
 
@@ -25,6 +29,26 @@ def _make_tester(monkeypatch):
     usb_driver = _load_usb_driver(monkeypatch)
     tester = usb_driver.BioXpTester.__new__(usb_driver.BioXpTester)
     tester.MOTOR_SWITCH_ACTIVE_VALUE = 1
+    axis_limits = {"x": 91919, "y": 95247, "z": 160000, "g": 15000}
+    offsets = {
+        "m_TCDoorOpen": 16000,
+        "m_TCDoorClose": 0,
+        "m_TCDoorStallGuardThreshold": 6,
+        "m_TC_DOOR_VELOCITY": 50,
+        "m_TC_DOOR_ACCELERATION": 20,
+        "m_TC_DOOR_MAX_CURRENT": 31,
+    }
+    monkeypatch.setattr(
+        tester,
+        "_machine_config_axis_max",
+        lambda axis, fallback: (axis_limits[str(axis)], "immutable_oem_machine_snapshot"),
+    )
+    monkeypatch.setattr(
+        tester,
+        "_machine_config_offset_int",
+        lambda key, fallback: (offsets[str(key)], "immutable_oem_machine_snapshot"),
+    )
+    monkeypatch.setattr(tester, "_motion_oem_gripper_version", lambda: 1)
     return tester, usb_driver
 
 
@@ -233,14 +257,14 @@ def test_motor_oem_axis_search_home_preserves_source_initial_sethome(monkeypatch
 
 
 
-def test_startup_door_home_matches_oem_initialize_without_manual_preclear(monkeypatch):
+def test_startup_door_home_preserves_board_level_oem_active_home_preclear(monkeypatch):
     tester, _ = _make_tester(monkeypatch)
     calls = []
 
     monkeypatch.setattr(tester, "motor_prepare_axis", lambda board_id, motor=0, **kwargs: calls.append(("prepare", board_id, motor, kwargs)) or {"ok": True})
     monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"ok": True, "value": 1})
     monkeypatch.setattr(tester, "motor_set_axis_param", lambda board_id, param, value, motor=0: calls.append(("sap", board_id, param, value, motor)) or {"ok": True, "value": value})
-    monkeypatch.setattr(tester, "motor_move_relative", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("OEM initializeMotors doorSearchHome does not preclear from an already-closed switch")))
+    monkeypatch.setattr(tester, "motor_move_relative", lambda board_id, steps, motor=0: calls.append(("relative", board_id, steps, motor)) or {"ok": True})
     monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=600, motor=0: calls.append(("move_left", board_id, speed, motor)) or {"ok": True})
     monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=20.0, **kwargs: calls.append(("wait", board_id, motor, timeout_s, kwargs)) or {"stopped": True, "seen_nonzero": True})
     monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: calls.append(("stop", board_id, motor)) or {"ok": True})
@@ -257,7 +281,25 @@ def test_startup_door_home_matches_oem_initialize_without_manual_preclear(monkey
 
     assert home["oem_mode"] == "initializeMotors.doorSearchHome"
     assert home["startup"] is True
-    assert home["preclear_move"] is None
+    assert home["preclear_move"]["ok"] is True
+    assert calls[:4] == [
+        ("prepare", tester.BOARD_THERMAL, 0, {
+            "run_current": 31,
+            "standby_current": 10,
+            "speed": 50,
+            "acc": 20,
+            "stall_guard": 6,
+            "ramp_mode": None,
+            "disable_right": True,
+            "disable_left": True,
+            "rdiv": None,
+            "pdiv": None,
+            "warm_enable": False,
+        }),
+        ("sap", tester.BOARD_THERMAL, 205, 8, 0),
+        ("relative", tester.BOARD_THERMAL, 2000, 0),
+        ("wait", tester.BOARD_THERMAL, 0, 8.0, {}),
+    ]
     assert home["wait"]["stopped"] is True
     assert home["ok"] is True
     assert ("wait", tester.BOARD_THERMAL, 0, 20.0, {"require_seen_nonzero": False}) in calls
@@ -269,6 +311,7 @@ def test_startup_door_home_accepts_oem_closed_predicate_after_wait_timeout(monke
 
     monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"ok": True, "value": 1})
     monkeypatch.setattr(tester, "motor_set_axis_param", lambda board_id, param, value, motor=0: {"ok": True, "value": value})
+    monkeypatch.setattr(tester, "motor_move_relative", lambda board_id, steps, motor=0: {"ok": True, "steps": steps})
     monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=600, motor=0: {"ok": True})
     monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=20.0, **kwargs: {"stopped": False, "seen_nonzero": True, "elapsed_ms": 20000})
     monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: {"ok": True})
@@ -695,14 +738,18 @@ def test_oem_rehome_and_initialize_motion_wrappers_keep_modes_separate(monkeypat
     init_with_homing = tester.motor_oem_initialize_motion(run_homing=True, timeout_s=77.0)
 
     assert rehome["source_mode"] == "ControlLib.rehome"
-    assert rehome["initialize_motors"]["aborted_at"] is None
-    assert rehome["door_state_save"]["implemented"] is False
+    assert rehome["ok"] is False
+    assert rehome["blocked"] is True
+    assert rehome["blocked_reason"] == "literal_direct_oem_stage_rewrite_pending"
+    assert rehome["physical_motion_commanded"] is False
+    assert "initialize_motors" not in rehome
     assert init_no_motion["source_mode"] == "ControlLib.initializeMotion"
     assert init_no_motion["physical_motion_commanded"] is False
     assert init_no_motion["rehome"] is None
-    assert init_with_homing["physical_motion_commanded"] is True
+    assert init_with_homing["ok"] is False
+    assert init_with_homing["physical_motion_commanded"] is False
     assert init_with_homing["rehome"]["source_mode"] == "ControlLib.rehome"
-    assert sequence == ["initializeMotors", "initializeMotorsWithoutMotion", "initializeMotorsWithoutMotion", "initializeMotors"]
+    assert sequence == ["initializeMotorsWithoutMotion", "initializeMotorsWithoutMotion"]
 
 
 def test_execute_oem_home_xy_uses_predicate_guard_and_direct_mode(monkeypatch):
@@ -753,3 +800,128 @@ def test_execute_oem_initialize_motion_dispatches_no_homing_diagnostic(monkeypat
     assert result["source_mode"] == "ControlLib.initializeMotion"
     assert observed == {"run_homing": False, "timeout_s": 44.0, "cleanup": True}
     assert result["route_semantics"]["raw_fastapi_route"] == "/motion/oem/initialize_motion"
+
+
+def test_execute_oem_rehome_remains_publicly_blocked_without_motion(monkeypatch):
+    from src.bioxp.oem_homing_model import source_matrix
+    from tests.test_motion_service import load_api
+
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motor_oem_rehome(self, *, timeout_s=120.0):
+            return {
+                "ok": False,
+                "source_mode": "ControlLib.rehome",
+                "blocked": True,
+                "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
+                "physical_motion_commanded": False,
+            }
+
+    result = api._execute_oem_rehome(FakeTester(), timeout_s=44.0)
+
+    assert result["ok"] is False
+    assert result["physical_motion_commanded"] is False
+    assert result["result"]["blocked"] is True
+    assert result["route_semantics"]["home_semantics"] == "rehome_intentionally_blocked_no_monolithic_live_homing"
+    rehome_mapping = next(
+        mapping
+        for mapping in source_matrix()["live_target_mappings"]
+        if mapping["source_mode"] == "ControlLib.rehome"
+    )
+    assert rehome_mapping["target_status"] == "intentionally_blocked_no_monolithic_live_homing"
+
+
+def test_initialize_motion_homing_request_and_openapi_remain_no_motion(monkeypatch):
+    from tests.test_motion_service import load_api
+
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        def motor_oem_initialize_motion(self, *, run_homing=False, timeout_s=120.0, include_tip_pipette_cleanup=False):
+            assert run_homing is True
+            return {
+                "ok": False,
+                "source_mode": "ControlLib.initializeMotion",
+                "run_homing": True,
+                "physical_motion_commanded": False,
+                "rehome": {"blocked": True, "physical_motion_commanded": False},
+            }
+
+    result = api._execute_oem_initialize_motion(FakeTester(), run_homing=True, timeout_s=44.0)
+
+    assert result["ok"] is False
+    assert result["physical_motion_commanded"] is False
+    assert result["route_semantics"]["home_semantics"] == "initializeMotion_homing_request_delegates_to_blocked_rehome_no_motion"
+    schemas = api.app.openapi()["components"]["schemas"]
+    assert "does not enable physical homing" in schemas["OemRehomeRequest"]["properties"]["run_homing"]["description"]
+    assert "does not enable physical homing" in schemas["OemInitializeMotionRequest"]["properties"]["run_homing"]["description"]
+    assert "does not enable physical homing" in schemas["OemInitializationRunRequest"]["properties"]["run_homing"]["description"]
+
+
+def test_initialization_run_homing_request_is_publicly_blocked_without_controller_call(monkeypatch):
+    from tests.test_motion_service import load_api
+
+    api = load_api(monkeypatch)
+    monkeypatch.setattr(api, "_require_motion_route_ready", lambda: None)
+    monkeypatch.setattr(api, "_get_tester", lambda: object())
+    monkeypatch.setattr(
+        api,
+        "run_oem_initialization_controller",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("blocked request must not invoke initialization controller")),
+    )
+
+    async def run_blocking(_label, callback, **_kwargs):
+        return callback()
+
+    monkeypatch.setattr(api, "_run_blocking", run_blocking)
+    result = asyncio.run(
+        api.motion_oem_initialization_run(
+            api.OemInitializationRunRequest(
+                operator_ack="OEM_INITIALIZATION_RUN_WITH_HOMING",
+                run_homing=True,
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["failed_closed"] is True
+    assert result["physical_motion_commanded"] is False
+
+
+def test_initialization_controller_homing_request_is_directly_blocked_without_tester_call():
+    from src.bioxp.oem_initialization import run_oem_initialization_controller
+
+    class Tester:
+        def __getattr__(self, name):
+            raise AssertionError(f"blocked controller must not access tester.{name}")
+
+    result = run_oem_initialization_controller(Tester(), run_homing=True)
+
+    assert result["ok"] is False
+    assert result["ready"] is False
+    assert result["failed_at"] == "initialize_motors_full_sequence"
+    assert result["phases"][-1]["blocked"] is True
+    assert result["phases"][-1]["physical_motion_commanded"] is False
+
+
+def test_checked_in_oem_homing_matrix_json_matches_source_model():
+    from src.bioxp.oem_homing_model import source_matrix
+
+    root = Path(__file__).resolve().parents[1]
+    actual = json.loads((root / "docs/oem/oem_homing_source_matrix.json").read_text())
+    expected = json.loads(json.dumps(source_matrix(), sort_keys=True))
+    assert actual == expected
+
+
+def test_source_model_covers_public_initialization_run_route():
+    from src.bioxp.oem_homing_model import source_matrix
+
+    raw_route_paths = {row["path"] for row in source_matrix()["raw_fastapi_route_table"]}
+    mapped_route_paths = {
+        row["route"]
+        for row in source_matrix()["routes"]
+        if row["surface"] == "raw-fastapi"
+    }
+    assert "/motion/oem/initialization/run" in raw_route_paths
+    assert "/motion/oem/initialization/run" in mapped_route_paths

@@ -104,32 +104,37 @@ def test_controller_no_homing_builds_all_phases_without_motion():
     assert result["ok"] is True
     assert result["ready"] is True
     assert "initialize_without_motion" in result["phase_names"]
-    assert result["machine_calibration_manifest"]["thermal_door"]["TCDoorOpen"]["value"] == 18500
+    door_open = result["machine_calibration_manifest"]["thermal_door"]["TCDoorOpen"]
+    assert door_open["source"] == "unavailable_fail_closed"
+    assert door_open["value"] is None
     assert not any(call == ("homexy", 60.0) for call in tester.calls)
 
 
-def test_controller_with_homing_runs_full_initialize_motors_phase():
+def test_controller_with_homing_is_blocked_without_full_initialize_motors_call():
     tester = FakeInitTester()
 
     result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=90)
 
-    assert result["ok"] is True
-    assert result["ready"] is True
+    assert result["ok"] is False
+    assert result["ready"] is False
     assert "initialize_motors_full_sequence" in result["phase_names"]
-    assert ("full_initialize_motors", 90) in tester.calls
+    assert result["failed_at"] == "initialize_motors_full_sequence"
+    assert result["phases"][-1]["blocked"] is True
+    assert ("full_initialize_motors", 90) not in tester.calls
     assert not any(isinstance(call, tuple) and call[0] == "homexy" for call in tester.calls)
 
 
-def test_controller_fails_closed_on_full_initialize_motors_failure():
+def test_controller_fails_closed_before_full_initialize_motors_attempt():
     class BadFullInit(FakeInitTester):
         def motor_oem_initialize_motors_full_sequence(self, timeout_s=120.0):
-            return {"ok": False, "error": "x_not_rebased"}
+            raise AssertionError("blocked controller must not attempt full initialization")
 
     result = run_oem_initialization_controller(BadFullInit(), run_homing=True)
 
     assert result["ok"] is False
     assert result["ready"] is False
     assert result["failed_at"] == "initialize_motors_full_sequence"
+    assert result["phases"][-1]["blocked"] is True
 
 
 class FakeFullInitSequenceTester(FakeInitTester):
@@ -156,16 +161,12 @@ class FakeFullInitSequenceTester(FakeInitTester):
         }
 
 
-def test_controller_uses_full_initialize_motors_not_homexy_for_run_homing():
+def test_controller_does_not_use_full_initialize_motors_or_homexy_for_run_homing():
     tester = FakeFullInitSequenceTester()
 
     result = run_oem_initialization_controller(tester, run_homing=True, timeout_s=123)
 
-    assert result["ok"] is True
-    assert ("full_initialize_motors", 123) in tester.calls
+    assert result["ok"] is False
+    assert ("full_initialize_motors", 123) not in tester.calls
     assert not any(call[0] == "homexy" for call in tester.calls)
-    assert any(
-        p.get("phase") == "initialize_motors_full_sequence"
-        and p.get("result", {}).get("source_mode") == "ClassControlInterface.initializeMotors"
-        for p in result["phases"]
-    )
+    assert result["phases"][-1]["blocked"] is True

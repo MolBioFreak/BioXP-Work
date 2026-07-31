@@ -119,15 +119,17 @@ def test_live_target_mapping_labels_missing_or_partial_ports_explicitly():
     assert by_mode["manual button goHome(true)"].target_status == "unsafe_until_predicate_matrix_fixed"
     assert by_mode["HomeXY"].target_status == "direct_oem_parallel_task_run_waitall"
     assert any("concurrently" in d or "Task.Run" in d for d in by_mode["HomeXY"].deviations)
-    assert by_mode["ControlLib.rehome"].target_status == "direct_wrapper_with_door_restore_gap"
-    assert by_mode["ControlLib.initializeMotion"].target_status == "direct_wrapper_no_homing_diagnostic_by_default"
+    assert by_mode["ControlLib.rehome"].target_status == "intentionally_blocked_no_monolithic_live_homing"
+    assert any("intentionally blocked" in d for d in by_mode["ControlLib.rehome"].deviations)
+    assert by_mode["ControlLib.initializeMotion"].target_status == "direct_wrapper_no_homing_diagnostic_only"
 
 
 def test_raw_fastapi_route_table_is_enumerated_as_raw_not_bms():
     by_path = {row["path"]: row for row in RAW_FASTAPI_ROUTE_TABLE}
     assert by_path["/motion/oem/startup_step"]["classification"] == "stepwise initializeMotors subset"
     assert by_path["/motion/oem/home_xy"]["classification"].startswith("direct HomeXY mode surface")
-    assert by_path["/motion/oem/rehome"]["classification"].startswith("direct ControlLib.rehome wrapper")
+    assert by_path["/motion/oem/rehome"]["classification"].startswith("ControlLib.rehome source-mode surface")
+    assert "intentionally blocked" in by_path["/motion/oem/rehome"]["classification"]
     assert by_path["/motion/oem/initialize_motion"]["classification"].startswith("direct ControlLib.initializeMotion wrapper")
     assert by_path["/motion/axis/home"]["classification"] == "manual/goHome-style route"
     assert by_path["/motion/axis/zero"]["classification"].startswith("Linux absolute controller-zero")

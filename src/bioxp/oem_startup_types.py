@@ -79,7 +79,7 @@ class OemStartupRequest(BaseModel):
     door_policy: Literal["wait_for_closed", "fail_if_open", "already_closed"] = "wait_for_closed"
     run_homing: bool = True
     run_post_home: bool = True
-    timeout_s: float = 300.0
+    timeout_s: float = Field(default=300.0, gt=0.1, le=900.0)
 
 
 class OemDoorEventRequest(BaseModel):

@@ -1,4 +1,18 @@
 from src.bioxp.usb_driver import BioXpTester
+from support_oem_machine_bundle import serial_206_immutable_machine_bundle
+
+
+def _fake_clock(sleeps):
+    state = {"now": 0.0}
+
+    def clock():
+        return state["now"]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        state["now"] += seconds
+
+    return clock, sleep
 
 
 def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
@@ -14,27 +28,32 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
     }
 
     monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis: profiles[axis])
-    monkeypatch.setattr(tester, "_machine_config_offset_int", lambda key, fallback: (31 if "CURRENT" in key else 3, "test"))
-    monkeypatch.setattr(tester, "_motion_oem_gripper_version", lambda: 1)
+    monkeypatch.setattr(tester, "_machine_config_bundle", serial_206_immutable_machine_bundle)
     monkeypatch.setattr(tester, "_tmcl_success", lambda ack: ack and ack.get("status") == 100)
     monkeypatch.setattr(tester, "send_tmcl_retry", lambda *args, **kwargs: sent.append((args, kwargs)) or {"status": 100})
 
     import src.bioxp.usb_driver as driver
     monkeypatch.setattr(driver.time, "sleep", lambda seconds: sleeps.append(seconds))
+    clock, poll_sleep = _fake_clock(sleeps)
+    wait_for_board = tester.oem_wait_for_board
+    monkeypatch.setattr(
+        tester,
+        "oem_wait_for_board",
+        lambda: wait_for_board(clock=clock, sleep=poll_sleep),
+    )
 
     result = tester.oem_initialize_without_motion_test_case()
 
     assert result["ok"] is True
     assert result["test_case"] == "oem.initializeMotorsWithoutMotion.live_parity.v1"
     commands = [(args[0], args[1], args[2], args[3], args[4]) for args, _ in sent]
-    # waitForBoard activates all four initially-uninitialized boards before
-    # initializeMotorsWithoutMotion starts its heater/chiller sequence.
-    assert commands[:7] == [
+    # The bounded Linux wait guard activates all four initially-uninitialized
+    # boards before the literal initializeMotorsWithoutMotion writes begin.
+    assert commands[:4] == [
         (4, 64, 0, 0, 1), (5, 64, 0, 0, 1),
-        (6, 64, 0, 0, 1), (6, 10, 4, 0, 0),
-        (7, 64, 0, 0, 1), (7, 143, 0, 0, 0), (7, 143, 0, 1, 0),
+        (6, 64, 0, 0, 1), (7, 64, 0, 0, 1),
     ]
-    assert commands[7:11] == [
+    assert commands[4:8] == [
         (6, 144, 0, 0, 0), (6, 144, 0, 0, 0),  # duplicate heater PWM off
         (7, 144, 0, 1, 0), (7, 144, 0, 0, 0),  # OC then RC
     ]
@@ -51,24 +70,24 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
 
 def test_wait_for_board_matches_oem_31_poll_then_selective_activation(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
+    tester._oem_initialized_boards = set()
     sent = []
     sleeps = []
     monkeypatch.setattr(tester, "send_tmcl_retry", lambda *args, **kwargs: sent.append(args) or {"status": 100})
-    import src.bioxp.usb_driver as driver
-    monkeypatch.setattr(driver.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(tester, "enable_motor_power", lambda: None)
+    clock, sleep = _fake_clock(sleeps)
 
-    result = tester.oem_wait_for_board()
+    result = tester.oem_wait_for_board(clock=clock, sleep=sleep)
 
     assert result["ok"] is True
-    assert len([row for row in result["trace"] if "pending" in row]) == 32
+    assert result["polls"] == 31
+    assert result["missing_boards"] == []
+    assert len(result["activations"]) == 1
     assert [(args[0], args[1], args[2], args[3], args[4]) for args in sent] == [
         (4, 64, 0, 0, 1), (5, 64, 0, 0, 1),
-        (6, 64, 0, 0, 1), (6, 10, 4, 0, 0),
-        (7, 64, 0, 0, 1), (7, 143, 0, 0, 0), (7, 143, 0, 1, 0),
+        (6, 64, 0, 0, 1), (7, 64, 0, 0, 1),
     ]
-    assert sleeps.count(0.1) == 32
-    assert sleeps.count(0.001) == 4
-    assert sleeps.count(0.01) == 4
+    assert sleeps == [0.1] * 31
 
 
 def test_oem_activation_chiller_accepts_status_2_but_other_boards_do_not(monkeypatch):

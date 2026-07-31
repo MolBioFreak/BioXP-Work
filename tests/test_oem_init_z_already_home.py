@@ -1,4 +1,5 @@
 from src.bioxp.usb_driver import BioXpTester
+from support_oem_machine_bundle import serial_206_immutable_machine_bundle
 
 
 class FakeTester(BioXpTester):
@@ -12,6 +13,9 @@ class FakeTester(BioXpTester):
         self.speed = speed
         self.home = home
         self.calls = []
+
+    def _machine_config_bundle(self):
+        return serial_206_immutable_machine_bundle()
 
     def motor_get_position(self, board, motor=0):
         self.calls.append(("pos", board, motor))

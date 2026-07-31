@@ -132,6 +132,17 @@ def mark_x_referenced(api, monkeypatch):
     )
 
 
+def mark_motion_recovered(api):
+    api._set_maintenance_state(
+        transition="test_motion_recovered",
+        motion_blocked=False,
+        recovery_required=False,
+        block_reason=None,
+        recovery_hint=None,
+        blocked_by=None,
+    )
+
+
 def load_api(monkeypatch):
     usb_pkg = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
@@ -203,6 +214,7 @@ def test_prepare_motion_axis_allows_debug_reuse_but_still_runs_fresh_interlock_w
 def test_relative_move_response_exposes_truth_metadata(monkeypatch):
     monkeypatch.delenv("BIOXP_ENABLE_PREP_REUSE_DEBUG", raising=False)
     api = load_api(monkeypatch)
+    mark_motion_recovered(api)
     mark_x_referenced(api, monkeypatch)
     monkeypatch.setattr(api._reference_state_store, "snapshot", lambda axes=None: {"rows": {"x": {"state": "referenced"}}})
     tester = FakeTester(armed=True, live=True)
@@ -302,6 +314,7 @@ def test_set_motion_axis_currents_rejects_unsupported_axes(monkeypatch):
 def test_relative_move_response_exposes_and_rejects_stall_evidence(monkeypatch):
     monkeypatch.delenv("BIOXP_ENABLE_PREP_REUSE_DEBUG", raising=False)
     api = load_api(monkeypatch)
+    mark_motion_recovered(api)
     mark_x_referenced(api, monkeypatch)
     monkeypatch.setattr(api._reference_state_store, "snapshot", lambda axes=None: {"rows": {"x": {"state": "referenced"}}})
     tester = FakeTester(armed=True, live=True)
