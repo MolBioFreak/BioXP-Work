@@ -58,6 +58,11 @@ def make_app(tmp_path: Path, monkeypatch):
         calls.append(("pipette_aspirate", {"channel": channel, "volume_ul": volume_ul}))
         return {"ok": True, "channel": channel, "volume_ul": volume_ul}
 
+    @app.post("/maintenance/usb/reconnect")
+    def local_maintenance_reconnect():
+        calls.append(("local_maintenance_reconnect", None))
+        return {"ok": True}
+
     class FakeHardwareState:
         ownership_epoch = 7
 
@@ -106,6 +111,30 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert len(full["stages"]) == 19
     assert catalog["dashboard"]["snapshot"]["collection_triggered"] is False
     assert all("enabled" in row and "dependencies" in row for row in catalog["actions"])
+
+
+def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_cannot_dispatch(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    local = action_for(catalog, "POST", "/maintenance/usb/reconnect")
+
+    assert local["provider_available"] is False
+    assert local["available"] is False
+    assert local["enabled"] is False
+    assert local["disabled_reason"] == "Local-only maintenance route is not callable through the operator relay."
+
+    response = client.post(
+        f"/operator/actions/{local['action_id']}",
+        json={
+            "expected_generation": catalog["ownership_generation"],
+            "idempotency_key": "local-route-must-not-dispatch",
+            "inputs": {},
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "Local-only maintenance route is not callable through the operator relay."
+    assert calls == []
 
 
 def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_path, monkeypatch):

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+from fastapi import FastAPI
+
 from bioxp.operator_controls import _assess_action, _build_catalog, _dashboard_payload, _motor_motion_action, _safety
 
 
-def machine_state(*, motion_enabled=False, x="unknown", y="unknown", z="unknown"):
+def machine_state(
+    *,
+    motion_enabled: bool = False,
+    x: str = "unknown",
+    y: str = "unknown",
+    z: str = "unknown",
+    can_ready: bool | None = True,
+    power_ready: bool = True,
+):
     return {
         "ownership_generation": 12,
-        "ownership": {"transport": "owned", "usb": "service", "router": "running", "CAN_READY": True},
+        "ownership": {"transport": "owned", "usb": "service", "router": "running", "CAN_READY": can_ready},
         "maintenance": {
             "motion_blocked": not motion_enabled,
             "recovery_required": not motion_enabled,
@@ -18,7 +28,7 @@ def machine_state(*, motion_enabled=False, x="unknown", y="unknown", z="unknown"
             "g": {"state": "referenced"}, "door": {"state": "referenced"},
         }},
         "domains": {
-            "power": {"status": "observed", "observation": {"safety_valid": True}},
+            "power": {"status": "observed", "observation": {"safety_valid": power_ready}},
             "axes": {"status": "observed", "observation": {"rows": {
                 "x": {"status": {"position": {"value": 123}, "speed": {"value": 0}, "max_current": {"value": 31}, "standby_current": {"value": 8}}, "switch_activity": {"left_raw_active": False, "right_raw_active": True}},
             }}},
@@ -42,6 +52,32 @@ def action(path: str, *, method="POST", safety="motion", provider=True):
         "provider_available": provider,
         "provider_unavailable_reason": None if provider else "provider not bound",
     }
+
+
+def test_local_only_maintenance_routes_are_visible_but_never_dispatchable():
+    app = FastAPI()
+
+    @app.post("/maintenance/usb/reconnect")
+    async def local_reconnect():
+        return {"ok": True}
+
+    @app.post("/reconnect")
+    async def public_reconnect():
+        return {"ok": True}
+
+    actions, dispatch = _build_catalog(app)
+    by_path = {action["informational_path"]: action for action in actions if action["kind"] == "primitive"}
+
+    local = by_path["/maintenance/usb/reconnect"]
+    assert local["provider_available"] is False
+    assert local["available"] is False
+    assert local["enabled"] is False
+    assert local["provider_unavailable_reason"] == "Local-only maintenance route is not callable through the operator relay."
+    assert local["action_id"] not in dispatch
+
+    public = by_path["/reconnect"]
+    assert public["provider_available"] is True
+    assert public["action_id"] in dispatch
 
 
 def test_motion_inactive_blocks_motor_axis_gripper_door_and_pipette_motion_with_obvious_reason():
@@ -113,9 +149,9 @@ def test_full_production_catalog_motion_primitives_fail_closed_on_incomplete_mai
     motion_actions = [
         row
         for row in actions
-        if row["kind"] == "primitive" and row["safety_class"] == "motion"
+        if row["kind"] == "primitive" and row["safety_class"] == "motion" and row["provider_available"] is True
     ]
-    assert len(motion_actions) >= 52
+    assert len(motion_actions) >= 51
 
     for missing_value in (None, "missing"):
         state = machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced")
@@ -155,6 +191,62 @@ def test_read_only_and_stop_controls_do_not_require_motion_enabled():
     stop_without_transport = _assess_action(action("/motion/axis/x/stop", safety="stop"), state, {})
     assert stop_without_transport["enabled"] is False
     assert stop_without_transport["disabled_reason"] == "Robot transport is unavailable."
+
+
+def test_bootstrap_controls_do_not_require_the_state_they_establish():
+    state = machine_state(
+        motion_enabled=True,
+        x="referenced",
+        y="referenced",
+        z="referenced",
+        can_ready=None,
+        power_ready=False,
+    )
+
+    stop = _assess_action(action("/motion/diagnostics/stop", safety="stop"), state, {})
+    snapshot = _assess_action(action("/hardware/snapshot/collect", safety="service"), state, {})
+    normal_move = _assess_action(action("/motion/axis/move"), state, {"axis": "x"})
+
+    assert stop["enabled"] is True
+    assert snapshot["enabled"] is True
+    assert normal_move["enabled"] is False
+    assert normal_move["disabled_reason"] == "Same-epoch CAN readiness has not been established."
+
+
+def test_reconnect_does_not_require_existing_usb_ownership():
+    state = machine_state()
+    state["ownership"] = {"transport": "released", "usb": "released", "router": "stopped", "CAN_READY": None}
+
+    reconnect = _assess_action(action("/reconnect", safety="service"), state, {})
+
+    assert reconnect["enabled"] is True
+    assert all(row["key"] != "transport_live" for row in reconnect["dependencies"])
+
+
+def test_motion_power_enable_requires_can_but_not_already_valid_24v():
+    without_can = machine_state(
+        motion_enabled=True,
+        x="referenced",
+        y="referenced",
+        z="referenced",
+        can_ready=None,
+        power_ready=False,
+    )
+    blocked = _assess_action(action("/motion/power/enable"), without_can, {})
+    assert blocked["enabled"] is False
+    assert blocked["disabled_reason"] == "Same-epoch CAN readiness has not been established."
+
+    with_can = machine_state(
+        motion_enabled=True,
+        x="referenced",
+        y="referenced",
+        z="referenced",
+        can_ready=True,
+        power_ready=False,
+    )
+    admitted = _assess_action(action("/motion/power/enable"), with_can, {})
+    assert admitted["enabled"] is True
+    assert all(row["key"] != "power_ready" for row in admitted["dependencies"])
 
 
 def test_constructor_pipettes_stage_does_not_require_motion_enabled():
@@ -205,4 +297,13 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     ]
     assert len(dashboard["pipettes"]["channels"]) == 4
     assert dashboard["pipettes"]["channels"][0]["tip_loaded"] is True
+    assert dashboard["snapshot"]["collection_triggered"] is False
+
+
+def test_dashboard_connection_live_does_not_fabricate_can_readiness():
+    state = machine_state(can_ready=None)
+    dashboard = _dashboard_payload(state)
+
+    assert dashboard["connection"]["live"] is True
+    assert dashboard["connection"]["ownership"]["CAN_READY"] is None
     assert dashboard["snapshot"]["collection_triggered"] is False

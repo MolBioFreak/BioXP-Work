@@ -246,6 +246,24 @@ def _dependency(key: str, label: str, met: bool, reason: str | None = None) -> d
     return {"key": key, "label": label, "met": bool(met), "reason": None if met else reason}
 
 
+_TRANSPORT_BOOTSTRAP_PATHS = {
+    "/reconnect",
+}
+
+_LOCAL_ONLY_PATH_PREFIXES = (
+    "/maintenance/usb/",
+)
+
+_CAN_BOOTSTRAP_PATHS = {
+    "/hardware/snapshot/collect",
+}
+
+_POWER_BOOTSTRAP_PATHS = {
+    "/motion/power/enable",
+    "/motion/power/diag",
+}
+
+
 def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assess one action using only already-published machine state."""
     values = inputs or {}
@@ -256,16 +274,31 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
 
     method = str(action.get("informational_method") or "GET")
     safety = str(action.get("safety_class") or "read_only")
-    requires_transport = method != "GET" or safety in {"stop", "emergency"}
-    ownership = machine_state.get("ownership") if isinstance(machine_state.get("ownership"), Mapping) else {}
+    path = str(action.get("informational_path") or "").lower()
+    requires_transport = (method != "GET" or safety in {"stop", "emergency"}) and path not in _TRANSPORT_BOOTSTRAP_PATHS
+    ownership_value = machine_state.get("ownership")
+    ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
     transport_live = bool(
         ownership.get("transport") == "owned"
         and ownership.get("usb") == "service"
         and ownership.get("router") == "running"
-        and ownership.get("CAN_READY") is True
     )
     if requires_transport:
         dependencies.append(_dependency("transport_live", "Robot transport live", transport_live, "Robot transport is unavailable."))
+
+    requires_can = (
+        requires_transport
+        and safety not in {"stop", "emergency"}
+        and path not in _CAN_BOOTSTRAP_PATHS
+        and (safety == "motion" or _motor_motion_action(action))
+    )
+    if requires_can:
+        dependencies.append(_dependency(
+            "can_ready",
+            "Same-epoch CAN ready",
+            ownership.get("CAN_READY") is True,
+            "Same-epoch CAN readiness has not been established.",
+        ))
 
     if safety == "motion" or _motor_motion_action(action):
         maintenance_value = machine_state.get("maintenance")
@@ -279,10 +312,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         door = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
         enclosure_ok = door.get("door_closed") is True and door.get("latch_closed") is True
         dependencies.append(_dependency("enclosure_ready", "Door closed and latched", enclosure_ok, "Robot door is not confirmed closed and latched."))
-        power_row = ((machine_state.get("domains") or {}).get("power") or {}) if isinstance(machine_state.get("domains"), Mapping) else {}
-        power = power_row.get("observation") if isinstance(power_row, Mapping) else None
-        power_ok = isinstance(power, Mapping) and power.get("safety_valid") is True
-        dependencies.append(_dependency("power_ready", "24 V motion power valid", power_ok, "24 V motion power is not confirmed ready."))
+        if path not in _POWER_BOOTSTRAP_PATHS:
+            power_row = ((machine_state.get("domains") or {}).get("power") or {}) if isinstance(machine_state.get("domains"), Mapping) else {}
+            power = power_row.get("observation") if isinstance(power_row, Mapping) else None
+            power_ok = isinstance(power, Mapping) and power.get("safety_valid") is True
+            dependencies.append(_dependency("power_ready", "24 V motion power valid", power_ok, "24 V motion power is not confirmed ready."))
 
         references = machine_state.get("references") if isinstance(machine_state.get("references"), Mapping) else {}
         rows = references.get("rows") if isinstance(references.get("rows"), Mapping) else {}
@@ -337,7 +371,8 @@ def _temperature_payload(sensor: Any, value_row: Any) -> dict[str, Any]:
 
 def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
-    ownership = machine_state.get("ownership") if isinstance(machine_state.get("ownership"), Mapping) else {}
+    ownership_value = machine_state.get("ownership")
+    ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
     maintenance_value = machine_state.get("maintenance")
     maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
     lifecycle = machine_state.get("lifecycle") if isinstance(machine_state.get("lifecycle"), Mapping) else {}
@@ -378,7 +413,7 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     pipettes = dict(pipette_observation) if isinstance(pipette_observation, Mapping) else {"ok": False, "channels": [], "error": "Pipette status is not reported."}
     enclosure = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
     freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {"state": "missing", "age_s": None, "fresh_for_s": None}
-    connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running" and ownership.get("CAN_READY") is True)
+    connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running")
     motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
     return {
         "schema_version": "bioxp.operator_dashboard.v1",
@@ -458,6 +493,8 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             action_id = _path_action_id(upper, path, operation.get("operationId"))
             inputs, locations = _extract_inputs(operation, document)
             safety = _safety(upper, path)
+            local_only = any(path.startswith(prefix) for prefix in _LOCAL_ONLY_PATH_PREFIXES)
+            unavailable_reason = "Local-only maintenance route is not callable through the operator relay." if local_only else None
             action = {
                 "action_id": action_id,
                 "label": str(operation.get("summary") or operation.get("operationId") or f"{upper} {path}")[:160],
@@ -469,12 +506,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "source_anchor": None,
                 "informational_method": upper,
                 "informational_path": path,
-                "provider_available": True,
-                "provider_unavailable_reason": None,
-                "available": True,
-                "unavailable_reason": None,
-                "enabled": True,
-                "disabled_reason": None,
+                "provider_available": not local_only,
+                "provider_unavailable_reason": unavailable_reason,
+                "available": not local_only,
+                "unavailable_reason": unavailable_reason,
+                "enabled": not local_only,
+                "disabled_reason": unavailable_reason,
                 "dependencies": [],
                 "requires_confirmation": safety not in {"read_only", "emergency", "stop"},
                 "timeout_seconds": 120.0 if safety == "motion" else 30.0,
@@ -482,7 +519,8 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "stages": [],
             }
             actions.append(action)
-            dispatch[action_id] = {"method": upper, "path": path, "locations": locations, "inputs": {row["name"] for row in inputs}}
+            if not local_only:
+                dispatch[action_id] = {"method": upper, "path": path, "locations": locations, "inputs": {row["name"] for row in inputs}}
     meta = [
         {
             "action_id": "meta.activate_motion",
