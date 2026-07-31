@@ -83,7 +83,6 @@ class OemStartupRequest(BaseModel):
 
 
 class OemDoorEventRequest(BaseModel):
-    session_id: Optional[str] = None
     door_closed: bool = True
     latch_closed: bool = True
 

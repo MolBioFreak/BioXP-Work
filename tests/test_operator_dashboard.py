@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from bioxp.oem_startup_types import OemDoorEventRequest
 from bioxp.operator_controls import _assess_action, _build_catalog, _dashboard_payload, _motor_motion_action, _safety
 
 
@@ -80,6 +81,57 @@ def test_local_only_maintenance_routes_are_visible_but_never_dispatchable():
     assert public["action_id"] in dispatch
 
 
+def test_operator_catalog_removes_non_oem_session_id_requirement_but_keeps_latest_status():
+    app = FastAPI()
+
+    @app.get("/oem/startup/status/latest")
+    async def latest_status():
+        return {"ok": True}
+
+    @app.get("/oem/startup/status/{session_id}")
+    async def compatibility_status(session_id: str):
+        return {"session_id": session_id}
+
+    @app.post("/oem/startup/door_event")
+    async def door_event(request: OemDoorEventRequest):
+        return request.model_dump()
+
+    actions, dispatch = _build_catalog(app)
+    primitives = [row for row in actions if row["kind"] == "primitive"]
+    paths = {row["informational_path"] for row in primitives}
+
+    assert "/oem/startup/status/latest" in paths
+    assert "/oem/startup/status/{session_id}" not in paths
+    assert all(input_row["name"] != "session_id" for row in primitives for input_row in row["inputs"])
+    assert all(route["path"] != "/oem/startup/status/{session_id}" for route in dispatch.values())
+
+
+def test_unproven_power_and_lifecycle_emergency_controls_are_visible_but_not_dispatchable():
+    app = FastAPI()
+
+    @app.post("/motion/power/enable")
+    async def power_enable():
+        return {"ok": True}
+
+    @app.post("/motion/power/diag")
+    async def power_diag():
+        return {"ok": True}
+
+    @app.post("/oem/runtime/emergency_stop")
+    async def lifecycle_emergency():
+        return {"ok": True}
+
+    actions, dispatch = _build_catalog(app)
+    by_path = {row["informational_path"]: row for row in actions if row["kind"] == "primitive"}
+    for path in ("/motion/power/enable", "/motion/power/diag", "/oem/runtime/emergency_stop"):
+        row = by_path[path]
+        assert row["provider_available"] is False
+        assert row["available"] is False
+        assert row["enabled"] is False
+        assert row["provider_unavailable_reason"].startswith("Quarantined:")
+        assert row["action_id"] not in dispatch
+
+
 def test_motion_inactive_blocks_motor_axis_gripper_door_and_pipette_motion_with_obvious_reason():
     state = machine_state(motion_enabled=False, x="referenced", y="referenced", z="referenced")
     for path in (
@@ -151,7 +203,7 @@ def test_full_production_catalog_motion_primitives_fail_closed_on_incomplete_mai
         for row in actions
         if row["kind"] == "primitive" and row["safety_class"] == "motion" and row["provider_available"] is True
     ]
-    assert len(motion_actions) >= 51
+    assert len(motion_actions) >= 49
 
     for missing_value in (None, "missing"):
         state = machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced")
@@ -221,32 +273,6 @@ def test_reconnect_does_not_require_existing_usb_ownership():
 
     assert reconnect["enabled"] is True
     assert all(row["key"] != "transport_live" for row in reconnect["dependencies"])
-
-
-def test_motion_power_enable_requires_can_but_not_already_valid_24v():
-    without_can = machine_state(
-        motion_enabled=True,
-        x="referenced",
-        y="referenced",
-        z="referenced",
-        can_ready=None,
-        power_ready=False,
-    )
-    blocked = _assess_action(action("/motion/power/enable"), without_can, {})
-    assert blocked["enabled"] is False
-    assert blocked["disabled_reason"] == "Same-epoch CAN readiness has not been established."
-
-    with_can = machine_state(
-        motion_enabled=True,
-        x="referenced",
-        y="referenced",
-        z="referenced",
-        can_ready=True,
-        power_ready=False,
-    )
-    admitted = _assess_action(action("/motion/power/enable"), with_can, {})
-    assert admitted["enabled"] is True
-    assert all(row["key"] != "power_ready" for row in admitted["dependencies"])
 
 
 def test_constructor_pipettes_stage_does_not_require_motion_enabled():

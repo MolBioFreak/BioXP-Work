@@ -254,15 +254,15 @@ _LOCAL_ONLY_PATH_PREFIXES = (
     "/maintenance/usb/",
 )
 
+_OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
+    "/motion/power/enable": "Quarantined: this route uses unacknowledged reverse-engineered relay writes and is not proven equivalent to an OEM global 24 V On operation.",
+    "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
+    "/oem/runtime/emergency_stop": "Quarantined: this route records lifecycle emergency state but does not dispatch the OEM physical aggregate abort sequence.",
+}
+
 _CAN_BOOTSTRAP_PATHS = {
     "/hardware/snapshot/collect",
 }
-
-_POWER_BOOTSTRAP_PATHS = {
-    "/motion/power/enable",
-    "/motion/power/diag",
-}
-
 
 def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assess one action using only already-published machine state."""
@@ -312,11 +312,10 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         door = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
         enclosure_ok = door.get("door_closed") is True and door.get("latch_closed") is True
         dependencies.append(_dependency("enclosure_ready", "Door closed and latched", enclosure_ok, "Robot door is not confirmed closed and latched."))
-        if path not in _POWER_BOOTSTRAP_PATHS:
-            power_row = ((machine_state.get("domains") or {}).get("power") or {}) if isinstance(machine_state.get("domains"), Mapping) else {}
-            power = power_row.get("observation") if isinstance(power_row, Mapping) else None
-            power_ok = isinstance(power, Mapping) and power.get("safety_valid") is True
-            dependencies.append(_dependency("power_ready", "24 V motion power valid", power_ok, "24 V motion power is not confirmed ready."))
+        power_row = ((machine_state.get("domains") or {}).get("power") or {}) if isinstance(machine_state.get("domains"), Mapping) else {}
+        power = power_row.get("observation") if isinstance(power_row, Mapping) else None
+        power_ok = isinstance(power, Mapping) and power.get("safety_valid") is True
+        dependencies.append(_dependency("power_ready", "24 V motion power valid", power_ok, "24 V motion power is not confirmed ready."))
 
         references = machine_state.get("references") if isinstance(machine_state.get("references"), Mapping) else {}
         rows = references.get("rows") if isinstance(references.get("rows"), Mapping) else {}
@@ -477,11 +476,16 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
     return specs, locations
 
 
+_NON_OPERATOR_COMPAT_PATHS = {
+    "/oem/startup/status/{session_id}",
+}
+
+
 def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     document = app.openapi()
     actions: list[dict[str, Any]] = []
     dispatch: dict[str, dict[str, Any]] = {}
-    excluded = {"/", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+    excluded = {"/", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", *_NON_OPERATOR_COMPAT_PATHS}
     for path, path_item in sorted(document.get("paths", {}).items()):
         if path in excluded or path.startswith("/operator/") or not isinstance(path_item, Mapping):
             continue
@@ -494,7 +498,13 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             inputs, locations = _extract_inputs(operation, document)
             safety = _safety(upper, path)
             local_only = any(path.startswith(prefix) for prefix in _LOCAL_ONLY_PATH_PREFIXES)
-            unavailable_reason = "Local-only maintenance route is not callable through the operator relay." if local_only else None
+            semantic_quarantine_reason = _OPERATOR_SEMANTIC_QUARANTINE_PATHS.get(path)
+            unavailable_reason = (
+                "Local-only maintenance route is not callable through the operator relay."
+                if local_only
+                else semantic_quarantine_reason
+            )
+            dispatchable = unavailable_reason is None
             action = {
                 "action_id": action_id,
                 "label": str(operation.get("summary") or operation.get("operationId") or f"{upper} {path}")[:160],
@@ -506,11 +516,11 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "source_anchor": None,
                 "informational_method": upper,
                 "informational_path": path,
-                "provider_available": not local_only,
+                "provider_available": dispatchable,
                 "provider_unavailable_reason": unavailable_reason,
-                "available": not local_only,
+                "available": dispatchable,
                 "unavailable_reason": unavailable_reason,
-                "enabled": not local_only,
+                "enabled": dispatchable,
                 "disabled_reason": unavailable_reason,
                 "dependencies": [],
                 "requires_confirmation": safety not in {"read_only", "emergency", "stop"},
@@ -519,7 +529,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "stages": [],
             }
             actions.append(action)
-            if not local_only:
+            if dispatchable:
                 dispatch[action_id] = {"method": upper, "path": path, "locations": locations, "inputs": {row["name"] for row in inputs}}
     meta = [
         {
