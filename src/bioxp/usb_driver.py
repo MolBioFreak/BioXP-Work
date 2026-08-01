@@ -4384,7 +4384,7 @@ class BioXpTester:
             "failures": failures,
         }
 
-    def oem_initialize_without_motion_test_case(self):
+    def oem_initialize_without_motion_test_case(self, *, board_wait=None):
         """Run the literal `initializeMotorsWithoutMotion` command sequence.
 
         This is intentionally a *live OEM-parity test case*, not a replacement
@@ -4421,9 +4421,26 @@ class BioXpTester:
         def gap(label, profile, param):
             return emit(label, profile["board"], 6, param, profile["motor"], 0)
 
-        # Literal ClassControlInterface.waitForBoard().  It owns board state;
-        # CAN_READY/router ownership is intentionally not a substitute.
-        board_wait = self.oem_wait_for_board()
+        # Literal ClassControlInterface.waitForBoard(). It owns board state;
+        # CAN_READY/router ownership is intentionally not a substitute. A caller
+        # may provide an already-verified serial-206 movement-board wait receipt
+        # so the chiller-only board 7 is not falsely promoted to motor readiness.
+        if board_wait is None:
+            board_wait = self.oem_wait_for_board()
+        if not isinstance(board_wait, dict) or board_wait.get("ok") is not True:
+            return {
+                "ok": False,
+                "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
+                "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
+                "source_anchor": source_anchor,
+                "physical_motion": False,
+                "homing_performed": False,
+                "board_wait": board_wait,
+                "transcript": transcript,
+                "failures": [],
+                "no_replies": [],
+                "error": "waitForBoard did not establish required serial-206 movement-board readiness",
+            }
 
         x = self._motion_oem_axis_profile("x")
         y = self._motion_oem_axis_profile("y")

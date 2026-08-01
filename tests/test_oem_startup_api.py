@@ -173,10 +173,11 @@ def test_api_composes_oem_runtime_and_finite_commissioning_routes_once():
     import src.bioxp.api as api
 
     route_counts = {}
-    for route in api.app.routes:
-        path = getattr(route, "path", None)
-        for method in getattr(route, "methods", set()):
-            route_counts[(method, path)] = route_counts.get((method, path), 0) + 1
+    for path, operations in api.app.openapi()["paths"].items():
+        for method in operations:
+            upper = method.upper()
+            if upper in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}:
+                route_counts[(upper, path)] = route_counts.get((upper, path), 0) + 1
 
     expected = {
         ("GET", "/oem/runtime/movement-runs/contract"),

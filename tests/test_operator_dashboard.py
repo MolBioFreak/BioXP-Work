@@ -37,6 +37,7 @@ def machine_state(
             "chiller": {"status": "observed", "observation": {"temps": {"rc_temp_c": {"value": 12000, "ok": True}}}},
             "pipette": {"status": "observed", "observation": {"ok": True, "channels": [{"channel": index, "available": True, "initialized": index < 2, "tip_loaded": index == 0} for index in range(4)]}},
             "latch": {"status": "observed", "observation": {"door_sensor": 1, "latch_sensor": 1}},
+            "interlock": {"status": "observed", "observation": {"motion_arm": {"armed": True}}},
         },
         "freshness": {"state": "fresh", "age_s": 1.25, "fresh_for_s": 30.0},
         "snapshot_id": "snapshot-1",
@@ -203,7 +204,7 @@ def test_full_production_catalog_motion_primitives_fail_closed_on_incomplete_mai
         for row in actions
         if row["kind"] == "primitive" and row["safety_class"] == "motion" and row["provider_available"] is True
     ]
-    assert len(motion_actions) >= 49
+    assert len(motion_actions) >= 48
 
     for missing_value in (None, "missing"):
         state = machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced")
@@ -223,7 +224,7 @@ def test_full_production_catalog_motion_primitives_fail_closed_on_incomplete_mai
         assert wrong_reason == [], (missing_value, wrong_reason)
         dashboard = _dashboard_payload(state)
         assert dashboard["motion"]["enabled"] is False, missing_value
-        assert dashboard["motion"]["reason"] == "Motion is inactive.", missing_value
+        assert dashboard["motion"]["reason"] == "Motion is inactive. Activate motion before moving this motor.", missing_value
 
 
 def test_non_motion_thermal_and_chiller_controls_are_service_classed():

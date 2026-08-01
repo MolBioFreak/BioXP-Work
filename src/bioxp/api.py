@@ -38,6 +38,7 @@ from .oem_gripper import (
     restore_gripper_idle_current,
 )
 from .oem_initialization import run_oem_initialization_controller
+from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
 from .operator_controls import install_operator_control_plane
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -1174,6 +1175,16 @@ class ReferenceDesyncRequest(BaseModel):
 
 class MotionHardResetRequest(BaseModel):
     rounds: int = Field(2, ge=1, le=5)
+
+
+class MotionPrepareWithoutMotionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operator_ack: str = Field(
+        ...,
+        description="Must be exactly PREPARE_NO_MOTION; this route writes OEM board/parameter state but never homes or moves an axis.",
+    )
+    operator_reason: str = Field(..., min_length=1, max_length=2000)
 
 
 class MotionArmStartupRequest(BaseModel):
@@ -5198,17 +5209,80 @@ async def motion_range_status(axes: str = Query("x,y,z,g", description="Comma-se
     return {**projection, "ok": projection.get("available", False), "axes": [axis.value for axis in requested_axes], "rows": rows, "motion_config": config, "live_status_available": bool(live_rows), "live_status_error": None if live_rows else "canonical range observation unavailable"}
 
 
-@app.post("/motion/interlock/prepare")
+@app.post("/motion/interlock/prepare", deprecated=True)
 async def prepare_interlock():
-    tester = _get_tester()
-    return await _run_blocking(
-        "Motion interlock prep",
-        lambda: (
-            tester.activate_boards(expect_reply=True),
-            tester.motor_prepare_motion_interlock(force_lock=True),
-        )[1],
-        timeout_s=25.0,
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "legacy_inferred_motion_prepare_quarantined",
+            "message": "This legacy inferred latch/power route is retired. Use /motion/oem/prepare_without_motion with explicit operator acknowledgement.",
+            "replacement": "/motion/oem/prepare_without_motion",
+            "physical_motion_commanded": False,
+        },
     )
+
+
+@app.post("/motion/oem/prepare_without_motion")
+async def motion_oem_prepare_without_motion(req: MotionPrepareWithoutMotionRequest):
+    if req.operator_ack != "PREPARE_NO_MOTION":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "operator_ack_required",
+                "message": "operator_ack must be exactly PREPARE_NO_MOTION",
+                "physical_motion_commanded": False,
+            },
+        )
+    try:
+        authority = Serial206MotionAuthority.from_active_snapshot()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "serial_206_authority_unavailable",
+                "message": str(exc),
+                "physical_motion_commanded": False,
+            },
+        ) from exc
+    hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
+    tester = _get_tester()
+    result = await _run_blocking(
+        "OEM no-motion preparation",
+        lambda: prepare_motion_without_motion(tester, authority),
+        timeout_s=120.0,
+    )
+    response = {
+        **result,
+        "operator_reason": req.operator_reason,
+        "next_required_action": "Collect a new canonical hardware snapshot before any motion admission.",
+    }
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=response)
+    return response
+
+
+@app.post("/motion/emergency_stop")
+async def motion_emergency_stop():
+    try:
+        authority = Serial206MotionAuthority.from_active_snapshot()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "serial_206_authority_unavailable",
+                "message": str(exc),
+                "physical_effect_verified": False,
+            },
+        ) from exc
+    result = await _run_safety_interrupt_blocking(
+        "Physical aggregate motion stop",
+        lambda tester: physical_aggregate_stop(tester, authority),
+        timeout_s=30.0,
+    )
+    hardware_state.invalidate(reason="physical_aggregate_stop_attempted")
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @app.get("/motion/power/status")
@@ -5216,23 +5290,29 @@ async def motion_power_status():
     return _motion_power_status_payload()
 
 
-@app.post("/motion/power/enable")
+@app.post("/motion/power/enable", deprecated=True)
 async def motion_power_enable():
-    tester = _get_tester()
-    return await _run_blocking(
-        "Motion power enable",
-        lambda: tester.motor_enable_sequence(conservative=True),
-        timeout_s=35.0,
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "unproven_global_24v_control_quarantined",
+            "message": "No OEM-equivalent global 24 V On command is proven for serial 206. Use source-grounded no-motion preparation.",
+            "replacement": "/motion/oem/prepare_without_motion",
+            "physical_motion_commanded": False,
+        },
     )
 
 
-@app.post("/motion/power/diag")
+@app.post("/motion/power/diag", deprecated=True)
 async def motion_power_diag():
-    tester = _get_tester()
-    return await _run_blocking(
-        "Motion driver power diagnostic",
-        lambda: tester.motor_driver_power_diag(axis_keys=("x", "y", "z", "g", "door")),
-        timeout_s=45.0,
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "unproven_power_diagnostic_quarantined",
+            "message": "The legacy diagnostic performed reconnect and inferred latch/power writes. Use canonical snapshot collection and source-grounded no-motion preparation.",
+            "replacements": ["/hardware/snapshot/collect", "/motion/oem/prepare_without_motion"],
+            "physical_motion_commanded": False,
+        },
     )
 
 

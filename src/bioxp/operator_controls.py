@@ -166,6 +166,10 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
     "/oem/initial_check",
 }
 
+_NO_MOTION_PREPARATION_PATHS = {
+    "/motion/oem/prepare_without_motion",
+}
+
 
 def _safety(method: str, path: str) -> str:
     lower = path.lower()
@@ -173,6 +177,8 @@ def _safety(method: str, path: str) -> str:
         return "emergency"
     if any(token in lower for token in ("/stop", "/abort", "/cancel")) or lower == "/oem/runtime/events/pause":
         return "stop"
+    if lower in _NO_MOTION_PREPARATION_PATHS:
+        return "service"
     if "constructor_pipettes" in lower:
         return "service" if method != "GET" else "read_only"
     if "/liquid/" in lower:
@@ -203,6 +209,8 @@ def _motor_motion_action(action: Mapping[str, Any]) -> bool:
     if str(action.get("safety_class")) in {"stop", "emergency"}:
         return False
     path = str(action.get("informational_path") or "").lower()
+    if path in _NO_MOTION_PREPARATION_PATHS:
+        return False
     if any(token in path for token in ("/stop", "/abort", "/cancel", "emergency")):
         return False
     if "constructor_pipettes" in path:
@@ -255,6 +263,7 @@ _LOCAL_ONLY_PATH_PREFIXES = (
 )
 
 _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
+    "/motion/interlock/prepare": "Quarantined: this legacy route performs inferred latch/power writes and is not the source-grounded serial-206 preparation provider.",
     "/motion/power/enable": "Quarantined: this route uses unacknowledged reverse-engineered relay writes and is not proven equivalent to an OEM global 24 V On operation.",
     "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
     "/oem/runtime/emergency_stop": "Quarantined: this route records lifecycle emergency state but does not dispatch the OEM physical aggregate abort sequence.",
@@ -262,7 +271,89 @@ _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
 
 _CAN_BOOTSTRAP_PATHS = {
     "/hardware/snapshot/collect",
+    "/motion/oem/prepare_without_motion",
 }
+
+
+def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]) -> dict[str, Any]:
+    """One fail-closed predicate shared by motion admission and dashboard truth."""
+    dependencies: list[dict[str, Any]] = []
+    ownership_value = machine_state.get("ownership")
+    ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
+    transport_live = bool(
+        ownership.get("transport") == "owned"
+        and ownership.get("usb") == "service"
+        and ownership.get("router") == "running"
+    )
+    dependencies.append(_dependency("transport_live", "Robot transport live", transport_live, "Robot transport is unavailable."))
+    dependencies.append(_dependency(
+        "can_ready", "Same-epoch CAN ready", ownership.get("CAN_READY") is True,
+        "Same-epoch CAN readiness has not been established.",
+    ))
+    snapshot_present = isinstance(machine_state.get("snapshot_id"), str) and bool(machine_state.get("snapshot_id"))
+    dependencies.append(_dependency(
+        "canonical_snapshot", "Canonical hardware snapshot", snapshot_present,
+        "Fresh canonical hardware snapshot is unavailable.",
+    ))
+    freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {}
+    freshness_reason = "Canonical hardware snapshot is stale." if freshness.get("state") == "stale" else "Fresh canonical hardware snapshot is unavailable."
+    dependencies.append(_dependency(
+        "snapshot_fresh", "Canonical snapshot fresh", freshness.get("state") == "fresh", freshness_reason,
+    ))
+    maintenance_value = machine_state.get("maintenance")
+    maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
+    motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
+    dependencies.append(_dependency(
+        "motion_enabled", "Motion enabled", motion_enabled,
+        "Motion is inactive. Activate motion before moving this motor.",
+    ))
+    domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
+    power_row = domains.get("power") if isinstance(domains.get("power"), Mapping) else {}
+    power = power_row.get("observation") if isinstance(power_row, Mapping) else None
+    dependencies.append(_dependency(
+        "power_ready", "24 V rail sensor valid",
+        isinstance(power, Mapping) and power.get("safety_valid") is True,
+        "24 V rail sensor is not confirmed ready.",
+    ))
+    lifecycle = machine_state.get("lifecycle") if isinstance(machine_state.get("lifecycle"), Mapping) else {}
+    door = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
+    latch_row = domains.get("latch") if isinstance(domains.get("latch"), Mapping) else {}
+    latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
+    enclosure_ok = bool(
+        door.get("door_closed") is True
+        and door.get("latch_closed") is True
+        and isinstance(latch, Mapping)
+        and latch.get("door_sensor") == 1
+        and latch.get("latch_sensor") == 1
+    )
+    dependencies.append(_dependency(
+        "enclosure_ready", "Door closed and latched", enclosure_ok,
+        "Robot door is not confirmed closed and latched.",
+    ))
+    interlock_row = domains.get("interlock") if isinstance(domains.get("interlock"), Mapping) else {}
+    interlock = interlock_row.get("observation") if isinstance(interlock_row, Mapping) else None
+    motion_arm = interlock.get("motion_arm") if isinstance(interlock, Mapping) else None
+    dependencies.append(_dependency(
+        "motion_arm", "Motion arm confirmed",
+        isinstance(motion_arm, Mapping) and motion_arm.get("armed") is True,
+        "Motion arm is not confirmed.",
+    ))
+    references = machine_state.get("references") if isinstance(machine_state.get("references"), Mapping) else {}
+    rows = references.get("rows") if isinstance(references.get("rows"), Mapping) else {}
+    for axis in required_axes:
+        row = rows.get(axis) if isinstance(rows, Mapping) else None
+        referenced = isinstance(row, Mapping) and row.get("state") == "referenced"
+        dependencies.append(_dependency(
+            f"axis_{axis}_referenced", f"{axis.upper()} axis homed", referenced,
+            f"{axis.upper()} axis is not homed.",
+        ))
+    failed = next((row for row in dependencies if not row["met"]), None)
+    return {
+        "enabled": failed is None,
+        "disabled_reason": None if failed is None else failed["reason"],
+        "dependencies": dependencies,
+    }
+
 
 def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assess one action using only already-published machine state."""
@@ -301,28 +392,9 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         ))
 
     if safety == "motion" or _motor_motion_action(action):
-        maintenance_value = machine_state.get("maintenance")
-        maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
-        motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
-        dependencies.append(_dependency(
-            "motion_enabled", "Motion enabled", motion_enabled,
-            "Motion is inactive. Activate motion before moving this motor.",
-        ))
-        lifecycle = machine_state.get("lifecycle") if isinstance(machine_state.get("lifecycle"), Mapping) else {}
-        door = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
-        enclosure_ok = door.get("door_closed") is True and door.get("latch_closed") is True
-        dependencies.append(_dependency("enclosure_ready", "Door closed and latched", enclosure_ok, "Robot door is not confirmed closed and latched."))
-        power_row = ((machine_state.get("domains") or {}).get("power") or {}) if isinstance(machine_state.get("domains"), Mapping) else {}
-        power = power_row.get("observation") if isinstance(power_row, Mapping) else None
-        power_ok = isinstance(power, Mapping) and power.get("safety_valid") is True
-        dependencies.append(_dependency("power_ready", "24 V motion power valid", power_ok, "24 V motion power is not confirmed ready."))
-
-        references = machine_state.get("references") if isinstance(machine_state.get("references"), Mapping) else {}
-        rows = references.get("rows") if isinstance(references.get("rows"), Mapping) else {}
-        for axis in _required_reference_axes(action, values):
-            row = rows.get(axis) if isinstance(rows, Mapping) else None
-            referenced = isinstance(row, Mapping) and row.get("state") == "referenced"
-            dependencies.append(_dependency(f"axis_{axis}_referenced", f"{axis.upper()} axis homed", referenced, f"{axis.upper()} axis is not homed."))
+        readiness = _motion_readiness(machine_state, _required_reference_axes(action, values))
+        existing_keys = {row["key"] for row in dependencies}
+        dependencies.extend(row for row in readiness["dependencies"] if row["key"] not in existing_keys)
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
@@ -413,12 +485,12 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     enclosure = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
     freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {"state": "missing", "age_s": None, "fresh_for_s": None}
     connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running")
-    motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
+    motion_readiness = _motion_readiness(machine_state, ["x", "y", "z", "g", "door"])
     return {
         "schema_version": "bioxp.operator_dashboard.v1",
         "ownership_generation": int(machine_state.get("ownership_generation") or 0),
         "connection": {"live": connection_live, "ownership": dict(ownership)},
-        "motion": {"enabled": motion_enabled, "reason": None if motion_enabled else maintenance.get("block_reason") or "Motion is inactive."},
+        "motion": {"enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"]},
         "operation": {"state": lifecycle.get("operation_state"), "reason": lifecycle.get("operation_reason")},
         "enclosure": {"door_closed": enclosure.get("door_closed"), "latch_closed": enclosure.get("latch_closed")},
         "axes": axes,
@@ -531,29 +603,62 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             actions.append(action)
             if dispatchable:
                 dispatch[action_id] = {"method": upper, "path": path, "locations": locations, "inputs": {row["name"] for row in inputs}}
+    prepare_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/oem/prepare_without_motion" and row["informational_method"] == "POST"),
+        None,
+    )
+    emergency_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/emergency_stop" and row["informational_method"] == "POST"),
+        None,
+    )
+    prepare_bound = prepare_provider is not None and prepare_provider.get("provider_available") is True
+    emergency_bound = emergency_provider is not None and emergency_provider.get("provider_available") is True
     meta = [
         {
             "action_id": "meta.activate_motion",
-            "label": "Activate Motion (complete OEM sequence)",
+            "label": "Prepare Motion Without Movement (OEM source sequence)",
             "subsystem": "meta",
             "category": "activation",
             "kind": "meta",
-            "safety_class": "motion",
-            "description": "Complete OEM activation sequence. Disabled until every source-defined activation provider is bound and commissioned.",
-            "source_anchor": "BioXPControlLib ClassControlInterface.initializeMotion",
+            "safety_class": "service",
+            "description": "Activate serial-206 motor boards, apply initializeMotorsWithoutMotion parameters, and verify 24 V/door/latch readbacks. This does not home or move an axis and does not claim a global 24 V switch.",
+            "source_anchor": "ClassIOControl.query24VSensor:92-110; ClassControlInterface.initializeMotorsWithoutMotion:3181-3265; activateBoard:3474-3493",
             "informational_method": "POST",
-            "informational_path": "/operator/actions/meta.activate_motion",
-            "provider_available": False,
-            "provider_unavailable_reason": "Complete OEM initializeMotion provider sequence is not bound.",
-            "available": False,
-            "unavailable_reason": "Complete OEM initializeMotion provider sequence is not bound.",
-            "enabled": False,
-            "disabled_reason": "Complete OEM initializeMotion provider sequence is not bound.",
+            "informational_path": "/motion/oem/prepare_without_motion",
+            "provider_available": prepare_bound,
+            "provider_unavailable_reason": None if prepare_bound else "Source-grounded no-motion preparation provider is not bound.",
+            "available": prepare_bound,
+            "unavailable_reason": None if prepare_bound else "Source-grounded no-motion preparation provider is not bound.",
+            "enabled": prepare_bound,
+            "disabled_reason": None if prepare_bound else "Source-grounded no-motion preparation provider is not bound.",
             "dependencies": [],
             "requires_confirmation": True,
-            "timeout_seconds": 300.0,
-            "inputs": [],
-            "stages": ["initialCheck", "initializeMotion", "home predicates", "pipette gate", "vision gate", "parkGantry gate"],
+            "timeout_seconds": 120.0,
+            "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
+            "stages": ["serial-206 authority", "activate boards 4/5/6", "resolve board 7 as non-motor", "initializeMotorsWithoutMotion", "exact parameter readback", "24 V query", "door query", "latch query"],
+        },
+        {
+            "action_id": "meta.emergency_stop",
+            "label": "Physical Aggregate Emergency Stop",
+            "subsystem": "meta",
+            "category": "emergency",
+            "kind": "meta",
+            "safety_class": "emergency",
+            "description": "Interrupt path that sends ClassMotor StopMotor to every serial-206 movement component and verifies exact ACK plus terminal zero speed.",
+            "source_anchor": "ClassMotor.StopMotor:161+; ControlLib.forceAbortMotion:10564-10606; ClassControlInterface.forceAbortMotion:5095-5104",
+            "informational_method": "POST",
+            "informational_path": "/motion/emergency_stop",
+            "provider_available": emergency_bound,
+            "provider_unavailable_reason": None if emergency_bound else "Physical aggregate stop provider is not bound.",
+            "available": emergency_bound,
+            "unavailable_reason": None if emergency_bound else "Physical aggregate stop provider is not bound.",
+            "enabled": emergency_bound,
+            "disabled_reason": None if emergency_bound else "Physical aggregate stop provider is not bound.",
+            "dependencies": [],
+            "requires_confirmation": False,
+            "timeout_seconds": 30.0,
+            "inputs": list(emergency_provider.get("inputs", [])) if emergency_provider else [],
+            "stages": ["stop x", "stop y", "stop z", "stop gripper", "stop thermal door", "terminal speed readback"],
         },
         {
             "action_id": "meta.home_xy",
@@ -602,10 +707,16 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "stages": list(OEM_INITIALIZE_MOTORS_STAGE_KEYS),
         },
     ]
-    # HomeXY is an explicit one-route meta action; dispatch remains exact and visible.
+    # Meta actions dispatch to exact bound provider routes; no synthesized sequence.
     home_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/home_xy"), None)
+    prepare_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/prepare_without_motion"), None)
+    emergency_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/emergency_stop"), None)
     if home_route:
         dispatch["meta.home_xy"] = home_route
+    if prepare_route:
+        dispatch["meta.activate_motion"] = prepare_route
+    if emergency_route:
+        dispatch["meta.emergency_stop"] = emergency_route
     actions.extend(meta)
     return actions, dispatch
 

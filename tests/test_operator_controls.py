@@ -70,7 +70,14 @@ def make_app(tmp_path: Path, monkeypatch):
             return {"ownership_epoch": self.ownership_epoch, "ownership": {"transport": "owned", "usb": "service", "router": "running", "CAN_READY": True}}
 
         def project(self, domain):
-            observation = {"safety_valid": True} if domain == "power" else {}
+            if domain == "power":
+                observation = {"safety_valid": True}
+            elif domain == "latch":
+                observation = {"door_sensor": 1, "latch_sensor": 1}
+            elif domain == "interlock":
+                observation = {"motion_arm": {"armed": True}}
+            else:
+                observation = {}
             return {
                 "snapshot_id": "test-snapshot",
                 "freshness": {"state": "fresh", "age_s": 0.0, "fresh_for_s": 30.0},
@@ -105,7 +112,7 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("POST", "/motion/axis/home")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.home_xy", "meta.full_initialization"}
+    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.full_initialization"}
     full = next(row for row in catalog["actions"] if row["action_id"] == "meta.full_initialization")
     assert full["available"] is False
     assert len(full["stages"]) == 19
