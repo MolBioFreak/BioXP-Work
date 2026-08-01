@@ -832,7 +832,7 @@ def test_execute_oem_rehome_remains_publicly_blocked_without_motion(monkeypatch)
     assert rehome_mapping["target_status"] == "intentionally_blocked_no_monolithic_live_homing"
 
 
-def test_initialize_motion_homing_request_and_openapi_remain_no_motion(monkeypatch):
+def test_initialize_motion_legacy_wrapper_stays_no_motion_but_openapi_exposes_typed_provider(monkeypatch):
     from tests.test_motion_service import load_api
 
     api = load_api(monkeypatch)
@@ -855,11 +855,11 @@ def test_initialize_motion_homing_request_and_openapi_remain_no_motion(monkeypat
     assert result["route_semantics"]["home_semantics"] == "initializeMotion_homing_request_delegates_to_blocked_rehome_no_motion"
     schemas = api.app.openapi()["components"]["schemas"]
     assert "does not enable physical homing" in schemas["OemRehomeRequest"]["properties"]["run_homing"]["description"]
-    assert "does not enable physical homing" in schemas["OemInitializeMotionRequest"]["properties"]["run_homing"]["description"]
-    assert "does not enable physical homing" in schemas["OemInitializationRunRequest"]["properties"]["run_homing"]["description"]
+    assert "typed serial-206 provider" in schemas["OemInitializeMotionRequest"]["properties"]["run_homing"]["description"]
+    assert "typed serial-206 provider" in schemas["OemInitializationRunRequest"]["properties"]["run_homing"]["description"]
 
 
-def test_initialization_run_homing_request_is_publicly_blocked_without_controller_call(monkeypatch):
+def test_initialization_run_homing_fails_closed_when_typed_provider_is_unbound(monkeypatch):
     from tests.test_motion_service import load_api
 
     api = load_api(monkeypatch)
@@ -875,19 +875,19 @@ def test_initialization_run_homing_request_is_publicly_blocked_without_controlle
         return callback()
 
     monkeypatch.setattr(api, "_run_blocking", run_blocking)
-    result = asyncio.run(
-        api.motion_oem_initialization_run(
-            api.OemInitializationRunRequest(
-                operator_ack="OEM_INITIALIZATION_RUN_WITH_HOMING",
-                run_homing=True,
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(
+            api.motion_oem_initialization_run(
+                api.OemInitializationRunRequest(
+                    operator_ack="OEM_INITIALIZATION_RUN_WITH_HOMING",
+                    run_homing=True,
+                )
             )
         )
-    )
 
-    assert result["ok"] is False
-    assert result["failed_closed"] is True
-    assert result["physical_motion_commanded"] is False
-
+    assert raised.value.status_code == 503
+    assert raised.value.detail["error"] == "serial206_oem_initialization_provider_unavailable"
+    assert raised.value.detail["physical_motion_commanded"] is False
 
 def test_initialization_controller_homing_request_is_directly_blocked_without_tester_call():
     from src.bioxp.oem_initialization import run_oem_initialization_controller

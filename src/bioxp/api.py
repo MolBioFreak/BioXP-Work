@@ -39,6 +39,11 @@ from .oem_gripper import (
 )
 from .oem_initialization import run_oem_initialization_controller
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
+from .oem_serial206_initialization import (
+    Serial206CommissioningEvidence,
+    Serial206OemInitializationProvider,
+    Serial206StageApproval,
+)
 from .operator_controls import install_operator_control_plane
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -183,6 +188,44 @@ _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
 _pipette_transport = None
+_serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
+
+
+def bind_serial206_oem_initialization_provider(
+    provider: Serial206OemInitializationProvider | None,
+) -> dict[str, Any]:
+    """Bind or explicitly clear the live serial-206 initialization provider."""
+    global _serial206_oem_initialization_provider
+    _serial206_oem_initialization_provider = provider
+    return serial206_oem_initialization_provider_status()
+
+
+def serial206_oem_initialization_provider_status() -> dict[str, Any]:
+    provider = _serial206_oem_initialization_provider
+    return {
+        "schema_version": "bioxp.serial206_oem_initialization_provider_status.v1",
+        "bound": provider is not None,
+        "initialize_motors_live_available": provider is not None,
+        "initialize_motion_live_available": provider is not None,
+        "physical_acceptance_required": True,
+        "provider": None if provider is None else type(provider).__name__,
+    }
+
+
+def _require_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "serial206_oem_initialization_provider_unavailable",
+                "provider_status": serial206_oem_initialization_provider_status(),
+                "physical_motion_commanded": False,
+            },
+        )
+    return provider
+
+
 try:
     _vision_capabilities = load_deck_layout().capabilities
 except Exception:
@@ -1313,19 +1356,55 @@ class OemRehomeRequest(BaseModel):
     timeout_s: float = Field(120.0, gt=1.0, le=240.0)
 
 
+class OemSerial206StageApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    approval_id: StrictStr = Field(min_length=1, max_length=200)
+    expected_generation: StrictInt = Field(ge=0)
+    expected_component: StrictStr = Field(min_length=1, max_length=40)
+    expected_direction: StrictStr = Field(min_length=1, max_length=120)
+    expected_bound: StrictInt
+    operator_note: StrictStr = Field(min_length=1, max_length=2000)
+    idempotency_key: StrictStr = Field(min_length=8, max_length=200)
+
+
+class OemSerial206CommissioningEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    component: StrictStr = Field(min_length=1, max_length=40)
+    generation: StrictInt = Field(ge=0)
+    fresh: StrictBool
+    direction_verified: StrictBool
+    limits_verified: StrictBool
+    switch_verified: StrictBool
+    stop_verified: StrictBool
+    reference_verified: StrictBool
+    gap9_polarity: StrictInt | None = Field(None, ge=0, le=1)
+    gap10_polarity: StrictInt | None = Field(None, ge=0, le=1)
+
+
 class OemInitializeMotionRequest(BaseModel):
-    operator_ack: str = Field(..., description="INITIALIZE for no-homing diagnostic; INITIALIZE_WITH_HOMING for homing body.")
-    run_homing: bool = Field(False, description="False calls initialize-without-motion only; true does not enable physical homing and remains fail-closed.")
-    include_tip_pipette_cleanup: bool = Field(False, description="Reserved label only; cleanup remains not ported until source-equivalent primitives exist.")
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: str = Field(..., description="INITIALIZE for no-homing diagnostic; INITIALIZE_WITH_HOMING for the typed serial-206 live provider.")
+    run_homing: bool = Field(False, description="False calls initialize-without-motion only; true invokes the typed serial-206 provider after exact approval and commissioning gates.")
+    include_tip_pipette_cleanup: bool = Field(False, description="For live initializeMotion, selects the source-shaped tip/pipette branch after exact readback.")
     timeout_s: float = Field(120.0, gt=1.0, le=240.0)
+    motor_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    motion_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
 
 
 class OemInitializationRunRequest(BaseModel):
-    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing dry/controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING for live homing body.")
-    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true does not enable physical homing and remains fail-closed.")
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING for typed serial-206 live initialization.")
+    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true invokes the typed serial-206 provider after exact approval and commissioning gates.")
     restore_door_state: bool = Field(False, description="Request explicit source-mode door restore policy after init. Open restore remains explicit, not silent.")
-    include_tip_pipette_cleanup: bool = Field(False, description="Reserved label; cleanup remains explicitly unsupported until source-equivalent primitives exist.")
+    include_tip_pipette_cleanup: bool = Field(False, description="Reserved for initializeMotion; the initializeMotors route does not perform tip cleanup.")
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
+    stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
 
 
 OEM_IDLE_STANDBY_CURRENT = 10
@@ -6039,20 +6118,53 @@ async def motion_oem_rehome(req: OemRehomeRequest):
     }
 
 
+def _serial206_stage_approvals(
+    rows: Mapping[str, OemSerial206StageApprovalRequest],
+) -> dict[str, Serial206StageApproval]:
+    return {key: Serial206StageApproval(**value.model_dump()) for key, value in rows.items()}
+
+
+def _serial206_commissioning_evidence(
+    rows: Mapping[str, OemSerial206CommissioningEvidenceRequest],
+) -> dict[str, Serial206CommissioningEvidence]:
+    return {key: Serial206CommissioningEvidence(**value.model_dump()) for key, value in rows.items()}
+
+
+@app.get("/motion/oem/initialization/provider-status")
+async def motion_oem_initialization_provider_status():
+    return serial206_oem_initialization_provider_status()
+
+
 @app.post("/motion/oem/initialization/run")
 async def motion_oem_initialization_run(req: OemInitializationRunRequest):
     expected_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if bool(req.run_homing) else "OEM_INITIALIZATION_RUN"
     if req.operator_ack != expected_ack:
         raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initialization controller run_homing={bool(req.run_homing)}")
     if bool(req.run_homing):
-        return {
-            "ok": False,
-            "failed_closed": True,
-            "source_mode": "ControlLib.initializeMotion",
-            "failed_at": "initialize_motors_full_sequence",
-            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
-            "physical_motion_commanded": False,
-        }
+        if req.restore_door_state or req.include_tip_pipette_cleanup:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "initialize_motors_scope_mismatch",
+                    "message": "Door restoration and tip cleanup belong to initializeMotion, not the literal initializeMotors provider.",
+                    "physical_motion_commanded": False,
+                },
+            )
+        _require_motion_route_ready()
+        provider = _require_serial206_oem_initialization_provider()
+        result = await _run_blocking(
+            "Typed serial-206 initializeMotors",
+            lambda: provider.initialize_motors(
+                mode="live",
+                approvals=_serial206_stage_approvals(req.stage_approvals),
+                commissioning=_serial206_commissioning_evidence(req.commissioning),
+                timeout_s=req.timeout_s,
+            ),
+            timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
+        )
+        if result.get("ok") is not True:
+            raise HTTPException(status_code=409, detail=result)
+        return result
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
@@ -6074,14 +6186,31 @@ async def motion_oem_initialize_motion(req: OemInitializeMotionRequest):
     if req.operator_ack != expected_ack:
         raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initializeMotion run_homing={bool(req.run_homing)}")
     if bool(req.run_homing):
-        return {
-            "ok": False,
-            "failed_closed": True,
-            "source_mode": "ControlLib.initializeMotion",
-            "failed_at": "initialize_motors_full_sequence",
-            "blocked_reason": "literal_direct_oem_stage_rewrite_pending",
-            "physical_motion_commanded": False,
-        }
+        if req.include_tip_pipette_cleanup is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "initialize_motion_scope_incomplete",
+                    "message": "Live initializeMotion must include its source tip/pipette branch; partial homing-only execution is not initializeMotion parity.",
+                    "physical_motion_commanded": False,
+                },
+            )
+        _require_motion_route_ready()
+        provider = _require_serial206_oem_initialization_provider()
+        result = await _run_blocking(
+            "Typed serial-206 initializeMotion",
+            lambda: provider.initialize_motion(
+                mode="live",
+                motor_approvals=_serial206_stage_approvals(req.motor_stage_approvals),
+                motion_approvals=_serial206_stage_approvals(req.motion_stage_approvals),
+                commissioning=_serial206_commissioning_evidence(req.commissioning),
+                timeout_s=req.timeout_s,
+            ),
+            timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
+        )
+        if result.get("ok") is not True:
+            raise HTTPException(status_code=409, detail=result)
+        return result
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
