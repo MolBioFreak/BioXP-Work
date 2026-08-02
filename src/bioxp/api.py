@@ -6117,9 +6117,9 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
     )
 
 
-def _require_oem_no_motion_profile_or_409(tester: BioXpTester) -> dict[str, Any]:
+def _require_oem_no_motion_profile_or_409(tester: BioXpTester, axis: str) -> dict[str, Any]:
     try:
-        return getattr(tester, "motor_oem_require_no_motion_profile")()
+        return getattr(tester, "motor_oem_require_no_motion_profile")(axis)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=409,
@@ -6137,7 +6137,7 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
     _require_motion_route_ready()
     axis = AxisName(req.axis)
     tester = _get_tester()
-    _require_oem_no_motion_profile_or_409(tester)
+    _require_oem_no_motion_profile_or_409(tester, axis.value)
     result = await _run_blocking(
         f"OEM moveSteps {axis.value} {int(req.steps)}",
         lambda: _execute_relative_move(
@@ -6189,7 +6189,7 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
         oem_method = "ClassControlInterface.moveG"
         source_anchor = "ClassControlInterface.cs:4268-4273"
     tester = _get_tester()
-    _require_oem_no_motion_profile_or_409(tester)
+    _require_oem_no_motion_profile_or_409(tester, axis.value)
 
     def execute() -> dict[str, Any]:
         z_current = None
@@ -6230,11 +6230,13 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     """Dispatch the literal serial-206 OEM HomeAxis branch for one component."""
     _require_motion_route_ready()
     tester = _get_tester()
-    _require_oem_no_motion_profile_or_409(tester)
+    _require_oem_no_motion_profile_or_409(tester, req.axis)
 
     def execute() -> dict[str, Any]:
+        interlock = getattr(tester, "motor_prepare_motion_interlock")(force_lock=True)
         result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
         if isinstance(result, dict):
+            result["interlock"] = interlock
             result["oem_method"] = "ClassControlInterface.HomeAxis"
             result["source_anchor"] = "ClassControlInterface.cs:4997-5052"
             result["standby_current_param7_written"] = False

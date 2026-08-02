@@ -4533,14 +4533,54 @@ class BioXpTester:
         self._oem_no_motion_profile_ready = bool(report["ok"])
         return report
 
-    def motor_oem_require_no_motion_profile(self):
-        """Require OEM activation -> initializeMotorsWithoutMotion ordering."""
+    def motor_oem_require_no_motion_profile(self, axis_key=None):
+        """Require and verify OEM activation -> profile initialization ordering."""
         if not bool(getattr(self, "_oem_no_motion_profile_ready", False)):
             raise RuntimeError(
                 "OEM no-motion motor profile is not established in this service generation; "
                 "run /motion/oem/prepare_without_motion before exact OEM movement"
             )
-        return {"ok": True, "source": "initializeMotorsWithoutMotion"}
+        if axis_key is None:
+            return {"ok": True, "source": "initializeMotorsWithoutMotion"}
+
+        preset_raw = self._motion_oem_axis_profile(str(axis_key).strip().lower())
+        if not isinstance(preset_raw, dict):
+            raise RuntimeError(f"invalid OEM motion profile for {axis_key!r}")
+        preset = {str(key): value for key, value in preset_raw.items()}
+        board = int(preset["board"])
+        motor = int(preset["motor"])
+        expected = {
+            4: int(preset["speed"]),
+            5: int(preset["acc"]),
+            6: int(preset["run_current"]),
+            205: int(preset["stall_guard"]),
+        }
+        if preset.get("disable_right") is not None:
+            expected[12] = int(bool(preset["disable_right"]))
+        if preset.get("disable_left") is not None:
+            expected[13] = int(bool(preset["disable_left"]))
+        readbacks = {}
+        mismatches = []
+        for param, wanted in expected.items():
+            row = self.motor_get_axis_param(board, param, motor=motor)
+            readbacks[param] = row
+            observed = row.get("value") if isinstance(row, dict) else None
+            if observed is None or int(observed) != int(wanted):
+                mismatches.append({"param": param, "expected": wanted, "observed": observed})
+        if mismatches:
+            self._oem_no_motion_profile_ready = False
+            raise RuntimeError(
+                f"OEM no-motion profile readback mismatch for {axis_key}: {mismatches}; "
+                "run /motion/oem/prepare_without_motion again"
+            )
+        return {
+            "ok": True,
+            "source": "initializeMotorsWithoutMotion",
+            "axis": str(axis_key).strip().lower(),
+            "board": board,
+            "motor": motor,
+            "readbacks": readbacks,
+        }
 
     def motor_oem_axis_search_home(self, axis_key, *, speed, timeout_s=30.0, max_search_abs_delta=None):
         """Source-faithful Class*Board.axisSearchHome(axis, speed).
@@ -5320,6 +5360,12 @@ class BioXpTester:
             "home": None,
             "restore": None,
         }
+
+        def finish():
+            home = out.get("home")
+            out["ok"] = bool(isinstance(home, dict) and home.get("ok") is True)
+            return out
+
         if key in {"x", "y"}:
             out["home"] = self.motor_oem_axis_search_home(
                 key,
@@ -5327,7 +5373,7 @@ class BioXpTester:
                 timeout_s=timeout_s,
                 max_search_abs_delta=preset.get("home_search_max_abs_delta"),
             )
-            return out
+            return finish()
         if key == "z":
             current = int(preset.get("run_current", 31))
             current_row = self.motor_set_axis_param(
@@ -5345,7 +5391,7 @@ class BioXpTester:
                 timeout_s=timeout_s,
                 max_search_abs_delta=preset.get("home_search_max_abs_delta"),
             )
-            return out
+            return finish()
         if key == "g":
             board = int(preset["board"])
             motor = int(preset["motor"])
@@ -5366,9 +5412,9 @@ class BioXpTester:
             finally:
                 if gv == 1:
                     out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
-            return out
+            return finish()
         out["home"] = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
-        return out
+        return finish()
 
     def motor_oem_home_axis(
         self,
