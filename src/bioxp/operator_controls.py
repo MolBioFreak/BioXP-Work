@@ -391,33 +391,18 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     if requires_transport:
         dependencies.append(_dependency("transport_live", "Robot transport live", transport_live, "Robot transport is unavailable."))
 
-    requires_can = (
-        requires_transport
-        and safety not in {"stop", "emergency"}
-        and path not in _CAN_BOOTSTRAP_PATHS
-        and not source_initializer
-        and (safety == "motion" or _motor_motion_action(action))
-    )
-    if requires_can:
-        dependencies.append(_dependency(
-            "can_ready",
-            "Same-epoch CAN ready",
-            ownership.get("CAN_READY") is True,
-            "Same-epoch CAN readiness has not been established.",
-        ))
-
-    if source_initializer:
+    if source_initializer or safety == "motion" or _motor_motion_action(action):
         maintenance_value = machine_state.get("maintenance")
         maintenance = maintenance_value if isinstance(maintenance_value, Mapping) else {}
         motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
+        motion_disabled_reason = (
+            "Motion is inactive. Activate motion before moving this motor."
+            if _motor_motion_action(action)
+            else "Motion is inactive. Activate motion before running this action."
+        )
         dependencies.append(_dependency(
-            "motion_enabled", "Motion enabled", motion_enabled,
-            "Motion is inactive. Activate motion before starting OEM initialization.",
+            "motion_enabled", "Motion enabled", motion_enabled, motion_disabled_reason,
         ))
-    elif safety == "motion" or _motor_motion_action(action):
-        readiness = _motion_readiness(machine_state, _required_reference_axes(action, values))
-        existing_keys = {row["key"] for row in dependencies}
-        dependencies.extend(row for row in readiness["dependencies"] if row["key"] not in existing_keys)
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
