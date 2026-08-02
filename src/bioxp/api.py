@@ -2863,7 +2863,12 @@ def _execute_relative_move(
     _require_motion_not_blocked_by_maintenance()
     if bool(oem_exact):
         preset = dict(_axis_preset(tester, axis))
-        board_status = tester.activate_boards(expect_reply=True)
+        profile = getattr(tester, "motor_oem_require_no_motion_profile")()
+        board_status = {
+            "ok": True,
+            "policy": "no_reactivation_after_oem_profile",
+            "profile": profile,
+        }
         interlock = tester.motor_prepare_motion_interlock(force_lock=True)
         prep = {
             "mode": "oem_exact_moveSteps",
@@ -3046,7 +3051,12 @@ def _execute_absolute_move(
     _require_motion_not_blocked_by_maintenance()
     if bool(oem_exact):
         preset = dict(_axis_preset(tester, axis))
-        board_status = tester.activate_boards(expect_reply=True)
+        profile = getattr(tester, "motor_oem_require_no_motion_profile")()
+        board_status = {
+            "ok": True,
+            "policy": "no_reactivation_after_oem_profile",
+            "profile": profile,
+        }
         interlock = tester.motor_prepare_motion_interlock(force_lock=True)
         prep = {
             "mode": "oem_exact_absolute",
@@ -6107,12 +6117,27 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
     )
 
 
+def _require_oem_no_motion_profile_or_409(tester: BioXpTester) -> dict[str, Any]:
+    try:
+        return getattr(tester, "motor_oem_require_no_motion_profile")()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "oem_no_motion_profile_required",
+                "message": str(exc),
+                "physical_motion_commanded": False,
+            },
+        ) from exc
+
+
 @app.post("/motion/oem/manual/relative")
 async def motion_oem_manual_relative(req: OemManualRelativeRequest):
     """Dispatch literal OEM moveSteps(axis, steps) with robot-owned bounds/evidence."""
     _require_motion_route_ready()
     axis = AxisName(req.axis)
     tester = _get_tester()
+    _require_oem_no_motion_profile_or_409(tester)
     result = await _run_blocking(
         f"OEM moveSteps {axis.value} {int(req.steps)}",
         lambda: _execute_relative_move(
@@ -6164,6 +6189,7 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
         oem_method = "ClassControlInterface.moveG"
         source_anchor = "ClassControlInterface.cs:4268-4273"
     tester = _get_tester()
+    _require_oem_no_motion_profile_or_409(tester)
 
     def execute() -> dict[str, Any]:
         z_current = None
@@ -6204,6 +6230,7 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     """Dispatch the literal serial-206 OEM HomeAxis branch for one component."""
     _require_motion_route_ready()
     tester = _get_tester()
+    _require_oem_no_motion_profile_or_409(tester)
 
     def execute() -> dict[str, Any]:
         result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)

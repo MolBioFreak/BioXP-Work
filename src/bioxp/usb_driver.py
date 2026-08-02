@@ -1005,17 +1005,15 @@ class BioXpTester:
         return None
 
     def enable_motor_power(self):
+        """Reject the removed non-OEM command-14 "ESM relay" shim.
+
+        Decompiled ``ClassControlInterface.ESM`` delegates directly to the
+        selected board's ``activateBoard()``.  That method sends command 64;
+        it never writes command 14 type 0/1 on deck IO bank 2.
         """
-        Explicitly toggles the Electronic Switch Module (ESM) relays on the Deck Board (0x05)
-        to route 24V power to the Deck and Head motors.
-        cmd14, type0/1, motor2 = 1.
-        """
-        # Bank 2, output 0 (Deck ESM) -> 1
-        self.send_tmcl(self.BOARD_DECK, 14, 0, 2, 1, wait_reply=False, write_timeout_ms=30)
-        time.sleep(0.01)
-        # Bank 2, output 1 (Head ESM) -> 1
-        self.send_tmcl(self.BOARD_DECK, 14, 1, 2, 1, wait_reply=False, write_timeout_ms=30)
-        time.sleep(0.01)
+        raise RuntimeError(
+            "non-OEM command-14 motor-power shim is disabled; use OEM board activation"
+        )
 
     def _record_oem_board_activation(self, board_id, *, active, ack):
         """Own IsInitialized evidence only at the OEM activate/deactivate boundary."""
@@ -1050,8 +1048,10 @@ class BioXpTester:
         )
 
     def _set_boards_active(self, active: bool, expect_reply=True, fail_fast=False):
-        if active:
-            self.enable_motor_power()
+        # OEM ESM semantics are exactly activateBoard/deactivateBoard (cmd64).
+        # Any board activation invalidates the source motor profile until
+        # initializeMotorsWithoutMotion establishes it again.
+        self._oem_no_motion_profile_ready = False
         out = {}
         value = 1 if active else 0
         for bid in self.BOARDS:
@@ -4517,7 +4517,7 @@ class BioXpTester:
 
         failures = [row for row in transcript if row.get("ack") is not None and not row.get("ok")]
         no_replies = [row for row in transcript if "ack" in row and row.get("ack") is None]
-        return {
+        report = {
             "ok": not failures and not no_replies,
             "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
             "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
@@ -4530,6 +4530,17 @@ class BioXpTester:
             "failures": failures,
             "no_replies": no_replies,
         }
+        self._oem_no_motion_profile_ready = bool(report["ok"])
+        return report
+
+    def motor_oem_require_no_motion_profile(self):
+        """Require OEM activation -> initializeMotorsWithoutMotion ordering."""
+        if not bool(getattr(self, "_oem_no_motion_profile_ready", False)):
+            raise RuntimeError(
+                "OEM no-motion motor profile is not established in this service generation; "
+                "run /motion/oem/prepare_without_motion before exact OEM movement"
+            )
+        return {"ok": True, "source": "initializeMotorsWithoutMotion"}
 
     def motor_oem_axis_search_home(self, axis_key, *, speed, timeout_s=30.0, max_search_abs_delta=None):
         """Source-faithful Class*Board.axisSearchHome(axis, speed).
