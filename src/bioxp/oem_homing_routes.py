@@ -6,6 +6,7 @@ BioXpTester, open USB/CAN/camera transports, or command motion.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 import time
 from typing import Any
@@ -23,6 +24,17 @@ from .oem_shadow_readback_live import build_shadow_readback_artifact
 from .runtime_state import OemRuntimeStateError, get_active_oem_runtime_state_store
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
+
+
+def _plain_response(value: Any) -> Any:
+    """Materialize immutable OEM snapshot views as ordinary JSON containers."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_response(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_response(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _require_bound_snapshot(root_dir: str | None) -> None:
@@ -54,7 +66,7 @@ async def get_oem_machine_config(root_dir: str | None = None) -> dict[str, Any]:
     result.setdefault("motion_commanded", False)
     result.setdefault("current_mutation_commanded", False)
     result.setdefault("switch_mask_mutation_commanded", False)
-    return result
+    return _plain_response(result)
 
 
 

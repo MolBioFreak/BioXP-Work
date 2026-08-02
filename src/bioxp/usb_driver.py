@@ -3668,19 +3668,18 @@ class BioXpTester:
         warm_enable=False,
         warm_current=10,
         warm_delay_s=0.50,
+        write_standby=True,
     ):
         """
-        OEM-like prep for one axis:
-        - SAP6 max current (clamped)
-        - SAP7 standby current
-        - optional SAP4/SAP5 speed/acc
+        Prepare one axis. ``write_standby=False`` preserves OEM methods that
+        write SAP6/max current but never touch SAP7/standby current.
         """
         ops = []
         rb_cur = self.motor_get_axis_param(board_id, 6, motor=motor)
         rb_cur_val = rb_cur.get("value")
         ops.append({"op": "gap6-current_before", "ack": rb_cur.get("ack"), "rb": rb_cur, "set": rb_cur_val})
         target_run = max(0, min(31, int(run_current)))
-        target_standby = max(0, min(target_run, int(standby_current)))
+        target_standby = None if not bool(write_standby) else max(0, min(target_run, int(standby_current)))
 
         if bool(warm_enable):
             warm_target = max(0, min(31, int(warm_current)))
@@ -3689,9 +3688,12 @@ class BioXpTester:
             time.sleep(max(0.05, float(warm_delay_s)))
 
         r6 = self.motor_set_axis_param(board_id, 6, target_run, motor=motor)
-        r7 = self.motor_set_axis_param(board_id, 7, target_standby, motor=motor)
         ops.append({"op": "sap6-run_current", "ack": r6.get("ack"), "rb": r6.get("readback"), "set": target_run})
-        ops.append({"op": "sap7-standby_current", "ack": r7.get("ack"), "rb": r7.get("readback"), "set": target_standby})
+        if bool(write_standby):
+            r7 = self.motor_set_axis_param(board_id, 7, target_standby, motor=motor)
+            ops.append({"op": "sap7-standby_current", "ack": r7.get("ack"), "rb": r7.get("readback"), "set": target_standby})
+        else:
+            ops.append({"op": "sap7-standby_current", "skipped": True, "reason": "OEM source does not write standby current for this method"})
         ops.extend(self.motor_set_speed_acc(board_id, motor=motor, speed=speed, acc=acc))
         if stall_guard is not None:
             rsg = self.motor_set_axis_param(board_id, 205, int(stall_guard), motor=motor)
@@ -5194,6 +5196,7 @@ class BioXpTester:
         timeout_s=20.0,
         startup=False,
         restore_idle_current=True,
+        oem_exact_current=False,
     ):
         """Run one G home with caller-selected OEM current lifetime.
 
@@ -5221,6 +5224,7 @@ class BioXpTester:
                 rdiv=preset.get("rdiv"),
                 pdiv=preset.get("pdiv"),
                 warm_enable=bool(preset.get("warm_enable", False)),
+                write_standby=not bool(oem_exact_current),
             )
             effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
             if bool(startup):
@@ -5245,9 +5249,19 @@ class BioXpTester:
                 )
         finally:
             if bool(restore_idle_current):
-                restore_current = self.motor_restore_gripper_idle_current(
-                    reason="oem_home_axis_g_finally"
-                )
+                if bool(oem_exact_current):
+                    restore_row = self.motor_set_axis_param(
+                        int(preset["board"]), 6, 10, motor=int(preset["motor"])
+                    )
+                    restore_current = {
+                        **dict(restore_row),
+                        "oem_method": "setMaxCurrent(MotorGrip, 10)",
+                        "standby_current_param7_written": False,
+                    }
+                else:
+                    restore_current = self.motor_restore_gripper_idle_current(
+                        reason="oem_home_axis_g_finally"
+                    )
         if bool(restore_idle_current) and (
             not isinstance(restore_current, dict) or restore_current.get("ok") is not True
         ):
@@ -5269,6 +5283,82 @@ class BioXpTester:
             "retained_current_readback": retained_current,
         }
 
+    def motor_oem_home_axis_board_test(self, axis_key, *, timeout_s=30.0):
+        """Literal ``ClassControlInterface.HomeAxis`` manual/board-test path.
+
+        This is intentionally separate from startup initialization and from the
+        PageMotionControl ``goHome`` path. In particular, serial-206 Z uses
+        ``setZaxisCurrentmax(...)`` followed by ``axisSearchHome(..., 597)``.
+        SAP7/standby current is never written by this OEM method.
+        """
+        key = str(axis_key).strip().lower()
+        if key == "d":
+            key = "door"
+        if key not in {"x", "y", "z", "g", "door"}:
+            raise ValueError(f"unsupported OEM HomeAxis key: {axis_key!r}")
+        preset_raw = self._motion_oem_axis_profile(key, startup=True)
+        if not isinstance(preset_raw, dict):
+            raise RuntimeError(f"invalid OEM HomeAxis profile for {key!r}")
+        preset = {str(name): value for name, value in preset_raw.items()}
+        out = {
+            "axis": key,
+            "oem_method": "ClassControlInterface.HomeAxis",
+            "source_anchor": "ClassControlInterface.cs:4997-5052",
+            "standby_current_param7_written": False,
+            "prelude": [],
+            "home": None,
+            "restore": None,
+        }
+        if key in {"x", "y"}:
+            out["home"] = self.motor_oem_axis_search_home(
+                key,
+                speed=250,
+                timeout_s=timeout_s,
+                max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+            )
+            return out
+        if key == "z":
+            current = int(preset.get("run_current", 31))
+            current_row = self.motor_set_axis_param(
+                int(preset["board"]), 6, current, motor=int(preset["motor"])
+            )
+            out["prelude"].append({
+                "op": "setZaxisCurrentmax",
+                "param": 6,
+                "value": current,
+                "receipt": current_row,
+            })
+            out["home"] = self.motor_oem_axis_search_home(
+                "z",
+                speed=597,
+                timeout_s=timeout_s,
+                max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+            )
+            return out
+        if key == "g":
+            board = int(preset["board"])
+            motor = int(preset["motor"])
+            gv = int(preset.get("gripper_version", 1))
+            current_row = self.motor_set_axis_param(board, 6, 31, motor=motor)
+            stall_row = self.motor_set_axis_param(board, 205, 5, motor=motor)
+            out["prelude"].extend([
+                {"op": "setGripperCurrent", "param": 6, "value": 31, "receipt": current_row},
+                {"op": "setStallGuardThreshold", "param": 205, "value": 5, "receipt": stall_row},
+            ])
+            try:
+                out["home"] = self.motor_oem_axis_search_home(
+                    "g",
+                    speed=200 if gv != 0 else 150,
+                    timeout_s=timeout_s,
+                    max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+                )
+            finally:
+                if gv == 1:
+                    out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
+            return out
+        out["home"] = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
+        return out
+
     def motor_oem_home_axis(
         self,
         axis_key,
@@ -5277,6 +5367,7 @@ class BioXpTester:
         timeout_s=20.0,
         startup=False,
         restore_idle_current=True,
+        oem_exact_current=False,
     ):
         axis_key_norm = str(axis_key).strip().lower()
         preset_raw = self._motion_oem_axis_profile(axis_key, startup=bool(startup))
@@ -5290,6 +5381,7 @@ class BioXpTester:
                 timeout_s=timeout_s,
                 startup=bool(startup),
                 restore_idle_current=bool(restore_idle_current),
+                oem_exact_current=bool(oem_exact_current),
             )
         prepare = self.motor_prepare_axis(
             preset["board"],
@@ -5305,6 +5397,7 @@ class BioXpTester:
             rdiv=preset.get("rdiv"),
             pdiv=preset.get("pdiv"),
             warm_enable=bool(preset.get("warm_enable", False)),
+            write_standby=not bool(oem_exact_current),
         )
         effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
         if axis_key_norm == "door":

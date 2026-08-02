@@ -1133,6 +1133,34 @@ class AxisName(str, Enum):
     THERMAL_DOOR = "door"
 
 
+class OemManualRelativeRequest(BaseModel):
+    """Exact OEM moveSteps inputs; board/profile details stay robot-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g"]
+    steps: int = Field(..., ge=-160000, le=160000)
+
+
+class OemManualHomeRequest(BaseModel):
+    """Exact OEM HomeAxis selector; homing parameters stay robot-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+
+
+class OemManualAbsoluteRequest(BaseModel):
+    """Exact OEM moveX/moveY/moveZ/moveG absolute inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g"]
+    position_steps: int
+    z_pseudo_home: Optional[Literal[500, 65000]] = None
+    wait_timeout_s: float = Field(default=20.0, ge=0.5, le=60.0)
+
+
 _LIQUID_REQUIRED_REFERENCE_AXES = (AxisName.X, AxisName.Y, AxisName.Z)
 
 
@@ -1351,14 +1379,6 @@ class OemStartupStepRequest(BaseModel):
     timeout_s: float = Field(25.0, gt=0.1, le=90.0)
 
 
-class GripperActionRequest(BaseModel):
-    operator_ack: str = Field(..., description="Must be GRIPPER_CLEAR or GRIPPER_HOME depending on the operation.")
-    reason: str = Field(..., min_length=1, max_length=2000)
-    timeout_s: float = Field(15.0, gt=0.1, le=90.0)
-    capture_bundle: bool = False
-    operator: Optional[str] = Field("bms-cockpit", max_length=200)
-
-
 class GripperRestoreIdleRequest(BaseModel):
     reason: str = Field("operator_restore_idle_current", max_length=2000)
     operator: Optional[str] = Field("bms-cockpit", max_length=200)
@@ -1388,17 +1408,6 @@ class AxisDiagnosticStopRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     axis: Literal["x", "y", "z", "g", "door"]
-    operator_ack: Literal["STOP_AXIS"]
-    reason: str = Field(..., min_length=1, max_length=2000)
-    operator: Optional[str] = Field("bms-cockpit", max_length=200)
-
-
-class ThermalDoorActionRequest(BaseModel):
-    operator_ack: str = Field(..., description="Must be HOME_THERMAL_DOOR, OPEN_THERMAL_DOOR, or CLOSE_THERMAL_DOOR for the selected route.")
-    reason: str = Field(..., min_length=1, max_length=2000)
-    timeout_s: float = Field(20.0, gt=0.1, le=60.0)
-    capture_bundle: bool = False
-    operator: Optional[str] = Field("bms-cockpit", max_length=200)
 
 
 class OemHomeXYRequest(BaseModel):
@@ -2849,15 +2858,35 @@ def _execute_relative_move(
     speed: Optional[int] = None,
     acc: Optional[int] = None,
     reuse_prepared: bool = False,
+    oem_exact: bool = False,
 ) -> dict:
     _require_motion_not_blocked_by_maintenance()
-    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(
-        tester,
-        axis,
-        speed=speed,
-        acc=acc,
-        reuse_prepared=reuse_prepared,
-    )
+    if bool(oem_exact):
+        preset = dict(_axis_preset(tester, axis))
+        board_status = tester.activate_boards(expect_reply=True)
+        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        prep = {
+            "mode": "oem_exact_moveSteps",
+            "oem_method": "ClassControlInterface.moveSteps",
+            "source_anchor": "ClassControlInterface.cs:4165-4204",
+            "axis_profile_rewritten": False,
+            "standby_current_param7_written": False,
+            "note": "OEM moveSteps does not rewrite speed, acceleration, current, or switch masks; only the OEM XYZ wake/interlock path ran.",
+        }
+        prep_policy = {
+            "mode": "oem_exact",
+            "reuse_requested": False,
+            "reuse_used": False,
+            "fresh_oem_interlock": True,
+        }
+    else:
+        preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(
+            tester,
+            axis,
+            speed=speed,
+            acc=acc,
+            reuse_prepared=reuse_prepared,
+        )
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     current = _position_value(position_before)
@@ -3012,9 +3041,21 @@ def _execute_absolute_move(
     *,
     speed: Optional[int] = None,
     acc: Optional[int] = None,
+    oem_exact: bool = False,
 ) -> dict:
     _require_motion_not_blocked_by_maintenance()
-    preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, speed=speed, acc=acc)
+    if bool(oem_exact):
+        preset = dict(_axis_preset(tester, axis))
+        board_status = tester.activate_boards(expect_reply=True)
+        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        prep = {
+            "mode": "oem_exact_absolute",
+            "axis_profile_rewritten": False,
+            "standby_current_param7_written": False,
+        }
+        prep_policy = {"mode": "oem_exact", "fresh_oem_interlock": True}
+    else:
+        preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, speed=speed, acc=acc)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
     switch_before = tester.motor_get_switch_activity(preset["board"], motor=preset["motor"])
     _guard_absolute_target(axis, position_before, position_steps, switch_before, preset)
@@ -5979,20 +6020,11 @@ async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
             timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 120.0),
         )
     elif action.executor in {"door-home", "door-open", "door-close"}:
-        door_request = ThermalDoorActionRequest(
-            operator_ack={
-                "door-home": "HOME_THERMAL_DOOR",
-                "door-open": "OPEN_THERMAL_DOOR",
-                "door-close": "CLOSE_THERMAL_DOOR",
-            }[action.executor],
-            reason=req.reason,
-            timeout_s=min(float(req.timeout_s), 60.0),
-        )
         result = await {
             "door-home": motion_thermal_door_home,
             "door-open": motion_thermal_door_open,
             "door-close": motion_thermal_door_close,
-        }[action.executor](door_request)
+        }[action.executor]()
     else:  # pragma: no cover - registry and dispatcher must evolve together
         raise HTTPException(status_code=500, detail="axis diagnostic registry executor is not wired")
 
@@ -6075,6 +6107,122 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
     )
 
 
+@app.post("/motion/oem/manual/relative")
+async def motion_oem_manual_relative(req: OemManualRelativeRequest):
+    """Dispatch literal OEM moveSteps(axis, steps) with robot-owned bounds/evidence."""
+    _require_motion_route_ready()
+    axis = AxisName(req.axis)
+    tester = _get_tester()
+    result = await _run_blocking(
+        f"OEM moveSteps {axis.value} {int(req.steps)}",
+        lambda: _execute_relative_move(
+            tester,
+            axis,
+            int(req.steps),
+            20.0,
+            speed=None,
+            acc=None,
+            reuse_prepared=False,
+            oem_exact=True,
+        ),
+        timeout_s=30.0,
+    )
+    if isinstance(result, dict):
+        result["oem_method"] = "ClassControlInterface.moveSteps"
+        result["source_anchor"] = "ClassControlInterface.cs:4165-4204"
+        result["requested_steps"] = int(req.steps)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/motion/oem/manual/absolute")
+async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
+    """Dispatch exact OEM moveX/moveY/moveZ/moveG absolute semantics."""
+    _require_motion_route_ready()
+    axis = AxisName(req.axis)
+    requested = int(req.position_steps)
+    if axis is AxisName.X:
+        effective = max(60, requested)
+        oem_method = "ClassControlInterface.moveX"
+        source_anchor = "ClassControlInterface.cs:4233-4243"
+    elif axis is AxisName.Z:
+        if req.z_pseudo_home is None:
+            raise HTTPException(
+                status_code=422,
+                detail="z_pseudo_home must be explicitly supplied as 500 or 65000 because OEM moveZ clamps against context-owned DefaultParameters.PSUDO_Z_HOME",
+            )
+        effective = max(int(req.z_pseudo_home), requested)
+        oem_method = "ClassControlInterface.moveZ"
+        source_anchor = "ClassControlInterface.cs:4254-4265"
+    elif axis is AxisName.Y:
+        effective = requested
+        oem_method = "ClassControlInterface.moveY"
+        source_anchor = "ClassControlInterface.cs:4246-4251"
+    else:
+        effective = requested
+        oem_method = "ClassControlInterface.moveG"
+        source_anchor = "ClassControlInterface.cs:4268-4273"
+    tester = _get_tester()
+
+    def execute() -> dict[str, Any]:
+        z_current = None
+        if axis is AxisName.Z:
+            preset = _axis_preset(tester, axis)
+            z_current = tester.motor_set_axis_param(
+                preset["board"], 6, int(preset["run_current"]), motor=preset["motor"]
+            )
+        result = _execute_absolute_move(
+            tester,
+            axis,
+            effective,
+            float(req.wait_timeout_s),
+            speed=None,
+            acc=None,
+            oem_exact=True,
+        )
+        result.update({
+            "oem_method": oem_method,
+            "source_anchor": source_anchor,
+            "requested_position_steps": requested,
+            "effective_position_steps": effective,
+            "z_pseudo_home": req.z_pseudo_home,
+            "z_run_current_param6": z_current,
+            "standby_current_param7_written": False,
+        })
+        return result
+
+    return await _run_blocking(
+        f"OEM manual absolute {req.axis} to {effective}",
+        execute,
+        timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
+    )
+
+
+@app.post("/motion/oem/manual/home")
+async def motion_oem_manual_home(req: OemManualHomeRequest):
+    """Dispatch the literal serial-206 OEM HomeAxis branch for one component."""
+    _require_motion_route_ready()
+    tester = _get_tester()
+
+    def execute() -> dict[str, Any]:
+        result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
+        if isinstance(result, dict):
+            result["oem_method"] = "ClassControlInterface.HomeAxis"
+            result["source_anchor"] = "ClassControlInterface.cs:4997-5052"
+            result["standby_current_param7_written"] = False
+        return result
+
+    result = await _run_blocking(
+        f"OEM manual home {req.axis}",
+        execute,
+        timeout_s=45.0,
+    )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
 @app.get("/motion/gripper/status")
 async def motion_gripper_status():
     projection = hardware_state.project("gripper")
@@ -6093,24 +6241,79 @@ async def motion_gripper_restore_idle_current(req: GripperRestoreIdleRequest):
 
 
 @app.post("/motion/gripper/clear")
-async def motion_gripper_clear(req: GripperActionRequest):
+async def motion_gripper_clear():
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper clear",
-        lambda: gripper_clear(tester, operator_ack=req.operator_ack, reason=req.reason, timeout_s=req.timeout_s),
-        timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 120.0),
+        lambda: gripper_clear(
+            tester,
+            operator_ack="GRIPPER_CLEAR",
+            reason="oem_manual_gripper_clear",
+            timeout_s=15.0,
+        ),
+        timeout_s=25.0,
     )
 
 
 @app.post("/motion/gripper/home")
-async def motion_gripper_home(req: GripperActionRequest):
+async def motion_gripper_home():
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper home",
-        lambda: gripper_home(tester, operator_ack=req.operator_ack, reason=req.reason, timeout_s=req.timeout_s),
-        timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 120.0),
+        lambda: gripper_home(
+            tester,
+            operator_ack="GRIPPER_HOME",
+            reason="oem_manual_gripper_home",
+            timeout_s=15.0,
+        ),
+        timeout_s=25.0,
+    )
+
+
+def _gripper_success_or_409(result: dict) -> dict:
+    if isinstance(result, dict) and result.get("ok") is True:
+        return result
+    raise HTTPException(status_code=409, detail=result)
+
+
+@app.post("/motion/gripper/open")
+async def motion_gripper_open():
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper open",
+        lambda: _gripper_success_or_409(
+            gripper_open(tester, operator_ack="GRIPPER_OPEN", reason="oem_manual_gripper_open", timeout_s=20.0)
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/gripper/open_wide")
+async def motion_gripper_open_wide():
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper open wide",
+        lambda: _gripper_success_or_409(
+            gripper_open_wide(tester, operator_ack="GRIPPER_OPEN_WIDE", reason="oem_manual_gripper_open_wide", timeout_s=20.0)
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/gripper/close")
+async def motion_gripper_close():
+    _require_motion_route_ready()
+    tester = _get_tester()
+    return await _run_blocking(
+        "OEM gripper close",
+        lambda: _gripper_success_or_409(
+            gripper_close(tester, operator_ack="GRIPPER_CLOSE", reason="oem_manual_gripper_close", timeout_s=20.0)
+        ),
+        timeout_s=30.0,
     )
 
 
@@ -6121,47 +6324,41 @@ def _thermal_door_success_or_409(result: dict) -> dict:
 
 
 @app.post("/motion/thermal_door/home")
-async def motion_thermal_door_home(req: ThermalDoorActionRequest):
-    if req.operator_ack != "HOME_THERMAL_DOOR":
-        raise HTTPException(status_code=422, detail="operator_ack must be HOME_THERMAL_DOOR")
+async def motion_thermal_door_home():
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
         "OEM thermal door home",
         lambda: _thermal_door_success_or_409(
-            tester.motor_oem_door_search_home(timeout_s=req.timeout_s, startup=False)
+            tester.motor_oem_door_search_home(timeout_s=20.0, startup=False)
         ),
-        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
+        timeout_s=30.0,
     )
 
 
 @app.post("/motion/thermal_door/open")
-async def motion_thermal_door_open(req: ThermalDoorActionRequest):
-    if req.operator_ack != "OPEN_THERMAL_DOOR":
-        raise HTTPException(status_code=422, detail="operator_ack must be OPEN_THERMAL_DOOR")
+async def motion_thermal_door_open():
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
         "OEM thermal door open",
         lambda: _thermal_door_success_or_409(
-            tester.motor_oem_open_thermal_door(timeout_s=req.timeout_s)
+            tester.motor_oem_open_thermal_door(timeout_s=20.0)
         ),
-        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
+        timeout_s=30.0,
     )
 
 
 @app.post("/motion/thermal_door/close")
-async def motion_thermal_door_close(req: ThermalDoorActionRequest):
-    if req.operator_ack != "CLOSE_THERMAL_DOOR":
-        raise HTTPException(status_code=422, detail="operator_ack must be CLOSE_THERMAL_DOOR")
+async def motion_thermal_door_close():
     _require_motion_route_ready()
     tester = _get_tester()
     return await _run_blocking(
         "OEM thermal door close",
         lambda: _thermal_door_success_or_409(
-            tester.motor_oem_close_thermal_door(timeout_s=req.timeout_s)
+            tester.motor_oem_close_thermal_door(timeout_s=20.0)
         ),
-        timeout_s=max(25.0, float(req.timeout_s) + 10.0),
+        timeout_s=30.0,
     )
 
 
