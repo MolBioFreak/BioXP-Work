@@ -5471,6 +5471,11 @@ async def motion_oem_prepare_without_motion():
                 "physical_motion_commanded": False,
             },
         ) from exc
+    ownership_bootstrap = None
+    if _tester is None and _generic_lifespan_claim_pending:
+        # The one-click no-motion preparation owns the complete source lifecycle:
+        # claim service USB first, then activate boards and apply the OEM profile.
+        ownership_bootstrap = await reconnect_runtime()
     hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
     tester = _get_tester()
     result = await _run_blocking(
@@ -5480,6 +5485,7 @@ async def motion_oem_prepare_without_motion():
     )
     response = {
         **result,
+        "ownership_bootstrap": ownership_bootstrap,
         "next_required_action": "Collect a new canonical hardware snapshot before any motion admission.",
     }
     if result.get("ok") is not True:
