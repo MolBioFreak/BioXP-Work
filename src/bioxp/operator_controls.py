@@ -291,6 +291,9 @@ def _dependency(key: str, label: str, met: bool, reason: str | None = None) -> d
 
 _TRANSPORT_BOOTSTRAP_PATHS = {
     "/reconnect",
+    # This source-grounded, no-motion route establishes board/profile readiness;
+    # blocking it on stale published transport state creates an admission deadlock.
+    "/motion/oem/prepare_without_motion",
 }
 
 _LOCAL_ONLY_PATH_PREFIXES = (
