@@ -22,6 +22,18 @@ class BoundedBody(BaseModel):
     number_lt: float = Field(ge=-2.5, lt=2.5)
 
 
+class AckBody(BaseModel):
+    operator_ack: str
+
+
+class StageApproval(BaseModel):
+    approval_id: str
+
+
+class OptionalNestedBody(BaseModel):
+    stage_approval: StageApproval | None = None
+
+
 def make_app(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     app = FastAPI()
@@ -52,6 +64,16 @@ def make_app(tmp_path: Path, monkeypatch):
     async def bounded(body: BoundedBody):
         calls.append(("bounded", body.model_dump()))
         return {"ok": True, **body.model_dump()}
+
+    @app.post("/motion/gripper/clear")
+    async def gripper_clear(body: AckBody):
+        calls.append(("gripper_clear", body.model_dump()))
+        return {"ok": True}
+
+    @app.post("/motion/optional-nested")
+    async def optional_nested(body: OptionalNestedBody):
+        calls.append(("optional_nested", body.model_dump()))
+        return {"ok": True}
 
     @app.post("/pipette/{channel}/aspirate")
     def pipette_aspirate(channel: int, volume_ul: float):
@@ -120,6 +142,31 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert len(motors["stages"]) == 19
     assert catalog["dashboard"]["snapshot"]["collection_triggered"] is False
     assert all("enabled" in row and "dependencies" in row for row in catalog["actions"])
+    assert all(
+        input_spec["name"] not in {"operator_ack", "operator_reason"}
+        for action in catalog["actions"]
+        for input_spec in action["inputs"]
+    )
+    optional_nested = action_for(catalog, "POST", "/motion/optional-nested")
+    assert next(row for row in optional_nested["inputs"] if row["name"] == "stage_approval")["default"] is None
+
+
+def test_operator_ack_is_not_user_input_and_is_supplied_internally(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/gripper/clear")
+    assert all(row["name"] != "operator_ack" for row in action["inputs"])
+    response = client.post(
+        f"/operator/actions/{action['action_id']}",
+        json={
+            "expected_generation": catalog["ownership_generation"],
+            "idempotency_key": "implicit-ack-gripper-clear",
+            "inputs": {},
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert calls == [("gripper_clear", {"operator_ack": "GRIPPER_CLEAR"})]
 
 
 def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_cannot_dispatch(tmp_path, monkeypatch):

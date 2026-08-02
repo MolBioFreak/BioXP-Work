@@ -142,8 +142,6 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
     raw_type = schema.get("type")
     value_type = "enum" if enum_values else raw_type if raw_type in {"string", "integer", "number", "boolean"} else "json"
     default = schema.get("default")
-    if value_type == "json" and default is None:
-        default = {} if raw_type == "object" else [] if raw_type == "array" else None
     return {
         "name": re.sub(r"[^a-z0-9_]", "_", name.lower()),
         "wire_name": name,
@@ -160,6 +158,42 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
         "exclusive_maximum": schema.get("exclusiveMaximum") if isinstance(schema.get("exclusiveMaximum"), (int, float)) else None,
         "default": _bounded_json(default, 4096) if default is not None else None,
     }
+
+
+_IMPLICIT_OPERATOR_ACK_BY_PATH = {
+    "/diagnostics/usb-sniff/start": "USB_SNIFF",
+    "/diagnostics/usb-sniff/stop": "USB_SNIFF",
+    "/maintenance/usb/recover_motion": "RECOVER",
+    "/motion/arm/strict_startup": "RECOVER_MOTION",
+    "/motion/diagnostics/execute": "RUN_AXIS_DIAGNOSTIC",
+    "/motion/diagnostics/stop": "STOP_AXIS",
+    "/motion/gripper/clear": "GRIPPER_CLEAR",
+    "/motion/gripper/home": "GRIPPER_HOME",
+    "/motion/interlock/override": "INTERLOCK_OVERRIDE",
+    "/motion/oem/home_xy": "HOMEXY",
+    "/motion/oem/rehome": "REHOME",
+    "/motion/oem/serial206/initialize_motors": "INITIALIZE_MOTORS_STAGE",
+    "/motion/oem/serial206/initialize_motion": "INITIALIZE_MOTION_STAGE",
+    "/motion/thermal_door/home": "HOME_THERMAL_DOOR",
+    "/motion/thermal_door/open": "OPEN_THERMAL_DOOR",
+    "/motion/thermal_door/close": "CLOSE_THERMAL_DOOR",
+    "/oem/initial_check": "INITIALIZE",
+    "/oem/startup/initialize_environment": "INITIALIZE",
+    "/oem/startup/request": "INITIALIZE",
+    "/oem/runtime/movement-runs": "OEM_PATH_EXECUTE",
+}
+
+
+def _implicit_operator_ack(path: str, inputs: Mapping[str, Any]) -> Any:
+    if path == "/motion/axes/current":
+        return True
+    if path == "/motion/oem/initialization/run":
+        return "OEM_INITIALIZATION_RUN_WITH_HOMING" if inputs.get("run_homing") is True else "OEM_INITIALIZATION_RUN"
+    if path == "/motion/oem/initialize_motion":
+        return "INITIALIZE_WITH_HOMING" if inputs.get("run_homing") is True else "INITIALIZE"
+    if path.startswith("/oem/runtime/commands/"):
+        return "INITIALIZE" if inputs.get("mode") == "live" else None
+    return _IMPLICIT_OPERATOR_ACK_BY_PATH.get(path)
 
 
 _LATCH_CAPABLE_INITIALIZATION_PATHS = {
@@ -557,6 +591,13 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
             for raw_name, raw_schema in properties.items():
                 schema = _resolve_schema(raw_schema, document) if isinstance(raw_schema, Mapping) else {}
                 name = re.sub(r"[^a-z0-9_]", "_", str(raw_name).lower())
+                if raw_name in {"operator_ack", "operator_reason"}:
+                    locations[name] = {
+                        "location": "body",
+                        "wire_name": str(raw_name),
+                        "implicit_operator_control": True,
+                    }
+                    continue
                 spec = _input_spec(name, schema, required=raw_name in required_names, location="body")
                 spec["wire_name"] = str(raw_name)
                 specs.append(spec)
@@ -803,9 +844,17 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
     if set(inputs) - allowed:
         raise HTTPException(status_code=422, detail={"error": "unknown_action_inputs", "unknown": sorted(set(inputs) - allowed)})
     for name, metadata in locations.items():
-        if name not in inputs:
-            continue
-        value = inputs[name]
+        if metadata.get("implicit_operator_control"):
+            if name == "operator_ack":
+                value = _implicit_operator_ack(path_template, inputs)
+                if value is None:
+                    continue
+            else:
+                value = "operator control invocation"
+        else:
+            if name not in inputs:
+                continue
+            value = inputs[name]
         location = str(metadata["location"])
         wire_name = str(metadata["wire_name"])
         if location == "path":
