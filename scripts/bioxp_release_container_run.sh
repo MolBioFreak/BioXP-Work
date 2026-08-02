@@ -18,7 +18,7 @@ CONTAINER_NAME=bioxp-robot-handler-prod
 PORT=8123
 LOCK_DIR=/var/lib/bioxp-oem-authority
 LOCK_FILE=/var/lib/bioxp-oem-authority/OEM_EVIDENCE_LOCK.json
-STATE_DIR=/home/molbiofreak/bioxp_re/.oem_runtime_state
+STATE_DIR=/var/lib/bioxp-oem-runtime
 
 SCRIPT_PATH="$($READLINK -f -- "${BASH_SOURCE[0]}")"
 APP_DIR="$(cd "$($DIRNAME "$SCRIPT_PATH")/.." && /bin/pwd -P)"
