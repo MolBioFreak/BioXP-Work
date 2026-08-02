@@ -17,7 +17,7 @@ def test_source_grounded_prepare_and_physical_stop_are_bound_operator_actions():
     assert prepare["informational_path"] == "/motion/oem/prepare_without_motion"
     assert prepare["provider_available"] is True
     assert prepare["enabled"] is True
-    assert {row["wire_name"] for row in prepare["inputs"]} == {"operator_ack", "operator_reason"}
+    assert prepare["inputs"] == []
 
     emergency = actions["meta.emergency_stop"]
     assert emergency["informational_path"] == "/motion/emergency_stop"
@@ -33,7 +33,6 @@ def test_legacy_inferred_power_routes_fail_closed_without_tester_access(monkeypa
     monkeypatch.setattr(api_module, "_get_tester", forbidden)
     for handler in (
         api_module.prepare_interlock,
-        api_module.motion_power_enable,
         api_module.motion_power_diag,
     ):
         with pytest.raises(HTTPException) as raised:
@@ -42,17 +41,9 @@ def test_legacy_inferred_power_routes_fail_closed_without_tester_access(monkeypa
         assert raised.value.detail["physical_motion_commanded"] is False
 
 
-def test_no_motion_prepare_requires_explicit_ack_before_authority_or_tester(monkeypatch):
-    def forbidden():
-        raise AssertionError("invalid acknowledgement must reject before provider access")
-
-    monkeypatch.setattr(api_module.Serial206MotionAuthority, "from_active_snapshot", forbidden)
-    monkeypatch.setattr(api_module, "_get_tester", forbidden)
-    request = api_module.MotionPrepareWithoutMotionRequest(
-        operator_ack="WRONG",
-        operator_reason="commissioning preflight",
-    )
-    with pytest.raises(HTTPException) as raised:
-        asyncio.run(api_module.motion_oem_prepare_without_motion(request))
-    assert raised.value.status_code == 409
-    assert raised.value.detail["physical_motion_commanded"] is False
+def test_no_motion_prepare_and_power_alias_are_one_click_no_input_routes():
+    paths = api_module.app.openapi()["paths"]
+    for path in ("/motion/oem/prepare_without_motion", "/motion/power/enable"):
+        operation = paths[path]["post"]
+        assert "requestBody" not in operation
+        assert operation.get("parameters", []) == []

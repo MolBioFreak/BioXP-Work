@@ -1290,16 +1290,6 @@ class MotionHardResetRequest(BaseModel):
     rounds: int = Field(2, ge=1, le=5)
 
 
-class MotionPrepareWithoutMotionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    operator_ack: str = Field(
-        ...,
-        description="Must be exactly PREPARE_NO_MOTION; this route writes OEM board/parameter state but never homes or moves an axis.",
-    )
-    operator_reason: str = Field(..., min_length=1, max_length=2000)
-
-
 class MotionArmStartupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -5410,7 +5400,7 @@ async def prepare_interlock():
         status_code=410,
         detail={
             "error": "legacy_inferred_motion_prepare_quarantined",
-            "message": "This legacy inferred latch/power route is retired. Use /motion/oem/prepare_without_motion with explicit operator acknowledgement.",
+            "message": "This legacy inferred latch/power route is retired. Use the one-click /motion/oem/prepare_without_motion route.",
             "replacement": "/motion/oem/prepare_without_motion",
             "physical_motion_commanded": False,
         },
@@ -5418,16 +5408,7 @@ async def prepare_interlock():
 
 
 @app.post("/motion/oem/prepare_without_motion")
-async def motion_oem_prepare_without_motion(req: MotionPrepareWithoutMotionRequest):
-    if req.operator_ack != "PREPARE_NO_MOTION":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "operator_ack_required",
-                "message": "operator_ack must be exactly PREPARE_NO_MOTION",
-                "physical_motion_commanded": False,
-            },
-        )
+async def motion_oem_prepare_without_motion():
     try:
         authority = Serial206MotionAuthority.from_active_snapshot()
     except Exception as exc:
@@ -5448,7 +5429,6 @@ async def motion_oem_prepare_without_motion(req: MotionPrepareWithoutMotionReque
     )
     response = {
         **result,
-        "operator_reason": req.operator_reason,
         "next_required_action": "Collect a new canonical hardware snapshot before any motion admission.",
     }
     if result.get("ok") is not True:
@@ -5486,9 +5466,9 @@ async def motion_power_status():
 
 
 @app.post("/motion/power/enable")
-async def motion_power_enable(req: MotionPrepareWithoutMotionRequest):
+async def motion_power_enable():
     """Compatibility alias for the source-grounded serial-206 power preparation."""
-    return await motion_oem_prepare_without_motion(req)
+    return await motion_oem_prepare_without_motion()
 
 
 @app.post("/motion/power/diag", deprecated=True)
