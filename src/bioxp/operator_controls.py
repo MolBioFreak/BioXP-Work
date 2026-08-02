@@ -376,6 +376,10 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     method = str(action.get("informational_method") or "GET")
     safety = str(action.get("safety_class") or "read_only")
     path = str(action.get("informational_path") or "").lower()
+    source_initializer = path in {
+        "/motion/oem/serial206/initialize_motors",
+        "/motion/oem/serial206/initialize_motion",
+    }
     requires_transport = (method != "GET" or safety in {"stop", "emergency"}) and path not in _TRANSPORT_BOOTSTRAP_PATHS
     ownership_value = machine_state.get("ownership")
     ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
@@ -391,6 +395,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         requires_transport
         and safety not in {"stop", "emergency"}
         and path not in _CAN_BOOTSTRAP_PATHS
+        and not source_initializer
         and (safety == "motion" or _motor_motion_action(action))
     )
     if requires_can:
@@ -401,7 +406,15 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "Same-epoch CAN readiness has not been established.",
         ))
 
-    if safety == "motion" or _motor_motion_action(action):
+    if source_initializer:
+        maintenance_value = machine_state.get("maintenance")
+        maintenance = maintenance_value if isinstance(maintenance_value, Mapping) else {}
+        motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
+        dependencies.append(_dependency(
+            "motion_enabled", "Motion enabled", motion_enabled,
+            "Motion is inactive. Activate motion before starting OEM initialization.",
+        ))
+    elif safety == "motion" or _motor_motion_action(action):
         readiness = _motion_readiness(machine_state, _required_reference_axes(action, values))
         existing_keys = {row["key"] for row in dependencies}
         dependencies.extend(row for row in readiness["dependencies"] if row["key"] not in existing_keys)
@@ -650,12 +663,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     meta = [
         {
             "action_id": "meta.activate_motion",
-            "label": "Prepare Motion Without Movement (OEM source sequence)",
+            "label": "Activate 24 V / Prepare Motion (OEM, No Movement)",
             "subsystem": "meta",
             "category": "activation",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Activate serial-206 motor boards, apply initializeMotorsWithoutMotion parameters, and verify 24 V/door/latch readbacks. This does not home or move an axis and does not claim a global 24 V switch.",
+            "description": "Activate the serial-206 motor power path using the OEM board-activation and initializeMotorsWithoutMotion sequence, then verify 24 V/door/latch readbacks. This does not home or move an axis.",
             "source_anchor": "ClassIOControl.query24VSensor:92-110; ClassControlInterface.initializeMotorsWithoutMotion:3181-3265; activateBoard:3474-3493",
             "informational_method": "POST",
             "informational_path": "/motion/oem/prepare_without_motion",

@@ -180,7 +180,7 @@ def test_production_capability_requires_frozen_selected_branches_and_calibrated_
         def motor_prepare_axis(self, *args, **kwargs): pass
         def motor_oem_open_thermal_door(self, *args, **kwargs): pass
         def _motion_oem_axis_profile(self, *args, **kwargs): pass
-        def _oem_no_motion_tmcl_with_readback(self, *args, **kwargs): pass
+        def chiller_gp_write(self, *args, **kwargs): pass
         def _machine_config_bundle(self):
             return {"ok": True, "config": {"config": {"GripperVersion": "1"}, "calibration": {"Calibrated": "1"}}}
 
@@ -214,7 +214,7 @@ def test_production_capability_rejects_nonfrozen_serial206_branch_selection(grip
         def motor_move_absolute(self, *args, **kwargs): pass
         def motor_oem_door_search_home(self, *args, **kwargs): pass
         def motor_thermal_door_status(self, *args, **kwargs): pass
-        def _oem_no_motion_tmcl_with_readback(self, *args, **kwargs): pass
+        def chiller_gp_write(self, *args, **kwargs): pass
         def oem_set_calibrated_ui_positions_zero(self): pass
         def _machine_config_bundle(self):
             return {"ok": True, "config": {"config": {"GripperVersion": gripper_version}, "calibration": {"Calibrated": calibrated}}}

@@ -319,7 +319,7 @@ def test_production_adapter_exposes_only_source_grounded_existing_primitives(mon
         def motor_thermal_door_status(self): return {"ok": True}
         def _machine_config_bundle(self):
             return {"ok": True, "config": {"config": {"GripperVersion": 1}, "calibration": {"Calibrated": 1}}}
-        def _oem_no_motion_tmcl_with_readback(self, **kwargs): return {"ok": True}
+        def chiller_gp_write(self, *args, **kwargs): return {"ok": True, "verified": True, "ack": dict(ACK), "readback": {"ok": True, "value": args[2]}}
         def oem_set_calibrated_ui_positions_zero(self): return {"ok": True}
 
     class Pipettes:

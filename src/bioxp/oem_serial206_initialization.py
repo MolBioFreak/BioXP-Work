@@ -259,7 +259,7 @@ class Serial206ProductionPrimitiveAdapter:
         "motor_thermal_door_status",
         "_motion_oem_axis_profile",
         "_machine_config_bundle",
-        "_oem_no_motion_tmcl_with_readback",
+        "chiller_gp_write",
     )
 
     def __init__(
@@ -430,7 +430,25 @@ class Serial206ProductionPrimitiveAdapter:
         return self.tester._machine_config_bundle()
 
     def _oem_no_motion_tmcl_with_readback(self, **kwargs: Any) -> Any:
-        return self.tester._oem_no_motion_tmcl_with_readback(**kwargs)
+        board = int(kwargs["board"])
+        command = int(kwargs["command"])
+        if board != int(self.tester.BOARD_CHILLER) or command != 9:
+            return {"ok": False, "failure": "unsupported_oem_gp_write", "board": board, "command": command}
+        row = self.tester.chiller_gp_write(
+            int(kwargs["cmd_type"]), int(kwargs["motor"]), int(kwargs["value"]), verify=True,
+        )
+        return {
+            "name": str(kwargs["name"]),
+            "board": board,
+            "command": command,
+            "cmd_type": int(kwargs["cmd_type"]),
+            "motor": int(kwargs["motor"]),
+            "value": int(kwargs["value"]),
+            "ack": row.get("ack") if isinstance(row, Mapping) else None,
+            "readback": row.get("readback") if isinstance(row, Mapping) else None,
+            "verified": row.get("verified") if isinstance(row, Mapping) else False,
+            "ok": bool(isinstance(row, Mapping) and row.get("ok") is True and row.get("verified") is True),
+        }
 
     def oem_initialize_motors_branch_binding(self) -> dict[str, Any]:
         status = self.capability_status()
