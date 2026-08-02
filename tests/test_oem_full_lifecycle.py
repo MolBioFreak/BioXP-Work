@@ -14,7 +14,7 @@ from src.bioxp.oem_full_lifecycle import (
     current_authority_identity,
     current_registry_sha256,
 )
-from src.bioxp.oem_movement_ledger import OEM_INITIALIZE_MOTORS_STAGES
+from src.bioxp.oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGES
 from src.bioxp.oem_runtime_store import OEMRuntimeStore
 
 

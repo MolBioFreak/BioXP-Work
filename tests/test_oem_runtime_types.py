@@ -6,7 +6,6 @@ from src.bioxp.oem_runtime_types import OEMCommandName, OEMRuntimeCommand
 def test_oem_command_vocabulary_is_exact():
     assert [c.value for c in OEMCommandName] == [
         "initializeSystem",
-        "startupHomingStepwise",
         "unlockProcess",
         "PrepareToRunJob",
         "abortjob",

@@ -33,7 +33,7 @@ from .oem_full_lifecycle import (
     current_registry_sha256,
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
-from .oem_movement_ledger import OEM_INITIALIZE_MOTORS_STAGE_KEYS
+from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGE_KEYS
 from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
 
 CATALOG_SCHEMA = "bioxp.operator_control_catalog.v1"

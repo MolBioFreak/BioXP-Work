@@ -19,7 +19,7 @@ from .oem_machine_bundle import (
     OEM_MACHINE_BUNDLE_LOCK_ENV,
     OEM_MACHINE_SERIAL,
 )
-from .oem_movement_ledger import OEM_INITIALIZE_MOTORS_STAGES
+from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGES
 from .oem_runtime_store import OEMRuntimeStore
 from .oem_runtime_types import new_id, utc_ts
 

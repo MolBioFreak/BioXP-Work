@@ -120,19 +120,6 @@ class OEMRuntimeStore:
             return None
         return json.loads(p.read_text())
 
-    def write_oem_movement_ledger(self, ledger: dict[str, Any]) -> dict[str, Any]:
-        """Persist the robot-owned initializeMotors source-order ledger atomically."""
-        payload = dict(ledger)
-        with self._lock:
-            payload["sequence"] = self.next_seq()
-            _atomic_json(self.root / "oem_initialize_motors_ledger.json", payload)
-        return payload
-
-    def read_oem_movement_ledger(self) -> dict[str, Any] | None:
-        path = self.root / "oem_initialize_motors_ledger.json"
-        if not path.exists():
-            return None
-        return json.loads(path.read_text())
 
     def create_oem_full_lifecycle_run_once(
         self,

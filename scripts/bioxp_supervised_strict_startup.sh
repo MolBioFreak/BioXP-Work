@@ -125,7 +125,7 @@ echo "RUN_DIR=${RUN_DIR}"
 if [[ "$RUN_HOMING" -eq 1 ]]; then
   echo
   echo "DISABLED: monolithic --homing is blocked after live testing showed it can wedge USB and hide wrong motion."
-  echo "Use ./scripts/bioxp_supervised_oem_startup_homing_stepwise.sh instead; it logs and confirms each physical step."
+  echo "Use the serial-206 initialization provider via /motion/oem/initialization/initialize_motors or the robot-owned operator catalog; it admits one exact OEM stage at a time."
   exit 2
 fi
 

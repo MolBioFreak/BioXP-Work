@@ -54,32 +54,6 @@ def test_runtime_api_door_event_does_not_auto_queue_initialize_system(tmp_path, 
     assert "queued_initializeSystem" not in resp.json()["actions_taken"]
 
 
-def test_runtime_api_accepts_typed_stage_name_and_binds_robot_owned_artifact_root(tmp_path, monkeypatch):
-    captured = []
-
-    class Worker:
-        def enqueue(self, command):
-            captured.append(command)
-            return {"ok": True, "queued": True, "command_id": command.command_id}
-
-    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(oem_runtime_api, "_require_runtime", lambda: (object(), Worker(), object(), object()))
-    req = oem_runtime_api.RuntimeCommandRequest(
-        mode="live",
-        operator_ack="HOME",
-        artifact_root="/remote/client/must/not/control/this",
-        params={"homing_step": "z-home"},
-    )
-
-    result = oem_runtime_api._enqueue("startupHomingStepwise", req)
-
-    assert result["queued"] is True
-    assert captured[0].name == "startupHomingStepwise"
-    assert captured[0].params == {"homing_step": "z-home"}
-    assert captured[0].artifact_root.startswith(str(tmp_path / "artifacts"))
-    assert captured[0].artifact_root != req.artifact_root
-
-
 def test_runtime_api_exposes_exact_command_terminal_result_by_id(tmp_path):
     runtime = oem_runtime_api.configure_runtime(store_root=str(tmp_path), autostart=False)
     client = TestClient(app)

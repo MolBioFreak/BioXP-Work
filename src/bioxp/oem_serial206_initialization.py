@@ -20,7 +20,12 @@ from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
-from .oem_movement_ledger import OemMovementLedger, OEM_INITIALIZE_MOTORS_STAGE_KEYS
+from .oem_serial206_initialization_contract import (
+    OEM_INITIALIZE_MOTORS_STAGE_KEYS,
+    SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA,
+    advance_initialize_motors_ledger,
+    new_initialize_motors_ledger,
+)
 from .oem_parity_config import load_oem_parity_config
 from .pipette.models import PipetteInitCommand
 from .services.reference_service import MarkAxisDesyncedCommand, MarkAxisReferencedCommand
@@ -967,7 +972,7 @@ class Serial206OemInitializationProvider:
 
     @staticmethod
     def _new_state() -> dict[str, Any]:
-        movement_ledger = OemMovementLedger._new()
+        movement_ledger = new_initialize_motors_ledger()
         movement_ledger["stage_order"] = list(OEM_INITIALIZE_MOTORS_STAGE_KEYS)
         return {
             "schema_version": _STATE_SCHEMA,
@@ -1093,7 +1098,7 @@ class Serial206OemInitializationProvider:
             raise ValueError("prepared generation/evidence is invalid")
 
         ledger = state.get("movement_ledger")
-        if not isinstance(ledger, dict) or ledger.get("schema_version") != OemMovementLedger.schema_version:
+        if not isinstance(ledger, dict) or ledger.get("schema_version") != SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA:
             raise ValueError("movement ledger schema mismatch")
         rows = ledger.get("stages")
         order = list(OEM_INITIALIZE_MOTORS_STAGE_KEYS)
@@ -1181,7 +1186,7 @@ class Serial206OemInitializationProvider:
 
     def _corrupt_projection(self) -> dict[str, Any]:
         return {
-            "schema_version": OemMovementLedger.schema_version,
+            "schema_version": SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA,
             "expected_next_stage": None,
             "terminal_state": "failed_closed",
             "compatibility_blocker": "durable_serial206_state_corrupt",
@@ -1468,7 +1473,7 @@ class Serial206OemInitializationProvider:
                 ledger["terminal_state"] = "awaiting_operator_observation"
             else:
                 row["state"] = "completed"
-                OemMovementLedger._advance_after_completed_stage(ledger, spec.key)
+                advance_initialize_motors_ledger(ledger, spec.key)
             try:
                 self._save_state(state)
             except Exception:
@@ -1536,7 +1541,7 @@ class Serial206OemInitializationProvider:
             else:
                 row["state"] = "operator_observed"
                 self._mark_referenced(spec, row.get("result"))
-                OemMovementLedger._advance_after_completed_stage(ledger, selected)
+                advance_initialize_motors_ledger(ledger, selected)
                 ok = True
                 blockers = []
             try:

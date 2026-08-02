@@ -369,23 +369,3 @@ def test_direct_startup_step_route_is_retired_before_readiness_or_tester_access(
         asyncio.run(api.motion_oem_startup_step(api.OemStartupStepRequest(step="x-home", timeout_s=10)))
     assert exc.value.status_code == 410
     assert exc.value.detail["physical_motion_commanded"] is False
-
-
-def test_legacy_startup_homing_stepwise_live_is_retired_before_ledger_or_program_access(tmp_path):
-    class Program:
-        @property
-        def hardware(self):
-            raise AssertionError("legacy hardware accessed")
-
-    store = OEMRuntimeStore(tmp_path / "runtime")
-    handler = OEMRuntimeCommandHandlers(startup_program=Program(), store=store)
-    result = handler.handle_startup_homing_stepwise(OEMRuntimeCommand(
-        name="startupHomingStepwise",
-        mode="live",
-        operator_ack="HOME",
-        artifact_root=str(tmp_path / "artifacts"),
-        params={"homing_step": "x-home"},
-    ))
-    assert result["ok"] is False
-    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["blockers"]
-    assert store.read_oem_movement_ledger() is None

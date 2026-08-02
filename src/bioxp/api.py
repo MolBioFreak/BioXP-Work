@@ -57,7 +57,6 @@ from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
 from .oem_runtime_api import (
     configure_runtime as configure_oem_runtime,
-    movement_ledger_projection as oem_movement_ledger_projection,
     router as oem_runtime_router,
     shutdown_runtime as shutdown_oem_runtime,
 )
@@ -3622,6 +3621,7 @@ def _status_payload() -> dict:
         and ownership.get("router") == "running"
     )
     lifecycle = lifecycle_state.projection()
+    serial206_initialization = serial206_oem_initialization_provider_status()
     return {
         **projection,
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
@@ -3639,7 +3639,9 @@ def _status_payload() -> dict:
         "operation_state": lifecycle["operation_state"],
         "startup": lifecycle["startup"],
         "lifecycle": lifecycle,
-        "oem_initialize_motors": oem_movement_ledger_projection(),
+        "oem_initialize_motors": serial206_initialization.get("initialize_motors"),
+        "oem_initialize_motion": serial206_initialization.get("initialize_motion_ledger"),
+        "serial206_initialization": serial206_initialization,
     }
 
 
@@ -5609,7 +5611,8 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
             status_code=409,
             detail=(
                 "Monolithic strict_startup run_homing is disabled after live testing showed wrong/hidden motion "
-                "and USB-busy emergency-stop failure. Use scripts/bioxp_supervised_oem_startup_homing_stepwise.sh."
+                "and USB-busy emergency-stop failure. Use the serial-206 initialization provider through "
+                "POST /motion/oem/initialization/initialize_motors or the robot-owned operator catalog."
             ),
         )
     operator_reason = str(req.operator_reason or "").strip()
