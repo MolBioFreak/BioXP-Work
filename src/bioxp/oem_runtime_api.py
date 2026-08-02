@@ -31,6 +31,7 @@ _worker = None
 _events: OEMRuntimeEventRouter | None = None
 _status: OEMRuntimeStatusService | None = None
 _startup_program_factory = None
+_serial206_provider_factory = None
 _full_lifecycle_runs: OemFullLifecycleRuns | None = None
 
 
@@ -84,18 +85,21 @@ class DoorEventRequest(BaseModel):
 def configure_runtime(
     *,
     startup_program_factory=None,
+    serial206_provider_factory=None,
     store_root: str | None = None,
     terminal_snapshot_hook=None,
     autostart: bool = True,
 ):
-    global _store, _worker, _events, _status, _startup_program_factory, _full_lifecycle_runs
+    global _store, _worker, _events, _status, _startup_program_factory, _serial206_provider_factory, _full_lifecycle_runs
     _startup_program_factory = startup_program_factory
+    _serial206_provider_factory = serial206_provider_factory
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
     # Do not call startup_program_factory during API startup: on robot it may open USB.
     # Runtime commands call it lazily only when an initialCheck/startup substage is explicitly requested.
     handlers = OEMRuntimeCommandHandlers(
         startup_program=None,
         startup_program_factory=startup_program_factory,
+        serial206_provider_factory=serial206_provider_factory,
         store=_store,
     )
     from .oem_runtime_worker import OEMRuntimeWorker
@@ -462,7 +466,10 @@ def runtime_prepare_to_run_job_readiness_dry_run(req: RuntimeCommandRequest):
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    handlers = OEMRuntimeCommandHandlers(startup_program_factory=_startup_program_factory)
+    handlers = OEMRuntimeCommandHandlers(
+        startup_program_factory=_startup_program_factory,
+        serial206_provider_factory=_serial206_provider_factory,
+    )
     return handlers.handle_prepare_to_run_job_readiness(cmd)
 
 

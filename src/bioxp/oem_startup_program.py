@@ -383,7 +383,7 @@ class BioXpStartupHardware:
                 "physical_motion": False,
                 "hardware_touched": False,
                 "step": {"step": selected},
-                "durable_robot_state": {"system_status": 1, "ready": True},
+                "durable_robot_state": {"system_status": 1, "initialization_complete": True, "ready": False},
                 "source_anchor": "ClassControlInterface.initializeMotors:3416",
                 "oem_source_order_preserved": True,
             }
@@ -489,7 +489,7 @@ class BioXpStartupHardware:
             {"step": "ui-zero-calibrated", "oem_anchor": "initializeMotors: Calibrated UI X/Y/Z zero writes", "requires_operator_observation": False},
             {"step": "chiller-oc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(OC)", "requires_operator_observation": False},
             {"step": "chiller-rc-cool-rate", "oem_anchor": "initializeMotors: setChillerCoolRate(RC)", "requires_operator_observation": False},
-            {"step": "system-status-initialized", "oem_anchor": "initializeMotors: system status=1, ready=true", "requires_operator_observation": False},
+            {"step": "system-status-initialized", "oem_anchor": "initializeMotors: system status=1 (initialization completion only)", "requires_operator_observation": False},
 
         ]
         if selected in {"plan", "full", "all", ""}:

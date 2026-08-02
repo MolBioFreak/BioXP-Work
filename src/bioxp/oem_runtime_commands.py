@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from .oem_runtime_types import OEMRuntimeCommand
 from .oem_initialization import run_oem_initialization_controller
 from .oem_movement_ledger import OemMovementLedger
+from .oem_serial206_initialization import Serial206CommissioningEvidence, Serial206StageApproval
 
 
 PREPARE_TO_RUN_JOB_READINESS_SCHEMA_VERSION = "bioxp.oem_runtime.prepare_to_run_job_readiness.v1"
@@ -35,15 +36,67 @@ PREPARE_TO_RUN_JOB_READINESS_STEPS = [
 
 
 class OEMRuntimeCommandHandlers:
-    def __init__(self, *, startup_program=None, startup_program_factory=None, store=None):
+    def __init__(
+        self,
+        *,
+        startup_program=None,
+        startup_program_factory=None,
+        serial206_provider_factory=None,
+        store=None,
+    ):
         self.startup_program = startup_program
         self.startup_program_factory = startup_program_factory
+        self.serial206_provider_factory = serial206_provider_factory
         self.movement_ledger = OemMovementLedger(store)
 
     def _startup_program(self):
         if self.startup_program is None and self.startup_program_factory is not None:
             self.startup_program = self.startup_program_factory()
         return self.startup_program
+
+    def _serial206_provider(self, capability: str):
+        if self.serial206_provider_factory is None:
+            raise RuntimeError("serial-206 initialization provider factory is not bound")
+        provider = self.serial206_provider_factory()
+        status = provider.capability_status()
+        available_field = f"{capability}_live_available"
+        if status.get(available_field) is not True:
+            raise RuntimeError(f"serial-206 provider lacks {capability}: {status}")
+        return provider
+
+    @staticmethod
+    def _stage_approval(value: Any) -> Serial206StageApproval | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ValueError("stage_approval must be an object")
+        return Serial206StageApproval(**dict(value))
+
+    @staticmethod
+    def _stage_approvals(value: Any) -> dict[str, Serial206StageApproval]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("stage approvals must be an object keyed by source stage")
+        parsed: dict[str, Serial206StageApproval] = {}
+        for stage, payload in value.items():
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"stage approval must be an object: {stage}")
+            parsed[str(stage)] = Serial206StageApproval(**dict(payload))
+        return parsed
+
+    @staticmethod
+    def _commissioning(value: Any) -> dict[str, Serial206CommissioningEvidence]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("commissioning must be an object keyed by component")
+        parsed: dict[str, Serial206CommissioningEvidence] = {}
+        for component, payload in value.items():
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"commissioning evidence must be an object: {component}")
+            parsed[str(component)] = Serial206CommissioningEvidence(**dict(payload))
+        return parsed
 
     def handlers(self) -> dict[str, Any]:
         return {
@@ -57,25 +110,22 @@ class OEMRuntimeCommandHandlers:
         }
 
     def handle_startup_homing_stepwise(self, command: OEMRuntimeCommand) -> dict[str, Any]:
-        """Execute or observe exactly one ledger-bound initializeMotors stage."""
+        """Fail closed for live legacy stage selection; dry-run planning remains non-authoritative."""
+        if command.mode == "live":
+            return {
+                "ok": False,
+                "state": "failed_closed",
+                "blockers": ["legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider"],
+                "physical_motion_commanded": False,
+                "hardware_touched": False,
+                "replacement": "serial206 initialization provider",
+            }
         return self._handle_stepwise_homing_stage(command, dict(command.params or {}))
 
     def handle_initialize_system(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         params = dict(command.params or {})
         if bool(params.get("run_oem_initialization", False)):
-            return {
-                "ok": False,
-                "ready": False,
-                "state": "failed_closed",
-                "command": command.name,
-                "stage": "oemInitializationController",
-                "blockers": ["legacy_monolithic_initialization_cannot_bypass_canonical_startup_stages"],
-                "required_routes": [
-                    "POST /oem/startup/constructor_pipettes",
-                    "POST /oem/startup/initialize_without_motion",
-                    "POST /oem/initial_check",
-                ],
-            }
+            return self._handle_oem_initialization_controller_stage(command, params)
         if bool(params.get("run_stepwise_homing", False)):
             return self._handle_stepwise_homing_stage(command, params)
         if bool(params.get("run_initialize_motion", False)) or bool(params.get("initialize_motion_only", False)):
@@ -197,13 +247,59 @@ class OEMRuntimeCommandHandlers:
     def _handle_oem_initialization_controller_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         run_homing = bool(params.get("run_homing", False))
         if run_homing:
+            if command.mode != "live":
+                return {
+                    "ok": True,
+                    "ready": False,
+                    "state": "dry_run",
+                    "command": command.name,
+                    "stage": "initializeMotors",
+                    "physical_motion_commanded": False,
+                    "blockers": ["shadow_runtime_command_does_not_bind_live_serial206_provider"],
+                }
+            required_ack = "INITIALIZE_MOTORS_STAGE"
+            if command.operator_ack != required_ack:
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "initializeMotors",
+                    "blockers": [f"operator_ack_{required_ack}_required"],
+                }
+            try:
+                provider = self._serial206_provider("initialize_motors")
+                result = provider.initialize_motors(
+                    mode="live",
+                    approval=self._stage_approval(params.get("stage_approval")),
+                    commissioning=self._commissioning(params.get("commissioning")),
+                    timeout_s=float(params.get("timeout_s", command.timeout_s or 180.0)),
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "physical_motion_commanded": False,
+                    "blockers": [f"serial206_initializeMotors_binding_or_contract_error:{type(exc).__name__}:{exc}"],
+                }
+            artifact_path = self._write_stage_artifact(
+                command,
+                "runtime_serial206_initialize_motors.json",
+                {"command": command.to_dict(), "initialize_motors": result},
+            )
             return {
-                "ok": False,
-                "ready": False,
-                "state": "failed_closed",
+                "ok": result.get("ok") is True,
+                "ready": result.get("ready") is True,
+                "state": result.get("state", "failed_closed"),
                 "command": command.name,
-                "stage": "oemInitializationController",
-                "blockers": ["run_homing_is_not_permitted_in_initializeMotorsWithoutMotion_stage"],
+                "stage": "initializeMotors",
+                "mode": "live",
+                "artifact_path": artifact_path,
+                "initialize_motors": result,
+                "physical_motion_commanded": result.get("physical_motion_commanded") is True,
+                "physical_effect_verified": result.get("physical_effect_verified") is True,
+                "blockers": list(result.get("blockers") or []),
             }
         required_ack = "OEM_INITIALIZATION_RUN"
         if command.mode == "live" and command.operator_ack != required_ack:
@@ -319,13 +415,60 @@ class OEMRuntimeCommandHandlers:
 
     def _handle_initialize_motion_stage(self, command: OEMRuntimeCommand, params: dict[str, Any]) -> dict[str, Any]:
         if bool(params.get("run_homing", False)):
+            if command.mode != "live":
+                return {
+                    "ok": True,
+                    "ready": False,
+                    "state": "dry_run",
+                    "command": command.name,
+                    "stage": "initializeMotion",
+                    "physical_motion_commanded": False,
+                    "blockers": ["shadow_runtime_command_does_not_bind_live_serial206_provider"],
+                }
+            required_ack = "INITIALIZE_MOTION_STAGE"
+            if command.operator_ack != required_ack:
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "command": command.name,
+                    "stage": "initializeMotion",
+                    "blockers": [f"operator_ack_{required_ack}_required"],
+                }
+            try:
+                provider = self._serial206_provider("initialize_motion")
+                result = provider.initialize_motion(
+                    mode="live",
+                    approvals=self._stage_approvals(params.get("motor_stage_approvals")),
+                    motion_approvals=self._stage_approvals(params.get("motion_stage_approvals")),
+                    commissioning=self._commissioning(params.get("commissioning")),
+                    timeout_s=float(params.get("timeout_s", command.timeout_s or 180.0)),
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "ready": False,
+                    "state": "failed_closed",
+                    "physical_motion_commanded": False,
+                    "blockers": [f"serial206_initializeMotion_binding_or_contract_error:{type(exc).__name__}:{exc}"],
+                }
+            artifact_path = self._write_stage_artifact(
+                command,
+                "runtime_serial206_initialize_motion.json",
+                {"command": command.to_dict(), "initialize_motion": result},
+            )
             return {
-                "ok": False,
-                "ready": False,
-                "state": "failed_closed",
+                "ok": result.get("ok") is True,
+                "ready": result.get("ready") is True,
+                "state": result.get("state", "failed_closed"),
                 "command": command.name,
                 "stage": "initializeMotion",
-                "blockers": ["run_homing_true_rejected_by_initializeMotion_diagnostic_stage"],
+                "mode": "live",
+                "artifact_path": artifact_path,
+                "initialize_motion": result,
+                "physical_motion_commanded": result.get("physical_motion_commanded") is True,
+                "physical_effect_verified": result.get("physical_effect_verified") is True,
+                "blockers": list(result.get("blockers") or []),
             }
         if command.mode == "live" and command.operator_ack != "INITIALIZE":
             return {

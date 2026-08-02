@@ -322,9 +322,27 @@ def _execute_oem_step_live(
             if not run_absolute(axis, step.get(axis)):
                 break
     elif op == "moveXY":
-        for axis in ("x", "y"):
-            if not run_absolute(axis, step.get(axis)):
-                break
+        move_xy = getattr(motion_executor, "move_xy", None)
+        if callable(move_xy):
+            x = step.get("x")
+            y = step.get("y")
+            if x is None or y is None:
+                result.update({"ok": False, "error": "moveXY missing x/y target"})
+            else:
+                sub = move_xy(
+                    int(x),
+                    int(y),
+                    speed=speed,
+                    acc=acc,
+                    wait_timeout_s=wait_timeout_s,
+                )
+                result["results"].append({"command": "moveXY", "result": sub})
+                if _step_result_failed(sub):
+                    result.update({"ok": False, "error": "moveXY step failed"})
+        else:
+            for axis in ("x", "y"):
+                if not run_absolute(axis, step.get(axis)):
+                    break
     elif op == "moveX":
         run_absolute("x", step.get("x"))
     elif op == "moveY":
@@ -348,23 +366,34 @@ def _execute_oem_step_live(
         if _step_result_failed(sub):
             result.update({"ok": False, "error": "sleep step failed"})
     elif op == "parallel":
-        # The current safe commissioning executor intentionally serializes planned
-        # parallel children so every primitive still goes through the existing
-        # one-axis guarded API path and returns a per-step evidence envelope.
-        result["parallel_semantics"] = "sequentialized_for_guarded_commissioning"
-        for idx, child in enumerate(step.get("steps") or []):
-            child_result = _execute_oem_step_live(
-                child,
-                motion_executor,
-                wait_timeout_s=wait_timeout_s,
+        children = list(step.get("steps") or [])
+        parallel = getattr(motion_executor, "parallel", None)
+        if callable(parallel):
+            sub = parallel(
+                children,
                 speed=speed,
                 acc=acc,
-                path=f"{path}.{idx}",
+                wait_timeout_s=wait_timeout_s,
             )
-            result["results"].append(child_result)
-            if _step_result_failed(child_result):
-                result.update({"ok": False, "error": "parallel child step failed"})
-                break
+            result["parallel_semantics"] = "controller_commands_issued_before_waits"
+            result["results"].append(sub)
+            if _step_result_failed(sub):
+                result.update({"ok": False, "error": "parallel path step failed"})
+        else:
+            result["parallel_semantics"] = "sequentialized_for_guarded_commissioning"
+            for idx, child in enumerate(children):
+                child_result = _execute_oem_step_live(
+                    child,
+                    motion_executor,
+                    wait_timeout_s=wait_timeout_s,
+                    speed=speed,
+                    acc=acc,
+                    path=f"{path}.{idx}",
+                )
+                result["results"].append(child_result)
+                if _step_result_failed(child_result):
+                    result.update({"ok": False, "error": "parallel child step failed"})
+                    break
     else:
         result.update({"ok": False, "error": f"unsupported OEM path step op: {op}"})
     return result

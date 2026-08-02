@@ -36,18 +36,22 @@ OEM_INITIALIZE_MOTORS_STAGES: tuple[dict[str, Any], ...] = (
     {
         "key": "x-home-settle",
         "source_anchor": "ClassControlInterface.initializeMotors:3370; M06 sleep(20ms)",
+        "requires_operator_observation": False,
     },
     {
         "key": "x-set-home",
         "source_anchor": "ClassControlInterface.initializeMotors:3371; M07 setHome(X)",
+        "requires_operator_observation": False,
     },
     {
         "key": "x-speed-1700",
         "source_anchor": "ClassControlInterface.initializeMotors:3372; M08 setSpeed(X,1700)",
+        "requires_operator_observation": False,
     },
     {
         "key": "x-speed-settle",
         "source_anchor": "ClassControlInterface.initializeMotors:3373; M09 sleep(40ms)",
+        "requires_operator_observation": False,
     },
     {
         "key": "x-park-6000",
@@ -64,10 +68,12 @@ OEM_INITIALIZE_MOTORS_STAGES: tuple[dict[str, Any], ...] = (
     {
         "key": "door-closed-predicate",
         "source_anchor": "ClassControlInterface.initializeMotors:3384-3387; M13 SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated → openThermalDoor → throw",
+        "requires_operator_observation": False,
     },
     {
         "key": "y-set-home",
         "source_anchor": "ClassControlInterface.initializeMotors:3389-3392; M14 setHome(Y)",
+        "requires_operator_observation": False,
     },
     {
         "key": "ui-zero-calibrated",
@@ -86,7 +92,7 @@ OEM_INITIALIZE_MOTORS_STAGES: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "system-status-initialized",
-        "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 and ready=true",
+        "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 (initialization complete is not machine readiness)",
         "requires_operator_observation": False,
     },
     {
@@ -231,7 +237,8 @@ class OemMovementLedger:
                         isinstance(durable, Mapping)
                         and type(durable.get("system_status")) is int
                         and durable.get("system_status") == 1
-                        and durable.get("ready") is True
+                        and durable.get("initialization_complete") is True
+                        and durable.get("ready") is False
                     ):
                         row["state"] = "failed"
                         ledger["terminal_state"] = "failed_closed"
@@ -243,7 +250,8 @@ class OemMovementLedger:
                         return self._save(ledger)
                     ledger["robot_state"] = {
                         "system_status": 1,
-                        "ready": True,
+                        "initialization_complete": True,
+                        "ready": False,
                         "source_anchor": row["source_anchor"],
                     }
                 if row["requires_operator_observation"]:

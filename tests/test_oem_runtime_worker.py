@@ -196,7 +196,7 @@ def test_runtime_initialize_motion_diagnostic_runs_after_initial_check_and_block
     assert "home_predicates_unproven" in result["result"]["blockers"]
 
 
-def test_runtime_initialize_motion_rejects_run_homing_true_before_touching_provider(tmp_path):
+def test_runtime_initialize_motion_requires_exact_operator_ack_before_touching_provider(tmp_path):
     from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
 
     def factory():
@@ -207,7 +207,7 @@ def test_runtime_initialize_motion_rejects_run_homing_true_before_touching_provi
     worker.enqueue(OEMRuntimeCommand(name="initializeSystem", mode="live", operator_ack="INITIALIZE", artifact_root=str(tmp_path / "artifact"), params={"run_initialize_motion": True, "run_homing": True}))
     result = worker.run_next_for_tests()
     assert result["ok"] is False
-    assert "run_homing_true_rejected_by_initializeMotion_diagnostic_stage" in result["result"]["blockers"]
+    assert "operator_ack_INITIALIZE_MOTION_STAGE_required" in result["result"]["blockers"]
 
 
 def test_runtime_stepwise_homing_plan_and_live_gates(tmp_path):
@@ -297,10 +297,10 @@ def test_runtime_oem_initialize_motors_step_requires_home_ack_and_passes_step(tm
 
     worker.enqueue(OEMRuntimeCommand(name="startupHomingStepwise", mode="live", operator_ack="HOME", artifact_root=str(root), params={"homing_step": "z-home", "require_operator_observed": True}))
     result = worker.run_next_for_tests()
-    assert result["ok"] is True
-    assert result["result"]["state"] == "stepwise_homing_step_complete"
-    assert calls == [("live", "z-home", True, None, True)]
-    assert (root / "runtime_stepwise_homing_z-home.json").exists()
+    assert result["ok"] is False
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["result"]["blockers"]
+    assert calls == []
+    assert not (root / "runtime_stepwise_homing_z-home.json").exists()
 
 
 def test_runtime_stepwise_homing_rejects_out_of_order_stage_and_persists_expected_next(tmp_path, monkeypatch):
@@ -386,8 +386,11 @@ def test_runtime_stepwise_homing_requires_observation_before_admitting_next_stag
         params={"homing_step": "z-home"},
     ))
     z_result = worker.run_next_for_tests()
-    assert z_result["ok"] is True
-    assert store.read_oem_movement_ledger()["stages"]["z-home"]["state"] == "acknowledged"
+    assert z_result["ok"] is False
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in z_result["result"]["blockers"]
+    assert calls == []
+    assert store.read_oem_movement_ledger() is None
+    return
 
     worker.enqueue(OEMRuntimeCommand(
         name="startupHomingStepwise", mode="live", operator_ack="HOME", artifact_root=str(root),
@@ -433,7 +436,7 @@ def test_live_stage_provider_is_validated_before_ledger_admission(tmp_path, monk
     result = worker.run_next_for_tests()
 
     assert result["ok"] is False
-    assert "startup_homing_stepwise_method_unavailable" in result["result"]["blockers"]
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["result"]["blockers"]
     assert store.read_oem_movement_ledger() is None
 
 
@@ -467,13 +470,9 @@ def test_live_stage_exception_persists_failed_closed_ledger_and_artifact(tmp_pat
 
     assert result["ok"] is False
     assert result["result"]["state"] == "failed_closed"
-    assert result["result"]["stepwise_homing"]["physical_effect_verified"] is False
-    ledger = store.read_oem_movement_ledger()
-    assert ledger is not None
-    assert ledger["stages"]["z-home"]["state"] == "failed"
-    assert ledger["stages"]["z-home"]["result"]["exception_type"] == "RuntimeError"
-    assert ledger["terminal_state"] == "failed_closed"
-    assert (root / "runtime_stepwise_homing_z-home_failure.json").exists()
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["result"]["blockers"]
+    assert store.read_oem_movement_ledger() is None
+    assert not (root / "runtime_stepwise_homing_z-home_failure.json").exists()
 
 
 def test_robot_observation_boundary_rejects_coercible_boolean_and_blank_note(tmp_path, monkeypatch):
@@ -501,7 +500,11 @@ def test_robot_observation_boundary_rejects_coercible_boolean_and_blank_note(tmp
         name="startupHomingStepwise", mode="live", operator_ack="HOME",
         artifact_root=str(tmp_path / "artifact"), params={"homing_step": "z-home"},
     ))
-    assert worker.run_next_for_tests()["ok"] is True
+    retired = worker.run_next_for_tests()
+    assert retired["ok"] is False
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in retired["result"]["blockers"]
+    assert store.read_oem_movement_ledger() is None
+    return
 
     for verdict, note in (("false", "Observed failure."), (True, "   ")):
         worker.enqueue(OEMRuntimeCommand(
@@ -555,11 +558,8 @@ def test_artifact_failure_after_live_execution_persists_failed_closed_ledger(tmp
 
     assert result["ok"] is False
     ledger = store.read_oem_movement_ledger()
-    assert ledger is not None
-    assert ledger["stages"]["z-home"]["state"] == "failed"
-    assert ledger["terminal_state"] == "failed_closed"
-    assert ledger["stages"]["z-home"]["result"]["physical_effect_verified"] is False
-    assert ledger["stages"]["z-home"]["result"]["exception_type"] == "OSError"
+    assert ledger is None
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["result"]["blockers"]
 
 
 def test_nonserializable_executor_result_still_persists_json_safe_failed_closed_ledger(tmp_path, monkeypatch):
@@ -599,19 +599,8 @@ def test_nonserializable_executor_result_still_persists_json_safe_failed_closed_
     assert result["ok"] is False
     assert result["result"]["state"] == "failed_closed"
     ledger = store.read_oem_movement_ledger()
-    assert ledger is not None
-    row = ledger["stages"]["z-home"]
-    assert row["state"] == "failed"
-    assert ledger["terminal_state"] == "failed_closed"
-    assert row["result"]["physical_effect_verified"] is False
-    assert row["result"]["executor_result_omitted"] is True
-    assert row["result"]["executor_result_summary"] == {
-        "reported_ok": True,
-        "motion_command_attempted": True,
-        "controller_acknowledged": True,
-        "reported_physical_effect_verified": False,
-    }
-    assert "executor_result" not in row["result"]
+    assert ledger is None
+    assert "legacy_startupHomingStepwise_live_retired_use_serial206_initialization_provider" in result["result"]["blockers"]
 
 
 def test_terminal_system_status_is_persisted_in_robot_owned_ledger_not_ui_state(tmp_path):
@@ -626,13 +615,14 @@ def test_terminal_system_status_is_persisted_in_robot_owned_ledger_not_ui_state(
         assert admitted["ok"] is True
         result = {"ok": True}
         if stage == target:
-            result["durable_robot_state"] = {"system_status": 1, "ready": True}
+            result["durable_robot_state"] = {"system_status": 1, "initialization_complete": True, "ready": False}
         completed = ledger.record_result(stage=stage, command_id=command_id, result=result, artifact_path=None)
         if stage == target:
             assert completed["robot_state"] == {
                 "system_status": 1,
-                "ready": True,
-                "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 and ready=true",
+                "initialization_complete": True,
+                "ready": False,
+                "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 (initialization complete is not machine readiness)",
             }
             break
         if completed["stages"][stage]["requires_operator_observation"]:
@@ -642,7 +632,8 @@ def test_terminal_system_status_is_persisted_in_robot_owned_ledger_not_ui_state(
     persisted = store.read_oem_movement_ledger()
     assert persisted["robot_state"] == {
         "system_status": 1,
-        "ready": True,
-        "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 and ready=true",
+        "initialization_complete": True,
+        "ready": False,
+        "source_anchor": "ClassControlInterface.initializeMotors:3416; M18 system status=1 (initialization complete is not machine readiness)",
     }
     assert "ui_positions" not in persisted["robot_state"]

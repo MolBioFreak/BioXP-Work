@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .. import BioXpCanDriver
 try:
@@ -524,6 +524,69 @@ class FourPipetteTransport:
             self._sleep(0.030)
         self._sleep(0.001)
         return rows
+
+    def initiate_group_once_for_oem_initialize_motion(self, *, cycle: str) -> dict[str, Any]:
+        """Execute exactly one `ClassPipetteCollection.initiateGroup()` cycle.
+
+        `ControlLib.initializeMotion` owns the initial/retry branch.  Keeping that
+        branch outside this primitive prevents the transport from silently doing
+        both attempts inside one command and gives the durable lifecycle one
+        receipt for each direct OEM call.
+        """
+        selected = str(cycle).strip()
+        if selected not in {"initializeMotion.initial", "initializeMotion.retry"}:
+            raise ValueError("cycle must be initializeMotion.initial or initializeMotion.retry")
+        with self._transaction_lock:
+            result = self._run_group_cycle(PipetteInitCommand(), cycle=selected)
+            return {
+                **dict(result),
+                "oem_source_anchor": "ClassPipetteCollection.initiateGroup:677-693; ControlLib.initializeMotion:8832,8835",
+                "single_group_cycle": True,
+                "retry_selected_by_transport": False,
+            }
+
+    def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> dict[str, Any]:
+        """Exact four-channel `checkedPipetteStatus()` query and error gate."""
+        selected = str(attempt).strip()
+        if selected not in {"initial", "retry"}:
+            raise ValueError("attempt must be initial or retry")
+        with self._transaction_lock:
+            rows = self._query_status()
+        exact_rows: list[dict[str, Any]] = []
+        for row in rows:
+            result = row.get("result") if isinstance(row, Mapping) else None
+            error_code = result.get("oem_error_code") if isinstance(result, Mapping) else None
+            exact_rows.append(
+                {
+                    "channel": row.get("channel") if isinstance(row, Mapping) else None,
+                    "reply_received": result.get("reply_received") if isinstance(result, Mapping) else False,
+                    "semantic_ok": result.get("semantic_ok") if isinstance(result, Mapping) else False,
+                    "error_code": error_code,
+                    "error_free": result.get("oem_error_free") if isinstance(result, Mapping) else False,
+                    "result": result,
+                }
+            )
+        ok = bool(
+            len(exact_rows) == 4
+            and all(
+                row["reply_received"] is True
+                and row["semantic_ok"] is True
+                and type(row["error_code"]) is int
+                and row["error_code"] == 0
+                and row["error_free"] is True
+                for row in exact_rows
+            )
+        )
+        return {
+            "ok": ok,
+            "attempt": selected,
+            "channels": exact_rows,
+            "channel_count": len(exact_rows),
+            "query_spacing_ms": 30,
+            "post_query_settle_ms": 1,
+            "oem_source_anchor": "ClassPipetteCollection.checkedPipetteStatus:726-748; ControlLib.initializeMotion:8833,8836",
+            "failure": None if ok else "checkedPipetteStatus_returned_false",
+        }
 
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
         started = time.monotonic()

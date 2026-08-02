@@ -42,8 +42,10 @@ from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, pr
 from .oem_serial206_initialization import (
     Serial206CommissioningEvidence,
     Serial206OemInitializationProvider,
+    Serial206ProductionPrimitiveAdapter,
     Serial206StageApproval,
 )
+from .oem_runtime_store import OEMRuntimeStore
 from .operator_controls import install_operator_control_plane
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -189,41 +191,105 @@ _reference_state_store = ReferenceStateStore(
 )
 _pipette_transport = None
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
+_serial206_oem_initialization_provider_binding_error: str | None = None
 
 
 def bind_serial206_oem_initialization_provider(
     provider: Serial206OemInitializationProvider | None,
 ) -> dict[str, Any]:
     """Bind or explicitly clear the live serial-206 initialization provider."""
-    global _serial206_oem_initialization_provider
+    global _serial206_oem_initialization_provider, _serial206_oem_initialization_provider_binding_error
     _serial206_oem_initialization_provider = provider
+    _serial206_oem_initialization_provider_binding_error = None
     return serial206_oem_initialization_provider_status()
 
 
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
+    capabilities = provider.capability_status() if provider is not None else {
+        "initialize_motors_live_available": False,
+        "initialize_motion_live_available": False,
+        "initialize_motion_partial_primitives": [],
+        "initialize_motion_missing_primitives": [],
+    }
+    projection_fn = getattr(provider, "initialize_motion_projection", None) if provider is not None else None
+    projection_raw = projection_fn() if callable(projection_fn) else None
+    projection = dict(projection_raw) if isinstance(projection_raw, Mapping) else {
+        "initialize_motion_ledger": None,
+        "machine_status": None,
+        "initialize_motors": None,
+    }
     return {
         "schema_version": "bioxp.serial206_oem_initialization_provider_status.v1",
         "bound": provider is not None,
-        "initialize_motors_live_available": provider is not None,
-        "initialize_motion_live_available": provider is not None,
+        **capabilities,
+        **projection,
         "physical_acceptance_required": True,
         "provider": None if provider is None else type(provider).__name__,
+        "binding_error": _serial206_oem_initialization_provider_binding_error,
     }
 
 
-def _require_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
+def _require_serial206_oem_initialization_provider(
+    capability: Literal["initialize_motors", "initialize_motion"] = "initialize_motors",
+) -> Serial206OemInitializationProvider:
     provider = _serial206_oem_initialization_provider
-    if provider is None:
+    status = serial206_oem_initialization_provider_status()
+    available_field = f"{capability}_live_available"
+    if provider is None or status.get(available_field) is not True:
         raise HTTPException(
             status_code=503,
             detail={
                 "error": "serial206_oem_initialization_provider_unavailable",
-                "provider_status": serial206_oem_initialization_provider_status(),
+                "required_capability": capability,
+                "provider_status": status,
                 "physical_motion_commanded": False,
             },
         )
     return provider
+
+
+def _get_serial206_oem_initialization_provider_for_runtime() -> Serial206OemInitializationProvider:
+    """Return the current managed-owner provider without leaking HTTP exceptions into the worker."""
+    provider = _serial206_oem_initialization_provider
+    status = serial206_oem_initialization_provider_status()
+    if provider is None:
+        raise RuntimeError(f"serial-206 OEM initialization provider is not bound: {status}")
+    return provider
+
+
+def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
+    if _tester is None or _pipette_transport is None:
+        raise RuntimeError("owned BioXpTester and FourPipetteTransport are required")
+    adapter = Serial206ProductionPrimitiveAdapter(
+        _tester,
+        _pipette_transport,
+        authority_provider=Serial206MotionAuthority.from_active_snapshot,
+        generation_provider=lambda: hardware_state.ownership_epoch,
+    )
+    store_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
+    return Serial206OemInitializationProvider(
+        adapter,
+        state_store=OEMRuntimeStore(store_root),
+        reference_store=_reference_state_store,
+        generation_provider=lambda: hardware_state.ownership_epoch,
+        preparation_provider=adapter,
+    )
+
+
+def _sync_serial206_oem_initialization_provider(*, transport: str, usb: str, router: str) -> None:
+    """Bind only to the current managed USB owner; clear on every other state."""
+    global _serial206_oem_initialization_provider, _serial206_oem_initialization_provider_binding_error
+    if (transport, usb, router) != ("owned", "service", "running"):
+        _serial206_oem_initialization_provider = None
+        _serial206_oem_initialization_provider_binding_error = None
+        return
+    try:
+        _serial206_oem_initialization_provider = _build_serial206_oem_initialization_provider()
+        _serial206_oem_initialization_provider_binding_error = None
+    except Exception as exc:
+        _serial206_oem_initialization_provider = None
+        _serial206_oem_initialization_provider_binding_error = f"{type(exc).__name__}: {exc}"
 
 
 try:
@@ -327,6 +393,7 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
                 "last_frame_at": None,
             }
         )
+    _sync_serial206_oem_initialization_provider(transport=transport, usb=usb, router=router)
     return epoch
 
 
@@ -519,6 +586,7 @@ async def lifespan(app: FastAPI):
     # USB, collect a snapshot, run diagnostics, or command motion.
     configure_oem_runtime(
         startup_program_factory=_get_live_oem_startup_program,
+        serial206_provider_factory=_get_serial206_oem_initialization_provider_for_runtime,
         store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
         autostart=True,
     )
@@ -1383,6 +1451,29 @@ class OemSerial206CommissioningEvidenceRequest(BaseModel):
     gap10_polarity: StrictInt | None = Field(None, ge=0, le=1)
 
 
+class OemSerial206InitializeMotorsStepRequest(BaseModel):
+    """One admitted source-ordered initializeMotors transition."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: StrictStr = Field(..., description="Must be exactly INITIALIZE_MOTORS_STAGE.")
+    stage_approval: OemSerial206StageApprovalRequest | None = None
+    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
+    timeout_s: float = Field(180.0, gt=1.0, le=300.0)
+
+
+class OemSerial206InitializeMotionStepRequest(BaseModel):
+    """One admitted source-ordered initializeMotion transition."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: StrictStr = Field(..., description="Must be exactly INITIALIZE_MOTION_STAGE.")
+    motor_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    motion_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
+    timeout_s: float = Field(180.0, gt=1.0, le=300.0)
+
+
 class OemInitializeMotionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1403,8 +1494,31 @@ class OemInitializationRunRequest(BaseModel):
     restore_door_state: bool = Field(False, description="Request explicit source-mode door restore policy after init. Open restore remains explicit, not silent.")
     include_tip_pipette_cleanup: bool = Field(False, description="Reserved for initializeMotion; the initializeMotors route does not perform tip cleanup.")
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
-    stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
+    stage_approval: OemSerial206StageApprovalRequest | None = Field(
+        default=None,
+        description="Single-use approval for exactly the durable expected-next OEM stage.",
+    )
     commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
+
+
+class OemSerial206ObservationRequest(BaseModel):
+    """Strict operator evidence transition; this contract performs no I/O."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    stage: StrictStr = Field(min_length=1, max_length=128)
+    command_id: StrictStr = Field(min_length=1, max_length=256)
+    expected_generation: StrictInt = Field(ge=0, le=2_147_483_647)
+    observed_pass: StrictBool
+    note: StrictStr = Field(min_length=1, max_length=2000)
+
+    @field_validator("stage", "command_id", "note")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        selected = value.strip()
+        if not selected:
+            raise ValueError("value must not be blank")
+        return selected
 
 
 OEM_IDLE_STANDBY_CURRENT = 10
@@ -6078,12 +6192,16 @@ async def motion_thermal_door_close(req: ThermalDoorActionRequest):
 
 @app.post("/motion/oem/startup_step")
 async def motion_oem_startup_step(req: OemStartupStepRequest):
-    _require_motion_route_ready()
-    tester = _get_tester()
-    return await _run_blocking(
-        f"OEM startup homing step {req.step}",
-        lambda: _execute_oem_startup_step(tester, req.step, req.timeout_s),
-        timeout_s=min(max(float(req.timeout_s) + 10.0, 15.0), 120.0),
+    del req
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "ok": False,
+            "failed_closed": True,
+            "physical_motion_commanded": False,
+            "blocker": "direct_caller_selected_startup_step_retired_use_serial206_initialization_provider",
+            "replacement": "/motion/oem/serial206/initialize_motors",
+        },
     )
 
 
@@ -6124,6 +6242,12 @@ def _serial206_stage_approvals(
     return {key: Serial206StageApproval(**value.model_dump()) for key, value in rows.items()}
 
 
+def _serial206_stage_approval(
+    row: OemSerial206StageApprovalRequest | None,
+) -> Serial206StageApproval | None:
+    return None if row is None else Serial206StageApproval(**row.model_dump())
+
+
 def _serial206_commissioning_evidence(
     rows: Mapping[str, OemSerial206CommissioningEvidenceRequest],
 ) -> dict[str, Serial206CommissioningEvidence]:
@@ -6133,6 +6257,16 @@ def _serial206_commissioning_evidence(
 @app.get("/motion/oem/initialization/provider-status")
 async def motion_oem_initialization_provider_status():
     return serial206_oem_initialization_provider_status()
+
+
+@app.post("/motion/oem/initialization/observation")
+async def motion_oem_initialization_observation(req: OemSerial206ObservationRequest):
+    """Persist post-command human evidence without readiness or USB access."""
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    result = provider.record_observation(**req.model_dump())
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @app.post("/motion/oem/initialization/run")
@@ -6150,13 +6284,13 @@ async def motion_oem_initialization_run(req: OemInitializationRunRequest):
                     "physical_motion_commanded": False,
                 },
             )
+        provider = _require_serial206_oem_initialization_provider("initialize_motors")
         _require_motion_route_ready()
-        provider = _require_serial206_oem_initialization_provider()
         result = await _run_blocking(
             "Typed serial-206 initializeMotors",
             lambda: provider.initialize_motors(
                 mode="live",
-                approvals=_serial206_stage_approvals(req.stage_approvals),
+                approval=_serial206_stage_approval(req.stage_approval),
                 commissioning=_serial206_commissioning_evidence(req.commissioning),
                 timeout_s=req.timeout_s,
             ),
@@ -6180,6 +6314,49 @@ async def motion_oem_initialization_run(req: OemInitializationRunRequest):
     )
 
 
+@app.post("/motion/oem/serial206/initialize_motors")
+async def motion_oem_serial206_initialize_motors(req: OemSerial206InitializeMotorsStepRequest):
+    if req.operator_ack != "INITIALIZE_MOTORS_STAGE":
+        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTORS_STAGE required")
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    _require_motion_route_ready()
+    result = await _run_blocking(
+        "Typed serial-206 initializeMotors expected stage",
+        lambda: provider.initialize_motors(
+            mode="live",
+            approval=_serial206_stage_approval(req.stage_approval),
+            commissioning=_serial206_commissioning_evidence(req.commissioning),
+            timeout_s=req.timeout_s,
+        ),
+        timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
+    )
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/motion/oem/serial206/initialize_motion")
+async def motion_oem_serial206_initialize_motion(req: OemSerial206InitializeMotionStepRequest):
+    if req.operator_ack != "INITIALIZE_MOTION_STAGE":
+        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTION_STAGE required")
+    provider = _require_serial206_oem_initialization_provider("initialize_motion")
+    _require_motion_route_ready()
+    result = await _run_blocking(
+        "Typed serial-206 initializeMotion expected stage",
+        lambda: provider.initialize_motion(
+            mode="live",
+            approvals=_serial206_stage_approvals(req.motor_stage_approvals),
+            motion_approvals=_serial206_stage_approvals(req.motion_stage_approvals),
+            commissioning=_serial206_commissioning_evidence(req.commissioning),
+            timeout_s=req.timeout_s,
+        ),
+        timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
+    )
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
 @app.post("/motion/oem/initialize_motion")
 async def motion_oem_initialize_motion(req: OemInitializeMotionRequest):
     expected_ack = "INITIALIZE_WITH_HOMING" if bool(req.run_homing) else "INITIALIZE"
@@ -6195,13 +6372,13 @@ async def motion_oem_initialize_motion(req: OemInitializeMotionRequest):
                     "physical_motion_commanded": False,
                 },
             )
+        provider = _require_serial206_oem_initialization_provider("initialize_motion")
         _require_motion_route_ready()
-        provider = _require_serial206_oem_initialization_provider()
         result = await _run_blocking(
             "Typed serial-206 initializeMotion",
             lambda: provider.initialize_motion(
                 mode="live",
-                motor_approvals=_serial206_stage_approvals(req.motor_stage_approvals),
+                approvals=_serial206_stage_approvals(req.motor_stage_approvals),
                 motion_approvals=_serial206_stage_approvals(req.motion_stage_approvals),
                 commissioning=_serial206_commissioning_evidence(req.commissioning),
                 timeout_s=req.timeout_s,
@@ -6969,4 +7146,5 @@ install_operator_control_plane(
     maintenance_state_provider=_maintenance_state_payload,
     reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
     lifecycle_state_provider=lifecycle_state.projection,
+    serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
 )

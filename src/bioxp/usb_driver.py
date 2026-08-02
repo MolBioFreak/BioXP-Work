@@ -5186,11 +5186,26 @@ class BioXpTester:
             "restore_current": restore_current,
         }
 
-    def _motor_oem_home_gripper_scoped(self, preset, *, speed=None, timeout_s=20.0, startup=False):
-        """Run one G home with action current bounded by an idle restore."""
+    def _motor_oem_home_gripper_scoped(
+        self,
+        preset,
+        *,
+        speed=None,
+        timeout_s=20.0,
+        startup=False,
+        restore_idle_current=True,
+    ):
+        """Run one G home with caller-selected OEM current lifetime.
+
+        Standalone/manual homing restores the idle current in this primitive.
+        `initializeMotors()` passes ``restore_idle_current=False`` because the
+        direct OEM method intentionally retains run current 31 until its final
+        source line after X/Y/Z/door initialization.
+        """
         prepare = None
         home = None
         restore_current = None
+        retained_current = None
         try:
             prepare = self.motor_prepare_axis(
                 preset["board"],
@@ -5222,21 +5237,47 @@ class BioXpTester:
                     rehome=True,
                     timeout_s=timeout_s,
                 )
+            if not bool(restore_idle_current):
+                retained_current = self.motor_get_axis_param(
+                    int(preset["board"]),
+                    6,
+                    motor=int(preset["motor"]),
+                )
         finally:
-            restore_current = self.motor_restore_gripper_idle_current(
-                reason="oem_home_axis_g_finally"
-            )
-        if not isinstance(restore_current, dict) or restore_current.get("ok") is not True:
+            if bool(restore_idle_current):
+                restore_current = self.motor_restore_gripper_idle_current(
+                    reason="oem_home_axis_g_finally"
+                )
+        if bool(restore_idle_current) and (
+            not isinstance(restore_current, dict) or restore_current.get("ok") is not True
+        ):
             raise RuntimeError("gripper idle-current restoration was not proven")
+        if not bool(restore_idle_current) and (
+            not isinstance(retained_current, dict)
+            or retained_current.get("ok") is not True
+            or int(retained_current.get("value", -1)) != int(preset.get("home_current", 31))
+        ):
+            raise RuntimeError("gripper OEM run current was not retained at 31 after homing")
         return {
             "axis": "g",
             "startup": bool(startup),
             "prepare": prepare,
             "home": home,
             "restore_current": restore_current,
+            "restore_idle_current_requested": bool(restore_idle_current),
+            "source_current_retained": not bool(restore_idle_current),
+            "retained_current_readback": retained_current,
         }
 
-    def motor_oem_home_axis(self, axis_key, *, speed=None, timeout_s=20.0, startup=False):
+    def motor_oem_home_axis(
+        self,
+        axis_key,
+        *,
+        speed=None,
+        timeout_s=20.0,
+        startup=False,
+        restore_idle_current=True,
+    ):
         axis_key_norm = str(axis_key).strip().lower()
         preset_raw = self._motion_oem_axis_profile(axis_key, startup=bool(startup))
         if not isinstance(preset_raw, dict):
@@ -5248,6 +5289,7 @@ class BioXpTester:
                 speed=speed,
                 timeout_s=timeout_s,
                 startup=bool(startup),
+                restore_idle_current=bool(restore_idle_current),
             )
         prepare = self.motor_prepare_axis(
             preset["board"],

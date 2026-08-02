@@ -112,10 +112,12 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("POST", "/motion/axis/home")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.full_initialization"}
-    full = next(row for row in catalog["actions"] if row["action_id"] == "meta.full_initialization")
-    assert full["available"] is False
-    assert len(full["stages"]) == 19
+    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.initialize_motors", "meta.initialize_motion"}
+    motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
+    motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
+    assert motors["available"] is False
+    assert motion["available"] is False
+    assert len(motors["stages"]) == 19
     assert catalog["dashboard"]["snapshot"]["collection_triggered"] is False
     assert all("enabled" in row and "dependencies" in row for row in catalog["actions"])
 
@@ -355,7 +357,7 @@ def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispa
     base = {"expected_generation": catalog["ownership_generation"], "idempotency_key": "reject-action-1234"}
     assert client.post(f"/operator/actions/{action['action_id']}", json={**base, "expected_generation": base["expected_generation"] + 1, "inputs": {"body": {}}}).status_code == 409
     assert client.post(f"/operator/actions/{action['action_id']}", json={**base, "inputs": {"wrong": 1}}).status_code == 422
-    assert client.post("/operator/actions/meta.full_initialization", json={**base, "inputs": {}}).status_code == 409
+    assert client.post("/operator/actions/meta.initialize_motion", json={**base, "inputs": {}}).status_code == 409
     assert calls == []
 
 

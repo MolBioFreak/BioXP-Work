@@ -1,234 +1,71 @@
 from __future__ import annotations
 
-import importlib.util
-from dataclasses import asdict
+import json
+import stat
+from pathlib import Path
+
+import pytest
+
+from bioxp.oem_runtime_store import OEMRuntimeStore
+from bioxp import oem_serial206_initialization as subject
 
 
-def test_serial206_literal_initialize_motors_provider_module_exists():
-    assert importlib.util.find_spec("src.bioxp.oem_serial206_initialization") is not None
+ACK = {"status": 100, "value": 0}
 
 
-def test_provider_exposes_typed_commissioning_and_literal_provider_contracts():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    assert subject.Serial206StageApproval
-    assert subject.Serial206CommissioningEvidence
-    assert subject.Serial206OemInitializationProvider
+def _write(value: int):
+    return {"ok": True, "ack": dict(ACK), "set_value": value, "readback": {"ack": dict(ACK), "value": value}}
 
 
-EXPECTED_STAGES = [
-    "z-home",
-    "gripper-current-31",
-    "gripper-clear-10000",
-    "gripper-home",
-    "x-home",
-    "x-home-settle",
-    "x-set-home",
-    "x-speed-1700",
-    "x-speed-settle",
-    "x-park-6000",
-    "y-home",
-    "door-home",
-    "door-closed-predicate",
-    "y-set-home",
-    "ui-zero-calibrated",
-    "chiller-oc-cool-rate",
-    "chiller-rc-cool-rate",
-    "system-status-initialized",
-    "gripper-idle-current-10",
-]
-
-
-class DurableStore:
-    def __init__(self):
-        self.ledger = None
-        self.motion_ledger = None
-        self.approvals = {"used": {}}
-
-    def read_oem_movement_ledger(self):
-        return self.ledger
-
-    def write_oem_movement_ledger(self, payload):
-        self.ledger = payload
-        return payload
-
-    def read_oem_stage_approvals(self):
-        return self.approvals
-
-    def write_oem_stage_approvals(self, payload):
-        self.approvals = payload
-        return payload
-
-    def read_oem_initialize_motion_ledger(self):
-        return self.motion_ledger
-
-    def write_oem_initialize_motion_ledger(self, payload):
-        self.motion_ledger = payload
-        return payload
-
-
-class ReferenceStore:
-    def __init__(self, initial=None):
-        self.rows = dict(initial or {})
-        self.transitions = []
-
-    def mark_referenced(self, command):
-        axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
-        row = {"axis": axis, "state": "referenced", "origin_position_steps": command.position_steps, "persisted": True}
-        self.rows[axis] = row
-        self.transitions.append(("referenced", axis))
-        return row
-
-    def mark_desynced(self, command):
-        axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
-        previous = self.rows.get(axis, {})
-        row = {"axis": axis, "state": "desynced", "origin_position_steps": previous.get("origin_position_steps"), "persisted": True}
-        self.rows[axis] = row
-        self.transitions.append(("desynced", axis))
-        return row
+def _production_axis_home(axis: str):
+    position = lambda value: {"ok": True, "ack": dict(ACK), "position": value}
+    return {
+        "axis": axis,
+        "startup": True,
+        "prepare": {"board": 4, "motor": 0, "ops": [{"op": "sap6", "set": 31, "ack": dict(ACK), "rb": {"ack": dict(ACK), "value": 31}}]},
+        "home": {
+            "ok": True,
+            "home_active_value": 1,
+            "position_before": position(123),
+            "position_after": position(4),
+            "position_after_sethome": position(0),
+            "move_home": {"ok": True, "ack": dict(ACK)},
+            "wait": {"stopped": True, "last_speed": 0, "last_ack": dict(ACK)},
+            "stop": {"ok": True, "ack": dict(ACK)},
+            "home_after": {"ok": True, "ack": dict(ACK), "value": 1},
+            "set_home": _write(0),
+            "seen_motion": True,
+            "switch_transition": True,
+            "home_predicate_confirmed": True,
+        },
+        "restore_current": None,
+    }
 
 
 class FakeSerial206Primitives:
-    def __init__(self, *, fail_stage=None, no_delta_stage=None, tips=(False, False, False, False), tip_queries=None):
-        self.calls = []
-        self.fail_stage = fail_stage
-        self.no_delta_stage = no_delta_stage
-        self.tips = list(tips)
-        self.tip_queries = [list(row) for row in (tip_queries or [])]
-
-    def _result(self, stage, *, moving=False, home=False):
-        self.calls.append(stage)
-        if stage == self.fail_stage:
-            return {"ok": False, "command_ack": {"status": 2}, "wait": {"stopped": False}}
-        before = 100 if moving or home else 0
-        after = before if stage == self.no_delta_stage else (0 if home else before + (10 if moving else 0))
-        return {
-            "ok": True,
-            "command_ack": {"status": 100},
-            "wait": {"stopped": True, "terminal_speed": 0, "seen_nonzero": bool(moving or home)},
-            "switch_predicate": {"expected": True, "observed": True} if home else None,
-            "position_before": before,
-            "position_after": after,
-            "home_position": 0 if home else None,
-            "controller_reference_agrees": True if home else None,
-            "physical_effect_verified": bool(moving or home),
-            "operator_assessment": "pass",
-        }
+    def __init__(self) -> None:
+        self.calls: list[str] = []
 
     def motor_oem_home_axis(self, axis, *, startup, speed=None, timeout_s):
-        speed_by_axis = {"z": 1791, "g": 200, "x": 250, "y": 250}
-        assert startup is True
-        assert speed in {None, speed_by_axis[axis]}
-        return self._result(f"{axis}-home" if axis != "g" else "gripper-home", moving=True, home=True)
+        assert (axis, startup, speed) == ("z", True, 1791)
+        self.calls.append("z-home")
+        return _production_axis_home(axis)
 
     def motor_set_axis_param(self, board, param, value, motor=0):
-        stage = {
-            (4, 2, 6, 31): "gripper-current-31",
-            (5, 0, 4, 1700): "x-speed-1700",
-            (4, 2, 6, 10): "gripper-idle-current-10",
-        }[(board, motor, param, value)]
-        return self._result(stage)
-
-    def motor_move_relative(self, board, steps, motor=0):
-        assert (board, motor, steps) == (4, 2, 10000)
-        return self._result("gripper-clear-10000", moving=True)
-
-    def motor_move_absolute(self, board, value, motor=0):
-        assert (board, motor, value) == (5, 0, 6000)
-        return self._result("x-park-6000", moving=True)
-
-    def motor_wait_stopped(self, board, motor=0, **kwargs):
-        return {"stopped": True, "terminal_speed": 0, "seen_nonzero": True}
-
-    def motor_set_home(self, board, motor=0):
-        stage = "x-set-home" if board == 5 else "y-set-home"
-        return self._result(stage, home=True)
-
-    def motor_oem_door_search_home(self, *, startup, timeout_s):
-        assert startup is True
-        return self._result("door-home", moving=True, home=True)
-
-    def motor_thermal_door_status(self):
-        return {**self._result("door-closed-predicate"), "oem_predicates": {"tcDoorClosed": True, "closed_source": "queryHome(ThermalDoor)"}}
-
-    def _machine_config_bundle(self):
-        return {"ok": True, "config": {"calibration": {"Calibrated": 0}}}
-
-    def _oem_no_motion_tmcl(self, *, name, board, command, cmd_type, motor, value):
-        stage = "chiller-oc-cool-rate" if cmd_type == 1 else "chiller-rc-cool-rate"
-        assert (board, command, motor, value) == (7, 9, 0, -25)
-        return self._result(stage)
-
-    def query_tip_status(self):
-        self.calls.append("query-tip-status")
-        channels = self.tip_queries.pop(0) if self.tip_queries else list(self.tips)
-        return {"ok": True, "channels": channels, "command_ack": {"status": 100}}
-
-    def initiate_pipette_group(self):
-        return self._result("pipette-initiate-group")
-
-    def checked_pipette_status(self):
-        return self._result("pipette-checked-status")
-
-    def set_stop_scripts(self, value):
-        assert value is False
-        return self._result("initializeMotion.stop_scripts")
-
-    def set_force_abort(self, value):
-        assert value is False
-        return self._result("initializeMotion.clear_forceabort")
-
-    def set_thermal_door_state(self, opened):
-        stage = "initializeMotion.openThermalDoor.tip_exists" if opened else "initializeMotion.thermal_door_closed"
-        return self._result(stage, moving=True)
-
-    def confirm_thermal_door(self, opened):
-        stage = "initializeMotion.thermal_door_open.tip_exists" if opened else "initializeMotion.thermal_door_closed"
-        return {**self._result(stage), "switch_predicate": {"expected": opened, "observed": opened}}
-
-    def set_tip_loaded(self, loaded, *, source_stage=None):
-        if loaded:
-            stage = "initializeMotion.tip_loaded.tip_exists"
-        elif source_stage == "no_tip":
-            stage = "initializeMotion.tip_loaded_false.no_tip"
-        else:
-            stage = "initializeMotion.tip_loaded_false.after_eject"
-        return self._result(stage)
-
-    def set_tip_dirty(self, dirty):
-        assert dirty is False
-        return self._result("initializeMotion.tip_dirty_false")
-
-    def scriptmove_to(self, **kwargs):
-        assert kwargs == {"from_location": 28, "from_well": 0, "to_location": 6, "column": 0, "row": 0}
-        return self._result("initializeMotion.scriptmoveTo.tip_exists", moving=True)
-
-    def update_location(self, location):
-        assert location == 6
-        return self._result("initializeMotion.updateLocation.tip_exists")
-
-    def eject_all_tips(self):
-        return self._result("initializeMotion.ejectAllTips.tip_exists", moving=True)
-
-    def move_z_absolute(self, position_steps):
-        assert position_steps == 80000
-        return self._result("initializeMotion.moveZ.tip_exists", moving=True)
-
-    def move_x_absolute(self, position_steps):
-        assert position_steps == 79000
-        return self._result("initializeMotion.moveX.tip_exists", moving=True)
+        assert (board, motor, param, value) == (4, 2, 6, 31)
+        self.calls.append("gripper-current-31")
+        return _write(value)
 
 
 class PreparationProvider:
-    def __init__(self, calls, generation=11):
+    def __init__(self, calls: list[str], generation: int = 11) -> None:
         self.calls = calls
         self.generation = generation
 
-    def prepare_for_initialize_motors(self, *, expected_generation):
+    def prepare_for_initialize_motors(self, *, expected_generation: int):
         self.calls.append("prepare")
         return {
             "ok": expected_generation == self.generation,
-            "expected_generation": expected_generation,
             "observed_generation": self.generation,
             "board_preparation_verified": True,
             "initialize_without_motion_verified": True,
@@ -236,7 +73,22 @@ class PreparationProvider:
         }
 
 
-def _commissioning(subject, generation=11, *, z_gap=True):
+class ReferenceStore:
+    def __init__(self) -> None:
+        self.transitions: list[tuple[str, str]] = []
+
+    def mark_referenced(self, command):
+        axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
+        self.transitions.append(("referenced", axis))
+        return {"axis": axis, "state": "referenced", "persisted": True}
+
+    def mark_desynced(self, command):
+        axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
+        self.transitions.append(("desynced", axis))
+        return {"axis": axis, "state": "desynced", "persisted": True}
+
+
+def _commissioning(generation: int = 11):
     rows = {}
     for component in ("z", "g", "x", "y", "door"):
         rows[component] = subject.Serial206CommissioningEvidence(
@@ -248,285 +100,250 @@ def _commissioning(subject, generation=11, *, z_gap=True):
             switch_verified=True,
             stop_verified=True,
             reference_verified=True,
-            gap9_polarity=1 if component == "z" and z_gap else None,
-            gap10_polarity=0 if component == "z" and z_gap else None,
+            gap9_polarity=1 if component == "z" else None,
+            gap10_polarity=0 if component == "z" else None,
         )
     return rows
 
 
-def _approvals(subject, generation=11):
-    approvals = {}
-    for spec in subject.SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS:
-        approvals[spec.key] = subject.Serial206StageApproval(
-            approval_id=f"T-{spec.key}",
-            expected_generation=generation,
-            expected_component=spec.component,
-            expected_direction=spec.direction,
-            expected_bound=spec.bound,
-            operator_note=f"Operator reviewed {spec.key}",
-            idempotency_key=f"idem-{spec.key}",
-        )
-    return approvals
-
-
-def _provider(subject, primitives, store, references, generation=11):
-    prep = PreparationProvider(primitives.calls, generation=generation)
-    return subject.Serial206OemInitializationProvider(
-        primitives,
-        ledger_store=store,
-        approval_store=store,
-        reference_store=references,
-        generation_provider=lambda: generation,
-        preparation_provider=prep,
-        sleep=lambda seconds: primitives.calls.append(f"sleep:{seconds:.3f}"),
+def _approval(stage: str, *, approval_id: str | None = None, generation: int = 11):
+    spec = {row.key: row for row in subject.SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS}[stage]
+    return subject.Serial206StageApproval(
+        approval_id=approval_id or f"approval-{stage}",
+        expected_generation=generation,
+        expected_component=spec.component,
+        expected_direction=spec.direction,
+        expected_bound=spec.bound,
+        operator_note=f"Approve exact stage {stage}",
+        idempotency_key=f"idempotency-{stage}",
     )
 
 
-def test_dry_run_returns_literal_order_without_preparation_or_primitive_io():
-    from src.bioxp import oem_serial206_initialization as subject
+def _provider(tmp_path: Path, primitives: FakeSerial206Primitives, references: ReferenceStore | None = None):
+    store = OEMRuntimeStore(tmp_path / "runtime")
+    return subject.Serial206OemInitializationProvider(
+        primitives,
+        state_store=store,
+        reference_store=references,
+        generation_provider=lambda: 11,
+        preparation_provider=PreparationProvider(primitives.calls),
+        sleep=lambda _: None,
+    )
 
+
+def test_live_call_executes_only_exact_next_stage_and_never_auto_observes(tmp_path):
     primitives = FakeSerial206Primitives()
-    result = _provider(subject, primitives, DurableStore(), ReferenceStore()).initialize_motors(mode="dry_run")
-
-    assert result["ok"] is True
-    assert result["ready"] is False
-    assert result["opened_usb"] is False
-    assert result["physical_motion_commanded"] is False
-    assert [row["stage"] for row in result["stage_receipts"]] == EXPECTED_STAGES
-    assert primitives.calls == []
-
-
-def test_live_initialize_motors_runs_exact_oem_order_and_persists_full_receipts():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    store = DurableStore()
-    refs = ReferenceStore({"x": {"state": "desynced"}, "y": {"state": "desynced"}})
-    primitives = FakeSerial206Primitives()
-    provider = _provider(subject, primitives, store, refs)
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
 
     result = provider.initialize_motors(
         mode="live",
-        approvals=_approvals(subject),
-        commissioning=_commissioning(subject),
+        approval=_approval("z-home"),
+        commissioning=_commissioning(),
     )
-
-    assert result["ok"] is True
-    assert result["ready"] is True
-    assert result["failed_at"] is None
-    assert [row["stage"] for row in result["stage_receipts"]] == EXPECTED_STAGES
-    assert primitives.calls == [
-        "prepare",
-        "z-home",
-        "gripper-current-31",
-        "gripper-clear-10000",
-        "gripper-home",
-        "x-home",
-        "sleep:0.020",
-        "x-set-home",
-        "x-speed-1700",
-        "sleep:0.040",
-        "x-park-6000",
-        "y-home",
-        "door-home",
-        "door-closed-predicate",
-        "y-set-home",
-        "chiller-oc-cool-rate",
-        "chiller-rc-cool-rate",
-        "gripper-idle-current-10",
-    ]
-    for receipt in result["stage_receipts"]:
-        assert receipt["approval_id"].startswith("T-")
-        assert receipt["command_ack"] is not None or receipt["stage"] in {"x-home-settle", "x-speed-settle", "ui-zero-calibrated", "system-status-initialized"}
-        assert "wait" in receipt
-        assert "switch_predicate" in receipt
-        assert "position_delta" in receipt
-        assert "home_position" in receipt
-        assert "reference_transition" in receipt
-        assert "physical_effect_verified" in receipt
-        assert "operator_assessment" in receipt
-    assert store.ledger["terminal_state"] == "initializeMotors_complete"
-    assert refs.rows["x"]["state"] == "referenced"
-    assert refs.rows["y"]["state"] == "referenced"
-
-
-def test_first_failed_stage_stops_and_no_delta_keeps_existing_reference_desynced():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    store = DurableStore()
-    refs = ReferenceStore({"x": {"state": "desynced", "origin_position_steps": 123}})
-    primitives = FakeSerial206Primitives(no_delta_stage="x-home")
-    result = _provider(subject, primitives, store, refs).initialize_motors(
-        mode="live",
-        approvals=_approvals(subject),
-        commissioning=_commissioning(subject),
-    )
-
-    assert result["ok"] is False
-    assert result["failed_at"] == "x-home"
-    assert result["stage_receipts"][-1]["failure"] == "ambiguous_or_unverified_stage_effect"
-    assert "x-park-6000" not in primitives.calls
-    assert refs.rows["x"]["state"] == "desynced"
-    assert refs.rows["x"]["origin_position_steps"] == 123
-
-
-def test_z_fails_closed_without_fresh_same_epoch_gap9_gap10_commissioning_before_io():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    primitives = FakeSerial206Primitives()
-    result = _provider(subject, primitives, DurableStore(), ReferenceStore()).initialize_motors(
-        mode="live",
-        approvals=_approvals(subject),
-        commissioning=_commissioning(subject, z_gap=False),
-    )
-
-    assert result["ok"] is False
-    assert result["failed_at"] == "admission"
-    assert "z_gap9_gap10_polarity_not_explicitly_commissioned" in result["blockers"]
-    assert primitives.calls == []
-
-
-def test_single_use_approval_cannot_authorize_a_second_motion():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    store = DurableStore()
-    approvals = _approvals(subject)
-    first_primitives = FakeSerial206Primitives(fail_stage="gripper-current-31")
-    first = _provider(subject, first_primitives, store, ReferenceStore()).initialize_motors(
-        mode="live", approvals=approvals, commissioning=_commissioning(subject)
-    )
-    assert first["failed_at"] == "gripper-current-31"
-
-    second_primitives = FakeSerial206Primitives()
-    second = _provider(subject, second_primitives, store, ReferenceStore()).initialize_motors(
-        mode="live", approvals=approvals, commissioning=_commissioning(subject)
-    )
-    assert second["ok"] is False
-    assert second["failed_at"] == "admission"
-    assert "approval_id_already_used:T-z-home" in second["blockers"]
-    assert second_primitives.calls == []
-
-
-def _motion_approvals(subject, generation=11):
-    approvals = {}
-    for spec in subject.SERIAL206_INITIALIZE_MOTION_STAGE_SPECS:
-        approvals[spec.key] = subject.Serial206StageApproval(
-            approval_id=f"IM-{spec.key}",
-            expected_generation=generation,
-            expected_component=spec.component,
-            expected_direction=spec.direction,
-            expected_bound=spec.bound,
-            operator_note=f"Operator approved {spec.key}",
-            idempotency_key=f"im-idem-{spec.key}",
-        )
-    return approvals
-
-
-def test_initialize_motion_dry_run_plans_both_tip_branches_without_any_io():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    primitives = FakeSerial206Primitives(tips=(True, False, False, False))
-    result = _provider(subject, primitives, DurableStore(), ReferenceStore()).initialize_motion(mode="dry_run")
 
     assert result["ok"] is True
     assert result["ready"] is False
-    assert result["branch"] == "undetermined_dry_run"
-    assert result["physical_motion_commanded"] is False
-    assert result["opened_usb"] is False
-    assert [row["stage"] for row in result["stage_receipts"]] == [
-        spec.key for spec in subject.SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
-    ]
-    assert primitives.calls == []
+    assert result["state"] == "awaiting_operator_observation"
+    assert [row["stage"] for row in result["stage_receipts"]] == ["z-home"]
+    assert primitives.calls == ["prepare", "z-home"]
+    row = result["movement_ledger"]["stages"]["z-home"]
+    assert row["state"] == "acknowledged"
+    assert row["observation"] is None
+    assert result["movement_ledger"]["expected_next_stage"] == "z-home"
+    assert references.transitions == []
 
 
-def test_initialize_motion_no_tip_branch_stops_after_exact_no_tip_state_update():
-    from src.bioxp import oem_serial206_initialization as subject
+def test_observation_is_strict_no_hardware_transition_then_next_call_runs_one_stage(tmp_path):
+    first_primitives = FakeSerial206Primitives()
+    references = ReferenceStore()
+    first = _provider(tmp_path, first_primitives, references)
+    executed = first.initialize_motors(
+        mode="live", approval=_approval("z-home"), commissioning=_commissioning()
+    )
+    command_id = executed["stage_receipts"][0]["approval_id"]
 
-    store = DurableStore()
-    primitives = FakeSerial206Primitives(tips=(False, False, False, False))
-    result = _provider(subject, primitives, store, ReferenceStore()).initialize_motion(
+    restarted_primitives = FakeSerial206Primitives()
+    restarted = _provider(tmp_path, restarted_primitives, references)
+    observed = restarted.record_observation(
+        stage="z-home",
+        command_id=command_id,
+        expected_generation=11,
+        observed_pass=True,
+        note="Christian observed correct z home movement and stop.",
+    )
+
+    assert observed["ok"] is True
+    assert observed["physical_motion_commanded"] is False
+    assert restarted_primitives.calls == []
+    assert observed["movement_ledger"]["expected_next_stage"] == "gripper-current-31"
+    assert references.transitions == [("referenced", "z")]
+
+    second = restarted.initialize_motors(
         mode="live",
-        motor_approvals=_approvals(subject),
-        motion_approvals=_motion_approvals(subject),
-        commissioning=_commissioning(subject),
+        approval=_approval("gripper-current-31"),
+        commissioning=_commissioning(),
     )
-
-    assert result["ok"] is True
-    assert result["ready"] is True
-    assert result["branch"] == "no_tip"
-    motion_stages = [row["stage"] for row in result["stage_receipts"]]
-    assert motion_stages == [
-        "initializeMotion.stop_scripts",
-        "initializeMotion.clear_forceabort",
-        "initializeMotion.initializeMotors",
-        "initializeMotion.thermal_door_closed",
-        "initializeMotion.queryTipStatus.initial",
-        "initializeMotion.sleep.after_tip_query",
-        "initializeMotion.tip_loaded_false.no_tip",
-    ]
-    assert "initializeMotion.openThermalDoor.tip_exists" not in primitives.calls
-    assert "initializeMotion.ejectAllTips.tip_exists" not in primitives.calls
-    assert "pipette-initiate-group" not in primitives.calls
-    assert store.motion_ledger["terminal_state"] == "initializeMotion_complete_no_tip"
+    assert second["ok"] is True
+    assert [row["stage"] for row in second["stage_receipts"]] == ["gripper-current-31"]
+    assert restarted_primitives.calls == ["gripper-current-31"]
+    assert second["movement_ledger"]["expected_next_stage"] == "gripper-clear-10000"
 
 
-def test_initialize_motion_stale_tip_branch_runs_literal_cleanup_and_pipette_checks():
-    from src.bioxp import oem_serial206_initialization as subject
+@pytest.mark.parametrize("observed_pass", ["true", "false", 0, 1, None])
+def test_observation_rejects_non_boolean_without_hardware_or_state_change(tmp_path, observed_pass):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    provider.initialize_motors(mode="live", approval=_approval("z-home"), commissioning=_commissioning())
+    before = provider.projection()
+    primitives.calls.clear()
 
-    store = DurableStore()
-    primitives = FakeSerial206Primitives(
-        tip_queries=[(True, False, True, False), (False, False, False, False)]
-    )
-    result = _provider(subject, primitives, store, ReferenceStore()).initialize_motion(
-        mode="live",
-        motor_approvals=_approvals(subject),
-        motion_approvals=_motion_approvals(subject),
-        commissioning=_commissioning(subject),
-    )
-
-    assert result["ok"] is True
-    assert result["branch"] == "stale_tip_remediation"
-    assert [row["stage"] for row in result["stage_receipts"]] == [
-        "initializeMotion.stop_scripts",
-        "initializeMotion.clear_forceabort",
-        "initializeMotion.initializeMotors",
-        "initializeMotion.thermal_door_closed",
-        "initializeMotion.queryTipStatus.initial",
-        "initializeMotion.sleep.after_tip_query",
-        "initializeMotion.openThermalDoor.tip_exists",
-        "initializeMotion.thermal_door_open.tip_exists",
-        "initializeMotion.tip_loaded.tip_exists",
-        "initializeMotion.scriptmoveTo.tip_exists",
-        "initializeMotion.updateLocation.tip_exists",
-        "initializeMotion.ejectAllTips.tip_exists",
-        "initializeMotion.moveZ.tip_exists",
-        "initializeMotion.moveX.tip_exists",
-        "initializeMotion.queryTipStatus.after_eject",
-        "initializeMotion.sleep.after_eject_query",
-        "initializeMotion.tip_dirty_false",
-        "initializeMotion.tip_loaded_false.after_eject",
-        "initializeMotion.sleep.before_initiate_group",
-        "initializeMotion.initiateGroup.initial",
-        "initializeMotion.checkedPipetteStatus.initial",
-    ]
-    assert store.motion_ledger["terminal_state"] == "initializeMotion_complete_stale_tip"
-    assert all(row["approval_id"].startswith("IM-") for row in result["stage_receipts"] if row["stage"] != "initializeMotion.initializeMotors")
-
-
-def test_stale_tip_remediation_fails_closed_when_post_eject_query_is_not_empty():
-    from src.bioxp import oem_serial206_initialization as subject
-
-    primitives = FakeSerial206Primitives(
-        tip_queries=[(True, False, False, False), (True, False, False, False)]
-    )
-    result = _provider(subject, primitives, DurableStore(), ReferenceStore()).initialize_motion(
-        mode="live",
-        motor_approvals=_approvals(subject),
-        motion_approvals=_motion_approvals(subject),
-        commissioning=_commissioning(subject),
+    result = provider.record_observation(
+        stage="z-home",
+        command_id="approval-z-home",
+        expected_generation=11,
+        observed_pass=observed_pass,
+        note="A real note",
     )
 
     assert result["ok"] is False
-    assert result["failed_at"] == "initializeMotion.queryTipStatus.after_eject"
-    assert result["stage_receipts"][-1]["failure"] == "stale_tip_remains_after_eject"
-    assert "initializeMotion.tip_dirty_false" not in primitives.calls
-    assert "pipette-initiate-group" not in primitives.calls
+    assert "observed_pass_must_be_boolean" in result["blockers"]
+    assert primitives.calls == []
+    assert provider.projection() == before
+
+
+def test_restart_resumes_expected_next_stage_without_replaying_acknowledged_stage(tmp_path):
+    first_primitives = FakeSerial206Primitives()
+    _provider(tmp_path, first_primitives).initialize_motors(
+        mode="live", approval=_approval("z-home"), commissioning=_commissioning()
+    )
+
+    restarted_primitives = FakeSerial206Primitives()
+    result = _provider(tmp_path, restarted_primitives).initialize_motors(
+        mode="live", approval=_approval("z-home", approval_id="different-approval"), commissioning=_commissioning()
+    )
+
+    assert result["ok"] is False
+    assert result["state"] == "awaiting_operator_observation"
+    assert "operator_observation_required:z-home" in result["blockers"]
+    assert restarted_primitives.calls == []
+
+
+def test_used_approval_is_rejected_after_restart_before_any_primitive(tmp_path):
+    first_primitives = FakeSerial206Primitives()
+    first = _provider(tmp_path, first_primitives)
+    first.initialize_motors(mode="live", approval=_approval("z-home", approval_id="single-use"), commissioning=_commissioning())
+    first.record_observation(
+        stage="z-home",
+        command_id="single-use",
+        expected_generation=11,
+        observed_pass=True,
+        note="Observed correct movement.",
+    )
+
+    restarted_primitives = FakeSerial206Primitives()
+    result = _provider(tmp_path, restarted_primitives).initialize_motors(
+        mode="live",
+        approval=_approval("gripper-current-31", approval_id="single-use"),
+        commissioning=_commissioning(),
+    )
+
+    assert result["ok"] is False
+    assert "approval_id_already_used:single-use" in result["blockers"]
+    assert restarted_primitives.calls == []
+
+
+def test_corrupt_durable_state_fails_closed_before_any_primitive(tmp_path):
+    root = tmp_path / "runtime"
+    store = OEMRuntimeStore(root)
+    state_path = store.serial206_initialization_state_path
+    state_path.write_text("{ definitely not JSON")
+    primitives = FakeSerial206Primitives()
+    provider = subject.Serial206OemInitializationProvider(
+        primitives,
+        state_store=store,
+        generation_provider=lambda: 11,
+        preparation_provider=PreparationProvider(primitives.calls),
+    )
+
+    result = provider.initialize_motors(
+        mode="live", approval=_approval("z-home"), commissioning=_commissioning()
+    )
+
+    assert result["ok"] is False
+    assert result["state"] == "failed_closed"
+    assert "durable_serial206_state_corrupt" in result["blockers"]
+    assert primitives.calls == []
+
+
+def test_single_atomic_state_file_contains_all_ledgers_with_restrictive_permissions(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    provider.initialize_motors(mode="live", approval=_approval("z-home"), commissioning=_commissioning())
+    store = provider.state_store
+    path = store.serial206_initialization_state_path
+    payload = json.loads(path.read_text())
+
+    assert set(payload) >= {"movement_ledger", "used_approvals", "initialize_motion_ledger"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_initialize_motion_live_is_truthfully_unavailable_when_exact_sequence_is_partial(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+
+    status = provider.capability_status()
+    result = provider.initialize_motion(mode="live")
+
+    assert status["initialize_motors_live_available"] is True
+    assert status["initialize_motion_live_available"] is False
+    assert "initializeMotion.scriptmoveTo.tip_exists" in status["initialize_motion_missing_primitives"]
+    assert result["ok"] is False
+    assert result["physical_motion_commanded"] is False
+    assert "initialize_motion_exact_primitives_not_bound" in result["blockers"]
+    assert primitives.calls == []
+
+
+def test_production_adapter_exposes_only_source_grounded_existing_primitives(monkeypatch):
+    class Tester:
+        def motor_oem_home_axis(self, *args, **kwargs): return {"ok": True}
+        def motor_set_axis_param(self, *args, **kwargs): return {"ok": True}
+        def motor_move_relative(self, *args, **kwargs): return {"ok": True}
+        def motor_wait_stopped(self, *args, **kwargs): return {"stopped": True}
+        def motor_get_position(self, *args, **kwargs): return {"ok": True, "ack": dict(ACK), "position": 0}
+        def motor_set_home(self, *args, **kwargs): return {"ok": True}
+        def motor_move_absolute(self, *args, **kwargs): return {"ok": True}
+        def motor_oem_door_search_home(self, *args, **kwargs): return {"ok": True}
+        def motor_thermal_door_status(self): return {"ok": True}
+        def _machine_config_bundle(self):
+            return {"ok": True, "config": {"config": {"GripperVersion": 1}, "calibration": {"Calibrated": 1}}}
+        def _oem_no_motion_tmcl_with_readback(self, **kwargs): return {"ok": True}
+        def oem_set_calibrated_ui_positions_zero(self): return {"ok": True}
+
+    class Pipettes:
+        def query_tip_status_all(self): return {"ok": True, "channels": []}
+        def eject_all_tips_for_oem_startup(self, **kwargs): return {"ok": True}
+        def initialize(self, command): return {"ok": True}
+
+    monkeypatch.setattr(subject, "prepare_motion_without_motion", lambda tester, authority: {
+        "ok": True,
+        "physical_motion": False,
+        "stage_ledger": [],
+    })
+    adapter = subject.Serial206ProductionPrimitiveAdapter(
+        Tester(), Pipettes(), authority_provider=lambda: object(), generation_provider=lambda: 7
+    )
+
+    status = adapter.capability_status()
+    prep = adapter.prepare_for_initialize_motors(expected_generation=7)
+
+    assert status["initialize_motors_exact_primitives_bound"] is False
+    assert status["initialize_motion_complete"] is False
+    assert "mandatory_primitive_not_bound:motor_prepare_axis" in status["initialize_motors_binding_blockers"]
+    assert "mandatory_primitive_not_bound:motor_oem_open_thermal_door" in status["initialize_motors_binding_blockers"]
+    assert not hasattr(adapter, "scriptmove_to")
+    assert not hasattr(adapter, "set_tip_loaded")
+    assert prep["ok"] is True
+    assert prep["physical_motion"] is False

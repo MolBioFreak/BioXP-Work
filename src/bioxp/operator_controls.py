@@ -34,6 +34,7 @@ from .oem_full_lifecycle import (
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
 from .oem_movement_ledger import OEM_INITIALIZE_MOTORS_STAGE_KEYS
+from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
 
 CATALOG_SCHEMA = "bioxp.operator_control_catalog.v1"
 RECEIPT_SCHEMA = "bioxp.operator_action_receipt.v1"
@@ -361,6 +362,15 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies: list[dict[str, Any]] = []
     provider_available = bool(action.get("provider_available", action.get("available", True)))
     provider_reason = str(action.get("provider_unavailable_reason") or action.get("unavailable_reason") or "Robot provider is not available.")
+    required_provider_capability = action.get("required_provider_capability")
+    if isinstance(required_provider_capability, str) and required_provider_capability:
+        provider_state_value = machine_state.get("serial206_initialization_provider")
+        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
+        capability_field = f"{required_provider_capability}_live_available"
+        capability_available = provider_state.get("bound") is True and provider_state.get(capability_field) is True
+        provider_available = provider_available and capability_available
+        if not capability_available:
+            provider_reason = f"Serial-206 live provider capability unavailable: {required_provider_capability}."
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     method = str(action.get("informational_method") or "GET")
@@ -551,6 +561,10 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
 _NON_OPERATOR_COMPAT_PATHS = {
     "/oem/startup/status/{session_id}",
 }
+_SERIAL206_PROVIDER_CAPABILITIES = {
+    "/motion/oem/serial206/initialize_motors": "initialize_motors",
+    "/motion/oem/serial206/initialize_motion": "initialize_motion",
+}
 
 
 def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -588,6 +602,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "source_anchor": None,
                 "informational_method": upper,
                 "informational_path": path,
+                "required_provider_capability": _SERIAL206_PROVIDER_CAPABILITIES.get(path),
                 "provider_available": dispatchable,
                 "provider_unavailable_reason": unavailable_reason,
                 "available": dispatchable,
@@ -596,7 +611,11 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "disabled_reason": unavailable_reason,
                 "dependencies": [],
                 "requires_confirmation": safety not in {"read_only", "emergency", "stop"},
-                "timeout_seconds": 120.0 if safety == "motion" else 30.0,
+                "timeout_seconds": (
+                    360.0
+                    if path in _SERIAL206_PROVIDER_CAPABILITIES
+                    else (120.0 if safety == "motion" else 30.0)
+                ),
                 "inputs": inputs,
                 "stages": [],
             }
@@ -611,8 +630,23 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         (row for row in actions if row["informational_path"] == "/motion/emergency_stop" and row["informational_method"] == "POST"),
         None,
     )
+    home_xy_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/oem/home_xy" and row["informational_method"] == "POST"),
+        None,
+    )
+    initialize_motors_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/oem/serial206/initialize_motors" and row["informational_method"] == "POST"),
+        None,
+    )
+    initialize_motion_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/oem/serial206/initialize_motion" and row["informational_method"] == "POST"),
+        None,
+    )
     prepare_bound = prepare_provider is not None and prepare_provider.get("provider_available") is True
     emergency_bound = emergency_provider is not None and emergency_provider.get("provider_available") is True
+    home_xy_bound = home_xy_provider is not None and home_xy_provider.get("provider_available") is True
+    initialize_motors_bound = initialize_motors_provider is not None and initialize_motors_provider.get("provider_available") is True
+    initialize_motion_bound = initialize_motion_provider is not None and initialize_motion_provider.get("provider_available") is True
     meta = [
         {
             "action_id": "meta.activate_motion",
@@ -671,52 +705,83 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "source_anchor": "ClassControlInterface.HomeXY:5056-5061",
             "informational_method": "POST",
             "informational_path": "/motion/oem/home_xy",
-            "provider_available": any(row["informational_path"] == "/motion/oem/home_xy" and row["informational_method"] == "POST" for row in actions),
-            "provider_unavailable_reason": None,
-            "available": True,
-            "unavailable_reason": None,
-            "enabled": True,
-            "disabled_reason": None,
+            "provider_available": home_xy_bound,
+            "provider_unavailable_reason": None if home_xy_bound else "OEM HomeXY provider route is not bound.",
+            "available": home_xy_bound,
+            "unavailable_reason": None if home_xy_bound else "OEM HomeXY provider route is not bound.",
+            "enabled": home_xy_bound,
+            "disabled_reason": None if home_xy_bound else "OEM HomeXY provider route is not bound.",
             "dependencies": [],
             "requires_confirmation": True,
             "timeout_seconds": 180.0,
-            "inputs": [],
+            "inputs": list(home_xy_provider.get("inputs", [])) if home_xy_provider else [],
             "stages": ["set X/Y speedacc=200", "launch X goHome", "launch Y goHome", "wait all", "restore action current"],
         },
         {
-            "action_id": "meta.full_initialization",
-            "label": "Full BioXP Initialization (OEM initializeSystem)",
+            "action_id": "meta.initialize_motors",
+            "label": "OEM initializeMotors — Execute Expected Stage",
             "subsystem": "meta",
             "category": "initialization",
             "kind": "meta",
             "safety_class": "motion",
-            "description": "Complete source-ordered BioXP initializeSystem/initializeMotors lifecycle with durable receipt for every stage.",
-            "source_anchor": "BioXPMainWindow.initializeSystem:1046-1342; ClassControlInterface.initializeMotors:3348-3421",
+            "description": "Execute exactly one durable, source-ordered ClassControlInterface.initializeMotors stage using its matching approval/commissioning block.",
+            "source_anchor": "ClassControlInterface.initializeMotors:3348-3421",
             "informational_method": "POST",
-            "informational_path": "/operator/actions/meta.full_initialization",
-            "provider_available": False,
-            "provider_unavailable_reason": "Full OEM lifecycle providers are not all bound and commissioned.",
-            "available": False,
-            "unavailable_reason": "Full OEM lifecycle providers are not all bound and commissioned.",
-            "enabled": False,
-            "disabled_reason": "Full OEM lifecycle providers are not all bound and commissioned.",
+            "informational_path": "/motion/oem/serial206/initialize_motors",
+            "required_provider_capability": "initialize_motors",
+            "provider_available": initialize_motors_bound,
+            "provider_unavailable_reason": None if initialize_motors_bound else "OEM initializeMotors provider route is not bound.",
+            "available": initialize_motors_bound,
+            "unavailable_reason": None if initialize_motors_bound else "OEM initializeMotors provider route is not bound.",
+            "enabled": initialize_motors_bound,
+            "disabled_reason": None if initialize_motors_bound else "OEM initializeMotors provider route is not bound.",
             "dependencies": [],
             "requires_confirmation": True,
-            "timeout_seconds": 900.0,
-            "inputs": [],
+            "timeout_seconds": 360.0,
+            "inputs": list(initialize_motors_provider.get("inputs", [])) if initialize_motors_provider else [],
             "stages": list(OEM_INITIALIZE_MOTORS_STAGE_KEYS),
+        },
+        {
+            "action_id": "meta.initialize_motion",
+            "label": "OEM initializeMotion — Execute Expected Stage",
+            "subsystem": "meta",
+            "category": "initialization",
+            "kind": "meta",
+            "safety_class": "motion",
+            "description": "Execute exactly one durable ControlLib.initializeMotion stage, including initializeMotors call-through, tip branch/ejection, source scriptmoveTo, final X/Z moves, pipette initiateGroup retry, and OEM exception effects.",
+            "source_anchor": "ControlLib.initializeMotion:8797-8856",
+            "informational_method": "POST",
+            "informational_path": "/motion/oem/serial206/initialize_motion",
+            "required_provider_capability": "initialize_motion",
+            "provider_available": initialize_motion_bound,
+            "provider_unavailable_reason": None if initialize_motion_bound else "OEM initializeMotion provider route is not bound.",
+            "available": initialize_motion_bound,
+            "unavailable_reason": None if initialize_motion_bound else "OEM initializeMotion provider route is not bound.",
+            "enabled": initialize_motion_bound,
+            "disabled_reason": None if initialize_motion_bound else "OEM initializeMotion provider route is not bound.",
+            "dependencies": [],
+            "requires_confirmation": True,
+            "timeout_seconds": 360.0,
+            "inputs": list(initialize_motion_provider.get("inputs", [])) if initialize_motion_provider else [],
+            "stages": [spec.key for spec in SERIAL206_INITIALIZE_MOTION_STAGE_SPECS],
         },
     ]
     # Meta actions dispatch to exact bound provider routes; no synthesized sequence.
     home_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/home_xy"), None)
     prepare_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/prepare_without_motion"), None)
     emergency_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/emergency_stop"), None)
+    initialize_motors_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/serial206/initialize_motors"), None)
+    initialize_motion_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/serial206/initialize_motion"), None)
     if home_route:
         dispatch["meta.home_xy"] = home_route
     if prepare_route:
         dispatch["meta.activate_motion"] = prepare_route
     if emergency_route:
         dispatch["meta.emergency_stop"] = emergency_route
+    if initialize_motors_route:
+        dispatch["meta.initialize_motors"] = initialize_motors_route
+    if initialize_motion_route:
+        dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
     return actions, dispatch
 
@@ -788,6 +853,7 @@ def install_operator_control_plane(
     maintenance_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     reference_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     lifecycle_state_provider: Callable[[], Mapping[str, Any]] | None = None,
+    serial206_initialization_state_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -833,6 +899,11 @@ def install_operator_control_plane(
                 "block_reason": "Motion state is not bound to the operator plane.",
             },
             "lifecycle": dict(lifecycle_state_provider()) if lifecycle_state_provider else lifecycle_state.projection(),
+            "serial206_initialization_provider": (
+                dict(serial206_initialization_state_provider())
+                if serial206_initialization_state_provider
+                else {"bound": False, "initialize_motors_live_available": False, "initialize_motion_live_available": False}
+            ),
             "references": dict(reference_state_provider()) if reference_state_provider else {"rows": {}},
             "domains": domains,
             "freshness": freshness or {"state": "missing", "age_s": None, "fresh_for_s": 30.0},

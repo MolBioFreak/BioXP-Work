@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,18 +12,72 @@ from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    tmp.replace(path)
+    """Durably replace one private JSON authority file.
+
+    The temporary file and containing state directory are deliberately private.
+    ``fsync`` is applied to both file contents and the parent directory so an ACK
+    cannot be returned for a transition that only existed in page cache.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class OEMRuntimeStore:
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
         self._lock = threading.RLock()
         self._seq = self._load_seq()
+
+    @property
+    def serial206_initialization_state_path(self) -> Path:
+        return self.root / "serial206_oem_initialization_state.json"
+
+    def read_oem_serial206_initialization_state(self) -> dict[str, Any] | None:
+        """Read the single atomic serial-206 lifecycle authority.
+
+        JSON/schema errors intentionally propagate.  Callers must fail closed;
+        treating corruption as a fresh state could replay acknowledged motion.
+        """
+        path = self.serial206_initialization_state_path
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("serial-206 initialization state must be an object")
+        return payload
+
+    def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Atomically persist movement, approval, and initializeMotion ledgers."""
+        payload = dict(state)
+        required = {"movement_ledger", "used_approvals", "initialize_motion_ledger"}
+        if not required.issubset(payload):
+            raise ValueError("serial-206 state must contain all lifecycle ledgers")
+        with self._lock:
+            _atomic_json(self.serial206_initialization_state_path, payload)
+        return payload
 
     def _load_seq(self) -> int:
         p = self.root / "sequence.txt"
