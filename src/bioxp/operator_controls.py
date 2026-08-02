@@ -265,7 +265,6 @@ _LOCAL_ONLY_PATH_PREFIXES = (
 
 _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
     "/motion/interlock/prepare": "Quarantined: this legacy route performs inferred latch/power writes and is not the source-grounded serial-206 preparation provider.",
-    "/motion/power/enable": "Quarantined: this route uses unacknowledged reverse-engineered relay writes and is not proven equivalent to an OEM global 24 V On operation.",
     "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
     "/oem/runtime/emergency_stop": "Quarantined: this route records lifecycle emergency state but does not dispatch the OEM physical aggregate abort sequence.",
 }
@@ -403,6 +402,18 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         dependencies.append(_dependency(
             "motion_enabled", "Motion enabled", motion_enabled, motion_disabled_reason,
         ))
+        if not source_initializer:
+            references_value = machine_state.get("references")
+            references = references_value if isinstance(references_value, Mapping) else {}
+            reference_rows_value = references.get("rows")
+            reference_rows = reference_rows_value if isinstance(reference_rows_value, Mapping) else {}
+            for axis in _required_reference_axes(action, values):
+                row = reference_rows.get(axis)
+                referenced = isinstance(row, Mapping) and row.get("state") == "referenced"
+                dependencies.append(_dependency(
+                    f"axis_{axis}_referenced", f"{axis.upper()} axis homed", referenced,
+                    f"{axis.upper()} axis is not homed.",
+                ))
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}

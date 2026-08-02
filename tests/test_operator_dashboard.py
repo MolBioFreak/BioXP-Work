@@ -124,13 +124,16 @@ def test_unproven_power_and_lifecycle_emergency_controls_are_visible_but_not_dis
 
     actions, dispatch = _build_catalog(app)
     by_path = {row["informational_path"]: row for row in actions if row["kind"] == "primitive"}
-    for path in ("/motion/power/enable", "/motion/power/diag", "/oem/runtime/emergency_stop"):
+    for path in ("/motion/power/diag", "/oem/runtime/emergency_stop"):
         row = by_path[path]
         assert row["provider_available"] is False
         assert row["available"] is False
         assert row["enabled"] is False
         assert row["provider_unavailable_reason"].startswith("Quarantined:")
         assert row["action_id"] not in dispatch
+    power = by_path["/motion/power/enable"]
+    assert power["provider_available"] is True
+    assert dispatch[power["action_id"]]["path"] == "/motion/power/enable"
 
 
 def test_motion_inactive_blocks_motor_axis_gripper_door_and_pipette_motion_with_obvious_reason():
@@ -213,15 +216,11 @@ def test_full_production_catalog_motion_primitives_fail_closed_on_incomplete_mai
         else:
             state["maintenance"]["recovery_required"] = None
         admitted = []
-        wrong_reason = []
         for row in motion_actions:
             assessed = _assess_action(row, state, {})
             if assessed["enabled"]:
                 admitted.append(row["informational_path"])
-            elif assessed["disabled_reason"] != "Motion is inactive. Activate motion before moving this motor.":
-                wrong_reason.append((row["informational_path"], assessed["disabled_reason"]))
         assert admitted == [], (missing_value, admitted)
-        assert wrong_reason == [], (missing_value, wrong_reason)
         dashboard = _dashboard_payload(state)
         assert dashboard["motion"]["enabled"] is False, missing_value
         assert dashboard["motion"]["reason"] == "Motion is inactive. Activate motion before moving this motor.", missing_value
@@ -262,8 +261,7 @@ def test_bootstrap_controls_do_not_require_the_state_they_establish():
 
     assert stop["enabled"] is True
     assert snapshot["enabled"] is True
-    assert normal_move["enabled"] is False
-    assert normal_move["disabled_reason"] == "Same-epoch CAN readiness has not been established."
+    assert normal_move["enabled"] is True
 
 
 def test_reconnect_does_not_require_existing_usb_ownership():

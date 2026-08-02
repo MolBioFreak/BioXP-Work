@@ -5485,17 +5485,10 @@ async def motion_power_status():
     return _motion_power_status_payload()
 
 
-@app.post("/motion/power/enable", deprecated=True)
-async def motion_power_enable():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "unproven_global_24v_control_quarantined",
-            "message": "No OEM-equivalent global 24 V On command is proven for serial 206. Use source-grounded no-motion preparation.",
-            "replacement": "/motion/oem/prepare_without_motion",
-            "physical_motion_commanded": False,
-        },
-    )
+@app.post("/motion/power/enable")
+async def motion_power_enable(req: MotionPrepareWithoutMotionRequest):
+    """Compatibility alias for the source-grounded serial-206 power preparation."""
+    return await motion_oem_prepare_without_motion(req)
 
 
 @app.post("/motion/power/diag", deprecated=True)

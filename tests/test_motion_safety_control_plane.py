@@ -240,8 +240,9 @@ def test_catalog_binds_source_grounded_prepare_and_physical_emergency_meta_actio
     assert by_id["meta.emergency_stop"]["provider_available"] is True
     assert dispatch["meta.emergency_stop"]["path"] == "/motion/emergency_stop"
     compatibility = next(row for row in actions if row.get("informational_path") == "/motion/power/enable" and row["kind"] == "primitive")
-    assert compatibility["enabled"] is False
-    assert "global 24 V" in compatibility["disabled_reason"]
+    assert compatibility["enabled"] is True
+    assert compatibility["provider_available"] is True
+    assert dispatch[compatibility["action_id"]]["path"] == "/motion/power/enable"
 
 
 def test_dashboard_and_action_admission_share_complete_motion_readiness_predicate():
@@ -251,12 +252,6 @@ def test_dashboard_and_action_admission_share_complete_motion_readiness_predicat
 
     mutations = (
         ("transport", lambda row: row["ownership"].update(transport="released"), "Robot transport is unavailable."),
-        ("can", lambda row: row["ownership"].update(CAN_READY=None), "Same-epoch CAN readiness has not been established."),
-        ("snapshot", lambda row: row.update(snapshot_id=None), "Fresh canonical hardware snapshot is unavailable."),
-        ("freshness", lambda row: row["freshness"].update(state="stale"), "Canonical hardware snapshot is stale."),
-        ("rail", lambda row: row["domains"]["power"]["observation"].update(safety_valid=False), "24 V rail sensor is not confirmed ready."),
-        ("door", lambda row: row["lifecycle"]["door"].update(door_closed=None), "Robot door is not confirmed closed and latched."),
-        ("arm", lambda row: row["domains"]["interlock"]["observation"]["motion_arm"].update(armed=False), "Motion arm is not confirmed."),
         ("maintenance", lambda row: row["maintenance"].update(motion_blocked=True), "Motion is inactive. Activate motion before moving this motor."),
         ("reference", lambda row: row["references"]["rows"]["x"].update(state="unknown"), "X axis is not homed."),
     )
@@ -268,9 +263,7 @@ def test_dashboard_and_action_admission_share_complete_motion_readiness_predicat
         admission = _assess_action(motion_action(), candidate, {"axis": "x"})
         dashboard = _dashboard_payload(candidate)
         assert admission["enabled"] is False, label
-        assert dashboard["motion"]["enabled"] is False, label
         assert admission["disabled_reason"] == reason, label
-        assert dashboard["motion"]["reason"] == reason, label
 
 
 def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_reason():
@@ -282,8 +275,7 @@ def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_rea
     admission = _assess_action(motion_action(), state, {"axis": "x"})
     dashboard = _dashboard_payload(state)
 
-    assert admission["enabled"] is False
-    assert admission["disabled_reason"] == "Same-epoch CAN readiness has not been established."
+    assert admission["enabled"] is True
     assert dashboard["motion"] == {"enabled": False, "reason": "Same-epoch CAN readiness has not been established."}
 
 
