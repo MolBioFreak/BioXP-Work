@@ -354,9 +354,7 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
     latch_row = domains.get("latch") if isinstance(domains.get("latch"), Mapping) else {}
     latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
     enclosure_ok = bool(
-        door.get("door_closed") is True
-        and door.get("latch_closed") is True
-        and isinstance(latch, Mapping)
+        isinstance(latch, Mapping)
         and latch.get("door_sensor") == 1
         and latch.get("latch_sensor") == 1
     )
@@ -536,16 +534,23 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     pipette_observation = pipette_row.get("observation") if isinstance(pipette_row, Mapping) else None
     pipettes = dict(pipette_observation) if isinstance(pipette_observation, Mapping) else {"ok": False, "channels": [], "error": "Pipette status is not reported."}
     enclosure = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
+    latch_row = domains.get("latch") if isinstance(domains.get("latch"), Mapping) else {}
+    latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
     freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {"state": "missing", "age_s": None, "fresh_for_s": None}
     connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running")
-    motion_readiness = _motion_readiness(machine_state, ["x", "y", "z", "g", "door"])
+    # Report power/interlock readiness independently from per-axis homing.
+    # Individual movement actions still enforce their own axis references.
+    motion_readiness = _motion_readiness(machine_state, [])
     return {
         "schema_version": "bioxp.operator_dashboard.v1",
         "ownership_generation": int(machine_state.get("ownership_generation") or 0),
         "connection": {"live": connection_live, "ownership": dict(ownership)},
         "motion": {"enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"]},
         "operation": {"state": lifecycle.get("operation_state"), "reason": lifecycle.get("operation_reason")},
-        "enclosure": {"door_closed": enclosure.get("door_closed"), "latch_closed": enclosure.get("latch_closed")},
+        "enclosure": {
+            "door_closed": (latch.get("door_sensor") == 1) if isinstance(latch, Mapping) else None,
+            "latch_closed": (latch.get("latch_sensor") == 1) if isinstance(latch, Mapping) else None,
+        },
         "axes": axes,
         "temperatures": temperatures,
         "pipettes": pipettes,

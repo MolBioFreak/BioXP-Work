@@ -325,6 +325,18 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     assert dashboard["snapshot"]["collection_triggered"] is False
 
 
+def test_dashboard_reports_active_motion_independently_from_homing_and_uses_live_latch_evidence():
+    state = machine_state(motion_enabled=True, x="desynced", y="referenced", z="desynced")
+    state["references"]["rows"]["g"]["state"] = "desynced"
+    state["references"]["rows"]["door"]["state"] = "desynced"
+    state["lifecycle"]["door"] = {"door_closed": None, "latch_closed": None}
+
+    dashboard = _dashboard_payload(state)
+
+    assert dashboard["motion"] == {"enabled": True, "reason": None}
+    assert dashboard["enclosure"] == {"door_closed": True, "latch_closed": True}
+
+
 def test_dashboard_connection_live_does_not_fabricate_can_readiness():
     state = machine_state(can_ready=None)
     dashboard = _dashboard_payload(state)
