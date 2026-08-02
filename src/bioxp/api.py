@@ -134,6 +134,8 @@ BMS_COMMISSIONING_CAPABILITIES = (
     "initialize_without_motion",
     "run_initial_check",
     "recover_motion_non_homing",
+    "initialize_motors",
+    "initialize_motion",
     "run_oem_motor_stage",
     "collect_axis_diagnostics",
     "run_axis_diagnostic",

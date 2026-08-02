@@ -339,7 +339,7 @@ class Serial206ProductionPrimitiveAdapter:
             "query_tip_status_all",
             "eject_all_tips_for_oem_startup",
             "initiate_group_once_for_oem_initialize_motion",
-            "checked_status_for_oem_initialize_motion",
+            "checked_pipette_status_for_oem_initialize_motion",
         )
         motion_missing = [
             f"pipette_primitive_not_bound:{name}"
@@ -516,7 +516,7 @@ class Serial206ProductionPrimitiveAdapter:
         return self.pipette_transport.initiate_group_once_for_oem_initialize_motion(cycle=cycle)
 
     def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> Any:
-        return self.pipette_transport.checked_status_for_oem_initialize_motion(attempt=attempt)
+        return self.pipette_transport.checked_pipette_status_for_oem_initialize_motion(attempt=attempt)
 
     @staticmethod
     def _position_value(result: Any) -> int:
@@ -1219,6 +1219,9 @@ class Serial206OemInitializationProvider:
         )
         return {
             "initialize_motors_live_available": motors,
+            "initialize_motors_binding_blockers": list(
+                primitive_status.get("initialize_motors_binding_blockers") or []
+            ),
             "initialize_motion_live_available": bool(motors and primitive_status.get("initialize_motion_complete") is True),
             "initialize_motion_partial_primitives": list(primitive_status.get("initialize_motion_partial_primitives") or []),
             "initialize_motion_missing_primitives": list(primitive_status.get("initialize_motion_missing_primitives") or []),
