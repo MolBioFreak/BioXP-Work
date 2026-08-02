@@ -108,7 +108,8 @@ class BioXpTester:
             "acc": 576,
             "run_current": 31,
             "standby_current": 10,
-            "stall_guard": 16,
+            # Serial-206 immutable OEM machine config m_Z_MOTOR_STALL_GUARD_THRESHOLD.
+            "stall_guard": 3,
             # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
             # Absence means no-write; do not actively force controller mask params to 0.
             "warm_enable": True,
@@ -4133,13 +4134,17 @@ class BioXpTester:
             return preset
         if key == "z":
             z_max, z_max_source = self._machine_config_axis_max("z", 160000)
+            z_stall, z_stall_source = self._machine_config_offset_int(
+                "m_Z_MOTOR_STALL_GUARD_THRESHOLD", None
+            )
             preset.update({
                 "speed": preset.get("speed", 1791),
                 "acc": preset.get("acc", 576),
                 "home_speed": 1791,
                 "run_current": 31,
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
-                "stall_guard": 16,
+                "stall_guard": int(z_stall),
+                "stall_guard_source": str(z_stall_source),
                 "oem_home_step": "MotorZ.axisSearchHome(speed=1791)",
                 "axis_min_steps": 0,
                 "axis_max_steps": z_max,

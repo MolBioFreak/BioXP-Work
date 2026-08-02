@@ -615,6 +615,11 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
 
 _NON_OPERATOR_COMPAT_PATHS = {
     "/oem/startup/status/{session_id}",
+    # Retired generic primitives must not compete with dedicated serial-206 OEM controls.
+    "/motion/axis/relative",
+    "/motion/axis/absolute",
+    "/motion/axis/home",
+    "/motion/axis/zero",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/serial206/initialize_motors": "initialize_motors",
