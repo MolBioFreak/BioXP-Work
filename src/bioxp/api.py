@@ -6309,6 +6309,15 @@ async def motion_oem_z_prepare():
     )
 
 
+@app.post("/motion/oem/z/live_right_reference")
+async def motion_oem_z_live_right_reference():
+    return await _run_blocking(
+        "serial-206 Z live right-reference recovery",
+        lambda: _execute_provider_z_intent("live_right_reference"),
+        timeout_s=30.0,
+    )
+
+
 @app.post("/motion/oem/z/reconcile_switch_masks")
 async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
     return await _run_blocking(

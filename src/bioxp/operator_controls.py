@@ -224,6 +224,11 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 
 _NO_MOTION_PREPARATION_PATHS = {
     "/motion/oem/prepare_without_motion",
+    # Serial-206 Z preparation configures controller state only; it is the
+    # prerequisite for recovering a desynchronised Z reference and must not
+    # require that reference to already be established.
+    "/motion/oem/z/prepare",
+    "/motion/oem/z/live_right_reference",
 }
 
 

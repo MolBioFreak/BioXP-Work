@@ -816,6 +816,17 @@ class Serial206ProductionPrimitiveAdapter:
             "physical_effect_verified": False,
         }
 
+    def z_right_reference(self) -> dict[str, Any]:
+        """Reconcile Z at the validated live right-reference input without motion."""
+        self._z_profile()
+        right = self.tester.motor_get_axis_param(4, 10, motor=1)
+        if not isinstance(right, Mapping) or right.get("ok") is not True or right.get("value") != 1:
+            return {"ok": False, "failure": "z_live_right_reference_not_asserted", "right_switch": right, "physical_motion": False}
+        set_home = self.tester.motor_set_home(4, motor=1)
+        position = self.tester.motor_get_position(4, motor=1)
+        ok = bool(isinstance(set_home, Mapping) and set_home.get("ok") is True and isinstance(position, Mapping) and position.get("position") == 0)
+        return {"ok": ok, "intent": "live_right_reference", "right_switch": right, "set_home": set_home, "position": position, "physical_motion": False, "controller_command_acknowledged": bool(isinstance(set_home, Mapping) and set_home.get("ok") is True), "controller_terminal_state_verified": ok, "physical_effect_verified": True, "failure": None if ok else "z_live_right_reference_not_verified"}
+
     def z_startup_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
         self._z_profile()
         result = self.tester.motor_oem_axis_search_home(
@@ -2306,6 +2317,8 @@ class Serial206OemInitializationProvider:
                     )
                 elif intent == "reconcile_switch_masks":
                     result = self.primitives.z_reconcile_switch_masks()
+                elif intent == "live_right_reference":
+                    result = self.primitives.z_right_reference()
                 elif intent == "manual_home":
                     result = self.primitives.z_manual_home(timeout_s=float(values.get("timeout_s", 30.0)))
                 elif intent == "diagnostic_home_axis":
@@ -2356,6 +2369,14 @@ class Serial206OemInitializationProvider:
             elif ok and intent == "reconcile_switch_masks":
                 z.update({"state": "unprepared", "generation": None, "prepared_receipt": None, "reference_state": "desynced", "last_failure": None})
                 self._z_mark_desynced("Z switch masks reconciled; source profile must be prepared again.", "serial206.z.reconcile_switch_masks")
+            elif ok and intent == "live_right_reference":
+                z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
+                if self.reference_store is not None:
+                    reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="z", position_steps=0, source="serial206.z.live_right_reference", motion_kind="home"))
+                    if reference.get("ok") is not True or reference.get("durable_clean") is not True:
+                        result = {**dict(result), "ok": False, "reference_state": _json_safe(reference), "failure": "z_live_right_reference_not_durable"}
+                        ok = False
+                        z.update({"state": "failed_latched", "reference_state": "desynced", "last_failure": _json_safe(result)})
             elif ok and intent in {"manual_home", "diagnostic_home_axis"}:
                 z.update({
                     "state": "awaiting_operator_observation",
