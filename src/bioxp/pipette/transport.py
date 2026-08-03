@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import threading
 import time
 from typing import Any, Callable, Mapping, Protocol
@@ -13,15 +14,30 @@ except Exception:  # pragma: no cover - surfaced lazily in status payloads
 from .models import (
     PipetteAspirateCommand,
     PipetteCommandError,
+    PipetteDiagnosticCommand,
     PipetteDispenseCommand,
+    PipetteErrorLogCommand,
+    PipetteHeartbeatCommand,
     PipetteInitCommand,
     PipetteMixCommand,
     PipetteNotReadyError,
+    PipetteTerminateCommand,
     PipetteTipAction,
     PipetteTipCommand,
     PipetteTipStateError,
     PipetteTransportUnavailableError,
 )
+
+
+def _call_eject_tip(driver: Any, *, initialized: bool) -> Any:
+    eject_fn = getattr(driver, "pipette_eject_tip")
+    try:
+        parameters = inspect.signature(eject_fn).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "initialized" in parameters:
+        return eject_fn(initialized=bool(initialized))
+    return eject_fn()
 
 
 class PipetteTransport(Protocol):
@@ -36,6 +52,12 @@ class PipetteTransport(Protocol):
     def dispense(self, command: PipetteDispenseCommand) -> dict[str, Any]: ...
 
     def mix(self, command: PipetteMixCommand) -> dict[str, Any]: ...
+
+    def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]: ...
+
+    def set_top_speed(self, velocity: int, channels: list[int] | None = None) -> dict[str, Any]: ...
+
+    def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]: ...
 
     def close(self) -> None: ...
 
@@ -104,6 +126,8 @@ class CanPipetteTransport:
 
     def _status_payload(self, **extra: Any) -> dict[str, Any]:
         ok = bool(extra.pop("ok", True))
+        controller_acknowledged = extra.pop("controller_acknowledged", None)
+        physical_effect_verified = bool(extra.pop("physical_effect_verified", False))
         payload = {
             "ok": ok,
             "transport": self._transport_name,
@@ -123,6 +147,12 @@ class CanPipetteTransport:
             "hardware_pressure": self._last_pressure,
             "hardware_truth_level": "software_shadow",
             "ack_required": True,
+            "controller_acknowledged": controller_acknowledged,
+            "hardware_postcondition_verified": bool(
+                isinstance(self._last_tip_status, dict)
+                and self._last_tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            "physical_effect_verified": physical_effect_verified,
             "response_timeout_s": self._response_timeout_s,
             "liquid_level_ul": self._liquid_level_ul,
         }
@@ -260,6 +290,8 @@ class CanPipetteTransport:
             command="initialize",
             driver_result=init_result,
             requested=command.to_payload(),
+            controller_acknowledged=bool(init_result.get("ok")),
+            physical_effect_verified=False,
             hardware_truth_level="acknowledged_command",
         )
         return payload
@@ -280,7 +312,10 @@ class CanPipetteTransport:
                 )
             self._tip_loaded = True
         elif command.action is PipetteTipAction.EJECT:
-            driver_result = self._assert_driver_result("tip:eject", driver.pipette_eject_tip())
+            driver_result = self._assert_driver_result(
+                "tip:eject",
+                _call_eject_tip(driver, initialized=bool(self._initialized)),
+            )
             tip_status = self._safe_query_tip_status(driver)
             if tip_status is not None and tip_status.get("ok") and tip_status.get("tip_loaded") is True:
                 raise PipetteTipStateError(
@@ -296,6 +331,12 @@ class CanPipetteTransport:
             action=command.action.value,
             requested=command.to_payload(),
             driver_result=driver_result,
+            controller_acknowledged=bool(driver_result.get("ok")),
+            hardware_postcondition_verified=bool(
+                isinstance(self._last_tip_status, dict)
+                and self._last_tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            physical_effect_verified=False,
             hardware_tip_status=self._last_tip_status,
             hardware_truth_level="hardware_query",
         )
@@ -316,6 +357,9 @@ class CanPipetteTransport:
             requested=command.to_payload(),
             volume_ul=float(command.volume_ul),
             driver_result=driver_result,
+            controller_acknowledged=bool(driver_result.get("ok")),
+            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
@@ -337,6 +381,9 @@ class CanPipetteTransport:
             volume_ul=float(command.volume_ul),
             blow_out=bool(command.blow_out),
             driver_result=driver_result,
+            controller_acknowledged=bool(driver_result.get("ok")),
+            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
@@ -370,8 +417,90 @@ class CanPipetteTransport:
             cycles=int(command.cycles),
             volume_ul=float(command.volume_ul),
             cycle_results=cycle_results,
+            controller_acknowledged=all(
+                bool(row.get("ok"))
+                for cycle in cycle_results
+                for row in (cycle.get("aspirate"), cycle.get("dispense"))
+            ),
+            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
+        )
+
+    def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
+        del command
+        driver = self._get_driver()
+        result = self._assert_driver_result("terminate", driver.terminate_pipette())
+        self._initialized = False
+        self._last_command = "terminate"
+        return self._status_payload(
+            command="terminate",
+            driver_result=result,
+            initialized=False,
+            controller_acknowledged=bool(result.get("ok")),
+            physical_effect_verified=False,
+            hardware_truth_level="controller_acknowledged",
+        )
+
+    def set_top_speed(self, velocity: int) -> dict[str, Any]:
+        driver = self._get_driver()
+        value = int(velocity)
+        result = self._assert_driver_result("set_top_speed", driver.set_top_speed(value))
+        self._last_command = "set_top_speed"
+        return self._status_payload(
+            command="set_top_speed",
+            requested={"velocity": value},
+            effective={"velocity": value},
+            driver_result=result,
+            controller_acknowledged=bool(result.get("ok")),
+            physical_effect_verified=False,
+            hardware_truth_level="controller_acknowledged",
+        )
+
+    def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]:
+        driver = self._get_driver()
+        result = self._assert_driver_result("heartbeat", driver.heartbeat(bool(command.enabled)))
+        self._last_command = "heartbeat_enable" if command.enabled else "heartbeat_disable"
+        return self._status_payload(
+            command=self._last_command,
+            requested=command.to_payload(),
+            driver_result=result,
+            controller_acknowledged=bool(result.get("ok")),
+            physical_effect_verified=False,
+            hardware_truth_level="controller_acknowledged",
+        )
+
+    def query_firmware(self, number: int = 1) -> dict[str, Any]:
+        result = self._get_driver().query_firmware(int(number))
+        self._last_transaction = result
+        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "query": f"&{int(number)}", "result": result, "hardware_truth_level": "hardware_query"}
+
+    def query_error_log(self, command: PipetteErrorLogCommand | None = None) -> dict[str, Any]:
+        selected = command or PipetteErrorLogCommand()
+        result = self._get_driver().query_error_log(selected.raw_byte)
+        self._last_transaction = result
+        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "query": "Q:<raw-byte>1", "requested": selected.to_payload(), "result": result, "hardware_truth_level": "hardware_query"}
+
+    def execute_diagnoses(self, command: PipetteDiagnosticCommand) -> dict[str, Any]:
+        result = self._get_driver().execute_diagnoses(command.number)
+        self._last_transaction = result
+        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "requested": command.to_payload(), "result": result, "hardware_truth_level": "hardware_query"}
+
+    def get_data(self, query: str) -> dict[str, Any]:
+        result = self._get_driver().get_data(query)
+        self._last_transaction = result
+        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "query": str(query), "result": result, "hardware_truth_level": "hardware_query"}
+
+    def start_fluid_detection(self) -> dict[str, Any]:
+        result = self._assert_driver_result("start_fluid_detection", self._get_driver().start_fluid_detection())
+        self._last_command = "start_fluid_detection"
+        return self._status_payload(
+            command="start_fluid_detection",
+            driver_result=result,
+            controller_acknowledged=bool(result.get("ok")),
+            physical_effect_verified=False,
+            hardware_truth_level="controller_acknowledged",
         )
 
     def close(self) -> None:
@@ -396,6 +525,11 @@ class FourPipetteTransport:
         self._sleep = sleep
         self._transaction_lock = threading.RLock()
         self._last_group_transaction: dict[str, Any] | None = None
+        self._tip_type = 201  # OEM enum value UNKNOWN
+        self._tip_location = -1
+        self._allow_to_stop = True
+        self._fluid_detection_timestamps: dict[int, float | None] = {channel: None for channel in self.CHANNELS}
+        self._last_error: dict[str, Any] | None = None
 
     def _channel_status(self, channel: int, transport: CanPipetteTransport) -> dict[str, Any]:
         driver = transport._get_driver()
@@ -431,6 +565,12 @@ class FourPipetteTransport:
             "live_query_performed": False,
             "last_group_transaction": self._last_group_transaction,
             "liquid_mutation_enabled": False,
+            "tip_type": self._tip_type,
+            "tip_location": self._tip_location,
+            "allow_to_stop": self._allow_to_stop,
+            "fluid_detection_timestamps": dict(self._fluid_detection_timestamps),
+            "last_error": self._last_error,
+            "physical_effect_verified": False,
         }
 
     def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
@@ -441,7 +581,10 @@ class FourPipetteTransport:
                 # ClassPipette.initiate(false) skips the wake frame once initialized,
                 # but still waits 100 ms and transmits WR.
                 self._sleep(0.100)
-                driver_result = driver.pipette_initiate_group()
+                driver_result = transport._assert_driver_result(
+                    "initialize",
+                    driver.pipette_initiate_group(),
+                )
                 result = {
                     **transport._status_payload(
                         command="initialize",
@@ -633,6 +776,177 @@ class FourPipetteTransport:
         }
         return dict(self._last_group_transaction)
 
+    def _selected_channels(self, channels: list[int] | tuple[int, ...] | None = None) -> list[int]:
+        selected = list(self.CHANNELS if channels is None else channels)
+        if not selected or any(type(channel) is not int or channel not in self.CHANNELS for channel in selected):
+            raise ValueError("channels must be a non-empty subset of integer channel IDs 0..3")
+        if len(set(selected)) != len(selected):
+            raise ValueError("channels must not contain duplicates")
+        return selected
+
+    def reinitialize_pipette(self) -> dict[str, Any]:
+        """Separate OEM reinitializePipette path: direct WR, 10 s wait, error 32 gate."""
+        with self._transaction_lock:
+            sends: list[dict[str, Any]] = []
+            for channel, transport in enumerate(self._transports):
+                driver = transport._get_driver()
+                result = transport._assert_driver_result("reinitialize_pipette", driver.pipette_initiate_group())
+                completion = driver.wait_pipette_initialization_completion(10.0)
+                sends.append({"channel": channel, "result": result, "completion": completion})
+                transport._initialized = bool(completion.get("ok"))
+            status = self._query_status()
+            error_codes = [row["result"].get("oem_error_code") for row in status]
+            ok = bool(all(row.get("result", {}).get("ok") for row in sends) and all(code == 32 for code in error_codes))
+            self._tip_type = 201
+            self._last_group_transaction = {
+                "ok": ok,
+                "outcome": "reinitialized" if ok else "reinitialize_status_not_all_32",
+                "sends": sends,
+                "status": status,
+                "error_codes": error_codes,
+                "tip_type": self._tip_type,
+                "group_wait_ms": 10_000,
+                "oem_source_anchor": "ClassPipetteCollection.reinitializePipette",
+            }
+            return dict(self._last_group_transaction)
+
+    def checked_pipette_condition(self) -> dict[str, Any]:
+        with self._transaction_lock:
+            rows = self._query_condition()
+        ok = bool(len(rows) == 4 and all(row.get("result", {}).get("ok") for row in rows))
+        return {
+            "ok": ok,
+            "channels": rows,
+            "channel_count": len(rows),
+            "null_reply_is_failure": True,
+            "oem_source_anchor": "ClassPipetteCollection.checkedPipetteCondition: QueryFirmware(1)",
+        }
+
+    def checked_pipette_status(self) -> dict[str, Any]:
+        return self.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
+
+    def set_top_speed(self, velocity: int, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        with self._transaction_lock:
+            rows = []
+            for channel in selected:
+                result = self._transports[channel].set_top_speed(int(velocity))
+                rows.append({"channel": channel, "result": result})
+            return {
+                "ok": all(row["result"].get("ok") for row in rows),
+                "velocity": int(velocity),
+                "channels": rows,
+                "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed",
+            }
+
+    def query_firmware(self, number: int = 1, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        rows = [{"channel": channel, "result": self._transports[channel].query_firmware(number)} for channel in selected]
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": f"&{int(number)}"}
+
+    def query_error_log(self, command: PipetteErrorLogCommand | None = None, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        rows = [{"channel": channel, "result": self._transports[channel].query_error_log(command)} for channel in selected]
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1"}
+
+    def execute_diagnoses(self, command: PipetteDiagnosticCommand, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        rows = [{"channel": channel, "result": self._transports[channel].execute_diagnoses(command)} for channel in selected]
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
+
+    def get_data(self, query: str, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        rows = [{"channel": channel, "result": self._transports[channel].get_data(query)} for channel in selected]
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": str(query)}
+
+    def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
+        with self._transaction_lock:
+            rows = [{"channel": channel, "result": transport.terminate(command)} for channel, transport in enumerate(self._transports)]
+            self._allow_to_stop = True
+            self._last_error = None if all(row["result"].get("ok") for row in rows) else {"operation": "terminate", "channels": rows}
+            return {
+                "ok": all(row["result"].get("ok") for row in rows),
+                "channels": rows,
+                "allow_to_stop": self._allow_to_stop,
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.terminatecommands: TR",
+            }
+
+    def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]:
+        rows = [{"channel": channel, "result": transport.heartbeat(command)} for channel, transport in enumerate(self._transports)]
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
+
+    def disable_heartbeat(self) -> dict[str, Any]:
+        return self.heartbeat(PipetteHeartbeatCommand(enabled=False))
+
+    def dispense_all(self, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        return self._mutation_blocked("dispense all") | {"channels": selected, "planned_command": "A0R"}
+
+    def aspirate_air(self, volume_ul: float, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        return self._mutation_blocked("aspirate air") | {"channels": selected, "planned_command": f"P{volume_ul},1R"}
+
+    def dispense_air(self, volume_ul: float, dispense_type: int = 0, channels: list[int] | None = None) -> dict[str, Any]:
+        selected = self._selected_channels(channels)
+        return self._mutation_blocked("dispense air") | {"channels": selected, "planned_command": f"D{volume_ul},{int(dispense_type)}R"}
+
+    def mix_all(self, count: int, vol: float, vigorous: int = 100) -> dict[str, Any]:
+        return self._mutation_blocked("mix all") | {
+            "count": int(count),
+            "requested_volume_ul": float(vol),
+            "vigorous": int(vigorous),
+            "oem_volume_source": "tip_type_derived",
+            "planned_wire_command": "composite P/D; no dedicated Mix command",
+        }
+
+    def detect_fluid(self, *, dry_run: bool = False) -> dict[str, Any]:
+        if not dry_run:
+            return self._mutation_blocked("fluid detection")
+        return {
+            "ok": False,
+            "outcome": "dry_run_only",
+            "planned_command": "BR",
+            "would_move_z": True,
+            "timeout_ms": 15_000,
+            "physical_effect_verified": False,
+        }
+
+    def get_fluid_timestamp(self, channel: int) -> float | None:
+        selected = self._selected_channels([channel])[0]
+        return self._fluid_detection_timestamps[selected]
+
+    def waitforcompletion(self, job: str, timeout_ms: int) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "job": str(job),
+            "timeout_ms": int(timeout_ms),
+            "outcome": "completion_not_registered",
+            "wait_policy": "single_shared_deadline_safety_hardening",
+        }
+
+    def queryIndividualTipStatus(self) -> list[bool]:  # noqa: N802
+        return [bool(row["tip_loaded"]) for row in self.query_tip_status_all()["channels"]]
+
+    def loadTip(self, tip_type: int, tip_location: int = -1) -> dict[str, Any]:  # noqa: N802
+        self._tip_type = int(tip_type)
+        self._tip_location = int(tip_location)
+        return {
+            "ok": True,
+            "outcome": "host_state_only",
+            "tip_type": self._tip_type,
+            "tip_location": self._tip_location,
+            "hardware_commanded": False,
+            "physical_effect_verified": False,
+        }
+
+    def set_tip(self, command: PipetteTipCommand) -> dict[str, Any]:
+        if command.action is PipetteTipAction.LOAD:
+            metadata = dict(command.metadata)
+            return self.loadTip(int(metadata.get("tip_type", 201)), int(metadata.get("tip_location", -1)))
+        del command
+        return self._mutation_blocked("tip ejection")
+
     def query_tip_status_all(self) -> dict[str, Any]:
         """Return exact four-channel OEM `?31` hardware readback."""
         with self._transaction_lock:
@@ -703,7 +1017,7 @@ class FourPipetteTransport:
         sends: list[dict[str, Any]] = []
         for channel in expected:
             driver = self._transports[channel]._get_driver()
-            result = driver.pipette_eject_tip()
+            result = _call_eject_tip(driver, initialized=bool(self._transports[channel]._initialized))
             if (
                 not isinstance(result, dict)
                 or result.get("ok") is not True
@@ -743,7 +1057,7 @@ class FourPipetteTransport:
             "after": after,
             "immediate_acknowledgements_verified": True,
             "hardware_postcondition_verified": True,
-            "physical_effect_verified": True,
+            "physical_effect_verified": False,
             "oem_source_anchors": [
                 "ClassPipetteCollection.ejectAllTips:1176-1235",
                 "ClassPipetteCollection.verifyEjectTip:1265-1323",
@@ -757,10 +1071,6 @@ class FourPipetteTransport:
             f"Pipette {operation} remains blocked by the accepted production safety envelope.",
             details={"operation": operation, "liquid_mutation_enabled": False, "channel_count": 4},
         )
-
-    def set_tip(self, command: PipetteTipCommand) -> dict[str, Any]:
-        del command
-        return self._mutation_blocked("tip mutation")
 
     def aspirate(self, command: PipetteAspirateCommand) -> dict[str, Any]:
         del command

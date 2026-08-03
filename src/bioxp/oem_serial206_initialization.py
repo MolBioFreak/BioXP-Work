@@ -3135,7 +3135,7 @@ class Serial206OemInitializationProvider:
             context = state["initialize_motion_ledger"]["context"]
             expected_channels = list(context.get("tip_channels_initial") or [])
             result = p.eject_all_pipette_tips_for_oem_startup(
-                operator_ack="EJECT",
+                operator_ack="EJECT_STALE_STARTUP_TIPS",
                 expected_channels_with_tips=expected_channels,
             )
             return {

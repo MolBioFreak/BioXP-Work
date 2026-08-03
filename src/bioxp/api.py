@@ -7254,6 +7254,15 @@ async def liquid_status():
 @app.post("/liquid/init")
 async def liquid_init(req: PipetteInitRequest):
     command = PipetteInitCommand.from_request(req)
+    if command.pressure_profile != "1R":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "field": "pressure_profile",
+                "message": "only OEM pressure profile 1R is supported",
+            },
+        )
     if command.prime_volume_ul is not None:
         raise HTTPException(status_code=409, detail="constructor initialization cannot prime or mutate liquid")
     if _can_ready_observation() is not True:

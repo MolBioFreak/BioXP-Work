@@ -64,6 +64,7 @@ class _PendingTransaction:
     matcher_name: str
     matcher: Callable[[NovoFrame], MatchResult]
     registered_at: float
+    owner_generation: int
     event: threading.Event = field(default_factory=threading.Event)
     frames: list[NovoFrame] = field(default_factory=list)
     skipped: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=64))
@@ -76,6 +77,7 @@ class _PendingTransaction:
 class _PipetteCompletion:
     registered_at: float
     deadline_at: float
+    owner_generation: int
     event: threading.Event = field(default_factory=threading.Event)
     frame: NovoFrame | None = None
 
@@ -151,6 +153,9 @@ class NovoRouter:
             if reader.is_alive():
                 raise NovoRouterError("Novo reader did not stop before USB release")
         self._reader = None
+        # Any waiter or completion registered under the previous reader owner is
+        # stale after shutdown/rebind, even if a late USB frame arrives.
+        self._reader_generation += 1
         with self._pending_lock:
             pending = self._pending
             self._pending = None
@@ -230,7 +235,11 @@ class NovoRouter:
             channel = (frame.arbitration_id & 0x78) >> 3
             with self._completion_lock:
                 completion = self._pipette_completions.get(channel)
-                if completion is not None:
+                if (
+                    completion is not None
+                    and completion.owner_generation == self._reader_generation
+                    and self._clock() <= completion.deadline_at
+                ):
                     completion.frame = frame
                     completion.event.set()
                     completion_matched = True
@@ -265,6 +274,33 @@ class NovoRouter:
             queue_name = "unknown"
         self._queues[queue_name].append(frame)
 
+    def transact_many(
+        self,
+        raw_txs: list[bytes] | tuple[bytes, ...],
+        *,
+        matcher: Callable[[NovoFrame], MatchResult] | None,
+        matcher_name: str,
+        timeout_s: float,
+        write_timeout_ms: int,
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        frames = [bytes(frame) for frame in raw_txs]
+        if not frames:
+            raise NovoRouterError("Novo multi-frame transaction requires at least one frame")
+        return self.transact(
+            b"".join(frames),
+            matcher=matcher,
+            matcher_name=matcher_name,
+            timeout_s=timeout_s,
+            write_timeout_ms=write_timeout_ms,
+            provenance={
+                **dict(provenance),
+                "tx_frame_count": len(frames),
+                "tx_frames": [list(frame) for frame in frames],
+                "tx_write_policy": "one_bulk_transfer_registered_once",
+            },
+        )
+
     def transact(
         self,
         raw_tx: bytes,
@@ -282,7 +318,13 @@ class NovoRouter:
             registered_at = self._clock()
             pending = None
             if matcher is not None:
-                pending = _PendingTransaction(transaction_id, matcher_name, matcher, registered_at)
+                pending = _PendingTransaction(
+                    transaction_id,
+                    matcher_name,
+                    matcher,
+                    registered_at,
+                    self._reader_generation,
+                )
                 with self._pending_lock:
                     if self._pending is not None:
                         raise NovoRouterError("a Novo transaction matcher is already registered")
@@ -297,6 +339,7 @@ class NovoRouter:
                 raise
             base = {
                 "transaction_id": transaction_id,
+                "owner_generation": self._reader_generation,
                 "matcher": matcher_name,
                 "registration_timestamp": registered_at,
                 "tx_timestamp": tx_at,
@@ -311,11 +354,28 @@ class NovoRouter:
                 if self._pending is pending:
                     self._pending = None
             malformed_seen = any(row.get("classification") == "malformed" for row in pending.skipped)
-            outcome = pending.outcome if completed else ("malformed" if malformed_seen else "timeout")
+            generation_changed = self._reader_generation != pending.owner_generation
+            outcome = (
+                "transport_rebound"
+                if generation_changed
+                else (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
+            )
             observed = pending.frames[-1] if pending.frames else None
+            multipart_frames = [frame for frame in pending.frames if frame.classification == "pipette_multipart"]
+            multipart_projection = {
+                "present": bool(multipart_frames),
+                "part_count": len(multipart_frames),
+                "parts": [frame.provenance() for frame in multipart_frames],
+                "reassembled_data": [byte for frame in multipart_frames for byte in frame.data],
+                "reassembly_policy": "arrival_order_same_channel_transaction",
+                "oem_chunk_index_equivalence": "unresolved",
+            }
+            terminal_success = bool(
+                completed and outcome not in {"ack", "malformed", "shutdown", "transport_rebound"}
+            )
             return {
                 **base,
-                "ok": bool(completed and outcome not in {"malformed", "shutdown"}),
+                "ok": terminal_success,
                 "outcome": outcome,
                 "receive_timestamp": pending.received_at,
                 "observed_rx_id": observed.arbitration_id if observed is not None else None,
@@ -323,8 +383,14 @@ class NovoRouter:
                 "observed_rx_raw": list(observed.raw) if observed is not None else None,
                 "frames": [frame.provenance() for frame in pending.frames],
                 "ack_received": any(frame.dlc == 0 for frame in pending.frames),
-                "completion_received": bool(completed and outcome not in {"ack"}),
-                "multipart_received": any((frame.arbitration_id & 0x7) in (3, 4) for frame in pending.frames),
+                "completion_received": bool(terminal_success and outcome != "ack"),
+                "multipart_received": bool(multipart_frames),
+                "multipart": multipart_projection,
+                "wait_policy": {
+                    "mode": "single_shared_deadline",
+                    "classification": "SAFETY-HARDENING",
+                    "apartment_equivalence": "unresolved",
+                },
                 "skipped_count": pending.skipped_total,
                 "skipped_frames": list(pending.skipped),
                 "skipped_frames_truncated": pending.skipped_total > len(pending.skipped),
@@ -385,6 +451,7 @@ class NovoRouter:
             self._pipette_completions[channel] = _PipetteCompletion(
                 registered_at=registered_at,
                 deadline_at=registered_at + max(0.0, float(timeout_s)),
+                owner_generation=self._reader_generation,
             )
 
     def wait_pipette_completion(self, channel: int, timeout_s: float) -> dict[str, Any]:
@@ -398,10 +465,19 @@ class NovoRouter:
         with self._completion_lock:
             self._pipette_completions.pop(channel, None)
         frame = completion.frame
-        valid = bool(signaled and frame is not None and frame.data and frame.data[0] == 0x20)
+        generation_changed = completion.owner_generation != self._reader_generation
+        valid = bool(
+            signaled
+            and not generation_changed
+            and frame is not None
+            and frame.data
+            and frame.data[0] == 0x20
+        )
         return {
             "ok": valid,
             "channel": channel,
+            "owner_generation": completion.owner_generation,
+            "generation_changed": generation_changed,
             "registration_timestamp": completion.registered_at,
             "deadline_timestamp": completion.deadline_at,
             "receive_timestamp": frame.received_at if frame is not None else None,
@@ -432,10 +508,18 @@ class NovoRouter:
 
     @staticmethod
     def pipette_matcher(
-        *, channel: int, expected_function: int, initialization: bool = False
+        *,
+        channel: int,
+        expected_function: int,
+        initialization: bool = False,
+        allow_multipart: bool = False,
     ) -> Callable[[NovoFrame], MatchResult]:
         channel = int(channel)
         expected_function = int(expected_function)
+        if channel not in range(4):
+            raise ValueError(f"invalid pipette channel: {channel}")
+        if expected_function not in PIPETTE_FUNCTIONS:
+            raise ValueError(f"invalid pipette response function: {expected_function}")
 
         def match(frame: NovoFrame) -> MatchResult:
             if frame.arbitration_id not in PIPETTE_RX_IDS:
@@ -445,6 +529,8 @@ class NovoRouter:
             if observed_channel != channel:
                 return MatchResult(False, classification="pipette_wrong_channel")
             if function in (3, 4):
+                if not allow_multipart:
+                    return MatchResult(False, classification="pipette_unexpected_multipart")
                 return MatchResult(True, terminal=False, classification="pipette_multipart", outcome="multipart")
             if function != expected_function:
                 return MatchResult(False, classification="pipette_wrong_function")
