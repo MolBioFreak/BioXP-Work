@@ -164,7 +164,6 @@ from .vision.inspection import InspectionCommand
 _tester: Optional[BioXpTester] = None
 _tester_quarantine: Optional[BioXpTester] = None
 _startup_error: Optional[str] = None
-_generic_lifespan_claim_pending = False
 _tester_lock = asyncio.Lock()
 # Connection ownership transitions share this lease with the safety-interrupt
 # lane. Normal tester work deliberately does not, so a stop can still preempt
@@ -594,8 +593,7 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
-    _generic_lifespan_claim_pending = False
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)
@@ -610,22 +608,32 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _tester = None
         _startup_error = f"OEM machine/runtime-state authority unavailable: {exc}"
+        _ownership_changed(
+            reason="oem_lifespan_startup_config_failed",
+            transport="unbound",
+            usb="unbound",
+            router="stopped",
+        )
         print(f"[WARN] {_startup_error}")
     else:
-        _tester = None
-        _generic_lifespan_claim_pending = True
-        _startup_error = (
-            "USB transport is intentionally unbound during generic API lifespan; "
-            "use an explicit ownership POST before hardware collection."
-        )
-    _ownership_changed(
-        reason="generic_lifespan_unbound",
-        transport="unbound",
-        usb="unbound",
-        router="unbound",
-    )
-    # Construct only the local OEM runtime/store/worker owners. Generic
-    # lifespan startup does not claim USB or command motion.
+        # Match the OEM application boundary: ControlLib construction acquires
+        # the Novo owner before CAN_READY/environment admission.  The owner
+        # construction is transport setup only; motion and physical startup
+        # remain behind their existing source-shaped gates.
+        try:
+            async with _tester_lock:
+                async with _tester_transition_lock:
+                    await _claim_service_usb_runtime(
+                        source="oem_lifespan_startup",
+                        block_motion=False,
+                    )
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            _startup_error = f"OEM automatic USB startup failed: {detail}"
+            print(f"[WARN] {_startup_error}")
+    # Construct the local OEM runtime/store/worker owners after the transport
+    # owner attempt, preserving the OEM startup ordering without dispatching
+    # homing or motion from generic API lifespan.
     configure_oem_runtime(
         store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
         autostart=True,
@@ -636,7 +644,6 @@ async def lifespan(app: FastAPI):
         # Close admission immediately, then drain the same ownership leases used
         # by reconnect. A shielded constructor may outlive its cancelled HTTP
         # waiter, but it cannot publish an owner after this shutdown completes.
-        _generic_lifespan_claim_pending = False
         async with _tester_lock:
             async with _tester_transition_lock:
                 shutdown_errors = []
@@ -5247,14 +5254,14 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-async def _claim_service_usb_runtime(*, source: str) -> dict[str, Any]:
-    """Construct the managed USB owner from an intentionally unbound state.
+async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) -> dict[str, Any]:
+    """Construct the managed USB owner from the OEM startup/reconnect boundary.
 
     The caller must hold ``_tester_transition_lock`` through
-    ``_run_tester_transition``.  Both the remote managed reconnect route and
-    the localhost maintenance route use this one quarantine-aware path.
+    ``_run_tester_transition`` for HTTP transitions.  Startup uses the same
+    quarantine-aware construction path before yielding the API lifespan.
     """
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
     if _tester_quarantine is not None:
         raise HTTPException(
             status_code=503,
@@ -5271,7 +5278,6 @@ async def _claim_service_usb_runtime(*, source: str) -> dict[str, Any]:
         _pipette_transport = transport
         _startup_error = None
         _ownership_changed(reason=source, transport="owned", usb="service", router="running")
-        _generic_lifespan_claim_pending = False
     except Exception as exc:
         cleanup_error = None
         partial_owner = getattr(exc, "partial_owner", None)
@@ -5318,11 +5324,13 @@ async def _claim_service_usb_runtime(*, source: str) -> dict[str, Any]:
                 usb_owner="released",
             )
         raise HTTPException(status_code=503, detail=_startup_error) from exc
-    return _mark_post_maintenance_motion_block(
-        source=source,
-        reason="USB runtime was reconnected; non-homing motion recovery is required before live motion.",
-        usb_owner="service",
-    )
+    if block_motion:
+        return _mark_post_maintenance_motion_block(
+            source=source,
+            reason="USB runtime was reconnected; non-homing motion recovery is required before live motion.",
+            usb_owner="service",
+        )
+    return _maintenance_state_payload()
 
 
 @app.post("/reconnect")
@@ -5331,7 +5339,7 @@ async def reconnect_runtime():
 
     async def transition():
         global _tester, _tester_quarantine, _startup_error, _pipette_transport
-        if _tester is None and _generic_lifespan_claim_pending:
+        if _tester is None:
             return await _claim_service_usb_runtime(source="runtime_reconnect")
         tester = _get_tester()
 
@@ -5379,10 +5387,10 @@ async def maintenance_usb_state():
 @app.post("/maintenance/usb/release")
 async def maintenance_usb_release(request: Request):
     _require_local_maintenance_client(request)
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport
 
     async def transition():
-        global _tester, _tester_quarantine, _startup_error, _pipette_transport, _generic_lifespan_claim_pending
+        global _tester, _tester_quarantine, _startup_error, _pipette_transport
         tester = _tester
         quarantined = _tester_quarantine
         cleanup_warnings = []
@@ -5422,7 +5430,6 @@ async def maintenance_usb_release(request: Request):
         _tester = None
         _tester_quarantine = None
         _pipette_transport = None
-        _generic_lifespan_claim_pending = False
         _ownership_changed(reason="maintenance_usb_release", transport="unbound", usb="released", router="stopped")
         _startup_error = "BioXP USB runtime manually released for direct maintenance testing."
         maintenance = _mark_post_maintenance_motion_block(
@@ -5555,9 +5562,9 @@ async def motion_oem_prepare_without_motion():
             },
         ) from exc
     ownership_bootstrap = None
-    if _tester is None and _generic_lifespan_claim_pending:
-        # The one-click no-motion preparation owns the complete source lifecycle:
-        # claim service USB first, then activate boards and apply the OEM profile.
+    if _tester is None:
+        # Automatic lifespan ownership is the normal path; retry only when
+        # startup ownership failed or a prior explicit release removed it.
         ownership_bootstrap = await reconnect_runtime()
     with _maintenance_state_lock:
         recovery_latch_generation = int(_maintenance_latch_generation)
