@@ -656,7 +656,6 @@ def test_lifespan_configures_oem_runtime_lazily_without_terminal_snapshot_hook(m
 
     assert configured == [
         {
-            "startup_program_factory": api._get_live_oem_startup_program,
             "store_root": str(tmp_path),
             "autostart": True,
         }

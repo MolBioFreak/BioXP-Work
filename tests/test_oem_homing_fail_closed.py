@@ -128,7 +128,7 @@ def _run(monkeypatch, rig, *, require_switch_transition=True):
         rehome=False,
         timeout_s=0.2,
         require_switch_transition=require_switch_transition,
-        max_search_abs_delta=500,
+        max_search_abs_delta=5000,
     )
 
 

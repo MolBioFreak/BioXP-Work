@@ -56,6 +56,30 @@ class FakeSerial206Primitives:
         self.calls.append("gripper-current-31")
         return _write(value)
 
+    def z_manual_home(self, *, timeout_s=30.0):
+        self.calls.append("manual-home")
+        return {"ok": True, "source_method": "goHome(true,1791)", "timeout_s": timeout_s}
+
+    def z_diagnostic_home_axis(self, *, timeout_s=30.0):
+        self.calls.append("diagnostic-home-axis")
+        return {"ok": True, "source_method": "HomeAxis(z,597)", "timeout_s": timeout_s}
+
+    def z_move_steps(self, steps, *, timeout_s=20.0):
+        self.calls.append(f"move-steps:{steps}")
+        return {"ok": True, "source_method": "moveSteps", "steps": steps, "timeout_s": timeout_s}
+
+    def z_move_absolute(self, requested_steps, pseudo_home_steps, *, timeout_s=20.0):
+        self.calls.append(f"move-absolute:{requested_steps}:{pseudo_home_steps}")
+        return {"ok": True, "source_method": "moveZ", "effective_target_steps": max(requested_steps, pseudo_home_steps), "timeout_s": timeout_s}
+
+    def z_stop(self):
+        self.calls.append("z-stop")
+        return {"ok": True, "source_method": "StopMotor double delivery"}
+
+    def z_reconcile_switch_masks(self):
+        self.calls.append("reconcile-switch-masks")
+        return {"ok": True, "source_method": "explicit_linux_recovery"}
+
 
 class PreparationProvider:
     def __init__(self, calls: list[str], generation: int = 11) -> None:
@@ -129,6 +153,61 @@ def _provider(tmp_path: Path, primitives: FakeSerial206Primitives, references: R
         preparation_provider=PreparationProvider(primitives.calls),
         sleep=lambda _: None,
     )
+
+
+def test_z_first_stage_requires_only_source_specific_z_commissioning_and_not_prior_reference(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    z_only = subject.Serial206CommissioningEvidence(
+        component="z",
+        generation=11,
+        fresh=True,
+        direction_verified=True,
+        limits_verified=True,
+        switch_verified=True,
+        stop_verified=True,
+        reference_verified=False,
+        gap9_polarity=1,
+        gap10_polarity=0,
+    )
+
+    result = provider.initialize_motors(
+        mode="live",
+        approval=_approval("z-home"),
+        commissioning={"z": z_only},
+    )
+
+    assert result["ok"] is True
+    assert result["stage_receipts"][0]["stage"] == "z-home"
+    assert not any("commissioning_evidence_required" in row for row in result.get("blockers", []))
+    assert not any("reference_verified_required" in row for row in result.get("blockers", []))
+
+
+def test_z_first_stage_rejects_non_source_gap9_gap10_polarity(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    reversed_z = subject.Serial206CommissioningEvidence(
+        component="z",
+        generation=11,
+        fresh=True,
+        direction_verified=True,
+        limits_verified=True,
+        switch_verified=True,
+        stop_verified=True,
+        reference_verified=False,
+        gap9_polarity=0,
+        gap10_polarity=1,
+    )
+
+    result = provider.initialize_motors(
+        mode="live",
+        approval=_approval("z-home"),
+        commissioning={"z": reversed_z},
+    )
+
+    assert result["ok"] is False
+    assert "z_gap9_gap10_polarity_must_match_oem_gap9_active_gap10_inactive" in result["blockers"]
+    assert primitives.calls == []
 
 
 def test_live_call_executes_only_exact_next_stage_and_never_auto_observes(tmp_path):
@@ -306,6 +385,131 @@ def test_initialize_motion_live_is_truthfully_unavailable_when_exact_sequence_is
     assert primitives.calls == []
 
 
+def test_provider_owns_durable_z_prepare_home_observation_and_move_lifecycle(tmp_path):
+    primitives = FakeSerial206Primitives()
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
+
+    prepared = provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="z-prepare-1"
+    )
+    assert prepared["ok"] is True
+    assert prepared["z_state"] == "prepared_unreferenced"
+
+    rejected_move = provider.execute_z_intent(
+        "move_steps",
+        expected_generation=11,
+        idempotency_key="z-move-before-home",
+        inputs={"steps": 25},
+    )
+    assert rejected_move["ok"] is False
+    assert rejected_move["blockers"] == ["z_state_blocks_intent:prepared_unreferenced:move_steps"]
+
+    home = provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="z-home-1"
+    )
+    assert home["ok"] is True
+    assert home["z_state"] == "awaiting_operator_observation"
+    assert references.transitions == [("desynced", "z"), ("desynced", "z")]
+
+    command_id = home["authority_receipt"]["command_id"]
+    observation = provider.record_z_observation(
+        command_id=command_id,
+        verdict="pass",
+        note="Observed Z shaft reach the home switch and stop",
+        expected_generation=11,
+    )
+    assert observation["ok"] is True
+    assert observation["z_state"] == "referenced_ready"
+    assert references.transitions[-1] == ("referenced", "z")
+
+    move = provider.execute_z_intent(
+        "move_steps",
+        expected_generation=11,
+        idempotency_key="z-move-after-home",
+        inputs={"steps": 25},
+    )
+    assert move["ok"] is True
+    assert move["z_state"] == "referenced_ready"
+    assert primitives.calls == ["prepare", "manual-home", "move-steps:25"]
+
+
+def test_z_motion_failure_attempts_hardware_stop_and_latches_reference_desynced(tmp_path):
+    primitives = FakeSerial206Primitives()
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
+    provider.execute_z_intent("prepare", expected_generation=11, idempotency_key="prepare-failure-case")
+    home = provider.execute_z_intent("manual_home", expected_generation=11, idempotency_key="home-failure-case")
+    provider.record_z_observation(
+        command_id=home["authority_receipt"]["command_id"],
+        verdict="pass",
+        note="Observed home before failure case",
+        expected_generation=11,
+    )
+    primitives.z_move_steps = lambda steps, timeout_s=20.0: {
+        "ok": False,
+        "failure": "target_event_128_missing",
+        "controller_command_acknowledged": True,
+        "controller_terminal_state_verified": False,
+    }
+
+    failed = provider.execute_z_intent(
+        "move_steps",
+        expected_generation=11,
+        idempotency_key="move-failure-case",
+        inputs={"steps": 100},
+    )
+
+    assert failed["ok"] is False
+    assert failed["z_state"] == "failed_latched"
+    assert failed["result"]["failure_stop"]["ok"] is True
+    assert primitives.calls[-1] == "z-stop"
+    assert references.transitions[-1] == ("desynced", "z")
+
+
+def test_non_provider_board4_activation_invalidates_preparation_and_reference(tmp_path):
+    primitives = FakeSerial206Primitives()
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="z-prepare-before-reactivation"
+    )["ok"] is True
+
+    invalidated = provider.notify_board_activation(4, {"status": 100})
+
+    assert invalidated["z_affected"] is True
+    projection = provider.z_projection()
+    assert projection["state"] == "unprepared"
+    assert projection["reference_state"] == "desynced"
+    assert projection["last_failure"]["reason"] == "board4_command64_outside_provider_preparation"
+    assert references.transitions[-1] == ("desynced", "z")
+
+
+def test_provider_switch_mask_recovery_is_explicit_confirmed_and_requires_reprepare(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+
+    denied = provider.execute_z_intent(
+        "reconcile_switch_masks",
+        expected_generation=11,
+        idempotency_key="z-mask-denied",
+        inputs={"confirm": "wrong"},
+    )
+    assert denied["ok"] is False
+    assert any(row.startswith("explicit_confirmation_required") for row in denied["blockers"])
+    assert "reconcile-switch-masks" not in primitives.calls
+
+    recovered = provider.execute_z_intent(
+        "reconcile_switch_masks",
+        expected_generation=11,
+        idempotency_key="z-mask-recovery",
+        inputs={"confirm": "RECONCILE_Z_SWITCH_MASKS"},
+    )
+    assert recovered["ok"] is True
+    assert recovered["z_state"] == "unprepared"
+    assert primitives.calls == ["reconcile-switch-masks"]
+
+
 def test_production_adapter_exposes_only_source_grounded_existing_primitives(monkeypatch):
     class Tester:
         def motor_oem_home_axis(self, *args, **kwargs): return {"ok": True}
@@ -327,7 +531,7 @@ def test_production_adapter_exposes_only_source_grounded_existing_primitives(mon
         def eject_all_tips_for_oem_startup(self, **kwargs): return {"ok": True}
         def initialize(self, command): return {"ok": True}
 
-    monkeypatch.setattr(subject, "prepare_motion_without_motion", lambda tester, authority: {
+    monkeypatch.setattr(subject, "prepare_motion_without_motion", lambda tester, authority, components=None: {
         "ok": True,
         "physical_motion": False,
         "stage_ledger": [],

@@ -172,9 +172,12 @@ def test_production_capability_requires_frozen_selected_branches_and_calibrated_
         def motor_set_axis_param(self, *args, **kwargs): pass
         def motor_move_relative(self, *args, **kwargs): pass
         def motor_wait_stopped(self, *args, **kwargs): pass
+        def motor_oem_wait_target_reached(self, *args, **kwargs): pass
         def motor_get_position(self, *args, **kwargs): pass
         def motor_set_home(self, *args, **kwargs): pass
         def motor_move_absolute(self, *args, **kwargs): pass
+        def motor_oem_move_absolute(self, *args, **kwargs): pass
+        def oem_no24v_state(self, *args, **kwargs): pass
         def motor_oem_door_search_home(self, *args, **kwargs): pass
         def motor_thermal_door_status(self, *args, **kwargs): pass
         def motor_prepare_axis(self, *args, **kwargs): pass
@@ -362,10 +365,9 @@ def test_terminal_initialization_completion_never_publishes_machine_ready():
     assert result["ready"] is False
 
 
-def test_direct_startup_step_route_is_retired_before_readiness_or_tester_access(monkeypatch):
-    monkeypatch.setattr(api, "_require_motion_route_ready", lambda: (_ for _ in ()).throw(AssertionError("readiness accessed")))
-    monkeypatch.setattr(api, "_get_tester", lambda: (_ for _ in ()).throw(AssertionError("tester accessed")))
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(api.motion_oem_startup_step(api.OemStartupStepRequest(step="x-home", timeout_s=10)))
-    assert exc.value.status_code == 410
-    assert exc.value.detail["physical_motion_commanded"] is False
+def test_direct_startup_step_route_is_absent_from_openapi_and_operator_catalog():
+    from bioxp.operator_controls import _build_catalog
+
+    assert "/motion/oem/startup/step" not in api.app.openapi()["paths"]
+    actions, _ = _build_catalog(api.app)
+    assert not any(row["informational_path"] == "/motion/oem/startup/step" for row in actions)

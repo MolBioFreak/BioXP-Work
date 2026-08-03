@@ -1,120 +1,91 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 import bioxp.api as api
+from bioxp import operator_controls
 
 
 class PartialProvider:
     def __init__(self) -> None:
-        self.observations = []
-        self.motor_calls = []
+        self.z_calls = []
 
     def capability_status(self):
         return {
             "initialize_motors_live_available": True,
             "initialize_motion_live_available": False,
-            "initialize_motion_partial_primitives": ["initializeMotion.queryTipStatus.initial"],
+            "initialize_motion_partial_primitives": [],
             "initialize_motion_missing_primitives": ["initializeMotion.scriptmoveTo.tip_exists"],
         }
 
-    def record_observation(self, **kwargs):
-        self.observations.append(kwargs)
-        return {"ok": True, "physical_motion_commanded": False, "movement_ledger": {"expected_next_stage": "gripper-current-31"}}
+    def initialize_motion_projection(self):
+        return {"initialize_motors": {"expected_next_stage": "z-home", "terminal_state": "pending"}}
 
-    def initialize_motors(self, **kwargs):
-        self.motor_calls.append(kwargs)
-        return {
-            "ok": True,
-            "ready": False,
-            "state": "awaiting_operator_observation",
-            "physical_motion_commanded": True,
-            "stage_receipts": [{"stage": "z-home"}],
-        }
+    def initialize_motors_admission_projection(self):
+        return {"available": True, "expected_stage": "z-home", "blockers": []}
 
+    def z_projection(self):
+        return {"available": True, "state": "prepared_unreferenced", "authority": type(self).__name__}
 
-def _observation_payload(**overrides):
-    payload = {
-        "stage": "z-home",
-        "command_id": "approval-z-home",
-        "expected_generation": 11,
-        "observed_pass": True,
-        "note": "Christian observed the commanded stage and terminal stop.",
-    }
-    payload.update(overrides)
-    return payload
+    def execute_z_intent(self, intent, **kwargs):
+        self.z_calls.append((intent, kwargs))
+        return {"ok": True, "z_state": "prepared_unreferenced", "authority_receipt": {"command_id": "z-1"}}
+
+    def record_z_observation(self, **kwargs):
+        self.z_calls.append(("observation", kwargs))
+        return {"ok": True, "z_state": "referenced_ready"}
 
 
-def test_api_request_contract_is_single_stage_and_observation_is_strict():
-    assert "stage_approval" in api.OemInitializationRunRequest.model_fields
-    assert "stage_approvals" not in api.OemInitializationRunRequest.model_fields
-    assert set(api.OemSerial206ObservationRequest.model_fields) == {
-        "stage", "command_id", "expected_generation", "observed_pass", "note"
-    }
+def test_z_observation_request_is_strict():
+    assert set(api.OemZObservationRequest.model_fields) == {"command_id", "verdict", "note"}
     with pytest.raises(ValidationError):
-        api.OemSerial206ObservationRequest(**_observation_payload(observed_pass="true"))
+        api.OemZObservationRequest(command_id="z-1", verdict=True, note="Observed")
     with pytest.raises(ValidationError):
-        api.OemSerial206ObservationRequest(**_observation_payload(note="   "))
+        api.OemZObservationRequest(command_id="z-1", verdict="pass", note="   ")
 
 
 def test_provider_status_is_truthful_for_unbound_and_partial_provider(monkeypatch):
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", None)
     unbound = api.serial206_oem_initialization_provider_status()
     assert unbound["bound"] is False
-    assert unbound["initialize_motors_live_available"] is False
-    assert unbound["initialize_motion_live_available"] is False
+    assert unbound["z_authority"]["available"] is False
 
     partial = api.bind_serial206_oem_initialization_provider(PartialProvider())
     assert partial["bound"] is True
     assert partial["initialize_motors_live_available"] is True
-    assert partial["initialize_motion_live_available"] is False
-    assert partial["initialize_motion_missing_primitives"] == ["initializeMotion.scriptmoveTo.tip_exists"]
+    assert partial["z_authority"]["state"] == "prepared_unreferenced"
 
 
-def test_observation_route_never_invokes_hardware_readiness_or_primitive(monkeypatch):
+def test_z_mutations_are_rejected_outside_operator_dispatch_context(monkeypatch):
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", PartialProvider())
+    with pytest.raises(HTTPException) as exc:
+        api._execute_provider_z_intent("move_steps", {"steps": 10})
+    assert exc.value.status_code == 410
+    assert exc.value.detail["error"] == "direct_z_mutation_retired"
+
+
+def test_operator_dispatch_context_reaches_provider_with_generation_and_idempotency(monkeypatch):
     provider = PartialProvider()
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", provider)
-    monkeypatch.setattr(
-        api,
-        "_require_motion_route_ready",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hardware readiness must not run")),
-    )
-    request = api.OemSerial206ObservationRequest(**_observation_payload())
-
-    result = asyncio.run(api.motion_oem_initialization_observation(request))
+    token = operator_controls._DISPATCH_CONTEXT.set({
+        "operator_command_id": "operator-1",
+        "idempotency_key": "idem-1",
+        "expected_ownership_generation": 11,
+        "action_id": "oem.z.move_steps",
+    })
+    try:
+        result = api._execute_provider_z_intent("move_steps", {"steps": 10})
+    finally:
+        operator_controls._DISPATCH_CONTEXT.reset(token)
 
     assert result["ok"] is True
-    assert result["physical_motion_commanded"] is False
-    assert provider.observations == [_observation_payload()]
-
-
-def test_initialize_motors_route_passes_only_one_stage_approval(monkeypatch):
-    provider = PartialProvider()
-    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", provider)
-    monkeypatch.setattr(api, "_require_motion_route_ready", lambda *args, **kwargs: None)
-    request = api.OemInitializationRunRequest(
-        operator_ack="OEM_INITIALIZATION_RUN_WITH_HOMING",
-        run_homing=True,
-        stage_approval={
-            "approval_id": "approval-z-home",
-            "expected_generation": 11,
-            "expected_component": "z",
-            "expected_direction": "toward-gap9-home",
-            "expected_bound": 160000,
-            "operator_note": "Approved exact durable next stage only.",
-            "idempotency_key": "idem-z-home",
-        },
-    )
-
-    result = asyncio.run(api.motion_oem_initialization_run(request))
-
-    assert result["state"] == "awaiting_operator_observation"
-    assert len(provider.motor_calls) == 1
-    assert isinstance(provider.motor_calls[0]["approval"], api.Serial206StageApproval)
-    assert "approvals" not in provider.motor_calls[0]
+    assert provider.z_calls == [("move_steps", {
+        "inputs": {"steps": 10},
+        "expected_generation": 11,
+        "idempotency_key": "idem-1",
+    })]
 
 
 def test_usb_ownership_sync_binds_and_clears_production_provider(monkeypatch):

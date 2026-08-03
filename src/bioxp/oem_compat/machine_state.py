@@ -22,6 +22,12 @@ class OemDefaultParameters:
         return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)
 
     def gantry_load(self, *, tiploaded: Any = None, plateloaded: Any = None) -> "OemDefaultParameters":
+        if isinstance(tiploaded, str) and tiploaded.strip().lower() in {"true", "false"}:
+            raise ValueError("tiploaded must be a typed boolean or OEM pipetteTipType value")
+        if tiploaded is True:
+            return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)
+        if tiploaded is False:
+            tiploaded = None
         # OEM: if tiploaded.HasValue && tiploaded != UNKNOWN => 500.
         if tiploaded not in UNKNOWN_TIP_VALUES:
             return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)

@@ -97,7 +97,7 @@ class OEMRuntimeWorker:
             self.state = OEMWorkerStateName.RUNNING.value
             self.gantry_available = False
             lifecycle_state.transition("running", reason=f"runtime_worker:{cmd.name}")
-            self._write_snapshot(OEMRuntimeStateName.INITIALIZING.value if cmd.name == "initializeSystem" else OEMRuntimeStateName.IDLE_NOT_READY.value)
+            self._write_snapshot(OEMRuntimeStateName.IDLE_NOT_READY.value)
         started = utc_ts()
         history = {"command": cmd.to_dict(), "started_at": started, "gantry_available_before": False}
         try:
@@ -133,7 +133,7 @@ class OEMRuntimeWorker:
             self._attach_terminal_hardware_snapshot(cmd, failed_result)
             row = {**history, "ok": False, "error": str(exc), "result": failed_result, "finished_at": utc_ts()}
             self.store.append_command_history(row)
-            self.store.append_error({"error_situation": "initialization_failure" if cmd.name == "initializeSystem" else "command_error", "command": cmd.to_dict(), "error": str(exc)})
+            self.store.append_error({"error_situation": "command_error", "command": cmd.to_dict(), "error": str(exc)})
             lifecycle_state.transition("error", reason=f"runtime_worker_failed:{cmd.name}")
             return {"ok": False, "ran": True, "error": str(exc), "worker": self.snapshot()}
         finally:

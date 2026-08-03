@@ -1494,6 +1494,11 @@ class AxisDiagnosticStopRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     axis: Literal["x", "y", "z", "g", "door"]
+    # Stop remains independently reachable.  These legacy fields are accepted
+    # for wire compatibility but are not required for or consulted by stop.
+    operator_ack: Optional[Literal["STOP_AXIS"]] = None
+    reason: Optional[str] = Field(None, max_length=2000)
+    operator: Optional[str] = Field(None, max_length=200)
 
 
 class OemHomeXYRequest(BaseModel):
@@ -7258,6 +7263,15 @@ async def liquid_status():
 @app.post("/liquid/init")
 async def liquid_init(req: PipetteInitRequest):
     command = PipetteInitCommand.from_request(req)
+    if command.pressure_profile != "1R":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "message": "Only OEM-backed pressure profile 1R is admitted.",
+                "physical_motion_commanded": False,
+            },
+        )
     if command.prime_volume_ul is not None:
         raise HTTPException(status_code=409, detail="constructor initialization cannot prime or mutate liquid")
     if _can_ready_observation() is not True:

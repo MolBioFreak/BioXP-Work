@@ -72,7 +72,8 @@ def test_startup_eject_targets_loaded_channels_and_verifies_empty():
     )
     assert result["ok"] is True
     assert result["outcome"] == "verified_empty"
-    assert result["physical_effect_verified"] is True
+    assert result["hardware_postcondition_verified"] is True
+    assert result["physical_effect_verified"] is False
     assert result["channels_targeted"] == [0, 2]
     assert fixture.drivers[0].commands == ["?31", "E1R", "?31"]
     assert fixture.drivers[1].commands == ["?31", "?31"]

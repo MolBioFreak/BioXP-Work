@@ -55,18 +55,27 @@ class BioXpCanDriver:
     """
 
     PIPETTE_TRANSACTION_TIMEOUT_S = 60.0
+    PIPETTE_CHANNELS = frozenset(range(4))
+
+    @classmethod
+    def _validate_pipette_id(cls, pipette_id: int) -> int:
+        selected = int(pipette_id)
+        if selected not in cls.PIPETTE_CHANNELS:
+            raise ValueError(f"pipette_id must be one of 0..3, got {selected}")
+        return selected
 
     def __init__(self, channel='can0', bitrate=1000000, *, pipette_id: int = 0, response_timeout_s: float = 60.0):
         # The BioXP USB-to-CAN adapter should map to can0 in Linux
         self.bus = can.interface.Bus(bustype='socketcan', channel=channel, bitrate=bitrate)
         self.channel = channel
         self.bitrate = int(bitrate)
-        self.pipette_id = int(pipette_id)
+        self.pipette_id = self._validate_pipette_id(pipette_id)
         self.response_timeout_s = float(response_timeout_s)
         self._sleep = time.sleep
 
     def pipette_can_ids(self) -> dict[str, int]:
-        pipette_id = int(self.pipette_id)
+        pipette_id = self._validate_pipette_id(self.pipette_id)
+        self.pipette_id = pipette_id
         tx = {
             "control": int(0x100 | (pipette_id << 3)),
             "command": int(0x101 | (pipette_id << 3)),
@@ -299,7 +308,61 @@ class BioXpCanDriver:
     ) -> dict[str, Any]:
         encoded = str(ascii_command).encode('ascii')
         if len(encoded) > 8:
-            raise ValueError(f"ASCII pipette command exceeds 8-byte frame budget: {ascii_command!r}")
+            ids = self.pipette_can_ids()
+            chunks = [encoded[index:index + 8] for index in range(0, len(encoded), 8)]
+            tx_ids = [
+                ids["first_part_command"],
+                *([ids["middle_part_command"]] * max(0, len(chunks) - 2)),
+                ids["report" if int(board_id) == ids["report"] else "command"],
+            ]
+            messages = [
+                can.Message(arbitration_id=int(tx_id), data=list(chunk), is_extended_id=False)
+                for tx_id, chunk in zip(tx_ids, chunks)
+            ]
+            transact_many = getattr(self.bus, "transact_can_many", None)
+            if not callable(transact_many):
+                raise ValueError("fragmented pipette TX requires the shared NovoRouter multi-frame owner")
+            initialization = command_name in {"pipette_initialize", "pipette_initiate_group"}
+            provenance = transact_many(
+                messages,
+                channel=int(self.pipette_id),
+                expected_function=int(tx_ids[-1]) & 0x7,
+                timeout_s=float(response_timeout_s if response_timeout_s is not None else self.response_timeout_s),
+                matcher_name=command_name or str(ascii_command),
+                initialization=initialization,
+                completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
+            )
+            frames = list(provenance.get("frames", []))
+            data = [int(byte) for frame in frames for byte in frame.get("data", [])]
+            observed = frames[-1] if frames else {}
+            ack_ok = bool(provenance.get("ok")) and self._ack_ok(data, ack_mode=ack_mode)
+            ack = {
+                "ok": ack_ok,
+                "received": bool(frames),
+                "arbitration_id": observed.get("arbitration_id"),
+                "dlc": observed.get("dlc"),
+                "data": data,
+                "raw": observed.get("raw"),
+                "ascii": ''.join(chr(byte) if 32 <= byte <= 126 else '.' for byte in data),
+                "outcome": provenance.get("outcome"),
+                "immediate_ack": next((frame for frame in frames if frame.get("dlc") == 0), None),
+                "completion": next((frame for frame in reversed(frames) if frame.get("dlc", 0) > 0), None),
+            }
+            if not ack_ok:
+                ack["error"] = "ack_timeout" if provenance.get("outcome") == "timeout" else "pipette_reply_error"
+            return {
+                "ok": ack_ok,
+                "tx_ok": True,
+                "ack": ack,
+                "provenance": provenance,
+                "error": None if ack_ok else ack["error"],
+                "ascii_command": str(ascii_command),
+                "length": len(encoded),
+                "fragmented": True,
+                "tx_frame_ids": tx_ids,
+                "tx_frame_count": len(chunks),
+                "fragment_policy": "first_103_middle_104_final_expected_family",
+            }
         return {
             **self._send_packet(
                 int(board_id),
@@ -411,6 +474,10 @@ class BioXpCanDriver:
         result = self._send_pipette_command("WR", command_name="pipette_initialize")
         result["wake"] = wake
         result["wake_delay_ms"] = 100
+        result["wake_transport_tx"] = bool(wake.get("tx_ok"))
+        result["wake_response_observed"] = bool(wake.get("ack", {}).get("received"))
+        result["wake_nonspace_observation"] = None
+        result["wake_continuation_gate"] = "none_oem_source_does_not_gate_on_wake_reply"
         result["immediate_ack_received"] = bool(
             result.get("ok") and result.get("ack", {}).get("outcome") == "ack"
         )
@@ -534,9 +601,81 @@ class BioXpCanDriver:
             "error": None if tip_loaded else "tip_not_detected",
         }
 
-    def pipette_eject_tip(self):
-        # OEM ClassPipette.ejectTip sends E1R after initialization.
-        return self._send_pipette_command("E1R", command_name="pipette_eject_tip")
+    def pipette_eject_tip(self, *, initialized: bool = True):
+        # OEM ClassPipette.ejectTip uses E1R after initialization and E0R otherwise.
+        return self._send_pipette_command("E1R" if initialized else "E0R", command_name="pipette_eject_tip")
+
+    def terminate_pipette(self):
+        return self._send_pipette_command("TR", address="control", command_name="terminate_pipette")
+
+    def set_top_speed(self, velocity: int):
+        value = int(velocity)
+        result = self._send_pipette_command(f"V{value},1R", command_name="set_top_speed")
+        result["effective_top_speed"] = value
+        return result
+
+    def dispense_all(self):
+        return self._send_pipette_command("A0R", command_name="dispense_all")
+
+    def aspirate_air(self, volume_ul: float, *, air_type: int = 1, tip_pressure_profile: str = "1R"):
+        del air_type
+        formatted_vol = self._format_pipette_volume(volume_ul)
+        return self._send_pipette_command(
+            f"P{formatted_vol},{str(tip_pressure_profile).upper()}",
+            command_name="aspirate_air",
+        )
+
+    def dispense_air(self, volume_ul: float, *, dispense_type: int = 0):
+        formatted_vol = self._format_pipette_volume(volume_ul)
+        return self._send_pipette_command(
+            f"D{formatted_vol},{int(dispense_type)}R",
+            command_name="dispense_air",
+        )
+
+    def heartbeat(self, enabled: bool):
+        return self._send_pipette_command("U60R" if enabled else "U61R", command_name="heartbeat")
+
+    def execute_diagnoses(self, number: int):
+        result = self._send_pipette_command(f"d{int(number)}R", command_name="execute_diagnoses")
+        self._sleep(1.500)
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        result["diagnosis"] = bytes(data[2:]).decode("ascii", errors="replace") if len(data) >= 2 else None
+        result["diagnostic_wait_ms"] = 1_500
+        return result
+
+    def query_error_log(self, raw_byte: int = 0):
+        value = int(raw_byte)
+        if value < 0 or value > 255:
+            raise ValueError("raw_byte must be between 0 and 255")
+        ids = self.pipette_can_ids()
+        payload = [ord("Q"), ord(":"), value, ord("1")]
+        return {
+            **self._send_packet(
+                ids["report"],
+                payload,
+                require_ack=True,
+                response_timeout_s=self.response_timeout_s,
+                ack_mode="query",
+                command_name="query_error_log",
+            ),
+            "raw_query": payload,
+        }
+
+    def get_data(self, query: str):
+        selected = str(query)
+        if not selected.startswith("?") or len(selected) != 3 or not selected[1:].isdigit():
+            raise ValueError("diagnostic data query must be an OEM ?<two-digit> literal")
+        result = self._send_pipette_command(selected, address="report", ack_mode="query", command_name="get_data")
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        result["query"] = selected
+        result["value_bytes"] = data[2:] if len(data) >= 2 else []
+        result["value_ascii"] = bytes(data[2:]).decode("ascii", errors="replace") if len(data) >= 2 else None
+        return result
+
+    def start_fluid_detection(self):
+        return self._send_pipette_command("BR", command_name="start_fluid_detection")
 
     def aspirate(self, volume_ul: float, tip_pressure_profile='1R'):
         """

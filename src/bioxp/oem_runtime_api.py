@@ -29,8 +29,6 @@ _store: OEMRuntimeStore | None = None
 _worker = None
 _events: OEMRuntimeEventRouter | None = None
 _status: OEMRuntimeStatusService | None = None
-_startup_program_factory = None
-_serial206_provider_factory = None
 _full_lifecycle_runs: OemFullLifecycleRuns | None = None
 
 
@@ -83,24 +81,13 @@ class DoorEventRequest(BaseModel):
 
 def configure_runtime(
     *,
-    startup_program_factory=None,
-    serial206_provider_factory=None,
     store_root: str | None = None,
     terminal_snapshot_hook=None,
     autostart: bool = True,
 ):
-    global _store, _worker, _events, _status, _startup_program_factory, _serial206_provider_factory, _full_lifecycle_runs
-    _startup_program_factory = startup_program_factory
-    _serial206_provider_factory = serial206_provider_factory
+    global _store, _worker, _events, _status, _full_lifecycle_runs
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
-    # Do not call startup_program_factory during API startup: on robot it may open USB.
-    # Runtime commands call it lazily only when an initialCheck/startup substage is explicitly requested.
-    handlers = OEMRuntimeCommandHandlers(
-        startup_program=None,
-        startup_program_factory=startup_program_factory,
-        serial206_provider_factory=serial206_provider_factory,
-        store=_store,
-    )
+    handlers = OEMRuntimeCommandHandlers()
     from .oem_runtime_worker import OEMRuntimeWorker
     _full_lifecycle_runs = OemFullLifecycleRuns(_store)
     _full_lifecycle_runs.recover_all()
@@ -113,6 +100,18 @@ def configure_runtime(
     _events = OEMRuntimeEventRouter(store=_store, worker=_worker)
     _status = OEMRuntimeStatusService(store=_store, worker=_worker)
     return {"store": _store, "worker": _worker, "events": _events, "status": _status, "full_lifecycle_runs": _full_lifecycle_runs}
+
+
+def record_physical_emergency_stop(
+    *,
+    result: dict[str, Any],
+    source: str = "motion_api",
+    reason: str = "operator_request",
+) -> dict[str, Any]:
+    """Journal the physical aggregate-stop receipt in the sole runtime ledger."""
+    _, _, events, _ = _require_runtime()
+    assert events is not None
+    return events.record_physical_emergency_stop(result=result, source=source, reason=reason)
 
 
 def shutdown_runtime():
@@ -407,11 +406,6 @@ def runtime_commands_enqueue(req: GenericCommandRequest):
     return _enqueue(req.name, req)
 
 
-@router.post("/commands/initializeSystem")
-def runtime_command_initialize_system(req: RuntimeCommandRequest):
-    return _enqueue(OEMCommandName.INITIALIZE_SYSTEM.value, req)
-
-
 @router.post("/commands/unlockProcess")
 def runtime_command_unlock_process(req: RuntimeCommandRequest):
     return _enqueue(OEMCommandName.UNLOCK_PROCESS.value, req)
@@ -439,10 +433,7 @@ def runtime_prepare_to_run_job_readiness_dry_run(req: RuntimeCommandRequest):
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    handlers = OEMRuntimeCommandHandlers(
-        startup_program_factory=_startup_program_factory,
-        serial206_provider_factory=_serial206_provider_factory,
-    )
+    handlers = OEMRuntimeCommandHandlers()
     return handlers.handle_prepare_to_run_job_readiness(cmd)
 
 
@@ -477,12 +468,6 @@ def runtime_event_pause():
 def runtime_event_resume(req: RuntimeCommandRequest = RuntimeCommandRequest()):
     _, _, events, _ = _require_runtime()
     return events.handle_resume(mode=req.mode)
-
-
-@router.post("/emergency_stop")
-def runtime_emergency_stop(reason: str = "operator_request"):
-    _, _, events, _ = _require_runtime()
-    return events.emergency_stop(reason=reason)
 
 
 @router.post("/recover")

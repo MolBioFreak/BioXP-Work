@@ -9,7 +9,7 @@ def _worker(tmp_path, monkeypatch):
 
     monkeypatch.setattr(events_module, "lifecycle_state", CanonicalLifecycleOwner())
     store = OEMRuntimeStore(tmp_path)
-    worker = OEMRuntimeWorker(store=store, handlers={"initializeSystem": lambda cmd: {"ok": True}, "wakefrompause": lambda cmd: {"ok": False}})
+    worker = OEMRuntimeWorker(store=store, handlers={"PrepareToRunJob": lambda cmd: {"ok": True}, "wakefrompause": lambda cmd: {"ok": False}})
     return store, worker, OEMRuntimeEventRouter(store=store, worker=worker)
 
 

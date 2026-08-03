@@ -23,12 +23,14 @@ class FakeMotionDriver:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
-        self.activation_status = {4: 100, 5: 100, 6: 100}
+        self.activation_status = {4: 100, 5: 100, 6: 100, 7: 100}
         self.stop_status = {axis: 100 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.speeds = {axis: 0 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.parameter_readbacks = {
             (5, 0, 4): 1700,
             (4, 0, 4): 1800,
+            (4, 1, 12): 0,
+            (4, 1, 13): 0,
         }
         self.rail = {"ack": {"status": 100}, "reply_valid": True, "sample_valid": True, "safety_valid": True, "oem_scalar": 0}
         self.io = {
@@ -40,7 +42,25 @@ class FakeMotionDriver:
         self.calls.append(("activate", board_id))
         return {"board": board_id, "ack": {"status": self.activation_status[board_id]}}
 
-    def oem_initialize_without_motion_test_case(self, *, board_wait):
+    def oem_activate_uninitialized_boards(self):
+        rows = []
+        for board_id in (4, 5, 6, 7):
+            status = self.activation_status[board_id]
+            self.calls.append(("activate", board_id))
+            rows.append({
+                "board": board_id,
+                "ack": None if status is None else {"status": status},
+                "ok": status == 100,
+            })
+        return {"ok": all(row["ok"] for row in rows), "boards": rows}
+
+    def motor_oem_wait_for_board(self):
+        self.calls.append(("wait_for_board",))
+        missing = [board for board, status in self.activation_status.items() if status != 100]
+        return {"ok": not missing, "initialized_boards": [board for board in self.activation_status if board not in missing], "missing": missing}
+
+    def oem_initialize_without_motion_test_case(self, *, board_wait, components=None):
+        del components
         self.calls.append(("initialize_without_motion", board_wait))
         return {
             "ok": True,
@@ -59,6 +79,19 @@ class FakeMotionDriver:
         self.calls.append(("read_param", board_id, motor, param))
         value = self.parameter_readbacks.get((board_id, motor, param))
         return {"board": board_id, "motor": motor, "param": param, "ack": {"status": 100}, "value": value}
+
+    def motor_set_axis_param(self, board_id: int, param: int, value: int, *, motor: int):
+        self.calls.append(("write_param", board_id, motor, param, value))
+        self.parameter_readbacks[(board_id, motor, param)] = value
+        return {
+            "board": board_id,
+            "motor": motor,
+            "param": param,
+            "value": value,
+            "ack": {"status": 100},
+            "readback": {"status": 100, "value": value},
+            "ok": True,
+        }
 
     def motor_query_24v_sensor(self):
         self.calls.append(("query_24v",))
@@ -128,25 +161,35 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
     assert result["ok"] is True
     assert result["physical_motion"] is False
     assert result["homing_performed"] is False
-    assert [call for call in driver.calls if call[0] == "activate"] == [("activate", 4), ("activate", 5), ("activate", 6)]
+    assert [call for call in driver.calls if call[0] == "activate"] == [("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7)]
     assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
-    board7 = next(row for row in result["stage_ledger"] if row["stage_id"] == "board_7_resolution")
-    assert board7["status"] == "not_applicable"
-    assert board7["controller_evidence"]["invalid_command_status"] == 2
-    assert board7["controller_evidence"]["command_sent"] is False
     assert [row["stage_id"] for row in result["stage_ledger"]] == [
         "authority",
-        "activate_board_4",
-        "activate_board_5",
-        "activate_board_6",
-        "board_7_resolution",
+        "activateBoard",
+        "waitForBoard",
         "initializeMotorsWithoutMotion",
+        "z_switch_mask_precondition",
         "parameter_readback",
         "rail_24v_readback",
         "door_readback",
         "latch_readback",
     ]
     assert all(row["status"] in {"passed", "not_applicable"} for row in result["stage_ledger"])
+
+
+def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switch_masks():
+    driver = FakeMotionDriver()
+    driver.parameter_readbacks[(4, 1, 13)] = 1
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is False
+    stage = next(row for row in result["stage_ledger"] if row["stage_id"] == "z_switch_mask_precondition")
+    assert stage["status"] == "failed"
+    assert stage["controller_evidence"]["readbacks"]["left_disable_param13"]["value"] == 1
+    assert stage["controller_evidence"]["writes"] == {}
+    assert ("write_param", 4, 1, 13, 0) not in driver.calls
+    assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
 
 
 def test_prepare_without_motion_fails_closed_on_parameter_readback_mismatch():
@@ -170,8 +213,9 @@ def test_prepare_without_motion_fails_fast_on_missing_board_ack_without_initiali
 
     assert result["ok"] is False
     assert not any(call[0] == "initialize_without_motion" for call in driver.calls)
-    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "activate_board_5")
+    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "waitForBoard")
     assert failed["status"] == "failed"
+    assert failed["controller_evidence"]["missing"] == [5]
 
 
 def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero_speed():
@@ -275,7 +319,8 @@ def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_rea
     admission = _assess_action(motion_action(), state, {"axis": "x"})
     dashboard = _dashboard_payload(state)
 
-    assert admission["enabled"] is True
+    assert admission["enabled"] is False
+    assert any(row["key"] == "canonical_snapshot" and row["met"] is False for row in admission["dependencies"])
     assert dashboard["motion"] == {"enabled": False, "reason": "Same-epoch CAN readiness has not been established."}
 
 
