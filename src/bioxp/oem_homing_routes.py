@@ -274,6 +274,8 @@ class _ApiPathMotionExecutor:
 
     def absolute(self, axis: str, position_steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
         axis_enum = self._api.AxisName(str(axis))
+        if axis_enum is self._api.AxisName.X and self._api._serial206_oem_initialization_provider is not None:
+            return self._api._execute_serial206_motion_intent("move_absolute", {"position_steps": int(position_steps), "wait_timeout_s": float(wait_timeout_s), "source_mode": "oem_path.moveX"})
         return self._api._execute_absolute_move(
             self._tester,
             axis_enum,
@@ -282,6 +284,11 @@ class _ApiPathMotionExecutor:
             speed=speed,
             acc=acc,
         )
+
+    def move_xy(self, x: int, y: int, *, wait_timeout_s: float = 12.0) -> dict[str, Any]:
+        if self._api._serial206_oem_initialization_provider is not None:
+            return self._api._execute_serial206_motion_intent("move_xy", {"x": int(x), "y": int(y), "wait_timeout_s": float(wait_timeout_s)})
+        return self._tester.oem_move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
 
     def relative(self, axis: str, steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
         axis_enum = self._api.AxisName(str(axis))
@@ -313,6 +320,7 @@ def _execute_oem_step_live(
     speed: int | None,
     acc: int | None,
     path: str,
+    pseudo_z_home_steps: int | None = None,
 ) -> dict[str, Any]:
     op = str(step.get("op") or "")
     result: dict[str, Any] = {"ok": True, "path": path, "op": op, "source_step": dict(step), "results": []}
@@ -321,7 +329,18 @@ def _execute_oem_step_live(
         if position is None:
             result.update({"ok": False, "error": f"{op} missing {axis} target"})
             return False
-        sub = motion_executor.absolute(axis, int(position), speed=speed, acc=acc, wait_timeout_s=wait_timeout_s)
+        if axis == "z" and callable(getattr(motion_executor, "oem_move_z", None)):
+            sub = motion_executor.oem_move_z(
+                int(position),
+                pseudo_home_steps=int(pseudo_z_home_steps if pseudo_z_home_steps is not None else 65000),
+                motor_current=31,
+                wait_for_stop=True,
+            )
+        elif callable(getattr(motion_executor, "oem_move_axis_absolute", None)):
+            sub = motion_executor.oem_move_axis_absolute(axis, int(position), wait_for_stop=True)
+        else:
+            result.update({"ok": False, "error": f"exact OEM absolute primitive is not bound for {axis}"})
+            return False
         row = {"axis": axis, "command": "absolute", "target_position": int(position), "result": sub}
         result["results"].append(row)
         if _step_result_failed(sub):
@@ -330,31 +349,38 @@ def _execute_oem_step_live(
         return True
 
     if op == "moveTo":
-        for axis in ("x", "y", "z"):
-            if not run_absolute(axis, step.get(axis)):
-                break
+        move_to = getattr(motion_executor, "oem_move_to", None)
+        if callable(move_to):
+            if any(step.get(axis) is None for axis in ("x", "y", "z")):
+                result.update({"ok": False, "error": "moveTo missing x/y/z target"})
+            else:
+                sub = move_to(
+                    int(step["x"]),
+                    int(step["y"]),
+                    int(step["z"]),
+                    pseudo_home_steps=int(pseudo_z_home_steps if pseudo_z_home_steps is not None else 65000),
+                    run_in_parallel=bool(step.get("run_in_parallel", True)),
+                    wait_timeout_s=wait_timeout_s,
+                )
+                result["results"].append({"command": "moveTo", "result": sub})
+                if _step_result_failed(sub):
+                    result.update({"ok": False, "error": "moveTo composite step failed"})
+        else:
+            result.update({"ok": False, "error": "OEM moveTo composite is not bound"})
     elif op == "moveXY":
-        move_xy = getattr(motion_executor, "move_xy", None)
+        move_xy = getattr(motion_executor, "move_xy", None) or getattr(motion_executor, "oem_move_xy", None)
         if callable(move_xy):
             x = step.get("x")
             y = step.get("y")
             if x is None or y is None:
                 result.update({"ok": False, "error": "moveXY missing x/y target"})
             else:
-                sub = move_xy(
-                    int(x),
-                    int(y),
-                    speed=speed,
-                    acc=acc,
-                    wait_timeout_s=wait_timeout_s,
-                )
+                sub = move_xy(int(x), int(y), wait_timeout_s=wait_timeout_s)
                 result["results"].append({"command": "moveXY", "result": sub})
                 if _step_result_failed(sub):
                     result.update({"ok": False, "error": "moveXY step failed"})
         else:
-            for axis in ("x", "y"):
-                if not run_absolute(axis, step.get(axis)):
-                    break
+            result.update({"ok": False, "error": "exact OEM moveXY composite is not bound"})
     elif op == "moveX":
         run_absolute("x", step.get("x"))
     elif op == "moveY":
@@ -378,34 +404,11 @@ def _execute_oem_step_live(
         if _step_result_failed(sub):
             result.update({"ok": False, "error": "sleep step failed"})
     elif op == "parallel":
-        children = list(step.get("steps") or [])
-        parallel = getattr(motion_executor, "parallel", None)
-        if callable(parallel):
-            sub = parallel(
-                children,
-                speed=speed,
-                acc=acc,
-                wait_timeout_s=wait_timeout_s,
-            )
-            result["parallel_semantics"] = "controller_commands_issued_before_waits"
-            result["results"].append(sub)
-            if _step_result_failed(sub):
-                result.update({"ok": False, "error": "parallel path step failed"})
-        else:
-            result["parallel_semantics"] = "sequentialized_for_guarded_commissioning"
-            for idx, child in enumerate(children):
-                child_result = _execute_oem_step_live(
-                    child,
-                    motion_executor,
-                    wait_timeout_s=wait_timeout_s,
-                    speed=speed,
-                    acc=acc,
-                    path=f"{path}.{idx}",
-                )
-                result["results"].append(child_result)
-                if _step_result_failed(child_result):
-                    result.update({"ok": False, "error": "parallel child step failed"})
-                    break
+        result.update({
+            "ok": False,
+            "parallel_semantics": "fail_closed_exact_parallel_leaf_not_bound",
+            "error": "exact OEM parallel leaf executor is not bound",
+        })
     else:
         result.update({"ok": False, "error": f"unsupported OEM path step op: {op}"})
     return result
@@ -418,6 +421,7 @@ def _execute_oem_steps_live(
     wait_timeout_s: float,
     speed: int | None,
     acc: int | None,
+    pseudo_z_home_steps: int | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     motion_commanded = False
@@ -430,6 +434,7 @@ def _execute_oem_steps_live(
             speed=speed,
             acc=acc,
             path=str(idx),
+            pseudo_z_home_steps=pseudo_z_home_steps,
         )
         results.append(step_result)
         if op != "sleep":
@@ -559,6 +564,42 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
 @router.post("/motion/oem/pathing/scriptmove_execute")
 async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return await _execute_oem_scriptmove_path_impl(payload)
+
+
+@router.post("/motion/oem/home_gz")
+async def execute_oem_home_gz(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dedicated ClassControlInterface.homeGZ composite command."""
+    payload = payload or {}
+    mode = str(payload.get("mode") or "dry_run").strip().lower()
+    if mode not in {"dry_run", "preview", "live"}:
+        raise HTTPException(status_code=400, detail=f"unsupported homeGZ mode: {mode}")
+    if mode == "live":
+        raise HTTPException(
+            status_code=409,
+            detail="homeGZ live execution remains quarantined by caught_plate_recovery_not_live_proven",
+        )
+    delay_s = int(payload.get("delay_s") or payload.get("delay") or 0)
+    if delay_s < 0 or delay_s > 60:
+        raise HTTPException(status_code=400, detail="homeGZ delay must be between 0 and 60 seconds")
+    dry_run = {
+        "ok": True,
+        "mode": "dry_run",
+        "opened_usb": False,
+        "physical_motion": False,
+        "motion_commanded": False,
+        "command": "homeGZ",
+        "delay_s": delay_s,
+        "sequence": [
+            "setGripperCurrent(31)",
+            "moveZ(PSUDO_Z_HOME, waitforstop=false)",
+            "sleep(delay * 1000)",
+            "goHome(gripper, version-dependent speed, wait=true)",
+            "caught-plate recovery or moveZ(PSUDO_Z_HOME)",
+            "restore gripper current 10 for GripperVersion=1",
+        ],
+        "source_anchor": "ClassControlInterface.homeGZ:4657-4687",
+    }
+    return dry_run
 
 
 @router.get("/motion/oem/programs")

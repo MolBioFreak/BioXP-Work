@@ -277,11 +277,13 @@ class Serial206ProductionPrimitiveAdapter:
         *,
         authority_provider: Callable[[], Any],
         generation_provider: Callable[[], int],
+        reference_store: Any | None = None,
     ) -> None:
         self.tester = tester
         self.pipette_transport = pipette_transport
         self.authority_provider = authority_provider
         self.generation_provider = generation_provider
+        self.reference_store = reference_store
         self._last_tip_channels: list[int] | None = None
         self._pending_move_position_before: Any = None
 
@@ -360,6 +362,7 @@ class Serial206ProductionPrimitiveAdapter:
         except Exception:
             table_identity = None
             motion_missing.append("immutable_oem_position_table_not_bound")
+        motion_missing.append("oem_moveTo_branch_authority_not_bound")
         motors = not blockers
         initialize_motion_complete = motors and not motion_missing
         return {
@@ -403,6 +406,239 @@ class Serial206ProductionPrimitiveAdapter:
     def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_home(*args, **kwargs)
 
+    def _x_profile(self) -> Mapping[str, Any]:
+        profile = self.tester._motion_oem_axis_profile("x", startup=True)
+        if not isinstance(profile, Mapping):
+            raise RuntimeError("serial-206 X profile unavailable")
+        if int(profile.get("board", -1)) != 5 or int(profile.get("motor", -1)) != 0:
+            raise RuntimeError("serial-206 X channel identity mismatch")
+        if int(profile.get("axis_min_steps", 0)) != 0 or int(profile.get("axis_max_steps", -1)) != 90263:
+            raise RuntimeError("serial-206 X limit authority mismatch")
+        return profile
+
+    @staticmethod
+    def _x_value(row: Any) -> int | None:
+        if not isinstance(row, Mapping):
+            return None
+        value = row.get("position", row.get("value"))
+        return int(value) if type(value) is int else None
+
+    def _reference_snapshot(self, axes: tuple[str, ...], operation: str) -> dict[str, Any]:
+        if self.reference_store is None:
+            return {"ok": True, "durable_clean": True, "authority_untrusted": False, "rows": {}}
+        snapshot = self.reference_store.snapshot(axes)
+        if not isinstance(snapshot, Mapping) or snapshot.get("ok") is not True or snapshot.get("durable_clean") is not True:
+            raise RuntimeError(f"durable reference authority unavailable for {operation}")
+        rows = snapshot.get("rows")
+        missing = [axis for axis in axes if not isinstance(rows, Mapping) or not isinstance(rows.get(axis), Mapping) or rows[axis].get("state") != "referenced"]
+        if missing:
+            raise RuntimeError(f"referenced axes required for {operation}: {','.join(missing)}")
+        return dict(snapshot)
+
+    def _x_desync(self, reason: str, motion_kind: str = "absolute") -> dict[str, Any]:
+        if self.reference_store is None:
+            return {"ok": False, "error": "reference store not bound"}
+        result = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(axis="x", reason=reason, source="serial206.x", motion_kind=motion_kind))
+        if result.get("ok") is True:
+            return result
+        return {"ok": False, "desync": result, "recovery": self.reference_store.recover_untrusted_authority(f"X desynchronization failed: {reason}")}
+
+    def _x_issue_absolute(self, requested: int, *, source_mode: str, clamp_low: int = 0, acceleration: int | None = None, event_window: Any = None) -> dict[str, Any]:
+        profile = self._x_profile()
+        before = self.tester.motor_get_position(5, motor=0)
+        before_value = self._x_value(before)
+        if before_value is None:
+            return {"ok": False, "failure": "x_position_before_unavailable", "command_issued": False, "before": _json_safe(before)}
+        target = min(90263, max(int(clamp_low), int(requested)))
+        result: dict[str, Any] = {"ok": False, "axis": "x", "source_mode": source_mode, "requested_position_steps": int(requested), "target_position_steps": target, "before": _json_safe(before), "before_position_steps": before_value, "command_issued": False, "source_noop": False}
+        if acceleration is not None:
+            setup = self.tester.motor_set_axis_param(5, 5, int(acceleration), motor=0)
+            result["acceleration_set"] = _json_safe(setup)
+            if not isinstance(setup, Mapping) or setup.get("ok") is not True or not isinstance(setup.get("readback"), Mapping) or setup["readback"].get("value") != int(acceleration):
+                result["failure"] = "x_acceleration_write_or_readback_failed"
+                return result
+        if before_value == target:
+            result.update({"ok": True, "source_noop": True, "noop_reason": "already_at_target", "after": _json_safe(before), "after_position_steps": before_value})
+            return result
+        result["event_window"] = event_window if event_window is not None else self.tester.begin_bus_event_window()
+        move = self.tester.motor_oem_move_absolute(5, target, motor=0, wait_for_stop=False, max_position=90263)
+        result.update({"move": _json_safe(move), "command_issued": True, "ok": isinstance(move, Mapping) and move.get("ok") is True})
+        if result["ok"] is not True:
+            result["failure"] = "x_absolute_command_ack_failed"
+        return result
+
+    def _x_finalize(self, ticket: Mapping[str, Any], *, timeout_s: float, motion_kind: str, publish: bool = True, restore_acceleration: bool = False) -> dict[str, Any]:
+        result = dict(ticket)
+        if result.get("source_noop") is True:
+            result["ok"] = bool(result.get("ok") is True and result.get("after_position_steps") == result.get("target_position_steps"))
+            return result
+        if result.get("command_issued") is not True:
+            return result
+        if result.get("ok") is not True:
+            result["physical_effect_ambiguous"] = True
+        else:
+            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
+            wait = wait_fn(5, motor=0, timeout_s=float(timeout_s), event_window=result.get("event_window"))
+            after = self.tester.motor_get_position(5, motor=0)
+            speed = self.tester.motor_get_speed(5, motor=0)
+            after_value = self._x_value(after)
+            terminal = isinstance(wait, Mapping) and wait.get("ok") is True and wait.get("target_reached") is True
+            speed_zero = isinstance(speed, Mapping) and speed.get("speed") == 0
+            result.update({"wait": _json_safe(wait), "after": _json_safe(after), "after_position_steps": after_value, "terminal_speed": _json_safe(speed), "target_position_verified": after_value == result.get("target_position_steps"), "controller_terminal_state_verified": terminal and speed_zero})
+            result["ok"] = bool(result.get("ok") is True and terminal and speed_zero and result["target_position_verified"])
+            if not result["ok"]:
+                result["failure"] = str(result.get("failure") or "x_absolute_terminal_evidence_not_accepted")
+        if restore_acceleration:
+            restore = self.tester.motor_set_axis_param(5, 5, 350, motor=0)
+            result["acceleration_restore"] = _json_safe(restore)
+            result["ok"] = bool(result.get("ok") is True and isinstance(restore, Mapping) and restore.get("ok") is True and isinstance(restore.get("readback"), Mapping) and restore["readback"].get("value") == 350)
+        if result.get("ok") is True and result.get("command_issued") is True and publish and self.reference_store is not None:
+            metadata = self.reference_store.record_motion("x", motion_kind)
+            result["reference_state"] = _json_safe(metadata)
+            if metadata.get("ok") is not True:
+                result["ok"] = False
+                result["failure"] = "x_motion_reference_metadata_not_verified"
+                result["reference_desync"] = _json_safe(self._x_desync(result["failure"], motion_kind))
+        elif result.get("ok") is not True and result.get("command_issued") is True:
+            stop = self.x_stop(timeout_s=3.0)
+            result["safety_stop"] = _json_safe(stop)
+            result["reference_desync"] = _json_safe(self._x_desync(str(result.get("failure") or "X motion ambiguous"), motion_kind)) if self.reference_store is not None else None
+        return result
+
+    def x_move_absolute(self, *, position_steps: int, acceleration: int | None = None, wait_for_stop: bool = True, wait_timeout_s: float = 20.0, source_mode: str = "ClassControlInterface.moveX", clamp_low_to_60: bool = True, publish_motion_metadata: bool = True) -> dict[str, Any]:
+        reference = self._reference_snapshot(("x",), source_mode)
+        ticket = self._x_issue_absolute(int(position_steps), source_mode=source_mode, clamp_low=60 if clamp_low_to_60 else 0, acceleration=acceleration)
+        if not wait_for_stop and ticket.get("command_issued") is True:
+            ticket.update({"pending_motion": True, "physical_motion": True, "reference_before": _json_safe(reference)})
+            return ticket
+        result = self._x_finalize(ticket, timeout_s=wait_timeout_s, motion_kind="absolute", publish=publish_motion_metadata, restore_acceleration=acceleration is not None)
+        result["reference_before"] = _json_safe(reference)
+        result["physical_motion"] = bool(result.get("command_issued"))
+        return result
+
+    def _move_xy_y_issue_absolute(self, requested: int, *, event_window: Any) -> dict[str, Any]:
+        profile = self._axis_profile("y")
+        before = self.tester.motor_get_position(4, motor=0)
+        before_value = self._x_value(before)
+        target = min(102956, max(0, int(requested)))
+        if before_value is None:
+            return {"ok": False, "failure": "y_position_before_unavailable", "command_issued": False}
+        if before_value == target:
+            return {"ok": True, "axis": "y", "source_noop": True, "command_issued": False, "target_position_steps": target, "before_position_steps": before_value, "after_position_steps": before_value}
+        move = self.tester.motor_oem_move_absolute(4, target, motor=0, wait_for_stop=False, max_position=102956)
+        return {"ok": isinstance(move, Mapping) and move.get("ok") is True, "axis": "y", "target_position_steps": target, "before_position_steps": before_value, "before": _json_safe(before), "event_window": event_window, "move": _json_safe(move), "command_issued": True}
+
+    def _move_xy_y_finalize(self, ticket: Mapping[str, Any], *, timeout_s: float) -> dict[str, Any]:
+        result = dict(ticket)
+        if result.get("source_noop") is True:
+            return result
+        wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
+        wait = wait_fn(4, motor=0, timeout_s=float(timeout_s), event_window=result.get("event_window"))
+        after = self.tester.motor_get_position(4, motor=0)
+        speed = self.tester.motor_get_speed(4, motor=0)
+        after_value = self._x_value(after)
+        result.update({"wait": _json_safe(wait), "after": _json_safe(after), "after_position_steps": after_value, "terminal_speed": _json_safe(speed)})
+        result["ok"] = bool(result.get("ok") is True and isinstance(wait, Mapping) and wait.get("ok") is True and wait.get("target_reached") is True and isinstance(speed, Mapping) and speed.get("speed") == 0 and after_value == result.get("target_position_steps"))
+        return result
+
+    def _finalize_move_xy_receipt(self, receipt: dict[str, Any], *, commands: Mapping[str, Any], waits: Mapping[str, Any], after: Mapping[str, int], restore: Mapping[str, Any], required_axes: tuple[str, ...]) -> dict[str, Any]:
+        command_ok = all(isinstance(commands.get(axis), Mapping) and commands[axis].get("ok") is True for axis in required_axes)
+        wait_ok = all(isinstance(waits.get(axis), Mapping) and waits[axis].get("ok") is True and waits[axis].get("target_reached") is True for axis in required_axes)
+        target_ok = all(after.get(axis) == receipt["requested"][axis] for axis in required_axes)
+        restore_ok = all(isinstance(restore.get(axis), Mapping) and restore[axis].get("ok") is True and isinstance(restore[axis].get("readback"), Mapping) and restore[axis]["readback"].get("value") == (350 if axis == "x" else 400) for axis in ("x", "y"))
+        ok = bool(command_ok and wait_ok and target_ok and restore_ok)
+        receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "after": _json_safe(after), "acceleration_restore": _json_safe(restore), "controller_command_acknowledged": command_ok, "controller_terminal_state_verified": wait_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
+        if ok and self.reference_store is not None and set(required_axes) == {"x", "y"}:
+            metadata = self.reference_store.record_motion_many(("x", "y"), "move_xy")
+            receipt["reference_state"] = _json_safe(metadata)
+            if metadata.get("ok") is not True:
+                ok = False
+                receipt.update({"ok": False, "failure": "moveXY_reference_metadata_not_verified", "reference_desync": _json_safe(self.reference_store.mark_desynced_many((MarkAxisDesyncedCommand(axis="x", reason="moveXY metadata failure", source="serial206.move_xy", motion_kind="move_xy"), MarkAxisDesyncedCommand(axis="y", reason="moveXY metadata failure", source="serial206.move_xy", motion_kind="move_xy"))))})
+        if not ok:
+            receipt.setdefault("failure", "moveXY_terminal_evidence_not_accepted")
+            stops = {axis: self.tester.motor_oem_stop_exact(5 if axis == "x" else 4, motor=0) for axis in required_axes}
+            receipt["safety_stop"] = _json_safe(stops)
+            if self.reference_store is not None:
+                receipt["reference_desync"] = _json_safe(self.reference_store.mark_desynced_many(tuple(MarkAxisDesyncedCommand(axis=axis, reason=str(receipt["failure"]), source="serial206.move_xy", motion_kind="move_xy") for axis in required_axes)))
+        return receipt
+
+
+    def x_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        stop = self.tester.motor_oem_stop_exact(5, motor=0)
+        wait = self.tester.motor_wait_stopped(5, motor=0, timeout_s=float(timeout_s), require_seen_nonzero=False)
+        return {"ok": bool(isinstance(stop, Mapping) and stop.get("ok") is True and isinstance(wait, Mapping) and wait.get("stopped") is True), "axis": "x", "intent": "stop", "stop": _json_safe(stop), "wait": _json_safe(wait), "physical_motion": False}
+
+    def x_abort(self, *, reason: str = "forceAbortMotion") -> dict[str, Any]:
+        abort = self.tester.motor_oem_force_abort_motion(reason=reason)
+        desync = self._x_desync(reason, "abort") if self.reference_store is not None else None
+        return {"ok": isinstance(abort, Mapping) and abort.get("ok") is True, "axis": "x", "intent": "abort", "logical_abort": _json_safe(abort), "reference_desync": _json_safe(desync)}
+
+    def prepare_x(self, *, expected_generation: int) -> dict[str, Any]:
+        result = self.prepare_for_initialize_motors(expected_generation=int(expected_generation))
+        result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_prepare_result_not_mapping"}
+        result.update({"axis": "x", "physical_motion": False, "source_anchor": "ClassControlInterface.initializeMotors"})
+        return result
+
+    def x_wait_for_motor(self, *, pending_ticket: Mapping[str, Any], wait_timeout_s: float) -> dict[str, Any]:
+        return self._x_finalize(pending_ticket, timeout_s=float(wait_timeout_s), motion_kind="absolute", publish=True)
+
+    def _x_home(self, *, timeout_s: float, source: str) -> dict[str, Any]:
+        profile = self._x_profile()
+        home = self.tester.motor_oem_go_home("x", speed=1700, rehome=True, timeout_s=max(30.0, float(timeout_s)), require_switch_transition=False)
+        set_home = self.tester.motor_set_home(5, motor=0)
+        position = self.tester.motor_get_position(5, motor=0)
+        value = self._x_value(position)
+        ok = isinstance(home, Mapping) and home.get("ok") is True and isinstance(set_home, Mapping) and set_home.get("ok") is True and value == 0
+        reference = None
+        if ok and self.reference_store is not None:
+            reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source=source, motion_kind="home"))
+            ok = reference.get("ok") is True and reference.get("durable_clean") is True
+        return {"ok": ok, "axis": "x", "intent": source, "home": _json_safe(home), "set_home": _json_safe(set_home), "position": _json_safe(position), "reference_state": _json_safe(reference), "physical_motion": True, "failure": None if ok else "x_home_evidence_not_verified"}
+
+    def x_startup_home(self, *, timeout_s: float) -> dict[str, Any]:
+        return self._x_home(timeout_s=timeout_s, source="oem_startup_home")
+
+    def x_home_axis(self, *, timeout_s: float) -> dict[str, Any]:
+        return self._x_home(timeout_s=timeout_s, source="oem_home_axis")
+
+    def x_manual_panel_home(self, *, timeout_s: float) -> dict[str, Any]:
+        return self._x_home(timeout_s=timeout_s, source="manual_panel_home")
+
+    def x_move_to_origin_home(self, *, timeout_s: float) -> dict[str, Any]:
+        return self._x_home(timeout_s=timeout_s, source="move_to_origin_home")
+
+    def x_compatibility_home(self, *, timeout_s: float) -> dict[str, Any]:
+        return self._x_home(timeout_s=timeout_s, source="compatibility_home")
+
+    def home_xy(self, *, timeout_s: float = 30.0, allow_implementation_mapped_predicate: bool = False) -> dict[str, Any]:
+        del allow_implementation_mapped_predicate
+        profiles = {"x": self._x_profile(), "y": self._axis_profile("y")}
+        setup = {"x": self.tester.motor_set_axis_param(5, 5, 200, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 200, motor=0)}
+        setup_ok = all(isinstance(setup[a], Mapping) and setup[a].get("ok") is True and isinstance(setup[a].get("readback"), Mapping) and setup[a]["readback"].get("value") == 200 for a in ("x", "y"))
+        if not setup_ok:
+            restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
+            return {"ok": False, "failure": "homexy_profile_setup_not_verified", "command_issued": False, "setup": _json_safe(setup), "restore": _json_safe(restore)}
+        event_window = self.tester.begin_bus_event_window()
+        results: dict[str, Any] = {}
+        errors: list[str] = []
+        def run(axis: str, speed: int) -> None:
+            try:
+                results[axis] = self.tester.motor_oem_go_home(axis, speed=speed, rehome=True, timeout_s=max(30.0, float(timeout_s)), require_switch_transition=False)
+            except Exception as exc:
+                errors.append(f"{axis}:{type(exc).__name__}:{exc}")
+        tx = threading.Thread(target=run, args=("x", 1700), daemon=False)
+        ty = threading.Thread(target=run, args=("y", 1800), daemon=False)
+        tx.start(); ty.start(); tx.join(); ty.join()
+        set_home = {"x": self.tester.motor_set_home(5, motor=0), "y": self.tester.motor_set_home(4, motor=0)}
+        positions = {"x": self.tester.motor_get_position(5, motor=0), "y": self.tester.motor_get_position(4, motor=0)}
+        zero_ok = all(self._x_value(positions[a]) == 0 for a in ("x", "y"))
+        restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
+        home_ok = not errors and all(isinstance(results.get(a), Mapping) and results[a].get("ok") is True for a in ("x", "y")) and all(isinstance(set_home[a], Mapping) and set_home[a].get("ok") is True for a in ("x", "y")) and zero_ok
+        reference = None
+        if home_ok and self.reference_store is not None:
+            reference = self.reference_store.mark_referenced_many((MarkAxisReferencedCommand(axis="x", position_steps=0, source="oem_home_xy", motion_kind="home_xy"), MarkAxisReferencedCommand(axis="y", position_steps=0, source="oem_home_xy", motion_kind="home_xy")))
+            home_ok = reference.get("ok") is True and reference.get("durable_clean") is True
+        return {"ok": bool(home_ok and all(isinstance(restore[a], Mapping) and restore[a].get("ok") is True and isinstance(restore[a].get("readback"), Mapping) and restore[a]["readback"].get("value") == (350 if a == "x" else 400) for a in ("x", "y"))), "intent": "home_xy", "command_issued": True, "event_window": _json_safe(event_window), "setup": _json_safe(setup), "home": _json_safe(results), "home_errors": errors, "set_home": _json_safe(set_home), "positions": _json_safe(positions), "restore": _json_safe(restore), "reference_state": _json_safe(reference), "source_anchor": "ClassControlInterface.HomeXY"}
     def _z_profile(self) -> dict[str, Any]:
         profile = dict(self.tester._motion_oem_axis_profile("z"))
         if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
@@ -875,15 +1111,25 @@ class Serial206ProductionPrimitiveAdapter:
     ) -> dict[str, Any]:
         """ClassControlInterface.moveZ with dynamic PSUDO_Z_HOME."""
         profile = self._axis_profile("z")
+        board = int(profile["board"])
+        present = getattr(self.tester, "_oem_board_present", None)
+        if callable(present) and not present(board):
+            return {
+                "ok": True,
+                "axis": "z",
+                "source_noop": "board_null",
+                "source_return_code": 0,
+                "source_anchor": "ClassControlInterface.moveZ:4254-4265",
+            }
         effective = max(int(pseudo_home_steps), int(position))
         current_set = self.tester.motor_set_axis_param(
-            profile["board"],
+            board,
             6,
             int(motor_current),
             motor=profile.get("motor", 0),
         )
         move = self.tester.motor_oem_move_absolute(
-            profile["board"],
+            board,
             effective,
             motor=profile.get("motor", 0),
             wait_for_stop=bool(wait_for_stop),
@@ -909,8 +1155,17 @@ class Serial206ProductionPrimitiveAdapter:
         wait_timeout_s: float = 5.0,
     ) -> dict[str, Any]:
         """ClassControlInterface.moveXY source ordering and acceleration."""
+        return self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
         px = self._axis_profile("x")
         py = self._axis_profile("y")
+        present = getattr(self.tester, "_oem_board_present", None)
+        x_present = not callable(present) or present(int(px["board"]))
+        y_present = not callable(present) or present(int(py["board"]))
+        if not y_present:
+            move = self.oem_move_axis_absolute("x", int(x), wait_for_stop=True) if x_present else None
+            return {"ok": move is None or move.get("ok") is True, "branch": "y_board_null", "move_x": _json_safe(move)}
+        if not x_present:
+            return {"ok": True, "branch": "x_board_null_literal_moveX_y_noop", "source_noop": "moveX checks the same null board"}
         current_x = self._read_axis_position("x")
         current_y = self._read_axis_position("y")
         target_x, target_y = int(x), int(y)
@@ -1109,105 +1364,89 @@ class Serial206ProductionPrimitiveAdapter:
         acc: int | None = None,
         wait_timeout_s: float,
     ) -> dict[str, Any]:
-        del acc
-        profiles = {axis: self._axis_profile(axis) for axis in ("x", "y")}
-        before = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
-        targets = {"x": int(x), "y": int(y)}
-        distances = {axis: abs(targets[axis] - before[axis]) for axis in ("x", "y")}
-        prepared = {
-            "x": self._prepare_path_axis("x", speed=speed, acc=350),
-            "y": self._prepare_path_axis("y", speed=speed, acc=400),
+        requested = {"x": int(x), "y": int(y)}
+        present_fn = getattr(self.tester, "motor_oem_axis_board_present", None)
+        if callable(present_fn):
+            present = {axis: bool(present_fn(axis)) for axis in ("x", "y")}
+        else:
+            present = {axis: True for axis in ("x", "y")}
+        receipt: dict[str, Any] = {
+            "ok": False,
+            "source_operation": "ClassControlInterface.moveXY",
+            "source_anchor": "ClassControlInterface.cs:4285-4367",
+            "requested": requested,
+            "board_present": present,
+            "ignored_compatibility_inputs": {"speed": speed, "acc": acc, "wait_timeout_s": float(wait_timeout_s)},
+            "oem_wait_timeout_ms": 5000,
         }
-        boosted: dict[str, Any] = {}
+        if not present["y"]:
+            fallback = self.x_move_absolute(position_steps=requested["x"], source_mode="moveXY.missing_y.moveX", clamp_low_to_60=True)
+            receipt.update({"branch": "missing_y_calls_moveX_x", "fallback": _json_safe(fallback), "ok": fallback.get("ok") is True})
+            return receipt
+        if not present["x"]:
+            fallback = self.x_move_absolute(position_steps=requested["y"], source_mode="moveXY.missing_x.literal_moveX_y", clamp_low_to_60=True)
+            receipt.update({"branch": "missing_x_literal_moveX_y", "fallback": _json_safe(fallback), "ok": fallback.get("source_noop") is True})
+            return receipt
+        reference = self._reference_snapshot(("x", "y"), "ClassControlInterface.moveXY")
+        before = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
+        distances = {axis: abs(requested[axis] - before[axis]) for axis in ("x", "y")}
+        receipt.update({"reference_before": _json_safe(reference), "before": before, "distances": distances})
+        if distances["x"] <= 20 or distances["y"] <= 20:
+            commands: dict[str, Any] = {}
+            waits: dict[str, Any] = {}
+            if distances["x"]:
+                commands["x"] = self.x_move_absolute(position_steps=requested["x"], source_mode="moveXY.near_axis.moveX", clamp_low_to_60=True, publish_motion_metadata=False)
+                waits["x"] = commands["x"].get("wait") or {"ok": commands["x"].get("ok") is True, "target_reached": commands["x"].get("ok") is True}
+            if distances["y"]:
+                ticket = self._move_xy_y_issue_absolute(requested["y"], event_window=self.tester.begin_bus_event_window())
+                commands["y"] = self._move_xy_y_finalize(ticket, timeout_s=5.0)
+                waits["y"] = commands["y"].get("wait") or {"ok": commands["y"].get("ok") is True, "target_reached": commands["y"].get("ok") is True}
+            after = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
+            restore = {"x": {"ok": True, "readback": {"value": 350}, "not_written": True}, "y": {"ok": True, "readback": {"value": 400}, "not_written": True}}
+            return self._finalize_move_xy_receipt({**receipt, "branch": "near_axis_sequential", "launch_order": list(commands)}, commands=commands, waits=waits, after=after, restore=restore, required_axes=tuple(commands))
+        x_acc = 400 if distances["x"] > 10000 else 350
+        y_acc = 750 if distances["y"] > 10000 else 400
+        acceleration_set = {"x": self.tester.motor_set_axis_param(5, 5, x_acc, motor=0), "y": self.tester.motor_set_axis_param(4, 5, y_acc, motor=0)}
+        setup_ok = all(isinstance(acceleration_set[axis], Mapping) and acceleration_set[axis].get("ok") is True and isinstance(acceleration_set[axis].get("readback"), Mapping) and acceleration_set[axis]["readback"].get("value") == expected for axis, expected in (("x", x_acc), ("y", y_acc)))
+        if not setup_ok:
+            restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
+            receipt.update({"branch": "parallel_setup_failed_before_motion", "acceleration_set": _json_safe(acceleration_set), "acceleration_restore": _json_safe(restore), "command_issued": False, "failure": "moveXY_acceleration_setup_not_verified", "reference_effect": "unchanged_no_motion_delivered"})
+            return receipt
+        event_window = self.tester.begin_bus_event_window()
         commands: dict[str, Any] = {}
         launch_order: list[str] = []
         stagger_ms = 0
         if distances["x"] > distances["y"]:
-            if distances["x"] > 10000:
-                boosted["x"] = self.tester.motor_set_axis_param(
-                    profiles["x"]["board"], 5, 750, motor=profiles["x"].get("motor", 0)
-                )
-                boosted["y"] = self.tester.motor_set_axis_param(
-                    profiles["y"]["board"], 5, 1500, motor=profiles["y"].get("motor", 0)
-                )
-            if distances["x"] > 20:
-                commands["x"] = self.tester.motor_move_absolute(
-                    profiles["x"]["board"], targets["x"], motor=profiles["x"].get("motor", 0)
-                )
-                launch_order.append("x")
-                if distances["y"] > 20:
-                    stagger_ms = int(900 * distances["y"] / distances["x"])
-                    time.sleep(float(stagger_ms) / 1000.0)
-                    commands["y"] = self.tester.motor_move_absolute(
-                        profiles["y"]["board"], targets["y"], motor=profiles["y"].get("motor", 0)
-                    )
-                    launch_order.append("y")
+            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_x_first", event_window=event_window)
+            launch_order.append("x")
+            if distances["y"] > 4000:
+                stagger_ms = 50 * distances["x"] // distances["y"]
+                time.sleep(stagger_ms / 1000.0)
+            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+            launch_order.append("y")
         else:
-            if distances["y"] > 10000:
-                boosted["x"] = self.tester.motor_set_axis_param(
-                    profiles["x"]["board"], 5, 1500, motor=profiles["x"].get("motor", 0)
-                )
-                boosted["y"] = self.tester.motor_set_axis_param(
-                    profiles["y"]["board"], 5, 750, motor=profiles["y"].get("motor", 0)
-                )
-            if distances["y"] > 20:
-                commands["y"] = self.tester.motor_move_absolute(
-                    profiles["y"]["board"], targets["y"], motor=profiles["y"].get("motor", 0)
-                )
-                launch_order.append("y")
-                if distances["x"] > 20:
-                    stagger_ms = int(900 * distances["x"] / distances["y"])
-                    time.sleep(float(stagger_ms) / 1000.0)
-                    commands["x"] = self.tester.motor_move_absolute(
-                        profiles["x"]["board"], targets["x"], motor=profiles["x"].get("motor", 0)
-                    )
-                    launch_order.append("x")
-        waits: dict[str, Any] = {}
-        for axis in launch_order:
-            profile = profiles[axis]
-            waits[axis] = self.tester.motor_wait_stopped(
-                profile["board"],
-                motor=profile.get("motor", 0),
-                timeout_s=float(wait_timeout_s),
-                require_seen_nonzero=True,
-            )
-        restored_acc = {
-            "x": self.tester.motor_set_axis_param(
-                profiles["x"]["board"], 5, 350, motor=profiles["x"].get("motor", 0)
-            ),
-            "y": self.tester.motor_set_axis_param(
-                profiles["y"]["board"], 5, 400, motor=profiles["y"].get("motor", 0)
-            ),
-        }
+            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+            launch_order.append("y")
+            if distances["x"] > 4000:
+                stagger_ms = 50 * distances["y"] // distances["x"]
+                time.sleep(stagger_ms / 1000.0)
+            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_y_first", event_window=event_window)
+            launch_order.append("x")
+        time.sleep(0.005)
+        many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
+        if callable(many_wait):
+            pair_wait = many_wait(((5, 0), (4, 0)), event_window=event_window, timeout_s=5.0, sta_sequential=False)
+            waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
+            if not waits:
+                waits = {"x": pair_wait, "y": pair_wait}
+        else:
+            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
+            waits = {"x": wait_fn(5, motor=0, timeout_s=5.0, event_window=event_window), "y": wait_fn(4, motor=0, timeout_s=5.0, event_window=event_window)}
+        restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
         after = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
-        expected_axes = {axis for axis in ("x", "y") if distances[axis] > 20}
-        return {
-            "ok": bool(
-                set(launch_order) == expected_axes
-                and all(
-                    isinstance(commands[axis], Mapping)
-                    and commands[axis].get("ok") is True
-                    and isinstance(waits[axis], Mapping)
-                    and waits[axis].get("stopped") is True
-                    for axis in expected_axes
-                )
-                and all(abs(after[axis] - targets[axis]) <= 20 for axis in ("x", "y"))
-                and all(isinstance(restored_acc[axis], Mapping) and restored_acc[axis].get("ok") is True for axis in ("x", "y"))
-            ),
-            "oem_move_xy_order": True,
-            "targets": targets,
-            "distances": distances,
-            "before": before,
-            "after": after,
-            "prepare": _json_safe(prepared),
-            "boosted_acceleration": _json_safe(boosted),
-            "launch_order": launch_order,
-            "stagger_ms": stagger_ms,
-            "commands": _json_safe(commands),
-            "waits": _json_safe(waits),
-            "restored_acceleration": _json_safe(restored_acc),
-            "source_anchor": "ClassControlInterface.moveXY:4285-4364",
-        }
+        receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "event_window": _json_safe(event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
+        return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
+
 
     def parallel(
         self,
@@ -1402,6 +1641,10 @@ class Serial206OemInitializationProvider:
         }
 
     @staticmethod
+    def _new_x_lifecycle() -> dict[str, Any]:
+        return {"schema_version": "bioxp.serial206_x_lifecycle.v1", "state": "unprepared", "generation": None, "prepared_receipt": None, "active_receipt": None, "pending_ticket": None, "reference_state": "unknown", "last_failure": None, "receipts": []}
+
+    @staticmethod
     def _new_state() -> dict[str, Any]:
         movement_ledger = new_initialize_motors_ledger()
         movement_ledger["stage_order"] = list(OEM_INITIALIZE_MOTORS_STAGE_KEYS)
@@ -1411,6 +1654,7 @@ class Serial206OemInitializationProvider:
             "used_approvals": {},
             "used_motion_approvals": {},
             "z_lifecycle": Serial206OemInitializationProvider._new_z_lifecycle(),
+            "x_lifecycle": Serial206OemInitializationProvider._new_x_lifecycle(),
             "initialize_motion_ledger": {
                 "schema_version": _MOTION_LEDGER_SCHEMA,
                 "source_anchor": "ControlLib.initializeMotion:8797-8856",
@@ -1457,6 +1701,7 @@ class Serial206OemInitializationProvider:
         defaults = cls._new_state()
         upgraded.setdefault("used_motion_approvals", {})
         upgraded.setdefault("z_lifecycle", copy.deepcopy(defaults["z_lifecycle"]))
+        upgraded.setdefault("x_lifecycle", copy.deepcopy(defaults["x_lifecycle"]))
         upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
         machine = upgraded.get("machine_status")
         if isinstance(machine, dict):
@@ -1501,6 +1746,17 @@ class Serial206OemInitializationProvider:
             raise ValueError("executing serial-206 Z lifecycle lacks active receipt")
         if z_lifecycle.get("state") != "executing" and z_lifecycle.get("active_receipt") is not None:
             raise ValueError("inactive serial-206 Z lifecycle carries active receipt")
+        x_lifecycle = state.get("x_lifecycle")
+        if not isinstance(x_lifecycle, dict) or x_lifecycle.get("schema_version") != "bioxp.serial206_x_lifecycle.v1":
+            raise ValueError("serial-206 X lifecycle is invalid")
+        if x_lifecycle.get("state") not in {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched"}:
+            raise ValueError("serial-206 X lifecycle state is invalid")
+        if not isinstance(x_lifecycle.get("receipts"), list) or len(x_lifecycle["receipts"]) > 128:
+            raise ValueError("serial-206 X receipt ledger is invalid")
+        if x_lifecycle.get("state") == "executing" and not isinstance(x_lifecycle.get("active_receipt"), Mapping):
+            raise ValueError("executing serial-206 X lifecycle lacks active receipt")
+        if x_lifecycle.get("state") != "executing" and x_lifecycle.get("active_receipt") is not None:
+            raise ValueError("inactive serial-206 X lifecycle carries active receipt")
         motion = state.get("initialize_motion_ledger")
         if not isinstance(motion, dict) or motion.get("schema_version") != _MOTION_LEDGER_SCHEMA:
             raise ValueError("initializeMotion ledger is invalid")
@@ -1655,6 +1911,124 @@ class Serial206OemInitializationProvider:
             except Exception:
                 return self._corrupt_projection()
 
+    def x_projection(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                state = self._load_state()
+                lifecycle = copy.deepcopy(state["x_lifecycle"])
+                reference = self.reference_store.snapshot(("x",)) if self.reference_store is not None else {"ok": False, "authority_untrusted": True}
+                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "lifecycle": lifecycle, "reference": _json_safe(reference)}
+            except Exception as exc:
+                return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
+
+    def execute_x_intent(self, intent: str, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = dict(values or {})
+        selected = str(intent).strip().lower()
+        with self._lock:
+            try:
+                state = self._load_state()
+            except Exception as exc:
+                return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"durable_state_unavailable:{exc}"}
+            lifecycle = state["x_lifecycle"]
+            generation = int(self.generation_provider())
+            command_id = str(values.get("command_id") or values.get("idempotency_key") or f"x-{selected}-{generation}")
+            if lifecycle.get("state") == "executing" and selected != "wait_for_motor":
+                lifecycle.update({"state": "failed_latched", "reference_state": "desynced", "last_failure": "restart_or_reentry_during_executing", "active_receipt": None, "pending_ticket": None})
+                try: self._save_state(state)
+                except Exception: pass
+                return {"ok": False, "axis": "x", "state": "failed_latched", "failure": "x_executing_outcome_ambiguous"}
+            active = lifecycle.get("active_receipt")
+            if isinstance(active, Mapping) and active.get("command_id") == command_id and selected != "wait_for_motor":
+                return copy.deepcopy(dict(active.get("result") or active))
+            if selected == "prepare":
+                prepare_fn = getattr(self.primitives, "prepare_x", None) or getattr(self.primitives, "prepare_for_initialize_motors")
+                result = prepare_fn(expected_generation=generation)
+                ok = isinstance(result, Mapping) and result.get("ok") is True and result.get("physical_motion") is False
+                lifecycle.update({"state": "prepared_unreferenced" if ok else "failed_latched", "generation": generation, "prepared_receipt": _json_safe(result), "reference_state": "desynced" if ok else "unknown", "last_failure": None if ok else _json_safe(result)})
+                self._save_state(state)
+                return {"ok": ok, "axis": "x", "intent": selected, "state": lifecycle["state"], "result": _json_safe(result)}
+            if selected == "wait_for_motor":
+                pending = lifecycle.get("pending_ticket")
+                if not isinstance(pending, Mapping):
+                    return {"ok": False, "axis": "x", "failure": "x_pending_ticket_missing", "state": lifecycle.get("state")}
+                result = self.primitives.x_wait_for_motor(pending_ticket=pending, wait_timeout_s=float(values.get("wait_timeout_s", 20.0)))
+            else:
+                active_receipt = {"command_id": command_id, "intent": selected, "generation": generation, "status": "executing", "result": None}
+                lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active_receipt, "pending_ticket": None})
+                self._save_state(state)
+                try:
+                    if selected == "move_absolute":
+                        result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "provider.x.move_absolute"))
+                    elif selected == "stop":
+                        result = self.primitives.x_stop(timeout_s=float(values.get("timeout_s", 3.0)))
+                    elif selected == "abort":
+                        result = self.primitives.x_abort(reason=str(values.get("reason") or "forceAbortMotion"))
+                    elif selected in {"startup_home", "home_axis", "manual_panel_home", "move_to_origin_home", "compatibility_home"}:
+                        home_fn = getattr(self.primitives, "x_" + selected)
+                        result = home_fn(timeout_s=float(values.get("timeout_s", 30.0)))
+                    else:
+                        raise ValueError(f"unsupported_x_intent:{selected}")
+                except Exception as exc:
+                    result = {"ok": False, "failure": f"x_intent_exception:{type(exc).__name__}:{exc}", "command_issued": False}
+            result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_result_not_mapping"}
+            if selected != "wait_for_motor" and result.get("pending_motion") is True:
+                lifecycle.update({"state": "executing", "active_receipt": {"command_id": command_id, "intent": selected, "status": "executing", "result": _json_safe(result)}, "pending_ticket": _json_safe(result)})
+            elif result.get("ok") is True:
+                lifecycle.update({"state": "referenced_ready", "active_receipt": None, "pending_ticket": None, "reference_state": "referenced", "last_failure": None})
+                lifecycle["receipts"].append({"command_id": command_id, "intent": selected, "result": _json_safe(result)})
+                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+            else:
+                lifecycle.update({"state": "failed_latched", "active_receipt": None, "pending_ticket": None, "reference_state": "desynced", "last_failure": _json_safe(result)})
+            self._save_state(state)
+            return {"ok": result.get("ok") is True, "axis": "x", "intent": selected, "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+
+    def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = dict(values or {})
+        with self._lock:
+            try:
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                generation = int(self.generation_provider())
+                command_id = str(values.get("command_id") or values.get("idempotency_key") or f"xy-{generation}-{int(x)}-{int(y)}")
+                for receipt in lifecycle.get("receipts", []):
+                    if isinstance(receipt, Mapping) and receipt.get("command_id") == command_id:
+                        return copy.deepcopy(dict(receipt.get("result") or receipt))
+                active = {"command_id": command_id, "intent": "move_xy", "generation": generation, "status": "executing", "result": None}
+                lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
+                self._save_state(state)
+                result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
+                result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
+                if result.get("ok") is True:
+                    lifecycle.update({"state": "referenced_ready", "active_receipt": None, "reference_state": "referenced", "last_failure": None})
+                else:
+                    lifecycle.update({"state": "failed_latched", "active_receipt": None, "reference_state": "desynced", "last_failure": _json_safe(result)})
+                lifecycle["receipts"].append({"command_id": command_id, "intent": "move_xy", "result": _json_safe(result)})
+                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+                self._save_state(state)
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+            except Exception as exc:
+                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}"}
+
+    def execute_homexy_intent(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = dict(values or {})
+        with self._lock:
+            try:
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                generation = int(self.generation_provider())
+                command_id = str(values.get("command_id") or f"homexy-{generation}")
+                active = {"command_id": command_id, "intent": "home_xy", "generation": generation, "status": "executing", "result": None}
+                lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
+                self._save_state(state)
+                result = self.primitives.home_xy(timeout_s=float(values.get("timeout_s", 30.0)), allow_implementation_mapped_predicate=bool(values.get("allow_implementation_mapped_predicate", False)))
+                result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "homexy_result_not_mapping"}
+                lifecycle.update({"state": "referenced_ready" if result.get("ok") is True else "failed_latched", "active_receipt": None, "reference_state": "referenced" if result.get("ok") is True else "desynced", "last_failure": None if result.get("ok") is True else _json_safe(result)})
+                lifecycle["receipts"].append({"command_id": command_id, "intent": "home_xy", "result": _json_safe(result)})
+                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+                self._save_state(state)
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+            except Exception as exc:
+                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}"}
     def notify_board_activation(self, board_id: int, ack: Any) -> dict[str, Any]:
         """Invalidate Z preparation/reference on any non-provider command-64 to board 4."""
         if int(board_id) != 4:
@@ -2048,6 +2422,35 @@ class Serial206OemInitializationProvider:
             "initialize_motion_partial_primitives": list(primitive_status.get("initialize_motion_partial_primitives") or []),
             "initialize_motion_missing_primitives": list(primitive_status.get("initialize_motion_missing_primitives") or []),
         }
+
+    def gantry_load(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
+        """Persist the exact DefaultParameters.GantryLoad-derived pseudo-home state."""
+        if tip_loaded is not None and type(tip_loaded) is not bool:
+            raise ValueError("tip_loaded must be bool or None")
+        if tip_loaded is True:
+            pseudo_home = 500
+        elif plate_on_gantry is None or plate_on_gantry == "":
+            pseudo_home = 65000
+        elif str(plate_on_gantry).upper() == "BIO_SECURITY_COVER":
+            pseudo_home = 65000
+        else:
+            pseudo_home = 500
+        with self._lock:
+            state = self._load_state()
+            machine = state["machine_status"]
+            machine["tip_loaded"] = tip_loaded
+            machine["plate_on_gantry"] = plate_on_gantry
+            machine["psudo_z_home_steps"] = pseudo_home
+            self._save_state(state)
+        return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
+
+    def force_to_high_home(self) -> dict[str, Any]:
+        """Persist DefaultParameters.ForceToHighHome()."""
+        with self._lock:
+            state = self._load_state()
+            state["machine_status"]["psudo_z_home_steps"] = 500
+            self._save_state(state)
+        return {"ok": True, "psudo_z_home_steps": 500, "source_anchor": "DefaultParameters.ForceToHighHome:81-84"}
 
     @staticmethod
     def _commissioning_blockers(

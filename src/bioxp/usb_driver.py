@@ -12,6 +12,7 @@ import json
 import concurrent.futures
 import threading
 from pathlib import Path
+from typing import Mapping
 
 try:
     from .oem_config import find_oem_machine_config_bundle
@@ -391,6 +392,7 @@ class BioXpTester:
         self._led_state_path = self._default_led_state_path()
         self._led_state_cache = None
         self._bus_event_buffer = []
+        self._bus_event_sequence = 0
         self._bus_event_buffer_max = 256
         # OEM ClassBaseBoard.m_24Vdropped latch.  This is changed only by the
         # source-equivalent deck voltage query and force-abort boundary; it is
@@ -586,6 +588,7 @@ class BioXpTester:
         self._motor_last_tx_ts = {int(bid): 0.0 for bid in self.MOTOR_BOARDS}
         self._motor_noresp_streak = {int(bid): 0 for bid in self.MOTOR_BOARDS}
         self._oem_initialized_boards = set()
+        self._oem_board_initialized = {int(board): False for board in self.BOARDS}
         self._oem_24v_dropped = False
         self._oem_user_stopped = False
         self._oem_latch_status = None
@@ -781,6 +784,8 @@ class BioXpTester:
         event = self._decode_bus_event_frame(resp, source=source)
         if event is None:
             return None
+        self._bus_event_sequence = int(getattr(self, "_bus_event_sequence", 0)) + 1
+        event["event_sequence"] = self._bus_event_sequence
         self._bus_event_buffer.append(event)
         overflow = len(self._bus_event_buffer) - int(self._bus_event_buffer_max)
         if overflow > 0:
@@ -843,6 +848,14 @@ class BioXpTester:
             for name in ("valid_async", "unknown_async"):
                 router_cleared[name] = int(clear_queue(name))
         return {"cleared": cleared, "router_cleared": router_cleared}
+
+    def begin_bus_event_window(self):
+        """Clear stale asynchronous frames and return a monotonic command cursor."""
+        cleared = self.clear_bus_event_buffer()
+        return {
+            "after_sequence": int(getattr(self, "_bus_event_sequence", 0)),
+            **cleared,
+        }
 
     def pop_bus_event_buffer(self):
         events = list(self._bus_event_buffer)
@@ -1016,6 +1029,8 @@ class BioXpTester:
             provenance = frame.provenance() if hasattr(frame, "provenance") else dict(frame)
             event = self._decode_bus_event_frame(provenance.get("raw") or [], source="novo_router_async")
             if event is not None:
+                self._bus_event_sequence = int(getattr(self, "_bus_event_sequence", 0)) + 1
+                event["event_sequence"] = self._bus_event_sequence
                 event["router_provenance"] = provenance
                 decoded.append(event)
             else:
@@ -1046,16 +1061,10 @@ class BioXpTester:
         accepted = status == 100 or (int(board_id) == int(self.BOARD_CHILLER) and status == 2)
         if not accepted:
             return
-        initialized = getattr(self, "_oem_initialized_boards", None)
-        if not isinstance(initialized, set):
-            initialized = set()
-            self._oem_initialized_boards = initialized
         state = self._oem_board_state()
         if active:
-            initialized.add(int(board_id))
             state[int(board_id)] = True
         else:
-            initialized.discard(int(board_id))
             state[int(board_id)] = False
 
     def _oem_board_activation_ack_success(self, board_id, ack):
@@ -1121,10 +1130,18 @@ class BioXpTester:
         # The OEM instance constructs these four m_Boards entries for this
         # instrument.  Configuration may explicitly remove an entry for a
         # variant/test harness, matching an OEM null board reference.
-        configured = getattr(self, "_oem_board_present", None)
+        configured = getattr(self, "_oem_board_presence", None)
         if isinstance(configured, dict):
             return bool(configured.get(int(board_id), False))
         return int(board_id) in self.BOARDS
+
+    def motor_oem_axis_board_present(self, axis: str) -> bool:
+        profile = self._motion_oem_axis_profile(str(axis).strip().lower(), startup=True)
+        return bool(isinstance(profile, Mapping) and self._oem_board_present(int(profile["board"])))
+
+    def motor_oem_axis_board_initialized(self, axis: str) -> bool:
+        profile = self._motion_oem_axis_profile(str(axis).strip().lower(), startup=True)
+        return bool(isinstance(profile, Mapping) and self._oem_board_present(int(profile["board"])) and self._oem_board_state().get(int(profile["board"]), False))
 
     def _oem_start_fan_service(self, board_id):
         """Literal Class{Thermal,Chiller}Board.startFanService dispatch."""
@@ -1310,23 +1327,10 @@ class BioXpTester:
         polls = 0
         activations = []
         while True:
-            initialized = {
-                int(board) for board in getattr(self, "_oem_initialized_boards", set())
-            }
-            missing = [int(board) for board in self.BOARDS if int(board) not in initialized]
-            if not missing:
-                return {
-                    "ok": True,
-                    "polls": polls,
-                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                    "timeout_s": timeout_s,
-                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
-                    "initialized_boards": sorted(initialized),
-                    "missing_boards": [],
-                    "activations": activations,
-                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
-                    "linux_guardrail": "bounded_wait_for_board",
-                }
+            state = self._oem_board_state()
+            required = [int(board) for board in self.BOARDS if self._oem_board_present(board)]
+            initialized = {board for board in required if bool(state.get(board, False))}
+            missing = [board for board in required if board not in initialized]
             elapsed = clock() - started
             if timeout_s is not None and elapsed >= timeout_s:
                 return {
@@ -1348,6 +1352,19 @@ class BioXpTester:
             sleep(poll_interval_s if remaining is None else min(poll_interval_s, remaining))
             polls += 1
             activation_counter += 1
+            if not missing:
+                return {
+                    "ok": True,
+                    "polls": polls,
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "timeout_s": timeout_s,
+                    "sleep_ms_per_poll": int(round(poll_interval_s * 1000.0)),
+                    "initialized_boards": sorted(initialized),
+                    "missing_boards": [],
+                    "activations": activations,
+                    "source_anchor": "ClassControlInterface.waitForBoard lines 3507-3534",
+                    "linux_guardrail": None if timeout_s is None else "bounded_wait_for_board",
+                }
             if activation_counter >= activation_every_polls:
                 activation_counter = 0
                 # OEM waitForBoard calls ControlInterface.activateBoard(),
@@ -1414,6 +1431,7 @@ class BioXpTester:
             max_reads=16,
             strict_match=True,
         )
+        self._record_oem_board_activation(int(board_id), active=True, ack=ack)
         observer = getattr(self, "_board_activation_observer", None)
         observation = observer(int(board_id), ack) if callable(observer) else None
         return {"board": int(board_id), "ack": ack, "z_authority_invalidation": observation}
@@ -2839,11 +2857,11 @@ class BioXpTester:
             0,
             0,
             0,
-            attempts=2,
+            attempts=1,
             wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=70,
-            max_reads=18,
+            write_timeout_ms=80,
+            read_timeout_ms=100,
+            max_reads=10,
             strict_match=True,
         )
         status = None if ack is None else ack.get("status")
@@ -2889,15 +2907,36 @@ class BioXpTester:
         return bool(getattr(self, "_oem_24v_dropped", False))
 
     def oem_latch_24v_dropped(self, *, reason="forceAbortMotion"):
-        """Apply the OEM force-abort transition to m_24Vdropped."""
+        """Compatibility alias for the exact board-aware OEM abort transition."""
+        return self.motor_oem_force_abort_motion(reason=reason)
+
+    def motor_oem_force_abort_motion(self, *, reason="forceAbortMotion"):
+        """Apply ClassControlInterface.forceAbortMotion board-level state changes."""
         self._oem_24v_dropped = True
-        self._oem_user_stopped = True
+        self._oem_abort_generation = int(getattr(self, "_oem_abort_generation", 0)) + 1
+        time.sleep(0.001)
+        affected = []
+        if self._oem_board_present(self.BOARD_HEAD):
+            affected.extend(("y", "z", "g"))
+        if self._oem_board_present(self.BOARD_DECK):
+            affected.append("x")
+        if self._oem_board_present(self.BOARD_THERMAL):
+            self._oem_user_stopped = True
+            affected.append("door")
+            for key, service in self._oem_fan_services().items():
+                if int(key[0]) == self.BOARD_THERMAL and isinstance(service, dict):
+                    timer = service.get("timer")
+                    if timer is not None:
+                        timer.cancel()
+                    service["running"] = False
         return {
             "ok": True,
             "no24v": True,
             "latched": True,
             "reason": str(reason),
-            "source_anchor": "ClassBaseBoard.m_24Vdropped; forceAbortMotion",
+            "abort_generation": self._oem_abort_generation,
+            "affected_waiters": affected,
+            "source_anchor": "ClassControlInterface.forceAbortMotion; board forceAbort overrides",
         }
 
     @staticmethod
@@ -3353,12 +3392,34 @@ class BioXpTester:
         )
         return {"board": int(board_id), "motor": int(motor), "ack": ack, "ok": self._tmcl_success(ack)}
 
-    def motor_oem_wait_target_reached(self, board_id, motor=0, timeout_s=20.0):
-        """Wait for the OEM TARGET_POSITION_REACHED(128) async event."""
+    def motor_oem_wait_target_reached(
+        self,
+        board_id,
+        motor=0,
+        timeout_s=20.0,
+        *,
+        event_window=None,
+    ):
+        """Wait for a fresh, axis-qualified OEM target/stall event."""
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_s))
+        abort_generation = int(getattr(self, "_oem_abort_generation", 0))
+        after_sequence = None
+        if isinstance(event_window, dict) and event_window.get("after_sequence") is not None:
+            after_sequence = int(event_window["after_sequence"])
         events = []
         while time.monotonic() <= deadline:
+            if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
+                return {
+                    "ok": False,
+                    "target_reached": False,
+                    "board": int(board_id),
+                    "motor": int(motor),
+                    "events": events,
+                    "failure": "No24V",
+                    "no24v": True,
+                    "event_window": event_window,
+                }
             window = self.collect_bus_events(
                 duration_s=min(0.020, max(0.0, deadline - time.monotonic())),
                 timeout_ms=8,
@@ -3368,12 +3429,27 @@ class BioXpTester:
             for event in window:
                 if not isinstance(event, dict):
                     continue
+                sequence = event.get("event_sequence")
+                if after_sequence is not None and (sequence is None or int(sequence) <= after_sequence):
+                    continue
                 if int(event.get("board", -1)) != int(board_id):
                     continue
-                if int(event.get("status", -1)) != 128:
-                    continue
                 event_motor = event.get("motor")
-                if event_motor is not None and int(event_motor) != int(motor):
+                if event_motor is None or int(event_motor) != int(motor):
+                    continue
+                status = int(event.get("status", -1))
+                if status == 130:
+                    return {
+                        "ok": False,
+                        "target_reached": False,
+                        "board": int(board_id),
+                        "motor": int(motor),
+                        "event": event,
+                        "events": events,
+                        "failure": "oem_moveToAbs_stall_event",
+                        "event_window": event_window,
+                    }
+                if status != 128:
                     continue
                 return {
                     "ok": True,
@@ -3383,6 +3459,7 @@ class BioXpTester:
                     "event": event,
                     "elapsed_ms": int((time.monotonic() - started) * 1000),
                     "events": events,
+                    "event_window": event_window,
                 }
         return {
             "ok": False,
@@ -3392,6 +3469,74 @@ class BioXpTester:
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "events": events,
             "failure": "oem_moveToAbs_target_event_timeout",
+            "event_window": event_window,
+        }
+
+    def motor_wait_target_reached(self, board_id, motor=0, timeout_s=20.0, *, event_window=None):
+        return self.motor_oem_wait_target_reached(board_id, motor=motor, timeout_s=timeout_s, event_window=event_window)
+
+    def motor_wait_target_reached_many(self, targets, timeout_s=5.0, *, event_window=None, sta_sequential=False):
+        result = self.motor_oem_wait_targets_reached(targets, timeout_s=timeout_s, event_window=event_window)
+        per_axis = {}
+        reached = result.get("reached") if isinstance(result, dict) else {}
+        for board, motor in targets:
+            key = f"{int(board)}:{int(motor)}"
+            event = reached.get(key) if isinstance(reached, dict) else None
+            per_axis["x" if int(board) == 5 else "y" if int(board) == 4 else key] = {
+                "ok": bool(event), "target_reached": bool(event), "event": event,
+                "failure": None if event else result.get("failure"),
+            }
+        result["per_axis"] = per_axis
+        result["sta_sequential"] = bool(sta_sequential)
+        return result
+
+    def motor_oem_wait_targets_reached(self, targets, timeout_s=5.0, *, event_window=None):
+        """Collect one shared OEM WaitAll-style window for addressed motors."""
+        pending = {(int(board), int(motor)) for board, motor in targets}
+        reached = {}
+        events = []
+        started = time.monotonic()
+        deadline = started + max(0.0, float(timeout_s))
+        abort_generation = int(getattr(self, "_oem_abort_generation", 0))
+        after_sequence = None
+        if isinstance(event_window, dict) and event_window.get("after_sequence") is not None:
+            after_sequence = int(event_window["after_sequence"])
+        while pending and time.monotonic() <= deadline:
+            if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
+                return {"ok": False, "failure": "No24V", "no24v": True, "reached": reached, "events": events}
+            window = self.collect_bus_events(
+                duration_s=min(0.020, max(0.0, deadline - time.monotonic())),
+                timeout_ms=8,
+                max_events=32,
+            )
+            events.extend(window)
+            for event in window:
+                if not isinstance(event, dict):
+                    continue
+                sequence = event.get("event_sequence")
+                if after_sequence is not None and (sequence is None or int(sequence) <= after_sequence):
+                    continue
+                status = int(event.get("status", -1))
+                event_motor = event.get("motor")
+                if event_motor is None:
+                    continue
+                key = (int(event.get("board", -1)), int(event_motor))
+                if key not in pending:
+                    continue
+                if status == 130:
+                    return {"ok": False, "failure": "oem_moveXY_stall_event", "stalled": [list(key)], "pending": [list(row) for row in sorted(pending)], "reached": reached, "events": events, "event_window": event_window}
+                if status != 128:
+                    continue
+                reached[f"{key[0]}:{key[1]}"] = event
+                pending.remove(key)
+        return {
+            "ok": not pending,
+            "failure": None if not pending else "oem_moveXY_target_event_timeout",
+            "pending": [list(key) for key in sorted(pending)],
+            "reached": reached,
+            "events": events,
+            "event_window": event_window,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
 
     def motor_oem_move_absolute(
@@ -3428,7 +3573,14 @@ class BioXpTester:
         before = self.motor_get_position(board_id, motor=motor)
         current = before.get("position") if isinstance(before, dict) else None
         if not isinstance(current, int):
-            current = 0
+            return {
+                "ok": False,
+                "failure": "current_position_unavailable",
+                "board": board_id,
+                "motor": motor,
+                "requested_position": requested,
+                "before": before,
+            }
         if int(current) == requested:
             return {
                 "ok": True,
@@ -3440,14 +3592,19 @@ class BioXpTester:
                 "before": before,
             }
 
+        axis_key = self.motor_axis_key_for_channel(board_id, motor=motor)
+        try:
+            profile = self._motion_oem_axis_profile(axis_key, startup=False)
+        except Exception:
+            profile = {}
+        if not isinstance(profile, dict):
+            profile = {}
+        min_position = profile.get("axis_min_steps")
         if max_position is None:
-            axis_key = self.motor_axis_key_for_channel(board_id, motor=motor)
-            try:
-                profile = self._motion_oem_axis_profile(axis_key, startup=False)
-                max_position = int(profile.get("axis_max_steps"))
-            except Exception:
-                max_position = None
-        if isinstance(max_position, int) and current > max_position - 10 and requested > current:
+            max_position = profile.get("axis_max_steps")
+        min_position = int(min_position) if isinstance(min_position, int) else 0
+        max_position = int(max_position) if isinstance(max_position, int) else None
+        if max_position is not None and abs(max_position - current) < 10 and requested > current:
             return {
                 "ok": True,
                 "source_return_code": current,
@@ -3460,15 +3617,17 @@ class BioXpTester:
             }
 
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
-        # queryMotorStop resets the OEM wait event before the new command.
-        self.clear_bus_event_buffer()
+        event_window = self.begin_bus_event_window()
+        wire_position = max(min_position, requested)
+        if max_position is not None:
+            wire_position = min(wire_position, max_position)
         time.sleep(0.001)
         ack = self._send_motor(
             board_id,
             4,
             0,
             motor,
-            requested,
+            wire_position,
             attempts=1,
             wait_reply=True,
             write_timeout_ms=55,
@@ -3485,7 +3644,7 @@ class BioXpTester:
                 4,
                 0,
                 motor,
-                requested,
+                wire_position,
                 attempts=1,
                 wait_reply=True,
                 write_timeout_ms=55,
@@ -3500,22 +3659,39 @@ class BioXpTester:
         result = {
             "ok": source_return_code == 0,
             "source_return_code": source_return_code,
+            "low_level_source_return_code": source_return_code,
             "board": board_id,
             "motor": motor,
             "requested_position": requested,
+            "wire_position": wire_position,
             "before": before,
             "pre_stop": pre_stop,
+            "event_window": event_window,
             "ack": ack,
             "retry_ack": retry_ack,
             "command_sent": True,
             "oem_wait_for_stop": bool(wait_for_stop),
         }
-        if result["ok"] is not True:
-            return result
         if wait_for_stop:
-            result["wait"] = self.motor_oem_wait_target_reached(board_id, motor=motor, timeout_s=20.0)
+            timeout_s = 30.0 if board_id == self.BOARD_THERMAL else 20.0
+            result["wait"] = self.motor_oem_wait_target_reached(
+                board_id,
+                motor=motor,
+                timeout_s=timeout_s,
+                event_window=event_window,
+            )
             if result["wait"].get("ok") is not True:
-                return {**result, "ok": False, "failure": "oem_moveToAbs_timeout"}
+                if self.oem_no24v_state() or result["wait"].get("failure") == "No24V":
+                    return {**result, "ok": False, "failure": "No24V", "no24v": True}
+                timeout_position = self.motor_get_position(board_id, motor=motor)
+                result["timeout_position"] = timeout_position
+                reached_requested = bool(
+                    board_id == self.BOARD_HEAD
+                    and isinstance(timeout_position, dict)
+                    and timeout_position.get("position") == requested
+                )
+                if not reached_requested:
+                    return {**result, "ok": False, "failure": "oem_moveToAbs_timeout"}
         if self.oem_no24v_state():
             return {**result, "ok": False, "failure": "No24V", "no24v": True}
         return result
@@ -5049,6 +5225,23 @@ class BioXpTester:
         position_before = self.motor_get_position(board, motor=motor)
         home_before = self.motor_query_home_switch(board, motor=motor)
         switches_before = self.motor_get_switch_activity(board, motor=motor)
+        if (
+            isinstance(position_before, dict)
+            and position_before.get("position") == 0
+            and isinstance(home_before, dict)
+            and home_before.get("value") == active_value
+        ):
+            return {
+                "ok": True,
+                "axis": key,
+                "board": board,
+                "motor": motor,
+                "source_return_code": 0,
+                "short_circuit": "MotorHome_and_CurrentPosition_zero",
+                "position_before": position_before,
+                "home_before": home_before,
+                "switches_before": switches_before,
+            }
         if key == "door":
             status_before = self.motor_thermal_door_status()
         else:
@@ -5231,6 +5424,8 @@ class BioXpTester:
                     failure = "home_switch_not_active_after_sethome"
 
         ok = failure is None
+        source_position = position_after.get("position") if isinstance(position_after, dict) else None
+        source_return_code = -int(source_position) if ok and isinstance(source_position, int) else 1
         return {
             "axis": key,
             "board": board,
@@ -5275,6 +5470,7 @@ class BioXpTester:
             "switch_transition": switch_transition,
             "home_predicate_confirmed": bool(ok),
             "false_home_guard": failure,
+            "source_return_code": source_return_code,
             "trace_tail": trace[-40:],
             "ok": ok,
         }
@@ -6802,7 +6998,7 @@ class BioXpTester:
             "ok": self._tmcl_success(ack),
         }
 
-    def motor_stop(self, board_id, motor=0):
+    def motor_oem_stop_exact(self, board_id, motor=0):
         first = self._send_motor(
             int(board_id),
             3,  # MST / ClassMotor.StopMotor
@@ -6817,8 +7013,7 @@ class BioXpTester:
             strict_match=True,
         )
         # OEM ClassMotor.StopMotor unconditionally transmits the frame twice.
-        # These are two explicit deliveries, not a retry of one ambiguous call.
-        time.sleep(0.05)
+        # These are two explicit back-to-back deliveries, not a retry of one ambiguous call.
         second = self._send_motor(
             int(board_id),
             3,
@@ -6841,6 +7036,9 @@ class BioXpTester:
             "oem_double_stop": True,
             "ok": self._tmcl_success(second),
         }
+
+    def motor_stop(self, board_id, motor=0):
+        return self.motor_oem_stop_exact(board_id, motor=motor)
 
     def motor_spin_test(self, board_id, velocity, seconds=2.0, motor=0):
         dur = max(0.2, min(8.0, float(seconds)))

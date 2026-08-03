@@ -80,6 +80,7 @@ from starlette.responses import Response, StreamingResponse
 
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
+from .pipette.receipts import PipetteReceiptStore
 from .pipette import (
     PipetteAspirateCommand,
     PipetteDispenseCommand,
@@ -191,6 +192,7 @@ _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
 _pipette_transport = None
+_pipette_receipts = PipetteReceiptStore()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 
@@ -219,6 +221,8 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     admission_raw = admission_fn() if callable(admission_fn) else None
     z_projection_fn = getattr(provider, "z_projection", None) if provider is not None else None
     z_projection_raw = z_projection_fn() if callable(z_projection_fn) else None
+    x_projection_fn = getattr(provider, "x_projection", None) if provider is not None else None
+    x_projection_raw = x_projection_fn() if callable(x_projection_fn) else None
     projection = dict(projection_raw) if isinstance(projection_raw, Mapping) else {
         "initialize_motion_ledger": None,
         "machine_status": None,
@@ -235,6 +239,11 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
             "expected_stage": None,
         },
         "z_authority": dict(z_projection_raw) if isinstance(z_projection_raw, Mapping) else {
+            "available": False,
+            "state": "unbound",
+            "blockers": ["serial206_provider_not_bound"],
+        },
+        "x_authority": dict(x_projection_raw) if isinstance(x_projection_raw, Mapping) else {
             "available": False,
             "state": "unbound",
             "blockers": ["serial206_provider_not_bound"],
@@ -264,6 +273,22 @@ def _require_serial206_oem_initialization_provider(
     return provider
 
 
+def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
+    context = current_operator_dispatch_context() or {}
+    payload = dict(inputs or {})
+    payload.setdefault("command_id", context.get("idempotency_key") or f"api-{intent}-{time.time_ns()}")
+    if intent == "home_xy":
+        result = provider.execute_homexy_intent(payload)
+    elif intent == "move_xy":
+        result = provider.execute_xy_intent(int(payload.pop("x")), int(payload.pop("y")), payload)
+    else:
+        result = provider.execute_x_intent(intent, payload)
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=dict(result) if isinstance(result, Mapping) else {"error": "serial206_motion_intent_failed"})
+    return dict(result)
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
     if _tester is None or _pipette_transport is None:
         raise RuntimeError("owned BioXpTester and FourPipetteTransport are required")
@@ -272,6 +297,7 @@ def _build_serial206_oem_initialization_provider() -> Serial206OemInitialization
         _pipette_transport,
         authority_provider=Serial206MotionAuthority.from_active_snapshot,
         generation_provider=lambda: hardware_state.ownership_epoch,
+        reference_store=_reference_state_store,
     )
     store_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
     provider = Serial206OemInitializationProvider(
@@ -6521,6 +6547,12 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
     if req.operator_ack != "HOMEXY":
         raise HTTPException(status_code=409, detail="operator_ack HOMEXY required for direct OEM HomeXY mode")
     _require_motion_route_ready()
+    if _serial206_oem_initialization_provider is not None:
+        return await _run_blocking(
+            "serial-206 provider HomeXY",
+            lambda: _execute_serial206_motion_intent("home_xy", {"timeout_s": float(req.timeout_s), "allow_implementation_mapped_predicate": bool(req.allow_implementation_mapped_predicate)}),
+            timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 180.0),
+        )
     tester = _get_tester()
     return await _run_blocking(
         "OEM HomeXY direct mode",
@@ -6656,6 +6688,12 @@ async def move_axis_absolute(req: MoveAbsoluteRequest):
             "physical_motion_commanded": False,
         })
     _require_motion_route_ready(req)
+    if req.axis is AxisName.X and not _motion_request_is_validation_only(req):
+        return await _run_blocking(
+            "serial-206 provider X absolute",
+            lambda: _execute_serial206_motion_intent("move_absolute", {"position_steps": int(req.position_steps), "wait_timeout_s": float(req.wait_timeout_s), "source_mode": "api.motion.axis.absolute"}),
+            timeout_s=min(max(float(req.wait_timeout_s) + 10.0, 20.0), 150.0),
+        )
     response = await run_absolute_motion_command(
         AbsoluteMoveCommand.from_request(req),
         get_tester=_get_tester,
@@ -7203,7 +7241,14 @@ async def camera_mjpeg(
 async def liquid_status():
     projection = hardware_state.project("pipette")
     observed = _domain_observation(projection, "pipette")
-    return {**projection, "pipette": observed, "channels": None if not isinstance(observed, dict) else observed.get("channels")}
+    return {
+        **projection,
+        "pipette": observed,
+        "channels": None if not isinstance(observed, dict) else observed.get("channels"),
+        "live_query_performed": False,
+        "truth_source": "hardware_state_projection_only",
+        "latest_receipt": _pipette_receipts.latest(),
+    }
 
 
 @app.post("/liquid/init")
@@ -7216,7 +7261,14 @@ async def liquid_init(req: PipetteInitRequest):
 
     def action() -> dict[str, Any]:
         result = _get_pipette_transport().initialize(command)
-        return {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
+        result = {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
+        receipt = _pipette_receipts.record(
+            operation="init",
+            requested_inputs=command.to_payload(),
+            result=result,
+            runtime_binding={"owner": "shared_bioxp_tester_pipette", "transport_owner_bound": True},
+        )
+        return {**result, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
 
     try:
         projection = await _run_blocking(
@@ -7237,6 +7289,7 @@ async def liquid_tip(req: PipetteTipRequest):
         PipetteTipCommand.from_request(req),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7247,6 +7300,7 @@ async def liquid_aspirate(req: PipetteAspirateRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7257,6 +7311,7 @@ async def liquid_dispense(req: PipetteDispenseRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7267,6 +7322,7 @@ async def liquid_mix(req: PipetteMixRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 

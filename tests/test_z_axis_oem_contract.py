@@ -161,6 +161,63 @@ def test_clear_event_window_clears_router_async_queues(monkeypatch):
     assert calls == ["valid_async", "unknown_async"]
 
 
+def test_begin_event_window_returns_monotonic_cursor(monkeypatch):
+    driver = _driver()
+    driver._bus_event_sequence = 7
+    driver._bus_event_buffer = [{"status": 128}]
+    monkeypatch.setattr(driver, "clear_bus_event_buffer", lambda: {"cleared": 1, "router_cleared": {}})
+
+    window = driver.begin_bus_event_window()
+
+    assert window["after_sequence"] == 7
+    assert window["cleared"] == 1
+
+
+def test_wait_target_reached_ignores_stale_event_and_accepts_fresh_event(monkeypatch):
+    driver = _driver()
+    driver._oem_abort_generation = 0
+    monkeypatch.setattr(driver, "oem_no24v_state", lambda: False)
+    monkeypatch.setattr(
+        driver,
+        "collect_bus_events",
+        lambda **kwargs: [
+            {"board": 5, "motor": 0, "status": 128, "event_sequence": 7},
+            {"board": 5, "motor": 0, "status": 128, "event_sequence": 8},
+        ],
+    )
+
+    result = driver.motor_oem_wait_target_reached(
+        5,
+        motor=0,
+        timeout_s=0.1,
+        event_window={"after_sequence": 7},
+    )
+
+    assert result["ok"] is True
+    assert result["event"]["event_sequence"] == 8
+
+
+def test_wait_target_reached_rejects_fresh_stall_event(monkeypatch):
+    driver = _driver()
+    driver._oem_abort_generation = 0
+    monkeypatch.setattr(driver, "oem_no24v_state", lambda: False)
+    monkeypatch.setattr(
+        driver,
+        "collect_bus_events",
+        lambda **kwargs: [{"board": 5, "motor": 0, "status": 130, "event_sequence": 8}],
+    )
+
+    result = driver.motor_oem_wait_target_reached(
+        5,
+        motor=0,
+        timeout_s=0.1,
+        event_window={"after_sequence": 7},
+    )
+
+    assert result["ok"] is False
+    assert result["failure"] == "oem_moveToAbs_stall_event"
+
+
 def test_move_z_home_is_distinct_source_method_at_1791_without_standby_write(monkeypatch):
     driver = _driver()
     calls = []
