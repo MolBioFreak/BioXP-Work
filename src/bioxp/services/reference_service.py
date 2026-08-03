@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 logger = logging.getLogger(__name__)
@@ -60,68 +60,147 @@ class MarkAxisDesyncedCommand:
     motion_kind: str | None = None
 
 
+class ReferenceStateAuthorityError(RuntimeError):
+    """Reference-state storage is unavailable or cannot be verified."""
+
+
 class ReferenceStateStore:
     def __init__(self, state_path: str | Path | None = None) -> None:
         self._state_path = None if state_path is None else Path(state_path)
         self._state_lock_path = None if self._state_path is None else self._state_path.with_suffix(self._state_path.suffix + ".lock")
         self._rows: dict[str, AxisReferenceRecord] = {}
         self._disk_state_dirty = False
+        self._authority_untrusted = self._state_path is None
         self._lock = Lock()
         self._load_from_disk()
 
-    def reset(self) -> bool:
+    @staticmethod
+    def _unknown_row(axis: str) -> dict[str, Any]:
+        return AxisReferenceRecord(axis=axis, state=ReferenceState.UNKNOWN).to_payload()
+
+    def _failure(self, axes: Iterable[Any], error: str, *, proposed: Iterable[AxisReferenceRecord] | None = None) -> dict[str, Any]:
+        axis_keys = [_axis_value(axis) for axis in axes]
+        proposed_rows = [record.to_payload() for record in (proposed or [])]
+        if not proposed_rows:
+            proposed_rows = [self._unknown_row(axis) for axis in axis_keys]
+        return {
+            "ok": False,
+            "persisted": False,
+            "verified": False,
+            "durable_clean": False,
+            "error": str(error),
+            "axes": axis_keys,
+            "rows": proposed_rows,
+        }
+
+    def _clean_commit_result(self) -> dict[str, Any]:
+        return {"ok": True, "persisted": True, "verified": True, "durable_clean": True}
+
+    def reset(self) -> dict[str, Any]:
         with self._lock:
-            with self._state_file_lock(fcntl.LOCK_EX):
-                self._rows = {}
-                return self._persist_locked()
+            if self._state_path is None:
+                return self._failure([], "durable_reference_path_required")
+            if self._disk_state_dirty or self._authority_untrusted:
+                return self._failure([], "reference_state_authority_untrusted")
+            try:
+                with self._state_file_lock(fcntl.LOCK_EX):
+                    loaded = self._read_rows_from_disk_locked()
+                    if loaded is None:
+                        self._authority_untrusted = True
+                        return self._failure([], "reference_state_disk_unreadable")
+                    previous = dict(self._rows)
+                    self._rows = dict(loaded)
+                    return self._commit_candidate_locked({}, previous)
+            except ReferenceStateAuthorityError as exc:
+                self._authority_untrusted = True
+                return self._failure([], str(exc))
 
     def snapshot(self, axes: Iterable[Any]) -> dict[str, Any]:
         axis_keys = [_axis_value(axis) for axis in axes]
         with self._lock:
-            with self._state_file_lock(fcntl.LOCK_SH):
-                if not self._disk_state_dirty:
-                    self._load_from_disk_locked()
-                rows = {
-                    axis: self._rows.get(axis, AxisReferenceRecord(axis=axis, state=ReferenceState.UNKNOWN)).to_payload()
-                    for axis in axis_keys
+            if self._state_path is None:
+                return {
+                    **self._failure(axis_keys, "durable_reference_path_required"),
+                    "axes": axis_keys,
+                    "rows": {axis: self._unknown_row(axis) for axis in axis_keys},
+                }
+            if self._disk_state_dirty or self._authority_untrusted:
+                return {
+                    **self._failure(axis_keys, "reference_state_authority_untrusted"),
+                    "axes": axis_keys,
+                    "rows": {axis: self._unknown_row(axis) for axis in axis_keys},
+                }
+            try:
+                with self._state_file_lock(fcntl.LOCK_SH):
+                    loaded = self._read_rows_from_disk_locked()
+                    if loaded is None:
+                        self._authority_untrusted = True
+                        return {
+                            **self._failure(axis_keys, "reference_state_disk_unreadable"),
+                            "axes": axis_keys,
+                            "rows": {axis: self._unknown_row(axis) for axis in axis_keys},
+                        }
+                    self._rows = loaded
+                    self._disk_state_dirty = False
+                    self._authority_untrusted = False
+                    rows = {
+                        axis: self._rows.get(axis, AxisReferenceRecord(axis=axis, state=ReferenceState.UNKNOWN)).to_payload()
+                        for axis in axis_keys
+                    }
+            except ReferenceStateAuthorityError as exc:
+                self._authority_untrusted = True
+                return {
+                    **self._failure(axis_keys, str(exc)),
+                    "axes": axis_keys,
+                    "rows": {axis: self._unknown_row(axis) for axis in axis_keys},
                 }
         return {
+            "ok": True,
+            "persisted": True,
+            "verified": True,
+            "durable_clean": True,
             "axes": axis_keys,
             "rows": rows,
         }
 
     def mark_referenced(self, command: MarkAxisReferencedCommand) -> dict[str, Any]:
-        axis = _axis_value(command.axis)
-        record = AxisReferenceRecord(
-            axis=axis,
-            state=ReferenceState.REFERENCED,
-            origin_position_steps=int(command.position_steps),
-            source=_normalize_text(command.source, fallback="manual"),
-            note=_normalize_optional_text(command.note),
-            updated_at=_utc_now(),
-            last_motion_kind=_normalize_optional_text(command.motion_kind),
-        )
-        with self._lock:
-            with self._state_file_lock(fcntl.LOCK_EX):
-                if self._disk_state_dirty:
-                    self._reconcile_dirty_rows_locked()
-                else:
-                    self._load_from_disk_locked()
-                self._rows[axis] = record
-                persisted = self._persist_locked()
-        payload = record.to_payload()
-        payload["persisted"] = persisted
-        return payload
+        result = self.mark_referenced_many([command])
+        return self._single_row_result(result, command.axis)
+
+    def mark_referenced_many(self, commands: Iterable[MarkAxisReferencedCommand]) -> dict[str, Any]:
+        commands = list(commands)
+
+        def apply(candidate: dict[str, AxisReferenceRecord]) -> list[AxisReferenceRecord]:
+            proposed: list[AxisReferenceRecord] = []
+            for command in commands:
+                axis = _axis_value(command.axis)
+                record = AxisReferenceRecord(
+                    axis=axis,
+                    state=ReferenceState.REFERENCED,
+                    origin_position_steps=int(command.position_steps),
+                    source=_normalize_text(command.source, fallback="manual"),
+                    note=_normalize_optional_text(command.note),
+                    updated_at=_utc_now(),
+                    last_motion_kind=_normalize_optional_text(command.motion_kind),
+                )
+                candidate[axis] = record
+                proposed.append(record)
+            return proposed
+
+        return self._run_mutation([command.axis for command in commands], apply)
 
     def mark_desynced(self, command: MarkAxisDesyncedCommand) -> dict[str, Any]:
-        axis = _axis_value(command.axis)
-        with self._lock:
-            with self._state_file_lock(fcntl.LOCK_EX):
-                if self._disk_state_dirty:
-                    self._reconcile_dirty_rows_locked()
-                else:
-                    self._load_from_disk_locked()
-                previous = self._rows.get(axis)
+        result = self.mark_desynced_many([command])
+        return self._single_row_result(result, command.axis)
+
+    def mark_desynced_many(self, commands: Iterable[MarkAxisDesyncedCommand]) -> dict[str, Any]:
+        commands = list(commands)
+
+        def apply(candidate: dict[str, AxisReferenceRecord]) -> list[AxisReferenceRecord]:
+            proposed: list[AxisReferenceRecord] = []
+            for command in commands:
+                axis = _axis_value(command.axis)
+                previous = candidate.get(axis)
                 record = AxisReferenceRecord(
                     axis=axis,
                     state=ReferenceState.DESYNCED,
@@ -132,22 +211,25 @@ class ReferenceStateStore:
                     last_motion_kind=_normalize_optional_text(command.motion_kind)
                     or (None if previous is None else previous.last_motion_kind),
                 )
-                self._rows[axis] = record
-                persisted = self._persist_locked()
-        payload = record.to_payload()
-        payload["persisted"] = persisted
-        return payload
+                candidate[axis] = record
+                proposed.append(record)
+            return proposed
+
+        return self._run_mutation([command.axis for command in commands], apply)
 
     def record_motion(self, axis: Any, motion_kind: str) -> dict[str, Any]:
-        axis_key = _axis_value(axis)
-        normalized_kind = _normalize_text(motion_kind, fallback="motion")
-        with self._lock:
-            with self._state_file_lock(fcntl.LOCK_EX):
-                if self._disk_state_dirty:
-                    self._reconcile_dirty_rows_locked()
-                else:
-                    self._load_from_disk_locked()
-                previous = self._rows.get(axis_key)
+        result = self.record_motion_many([(axis, motion_kind)])
+        return self._single_row_result(result, axis)
+
+    def record_motion_many(self, motions: Iterable[tuple[Any, str]]) -> dict[str, Any]:
+        motions = list(motions)
+
+        def apply(candidate: dict[str, AxisReferenceRecord]) -> list[AxisReferenceRecord]:
+            proposed: list[AxisReferenceRecord] = []
+            for axis, motion_kind in motions:
+                axis_key = _axis_value(axis)
+                normalized_kind = _normalize_text(motion_kind, fallback="motion")
+                previous = candidate.get(axis_key)
                 if previous is None:
                     record = AxisReferenceRecord(
                         axis=axis_key,
@@ -165,26 +247,149 @@ class ReferenceStateStore:
                         updated_at=_utc_now(),
                         last_motion_kind=normalized_kind,
                     )
-                self._rows[axis_key] = record
-                persisted = self._persist_locked()
-        payload = record.to_payload()
-        payload["persisted"] = persisted
-        return payload
+                candidate[axis_key] = record
+                proposed.append(record)
+            return proposed
+
+        return self._run_mutation([axis for axis, _ in motions], apply)
+
+    def recover_untrusted_authority(self, reason: str) -> dict[str, Any]:
+        """Convert all persisted references to desynced before restoring trust."""
+        with self._lock:
+            if self._state_path is None:
+                return self._failure([], "durable_reference_path_required")
+            try:
+                with self._state_file_lock(fcntl.LOCK_EX):
+                    loaded = self._read_rows_from_disk_locked()
+                    if loaded is None:
+                        self._authority_untrusted = True
+                        return self._failure([], "reference_state_disk_unreadable")
+                    previous = dict(self._rows)
+                    self._rows = dict(loaded)
+                    candidate = dict(loaded)
+                    proposed: list[AxisReferenceRecord] = []
+                    for axis, record in loaded.items():
+                        if record.state is not ReferenceState.REFERENCED:
+                            continue
+                        replacement = AxisReferenceRecord(
+                            axis=record.axis,
+                            state=ReferenceState.DESYNCED,
+                            origin_position_steps=record.origin_position_steps,
+                            source="reference_recovery",
+                            note=_normalize_text(reason, fallback="reference authority recovery"),
+                            updated_at=_utc_now(),
+                            last_motion_kind=record.last_motion_kind,
+                        )
+                        candidate[axis] = replacement
+                        proposed.append(replacement)
+                    result = self._commit_candidate_locked(candidate, previous)
+                    result.update({"axes": list(loaded), "rows": [row.to_payload() for row in proposed]})
+                    return result
+            except ReferenceStateAuthorityError as exc:
+                self._authority_untrusted = True
+                return self._failure([], str(exc))
+
+    @staticmethod
+    def _single_row_result(result: dict[str, Any], axis: Any) -> dict[str, Any]:
+        axis_key = _axis_value(axis)
+        rows = result.get("rows") if isinstance(result, dict) else None
+        row = next((dict(item) for item in rows or [] if item.get("axis") == axis_key), None)
+        if row is None:
+            row = ReferenceStateStore._unknown_row(axis_key)
+        for key in ("ok", "persisted", "verified", "durable_clean", "error"):
+            if key in result:
+                row[key] = result[key]
+        return row
+
+    def _run_mutation(
+        self,
+        axes: Iterable[Any],
+        mutator: Callable[[dict[str, AxisReferenceRecord]], list[AxisReferenceRecord]],
+    ) -> dict[str, Any]:
+        axis_keys = [_axis_value(axis) for axis in axes]
+        with self._lock:
+            if self._state_path is None:
+                return self._failure(axis_keys, "durable_reference_path_required")
+            if self._disk_state_dirty or self._authority_untrusted:
+                return self._failure(axis_keys, "reference_state_authority_untrusted")
+            try:
+                with self._state_file_lock(fcntl.LOCK_EX):
+                    loaded = self._read_rows_from_disk_locked()
+                    if loaded is None:
+                        self._authority_untrusted = True
+                        return self._failure(axis_keys, "reference_state_disk_unreadable")
+                    previous = dict(self._rows)
+                    self._rows = dict(loaded)
+                    candidate = dict(loaded)
+                    proposed = mutator(candidate)
+                    result = self._commit_candidate_locked(candidate, previous)
+                    result.update({"axes": axis_keys, "rows": [row.to_payload() for row in proposed]})
+                    return result
+            except ReferenceStateAuthorityError as exc:
+                self._authority_untrusted = True
+                return self._failure(axis_keys, str(exc))
+            except Exception as exc:
+                self._authority_untrusted = True
+                self._disk_state_dirty = True
+                return self._failure(axis_keys, f"reference_state_mutation_failed:{type(exc).__name__}:{exc}")
+
+    def _commit_candidate_locked(
+        self,
+        candidate: dict[str, AxisReferenceRecord],
+        previous: dict[str, AxisReferenceRecord],
+    ) -> dict[str, Any]:
+        self._rows = dict(candidate)
+        if not self._persist_locked():
+            self._rows = dict(previous)
+            self._disk_state_dirty = True
+            self._authority_untrusted = True
+            return self._failure([], "reference_state_persist_failed")
+        verified = self._read_rows_from_disk_locked()
+        if verified is None or not self._records_equal(candidate, verified):
+            self._rows = dict(previous)
+            self._disk_state_dirty = True
+            self._authority_untrusted = True
+            return self._failure([], "reference_state_durable_reread_mismatch")
+        self._rows = verified
+        self._disk_state_dirty = False
+        self._authority_untrusted = False
+        return self._clean_commit_result()
+
+    @staticmethod
+    def _records_equal(
+        left: dict[str, AxisReferenceRecord],
+        right: dict[str, AxisReferenceRecord],
+    ) -> bool:
+        return {
+            axis: record.to_payload() for axis, record in left.items()
+        } == {
+            axis: record.to_payload() for axis, record in right.items()
+        }
 
     def _load_from_disk(self) -> None:
-        with self._state_file_lock(fcntl.LOCK_SH):
-            self._load_from_disk_locked()
+        if self._state_path is None:
+            self._authority_untrusted = True
+            return
+        try:
+            with self._state_file_lock(fcntl.LOCK_SH):
+                self._load_from_disk_locked()
+        except ReferenceStateAuthorityError:
+            self._authority_untrusted = True
+            self._disk_state_dirty = True
 
     def _load_from_disk_locked(self) -> None:
         loaded = self._read_rows_from_disk_locked()
         if loaded is None:
+            self._authority_untrusted = True
+            self._disk_state_dirty = True
             return
         self._rows = loaded
         self._disk_state_dirty = False
+        self._authority_untrusted = False
 
     def _read_rows_from_disk_locked(self) -> dict[str, AxisReferenceRecord] | None:
         if self._state_path is None:
-            return dict(self._rows)
+            return None
         if not self._state_path.exists():
             return {}
         try:
@@ -213,20 +418,10 @@ class ReferenceStateStore:
             )
         return loaded
 
-    def _reconcile_dirty_rows_locked(self) -> None:
-        loaded = self._read_rows_from_disk_locked()
-        if loaded is None:
-            return
-        for axis, local_record in self._rows.items():
-            disk_record = loaded.get(axis)
-            if _record_is_newer_or_equal(local_record, disk_record):
-                loaded[axis] = local_record
-        self._rows = loaded
-
     def _persist_locked(self) -> bool:
         if self._state_path is None:
-            self._disk_state_dirty = False
-            return True
+            self._disk_state_dirty = True
+            return False
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -236,7 +431,6 @@ class ReferenceStateStore:
             tmp_path = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
             tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2))
             tmp_path.replace(self._state_path)
-            self._disk_state_dirty = False
             return True
         except Exception:
             self._disk_state_dirty = True
@@ -251,24 +445,23 @@ class ReferenceStateStore:
         try:
             self._state_lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock_file = self._state_lock_path.open("a+")
-        except Exception:
+        except Exception as exc:
             logger.warning("Failed to lock reference state file %s", self._state_lock_path, exc_info=True)
-            yield
-            return
+            raise ReferenceStateAuthorityError(f"reference state lock unavailable: {exc}") from exc
         try:
             try:
                 fcntl.flock(lock_file.fileno(), mode)
-            except Exception:
+            except Exception as exc:
                 logger.warning("Failed to lock reference state file %s", self._state_lock_path, exc_info=True)
-                yield
-                return
+                raise ReferenceStateAuthorityError(f"reference state lock unavailable: {exc}") from exc
             try:
                 yield
             finally:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                except Exception:
+                except Exception as exc:
                     logger.warning("Failed to unlock reference state file %s", self._state_lock_path, exc_info=True)
+                    raise ReferenceStateAuthorityError(f"reference state unlock unavailable: {exc}") from exc
         finally:
             lock_file.close()
 

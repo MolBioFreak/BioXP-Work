@@ -37,7 +37,6 @@ from .oem_gripper import (
     gripper_status,
     restore_gripper_idle_current,
 )
-from .oem_initialization import run_oem_initialization_controller
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
 from .oem_serial206_initialization import (
     Serial206CommissioningEvidence,
@@ -46,7 +45,7 @@ from .oem_serial206_initialization import (
     Serial206StageApproval,
 )
 from .oem_runtime_store import OEMRuntimeStore
-from .operator_controls import install_operator_control_plane
+from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
 # must neither activate a camera nor present an unqueried cache as observation.
@@ -57,6 +56,7 @@ from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
 from .oem_runtime_api import (
     configure_runtime as configure_oem_runtime,
+    record_physical_emergency_stop,
     router as oem_runtime_router,
     shutdown_runtime as shutdown_oem_runtime,
 )
@@ -80,6 +80,7 @@ from starlette.responses import Response, StreamingResponse
 
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
+from .pipette.receipts import PipetteReceiptStore
 from .pipette import (
     PipetteAspirateCommand,
     PipetteDispenseCommand,
@@ -191,6 +192,7 @@ _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
 _pipette_transport = None
+_pipette_receipts = PipetteReceiptStore()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 
@@ -215,6 +217,12 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     }
     projection_fn = getattr(provider, "initialize_motion_projection", None) if provider is not None else None
     projection_raw = projection_fn() if callable(projection_fn) else None
+    admission_fn = getattr(provider, "initialize_motors_admission_projection", None) if provider is not None else None
+    admission_raw = admission_fn() if callable(admission_fn) else None
+    z_projection_fn = getattr(provider, "z_projection", None) if provider is not None else None
+    z_projection_raw = z_projection_fn() if callable(z_projection_fn) else None
+    x_projection_fn = getattr(provider, "x_projection", None) if provider is not None else None
+    x_projection_raw = x_projection_fn() if callable(x_projection_fn) else None
     projection = dict(projection_raw) if isinstance(projection_raw, Mapping) else {
         "initialize_motion_ledger": None,
         "machine_status": None,
@@ -225,6 +233,21 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
         "bound": provider is not None,
         **capabilities,
         **projection,
+        "initialize_motors_admission": dict(admission_raw) if isinstance(admission_raw, Mapping) else {
+            "available": False,
+            "blockers": ["serial206_provider_not_bound"],
+            "expected_stage": None,
+        },
+        "z_authority": dict(z_projection_raw) if isinstance(z_projection_raw, Mapping) else {
+            "available": False,
+            "state": "unbound",
+            "blockers": ["serial206_provider_not_bound"],
+        },
+        "x_authority": dict(x_projection_raw) if isinstance(x_projection_raw, Mapping) else {
+            "available": False,
+            "state": "unbound",
+            "blockers": ["serial206_provider_not_bound"],
+        },
         "physical_acceptance_required": True,
         "provider": None if provider is None else type(provider).__name__,
         "binding_error": _serial206_oem_initialization_provider_binding_error,
@@ -250,13 +273,22 @@ def _require_serial206_oem_initialization_provider(
     return provider
 
 
-def _get_serial206_oem_initialization_provider_for_runtime() -> Serial206OemInitializationProvider:
-    """Return the current managed-owner provider without leaking HTTP exceptions into the worker."""
+def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
-    status = serial206_oem_initialization_provider_status()
     if provider is None:
-        raise RuntimeError(f"serial-206 OEM initialization provider is not bound: {status}")
-    return provider
+        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
+    context = current_operator_dispatch_context() or {}
+    payload = dict(inputs or {})
+    payload.setdefault("command_id", context.get("idempotency_key") or f"api-{intent}-{time.time_ns()}")
+    if intent == "home_xy":
+        result = provider.execute_homexy_intent(payload)
+    elif intent == "move_xy":
+        result = provider.execute_xy_intent(int(payload.pop("x")), int(payload.pop("y")), payload)
+    else:
+        result = provider.execute_x_intent(intent, payload)
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=dict(result) if isinstance(result, Mapping) else {"error": "serial206_motion_intent_failed"})
+    return dict(result)
 
 
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
@@ -267,15 +299,18 @@ def _build_serial206_oem_initialization_provider() -> Serial206OemInitialization
         _pipette_transport,
         authority_provider=Serial206MotionAuthority.from_active_snapshot,
         generation_provider=lambda: hardware_state.ownership_epoch,
+        reference_store=_reference_state_store,
     )
     store_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
-    return Serial206OemInitializationProvider(
+    provider = Serial206OemInitializationProvider(
         adapter,
         state_store=OEMRuntimeStore(store_root),
         reference_store=_reference_state_store,
         generation_provider=lambda: hardware_state.ownership_epoch,
         preparation_provider=adapter,
     )
+    _tester.set_board_activation_observer(provider.notify_board_activation)
+    return provider
 
 
 def _sync_serial206_oem_initialization_provider(*, transport: str, usb: str, router: str) -> None:
@@ -582,12 +617,9 @@ async def lifespan(app: FastAPI):
         usb="unbound",
         router="unbound",
     )
-    # Construct only the local OEM runtime/store/worker owners. The startup
-    # program factory remains lazy, so generic lifespan startup does not claim
-    # USB, collect a snapshot, run diagnostics, or command motion.
+    # Construct only the local OEM runtime/store/worker owners. Generic
+    # lifespan startup does not claim USB or command motion.
     configure_oem_runtime(
-        startup_program_factory=_get_live_oem_startup_program,
-        serial206_provider_factory=_get_serial206_oem_initialization_provider_for_runtime,
         store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
         autostart=True,
     )
@@ -665,6 +697,32 @@ app = FastAPI(
 app.include_router(oem_compat_router)
 app.include_router(oem_runtime_router)
 app.include_router(oem_homing_router)
+
+
+def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    context = current_operator_dispatch_context()
+    if context is None:
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "direct_z_mutation_retired",
+                "authority": "Serial206OemInitializationProvider",
+                "replacement": "/operator-controls/actions/{semantic_z_action_id}/invoke",
+            },
+        )
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    execute = getattr(provider, "execute_z_intent", None)
+    if not callable(execute):
+        raise HTTPException(status_code=409, detail={"error": "serial206_z_authority_not_bound"})
+    result = execute(
+        intent,
+        inputs=dict(inputs or {}),
+        expected_generation=int(context["expected_ownership_generation"]),
+        idempotency_key=str(context["idempotency_key"]),
+    )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 def _get_tester() -> BioXpTester:
@@ -1082,24 +1140,6 @@ async def oem_initial_check(req: OemInitialCheckRequest | None = None):
     return {"ok": True, "lifecycle": projection}
 
 
-@app.get("/oem/motion_worker/status")
-async def oem_motion_worker_status():
-    if _oem_startup_program is None:
-        return {"ok": False, "available": False, "cache_state": "missing", "worker": None, "error": "OEM startup worker has not been created by an explicit startup POST"}
-    return {**_oem_startup_program.worker_status(), "lifecycle": lifecycle_state.projection()}
-
-
-@app.post("/oem/motion_worker/run_next")
-async def oem_motion_worker_run_next():
-    result = _get_existing_oem_startup_program().run_next_worker_command()
-    return {"ok": result is not None, "result": result, "status": _get_existing_oem_startup_program().worker_status()}
-
-
-@app.post("/oem/motion_worker/abort")
-async def oem_motion_worker_abort(reason: str = "operator abort"):
-    return _get_existing_oem_startup_program().abort_worker(reason=reason)
-
-
 @app.post("/oem/switch_audit")
 async def oem_switch_audit(req: OemSwitchAuditRequest):
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
@@ -1156,8 +1196,68 @@ class OemManualAbsoluteRequest(BaseModel):
 
     axis: Literal["x", "y", "z", "g"]
     position_steps: int
-    z_pseudo_home: Optional[Literal[500, 65000]] = None
     wait_timeout_s: float = Field(default=20.0, ge=0.5, le=60.0)
+
+
+class OemZObservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str = Field(min_length=1, max_length=128)
+    verdict: Literal["pass", "fail"]
+    note: str = Field(min_length=3, max_length=1000)
+
+    @field_validator("command_id", "note")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        selected = value.strip()
+        if not selected:
+            raise ValueError("value must not be blank")
+        return selected
+
+
+class OemZReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RECONCILE_Z_SWITCH_MASKS"]
+
+
+class OemMoveZHomeRequest(BaseModel):
+    """Exact ClassControlInterface.MoveZHome input."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rehome: bool = True
+    wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
+
+
+def _robot_owned_z_pseudo_home() -> dict[str, Any]:
+    """Resolve DefaultParameters.PSUDO_Z_HOME from durable robot state."""
+    provider = serial206_oem_initialization_provider_status()
+    machine = provider.get("machine_status") if isinstance(provider, Mapping) else None
+    pseudo_home = machine.get("psudo_z_home_steps") if isinstance(machine, Mapping) else None
+    tip_loaded = machine.get("tip_loaded") if isinstance(machine, Mapping) else None
+    plate_on_gantry = machine.get("plate_on_gantry") if isinstance(machine, Mapping) else None
+    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+        if tip_loaded is True:
+            pseudo_home = 500
+        elif tip_loaded is False and (plate_on_gantry is None or plate_on_gantry == ""):
+            pseudo_home = 65000
+        elif tip_loaded is False and str(plate_on_gantry).upper() == "BIO_SECURITY_COVER":
+            pseudo_home = 65000
+        elif tip_loaded is False:
+            pseudo_home = 500
+        else:
+            raise RuntimeError("durable PSUDO_Z_HOME authority is unavailable")
+        source = "DefaultParameters.GantryLoad_legacy_durable_state_upgrade"
+    else:
+        source = "DefaultParameters.GantryLoad_durable_robot_state"
+    return {
+        "position_steps": int(pseudo_home),
+        "tip_loaded": tip_loaded,
+        "caller_selectable": False,
+        "source": source,
+        "source_anchor": "DefaultParameters.cs:47-84",
+    }
 
 
 _LIQUID_REQUIRED_REFERENCE_AXES = (AxisName.X, AxisName.Y, AxisName.Z)
@@ -1365,19 +1465,6 @@ class MaintenanceRecoverMotionRequest(BaseModel):
     include_diag: bool = True
 
 
-class OemStartupStepRequest(BaseModel):
-    step: str = Field(
-        ...,
-        pattern=(
-            r"^(z-home|gripper-clear|gripper-commission-home|gripper-home|"
-            r"x-home|x-home-settle|x-set-home|x-speed-1700|x-speed-settle|x-park-6000|"
-            r"y-home|door-home|door-closed-predicate|y-set-home|ui-zero-calibrated|"
-            r"chiller-oc-cool-rate|chiller-rc-cool-rate|system-status-initialized)$"
-        ),
-    )
-    timeout_s: float = Field(25.0, gt=0.1, le=90.0)
-
-
 class GripperRestoreIdleRequest(BaseModel):
     reason: str = Field("operator_restore_idle_current", max_length=2000)
     operator: Optional[str] = Field("bms-cockpit", max_length=200)
@@ -1416,12 +1503,6 @@ class OemHomeXYRequest(BaseModel):
         False,
         description="Supervised commissioning override; each axis still uses guarded switch-search and does not collapse to /motion/axis/zero.",
     )
-
-
-class OemRehomeRequest(BaseModel):
-    operator_ack: str = Field(..., description="Must be exactly REHOME for the direct ControlLib.rehome wrapper.")
-    run_homing: bool = Field(False, description="Compatibility flag only; it does not enable physical homing while the monolithic wrapper remains fail-closed.")
-    timeout_s: float = Field(120.0, gt=1.0, le=240.0)
 
 
 class OemSerial206StageApprovalRequest(BaseModel):
@@ -1472,33 +1553,6 @@ class OemSerial206InitializeMotionStepRequest(BaseModel):
     motion_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
     commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
-
-
-class OemInitializeMotionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    operator_ack: str = Field(..., description="INITIALIZE for no-homing diagnostic; INITIALIZE_WITH_HOMING for the typed serial-206 live provider.")
-    run_homing: bool = Field(False, description="False calls initialize-without-motion only; true invokes the typed serial-206 provider after exact approval and commissioning gates.")
-    include_tip_pipette_cleanup: bool = Field(False, description="For live initializeMotion, selects the source-shaped tip/pipette branch after exact readback.")
-    timeout_s: float = Field(120.0, gt=1.0, le=240.0)
-    motor_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
-    motion_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
-    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
-
-
-class OemInitializationRunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    operator_ack: str = Field(..., description="OEM_INITIALIZATION_RUN for no-homing controller pass; OEM_INITIALIZATION_RUN_WITH_HOMING for typed serial-206 live initialization.")
-    run_homing: bool = Field(False, description="False executes prep/controller phases without homing; true invokes the typed serial-206 provider after exact approval and commissioning gates.")
-    restore_door_state: bool = Field(False, description="Request explicit source-mode door restore policy after init. Open restore remains explicit, not silent.")
-    include_tip_pipette_cleanup: bool = Field(False, description="Reserved for initializeMotion; the initializeMotors route does not perform tip cleanup.")
-    timeout_s: float = Field(180.0, gt=1.0, le=300.0)
-    stage_approval: OemSerial206StageApprovalRequest | None = Field(
-        default=None,
-        description="Single-use approval for exactly the durable expected-next OEM stage.",
-    )
-    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
 
 
 class OemSerial206ObservationRequest(BaseModel):
@@ -2292,9 +2346,8 @@ def _gap8_target_reached_value(wait: Any) -> Any:
 
 
 def _gap8_target_confirmed(wait: Any) -> bool:
-    # Decompiled OEM ClassMotor.queryReachedPosition() only treats GAP8 query ACK
-    # success as method return 0. It is tracked as telemetry but not used as the
-    # normal movement-complete proof; async event 128 is the proof.
+    # Decompiled queryReachedPosition exposes command success, not a target
+    # boolean. GAP8 remains telemetry and cannot replace status-128.
     return False
 
 
@@ -2356,15 +2409,18 @@ def _motion_classification(
     gap8_confirmed = _gap8_target_confirmed(wait)
     controller_error_seen = bool(stall_event_seen or voltage_drop_seen or max_current_reference_deviation_seen)
     move_ack_ok = bool(isinstance(move, dict) and move.get("ok") is True)
-    controller_target_confirmed = bool(target_event_seen or gap8_confirmed)
-    # GAP1/GAP3 deltas are not independent proof of motion because the controller
-    # can report phantom position/speed when the axis is stalled or desynced.
-    # Accept only source-shaped controller evidence:
-    # (a) a target-reached event for normal moves, or
-    # (b) the home predicate confirmed after stop + setHome for homing.
-    # A switch transition is retained as telemetry, but OEM goHome ultimately keys
-    # on queryHome() active after the search, not on our Linux-only requirement that
-    # an inactive sample must have appeared in the polling window.
+    wait_ok = bool(isinstance(wait, dict) and wait.get("ok") is True)
+    stopped = bool(isinstance(wait, dict) and (wait.get("stopped") is True or wait.get("last_speed") == 0))
+    poll_convergence_confirmed = False
+    controller_target_confirmed = bool(target_event_seen)
+    if target_event_seen:
+        completion_source = "motor_addressed_event_128"
+    elif home_predicate_confirmed:
+        completion_source = "home_predicate_after_stop_and_sethome"
+    else:
+        completion_source = None
+    # Position/speed convergence is telemetry only. Status-128 or the exact
+    # home switch/setHome predicate is required for controller completion.
     controller_motion_evidence = bool(
         move_ack_ok
         and not controller_error_seen
@@ -2381,7 +2437,10 @@ def _motion_classification(
         "position_delta": delta,
         "nonzero_speed_seen": nonzero_speed_seen,
         "gap8_target_reached": gap8_value,
+        "gap8_target_confirmed": gap8_confirmed,
+        "poll_convergence_confirmed": poll_convergence_confirmed,
         "controller_target_confirmed": controller_target_confirmed,
+        "controller_completion_source": completion_source,
         "controller_error_seen": controller_error_seen,
         "switch_transition": switch_transition,
         "home_predicate_confirmed": bool(home_predicate_confirmed),
@@ -2548,26 +2607,8 @@ def _axis_limit_row(axis: AxisName) -> dict:
     row = limits.get(axis.value) if isinstance(limits, dict) else None
     out = dict(row) if isinstance(row, dict) else {}
     if axis == AxisName.Z:
-        source_min = _limit_int(out, "min_steps")
-        source_max = _limit_int(out, "max_steps")
-        # OEM ClassBioXPSettings stores source-space Z as 0..ZHighLimit,
-        # while the commissioned live controller reports upward travel as
-        # negative counts with reference at zero. Preserve both contracts.
-        if (
-            source_min is not None
-            and source_max is not None
-            and source_min >= 0
-            and source_max >= source_min
-        ):
-            out.update({
-                "source_min_steps": source_min,
-                "source_max_steps": source_max,
-                "min_steps": -source_max,
-                "max_steps": 0,
-                "coordinate_contract": "observed_live_signed_z",
-                "source_coordinate_contract": "oem_source_nonnegative_z",
-                "oem_equivalent": False,
-            })
+        out["coordinate_contract"] = "oem_source_nonnegative_z"
+        out["oem_equivalent"] = True
     return out
 
 
@@ -2868,7 +2909,17 @@ def _execute_relative_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        interlock = (
+            tester.motor_oem_verify_motion_interlock()
+            if axis is AxisName.Z
+            else tester.motor_prepare_motion_interlock(force_lock=True)
+        )
+        if not isinstance(interlock, dict) or interlock.get("ok") is not True:
+            raise HTTPException(status_code=409, detail={
+                "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
+                "physical_motion_commanded": False,
+                "interlock": interlock,
+            })
         prep = {
             "mode": "oem_exact_moveSteps",
             "oem_method": "ClassControlInterface.moveSteps",
@@ -3056,7 +3107,17 @@ def _execute_absolute_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = tester.motor_prepare_motion_interlock(force_lock=True)
+        interlock = (
+            tester.motor_oem_verify_motion_interlock()
+            if axis is AxisName.Z
+            else tester.motor_prepare_motion_interlock(force_lock=True)
+        )
+        if not isinstance(interlock, dict) or interlock.get("ok") is not True:
+            raise HTTPException(status_code=409, detail={
+                "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
+                "physical_motion_commanded": False,
+                "interlock": interlock,
+            })
         prep = {
             "mode": "oem_exact_absolute",
             "axis_profile_rewritten": False,
@@ -3279,7 +3340,7 @@ def _require_home_predicate_guard(axis: AxisName, snapshot: dict, *, allow_imple
                 "current_snapshot": snapshot,
                 "incident_guard": "manual_z_home_gap9_search_can_ignore_physical_gap10_bottom_reference",
                 "safe_alternatives": [
-                    "/motion/oem/startup_step for the supervised OEM startup recipe",
+                    "/motion/oem/initialization/provider-status for the canonical initialization state",
                     "/motion/axis/zero for controller-coordinate return-to-zero when operator-supervised",
                     "/motion/axis/relative for bounded operator-watched jogs",
                 ],
@@ -3304,7 +3365,7 @@ def _require_home_predicate_guard(axis: AxisName, snapshot: dict, *, allow_imple
             "current_snapshot": snapshot,
             "safe_alternatives": [
                 "/motion/axis/zero for controller-coordinate return-to-zero",
-                "/motion/oem/startup_step for the supervised OEM startup recipe",
+                "/motion/oem/initialization/provider-status for the canonical initialization state",
                 "/motion/axis/relative for operator-watched bounded jogs",
             ],
             "override_for_supervised_commissioning": "Set allow_implementation_mapped_predicate=true only with camera/operator proof; route still requires OEM queryHome/setHome proof.",
@@ -3624,6 +3685,14 @@ def _status_payload() -> dict:
     serial206_initialization = serial206_oem_initialization_provider_status()
     return {
         **projection,
+        "runtime_identity": {
+            "release_sha": os.environ.get("BIOXP_RELEASE_SHA"),
+            "release_tree": os.environ.get("BIOXP_RELEASE_TREE"),
+            "source_mount": os.environ.get("BIOXP_RELEASE_SOURCE_MOUNT"),
+            "runtime_owner": os.environ.get("BIOXP_RUNTIME_OWNER"),
+            "service_unit": "bioxp-api.service",
+            "listener_port": 8123,
+        },
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
         "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
@@ -5511,13 +5580,18 @@ async def motion_emergency_stop():
     try:
         authority = Serial206MotionAuthority.from_active_snapshot()
     except Exception as exc:
+        failed = {
+            "ok": False,
+            "error": "serial_206_authority_unavailable",
+            "message": str(exc),
+            "delivery_attempted": False,
+            "controller_terminal_state_verified": False,
+            "physical_effect_verified": False,
+        }
+        failed["runtime_event"] = record_physical_emergency_stop(result=failed)
         raise HTTPException(
             status_code=409,
-            detail={
-                "error": "serial_206_authority_unavailable",
-                "message": str(exc),
-                "physical_effect_verified": False,
-            },
+            detail=failed,
         ) from exc
     result = await _run_safety_interrupt_blocking(
         "Physical aggregate motion stop",
@@ -5525,6 +5599,7 @@ async def motion_emergency_stop():
         timeout_s=30.0,
     )
     hardware_state.invalidate(reason="physical_aggregate_stop_attempted")
+    result["runtime_event"] = record_physical_emergency_stop(result=result)
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
@@ -5752,96 +5827,6 @@ async def led_rgb(req: LedRgbRequest):
     )
 
 
-def _execute_oem_startup_step(tester: BioXpTester, step: str, timeout_s: float) -> dict:
-    _require_motion_not_blocked_by_maintenance()
-    step = str(step).strip().lower()
-    t0 = time.monotonic()
-    arm_state = tester.motion_arm_state()
-    live_gate = tester.motion_gate_live_snapshot()
-    if not (bool(arm_state.get("armed")) and bool(live_gate.get("ok"))):
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "strict startup arm/live gate is not green; run no-homing strict startup first", "arm_state": arm_state, "live_gate": live_gate},
-        )
-    board_status = tester.activate_boards(expect_reply=True)
-    interlock = tester.motor_prepare_motion_interlock(force_lock=True)
-    # Keep each supervised step source-shaped to ClassControlInterface.initializeMotors().
-    if step == "z-home":
-        # Direct OEM anchor: ClassControlInterface.initializeMotors() calls
-        # MotorZ.axisSearchHome(speed=1791). Do not substitute a right-limit
-        # reference return or a pre-home coordinate probe for that source step.
-        home_axis = getattr(tester, "motor_oem_home_axis", None)
-        if not callable(home_axis):
-            raise HTTPException(status_code=503, detail="OEM axisSearchHome runtime binding is unavailable")
-        result = home_axis("z", startup=True, timeout_s=timeout_s)
-    elif step == "gripper-clear":
-        result = gripper_clear(
-            tester,
-            operator_ack="GRIPPER_CLEAR",
-            reason="OEM startup_step gripper-clear",
-            timeout_s=timeout_s,
-        )
-    elif step == "gripper-commission-home":
-        result = gripper_commission_home(
-            tester,
-            operator_ack="GRIPPER_COMMISSION_HOME",
-            reason="OEM startup_step gripper-commission-home",
-            timeout_s=timeout_s,
-        )
-        if not (isinstance(result, dict) and result.get("ok") is True):
-            raise HTTPException(status_code=409, detail=f"OEM gripper commission/home failed: {result}")
-    elif step == "gripper-home":
-        result = gripper_home(
-            tester,
-            operator_ack="GRIPPER_HOME",
-            reason="OEM startup_step gripper-home",
-            timeout_s=timeout_s,
-        )
-    elif step == "x-home":
-        result = tester.motor_oem_home_axis("x", startup=True, timeout_s=timeout_s)
-    elif step == "x-park-6000":
-        preset = tester._motion_oem_axis_profile("x", startup=True)
-        # OEM initializeMotors waits before setHome, then waits again after
-        # selecting speed 1700 before issuing the finite absolute park.
-        time.sleep(0.02)
-        sethome = tester.motor_set_home(preset["board"], motor=preset["motor"])
-        set_speed = tester.motor_set_axis_param(preset["board"], 4, 1700, motor=preset["motor"])
-        time.sleep(0.04)
-        move = tester.motor_move_absolute(preset["board"], 6000, motor=preset["motor"])
-        wait = tester.motor_wait_stopped(
-            preset["board"],
-            motor=preset["motor"],
-            timeout_s=min(float(timeout_s), 12.0),
-            require_seen_nonzero=True,
-        )
-        result = {"set_home_x": sethome, "set_speed_1700": set_speed, "move_x_6000": move, "wait": wait}
-        if not (move.get("ok") and wait.get("stopped") is True):
-            raise HTTPException(status_code=409, detail=f"OEM X park failed/ambiguous: {wait}")
-    elif step == "y-home":
-        result = tester.motor_oem_home_axis("y", startup=True, timeout_s=timeout_s)
-    elif step == "door-home":
-        result = tester.motor_oem_home_axis("door", startup=True, timeout_s=timeout_s)
-    elif step == "y-set-home":
-        preset = tester._motion_oem_axis_profile("y", startup=True)
-        result = tester.motor_set_home(preset["board"], motor=preset["motor"])
-    else:
-        raise HTTPException(status_code=422, detail=f"Unknown OEM startup step: {step}")
-    if step in {"z-home", "gripper-home", "x-home", "y-home", "door-home"}:
-        _ensure_oem_home_succeeded(tester, AxisName("g" if step == "gripper-home" else "door" if step == "door-home" else step.split("-")[0]), result)
-    return {
-        "ok": True,
-        "step": step,
-        "board_status": board_status,
-        "interlock": interlock,
-        "arm_state": arm_state,
-        "live_gate": live_gate,
-        "result": result,
-        "motion_truth": _motion_truth_payload(),
-        "oem_reference": "ClassControlInterface.initializeMotors lines 3348-3391",
-        "elapsed_ms": int((time.monotonic() - t0) * 1000),
-    }
-
-
 def _execute_oem_home_xy(tester: BioXpTester, *, timeout_s: float, allow_implementation_mapped_predicate: bool = False) -> dict:
     _require_motion_not_blocked_by_maintenance()
     predicate_snapshots = {}
@@ -5866,58 +5851,6 @@ def _execute_oem_home_xy(tester: BioXpTester, *, timeout_s: float, allow_impleme
         },
         "predicate_snapshots_before": predicate_snapshots,
         "allow_implementation_mapped_predicate": bool(allow_implementation_mapped_predicate),
-        "result": result,
-    }
-
-
-def _execute_oem_rehome(tester: BioXpTester, *, timeout_s: float) -> dict:
-    _require_motion_not_blocked_by_maintenance()
-    result = tester.motor_oem_rehome(timeout_s=timeout_s)
-    return {
-        "ok": bool(isinstance(result, dict) and result.get("ok") is True),
-        "source_mode": "ControlLib.rehome",
-        "physical_motion_commanded": bool(
-            isinstance(result, dict) and result.get("physical_motion_commanded") is True
-        ),
-        "route_semantics": {
-            "source_command": "ControlLib.rehome",
-            "home_semantics": "rehome_intentionally_blocked_no_monolithic_live_homing",
-            "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"],
-            "raw_fastapi_route": "/motion/oem/rehome",
-        },
-        "result": result,
-    }
-
-
-def _execute_oem_initialize_motion(
-    tester: BioXpTester,
-    *,
-    run_homing: bool,
-    timeout_s: float,
-    include_tip_pipette_cleanup: bool = False,
-) -> dict:
-    _require_motion_not_blocked_by_maintenance()
-    result = tester.motor_oem_initialize_motion(
-        run_homing=bool(run_homing),
-        timeout_s=timeout_s,
-        include_tip_pipette_cleanup=bool(include_tip_pipette_cleanup),
-    )
-    return {
-        "ok": bool(isinstance(result, dict) and result.get("ok") is True),
-        "source_mode": "ControlLib.initializeMotion",
-        "physical_motion_commanded": bool(
-            isinstance(result, dict) and result.get("physical_motion_commanded") is True
-        ),
-        "route_semantics": {
-            "source_command": "ControlLib.initializeMotion",
-            "home_semantics": (
-                "initializeMotion_homing_request_delegates_to_blocked_rehome_no_motion"
-                if bool(run_homing)
-                else "initializeMotion_no_homing_diagnostic"
-            ),
-            "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"],
-            "raw_fastapi_route": "/motion/oem/initialize_motion",
-        },
         "result": result,
     }
 
@@ -6151,11 +6084,52 @@ def _require_oem_no_motion_profile_or_409(tester: BioXpTester, axis: str) -> dic
         ) from exc
 
 
+def _record_z_motion_outcome(result: dict[str, Any], *, source: str, motion_kind: str) -> dict[str, Any]:
+    payload = dict(result)
+    if payload.get("ok") is True:
+        payload["reference_state"] = _reference_state_store.record_motion(AxisName.Z, motion_kind)
+        payload["physical_effect_verified"] = False
+        payload["physical_effect_verification_required"] = True
+        return payload
+    move = payload.get("move")
+    command_sent = bool(isinstance(move, Mapping) and move.get("command_sent", move.get("ack") is not None) is True)
+    if command_sent:
+        payload["reference_state"] = _reference_state_store.mark_desynced(
+            MarkAxisDesyncedCommand(
+                axis=AxisName.Z,
+                reason=f"{source} failed after the controller command was delivered.",
+                source=source,
+                motion_kind=motion_kind,
+            )
+        )
+        payload["maintenance_state"] = _mark_post_maintenance_motion_block(
+            source=source,
+            reason="Z movement failed after command delivery; reference is desynced and recovery is required.",
+            z_motion_failure={
+                "error": payload.get("error"),
+                "motion_failure": payload.get("motion_failure"),
+                "move": payload.get("move"),
+                "wait": payload.get("wait"),
+            },
+        )
+    payload["physical_effect_verified"] = False
+    return payload
+
+
 @app.post("/motion/oem/manual/relative")
 async def motion_oem_manual_relative(req: OemManualRelativeRequest):
     """Dispatch literal OEM moveSteps(axis, steps) with robot-owned bounds/evidence."""
     _require_motion_route_ready()
     axis = AxisName(req.axis)
+    if axis is AxisName.Z:
+        return await _run_blocking(
+            "serial-206 Z moveSteps",
+            lambda: _execute_provider_z_intent(
+                "move_steps",
+                {"steps": int(req.steps), "wait_timeout_s": 20.0},
+            ),
+            timeout_s=30.0,
+        )
     tester = _get_tester()
     _require_oem_no_motion_profile_or_409(tester, axis.value)
     result = await _run_blocking(
@@ -6176,6 +6150,12 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
         result["oem_method"] = "ClassControlInterface.moveSteps"
         result["source_anchor"] = "ClassControlInterface.cs:4165-4204"
         result["requested_steps"] = int(req.steps)
+        if axis is AxisName.Z:
+            result = _record_z_motion_outcome(
+                result,
+                source="ClassControlInterface.moveSteps.z",
+                motion_kind="relative",
+            )
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
@@ -6186,18 +6166,27 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
     """Dispatch exact OEM moveX/moveY/moveZ/moveG absolute semantics."""
     _require_motion_route_ready()
     axis = AxisName(req.axis)
+    if axis is AxisName.Z:
+        return await _run_blocking(
+            "serial-206 Z moveZ",
+            lambda: _execute_provider_z_intent(
+                "move_absolute",
+                {
+                    "position_steps": int(req.position_steps),
+                    "wait_timeout_s": float(req.wait_timeout_s),
+                },
+            ),
+            timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
+        )
     requested = int(req.position_steps)
+    pseudo_home: dict[str, Any] | None = None
     if axis is AxisName.X:
         effective = max(60, requested)
         oem_method = "ClassControlInterface.moveX"
         source_anchor = "ClassControlInterface.cs:4233-4243"
     elif axis is AxisName.Z:
-        if req.z_pseudo_home is None:
-            raise HTTPException(
-                status_code=422,
-                detail="z_pseudo_home must be explicitly supplied as 500 or 65000 because OEM moveZ clamps against context-owned DefaultParameters.PSUDO_Z_HOME",
-            )
-        effective = max(int(req.z_pseudo_home), requested)
+        pseudo_home = _robot_owned_z_pseudo_home()
+        effective = max(int(pseudo_home["position_steps"]), requested)
         oem_method = "ClassControlInterface.moveZ"
         source_anchor = "ClassControlInterface.cs:4254-4265"
     elif axis is AxisName.Y:
@@ -6232,28 +6221,168 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
             "source_anchor": source_anchor,
             "requested_position_steps": requested,
             "effective_position_steps": effective,
-            "z_pseudo_home": req.z_pseudo_home,
+            "z_pseudo_home": pseudo_home,
             "z_run_current_param6": z_current,
             "standby_current_param7_written": False,
         })
         return result
 
-    return await _run_blocking(
+    result = await _run_blocking(
         f"OEM manual absolute {req.axis} to {effective}",
         execute,
         timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
+    )
+    if axis is AxisName.Z and isinstance(result, dict):
+        result = _record_z_motion_outcome(
+            result,
+            source="ClassControlInterface.moveZ",
+            motion_kind="absolute",
+        )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+def _record_z_home_outcome(result: dict[str, Any], *, source: str, motion_kind: str) -> dict[str, Any]:
+    payload = dict(result)
+    if payload.get("ok") is True:
+        payload["reference_state"] = _reference_state_store.mark_referenced(
+            MarkAxisReferencedCommand(
+                axis=AxisName.Z,
+                position_steps=0,
+                source=source,
+                note="OEM GAP9 home predicate, terminal stop, and setHome zero readback confirmed.",
+                motion_kind=motion_kind,
+            )
+        )
+        payload["physical_effect_verified"] = False
+        payload["physical_effect_verification_required"] = True
+        return payload
+    payload["reference_state"] = _reference_state_store.mark_desynced(
+        MarkAxisDesyncedCommand(
+            axis=AxisName.Z,
+            reason=f"{source} failed; Z reference was not established.",
+            source=source,
+            motion_kind=motion_kind,
+        )
+    )
+    payload["maintenance_state"] = _mark_post_maintenance_motion_block(
+        source=source,
+        reason="Z home failed; no further Z motion is admitted until source-grounded no-motion recovery is completed.",
+        z_home_failure={
+            "error": payload.get("error"),
+            "home": payload.get("home"),
+            "interlock": payload.get("interlock"),
+        },
+    )
+    payload["physical_effect_verified"] = False
+    return payload
+
+
+@app.get("/motion/oem/z/status")
+async def motion_oem_z_status():
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    projection = getattr(provider, "z_projection", None)
+    if not callable(projection):
+        raise HTTPException(status_code=409, detail={"error": "serial206_z_authority_not_bound"})
+    return projection()
+
+
+@app.post("/motion/oem/z/prepare")
+async def motion_oem_z_prepare():
+    return await _run_blocking(
+        "serial-206 Z prepare",
+        lambda: _execute_provider_z_intent("prepare"),
+        timeout_s=60.0,
+    )
+
+
+@app.post("/motion/oem/z/reconcile_switch_masks")
+async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
+    return await _run_blocking(
+        "serial-206 Z switch-mask recovery",
+        lambda: _execute_provider_z_intent("reconcile_switch_masks", {"confirm": req.confirm}),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/z/diagnostic_home_axis")
+async def motion_oem_z_diagnostic_home_axis():
+    return await _run_blocking(
+        "serial-206 diagnostic HomeAxis z",
+        lambda: _execute_provider_z_intent("diagnostic_home_axis", {"timeout_s": 30.0}),
+        timeout_s=45.0,
+    )
+
+
+@app.post("/motion/oem/z/stop")
+async def motion_oem_z_stop():
+    return await _run_blocking(
+        "serial-206 Z stop",
+        lambda: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
+        timeout_s=10.0,
+    )
+
+
+@app.post("/motion/oem/z/observation")
+async def motion_oem_z_observation(req: OemZObservationRequest):
+    context = current_operator_dispatch_context()
+    if context is None:
+        raise HTTPException(status_code=410, detail={"error": "direct_z_observation_retired"})
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    record = getattr(provider, "record_z_observation", None)
+    if not callable(record):
+        raise HTTPException(status_code=409, detail={"error": "serial206_z_authority_not_bound"})
+    try:
+        return record(
+            command_id=req.command_id,
+            verdict=req.verdict,
+            note=req.note,
+            expected_generation=int(context["expected_ownership_generation"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": "z_observation_rejected", "reason": str(exc)}) from exc
+
+
+@app.post("/motion/oem/z/move_z_home")
+async def motion_oem_move_z_home(req: OemMoveZHomeRequest):
+    del req
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "duplicate_z_home_route_retired",
+            "replacement": "oem.z.manual_home",
+            "authority": "Serial206OemInitializationProvider",
+        },
     )
 
 
 @app.post("/motion/oem/manual/home")
 async def motion_oem_manual_home(req: OemManualHomeRequest):
-    """Dispatch the literal serial-206 OEM HomeAxis branch for one component."""
+    """Dispatch source-exact manual home; Z is goHome(true, 1791)."""
     _require_motion_route_ready()
+    if req.axis == "z":
+        return await _run_blocking(
+            "serial-206 Z manual goHome",
+            lambda: _execute_provider_z_intent("manual_home", {"timeout_s": 30.0}),
+            timeout_s=45.0,
+        )
     tester = _get_tester()
     _require_oem_no_motion_profile_or_409(tester, req.axis)
 
     def execute() -> dict[str, Any]:
-        interlock = getattr(tester, "motor_prepare_motion_interlock")(force_lock=True)
+        interlock = (
+            tester.motor_oem_verify_motion_interlock()
+            if req.axis == "z"
+            else getattr(tester, "motor_prepare_motion_interlock")(force_lock=True)
+        )
+        if not isinstance(interlock, dict) or interlock.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": "oem_z_interlock_not_verified" if req.axis == "z" else "oem_interlock_not_verified",
+                "physical_motion_commanded": False,
+                "interlock": interlock,
+            }
         result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
         if isinstance(result, dict):
             result["interlock"] = interlock
@@ -6267,6 +6396,12 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
         execute,
         timeout_s=45.0,
     )
+    if req.axis == "z" and isinstance(result, dict):
+        result = _record_z_home_outcome(
+            result,
+            source="ClassControlInterface.HomeAxis.z",
+            motion_kind="home_axis_board_test",
+        )
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
@@ -6411,26 +6546,17 @@ async def motion_thermal_door_close():
     )
 
 
-@app.post("/motion/oem/startup_step")
-async def motion_oem_startup_step(req: OemStartupStepRequest):
-    del req
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "ok": False,
-            "failed_closed": True,
-            "physical_motion_commanded": False,
-            "blocker": "direct_caller_selected_startup_step_retired_use_serial206_initialization_provider",
-            "replacement": "/motion/oem/serial206/initialize_motors",
-        },
-    )
-
-
 @app.post("/motion/oem/home_xy")
 async def motion_oem_home_xy(req: OemHomeXYRequest):
     if req.operator_ack != "HOMEXY":
         raise HTTPException(status_code=409, detail="operator_ack HOMEXY required for direct OEM HomeXY mode")
     _require_motion_route_ready()
+    if _serial206_oem_initialization_provider is not None:
+        return await _run_blocking(
+            "serial-206 provider HomeXY",
+            lambda: _execute_serial206_motion_intent("home_xy", {"timeout_s": float(req.timeout_s), "allow_implementation_mapped_predicate": bool(req.allow_implementation_mapped_predicate)}),
+            timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 180.0),
+        )
     tester = _get_tester()
     return await _run_blocking(
         "OEM HomeXY direct mode",
@@ -6441,20 +6567,6 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
         ),
         timeout_s=min(max(float(req.timeout_s) + 10.0, 20.0), 150.0),
     )
-
-
-@app.post("/motion/oem/rehome")
-async def motion_oem_rehome(req: OemRehomeRequest):
-    if req.operator_ack != "REHOME":
-        raise HTTPException(status_code=409, detail="operator_ack REHOME required for direct OEM rehome wrapper")
-    return {
-        "ok": False,
-        "failed_closed": True,
-        "source_mode": "ControlLib.rehome",
-        "physical_motion_commanded": False,
-        "message": "Direct rehome remains blocked; run_homing does not enable monolithic live homing.",
-        "route_semantics": {"raw_fastapi_route": "/motion/oem/rehome", "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home"]},
-    }
 
 
 def _serial206_stage_approvals(
@@ -6490,52 +6602,7 @@ async def motion_oem_initialization_observation(req: OemSerial206ObservationRequ
     return result
 
 
-@app.post("/motion/oem/initialization/run")
-async def motion_oem_initialization_run(req: OemInitializationRunRequest):
-    expected_ack = "OEM_INITIALIZATION_RUN_WITH_HOMING" if bool(req.run_homing) else "OEM_INITIALIZATION_RUN"
-    if req.operator_ack != expected_ack:
-        raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initialization controller run_homing={bool(req.run_homing)}")
-    if bool(req.run_homing):
-        if req.restore_door_state or req.include_tip_pipette_cleanup:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "initialize_motors_scope_mismatch",
-                    "message": "Door restoration and tip cleanup belong to initializeMotion, not the literal initializeMotors provider.",
-                    "physical_motion_commanded": False,
-                },
-            )
-        provider = _require_serial206_oem_initialization_provider("initialize_motors")
-        _require_motion_route_ready()
-        result = await _run_blocking(
-            "Typed serial-206 initializeMotors",
-            lambda: provider.initialize_motors(
-                mode="live",
-                approval=_serial206_stage_approval(req.stage_approval),
-                commissioning=_serial206_commissioning_evidence(req.commissioning),
-                timeout_s=req.timeout_s,
-            ),
-            timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
-        )
-        if result.get("ok") is not True:
-            raise HTTPException(status_code=409, detail=result)
-        return result
-    _require_motion_route_ready()
-    tester = _get_tester()
-    return await _run_blocking(
-        "OEM initialization controller",
-        lambda: run_oem_initialization_controller(
-            tester,
-            run_homing=req.run_homing,
-            restore_door_state=req.restore_door_state,
-            include_tip_pipette_cleanup=req.include_tip_pipette_cleanup,
-            timeout_s=req.timeout_s,
-        ),
-        timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
-    )
-
-
-@app.post("/motion/oem/serial206/initialize_motors")
+@app.post("/motion/oem/initialization/initialize_motors")
 async def motion_oem_serial206_initialize_motors(req: OemSerial206InitializeMotorsStepRequest):
     if req.operator_ack != "INITIALIZE_MOTORS_STAGE":
         raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTORS_STAGE required")
@@ -6556,7 +6623,7 @@ async def motion_oem_serial206_initialize_motors(req: OemSerial206InitializeMoto
     return result
 
 
-@app.post("/motion/oem/serial206/initialize_motion")
+@app.post("/motion/oem/initialization/initialize_motion")
 async def motion_oem_serial206_initialize_motion(req: OemSerial206InitializeMotionStepRequest):
     if req.operator_ack != "INITIALIZE_MOTION_STAGE":
         raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTION_STAGE required")
@@ -6578,51 +6645,6 @@ async def motion_oem_serial206_initialize_motion(req: OemSerial206InitializeMoti
     return result
 
 
-@app.post("/motion/oem/initialize_motion")
-async def motion_oem_initialize_motion(req: OemInitializeMotionRequest):
-    expected_ack = "INITIALIZE_WITH_HOMING" if bool(req.run_homing) else "INITIALIZE"
-    if req.operator_ack != expected_ack:
-        raise HTTPException(status_code=409, detail=f"operator_ack {expected_ack} required for OEM initializeMotion run_homing={bool(req.run_homing)}")
-    if bool(req.run_homing):
-        if req.include_tip_pipette_cleanup is not True:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "initialize_motion_scope_incomplete",
-                    "message": "Live initializeMotion must include its source tip/pipette branch; partial homing-only execution is not initializeMotion parity.",
-                    "physical_motion_commanded": False,
-                },
-            )
-        provider = _require_serial206_oem_initialization_provider("initialize_motion")
-        _require_motion_route_ready()
-        result = await _run_blocking(
-            "Typed serial-206 initializeMotion",
-            lambda: provider.initialize_motion(
-                mode="live",
-                approvals=_serial206_stage_approvals(req.motor_stage_approvals),
-                motion_approvals=_serial206_stage_approvals(req.motion_stage_approvals),
-                commissioning=_serial206_commissioning_evidence(req.commissioning),
-                timeout_s=req.timeout_s,
-            ),
-            timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
-        )
-        if result.get("ok") is not True:
-            raise HTTPException(status_code=409, detail=result)
-        return result
-    _require_motion_route_ready()
-    tester = _get_tester()
-    return await _run_blocking(
-        "OEM ControlLib.initializeMotion direct wrapper",
-        lambda: _execute_oem_initialize_motion(
-            tester,
-            run_homing=req.run_homing,
-            timeout_s=req.timeout_s,
-            include_tip_pipette_cleanup=req.include_tip_pipette_cleanup,
-        ),
-        timeout_s=min(max(float(req.timeout_s) + 10.0, 30.0), 260.0),
-    )
-
-
 def _motion_response_allows_reference_update(response: dict) -> bool:
     if bool(response.get("dry_run")):
         return False
@@ -6642,6 +6664,12 @@ def _motion_response_allows_reference_update(response: dict) -> bool:
 
 @app.post("/motion/axis/relative")
 async def move_axis_relative(req: MoveRelativeRequest):
+    if req.axis is AxisName.Z:
+        raise HTTPException(status_code=410, detail={
+            "error": "alternate_z_authority_retired",
+            "replacement": "/motion/oem/manual/relative",
+            "physical_motion_commanded": False,
+        })
     _require_motion_route_ready(req)
     response = await run_relative_motion_command(
         RelativeMoveCommand.from_request(req),
@@ -6657,7 +6685,19 @@ async def move_axis_relative(req: MoveRelativeRequest):
 
 @app.post("/motion/axis/absolute")
 async def move_axis_absolute(req: MoveAbsoluteRequest):
+    if req.axis is AxisName.Z:
+        raise HTTPException(status_code=410, detail={
+            "error": "alternate_z_authority_retired",
+            "replacement": "/motion/oem/manual/absolute",
+            "physical_motion_commanded": False,
+        })
     _require_motion_route_ready(req)
+    if req.axis is AxisName.X and not _motion_request_is_validation_only(req):
+        return await _run_blocking(
+            "serial-206 provider X absolute",
+            lambda: _execute_serial206_motion_intent("move_absolute", {"position_steps": int(req.position_steps), "wait_timeout_s": float(req.wait_timeout_s), "source_mode": "api.motion.axis.absolute"}),
+            timeout_s=min(max(float(req.wait_timeout_s) + 10.0, 20.0), 150.0),
+        )
     response = await run_absolute_motion_command(
         AbsoluteMoveCommand.from_request(req),
         get_tester=_get_tester,
@@ -6673,6 +6713,12 @@ async def move_axis_absolute(req: MoveAbsoluteRequest):
 @app.post("/motion/axis/zero")
 async def move_axis_zero(req: MoveAxisZeroRequest):
     """Compatibility-safe operator command: return an axis to controller coordinate 0."""
+    if req.axis is AxisName.Z:
+        raise HTTPException(status_code=410, detail={
+            "error": "signed_or_controller_zero_z_authority_retired",
+            "replacement": "/motion/oem/manual/home",
+            "physical_motion_commanded": False,
+        })
     _require_motion_route_ready(req)
     response = await run_absolute_motion_command(
         AbsoluteMoveCommand(
@@ -6715,6 +6761,15 @@ async def move_axis_zero(req: MoveAxisZeroRequest):
 
 @app.post("/motion/axis/home")
 async def home_axis(req: HomeAxisRequest):
+    if req.axis is AxisName.Z:
+        raise HTTPException(status_code=410, detail={
+            "error": "ambiguous_generic_z_home_retired",
+            "replacements": [
+                "/motion/oem/manual/home",
+                "/motion/oem/initialization/initialize_motors",
+            ],
+            "physical_motion_commanded": False,
+        })
     _require_motion_route_ready(req)
     response = await run_home_axis_command(
         HomeAxisCommand.from_request(req),
@@ -6730,7 +6785,7 @@ async def home_axis(req: HomeAxisRequest):
             "home_semantics": "manual_goHome_style_switch_search_not_startup_axisSearchHome_not_zero",
             "oem_switch_search_homing_executed": not bool(response.get("dry_run")),
             "manual_home_safety": "fail_closed_until_predicate_matrix_live_or_source_verified; OEM proof is queryHome active after stop plus setHome success",
-            "not_equivalent_to": ["/motion/axis/zero", "/motion/oem/startup_step", "/motion/oem/rehome", "/motion/oem/home_xy"],
+            "not_equivalent_to": ["/motion/axis/zero", "/motion/oem/initialization/initialize_motors"],
         }
     )
     if _motion_response_allows_reference_update(response):
@@ -6764,6 +6819,12 @@ async def motion_reference_status(
 
 @app.post("/motion/reference/mark_referenced")
 async def motion_reference_mark_referenced(req: ReferenceMarkRequest):
+    if req.axis is AxisName.Z:
+        raise HTTPException(status_code=410, detail={
+            "error": "unproven_z_reference_mutation_retired",
+            "message": "Z reference can only be established by a source-shaped OEM home with GAP9/stop/setHome proof.",
+            "physical_motion_commanded": False,
+        })
     return _reference_state_store.mark_referenced(
         MarkAxisReferencedCommand(
             axis=req.axis,
@@ -7184,7 +7245,14 @@ async def camera_mjpeg(
 async def liquid_status():
     projection = hardware_state.project("pipette")
     observed = _domain_observation(projection, "pipette")
-    return {**projection, "pipette": observed, "channels": None if not isinstance(observed, dict) else observed.get("channels")}
+    return {
+        **projection,
+        "pipette": observed,
+        "channels": None if not isinstance(observed, dict) else observed.get("channels"),
+        "live_query_performed": False,
+        "truth_source": "hardware_state_projection_only",
+        "latest_receipt": _pipette_receipts.latest(),
+    }
 
 
 @app.post("/liquid/init")
@@ -7197,7 +7265,14 @@ async def liquid_init(req: PipetteInitRequest):
 
     def action() -> dict[str, Any]:
         result = _get_pipette_transport().initialize(command)
-        return {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
+        result = {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
+        receipt = _pipette_receipts.record(
+            operation="init",
+            requested_inputs=command.to_payload(),
+            result=result,
+            runtime_binding={"owner": "shared_bioxp_tester_pipette", "transport_owner_bound": True},
+        )
+        return {**result, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
 
     try:
         projection = await _run_blocking(
@@ -7218,6 +7293,7 @@ async def liquid_tip(req: PipetteTipRequest):
         PipetteTipCommand.from_request(req),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7228,6 +7304,7 @@ async def liquid_aspirate(req: PipetteAspirateRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7238,6 +7315,7 @@ async def liquid_dispense(req: PipetteDispenseRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 
@@ -7248,6 +7326,7 @@ async def liquid_mix(req: PipetteMixRequest):
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
+        receipt_store=_pipette_receipts,
     )
 
 
