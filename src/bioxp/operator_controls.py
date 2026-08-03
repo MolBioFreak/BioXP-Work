@@ -224,6 +224,10 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 
 _NO_MOTION_PREPARATION_PATHS = {
     "/motion/oem/prepare_without_motion",
+    # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a
+    # movement/homing action.  It must remain available to repair a stale Z
+    # coordinate while the physical-motion arm is deliberately disarmed.
+    "/motion/oem/z/set_home",
 }
 
 
