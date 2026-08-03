@@ -286,6 +286,16 @@ def _home_action(action: Mapping[str, Any]) -> bool:
     return "home" in path and not any(token in path for token in ("move", "park", "position"))
 
 
+_Z_NO_MOTION_STATE_ACTIONS = frozenset({
+    "oem.z.prepare",
+    "oem.z.reconcile_switch_masks",
+})
+
+
+def _z_no_motion_state_action(action: Mapping[str, Any]) -> bool:
+    return str(action.get("action_id") or "") in _Z_NO_MOTION_STATE_ACTIONS
+
+
 def _required_reference_axes(action: Mapping[str, Any], inputs: Mapping[str, Any]) -> list[str]:
     if not _motor_motion_action(action) or _home_action(action):
         return []
@@ -487,7 +497,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         ))
 
     if source_initializer or safety == "motion" or _motor_motion_action(action):
-        required_axes = [] if source_initializer else _required_reference_axes(action, values)
+        z_state_establishing = _z_no_motion_state_action(action)
+        required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
         readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(
@@ -505,13 +516,20 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             z_preset = z_row.get("preset") if isinstance(z_row, Mapping) else None
             left_mask_clear = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
             right_mask_clear = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is False
-            dependencies.append(_dependency(
-                "z_switch_masks_clear",
-                "Z GAP12/GAP13 switch masks clear",
-                left_mask_clear and right_mask_clear,
-                "Z switch-disable masks are not both clear; restore the OEM no-motion profile.",
-            ))
-            if not _home_action(action):
+            # Reconciliation is the state-establishing action for this exact
+            # precondition.  Requiring masks to be clear here makes recovery
+            # impossible.  Preparation remains ordered after reconciliation.
+            if action_id != "oem.z.reconcile_switch_masks":
+                dependencies.append(_dependency(
+                    "z_switch_masks_clear",
+                    "Z GAP12/GAP13 switch masks clear",
+                    left_mask_clear and right_mask_clear,
+                    "Z switch-disable masks are not both clear; restore the OEM no-motion profile.",
+                ))
+            # Preparation and mask reconciliation do not move Z and therefore
+            # must not require an already-valid OEM coordinate.  Movement and
+            # ordinary non-home Z actions retain the envelope/target gates.
+            if not _home_action(action) and not z_state_establishing:
                 position = _value(z_status, "position")
                 minimum = z_preset.get("axis_min_steps") if isinstance(z_preset, Mapping) else 0
                 maximum = z_preset.get("axis_max_steps") if isinstance(z_preset, Mapping) else 160000

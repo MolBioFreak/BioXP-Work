@@ -707,7 +707,7 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
             detail={
                 "error": "direct_z_mutation_retired",
                 "authority": "Serial206OemInitializationProvider",
-                "replacement": "/operator-controls/actions/{semantic_z_action_id}/invoke",
+                "replacement": "/operator/actions/{semantic_z_action_id}",
             },
         )
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
