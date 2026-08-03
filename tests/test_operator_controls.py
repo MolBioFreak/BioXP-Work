@@ -169,6 +169,25 @@ def test_operator_ack_is_not_user_input_and_is_supplied_internally(tmp_path, mon
     assert calls == [("gripper_clear", {"operator_ack": "GRIPPER_CLEAR"})]
 
 
+def test_partial_snapshot_does_not_make_unrelated_domains_block_motion(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    hardware = app.state.operator_test_hardware
+    original_project = hardware.project
+
+    def partial_project(domain):
+        row = original_project(domain)
+        if domain in {"transport", "power", "interlock", "latch"}:
+            return row
+        return {"domains": {domain: {"status": "missing", "observation": None}}, "freshness": {"state": "missing"}}
+
+    monkeypatch.setattr(hardware, "project", partial_project)
+    catalog = TestClient(app).get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/axis/home")
+    dependencies = {row["key"]: row for row in action["dependencies"]}
+    assert dependencies["canonical_snapshot"]["met"] is True
+    assert dependencies["snapshot_fresh"]["met"] is True
+
+
 def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_cannot_dispatch(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)

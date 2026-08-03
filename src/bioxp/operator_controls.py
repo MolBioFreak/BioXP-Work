@@ -1198,7 +1198,10 @@ def install_operator_control_plane(
             if projection.get("snapshot_id"):
                 snapshot_id = projection.get("snapshot_id")
             freshness = projection.get("freshness")
-            if isinstance(freshness, Mapping):
+            # A partial canonical collection is valid for an action only when
+            # that action's own required domains are observed.  Do not let
+            # unrelated, uncollected domains erase the snapshot identity.
+            if isinstance(freshness, Mapping) and isinstance(row, Mapping) and row.get("status") == "observed":
                 freshness_rows.append(dict(freshness))
         ownership_projection = hardware_state.ownership_projection()
         state_rank = {"fresh": 0, "stale": 1, "missing": 2}

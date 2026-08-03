@@ -5561,6 +5561,10 @@ async def motion_oem_prepare_without_motion():
         ownership_bootstrap = await reconnect_runtime()
     with _maintenance_state_lock:
         recovery_latch_generation = int(_maintenance_latch_generation)
+        recovery_pending = (
+            _maintenance_state.get("motion_blocked") is True
+            and _maintenance_state.get("recovery_required") is True
+        )
     hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
     tester = _get_tester()
     result = await _run_blocking(
@@ -5575,14 +5579,18 @@ async def motion_oem_prepare_without_motion():
     }
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=response)
-    response["maintenance_state"] = _clear_post_maintenance_motion_block(
-        source="oem_prepare_without_motion_completed",
-        expected_latch_generation=recovery_latch_generation,
-        evidence={
-            "physical_motion_commanded": False,
-            "profile": "initializeMotorsWithoutMotion",
-            "result_ok": True,
-        },
+    response["maintenance_state"] = (
+        _clear_post_maintenance_motion_block(
+            source="oem_prepare_without_motion_completed",
+            expected_latch_generation=recovery_latch_generation,
+            evidence={
+                "physical_motion_commanded": False,
+                "profile": "initializeMotorsWithoutMotion",
+                "result_ok": True,
+            },
+        )
+        if recovery_pending
+        else _maintenance_state_payload()
     )
     return response
 
