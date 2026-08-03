@@ -1205,7 +1205,10 @@ def install_operator_control_plane(
                 freshness_rows.append(dict(freshness))
         ownership_projection = hardware_state.ownership_projection()
         state_rank = {"fresh": 0, "stale": 1, "missing": 2}
-        freshness = max(
+        # Global snapshot presence is established by any fresh observed domain.
+        # Action-specific predicates below decide whether each required domain
+        # is adequate; unrelated stale/missing rows cannot poison that proof.
+        freshness = min(
             freshness_rows,
             key=lambda row: state_rank.get(str(row.get("state")), 2),
             default={"state": "missing", "age_s": None, "fresh_for_s": 30.0},
