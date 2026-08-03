@@ -2277,6 +2277,7 @@ class Serial206OemInitializationProvider:
             allowed_by_state = {
                 "prepare": {"unprepared", "failed_latched"},
                 "reconcile_switch_masks": {"unprepared", "failed_latched"},
+                "live_right_reference": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "manual_home": {"prepared_unreferenced", "referenced_ready"},
                 "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
                 "move_steps": {"referenced_ready"},
