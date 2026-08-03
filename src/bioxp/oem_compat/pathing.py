@@ -113,6 +113,16 @@ class OemPathPlanner:
                 points += [{"x": num, "y": num2}, {"x": x, "y": y}]
         return points
 
+    @staticmethod
+    def _move_to_authority(state: OemMachineState) -> dict[str, Any]:
+        """Carry the exact dynamic predicates required by the OEM moveTo branch."""
+        return {
+            "gripper_confirmed": bool(state.confirm_axis("gripper")),
+            "tip_loaded": bool(state.tip_loaded),
+            "plate_on_gantry": state.plate_on_gantry,
+            "location19_y": state.location19_y,
+        }
+
     def plan_script_move_to(self, *, current_loc: str | int | None, location_id: str | int, column: int = 0, row: int = 0, positionflag: int = 0, state: OemMachineState, run_in_parallel: bool = True) -> dict[str, Any]:
         loc_id = _loc_id(location_id); current_id = _loc_id(current_loc)
         target = self._target(location_id)
@@ -128,7 +138,7 @@ class OemPathPlanner:
             steps.append(_step("moveZ", z=num, source_lines="ClassControlInterface.cs:3853-3856"))
         elif state.confirm_axis("gripper") and not state.tip_loaded:
             branch = "gripper_confirmed_no_tip_direct_moveTo"
-            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), source_lines="ClassControlInterface.cs:3858-3860"))
+            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:3858-3860"))
         elif state.tip_loaded:
             branch = "tip_loaded"
             if z > pseudo:
@@ -183,10 +193,10 @@ class OemPathPlanner:
                     steps += [_step("moveY", y=y), _step("moveX", x=82450), _step("moveZ", z=145000), _step("moveX", x=self.x_high_limit - 500), _step("moveSteps", axis="x", delta=-1000), _step("moveZ", z=pseudo)]
             else:
                 branch = "tip_loaded_default_moveTo"
-                steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), source_lines="ClassControlInterface.cs:3985-3988"))
+                steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:3985-3988"))
         elif not state.tip_dirty:
             branch = "no_tip_not_dirty_default_moveTo"
-            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), source_lines="ClassControlInterface.cs:3990-3992"))
+            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:3990-3992"))
         elif loc_id == WASTE_BIN_ID:
             branch = "dirty_tip_waste_bin_special"
             steps.append(_step("moveZ", z=pseudo, source_lines="ClassControlInterface.cs:3994-4007"))
@@ -195,7 +205,7 @@ class OemPathPlanner:
             steps += [_step("moveY", y=y), _step("moveX", x=82450), _step("moveZ", z=145000), _step("moveX", x=self.x_high_limit - 500), _step("moveSteps", axis="x", delta=-1000), _step("moveZ", z=pseudo)]
         else:
             branch = "dirty_tip_default_moveTo"
-            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), source_lines="ClassControlInterface.cs:4009-4011"))
+            steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:4009-4011"))
 
         return {
             "ok": True,
