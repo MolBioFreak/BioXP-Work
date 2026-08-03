@@ -1285,7 +1285,7 @@ def test_target_validation_runs_before_missing_current_position_fails_closed(mon
 def test_robot_owns_oem_z_pseudo_home_from_durable_machine_state(monkeypatch):
     api = load_api(monkeypatch)
 
-    for tip_loaded, expected in ((True, 500), (False, 500), (None, 65000)):
+    for tip_loaded, expected in ((True, 500), (False, 65000)):
         monkeypatch.setattr(
             api,
             "serial206_oem_initialization_provider_status",
@@ -1294,6 +1294,14 @@ def test_robot_owns_oem_z_pseudo_home_from_durable_machine_state(monkeypatch):
         row = api._robot_owned_z_pseudo_home()
         assert row["position_steps"] == expected
         assert row["caller_selectable"] is False
+
+    monkeypatch.setattr(
+        api,
+        "serial206_oem_initialization_provider_status",
+        lambda: {"bound": True, "machine_status": {"tip_loaded": None}},
+    )
+    with pytest.raises(RuntimeError, match="durable PSUDO_Z_HOME authority is unavailable"):
+        api._robot_owned_z_pseudo_home()
 
 
 def test_controller_poll_convergence_does_not_replace_source_event_128(monkeypatch):

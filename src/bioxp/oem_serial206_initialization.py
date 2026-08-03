@@ -639,6 +639,7 @@ class Serial206ProductionPrimitiveAdapter:
             reference = self.reference_store.mark_referenced_many((MarkAxisReferencedCommand(axis="x", position_steps=0, source="oem_home_xy", motion_kind="home_xy"), MarkAxisReferencedCommand(axis="y", position_steps=0, source="oem_home_xy", motion_kind="home_xy")))
             home_ok = reference.get("ok") is True and reference.get("durable_clean") is True
         return {"ok": bool(home_ok and all(isinstance(restore[a], Mapping) and restore[a].get("ok") is True and isinstance(restore[a].get("readback"), Mapping) and restore[a]["readback"].get("value") == (350 if a == "x" else 400) for a in ("x", "y"))), "intent": "home_xy", "command_issued": True, "event_window": _json_safe(event_window), "setup": _json_safe(setup), "home": _json_safe(results), "home_errors": errors, "set_home": _json_safe(set_home), "positions": _json_safe(positions), "restore": _json_safe(restore), "reference_state": _json_safe(reference), "source_anchor": "ClassControlInterface.HomeXY"}
+
     def _z_profile(self) -> dict[str, Any]:
         profile = dict(self.tester._motion_oem_axis_profile("z"))
         if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
@@ -778,7 +779,7 @@ class Serial206ProductionPrimitiveAdapter:
             "requested_position_steps": requested,
             "effective_position_steps": effective,
             "pseudo_home_steps": int(pseudo_home_steps),
-            "source_anchor": "ClassControlInterface.moveZ:4663-4699",
+            "source_anchor": "ClassControlInterface.moveZ:4254-4265",
         })
         return result
 
@@ -1175,10 +1176,12 @@ class Serial206ProductionPrimitiveAdapter:
         waits: dict[str, Any] = {}
         launch_order: list[str] = []
         if distance_x <= 20 or distance_y <= 20:
-            commands["x"] = self.oem_move_axis_absolute("x", target_x, wait_for_stop=True)
-            launch_order.append("x")
-            commands["y"] = self.oem_move_axis_absolute("y", target_y, wait_for_stop=True)
-            launch_order.append("y")
+            if distance_x != 0:
+                commands["x"] = self.oem_move_axis_absolute("x", target_x, wait_for_stop=True)
+                launch_order.append("x")
+            if distance_y != 0:
+                commands["y"] = self.oem_move_axis_absolute("y", target_y, wait_for_stop=True)
+                launch_order.append("y")
             return {
                 "ok": all(commands[key].get("ok") is True for key in launch_order),
                 "targets": {"x": target_x, "y": target_y},
@@ -1194,6 +1197,7 @@ class Serial206ProductionPrimitiveAdapter:
             "x": self.tester.motor_set_axis_param(px["board"], 5, x_acc, motor=px.get("motor", 0)),
             "y": self.tester.motor_set_axis_param(py["board"], 5, y_acc, motor=py.get("motor", 0)),
         }
+        event_window = self.tester.begin_bus_event_window()
         if distance_x > distance_y:
             commands["x"] = self.tester.motor_oem_move_absolute(
                 px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
@@ -1217,16 +1221,17 @@ class Serial206ProductionPrimitiveAdapter:
             )
             launch_order.append("x")
         time.sleep(0.005)
-        for axis, profile in (("x", px), ("y", py)):
-            waits[axis] = self.tester.motor_oem_wait_target_reached(
-                profile["board"], motor=profile.get("motor", 0), timeout_s=5.0
-            )
+        waits["pair"] = self.tester.motor_oem_wait_targets_reached(
+            ((px["board"], px.get("motor", 0)), (py["board"], py.get("motor", 0))),
+            timeout_s=5.0,
+            event_window=event_window,
+        )
         restore_acc = {
             "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
             "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
         }
         return {
-            "ok": all(isinstance(waits[axis], Mapping) and waits[axis].get("ok") is True for axis in ("x", "y")),
+            "ok": isinstance(waits["pair"], Mapping) and waits["pair"].get("ok") is True,
             "targets": {"x": target_x, "y": target_y},
             "before": {"x": current_x, "y": current_y},
             "commands": _json_safe(commands),
@@ -1246,56 +1251,143 @@ class Serial206ProductionPrimitiveAdapter:
         pseudo_home_steps: int,
         run_in_parallel: bool = True,
         wait_timeout_s: float = 5.0,
+        gripper_confirmed: bool | None = None,
+        tip_loaded: bool | None = None,
+        plate_on_gantry: int | None = None,
+        location19_y: int | None = None,
     ) -> dict[str, Any]:
-        """Core OEM composite moveTo ordering, including Z pre-clear."""
-        del run_in_parallel
+        """Literal ClassControlInterface.moveTo branch ordering."""
         pseudo = int(pseudo_home_steps)
-        current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
         target = {"x": int(x), "y": int(y), "z": int(z)}
+        results: list[dict[str, Any]] = []
+
+        def home_axis(axis: str, speed: int) -> dict[str, Any]:
+            profile = self._axis_profile(axis)
+            present = getattr(self.tester, "_oem_board_present", None)
+            if callable(present) and not present(int(profile["board"])):
+                return {"ok": True, "axis": axis, "source_noop": "board_null"}
+            return self.tester.motor_oem_go_home(
+                axis, speed=int(speed), rehome=True,
+                timeout_s=max(30.0, float(wait_timeout_s)),
+                require_switch_transition=False,
+            )
+
+        def move_axis(axis: str, position: int, acc: int) -> dict[str, Any]:
+            profile = self._axis_profile(axis)
+            effective = max(60, int(position)) if axis == "x" else int(position)
+            set_acc = self.tester.motor_set_axis_param(
+                profile["board"], 5, int(acc), motor=profile.get("motor", 0)
+            )
+            try:
+                move = self.tester.motor_oem_move_absolute(
+                    profile["board"], effective, motor=profile.get("motor", 0),
+                    wait_for_stop=True, max_position=profile.get("axis_max_steps"),
+                )
+            finally:
+                restore = self.tester.motor_set_axis_param(
+                    profile["board"], 5, 350 if axis == "x" else 400,
+                    motor=profile.get("motor", 0),
+                )
+            return {"ok": isinstance(move, Mapping) and move.get("ok") is True,
+                    "axis": axis, "target": effective, "set_acc": _json_safe(set_acc),
+                    "move": _json_safe(move), "restore_acc": _json_safe(restore)}
+
+        def run_pair(first: Callable[[], dict[str, Any]], second: Callable[[], dict[str, Any]], delay_s: float) -> list[dict[str, Any]]:
+            first_result: list[dict[str, Any]] = []
+            first_error: list[BaseException] = []
+            started = threading.Event()
+            def invoke_first() -> None:
+                started.set()
+                try:
+                    first_result.append(first())
+                except BaseException as exc:
+                    first_error.append(exc)
+            thread = threading.Thread(target=invoke_first, daemon=False)
+            thread.start()
+            started.wait()
+            time.sleep(delay_s)
+            second_result = second()
+            thread.join()
+            if first_error:
+                raise first_error[0]
+            return first_result + [second_result]
+
         if target == {"x": 0, "y": 0, "z": 0}:
-            z_home = self.tester.motor_oem_home_axis("z", startup=False, timeout_s=float(wait_timeout_s))
-            xy_home = self.tester.motor_oem_home_xy(timeout_s=float(wait_timeout_s))
+            z_home = self.tester.motor_oem_move_z_home(
+                rehome=True, timeout_s=max(30.0, float(wait_timeout_s))
+            )
+            if run_in_parallel:
+                xy = run_pair(lambda: home_axis("x", 1700), lambda: home_axis("y", 1800), 0.0)
+            else:
+                xy = [home_axis("x", 1700), home_axis("y", 1800)]
             return {
-                "ok": bool(
-                    isinstance(z_home, Mapping)
-                    and z_home.get("ok") is True
-                    and isinstance(xy_home, Mapping)
-                    and xy_home.get("ok") is True
-                ),
+                "ok": isinstance(z_home, Mapping) and z_home.get("ok") is True
+                      and all(row.get("ok") is True for row in xy),
+                "source_return_code": 0,
                 "branch": "all_zero_home",
                 "z_home": _json_safe(z_home),
-                "xy_home": _json_safe(xy_home),
-                "source_anchor": "ClassControlInterface.moveTo:4463-4508",
+                "xy_home": _json_safe(xy),
+                "source_anchor": "ClassControlInterface.moveTo:4463-4506",
             }
-        preclear = None
+
+        if type(gripper_confirmed) is not bool or type(tip_loaded) is not bool:
+            raise RuntimeError("moveTo gripper confirmation and TipLoaded authority are required")
+        if plate_on_gantry in {4, 5} and type(location19_y) is not int:
+            raise RuntimeError("moveTo location-19 Y authority is required for loaded plate branch")
+        plate_clear_y = int(location19_y) if type(location19_y) is int else 0
+
+        current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
         if current["z"] > pseudo:
-            preclear = self.oem_move_z(
-                pseudo,
-                pseudo_home_steps=pseudo,
-                motor_current=31,
-                wait_for_stop=True,
-            )
-            if preclear.get("ok") is not True:
-                return {"ok": False, "branch": "z_preclear_failed", "preclear": _json_safe(preclear)}
-        xy = self.oem_move_xy(target["x"], target["y"], wait_timeout_s=wait_timeout_s)
-        final_z = None
+            results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+        x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
+        y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
+
+        def move_y_or_home() -> dict[str, Any]:
+            return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
+
+        if gripper_confirmed and not tip_loaded:
+            results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0))
+            branch = "confirmed_gripper_no_tip_moveXY"
+        elif target["y"] < current["y"] or target["y"] < 46800:
+            if plate_on_gantry in {4, 5}:
+                if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
+                    results.append(move_axis("y", plate_clear_y, y_acc))
+                results.append(move_axis("x", target["x"], x_acc))
+                time.sleep(0.001)
+                results.append(move_y_or_home())
+                branch = "descending_y_loaded_plate"
+            elif run_in_parallel:
+                results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600))
+                branch = "descending_y_parallel_x_first"
+            else:
+                results.extend((move_axis("x", target["x"], x_acc), move_y_or_home()))
+                branch = "descending_y_sequential_x_first"
+        elif run_in_parallel:
+            results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300))
+            branch = "parallel_y_first"
+        else:
+            results.extend((move_y_or_home(), move_axis("x", target["x"], x_acc)))
+            branch = "sequential_y_first"
+
+        time.sleep(0.001)
+        time.sleep(0.001)
         if target["z"] > pseudo:
-            final_z = self.oem_move_z(
-                target["z"],
-                pseudo_home_steps=pseudo,
-                motor_current=31,
-                wait_for_stop=True,
-            )
+            results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+        px, py = self._axis_profile("x"), self._axis_profile("y")
+        restore = {
+            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
+            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
+        }
         return {
-            "ok": bool(xy.get("ok") is True and (final_z is None or final_z.get("ok") is True)),
-            "branch": "nonzero_composite",
+            "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
+            "source_return_code": 0,
+            "branch": branch,
             "target": target,
             "before": current,
             "pseudo_z_home": pseudo,
-            "preclear": _json_safe(preclear),
-            "xy": _json_safe(xy),
-            "final_z": _json_safe(final_z),
-            "source_anchor": "ClassControlInterface.moveTo:4510-4652",
+            "operations": _json_safe(results),
+            "restore_acc": _json_safe(restore),
+            "source_anchor": "ClassControlInterface.moveTo:4463-4620",
         }
 
     def absolute(
@@ -1677,6 +1769,7 @@ class Serial206OemInitializationProvider:
                 "thermal_door_open": None,
                 "tip_loaded": None,
                 "tip_dirty": None,
+                "plate_on_gantry": None,
                 "psudo_z_home_steps": 65000,
                 "current_location": None,
                 "current_well": None,
@@ -2208,10 +2301,14 @@ class Serial206OemInitializationProvider:
                     )
                 elif intent == "move_absolute":
                     machine_status = state.get("machine_status") or {}
-                    pseudo_home = 500 if type(machine_status.get("tip_loaded")) is bool else 65000
-                    result = self.primitives.z_move_absolute(
-                        int(values["position_steps"]), pseudo_home,
-                        timeout_s=float(values.get("wait_timeout_s", 20.0)),
+                    pseudo_home = machine_status.get("psudo_z_home_steps")
+                    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+                        raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    result = self.primitives.oem_move_z(
+                        int(values["position_steps"]),
+                        pseudo_home_steps=int(pseudo_home),
+                        motor_current=31,
+                        wait_for_stop=True,
                     )
                 else:
                     result = self.primitives.z_stop()

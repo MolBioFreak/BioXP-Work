@@ -207,6 +207,6 @@ def test_api_init_rejects_unmapped_pressure_profile_before_readiness_gate():
     assert failure.value.status_code == 400
     assert failure.value.detail == {
         "error": "validation_error",
-        "field": "pressure_profile",
-        "message": "only OEM pressure profile 1R is supported",
+        "message": "Only OEM-backed pressure profile 1R is admitted.",
+        "physical_motion_commanded": False,
     }

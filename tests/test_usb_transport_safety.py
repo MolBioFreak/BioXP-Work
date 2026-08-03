@@ -192,4 +192,4 @@ def test_oem_board_activation_relaxes_command_echo_only_for_chiller(monkeypatch)
 
     assert result[7]["status"] == 2
     assert calls == [(4, 64, True), (5, 64, True), (6, 64, True), (7, 64, False)]
-    assert tester._oem_initialized_boards == {4, 5, 6, 7}
+    assert tester._oem_board_state() == {4: True, 5: True, 6: True, 7: True}

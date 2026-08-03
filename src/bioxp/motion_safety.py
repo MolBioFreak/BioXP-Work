@@ -27,7 +27,7 @@ _SERIAL206_COMPONENTS = (
     ("g", 4, 2, True),
     ("door", 6, 0, True),
 )
-_SERIAL206_ACTIVATION_BOARDS = (4, 5, 6)
+_SERIAL206_ACTIVATION_BOARDS = (4, 5, 6, 7)
 
 
 @dataclass(frozen=True)
@@ -133,43 +133,26 @@ def prepare_motion_without_motion(
     if not authority_ok:
         return _preparation_result(authority, ledger)
 
-    activation_rows: dict[int, Any] = {}
-    for board in activation_boards:
-        try:
-            row = driver.board_activate(board)
-        except Exception as exc:
-            row = {"board": board, "ack": None, "error": f"{type(exc).__name__}: {exc}"}
-        activation_rows[board] = row
-        ack_ok = _ack_status(row) == 100
-        ledger.append(_stage(
-            f"activate_board_{board}",
-            "passed" if ack_ok else "failed",
-            "ClassControlInterface.activateBoard lines 3474-3493",
-            row,
-        ))
-        if not ack_ok:
-            return _preparation_result(authority, ledger)
-
-    board_wait = {
-        "ok": True,
-        "required_boards": list(activation_boards),
-        "initialized_boards": list(activation_boards),
-        "activation_receipts": activation_rows,
-        "source_anchor": "ClassControlInterface.activateBoard lines 3474-3493",
-    }
+    try:
+        activation = driver.oem_activate_uninitialized_boards()
+        board_wait = driver.motor_oem_wait_for_board()
+    except Exception as exc:
+        activation = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        board_wait = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     ledger.append(_stage(
-        "board_7_resolution",
-        "not_applicable",
-        "serial-206 board authority: board 7 is chiller, not a ClassMotor movement board",
-        {
-            "board": 7,
-            "role": "chiller_auxiliary_temperature_controller",
-            "activation_required": False,
-            "command_sent": False,
-            "invalid_command_status": 2,
-            "resolution": "status 2 is not promoted to motor activation success",
-        },
+        "activateBoard",
+        "passed" if isinstance(activation, Mapping) else "failed",
+        "ClassControlInterface.activateBoard lines 3474-3493",
+        activation,
     ))
+    ledger.append(_stage(
+        "waitForBoard",
+        "passed" if isinstance(board_wait, Mapping) and board_wait.get("ok") is True else "failed",
+        "ClassControlInterface.waitForBoard lines 3507-3534",
+        board_wait,
+    ))
+    if not isinstance(board_wait, Mapping) or board_wait.get("ok") is not True:
+        return _preparation_result(authority, ledger)
 
     try:
         initialized = driver.oem_initialize_without_motion_test_case(
@@ -316,7 +299,7 @@ def physical_aggregate_stop(
     not prove that a mechanism physically moved or stopped, so operator-observed
     physical-effect verification remains explicitly false.
     """
-    latch = getattr(driver, "oem_latch_24v_dropped", None)
+    latch = getattr(driver, "motor_oem_force_abort_motion", None)
     force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
     components: list[dict[str, Any]] = []
     present_rows: list[tuple[dict[str, Any], int, int]] = []

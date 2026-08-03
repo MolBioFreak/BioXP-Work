@@ -23,7 +23,7 @@ class FakeMotionDriver:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
-        self.activation_status = {4: 100, 5: 100, 6: 100}
+        self.activation_status = {4: 100, 5: 100, 6: 100, 7: 100}
         self.stop_status = {axis: 100 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.speeds = {axis: 0 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.parameter_readbacks = {
@@ -41,6 +41,23 @@ class FakeMotionDriver:
     def board_activate(self, board_id: int):
         self.calls.append(("activate", board_id))
         return {"board": board_id, "ack": {"status": self.activation_status[board_id]}}
+
+    def oem_activate_uninitialized_boards(self):
+        rows = []
+        for board_id in (4, 5, 6, 7):
+            status = self.activation_status[board_id]
+            self.calls.append(("activate", board_id))
+            rows.append({
+                "board": board_id,
+                "ack": None if status is None else {"status": status},
+                "ok": status == 100,
+            })
+        return {"ok": all(row["ok"] for row in rows), "boards": rows}
+
+    def motor_oem_wait_for_board(self):
+        self.calls.append(("wait_for_board",))
+        missing = [board for board, status in self.activation_status.items() if status != 100]
+        return {"ok": not missing, "initialized_boards": [board for board in self.activation_status if board not in missing], "missing": missing}
 
     def oem_initialize_without_motion_test_case(self, *, board_wait, components=None):
         del components
@@ -144,18 +161,12 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
     assert result["ok"] is True
     assert result["physical_motion"] is False
     assert result["homing_performed"] is False
-    assert [call for call in driver.calls if call[0] == "activate"] == [("activate", 4), ("activate", 5), ("activate", 6)]
+    assert [call for call in driver.calls if call[0] == "activate"] == [("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7)]
     assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
-    board7 = next(row for row in result["stage_ledger"] if row["stage_id"] == "board_7_resolution")
-    assert board7["status"] == "not_applicable"
-    assert board7["controller_evidence"]["invalid_command_status"] == 2
-    assert board7["controller_evidence"]["command_sent"] is False
     assert [row["stage_id"] for row in result["stage_ledger"]] == [
         "authority",
-        "activate_board_4",
-        "activate_board_5",
-        "activate_board_6",
-        "board_7_resolution",
+        "activateBoard",
+        "waitForBoard",
         "initializeMotorsWithoutMotion",
         "z_switch_mask_precondition",
         "parameter_readback",
@@ -202,8 +213,9 @@ def test_prepare_without_motion_fails_fast_on_missing_board_ack_without_initiali
 
     assert result["ok"] is False
     assert not any(call[0] == "initialize_without_motion" for call in driver.calls)
-    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "activate_board_5")
+    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "waitForBoard")
     assert failed["status"] == "failed"
+    assert failed["controller_evidence"]["missing"] == [5]
 
 
 def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero_speed():

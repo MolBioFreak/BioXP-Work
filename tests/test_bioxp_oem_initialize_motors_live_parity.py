@@ -79,8 +79,20 @@ class _ZPrimitiveSpy:
             "controller_terminal_state_verified": True,
         }
 
-    def z_move_absolute(self, position: int, pseudo_home: int, *, timeout_s: float):
-        self.calls.append(("move_absolute", {"position": position, "pseudo_home": pseudo_home, "timeout_s": timeout_s}))
+    def oem_move_z(
+        self,
+        position: int,
+        *,
+        pseudo_home_steps: int,
+        motor_current: int,
+        wait_for_stop: bool,
+    ):
+        self.calls.append(("move_absolute", {
+            "position": position,
+            "pseudo_home_steps": pseudo_home_steps,
+            "motor_current": motor_current,
+            "wait_for_stop": wait_for_stop,
+        }))
         return {
             "ok": True,
             "controller_command_acknowledged": True,
@@ -134,5 +146,10 @@ def test_provider_owns_z_lifecycle_and_routes_only_source_positive_intents():
     )
     assert absolute["ok"] is True
     assert ("move_steps", {"steps": 250, "timeout_s": 20.0}) in spy.calls
-    assert ("move_absolute", {"position": 70000, "pseudo_home": 65000, "timeout_s": 20.0}) in spy.calls
+    assert ("move_absolute", {
+        "position": 70000,
+        "pseudo_home_steps": 65000,
+        "motor_current": 31,
+        "wait_for_stop": True,
+    }) in spy.calls
     assert [name for name, _ in spy.calls] == ["prepare", "manual_home", "move_steps", "move_absolute"]

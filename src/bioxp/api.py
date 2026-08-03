@@ -289,6 +289,8 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=dict(result) if isinstance(result, Mapping) else {"error": "serial206_motion_intent_failed"})
     return dict(result)
+
+
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
     if _tester is None or _pipette_transport is None:
         raise RuntimeError("owned BioXpTester and FourPipetteTransport are required")
@@ -1234,17 +1236,19 @@ def _robot_owned_z_pseudo_home() -> dict[str, Any]:
     machine = provider.get("machine_status") if isinstance(provider, Mapping) else None
     pseudo_home = machine.get("psudo_z_home_steps") if isinstance(machine, Mapping) else None
     tip_loaded = machine.get("tip_loaded") if isinstance(machine, Mapping) else None
+    plate_on_gantry = machine.get("plate_on_gantry") if isinstance(machine, Mapping) else None
     if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
-        # A durable machine projection may expose the OEM tip predicate before
-        # it has materialized the derived coordinate.  Preserve the OEM
-        # low-clearance branch for either known boolean state; only an unknown
-        # predicate falls back to the uninitialized-load coordinate.
-        if type(tip_loaded) is bool:
+        if tip_loaded is True:
             pseudo_home = 500
-            source = "DefaultParameters.GantryLoad_durable_robot_state"
-        else:
+        elif tip_loaded is False and (plate_on_gantry is None or plate_on_gantry == ""):
             pseudo_home = 65000
-            source = "DefaultParameters.PSUDO_Z_HOME_LOW_uninitialized_load_state"
+        elif tip_loaded is False and str(plate_on_gantry).upper() == "BIO_SECURITY_COVER":
+            pseudo_home = 65000
+        elif tip_loaded is False:
+            pseudo_home = 500
+        else:
+            raise RuntimeError("durable PSUDO_Z_HOME authority is unavailable")
+        source = "DefaultParameters.GantryLoad_legacy_durable_state_upgrade"
     else:
         source = "DefaultParameters.GantryLoad_durable_robot_state"
     return {
@@ -1490,6 +1494,11 @@ class AxisDiagnosticStopRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     axis: Literal["x", "y", "z", "g", "door"]
+    # Stop remains independently reachable.  These legacy fields are accepted
+    # for wire compatibility but are not required for or consulted by stop.
+    operator_ack: Optional[Literal["STOP_AXIS"]] = None
+    reason: Optional[str] = Field(None, max_length=2000)
+    operator: Optional[str] = Field(None, max_length=200)
 
 
 class OemHomeXYRequest(BaseModel):
@@ -7259,8 +7268,8 @@ async def liquid_init(req: PipetteInitRequest):
             status_code=400,
             detail={
                 "error": "validation_error",
-                "field": "pressure_profile",
-                "message": "only OEM pressure profile 1R is supported",
+                "message": "Only OEM-backed pressure profile 1R is admitted.",
+                "physical_motion_commanded": False,
             },
         )
     if command.prime_volume_ul is not None:
