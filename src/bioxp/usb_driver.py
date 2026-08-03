@@ -4398,14 +4398,27 @@ class BioXpTester:
         }
 
     def motor_set_home(self, board_id, motor=0):
-        # OEM ClassMotor.setHome => SAP param 1, value 0.
+        # OEM ClassMotor.setHome => SAP param 1, value 0.  On this serial-206
+        # transport an SAP completion may arrive without the separate ACK frame;
+        # a successful immediate GAP1=0 readback is therefore the controller
+        # evidence that the source-shaped write took effect.
         row = self.motor_set_axis_param(board_id, 1, 0, motor=motor)
+        ack = row.get("ack")
+        readback = row.get("readback")
+        direct_ack = self._tmcl_success(ack)
+        readback_verified = bool(
+            isinstance(readback, Mapping)
+            and self._tmcl_success(readback.get("ack"))
+            and readback.get("value") == 0
+        )
         return {
             "board": int(board_id),
             "motor": int(motor),
-            "ack": row.get("ack"),
-            "readback": row.get("readback"),
-            "ok": self._tmcl_success(row.get("ack")),
+            "ack": ack,
+            "readback": readback,
+            "direct_ack": direct_ack,
+            "readback_verified": readback_verified,
+            "ok": bool(direct_ack or readback_verified),
         }
 
     def motor_axis_search_home(
