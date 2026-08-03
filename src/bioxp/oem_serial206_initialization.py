@@ -582,9 +582,24 @@ class Serial206ProductionPrimitiveAdapter:
     def x_wait_for_motor(self, *, pending_ticket: Mapping[str, Any], wait_timeout_s: float) -> dict[str, Any]:
         return self._x_finalize(pending_ticket, timeout_s=float(wait_timeout_s), motion_kind="absolute", publish=True)
 
-    def _x_home(self, *, timeout_s: float, source: str) -> dict[str, Any]:
+    def _x_home(self, *, timeout_s: float, source: str, startup: bool = False) -> dict[str, Any]:
         profile = self._x_profile()
-        home = self.tester.motor_oem_go_home("x", speed=1700, rehome=True, timeout_s=max(30.0, float(timeout_s)), require_switch_transition=False)
+        if startup:
+            home = self.tester.motor_oem_axis_search_home(
+                "x",
+                speed=250,
+                timeout_s=max(30.0, float(timeout_s)),
+                max_search_abs_delta=int(profile["home_search_max_abs_delta"]),
+            )
+        else:
+            home = self.tester.motor_oem_go_home(
+                "x",
+                speed=500,
+                rehome=True,
+                timeout_s=max(30.0, float(timeout_s)),
+                require_switch_transition=True,
+                max_search_abs_delta=int(profile["home_search_max_abs_delta"]),
+            )
         set_home = self.tester.motor_set_home(5, motor=0)
         position = self.tester.motor_get_position(5, motor=0)
         value = self._x_value(position)
@@ -593,10 +608,10 @@ class Serial206ProductionPrimitiveAdapter:
         if ok and self.reference_store is not None:
             reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source=source, motion_kind="home"))
             ok = reference.get("ok") is True and reference.get("durable_clean") is True
-        return {"ok": ok, "axis": "x", "intent": source, "home": _json_safe(home), "set_home": _json_safe(set_home), "position": _json_safe(position), "reference_state": _json_safe(reference), "physical_motion": True, "failure": None if ok else "x_home_evidence_not_verified"}
+        return {"ok": ok, "axis": "x", "intent": source, "startup": bool(startup), "home": _json_safe(home), "set_home": _json_safe(set_home), "position": _json_safe(position), "reference_state": _json_safe(reference), "physical_motion": True, "failure": None if ok else "x_home_evidence_not_verified"}
 
     def x_startup_home(self, *, timeout_s: float) -> dict[str, Any]:
-        return self._x_home(timeout_s=timeout_s, source="oem_startup_home")
+        return self._x_home(timeout_s=timeout_s, source="oem_startup_home", startup=True)
 
     def x_home_axis(self, *, timeout_s: float) -> dict[str, Any]:
         return self._x_home(timeout_s=timeout_s, source="oem_home_axis")

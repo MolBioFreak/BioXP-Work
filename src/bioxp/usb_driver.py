@@ -84,8 +84,12 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for X.
-            # Absence means no-write; do not actively force controller mask params to 0.
+            # OEM initializeMotorsWithoutMotion omits SAP12/SAP13 for X.  The
+            # live serial-206 reconciliation intentionally mirrors Y here:
+            # mask the persistently asserted right input so TMCL does not
+            # acknowledge +X while inhibiting the motor.  This is an explicit
+            # live adaptation, not a claim that the source method writes SAP12.
+            "disable_right": True,
             "warm_enable": True,
         },
         "y": {
@@ -4547,6 +4551,10 @@ class BioXpTester:
                 "run_current": 31,
                 "standby_current": 20 if startup else preset.get("standby_current", 10),
                 "stall_guard": 16,
+                # Live serial-206 X/Y right-switch parity adaptation; the
+                # effective SAP12 value is verified by the no-motion profile
+                # transaction before any X motion is admitted.
+                "disable_right": True,
                 "oem_home_step": "MotorX.axisSearchHome(speed=250)" if startup else "MotorX.goHome(speed=500,rehome=true)",
                 "axis_min_steps": 0,
                 "axis_max_steps": x_max,
@@ -4887,8 +4895,9 @@ class BioXpTester:
             return {
                 "ok": False,
                 "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
-                "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
+                "test_case_note": "Source-faithful no-motion sequence plus explicit X right-limit reconciliation; it does not home or command axis movement.",
                 "source_anchor": source_anchor,
+                "wire_contract": "literal_oem_order_with_explicit_x_right_limit_reconciliation",
                 "physical_motion": False,
                 "homing_performed": False,
                 "board_wait": board_wait,
@@ -4916,6 +4925,7 @@ class BioXpTester:
             emit("setChillerPWM.reagent_rc_off", self.BOARD_CHILLER, 144, 0, self.CHILLER_SET_AXIS[self.CHILLER_BANK_RC], 0)
             sleep_ms(1)
 
+        source_adaptations = []
         for name, profile, speed, acc, current, stall, masks in (
             ("x", x, 1700, 350, 31, 16, ()),
             ("y", y, 1800, 400, 31, 16, ((12, 1, "disable_right"),)),
@@ -4935,6 +4945,37 @@ class BioXpTester:
             for param, value, mask_name in masks:
                 sap(f"{name}.{mask_name}", profile, param, value)
                 sleep_ms(2)
+            if name == "x":
+                # This is deliberately separate from the source transcript:
+                # the recovered OEM initializer omits X SAP12, while the live
+                # serial-206 repair requires the same right-switch mask as Y.
+                # Do not accept ACK-only success; the effective register must
+                # read back as 1 before the profile can be considered repaired.
+                x_mask = self.motor_set_axis_param(
+                    self.BOARD_DECK, 12, 1, motor=0
+                )
+                x_mask_readback = x_mask.get("readback") if isinstance(x_mask, dict) else None
+                x_mask_ok = bool(
+                    isinstance(x_mask, dict)
+                    and x_mask.get("ok") is True
+                    and isinstance(x_mask_readback, dict)
+                    and x_mask_readback.get("value") == 1
+                )
+                transcript.append({
+                    "label": "x.live_right_limit_reconciliation",
+                    "board": int(self.BOARD_DECK),
+                    "command": 5,
+                    "type": 12,
+                    "motor": 0,
+                    "value": 1,
+                    "ack": x_mask.get("ack") if isinstance(x_mask, dict) else None,
+                    "readback": x_mask_readback,
+                    "set": 1,
+                    "ok": x_mask_ok,
+                    "source_exact": False,
+                    "adaptation": "serial206_x_y_right_switch_parity",
+                })
+                source_adaptations.append("x_right_limit_mask_sap12_1_readback")
 
         if "g" in selected:
             gv0 = int(gripper_version) == 0
@@ -4980,12 +5021,14 @@ class BioXpTester:
         report = {
             "ok": not failures and not no_replies,
             "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
-            "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
+            "test_case_note": "Source-faithful no-motion sequence plus explicit X right-limit reconciliation; it does not home or command axis movement.",
             "source_anchor": source_anchor,
+            "wire_contract": "literal_oem_order_with_explicit_x_right_limit_reconciliation",
             "selected_components": sorted(selected),
             "physical_motion": False,
             "homing_performed": False,
             "board_wait": board_wait,
+            "source_adaptations": source_adaptations,
             "machine_values": {"z_current": z_current, "z_current_source": z_current_source, "z_stall_guard": z_stall, "z_stall_guard_source": z_stall_source, "gripper_version": gripper_version},
             "transcript": transcript,
             "failures": failures,
