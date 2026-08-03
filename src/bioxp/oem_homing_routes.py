@@ -176,6 +176,8 @@ async def plan_oem_scriptmove_path(
     clean_path: bool = False,
     device_type: str = "",
     gripper_confirmed: bool = False,
+    plate_on_gantry: int | str | None = None,
+    location19_y: int | None = None,
     pseudo_z_home: int | None = None,
     run_in_parallel: bool = True,
     root_dir: str | None = None,
@@ -206,6 +208,8 @@ async def plan_oem_scriptmove_path(
         clean_path=clean_path,
         device_type=device_type,
         gripper_confirmed=gripper_confirmed,
+        plate_on_gantry=plate_on_gantry,
+        location19_y=location19_y,
         pseudo_z_home=pseudo_z_home,
     )
     plan = planner.plan_script_move_to(
@@ -354,17 +358,40 @@ def _execute_oem_step_live(
             if any(step.get(axis) is None for axis in ("x", "y", "z")):
                 result.update({"ok": False, "error": "moveTo missing x/y/z target"})
             else:
-                sub = move_to(
-                    int(step["x"]),
-                    int(step["y"]),
-                    int(step["z"]),
-                    pseudo_home_steps=int(pseudo_z_home_steps if pseudo_z_home_steps is not None else 65000),
-                    run_in_parallel=bool(step.get("run_in_parallel", True)),
-                    wait_timeout_s=wait_timeout_s,
+                authority = step.get("move_to_authority")
+                plate_on_gantry = authority.get("plate_on_gantry") if isinstance(authority, Mapping) else None
+                plate_authority_valid = (
+                    plate_on_gantry is None
+                    or (type(plate_on_gantry) is int and type(plate_on_gantry) is not bool)
+                    or type(plate_on_gantry) is str
                 )
-                result["results"].append({"command": "moveTo", "result": sub})
-                if _step_result_failed(sub):
-                    result.update({"ok": False, "error": "moveTo composite step failed"})
+                if (
+                    not isinstance(authority, Mapping)
+                    or type(authority.get("gripper_confirmed")) is not bool
+                    or type(authority.get("tip_loaded")) is not bool
+                    or not plate_authority_valid
+                    or (
+                        plate_on_gantry in {4, 5}
+                        and type(authority.get("location19_y")) is not int
+                    )
+                ):
+                    result.update({"ok": False, "error": "OEM moveTo branch authority is not bound"})
+                else:
+                    sub = move_to(
+                        int(step["x"]),
+                        int(step["y"]),
+                        int(step["z"]),
+                        pseudo_home_steps=int(pseudo_z_home_steps if pseudo_z_home_steps is not None else 65000),
+                        run_in_parallel=bool(step.get("run_in_parallel", True)),
+                        wait_timeout_s=wait_timeout_s,
+                        gripper_confirmed=authority["gripper_confirmed"],
+                        tip_loaded=authority["tip_loaded"],
+                        plate_on_gantry=authority.get("plate_on_gantry"),
+                        location19_y=authority.get("location19_y"),
+                    )
+                    result["results"].append({"command": "moveTo", "result": sub})
+                    if _step_result_failed(sub):
+                        result.update({"ok": False, "error": "moveTo composite step failed"})
         else:
             result.update({"ok": False, "error": "OEM moveTo composite is not bound"})
     elif op == "moveXY":
@@ -496,6 +523,8 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
         clean_path=bool(payload.get("clean_path") or False),
         device_type=str(payload.get("device_type") or ""),
         gripper_confirmed=bool(payload.get("gripper_confirmed") or False),
+        plate_on_gantry=payload.get("plate_on_gantry"),
+        location19_y=payload.get("location19_y"),
         pseudo_z_home=payload.get("pseudo_z_home"),
         run_in_parallel=bool(payload.get("run_in_parallel") if payload.get("run_in_parallel") is not None else True),
         root_dir=payload.get("root_dir"),

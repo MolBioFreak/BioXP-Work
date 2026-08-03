@@ -270,6 +270,38 @@ class Serial206ProductionPrimitiveAdapter:
         "chiller_gp_write",
     )
 
+    _INITIALIZE_MOTION_PIPETTE_METHODS = (
+        "query_all_pipette_tip_states",
+        "eject_all_pipette_tips_for_oem_startup",
+        "initiate_pipette_group_for_oem_initialize_motion",
+        "checked_pipette_status_for_oem_initialize_motion",
+    )
+
+    _PIPETTE_TRANSPORT_METHODS = (
+        "query_tip_status_all",
+        "eject_all_tips_for_oem_startup",
+        "initiate_group_once_for_oem_initialize_motion",
+        "checked_pipette_status_for_oem_initialize_motion",
+    )
+
+    _MOVE_TO_ADAPTER_METHODS = (
+        "oem_initialize_motion_scriptmove_to_waste",
+        "oem_move_to",
+        "oem_move_xy",
+        "oem_move_z",
+        "oem_move_axis_absolute",
+    )
+
+    _MOVE_TO_TESTER_METHODS = (
+        "_motion_oem_axis_profile",
+        "motor_get_position",
+        "motor_set_axis_param",
+        "motor_oem_move_absolute",
+        "motor_oem_wait_targets_reached",
+        "motor_oem_go_home",
+        "motor_oem_move_z_home",
+    )
+
     def __init__(
         self,
         tester: Any,
@@ -345,24 +377,35 @@ class Serial206ProductionPrimitiveAdapter:
             blockers.append("serial206_gripper_version_1_not_selected")
         if calibrated is not None and calibrated is not True:
             blockers.append("serial206_calibrated_1_branch_not_selected")
-        pipette_methods = (
-            "query_tip_status_all",
-            "eject_all_tips_for_oem_startup",
-            "initiate_group_once_for_oem_initialize_motion",
-            "checked_pipette_status_for_oem_initialize_motion",
-        )
         motion_missing = [
             f"pipette_primitive_not_bound:{name}"
-            for name in pipette_methods
+            for name in self._PIPETTE_TRANSPORT_METHODS
             if not callable(getattr(self.pipette_transport, name, None))
         ]
+        motion_missing.extend(
+            f"initializeMotion_primitive_not_bound:{name}"
+            for name in self._INITIALIZE_MOTION_PIPETTE_METHODS
+            if not callable(getattr(self, name, None))
+        )
+        move_to_missing = [
+            f"moveTo_adapter_dependency_not_bound:{name}"
+            for name in self._MOVE_TO_ADAPTER_METHODS
+            if not callable(getattr(self, name, None))
+        ]
+        move_to_missing.extend(
+            f"moveTo_tester_dependency_not_bound:{name}"
+            for name in self._MOVE_TO_TESTER_METHODS
+            if not callable(getattr(self.tester, name, None))
+        )
         try:
             table = load_bound_oem_position_table()
             table_identity = {"source": table.source}
         except Exception:
             table_identity = None
             motion_missing.append("immutable_oem_position_table_not_bound")
-        motion_missing.append("oem_moveTo_branch_authority_not_bound")
+        move_to_bound = table_identity is not None and not move_to_missing
+        if not move_to_bound:
+            motion_missing.append("oem_moveTo_branch_authority_not_bound")
         motors = not blockers
         initialize_motion_complete = motors and not motion_missing
         return {
@@ -376,6 +419,12 @@ class Serial206ProductionPrimitiveAdapter:
             "initialize_motion_complete": initialize_motion_complete,
             "initialize_motion_partial_primitives": list(_MOTION_STAGE_ORDER) if initialize_motion_complete else [],
             "initialize_motion_missing_primitives": motion_missing,
+            "initialize_motion_moveTo_branch_authority": {
+                "bound": move_to_bound,
+                "adapter_dependencies": list(self._MOVE_TO_ADAPTER_METHODS),
+                "tester_dependencies": list(self._MOVE_TO_TESTER_METHODS),
+                "source_anchor": "ClassControlInterface.moveTo:4463-4620; ClassControlInterface.scriptmoveTo:3734-4014",
+            },
             "position_table_identity": _json_safe(table_identity),
         }
 
@@ -1655,6 +1704,8 @@ class Serial206ProductionPrimitiveAdapter:
         tip_dirty: bool,
         timeout_s: float,
         pseudo_home_steps: int = 65000,
+        plate_on_gantry: int | str | None = None,
+        location19_y: int | None = None,
     ) -> dict[str, Any]:
         table = load_bound_oem_position_table()
         parity = load_oem_parity_config(None)
@@ -1678,6 +1729,8 @@ class Serial206ProductionPrimitiveAdapter:
             device_type="BIOXP",
             gripper_confirmed=False,
             pseudo_z_home=int(pseudo_home_steps),
+            plate_on_gantry=plate_on_gantry,
+            location19_y=location19_y,
         )
         planner = OemPathPlanner(
             table,
@@ -3259,6 +3312,8 @@ class Serial206OemInitializationProvider:
                 tip_dirty=bool(machine.get("tip_dirty")) if isinstance(machine, Mapping) else False,
                 timeout_s=min(bounded, 60.0),
                 pseudo_home_steps=int(machine.get("psudo_z_home_steps", 65000)) if isinstance(machine, Mapping) else 65000,
+                plate_on_gantry=machine.get("plate_on_gantry") if isinstance(machine, Mapping) else None,
+                location19_y=machine.get("location19_y") if isinstance(machine, Mapping) else None,
             )
         if stage == "initializeMotion.updateLocation.tip_exists":
             return {
