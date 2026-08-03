@@ -4555,6 +4555,13 @@ class BioXpTester:
                 # effective SAP12 value is verified by the no-motion profile
                 # transaction before any X motion is admitted.
                 "disable_right": True,
+                # Keep startup and manual OEM modes explicit in every status
+                # projection. ``oem_home_step`` remains the selected mode for
+                # backward compatibility; these named fields prevent a generic
+                # status read from being mistaken for startup parity.
+                "home_mode": "startup" if startup else "manual",
+                "oem_startup_home_step": "MotorX.axisSearchHome(speed=250)",
+                "oem_manual_home_step": "MotorX.goHome(speed=500,rehome=true)",
                 "oem_home_step": "MotorX.axisSearchHome(speed=250)" if startup else "MotorX.goHome(speed=500,rehome=true)",
                 "axis_min_steps": 0,
                 "axis_max_steps": x_max,
