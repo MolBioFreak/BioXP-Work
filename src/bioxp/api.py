@@ -5717,23 +5717,33 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    latch_generation = _require_non_homing_motion_recovery_pending()
+    # A non-homing strict startup is the explicit operator-controlled way to
+    # establish the live arm.  It is valid both after a maintenance latch and
+    # from a clean, deliberately disarmed service state; requiring an existing
+    # maintenance latch made the arm state permanently unreachable after boot.
+    maintenance_before = _maintenance_state_payload()
+    latch_generation = None
+    if maintenance_before.get("recovery_required") is True:
+        latch_generation = _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
         lambda: tester.motion_arm_strict_startup(run_homing=False),
         timeout_s=90.0,
     )
-    maintenance = _complete_non_homing_motion_recovery(
-        response,
-        source="motion_arm_strict_startup",
-        expected_latch_generation=latch_generation,
-        evidence={
-            "strict_startup": response,
-            "run_homing": False,
-            "operator_reason": operator_reason,
-        },
-    )
+    if latch_generation is not None:
+        maintenance = _complete_non_homing_motion_recovery(
+            response,
+            source="motion_arm_strict_startup",
+            expected_latch_generation=latch_generation,
+            evidence={
+                "strict_startup": response,
+                "run_homing": False,
+                "operator_reason": operator_reason,
+            },
+        )
+    else:
+        maintenance = _maintenance_state_payload()
     if isinstance(response, dict):
         response = dict(response)
         response["maintenance_state"] = maintenance
