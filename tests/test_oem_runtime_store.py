@@ -11,7 +11,7 @@ def test_runtime_store_writes_state_and_journals_with_sequence(tmp_path, monkeyp
     store = OEMRuntimeStore(tmp_path)
     state = store.write_state(OEMRuntimeSnapshot())
     event = store.append_event({"event_type": "door"})
-    hist = store.append_command_history({"command": {"name": "initializeSystem"}})
+    hist = store.append_command_history({"command": {"name": "PrepareToRunJob"}})
     assert state["sequence"] < event["sequence"] < hist["sequence"]
     assert state["runtime_state"] == "waiting"
     saved = store.read_state()
@@ -25,7 +25,7 @@ def test_runtime_recovery_flags_active_command(tmp_path):
     store = OEMRuntimeStore(tmp_path)
     payload = OEMRuntimeSnapshot().to_dict()
     payload["worker"]["state"] = "running"
-    payload["worker"]["active_command"] = {"name": "initializeSystem"}
+    payload["worker"]["active_command"] = {"name": "PrepareToRunJob"}
     store.write_state(payload)
     recovered = store.recover_state()
     assert recovered["recovery_required"] is True

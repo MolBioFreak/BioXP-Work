@@ -255,9 +255,12 @@ class Serial206ProductionPrimitiveAdapter:
         "motor_set_axis_param",
         "motor_move_relative",
         "motor_wait_stopped",
+        "motor_oem_wait_target_reached",
         "motor_get_position",
         "motor_set_home",
         "motor_move_absolute",
+        "motor_oem_move_absolute",
+        "oem_no24v_state",
         "motor_prepare_axis",
         "motor_oem_door_search_home",
         "motor_oem_open_thermal_door",
@@ -382,7 +385,11 @@ class Serial206ProductionPrimitiveAdapter:
                 "physical_motion": False,
                 "blocker": "ownership_generation_changed_before_preparation",
             }
-        raw = prepare_motion_without_motion(self.tester, self.authority_provider())
+        raw = prepare_motion_without_motion(
+            self.tester,
+            self.authority_provider(),
+            components=("z",),
+        )
         ok = isinstance(raw, Mapping) and raw.get("ok") is True and raw.get("physical_motion") is False
         return {
             "ok": ok,
@@ -393,11 +400,234 @@ class Serial206ProductionPrimitiveAdapter:
             "receipt": _json_safe(raw),
         }
 
-    def motor_oem_home_axis(self, *args: Any, **kwargs: Any) -> Any:
-        return self.tester.motor_oem_home_axis(*args, **kwargs)
+    def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_set_home(*args, **kwargs)
 
-    def motor_set_axis_param(self, *args: Any, **kwargs: Any) -> Any:
-        return self.tester.motor_set_axis_param(*args, **kwargs)
+    def _z_profile(self) -> dict[str, Any]:
+        profile = dict(self.tester._motion_oem_axis_profile("z"))
+        if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
+            raise RuntimeError("serial-206 Z authority must resolve to board 4 motor 1")
+        self.tester.motor_oem_require_no_motion_profile("z")
+        interlock = self.tester.motor_oem_verify_motion_interlock()
+        if not isinstance(interlock, Mapping) or interlock.get("ok") is not True:
+            raise RuntimeError(f"serial-206 Z interlock failed: {interlock}")
+        return profile
+
+    @staticmethod
+    def _z_value(row: Any) -> int | None:
+        value = row.get("value") if isinstance(row, Mapping) else None
+        return int(value) if type(value) is int else None
+
+    def _z_finalize_position_move(
+        self,
+        *,
+        profile: Mapping[str, Any],
+        before: Mapping[str, Any],
+        target: int,
+        move: Mapping[str, Any],
+        wait_timeout_s: float,
+        event_window: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        wait = self.tester.motor_wait_stopped(
+            board, motor=motor, timeout_s=float(wait_timeout_s), require_seen_nonzero=True
+        )
+        events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
+        axis_events = [
+            row for row in events if isinstance(row, Mapping)
+            and row.get("board") in {None, board}
+            and row.get("motor") in {None, motor}
+        ]
+        target_events = [row for row in axis_events if row.get("status") == 128]
+        error_events = [row for row in axis_events if row.get("status") in {13, 14, 130}]
+        after = self.tester.motor_get_position(board, motor=motor)
+        before_value = self._z_value(before)
+        after_value = self._z_value(after)
+        move_ack = isinstance(move, Mapping) and move.get("ok") is True
+        terminal = isinstance(wait, Mapping) and wait.get("stopped") is True
+        ok = bool(
+            move_ack and terminal and target_events and not error_events
+            and after_value == int(target)
+        )
+        failure_stop = None
+        if not ok:
+            failure_stop = self.z_stop(timeout_s=3.0)
+        return {
+            "ok": ok,
+            "robot_http_acknowledged": True,
+            "controller_command_acknowledged": move_ack,
+            "controller_terminal_state_verified": terminal,
+            "physical_effect_verified": False,
+            "event_window": _json_safe(event_window),
+            "target_events": _json_safe(target_events),
+            "controller_error_events": _json_safe(error_events),
+            "before": _json_safe(before),
+            "after": _json_safe(after),
+            "before_position_steps": before_value,
+            "target_position_steps": int(target),
+            "after_position_steps": after_value,
+            "move": _json_safe(move),
+            "wait": _json_safe(wait),
+            "failure_stop": _json_safe(failure_stop),
+        }
+
+    def z_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
+        profile = self._z_profile()
+        before = self.tester.motor_get_position(4, motor=1)
+        before_value = self._z_value(before)
+        if before_value is None:
+            return {"ok": False, "error": "z_current_position_unavailable", "before": _json_safe(before)}
+        target = before_value + int(steps)
+        if before_value < 0 or before_value > 160000 or target < 0 or target > 160000:
+            return {
+                "ok": False,
+                "error": "z_source_coordinate_out_of_bounds",
+                "before_position_steps": before_value,
+                "requested_steps": int(steps),
+                "target_position_steps": target,
+                "source_min_steps": 0,
+                "source_max_steps": 160000,
+            }
+        event_window = self.tester.clear_bus_event_buffer()
+        move = self.tester.motor_move_relative(4, int(steps), motor=1)
+        result = self._z_finalize_position_move(
+            profile=profile, before=before, target=target, move=move,
+            wait_timeout_s=wait_timeout_s, event_window=event_window,
+        )
+        result.update({
+            "intent": "move_steps",
+            "requested_steps": int(steps),
+            "source_anchor": "ClassControlInterface.moveSteps:4165-4204",
+        })
+        return result
+
+    def z_move_absolute(
+        self,
+        *,
+        requested_position_steps: int,
+        pseudo_home_steps: int,
+        wait_timeout_s: float = 20.0,
+    ) -> dict[str, Any]:
+        profile = self._z_profile()
+        requested = int(requested_position_steps)
+        effective = max(int(pseudo_home_steps), requested)
+        if requested < 0 or requested > 160000 or effective < 0 or effective > 160000:
+            return {
+                "ok": False,
+                "error": "z_source_coordinate_out_of_bounds",
+                "requested_position_steps": requested,
+                "effective_position_steps": effective,
+                "source_min_steps": 0,
+                "source_max_steps": 160000,
+            }
+        before = self.tester.motor_get_position(4, motor=1)
+        current_write = self.tester.motor_set_axis_param(4, 6, int(profile["run_current"]), motor=1)
+        current_readback = self.tester.motor_get_axis_param(4, 6, motor=1)
+        if not isinstance(current_write, Mapping) or current_write.get("ok") is not True or self._z_value(current_readback) != int(profile["run_current"]):
+            return {
+                "ok": False,
+                "error": "z_source_current_readback_failed",
+                "current_write": _json_safe(current_write),
+                "current_readback": _json_safe(current_readback),
+            }
+        event_window = self.tester.clear_bus_event_buffer()
+        move = self.tester.motor_move_absolute(4, effective, motor=1)
+        result = self._z_finalize_position_move(
+            profile=profile, before=before, target=effective, move=move,
+            wait_timeout_s=wait_timeout_s, event_window=event_window,
+        )
+        result.update({
+            "intent": "move_absolute",
+            "requested_position_steps": requested,
+            "effective_position_steps": effective,
+            "pseudo_home_steps": int(pseudo_home_steps),
+            "source_anchor": "ClassControlInterface.moveZ:4663-4699",
+        })
+        return result
+
+    def z_manual_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        self._z_profile()
+        interlock = self.tester.motor_oem_verify_motion_interlock()
+        if interlock.get("ok") is not True:
+            return {"ok": False, "failure": "motion_interlock_not_ready", "interlock": interlock}
+        home = self.tester.motor_oem_move_z_home(rehome=True, timeout_s=float(timeout_s))
+        ok = isinstance(home, Mapping) and home.get("ok") is True
+        return {
+            "ok": ok,
+            "intent": "manual_go_home_1791",
+            "source_method": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
+            "interlock": interlock,
+            "home": home,
+            "controller_command_acknowledged": bool(ok),
+            "controller_terminal_state_verified": bool(ok),
+            "physical_effect_verified": False,
+        }
+
+    def z_startup_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        self._z_profile()
+        result = self.tester.motor_oem_axis_search_home(
+            "z", speed=1791, timeout_s=float(timeout_s), max_search_abs_delta=160000
+        )
+        return {**dict(result), "intent": "startup_axis_search_1791"}
+
+    def z_diagnostic_home_axis(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        self._z_profile()
+        interlock = self.tester.motor_oem_verify_motion_interlock()
+        if interlock.get("ok") is not True:
+            return {"ok": False, "failure": "motion_interlock_not_ready", "interlock": interlock}
+        home = self.tester.motor_oem_home_axis_board_test("z", timeout_s=float(timeout_s))
+        ok = isinstance(home, Mapping) and home.get("ok") is True
+        return {
+            "ok": ok,
+            "intent": "diagnostic_home_axis_597",
+            "source_method": "ClassControlInterface.HomeAxis(z) -> axisSearchHome(597)",
+            "interlock": interlock,
+            "home": home,
+            "controller_command_acknowledged": bool(ok),
+            "controller_terminal_state_verified": bool(ok),
+            "physical_effect_verified": False,
+        }
+
+    def z_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        stop = self.tester.motor_stop(4, motor=1)
+        wait = self.tester.motor_wait_stopped(
+            4, motor=1, timeout_s=float(timeout_s), require_seen_nonzero=False
+        )
+        terminal = isinstance(wait, Mapping) and wait.get("stopped") is True
+        return {
+            "ok": bool(isinstance(stop, Mapping) and stop.get("ok") is True and terminal),
+            "intent": "stop",
+            "controller_command_acknowledged": isinstance(stop, Mapping) and stop.get("ok") is True,
+            "controller_terminal_state_verified": terminal,
+            "physical_effect_verified": False,
+            "stop": _json_safe(stop),
+            "wait": _json_safe(wait),
+        }
+
+    def z_reconcile_switch_masks(self) -> dict[str, Any]:
+        before = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
+        writes = {param: self.tester.motor_set_axis_param(4, param, 0, motor=1) for param in (12, 13)}
+        after = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
+        ok = all(
+            isinstance(writes[param], Mapping) and writes[param].get("ok") is True
+            and self._z_value(after[param]) == 0
+            for param in (12, 13)
+        )
+        return {
+            "ok": ok,
+            "intent": "reconcile_switch_masks",
+            "physical_motion": False,
+            "physical_effect_verified": False,
+            "before": _json_safe(before),
+            "writes": _json_safe(writes),
+            "after": _json_safe(after),
+            "source_exact": False,
+            "recovery_reason": "restore serial-206 source precondition GAP12=0 GAP13=0",
+        }
+
+    def motor_get_axis_param(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_get_axis_param(*args, **kwargs)
 
     def motor_move_relative(self, *args: Any, **kwargs: Any) -> Any:
         board = args[0]
@@ -414,8 +644,13 @@ class Serial206ProductionPrimitiveAdapter:
         after = self.tester.motor_get_position(board, motor=motor)
         return {"wait": wait, "position": {"after": after}}
 
-    def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
-        return self.tester.motor_set_home(*args, **kwargs)
+    def motor_oem_home_axis(self, axis: str, *args: Any, **kwargs: Any) -> Any:
+        if str(axis).strip().lower() == "z" and kwargs.get("startup") is True:
+            return self.z_startup_home(timeout_s=float(kwargs.get("timeout_s", 30.0)))
+        return self.tester.motor_oem_home_axis(axis, *args, **kwargs)
+
+    def motor_set_axis_param(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_set_axis_param(*args, **kwargs)
 
     def motor_move_absolute(self, *args: Any, **kwargs: Any) -> Any:
         board = args[0]
@@ -593,39 +828,219 @@ class Serial206ProductionPrimitiveAdapter:
         timeout_s: float,
         speed: int | None = None,
         acc: int | None = None,
+        pseudo_home_steps: int = 65000,
     ) -> dict[str, Any]:
+        del speed, acc, timeout_s
+        axis_key = str(axis).lower()
+        if axis_key == "z":
+            return self.oem_move_z(
+                int(position),
+                pseudo_home_steps=int(pseudo_home_steps),
+                motor_current=31,
+                wait_for_stop=True,
+            )
+        return self.oem_move_axis_absolute(axis_key, int(position), wait_for_stop=True)
+
+    def oem_move_axis_absolute(
+        self,
+        axis: str,
+        position: int,
+        *,
+        wait_for_stop: bool = True,
+    ) -> dict[str, Any]:
+        """Issue one source-shaped raw axis move without profile preparation."""
         profile = self._axis_profile(axis)
-        before = self.tester.motor_get_position(profile["board"], motor=profile.get("motor", 0))
-        prepared = self._prepare_path_axis(axis, speed=speed, acc=acc)
-        move = self.tester.motor_move_absolute(
+        move = self.tester.motor_oem_move_absolute(
             profile["board"],
             int(position),
             motor=profile.get("motor", 0),
-        )
-        wait = self.tester.motor_wait_stopped(
-            profile["board"],
-            motor=profile.get("motor", 0),
-            timeout_s=float(timeout_s),
-            require_seen_nonzero=True,
-        )
-        after = self.tester.motor_get_position(profile["board"], motor=profile.get("motor", 0))
-        after_value = self._position_value(after)
-        ok = bool(
-            isinstance(move, Mapping)
-            and move.get("ok") is True
-            and isinstance(wait, Mapping)
-            and wait.get("stopped") is True
-            and after_value == int(position)
+            wait_for_stop=bool(wait_for_stop),
+            max_position=profile.get("axis_max_steps"),
         )
         return {
-            "ok": ok,
+            "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
             "axis": str(axis).lower(),
             "target": int(position),
-            "prepare": _json_safe(prepared),
             "move": _json_safe(move),
-            "wait": _json_safe(wait),
-            "position": {"before": _json_safe(before), "after": _json_safe(after)},
-            "source_anchor": "ControlLib.initializeMotion:8815-8816; ClassControlInterface.moveZ/moveX",
+            "source_anchor": "ClassHeadBoard.moveToAbs; ClassControlInterface.moveX/moveY",
+        }
+
+    def oem_move_z(
+        self,
+        position: int,
+        *,
+        pseudo_home_steps: int,
+        motor_current: int = 31,
+        wait_for_stop: bool = True,
+    ) -> dict[str, Any]:
+        """ClassControlInterface.moveZ with dynamic PSUDO_Z_HOME."""
+        profile = self._axis_profile("z")
+        effective = max(int(pseudo_home_steps), int(position))
+        current_set = self.tester.motor_set_axis_param(
+            profile["board"],
+            6,
+            int(motor_current),
+            motor=profile.get("motor", 0),
+        )
+        move = self.tester.motor_oem_move_absolute(
+            profile["board"],
+            effective,
+            motor=profile.get("motor", 0),
+            wait_for_stop=bool(wait_for_stop),
+            max_position=profile.get("axis_max_steps"),
+        )
+        return {
+            "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
+            "axis": "z",
+            "requested": int(position),
+            "effective": effective,
+            "pseudo_z_home": int(pseudo_home_steps),
+            "motor_current": int(motor_current),
+            "current_set": _json_safe(current_set),
+            "move": _json_safe(move),
+            "source_anchor": "ClassControlInterface.moveZ:4254-4265",
+        }
+
+    def oem_move_xy(
+        self,
+        x: int,
+        y: int,
+        *,
+        wait_timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        """ClassControlInterface.moveXY source ordering and acceleration."""
+        px = self._axis_profile("x")
+        py = self._axis_profile("y")
+        current_x = self._read_axis_position("x")
+        current_y = self._read_axis_position("y")
+        target_x, target_y = int(x), int(y)
+        distance_x = abs(target_x - current_x)
+        distance_y = abs(target_y - current_y)
+        commands: dict[str, Any] = {}
+        waits: dict[str, Any] = {}
+        launch_order: list[str] = []
+        if distance_x <= 20 or distance_y <= 20:
+            commands["x"] = self.oem_move_axis_absolute("x", target_x, wait_for_stop=True)
+            launch_order.append("x")
+            commands["y"] = self.oem_move_axis_absolute("y", target_y, wait_for_stop=True)
+            launch_order.append("y")
+            return {
+                "ok": all(commands[key].get("ok") is True for key in launch_order),
+                "targets": {"x": target_x, "y": target_y},
+                "before": {"x": current_x, "y": current_y},
+                "commands": _json_safe(commands),
+                "launch_order": launch_order,
+                "source_anchor": "ClassControlInterface.moveXY:4285-4311",
+            }
+
+        x_acc = 400 if distance_x > 10000 else 350
+        y_acc = 750 if distance_y > 10000 else 400
+        set_acc = {
+            "x": self.tester.motor_set_axis_param(px["board"], 5, x_acc, motor=px.get("motor", 0)),
+            "y": self.tester.motor_set_axis_param(py["board"], 5, y_acc, motor=py.get("motor", 0)),
+        }
+        if distance_x > distance_y:
+            commands["x"] = self.tester.motor_oem_move_absolute(
+                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
+            )
+            launch_order.append("x")
+            if distance_y > 4000:
+                time.sleep(0.050 * distance_x / distance_y)
+            commands["y"] = self.tester.motor_oem_move_absolute(
+                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
+            )
+            launch_order.append("y")
+        else:
+            commands["y"] = self.tester.motor_oem_move_absolute(
+                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
+            )
+            launch_order.append("y")
+            if distance_x > 4000:
+                time.sleep(0.050 * distance_y / distance_x)
+            commands["x"] = self.tester.motor_oem_move_absolute(
+                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
+            )
+            launch_order.append("x")
+        time.sleep(0.005)
+        for axis, profile in (("x", px), ("y", py)):
+            waits[axis] = self.tester.motor_oem_wait_target_reached(
+                profile["board"], motor=profile.get("motor", 0), timeout_s=5.0
+            )
+        restore_acc = {
+            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
+            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
+        }
+        return {
+            "ok": all(isinstance(waits[axis], Mapping) and waits[axis].get("ok") is True for axis in ("x", "y")),
+            "targets": {"x": target_x, "y": target_y},
+            "before": {"x": current_x, "y": current_y},
+            "commands": _json_safe(commands),
+            "waits": _json_safe(waits),
+            "set_acc": _json_safe(set_acc),
+            "restore_acc": _json_safe(restore_acc),
+            "launch_order": launch_order,
+            "source_anchor": "ClassControlInterface.moveXY:4285-4366",
+        }
+
+    def oem_move_to(
+        self,
+        x: int,
+        y: int,
+        z: int,
+        *,
+        pseudo_home_steps: int,
+        run_in_parallel: bool = True,
+        wait_timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        """Core OEM composite moveTo ordering, including Z pre-clear."""
+        del run_in_parallel
+        pseudo = int(pseudo_home_steps)
+        current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
+        target = {"x": int(x), "y": int(y), "z": int(z)}
+        if target == {"x": 0, "y": 0, "z": 0}:
+            z_home = self.tester.motor_oem_home_axis("z", startup=False, timeout_s=float(wait_timeout_s))
+            xy_home = self.tester.motor_oem_home_xy(timeout_s=float(wait_timeout_s))
+            return {
+                "ok": bool(
+                    isinstance(z_home, Mapping)
+                    and z_home.get("ok") is True
+                    and isinstance(xy_home, Mapping)
+                    and xy_home.get("ok") is True
+                ),
+                "branch": "all_zero_home",
+                "z_home": _json_safe(z_home),
+                "xy_home": _json_safe(xy_home),
+                "source_anchor": "ClassControlInterface.moveTo:4463-4508",
+            }
+        preclear = None
+        if current["z"] > pseudo:
+            preclear = self.oem_move_z(
+                pseudo,
+                pseudo_home_steps=pseudo,
+                motor_current=31,
+                wait_for_stop=True,
+            )
+            if preclear.get("ok") is not True:
+                return {"ok": False, "branch": "z_preclear_failed", "preclear": _json_safe(preclear)}
+        xy = self.oem_move_xy(target["x"], target["y"], wait_timeout_s=wait_timeout_s)
+        final_z = None
+        if target["z"] > pseudo:
+            final_z = self.oem_move_z(
+                target["z"],
+                pseudo_home_steps=pseudo,
+                motor_current=31,
+                wait_for_stop=True,
+            )
+        return {
+            "ok": bool(xy.get("ok") is True and (final_z is None or final_z.get("ok") is True)),
+            "branch": "nonzero_composite",
+            "target": target,
+            "before": current,
+            "pseudo_z_home": pseudo,
+            "preclear": _json_safe(preclear),
+            "xy": _json_safe(xy),
+            "final_z": _json_safe(final_z),
+            "source_anchor": "ClassControlInterface.moveTo:4510-4652",
         }
 
     def absolute(
@@ -880,6 +1295,7 @@ class Serial206ProductionPrimitiveAdapter:
         tip_loaded: bool,
         tip_dirty: bool,
         timeout_s: float,
+        pseudo_home_steps: int = 65000,
     ) -> dict[str, Any]:
         table = load_bound_oem_position_table()
         parity = load_oem_parity_config(None)
@@ -902,7 +1318,7 @@ class Serial206ProductionPrimitiveAdapter:
             clean_path=False,
             device_type="BIOXP",
             gripper_confirmed=False,
-            pseudo_z_home=int(parity.values.get("ZPseudoHome", 65000)),
+            pseudo_z_home=int(pseudo_home_steps),
         )
         planner = OemPathPlanner(
             table,
@@ -924,6 +1340,7 @@ class Serial206ProductionPrimitiveAdapter:
             wait_timeout_s=float(timeout_s),
             speed=None,
             acc=None,
+            pseudo_z_home_steps=int(pseudo_home_steps),
         )
         return {
             "ok": execution.get("ok") is True,
@@ -971,6 +1388,20 @@ class Serial206OemInitializationProvider:
         self._memory_state: dict[str, Any] | None = None
 
     @staticmethod
+    def _new_z_lifecycle() -> dict[str, Any]:
+        return {
+            "schema_version": "bioxp.serial206_z_lifecycle.v1",
+            "state": "unprepared",
+            "generation": None,
+            "prepared_receipt": None,
+            "active_receipt": None,
+            "awaiting_observation_receipt_id": None,
+            "reference_state": "unknown",
+            "last_failure": None,
+            "receipts": [],
+        }
+
+    @staticmethod
     def _new_state() -> dict[str, Any]:
         movement_ledger = new_initialize_motors_ledger()
         movement_ledger["stage_order"] = list(OEM_INITIALIZE_MOTORS_STAGE_KEYS)
@@ -979,6 +1410,7 @@ class Serial206OemInitializationProvider:
             "movement_ledger": movement_ledger,
             "used_approvals": {},
             "used_motion_approvals": {},
+            "z_lifecycle": Serial206OemInitializationProvider._new_z_lifecycle(),
             "initialize_motion_ledger": {
                 "schema_version": _MOTION_LEDGER_SCHEMA,
                 "source_anchor": "ControlLib.initializeMotion:8797-8856",
@@ -1001,6 +1433,7 @@ class Serial206OemInitializationProvider:
                 "thermal_door_open": None,
                 "tip_loaded": None,
                 "tip_dirty": None,
+                "psudo_z_home_steps": 65000,
                 "current_location": None,
                 "current_well": None,
                 "system_status": None,
@@ -1023,11 +1456,15 @@ class Serial206OemInitializationProvider:
         upgraded = copy.deepcopy(state)
         defaults = cls._new_state()
         upgraded.setdefault("used_motion_approvals", {})
+        upgraded.setdefault("z_lifecycle", copy.deepcopy(defaults["z_lifecycle"]))
         upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
         machine = upgraded.get("machine_status")
         if isinstance(machine, dict):
+            pseudo_home_missing = "psudo_z_home_steps" not in machine
             for key, value in defaults["machine_status"].items():
                 machine.setdefault(key, copy.deepcopy(value))
+            if pseudo_home_missing:
+                machine["psudo_z_home_steps"] = 500 if machine.get("tip_loaded") is True else 65000
         motion = upgraded.get("initialize_motion_ledger")
         if isinstance(motion, dict):
             motion.setdefault("stage_receipts", [])
@@ -1049,6 +1486,21 @@ class Serial206OemInitializationProvider:
         used = state.get("used_approvals")
         if not isinstance(used, dict):
             raise ValueError("used approvals ledger is invalid")
+        z_lifecycle = state.get("z_lifecycle")
+        if not isinstance(z_lifecycle, dict) or z_lifecycle.get("schema_version") != "bioxp.serial206_z_lifecycle.v1":
+            raise ValueError("serial-206 Z lifecycle is invalid")
+        if z_lifecycle.get("state") not in {
+            "unprepared", "prepared_unreferenced", "executing",
+            "awaiting_operator_observation", "referenced_ready", "failed_latched",
+        }:
+            raise ValueError("serial-206 Z lifecycle state is invalid")
+        z_receipts = z_lifecycle.get("receipts")
+        if not isinstance(z_receipts, list) or len(z_receipts) > 128:
+            raise ValueError("serial-206 Z receipt ledger is invalid")
+        if z_lifecycle.get("state") == "executing" and not isinstance(z_lifecycle.get("active_receipt"), Mapping):
+            raise ValueError("executing serial-206 Z lifecycle lacks active receipt")
+        if z_lifecycle.get("state") != "executing" and z_lifecycle.get("active_receipt") is not None:
+            raise ValueError("inactive serial-206 Z lifecycle carries active receipt")
         motion = state.get("initialize_motion_ledger")
         if not isinstance(motion, dict) or motion.get("schema_version") != _MOTION_LEDGER_SCHEMA:
             raise ValueError("initializeMotion ledger is invalid")
@@ -1060,6 +1512,9 @@ class Serial206OemInitializationProvider:
             raise ValueError("initializeMotion receipt/context authority is invalid")
         if not isinstance(used_motion, dict) or not isinstance(machine_status, dict):
             raise ValueError("initializeMotion approval/machine-state authority is invalid")
+        pseudo_home = machine_status.get("psudo_z_home_steps")
+        if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+            raise ValueError("PSUDO_Z_HOME state is invalid")
         terminal = motion.get("terminal_state")
         if terminal not in {"not_started", "running", "awaiting_next_stage", "initializeMotion_complete", "failed_closed"}:
             raise ValueError("initializeMotion terminal state is invalid")
@@ -1200,6 +1655,350 @@ class Serial206OemInitializationProvider:
             except Exception:
                 return self._corrupt_projection()
 
+    def notify_board_activation(self, board_id: int, ack: Any) -> dict[str, Any]:
+        """Invalidate Z preparation/reference on any non-provider command-64 to board 4."""
+        if int(board_id) != 4:
+            return {"z_affected": False, "board": int(board_id)}
+        with self._lock:
+            state = self._load_state()
+            z = state["z_lifecycle"]
+            active = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
+            if z.get("state") == "executing" and active.get("intent") == "prepare":
+                return {"z_affected": False, "board": 4, "provider_owned_preparation": True}
+            previous = str(z.get("state") or "unprepared")
+            if previous == "unprepared":
+                return {"z_affected": False, "board": 4, "already_unprepared": True}
+            invalidation = {
+                "reason": "board4_command64_outside_provider_preparation",
+                "previous_state": previous,
+                "ack": _json_safe(ack),
+                "invalidated_at": time.time(),
+            }
+            z.update({
+                "state": "unprepared",
+                "generation": None,
+                "prepared_receipt": None,
+                "reference_state": "desynced",
+                "awaiting_observation_receipt_id": None,
+                "last_failure": invalidation,
+            })
+            self._z_mark_desynced(
+                "Board 4 was reactivated outside provider-owned Z preparation.",
+                "serial206.z.board_activation_invalidation",
+            )
+            self._save_state(state)
+            return {"z_affected": True, "board": 4, "invalidation": invalidation}
+
+    def z_projection(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                state = self._load_state()
+            except Exception:
+                return {"available": False, "state": "corrupt", "blockers": ["durable_serial206_state_corrupt"]}
+            z = copy.deepcopy(state["z_lifecycle"])
+            generation = int(self.generation_provider())
+            prepared_generation = z.get("generation")
+            if prepared_generation is not None and int(prepared_generation) != generation:
+                z["state"] = "unprepared"
+                z["reference_state"] = "desynced"
+                z["generation_invalidated"] = True
+            z.update({
+                "available": True,
+                "ownership_generation": generation,
+                "authority": type(self).__name__,
+                "board": 4,
+                "motor": 1,
+                "coordinate_contract": "oem_source_nonnegative_z",
+                "source_min_steps": 0,
+                "source_max_steps": 160000,
+            })
+            return z
+
+    @staticmethod
+    def _append_z_receipt(z: dict[str, Any], receipt: Mapping[str, Any]) -> None:
+        receipts = list(z.get("receipts") or [])
+        receipts.append(_json_safe(dict(receipt)))
+        z["receipts"] = receipts[-128:]
+
+    def _z_mark_desynced(self, reason: str, source: str) -> None:
+        if self.reference_store is None:
+            return
+        self.reference_store.mark_desynced(
+            MarkAxisDesyncedCommand(axis="z", reason=reason, source=source)
+        )
+
+    def execute_z_intent(
+        self,
+        intent: str,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        intent = str(intent).strip()
+        values = dict(inputs or {})
+        with self._lock:
+            state = self._load_state()
+            z = state["z_lifecycle"]
+            observed_generation = int(self.generation_provider())
+            if z.get("generation") is not None and int(z["generation"]) != observed_generation:
+                z.update({
+                    "state": "unprepared",
+                    "generation": None,
+                    "prepared_receipt": None,
+                    "reference_state": "desynced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": {
+                        "reason": "ownership_generation_changed",
+                        "observed_generation": observed_generation,
+                        "invalidated_at": time.time(),
+                    },
+                })
+                self._z_mark_desynced(
+                    "Ownership generation changed; Z preparation/reference invalidated.",
+                    "serial206.z.generation_invalidation",
+                )
+                self._save_state(state)
+            for existing in reversed(z.get("receipts") or []):
+                if existing.get("idempotency_key") == idempotency_key:
+                    return {"ok": existing.get("status") == "completed", "replayed": True, "authority_receipt": existing}
+            command_id = f"z_{int(time.time() * 1000)}_{len(z.get('receipts') or []) + 1}"
+            receipt = {
+                "command_id": command_id,
+                "intent": intent,
+                "idempotency_key": idempotency_key,
+                "expected_generation": int(expected_generation),
+                "inputs": _json_safe(values),
+                "status": "pending_admission",
+                "started_at": time.time(),
+                "robot_http_acknowledged": True,
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "physical_effect_verified": False,
+                "operator_assessment": None,
+            }
+            self._append_z_receipt(z, receipt)
+            self._save_state(state)
+
+            observed_generation = int(self.generation_provider())
+            allowed_by_state = {
+                "prepare": {"unprepared", "failed_latched"},
+                "reconcile_switch_masks": {"unprepared", "failed_latched"},
+                "manual_home": {"prepared_unreferenced", "referenced_ready"},
+                "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+                "move_steps": {"referenced_ready"},
+                "move_absolute": {"referenced_ready"},
+                "stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched"},
+            }
+            blockers = []
+            if expected_generation != observed_generation:
+                blockers.append(f"ownership_generation_mismatch:{expected_generation}:{observed_generation}")
+            if intent not in allowed_by_state:
+                blockers.append(f"unsupported_z_intent:{intent}")
+            elif z.get("state") not in allowed_by_state[intent]:
+                blockers.append(f"z_state_blocks_intent:{z.get('state')}:{intent}")
+            if z.get("generation") is not None and int(z["generation"]) != observed_generation and intent not in {"prepare", "reconcile_switch_masks", "stop"}:
+                blockers.append("z_preparation_generation_stale")
+            if intent == "prepare" and self.preparation_provider is None:
+                blockers.append("z_preparation_provider_not_bound")
+            if intent == "reconcile_switch_masks" and values.get("confirm") != "RECONCILE_Z_SWITCH_MASKS":
+                blockers.append("explicit_confirmation_required:RECONCILE_Z_SWITCH_MASKS")
+            if blockers:
+                receipt.update({"status": "rejected", "finished_at": time.time(), "blockers": blockers})
+                self._append_z_receipt(z, receipt)
+                self._save_state(state)
+                return {"ok": False, "blockers": blockers, "authority_receipt": receipt}
+
+            previous_state = z.get("state")
+            receipt["status"] = "executing"
+            z["active_receipt"] = copy.deepcopy(receipt)
+            z["state"] = "executing"
+            self._save_state(state)
+            try:
+                if intent == "prepare":
+                    preparer = self.preparation_provider
+                    if preparer is None:
+                        raise RuntimeError("Z preparation provider is not bound")
+                    result = preparer.prepare_for_initialize_motors(
+                        expected_generation=observed_generation
+                    )
+                elif intent == "reconcile_switch_masks":
+                    result = self.primitives.z_reconcile_switch_masks()
+                elif intent == "manual_home":
+                    result = self.primitives.z_manual_home(timeout_s=float(values.get("timeout_s", 30.0)))
+                elif intent == "diagnostic_home_axis":
+                    result = self.primitives.z_diagnostic_home_axis(timeout_s=float(values.get("timeout_s", 30.0)))
+                elif intent == "move_steps":
+                    result = self.primitives.z_move_steps(
+                        int(values["steps"]), timeout_s=float(values.get("wait_timeout_s", 20.0))
+                    )
+                elif intent == "move_absolute":
+                    machine_status = state.get("machine_status") or {}
+                    pseudo_home = 500 if type(machine_status.get("tip_loaded")) is bool else 65000
+                    result = self.primitives.z_move_absolute(
+                        int(values["position_steps"]), pseudo_home,
+                        timeout_s=float(values.get("wait_timeout_s", 20.0)),
+                    )
+                else:
+                    result = self.primitives.z_stop()
+            except Exception as exc:
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            ok = isinstance(result, Mapping) and result.get("ok") is True
+            if not ok and intent != "stop":
+                try:
+                    result = {**dict(result), "failure_stop": _json_safe(self.primitives.z_stop())}
+                except Exception as exc:
+                    result = {**dict(result), "failure_stop": {"ok": False, "error": f"{type(exc).__name__}: {exc}"}}
+            receipt.update({
+                "status": "completed" if ok else "failed",
+                "finished_at": time.time(),
+                "result": _json_safe(result),
+                "controller_command_acknowledged": bool(isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True),
+                "controller_terminal_state_verified": bool(isinstance(result, Mapping) and result.get("controller_terminal_state_verified") is True),
+            })
+            z["active_receipt"] = None
+            if ok and intent == "prepare":
+                z.update({
+                    "state": "prepared_unreferenced",
+                    "generation": observed_generation,
+                    "prepared_receipt": _json_safe(receipt),
+                    "reference_state": "desynced",
+                    "last_failure": None,
+                })
+                self._z_mark_desynced("Z profile prepared; homing observation still required.", "serial206.z.prepare")
+            elif ok and intent == "reconcile_switch_masks":
+                z.update({"state": "unprepared", "generation": None, "prepared_receipt": None, "reference_state": "desynced", "last_failure": None})
+                self._z_mark_desynced("Z switch masks reconciled; source profile must be prepared again.", "serial206.z.reconcile_switch_masks")
+            elif ok and intent in {"manual_home", "diagnostic_home_axis"}:
+                z.update({
+                    "state": "awaiting_operator_observation",
+                    "awaiting_observation_receipt_id": command_id,
+                    "reference_state": "desynced",
+                    "last_failure": None,
+                })
+                self._z_mark_desynced("Controller home proof awaits independent physical observation.", f"serial206.z.{intent}")
+            elif ok and intent in {"move_steps", "move_absolute"}:
+                z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
+            elif ok and intent == "stop":
+                z["state"] = previous_state if previous_state != "executing" else "failed_latched"
+            else:
+                z.update({
+                    "state": "failed_latched",
+                    "reference_state": "desynced",
+                    "last_failure": _json_safe(receipt),
+                })
+                self._z_mark_desynced(f"Failed serial-206 Z intent {intent}.", f"serial206.z.{intent}")
+            self._append_z_receipt(z, receipt)
+            self._save_state(state)
+            return {"ok": ok, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": _json_safe(z)}
+
+    def record_z_observation(
+        self,
+        *,
+        command_id: str,
+        verdict: str,
+        note: str,
+        expected_generation: int,
+    ) -> dict[str, Any]:
+        if verdict not in {"pass", "fail"}:
+            raise ValueError("Z observation verdict must be pass or fail")
+        with self._lock:
+            state = self._load_state()
+            z = state["z_lifecycle"]
+            if int(expected_generation) != int(self.generation_provider()):
+                raise ValueError("ownership generation changed before Z observation")
+            if z.get("state") != "awaiting_operator_observation" or z.get("awaiting_observation_receipt_id") != command_id:
+                raise ValueError("Z lifecycle is not awaiting this observation")
+            receipts = list(z.get("receipts") or [])
+            match = next((row for row in reversed(receipts) if row.get("command_id") == command_id), None)
+            if match is None:
+                raise ValueError("Z authority receipt is missing")
+            observation = {
+                "command_id": command_id,
+                "verdict": verdict,
+                "note": str(note),
+                "observed_at": time.time(),
+                "physical_effect_verified": verdict == "pass",
+            }
+            if verdict == "pass":
+                home_result = match.get("result") if isinstance(match.get("result"), Mapping) else {}
+                if not isinstance(home_result, Mapping) or home_result.get("ok") is not True:
+                    raise ValueError("controller home proof is not successful")
+                z.update({
+                    "state": "referenced_ready",
+                    "reference_state": "referenced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": None,
+                })
+                if self.reference_store is not None:
+                    self.reference_store.mark_referenced(
+                        MarkAxisReferencedCommand(
+                            axis="z", position_steps=0,
+                            source="serial206.z.operator_observation",
+                            motion_kind="home",
+                        )
+                    )
+            else:
+                z.update({
+                    "state": "failed_latched",
+                    "reference_state": "desynced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": _json_safe(observation),
+                })
+                self._z_mark_desynced("Operator rejected physical Z home observation.", "serial206.z.operator_observation")
+            z["last_observation"] = observation
+            self._save_state(state)
+            return {"ok": True, "observation": observation, "z_state": z.get("state"), "z_lifecycle": _json_safe(z)}
+
+    def initialize_motors_admission_projection(self) -> dict[str, Any]:
+        """Publish exact next-stage inputs instead of capability-only availability."""
+        with self._lock:
+            try:
+                state = self._load_state()
+            except Exception:
+                return {
+                    "available": False,
+                    "blockers": ["durable_serial206_state_corrupt"],
+                    "expected_stage": None,
+                }
+            ledger = state["movement_ledger"]
+            expected = ledger.get("expected_next_stage")
+            if expected is None:
+                return {
+                    "available": False,
+                    "blockers": ["initialize_motors_complete"],
+                    "expected_stage": None,
+                }
+            spec = _SPEC_BY_KEY[expected]
+            row = ledger["stages"][expected]
+            blockers = []
+            if row.get("state") == "acknowledged":
+                blockers.append(f"operator_observation_required:{expected}")
+            elif row.get("state") != "pending":
+                blockers.append(f"stage_not_pending:{expected}:{row.get('state')}")
+            gates = ["direction_verified", "limits_verified", "switch_verified", "stop_verified"]
+            if not spec.establishes_reference:
+                gates.append("reference_verified")
+            return {
+                "available": not blockers,
+                "blockers": blockers,
+                "expected_stage": expected,
+                "stage_state": row.get("state"),
+                "approval": {
+                    "expected_component": spec.component,
+                    "expected_direction": spec.direction,
+                    "expected_bound": spec.bound,
+                    "expected_generation": int(self.generation_provider()),
+                },
+                "commissioning": {
+                    "required_components": [spec.component] if spec.component in _COMMISSIONED_COMPONENTS else [],
+                    "required_gates": gates if spec.component in _COMMISSIONED_COMPONENTS else [],
+                    "reference_established_by_stage": bool(spec.establishes_reference),
+                    "z_required_polarity": {"gap9": 1, "gap10": 0} if spec.component == "z" else None,
+                },
+            }
+
     def initialize_motion_projection(self) -> dict[str, Any]:
         with self._lock:
             try:
@@ -1252,10 +2051,16 @@ class Serial206OemInitializationProvider:
 
     @staticmethod
     def _commissioning_blockers(
-        commissioning: Mapping[str, Serial206CommissioningEvidence], *, generation: int
+        commissioning: Mapping[str, Serial206CommissioningEvidence],
+        *,
+        generation: int,
+        components: tuple[str, ...],
+        establishes_reference: bool,
     ) -> list[str]:
         blockers: list[str] = []
-        for component in _COMMISSIONED_COMPONENTS:
+        for component in components:
+            if component not in _COMMISSIONED_COMPONENTS:
+                continue
             evidence = commissioning.get(component)
             if not isinstance(evidence, Serial206CommissioningEvidence):
                 blockers.append(f"commissioning_evidence_required:{component}")
@@ -1264,15 +2069,14 @@ class Serial206OemInitializationProvider:
                 blockers.append(f"commissioning_component_mismatch:{component}")
             if evidence.generation != generation or evidence.fresh is not True:
                 blockers.append(f"fresh_same_epoch_commissioning_required:{component}")
-            for gate in ("direction_verified", "limits_verified", "switch_verified", "stop_verified", "reference_verified"):
+            gates = ["direction_verified", "limits_verified", "switch_verified", "stop_verified"]
+            if not establishes_reference:
+                gates.append("reference_verified")
+            for gate in gates:
                 if getattr(evidence, gate) is not True:
                     blockers.append(f"{component}_{gate}_required")
-            if component == "z" and not (
-                evidence.gap9_polarity in {0, 1}
-                and evidence.gap10_polarity in {0, 1}
-                and evidence.gap9_polarity != evidence.gap10_polarity
-            ):
-                blockers.append("z_gap9_gap10_polarity_not_explicitly_commissioned")
+            if component == "z" and (evidence.gap9_polarity, evidence.gap10_polarity) != (1, 0):
+                blockers.append("z_gap9_gap10_polarity_must_match_oem_gap9_active_gap10_inactive")
         return blockers
 
     @staticmethod
@@ -1379,7 +2183,14 @@ class Serial206OemInitializationProvider:
             if status["initialize_motors_live_available"] is not True:
                 blockers.append("initialize_motors_exact_primitives_not_bound")
             blockers.extend(self._approval_blockers(approval, spec, generation=generation, used=state["used_approvals"]))
-            blockers.extend(self._commissioning_blockers(dict(commissioning or {}), generation=generation))
+            blockers.extend(
+                self._commissioning_blockers(
+                    dict(commissioning or {}),
+                    generation=generation,
+                    components=(spec.component,),
+                    establishes_reference=bool(spec.establishes_reference),
+                )
+            )
             if blockers:
                 return self._failure("admission", blockers, generation=generation, movement_ledger=ledger)
             assert approval is not None
@@ -1406,6 +2217,15 @@ class Serial206OemInitializationProvider:
                     "state": "completed" if prep_ok else "failed_closed",
                     "receipt": _json_safe(raw_preparation),
                 }
+                if prep_ok:
+                    state["z_lifecycle"].update({
+                        "state": "prepared_unreferenced",
+                        "generation": generation,
+                        "prepared_receipt": _json_safe(raw_preparation),
+                        "active_receipt": None,
+                        "reference_state": "desynced",
+                        "last_failure": None,
+                    })
                 try:
                     self._save_state(state)
                 except Exception:
@@ -1417,6 +2237,14 @@ class Serial206OemInitializationProvider:
                         generation=generation,
                         movement_ledger=ledger,
                     )
+
+            if state["preparation"].get("state") == "completed" and state["preparation"].get("generation") == generation and state["z_lifecycle"].get("state") == "unprepared":
+                state["z_lifecycle"].update({
+                    "state": "prepared_unreferenced",
+                    "generation": generation,
+                    "prepared_receipt": _json_safe(state["preparation"].get("receipt")),
+                    "reference_state": "desynced",
+                })
 
             # One atomic pre-command transition consumes the generation-bound
             # approval and admits exactly the expected stage.
@@ -1435,6 +2263,16 @@ class Serial206OemInitializationProvider:
                 "observation": None,
             })
             ledger["terminal_state"] = "running"
+            if spec.component == "z":
+                state["z_lifecycle"].update({
+                    "state": "executing",
+                    "active_receipt": {
+                        "command_id": approval.approval_id,
+                        "intent": "startup_axis_search_1791",
+                        "idempotency_key": approval.idempotency_key,
+                        "status": "executing",
+                    },
+                })
             try:
                 self._save_state(state)
             except Exception:
@@ -1474,6 +2312,31 @@ class Serial206OemInitializationProvider:
             else:
                 row["state"] = "completed"
                 advance_initialize_motors_ledger(ledger, spec.key)
+            if spec.component == "z":
+                z = state["z_lifecycle"]
+                z["active_receipt"] = None
+                z_receipt = {
+                    "command_id": approval.approval_id,
+                    "intent": "startup_axis_search_1791",
+                    "idempotency_key": approval.idempotency_key,
+                    "status": "completed" if receipt["ok"] is True else "failed",
+                    "result": _json_safe(receipt),
+                    "physical_effect_verified": False,
+                }
+                self._append_z_receipt(z, z_receipt)
+                if receipt["ok"] is True:
+                    z.update({
+                        "state": "awaiting_operator_observation",
+                        "awaiting_observation_receipt_id": approval.approval_id,
+                        "reference_state": "desynced",
+                        "last_failure": None,
+                    })
+                else:
+                    z.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": _json_safe(z_receipt),
+                    })
             try:
                 self._save_state(state)
             except Exception:
@@ -1544,6 +2407,28 @@ class Serial206OemInitializationProvider:
                 advance_initialize_motors_ledger(ledger, selected)
                 ok = True
                 blockers = []
+            if spec.component == "z":
+                z = state["z_lifecycle"]
+                z["last_observation"] = {
+                    "command_id": command_id,
+                    "verdict": "pass" if observed_pass else "fail",
+                    "note": note.strip(),
+                    "observed_at": time.time(),
+                    "physical_effect_verified": bool(observed_pass),
+                }
+                z["awaiting_observation_receipt_id"] = None
+                if observed_pass:
+                    z.update({
+                        "state": "referenced_ready",
+                        "reference_state": "referenced",
+                        "last_failure": None,
+                    })
+                else:
+                    z.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": _json_safe(z["last_observation"]),
+                    })
             try:
                 self._save_state(state)
             except Exception:
@@ -1834,6 +2719,7 @@ class Serial206OemInitializationProvider:
                 tip_loaded=True,
                 tip_dirty=bool(machine.get("tip_dirty")) if isinstance(machine, Mapping) else False,
                 timeout_s=min(bounded, 60.0),
+                pseudo_home_steps=int(machine.get("psudo_z_home_steps", 65000)) if isinstance(machine, Mapping) else 65000,
             )
         if stage == "initializeMotion.updateLocation.tip_exists":
             return {
@@ -1857,7 +2743,13 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8814; ClassPipetteCollection.ejectAllTips(false,true)",
             }
         if stage == "initializeMotion.moveZ.tip_exists":
-            return p.oem_initialize_motion_move_absolute("z", 80000, timeout_s=min(bounded, 45.0))
+            machine = state.get("machine_status") if isinstance(state, Mapping) else {}
+            return p.oem_initialize_motion_move_absolute(
+                "z",
+                80000,
+                timeout_s=min(bounded, 45.0),
+                pseudo_home_steps=int(machine.get("psudo_z_home_steps", 65000)) if isinstance(machine, Mapping) else 65000,
+            )
         if stage == "initializeMotion.moveX.tip_exists":
             return p.oem_initialize_motion_move_absolute("x", 79000, timeout_s=min(bounded, 45.0))
         if stage == "initializeMotion.queryTipStatus.after_eject":
@@ -1980,6 +2872,7 @@ class Serial206OemInitializationProvider:
             next_stage = "initializeMotion.tip_loaded.tip_exists"
         elif stage == "initializeMotion.tip_loaded.tip_exists":
             machine["tip_loaded"] = True
+            machine["psudo_z_home_steps"] = 500
             next_stage = "initializeMotion.scriptmoveTo.tip_exists"
         elif stage == "initializeMotion.scriptmoveTo.tip_exists":
             next_stage = "initializeMotion.updateLocation.tip_exists"
@@ -2011,6 +2904,7 @@ class Serial206OemInitializationProvider:
             next_stage = "initializeMotion.tip_loaded_false.after_eject"
         elif stage == "initializeMotion.tip_loaded_false.after_eject":
             machine["tip_loaded"] = False
+            machine["psudo_z_home_steps"] = 65000
             next_stage = "initializeMotion.sleep.before_initiate_group"
         elif stage == "initializeMotion.sleep.before_initiate_group":
             next_stage = "initializeMotion.initiateGroup.initial"
@@ -2040,6 +2934,7 @@ class Serial206OemInitializationProvider:
             return
         elif stage == "initializeMotion.tip_loaded_false.no_tip":
             machine["tip_loaded"] = False
+            machine["psudo_z_home_steps"] = 65000
             motion["terminal_state"] = "initializeMotion_complete"
             motion["expected_next_stage"] = None
             return

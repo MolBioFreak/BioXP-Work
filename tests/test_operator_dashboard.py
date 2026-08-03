@@ -107,35 +107,6 @@ def test_operator_catalog_removes_non_oem_session_id_requirement_but_keeps_lates
     assert all(route["path"] != "/oem/startup/status/{session_id}" for route in dispatch.values())
 
 
-def test_unproven_power_and_lifecycle_emergency_controls_are_visible_but_not_dispatchable():
-    app = FastAPI()
-
-    @app.post("/motion/power/enable")
-    async def power_enable():
-        return {"ok": True}
-
-    @app.post("/motion/power/diag")
-    async def power_diag():
-        return {"ok": True}
-
-    @app.post("/oem/runtime/emergency_stop")
-    async def lifecycle_emergency():
-        return {"ok": True}
-
-    actions, dispatch = _build_catalog(app)
-    by_path = {row["informational_path"]: row for row in actions if row["kind"] == "primitive"}
-    for path in ("/motion/power/diag", "/oem/runtime/emergency_stop"):
-        row = by_path[path]
-        assert row["provider_available"] is False
-        assert row["available"] is False
-        assert row["enabled"] is False
-        assert row["provider_unavailable_reason"].startswith("Quarantined:")
-        assert row["action_id"] not in dispatch
-    power = by_path["/motion/power/enable"]
-    assert power["provider_available"] is True
-    assert dispatch[power["action_id"]]["path"] == "/motion/power/enable"
-
-
 def test_motion_inactive_blocks_motor_axis_gripper_door_and_pipette_motion_with_obvious_reason():
     state = machine_state(motion_enabled=False, x="referenced", y="referenced", z="referenced")
     for path in (
@@ -149,27 +120,6 @@ def test_motion_inactive_blocks_motor_axis_gripper_door_and_pipette_motion_with_
         assert assessed["enabled"] is False
         assert assessed["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
         assert next(row for row in assessed["dependencies"] if row["key"] == "motion_enabled")["met"] is False
-
-
-def test_indirect_live_motion_routes_are_classified_and_gated_as_motion():
-    state = machine_state(motion_enabled=False, x="referenced", y="referenced", z="referenced")
-    for path in (
-        "/latch/lock",
-        "/latch/unlock",
-        "/protocol/execute",
-        "/oem/runtime/commands/enqueue",
-        "/oem/runtime/commands/initializeSystem",
-        "/oem/runtime/commands/PrepareToRunJob",
-        "/oem/runtime/events/resume",
-        "/oem/startup/initialize_environment",
-        "/oem/initial_check",
-    ):
-        row = action(path, safety=_safety("POST", path))
-        assert row["safety_class"] == "motion", path
-        assert _motor_motion_action(row) is True, path
-        assessed = _assess_action(row, state, {})
-        assert assessed["enabled"] is False, path
-        assert assessed["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor.", path
 
 
 def test_incomplete_maintenance_state_fails_closed_for_every_motion_class():
@@ -261,7 +211,8 @@ def test_bootstrap_controls_do_not_require_the_state_they_establish():
 
     assert stop["enabled"] is True
     assert snapshot["enabled"] is True
-    assert normal_move["enabled"] is True
+    assert normal_move["enabled"] is False
+    assert any(row["key"] == "power_ready" and row["met"] is False for row in normal_move["dependencies"])
 
 
 def test_reconnect_does_not_require_existing_usb_ownership():
@@ -303,17 +254,53 @@ def test_provider_gate_precedes_runtime_dependencies():
     assert assessed["disabled_reason"] == "provider not bound"
 
 
+def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
+    from bioxp import api
+
+    actions, dispatch = _build_catalog(api.app)
+    by_id = {row["action_id"]: row for row in actions}
+    required = {
+        "oem.z.manual_home": [],
+        "oem.z.move_steps": ["steps"],
+        "oem.z.move_absolute": ["position_steps"],
+        "oem.z.prepare": [],
+        "oem.z.reconcile_switch_masks": ["confirm"],
+        "oem.z.diagnostic_home_axis": [],
+        "oem.z.stop": [],
+        "oem.z.observe": ["command_id", "verdict", "note"],
+    }
+    for action_id, input_names in required.items():
+        assert action_id in by_id
+        assert [row["name"] for row in by_id[action_id]["inputs"]] == input_names
+        assert by_id[action_id]["requires_confirmation"] is True
+        assert by_id[action_id]["required_provider_capability"] == "initialize_motors"
+        assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
+    assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
+    assert not any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
+
+
 def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics():
     dashboard = _dashboard_payload(machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced"))
     assert dashboard["schema_version"] == "bioxp.operator_dashboard.v1"
     assert dashboard["motion"]["enabled"] is True
     assert dashboard["connection"]["live"] is True
-    assert dashboard["axes"][0] == {
+    axis = dashboard["axes"][0]
+    assert {
+        key: axis[key]
+        for key in (
+            "axis", "reference", "position_steps", "speed_steps_s",
+            "run_current", "standby_current", "left_switch_active",
+            "right_switch_active", "motor_temperature_c",
+            "motor_temperature_available",
+        )
+    } == {
         "axis": "x", "reference": "referenced", "position_steps": 123, "speed_steps_s": 0,
         "run_current": 31, "standby_current": 8, "left_switch_active": False,
         "right_switch_active": True, "motor_temperature_c": None,
         "motor_temperature_available": False,
     }
+    assert {"left_switch_state", "right_switch_state", "left_switch_disabled", "right_switch_disabled", "coordinate_contract", "min_steps", "max_steps"} <= set(axis)
+    assert dashboard["z_axis"]["authority"] == "Serial206OemInitializationProvider"
     assert dashboard["temperatures"] == [
         {"sensor": "tc_temp_c", "label": "Thermal cycler block", "unit": "°C", "temperature_c": 37.0, "available": True},
         {"sensor": "lid_temp_c", "label": "Thermal cycler lid", "unit": "°C", "temperature_c": 42.125, "available": True},

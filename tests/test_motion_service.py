@@ -509,30 +509,15 @@ def test_home_axis_route_preserves_oem_switch_search_and_marks_reference(monkeyp
     assert recorded[1].motion_kind == "home"
 
 
-def test_home_axis_route_skips_reference_mark_for_dry_run(monkeypatch):
+def test_generic_z_home_route_is_retired_even_for_dry_run(monkeypatch):
     api = load_api(monkeypatch)
-    recorded = []
-
-    async def fake_runner(command, **kwargs):
-        recorded.append(command)
-        return {"axis": getattr(command.axis, "value", command.axis), "dry_run": True, "home": {"ok": True}}
-
-    class FakeStore:
-        def mark_referenced(self, command):
-            recorded.append(command)
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "run_home_axis_command", fake_runner)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
     req = api.HomeAxisRequest(axis=api.AxisName.Z, capture_bundle=True, dry_run_bundle=True)
-    result = asyncio.run(api.home_axis(req))
 
-    assert result["dry_run"] is True
-    assert result["route_semantics"]["source_command"] == "home_axis_manual_button_goHome_guarded"
-    assert result["route_semantics"]["home_semantics"] == "manual_goHome_style_switch_search_not_startup_axisSearchHome_not_zero"
-    assert result["route_semantics"]["oem_switch_search_homing_executed"] is False
-    assert recorded == [recorded[0]]
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(api.home_axis(req))
+
+    assert exc.value.status_code == 410
+    assert exc.value.detail["error"] == "ambiguous_generic_z_home_retired"
 
 
 def test_dual_limit_switch_state_is_readback_only_for_supervised_motion(monkeypatch):
@@ -1226,7 +1211,7 @@ def test_axis_limit_guard_blocks_relative_target_outside_oem_envelope(monkeypatc
         raise AssertionError("out-of-range X target was not blocked")
 
 
-def test_z_guard_transforms_oem_source_limits_into_live_signed_controller_envelope(monkeypatch):
+def test_z_guard_uses_only_oem_source_nonnegative_controller_envelope(monkeypatch):
     api = load_api(monkeypatch)
     monkeypatch.setattr(
         api,
@@ -1234,15 +1219,16 @@ def test_z_guard_transforms_oem_source_limits_into_live_signed_controller_envelo
         lambda: {"axis_limits": {"z": {"min_steps": 0, "max_steps": 160000, "source": "test_oem_source"}}},
     )
 
-    api._guard_absolute_target(
-        api.AxisName.Z,
-        {"position": 0},
-        -1,
-        {"left_active": False, "right_active": False},
-        {},
-    )
+    for valid_target in (0, 1, 500, 65000, 160000):
+        api._guard_absolute_target(
+            api.AxisName.Z,
+            {"position": 0},
+            valid_target,
+            {"left_active": False, "right_active": False},
+            {},
+        )
 
-    for unsafe_target in (1, -160001):
+    for unsafe_target in (-1, 160001):
         try:
             api._guard_absolute_target(
                 api.AxisName.Z,
@@ -1254,9 +1240,9 @@ def test_z_guard_transforms_oem_source_limits_into_live_signed_controller_envelo
         except api.HTTPException as exc:
             assert exc.status_code == 409
             assert exc.detail["reason"] == "target_outside_oem_axis_limits"
-            assert exc.detail["configured_limit"]["coordinate_contract"] == "observed_live_signed_z"
+            assert exc.detail["configured_limit"]["coordinate_contract"] == "oem_source_nonnegative_z"
         else:
-            raise AssertionError(f"unsafe signed-Z target {unsafe_target} was not blocked")
+            raise AssertionError(f"unsafe OEM Z target {unsafe_target} was not blocked")
 
 
 def test_target_validation_runs_before_missing_current_position_fails_closed(monkeypatch):
@@ -1271,7 +1257,7 @@ def test_target_validation_runs_before_missing_current_position_fails_closed(mon
         api._guard_absolute_target(
             api.AxisName.Z,
             None,
-            1,
+            160001,
             {"left_active": False, "right_active": False},
             {},
         )
@@ -1284,7 +1270,7 @@ def test_target_validation_runs_before_missing_current_position_fails_closed(mon
         api._guard_absolute_target(
             api.AxisName.Z,
             None,
-            -1,
+            1,
             {"left_active": False, "right_active": False},
             {},
         )
@@ -1294,6 +1280,55 @@ def test_target_validation_runs_before_missing_current_position_fails_closed(mon
     else:
         raise AssertionError("missing current position did not fail closed")
 
+
+
+def test_robot_owns_oem_z_pseudo_home_from_durable_machine_state(monkeypatch):
+    api = load_api(monkeypatch)
+
+    for tip_loaded, expected in ((True, 500), (False, 500), (None, 65000)):
+        monkeypatch.setattr(
+            api,
+            "serial206_oem_initialization_provider_status",
+            lambda value=tip_loaded: {"bound": True, "machine_status": {"tip_loaded": value}},
+        )
+        row = api._robot_owned_z_pseudo_home()
+        assert row["position_steps"] == expected
+        assert row["caller_selectable"] is False
+
+
+def test_controller_poll_convergence_does_not_replace_source_event_128(monkeypatch):
+    api = load_api(monkeypatch)
+
+    evidence = api._build_motion_evidence(
+        preset={"board": 4, "motor": 1},
+        prep={},
+        interlock={},
+        position_before={"position": 500},
+        switch_before={"left_active": False, "right_active": False},
+        position_after={"position": 1000},
+        switch_after={"left_active": False, "right_active": False},
+        move={"ok": True, "ack": {"status": 100}},
+        wait={
+            "ok": True,
+            "stopped": True,
+            "seen_nonzero": True,
+            "last_speed": 0,
+            "reached_position_after": {"target_reached": None, "ok": True},
+            "log_tail": [
+                {"speed": 100, "position": 750, "target_reached": None},
+                {"speed": 0, "position": 1000, "target_reached": None},
+            ],
+        },
+        raw_events=[],
+        event_capture_attempted=True,
+    )
+
+    classification = evidence["classification"]
+    assert classification["target_reached_event_seen"] is False
+    assert classification["poll_convergence_confirmed"] is False
+    assert classification["controller_motion_evidence"] is False
+    assert classification["physical_motion_confirmed"] is False
+    assert classification["evidence_level"] == "controller_only"
 
 
 def test_target_reached_event_for_wrong_motor_does_not_confirm_motion(monkeypatch):

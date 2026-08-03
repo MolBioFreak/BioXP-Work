@@ -51,8 +51,41 @@ class OEMRuntimeEventRouter:
         row = self.store.append_event(OEMRuntimeEvent(event_type="resume", source=source, actions_taken=["queued_wakefrompause"]).to_dict())
         return {"ok": True, "event": row, "queued": queued, "runtime_state": lifecycle["operation_state"], "lifecycle": lifecycle}
 
-    def emergency_stop(self, *, source: str = "api", reason: str = "operator_request") -> dict[str, Any]:
-        row = self.store.append_event(OEMRuntimeEvent(event_type="emergency_stop", source=source, payload={"reason": reason}, actions_taken=["runtime_emergency_stopped", "hardware_stop_required"]).to_dict())
-        self.store.append_error({"error_situation": "emergency_stop", "operator_action_required": True, "reason": reason})
+    def record_physical_emergency_stop(
+        self,
+        *,
+        result: dict[str, Any],
+        source: str = "motion_api",
+        reason: str = "operator_request",
+    ) -> dict[str, Any]:
+        delivery_attempted = result.get("delivery_attempted") is True
+        terminal_verified = result.get("controller_terminal_state_verified") is True
+        actions = [
+            "physical_aggregate_stop_attempted" if delivery_attempted else "physical_aggregate_stop_not_delivered",
+            "controller_terminal_state_verified" if terminal_verified else "controller_terminal_state_unverified",
+        ]
+        row = self.store.append_event(
+            OEMRuntimeEvent(
+                event_type="emergency_stop",
+                source=source,
+                payload={"reason": reason, "physical_stop_receipt": result},
+                actions_taken=actions,
+            ).to_dict()
+        )
+        self.store.append_error({
+            "error_situation": "emergency_stop" if terminal_verified else "emergency_stop_not_verified",
+            "operator_action_required": True,
+            "reason": reason,
+            "delivery_attempted": delivery_attempted,
+            "controller_terminal_state_verified": terminal_verified,
+        })
         lifecycle = lifecycle_state.transition("emergency", reason=f"emergency_stop:{reason}")
-        return {"ok": True, "event": row, "runtime_state": lifecycle["operation_state"], "lifecycle": lifecycle}
+        return {
+            "ok": terminal_verified,
+            "event": row,
+            "actions_taken": actions,
+            "delivery_attempted": delivery_attempted,
+            "controller_terminal_state_verified": terminal_verified,
+            "runtime_state": lifecycle["operation_state"],
+            "lifecycle": lifecycle,
+        }

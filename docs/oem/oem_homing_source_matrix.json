@@ -142,14 +142,13 @@
     },
     {
       "deviations": [
-        "Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.",
-        "The z-home step is explicitly harmonized to the same live-reference contract used by the initializeMotors Z stage."
+        "The provider owns admission, physical execution, atomic state, observation, and receipts."
       ],
-      "source_mode": "initializeMotors/startup_step",
+      "source_mode": "initializeMotors/initializeMotion",
       "target_file": "src/bioxp/api.py",
-      "target_line": 2714,
-      "target_status": "stepwise_guarded_subset_not_monolithic_oem",
-      "target_symbol": "motion_oem_startup_step / _execute_oem_startup_step"
+      "target_line": 1307,
+      "target_status": "canonical_atomic_serial206_authority",
+      "target_symbol": "Serial206OemInitializationProvider"
     },
     {
       "deviations": [
@@ -204,30 +203,6 @@
       "target_line": 3925,
       "target_status": "direct_oem_parallel_task_run_waitall",
       "target_symbol": "BioXpTester.motor_oem_home_xy / motion_oem_home_xy"
-    },
-    {
-      "deviations": [
-        "Source-mode surface is present, but direct monolithic rehome is intentionally blocked pending a literal source-equivalent stage rewrite.",
-        "run_homing=true does not enable physical homing.",
-        "Door-state save/restore remains unimplemented because no trusted Linux setter/source-equivalent primitive is exposed."
-      ],
-      "source_mode": "ControlLib.rehome",
-      "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3975,
-      "target_status": "intentionally_blocked_no_monolithic_live_homing",
-      "target_symbol": "BioXpTester.motor_oem_rehome / motion_oem_rehome"
-    },
-    {
-      "deviations": [
-        "No-homing initialize-without-motion surface is direct.",
-        "run_homing=true delegates to the intentionally blocked rehome surface and therefore does not command physical homing.",
-        "Tip/pipette cleanup remains labeled as not ported, not silently collapsed."
-      ],
-      "source_mode": "ControlLib.initializeMotion",
-      "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3996,
-      "target_status": "direct_wrapper_no_homing_diagnostic_only",
-      "target_symbol": "BioXpTester.motor_oem_initialize_motion / motion_oem_initialize_motion"
     }
   ],
   "manual_home": {
@@ -373,34 +348,28 @@
   },
   "raw_fastapi_route_table": [
     {
-      "classification": "stepwise initializeMotors subset",
-      "methods": "POST",
-      "name": "motion_oem_startup_step",
-      "path": "/motion/oem/startup_step"
-    },
-    {
       "classification": "direct HomeXY mode surface; guarded X/Y switch-search",
       "methods": "POST",
       "name": "motion_oem_home_xy",
       "path": "/motion/oem/home_xy"
     },
     {
-      "classification": "ControlLib.rehome source-mode surface; intentionally blocked with no monolithic live homing",
+      "classification": "canonical serial-206 initializeMotors provider",
       "methods": "POST",
-      "name": "motion_oem_rehome",
-      "path": "/motion/oem/rehome"
+      "name": "motion_oem_serial206_initialize_motors",
+      "path": "/motion/oem/initialization/initialize_motors"
     },
     {
-      "classification": "direct ControlLib.initializeMotion wrapper; no-homing diagnostic by default",
+      "classification": "canonical serial-206 initializeMotion provider",
       "methods": "POST",
-      "name": "motion_oem_initialize_motion",
-      "path": "/motion/oem/initialize_motion"
+      "name": "motion_oem_serial206_initialize_motion",
+      "path": "/motion/oem/initialization/initialize_motion"
     },
     {
-      "classification": "OEM initialization controller; run_homing=true intentionally blocked with no monolithic live homing",
-      "methods": "POST",
-      "name": "motion_oem_initialization_run",
-      "path": "/motion/oem/initialization/run"
+      "classification": "canonical serial-206 initialization state",
+      "methods": "GET",
+      "name": "motion_oem_initialization_provider_status",
+      "path": "/motion/oem/initialization/provider-status"
     },
     {
       "classification": "manual/goHome-style route",
@@ -447,17 +416,6 @@
   ],
   "routes": [
     {
-      "equivalence": "not-equivalent-to-manual-home",
-      "maps_to": "stepwise initializeMotors subset",
-      "method": "POST",
-      "notes": [
-        "Raw FastAPI lives inside robot/container network in this setup.",
-        "Use this for supervised OEM startup steps, not as a generic Home button."
-      ],
-      "route": "/motion/oem/startup_step",
-      "surface": "raw-fastapi"
-    },
-    {
       "equivalence": "not-equivalent-to-single-axis-home-or-zero",
       "maps_to": "direct HomeXY mode surface",
       "method": "POST",
@@ -469,36 +427,23 @@
       "surface": "raw-fastapi"
     },
     {
-      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
-      "maps_to": "ControlLib.rehome source-mode surface",
+      "equivalence": "canonical-provider-authority",
+      "maps_to": "canonical serial-206 initializeMotors stage",
       "method": "POST",
       "notes": [
-        "Direct monolithic rehome is intentionally blocked; run_homing=true does not enable physical homing.",
-        "Door save/restore gap remains explicit."
+        "Admission, execution, observation, and receipt state are atomic in the serial-206 provider."
       ],
-      "route": "/motion/oem/rehome",
+      "route": "/motion/oem/initialization/initialize_motors",
       "surface": "raw-fastapi"
     },
     {
-      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
-      "maps_to": "ControlLib.initializeMotion source-mode surface",
+      "equivalence": "canonical-provider-authority",
+      "maps_to": "canonical serial-206 initializeMotion stage",
       "method": "POST",
       "notes": [
-        "No-homing diagnostic by default; run_homing=true reaches intentionally blocked rehome and does not enable physical homing.",
-        "Tip/pipette cleanup is labeled not ported."
+        "The provider advances only the expected approved stage."
       ],
-      "route": "/motion/oem/initialize_motion",
-      "surface": "raw-fastapi"
-    },
-    {
-      "equivalence": "intentionally-blocked-no-monolithic-live-homing",
-      "maps_to": "OEM initialization controller",
-      "method": "POST",
-      "notes": [
-        "No-homing controller pass is available; run_homing=true returns fail-closed before controller or tester access.",
-        "This is not a physical initializeMotors/rehome monolith."
-      ],
-      "route": "/motion/oem/initialization/run",
+      "route": "/motion/oem/initialization/initialize_motion",
       "surface": "raw-fastapi"
     },
     {
@@ -524,22 +469,12 @@
     },
     {
       "equivalence": "proxy-not-authority",
-      "maps_to": "proxy/linkage to raw startup_step when exposed",
+      "maps_to": "robot-owned catalog action invocation",
       "method": "POST",
       "notes": [
-        "BMS may expose/proxy a subset and status shape can differ from raw robot API."
+        "BMS forwards robot action identifiers and robot admission receipts without local mutation policy."
       ],
-      "route": "/api/bioxp/motion/oem/startup_step",
-      "surface": "bms-proxy"
-    },
-    {
-      "equivalence": "proxy-not-authority",
-      "maps_to": "proxy/linkage to raw manual home when exposed",
-      "method": "POST",
-      "notes": [
-        "Do not assume this is present or a full mirror; probe route existence separately."
-      ],
-      "route": "/api/bioxp/motion/axis/home",
+      "route": "/api/bioxp/operator-controls/actions/{action_id}/invoke",
       "surface": "bms-proxy"
     }
   ],

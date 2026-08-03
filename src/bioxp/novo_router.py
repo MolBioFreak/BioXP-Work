@@ -335,6 +335,14 @@ class NovoRouter:
             raise KeyError(name)
         return list(self._queues[name])
 
+    def queue_clear(self, name: str) -> int:
+        if name not in self._queues:
+            raise KeyError(name)
+        queue = self._queues[name]
+        cleared = len(queue)
+        queue.clear()
+        return cleared
+
     def calculate_pressure_offsets(self) -> dict[int, float]:
         samples: dict[int, list[float]] = {channel: [] for channel in range(4)}
         for frame in self._queues["pressure"]:
