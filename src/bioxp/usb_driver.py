@@ -5927,7 +5927,11 @@ class BioXpTester:
                 speed=1791,
                 rehome=bool(rehome),
                 timeout_s=float(timeout_s),
-                max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+                # OEM MoveZHome delegates directly to goHome(rehome, Z, 1791,
+                # true); it has no controller-coordinate distance cutoff.  A
+                # Linux-added cap stopped live Z at -361483 before GAP9 could
+                # assert, despite the OEM search still being in progress.
+                max_search_abs_delta=None,
             )
         return {
             "ok": bool(current_ok and isinstance(home, dict) and home.get("ok") is True),

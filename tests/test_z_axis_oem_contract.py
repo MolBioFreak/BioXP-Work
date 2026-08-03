@@ -257,7 +257,7 @@ def test_move_z_home_is_distinct_source_method_at_1791_without_standby_write(mon
         ("require_profile", "z"),
         ("set", 4, 1, 6, 31),
         ("get", 4, 1, 6),
-        ("go_home", "z", {"speed": 1791, "rehome": True, "timeout_s": 30.0, "max_search_abs_delta": 160000}),
+        ("go_home", "z", {"speed": 1791, "rehome": True, "timeout_s": 30.0, "max_search_abs_delta": None}),
     ]
 
 
