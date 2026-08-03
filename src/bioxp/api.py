@@ -176,6 +176,13 @@ _camera_provider = CameraProvider()
 
 
 def _default_reference_state_path() -> str:
+    # The service mounts this root specifically as durable runtime authority.
+    # Reference state must share it with OEMRuntimeStore; using container HOME
+    # puts the two authorities in different stores and loses reference state on
+    # every container replacement.
+    runtime_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
+    if runtime_root:
+        return os.path.join(runtime_root, "reference-state.json")
     xdg_state_home = os.environ.get("XDG_STATE_HOME")
     if xdg_state_home:
         base_dir = xdg_state_home
