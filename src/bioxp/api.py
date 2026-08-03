@@ -1189,6 +1189,16 @@ class OemManualHomeRequest(BaseModel):
     axis: Literal["x", "y", "z", "g", "door"]
 
 
+class OemManualSetHomeRequest(BaseModel):
+    """Operator-supervised no-motion set-home: record the current physical position as controller 0."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis: Literal["x", "y", "z", "g", "door"]
+    operator_ack: Literal["SET_HOME_CURRENT_POSITION"]
+    operator_note: str = Field(default="", max_length=2000)
+
+
 class OemManualAbsoluteRequest(BaseModel):
     """Exact OEM moveX/moveY/moveZ/moveG absolute inputs."""
 
@@ -6349,6 +6359,15 @@ async def motion_oem_z_observation(req: OemZObservationRequest):
         raise HTTPException(status_code=409, detail={"error": "z_observation_rejected", "reason": str(exc)}) from exc
 
 
+@app.post("/motion/oem/z/set_home")
+async def motion_oem_z_set_home():
+    return await _run_blocking(
+        "serial-206 Z manual set-home (no motion)",
+        lambda: _execute_provider_z_intent("set_home"),
+        timeout_s=60.0,
+    )
+
+
 @app.post("/motion/oem/z/move_z_home")
 async def motion_oem_move_z_home(req: OemMoveZHomeRequest):
     del req
@@ -6407,6 +6426,75 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
             source="ClassControlInterface.HomeAxis.z",
             motion_kind="home_axis_board_test",
         )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.post("/motion/oem/manual/sethome")
+async def motion_oem_manual_sethome(req: OemManualSetHomeRequest):
+    """Operator-supervised no-motion set-home: record current position as controller 0.
+
+    Z is owned by the Serial-206 provider (oem.z.set_home). X/Y/G/door use the
+    exact OEM setHome write (SAP param 1 = 0) with readback and a durable
+    reference mark. No search, no motion, no switch transition is required.
+    """
+    _require_motion_route_ready()
+    if req.axis == "z":
+        return await _run_blocking(
+            "serial-206 Z manual set-home (no motion)",
+            lambda: _execute_provider_z_intent("set_home"),
+            timeout_s=60.0,
+        )
+    tester = _get_tester()
+
+    def execute() -> dict[str, Any]:
+        profile = tester._motion_oem_axis_profile(req.axis)
+        if not isinstance(profile, dict):
+            return {"ok": False, "error": "live_axis_profile_unavailable", "axis": req.axis, "physical_motion": False}
+        board = int(profile.get("board", 0))
+        motor = int(profile.get("motor", 0))
+        set_home = tester.motor_set_home(board, motor=motor)
+        position = tester.motor_get_position(board, motor=motor)
+        value = position.get("position") if isinstance(position, dict) else None
+        ok = (
+            isinstance(set_home, dict)
+            and set_home.get("ok") is True
+            and isinstance(position, dict)
+            and position.get("ok") is True
+            and value is not None
+            and int(value) == 0
+        )
+        reference = None
+        if ok:
+            reference = _reference_state_store.mark_referenced(
+                MarkAxisReferencedCommand(
+                    axis=req.axis,
+                    position_steps=0,
+                    source="oem.manual_set_home",
+                    motion_kind="manual_set_home",
+                )
+            )
+            ok = reference.get("ok") is True and reference.get("durable_clean") is True
+        return {
+            "ok": ok,
+            "axis": req.axis,
+            "intent": "manual_set_home",
+            "source_method": "ClassMotor.setHome (SAP param 1 = 0) at current physical position",
+            "physical_motion": False,
+            "controller_command_acknowledged": ok,
+            "controller_terminal_state_verified": ok,
+            "set_home": _json_safe(set_home),
+            "position": _json_safe(position),
+            "reference_state": _json_safe(reference),
+            "failure": None if ok else "manual_set_home_evidence_not_verified",
+        }
+
+    result = await _run_blocking(
+        f"OEM manual set-home {req.axis}",
+        execute,
+        timeout_s=60.0,
+    )
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result

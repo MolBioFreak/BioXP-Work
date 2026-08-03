@@ -801,6 +801,58 @@ class Serial206ProductionPrimitiveAdapter:
             "physical_effect_verified": False,
         }
 
+    def z_set_home(self, *, source: str = "oem.z.set_home") -> dict[str, Any]:
+        """No-motion manual home: record the current physical position as controller 0.
+
+        OEM ClassMotor.setHome writes axis parameter 1 (actual position) to 0.
+        There is no search and no motion; readback and a durable reference mark
+        complete the evidence chain.
+        """
+        # This is deliberately *not* ``_z_profile()``.  That helper enforces the
+        # Linux no-motion preparation/profile and motion interlock, neither of
+        # which is called by the OEM ClassMotor.setHome implementation.  Reusing
+        # it made the exact OEM state-establishing write unreachable precisely
+        # when it is needed to repair a stale/desynced controller coordinate.
+        profile = dict(self.tester._motion_oem_axis_profile("z"))
+        if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
+            raise RuntimeError("serial-206 Z setHome authority must resolve to board 4 motor 1")
+        set_home = self.tester.motor_set_home(4, motor=1)
+        position = self.tester.motor_get_position(4, motor=1)
+        value = self._z_value(position)
+        ok = (
+            isinstance(set_home, Mapping)
+            and set_home.get("ok") is True
+            and isinstance(position, Mapping)
+            and position.get("ok") is True
+            and value == 0
+        )
+        reference = None
+        if ok and self.reference_store is not None:
+            reference = self.reference_store.mark_referenced(
+                MarkAxisReferencedCommand(
+                    axis="z",
+                    position_steps=0,
+                    source=source,
+                    motion_kind="manual_set_home",
+                )
+            )
+            ok = reference.get("ok") is True and reference.get("durable_clean") is True
+        return {
+            "ok": ok,
+            "intent": "set_home",
+            "source_method": "ClassMotor.setHome (SAP param 1 = 0) at current physical position; no OEM profile/interlock/search prelude",
+            "source_anchor": "ClassMotor.cs:492-516; ClassHeadBoard.cs:121-124",
+            "board": 4,
+            "motor": 1,
+            "set_home": _json_safe(set_home),
+            "position": _json_safe(position),
+            "reference_state": _json_safe(reference),
+            "physical_motion": False,
+            "controller_command_acknowledged": bool(ok),
+            "controller_terminal_state_verified": bool(ok),
+            "failure": None if ok else "z_set_home_evidence_not_verified",
+        }
+
     def z_startup_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
         self._z_profile()
         result = self.tester.motor_oem_axis_search_home(
@@ -2253,6 +2305,12 @@ class Serial206OemInitializationProvider:
                 "reconcile_switch_masks": {"unprepared", "failed_latched"},
                 "manual_home": {"prepared_unreferenced", "referenced_ready"},
                 "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+                # ClassMotor.setHome is the no-motion state-establishing OEM
+                # primitive.  It cannot require the prepared/reference state it
+                # creates; otherwise a stale controller position has no canonical
+                # recovery route.  Operator-plane generation ownership remains
+                # mandatory for this mutation.
+                "set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "move_steps": {"referenced_ready"},
                 "move_absolute": {"referenced_ready"},
                 "stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched"},
@@ -2264,7 +2322,7 @@ class Serial206OemInitializationProvider:
                 blockers.append(f"unsupported_z_intent:{intent}")
             elif z.get("state") not in allowed_by_state[intent]:
                 blockers.append(f"z_state_blocks_intent:{z.get('state')}:{intent}")
-            if z.get("generation") is not None and int(z["generation"]) != observed_generation and intent not in {"prepare", "reconcile_switch_masks", "stop"}:
+            if z.get("generation") is not None and int(z["generation"]) != observed_generation and intent not in {"prepare", "reconcile_switch_masks", "set_home", "stop"}:
                 blockers.append("z_preparation_generation_stale")
             if intent == "prepare" and self.preparation_provider is None:
                 blockers.append("z_preparation_provider_not_bound")
@@ -2293,6 +2351,8 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_reconcile_switch_masks()
                 elif intent == "manual_home":
                     result = self.primitives.z_manual_home(timeout_s=float(values.get("timeout_s", 30.0)))
+                elif intent == "set_home":
+                    result = self.primitives.z_set_home()
                 elif intent == "diagnostic_home_axis":
                     result = self.primitives.z_diagnostic_home_axis(timeout_s=float(values.get("timeout_s", 30.0)))
                 elif intent == "move_steps":
@@ -2341,6 +2401,14 @@ class Serial206OemInitializationProvider:
             elif ok and intent == "reconcile_switch_masks":
                 z.update({"state": "unprepared", "generation": None, "prepared_receipt": None, "reference_state": "desynced", "last_failure": None})
                 self._z_mark_desynced("Z switch masks reconciled; source profile must be prepared again.", "serial206.z.reconcile_switch_masks")
+            elif ok and intent == "set_home":
+                z.update({
+                    "state": "referenced_ready",
+                    "generation": observed_generation,
+                    "reference_state": "referenced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": None,
+                })
             elif ok and intent in {"manual_home", "diagnostic_home_axis"}:
                 z.update({
                     "state": "awaiting_operator_observation",

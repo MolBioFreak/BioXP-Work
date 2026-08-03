@@ -289,6 +289,7 @@ def _home_action(action: Mapping[str, Any]) -> bool:
 _Z_NO_MOTION_STATE_ACTIONS = frozenset({
     "oem.z.prepare",
     "oem.z.reconcile_switch_masks",
+    "oem.z.set_home",
 })
 
 
@@ -453,6 +454,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "oem.z.reconcile_switch_masks": {"unprepared", "failed_latched"},
             "oem.z.manual_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.z.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+            "oem.z.set_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.z.move_steps": {"referenced_ready"},
             "oem.z.move_absolute": {"referenced_ready"},
             "oem.z.observe": {"awaiting_operator_observation"},
@@ -886,6 +888,15 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="Reconcile OEM Z switch masks",
         description="Explicitly restore GAP12=0 and GAP13=0 after inherited Linux contamination; requires fresh Z preparation afterward.",
         source_anchor="ClassMotor param12 right-disable; param13 left-disable",
+        fixed_inputs={"axis": "z"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_home",
+        path="/motion/oem/z/set_home",
+        label="Set OEM Z home at current position (no motion)",
+        description="No-motion manual home: record the current physical position as controller 0 via ClassMotor.setHome (SAP param 1 = 0) with readback and a durable reference mark.",
+        source_anchor="ClassMotor.setHome; SAP param 1 = actual position",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
