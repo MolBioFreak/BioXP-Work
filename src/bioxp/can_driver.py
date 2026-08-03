@@ -2,7 +2,7 @@ import struct
 import time
 import math
 from enum import IntEnum
-from typing import Any
+from typing import Any, Callable
 
 try:
     import can  # type: ignore
@@ -47,6 +47,137 @@ class MotorAxis(IntEnum):
     GRIPPER = 3
 
 
+_PIPETTE_COMPLETION_CATEGORIES = frozenset(
+    {
+        "pipette_initialize",
+        "pipette_initiate_group",
+        "pipette_eject_tip",
+        "dispense_all",
+        "dispense",
+        "aspirate",
+        "aspirate_air",
+        "set_top_speed",
+        "terminate_pipette",
+        "start_fluid_detection",
+    }
+)
+
+PIPETTE_DATA_QUERY_LABELS: dict[str, tuple[str, str | None]] = {
+    "?40": ("total_operating_time", "minutes"),
+    "?41": ("device_power_ups", None),
+    "?42": ("pump_initializations", None),
+    "?44": ("plunger_distance", "meters"),
+    "?45": ("plunger_movements", None),
+    "?47": ("tip_ejections", None),
+    "?51": ("highest_power_supply_voltage", "volts"),
+    "?52": ("lowest_power_supply_voltage", "volts"),
+    "?53": ("current_temperature", "fahrenheit"),
+    "?54": ("highest_temperature", "fahrenheit"),
+    "?55": ("lowest_temperature", "fahrenheit"),
+    "?58": ("highest_pressure", "psi"),
+    "?59": ("lowest_pressure", "psi"),
+}
+
+
+def process_pipette_message(
+    dlc: int,
+    message: list[int] | bytes | bytearray,
+    *,
+    command_name: str | None,
+    state: dict[str, Any] | None = None,
+    received_at: float | None = None,
+) -> dict[str, Any]:
+    """Apply the literal serial-206 ``ClassPipette.processMessage`` rules.
+
+    The returned projection keeps the OEM error/event result separate from the
+    Linux transport validity gate.  ``message`` is the decoded pipette data
+    array, not the enclosing Novo record.
+    """
+    current = dict(state or {})
+    current.setdefault("initialized", False)
+    current.setdefault("error_code", 0)
+    current.setdefault("error_queue", [])
+    current.setdefault("tip_loaded", False)
+    current.setdefault("diagnosis", None)
+    current.setdefault("fluid_timestamp", None)
+    current.setdefault("initialization_counter", 0)
+    data = [int(value) & 0xFF for value in message]
+    selected_dlc = int(dlc)
+    if command_name == "query_status":
+        # ClassPipette.QueryStatus() resets the local status/error-vector
+        # projection before issuing Q1.  The asynchronous reply then repopulates
+        # the raw channel error and any returned queue entries.
+        current["initialized"] = False
+        current["error_queue"] = []
+    if selected_dlc == 0:
+        return {
+            **current,
+            "ok": True,
+            "reply_presence": "empty_completion",
+            "command_name": command_name,
+            "completion_signal": command_name in _PIPETTE_COMPLETION_CATEGORIES,
+            "oem_error_code": int(current.get("error_code", 0)),
+            "event_error_code": 0,
+            "message": data,
+        }
+    if selected_dlc < 0 or len(data) < selected_dlc or len(data) < 3:
+        return {
+            **current,
+            "ok": False,
+            "reply_presence": "malformed",
+            "command_name": command_name,
+            "completion_signal": False,
+            "oem_error_code": None,
+            "event_error_code": None,
+            "message": data,
+            "error": "pipette_async_message_shorter_than_error_offset",
+        }
+
+    bounded = data[:selected_dlc]
+    error_code = int(bounded[2])
+    current["error_code"] = error_code
+    if error_code == 0x20:
+        current["initialized"] = True
+    event_error_code = error_code
+    if error_code == 42 and command_name == "pipette_eject_tip":
+        event_error_code = 0
+
+    completion_signal = selected_dlc == 2 and command_name in _PIPETTE_COMPLETION_CATEGORIES
+    if selected_dlc == 2 and command_name == "start_fluid_detection":
+        current["fluid_timestamp"] = float(received_at if received_at is not None else time.time())
+    elif selected_dlc > 2 and command_name in {"query_error_log", "query_status"}:
+        queue = list(current.get("error_queue", []))
+        for value in bounded[3:]:
+            if value == 0x40:
+                queue.clear()
+            else:
+                queue.append(int(value))
+        current["error_queue"] = queue
+    elif selected_dlc > 2 and command_name in {"pipette_initialize", "pipette_initiate_group"}:
+        current["initialization_counter"] = int(current.get("initialization_counter", 0)) + 1
+    elif selected_dlc > 2 and command_name == "query_tip_status":
+        # OEM processMessage indexes the raw asynchronous message at msg[4].
+        # A short frame is retained as invalid rather than being normalized to
+        # a successful no-tip state by the Linux adapter.
+        current["tip_loaded"] = bool(len(bounded) > 4 and bounded[4] == ord("1"))
+    elif selected_dlc > 2 and command_name == "execute_diagnoses":
+        current["diagnosis"] = bytes(bounded[2:]).decode("ascii", errors="replace")
+    elif selected_dlc > 2 and command_name == "start_fluid_detection":
+        current["fluid_timestamp"] = float(received_at if received_at is not None else time.time())
+
+    return {
+        **current,
+        "ok": True,
+        "reply_presence": "nonempty",
+        "command_name": command_name,
+        "completion_signal": completion_signal,
+        "oem_error_code": error_code,
+        "event_error_code": event_error_code,
+        "tip_lost_suppressed_for_eject": bool(error_code == 42 and command_name == "pipette_eject_tip"),
+        "message": bounded,
+    }
+
+
 class BioXpCanDriver:
     """
     Python CAN Driver for the BioXP 3200.
@@ -64,7 +195,7 @@ class BioXpCanDriver:
             raise ValueError(f"pipette_id must be one of 0..3, got {selected}")
         return selected
 
-    def __init__(self, channel='can0', bitrate=1000000, *, pipette_id: int = 0, response_timeout_s: float = 60.0):
+    def __init__(self, channel='can0', bitrate=1000000, *, pipette_id: int = 0, response_timeout_s: float = 60.0, pipette_error_callback: Callable[[int, int], None] | None = None):
         # The BioXP USB-to-CAN adapter should map to can0 in Linux
         self.bus = can.interface.Bus(bustype='socketcan', channel=channel, bitrate=bitrate)
         self.channel = channel
@@ -72,6 +203,9 @@ class BioXpCanDriver:
         self.pipette_id = self._validate_pipette_id(pipette_id)
         self.response_timeout_s = float(response_timeout_s)
         self._sleep = time.sleep
+        self._pipette_message_state: dict[str, Any] = {}
+        self._pipette_last_command: str | None = None
+        self._pipette_error_callback = pipette_error_callback
 
     def pipette_can_ids(self) -> dict[str, int]:
         pipette_id = self._validate_pipette_id(self.pipette_id)
@@ -201,6 +335,7 @@ class BioXpCanDriver:
         response_timeout_s: float | None = None,
         ack_mode: str = "command",
         command_name: str | None = None,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         """
         Broadcast a single 8-byte CAN packet and optionally require a response.
@@ -237,6 +372,7 @@ class BioXpCanDriver:
                     matcher_name=command_name or f"pipette_function_{function}",
                     initialization=initialization,
                     completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
+                    wait_for_completion=wait_for_completion,
                 )
             except Exception as exc:
                 return {**base, "tx_ok": False, "error": str(exc), "provenance": None}
@@ -245,7 +381,16 @@ class BioXpCanDriver:
             for frame in frames:
                 data.extend(int(byte) for byte in frame.get("data", []))
             observed = frames[-1] if frames else {}
-            ack_ok = bool(provenance.get("ok")) and self._ack_ok(data, ack_mode=ack_mode)
+            provenance_ok = bool(provenance.get("ok")) if isinstance(provenance, dict) else False
+            immediate_initialization_ack = bool(
+                initialization
+                and isinstance(provenance, dict)
+                and provenance.get("outcome") == "ack"
+                and frames
+            )
+            ack_ok = immediate_initialization_ack or (
+                provenance_ok and (not wait_for_completion or self._ack_ok(data, ack_mode=ack_mode))
+            )
             ack = {
                 "ok": ack_ok,
                 "received": bool(frames),
@@ -258,6 +403,7 @@ class BioXpCanDriver:
                 "immediate_ack": next((frame for frame in frames if frame.get("dlc") == 0), None),
                 "completion": next((frame for frame in reversed(frames) if frame.get("dlc", 0) > 0), None),
             }
+            message_state = self._apply_pipette_provenance(provenance, command_name)
             if not ack_ok:
                 ack["error"] = "ack_timeout" if provenance.get("outcome") == "timeout" else "pipette_reply_error"
             return {
@@ -266,8 +412,11 @@ class BioXpCanDriver:
                 "tx_ok": True,
                 "ack": ack,
                 "provenance": provenance,
+                "pipette_message_state": message_state,
                 "error": None if ack_ok else ack["error"],
             }
+        if not wait_for_completion:
+            raise ValueError("deferred pipette completion requires the shared NovoRouter transaction owner")
         try:
             self.bus.send(msg)
             print(f"[CAN TX] ID: {hex(int(board_id))} | Data: {[hex(b) for b in payload]}")
@@ -289,10 +438,17 @@ class BioXpCanDriver:
             ack_mode=ack_mode,
             expected_arbitration_id=int(board_id) | 0x400,
         )
+        message_state = self.process_pipette_message(
+            int(ack.get("dlc", len(ack.get("data", [])))),
+            list(ack.get("data", [])),
+            command_name=command_name,
+            received_at=ack.get("received_at"),
+        )
         return {
             **base,
             "ok": bool(ack.get("ok")),
             "ack": ack,
+            "pipette_message_state": message_state,
             "error": None if ack.get("ok") else ack.get("error", "ack_failed"),
         }
 
@@ -305,6 +461,7 @@ class BioXpCanDriver:
         response_timeout_s: float | None = None,
         ack_mode: str = "command",
         command_name: str | None = None,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         encoded = str(ascii_command).encode('ascii')
         if len(encoded) > 8:
@@ -331,11 +488,21 @@ class BioXpCanDriver:
                 matcher_name=command_name or str(ascii_command),
                 initialization=initialization,
                 completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
+                wait_for_completion=wait_for_completion,
             )
             frames = list(provenance.get("frames", []))
             data = [int(byte) for frame in frames for byte in frame.get("data", [])]
             observed = frames[-1] if frames else {}
-            ack_ok = bool(provenance.get("ok")) and self._ack_ok(data, ack_mode=ack_mode)
+            provenance_ok = bool(provenance.get("ok")) if isinstance(provenance, dict) else False
+            immediate_initialization_ack = bool(
+                initialization
+                and isinstance(provenance, dict)
+                and provenance.get("outcome") == "ack"
+                and frames
+            )
+            ack_ok = immediate_initialization_ack or (
+                provenance_ok and (not wait_for_completion or self._ack_ok(data, ack_mode=ack_mode))
+            )
             ack = {
                 "ok": ack_ok,
                 "received": bool(frames),
@@ -348,6 +515,7 @@ class BioXpCanDriver:
                 "immediate_ack": next((frame for frame in frames if frame.get("dlc") == 0), None),
                 "completion": next((frame for frame in reversed(frames) if frame.get("dlc", 0) > 0), None),
             }
+            message_state = self._apply_pipette_provenance(provenance, command_name)
             if not ack_ok:
                 ack["error"] = "ack_timeout" if provenance.get("outcome") == "timeout" else "pipette_reply_error"
             return {
@@ -355,6 +523,7 @@ class BioXpCanDriver:
                 "tx_ok": True,
                 "ack": ack,
                 "provenance": provenance,
+                "pipette_message_state": message_state,
                 "error": None if ack_ok else ack["error"],
                 "ascii_command": str(ascii_command),
                 "length": len(encoded),
@@ -371,15 +540,25 @@ class BioXpCanDriver:
                 response_timeout_s=response_timeout_s,
                 ack_mode=ack_mode,
                 command_name=command_name or str(ascii_command),
+                wait_for_completion=wait_for_completion,
             ),
             "ascii_command": str(ascii_command),
             "length": len(encoded),
         }
 
-    def _send_pipette_command(self, ascii_command: str, *, address: str = "command", ack_mode: str = "command", command_name: str | None = None) -> dict[str, Any]:
+    def _send_pipette_command(
+        self,
+        ascii_command: str,
+        *,
+        address: str = "command",
+        ack_mode: str = "command",
+        command_name: str | None = None,
+        wait_for_completion: bool = True,
+    ) -> dict[str, Any]:
         ids = self.pipette_can_ids()
         if address not in ids:
             raise ValueError(f"Unknown pipette CAN address kind: {address!r}")
+        self._pipette_last_command = command_name or f"pipette:{ascii_command}"
         return self._send_ascii_packet(
             ids[address],
             ascii_command,
@@ -387,7 +566,46 @@ class BioXpCanDriver:
             response_timeout_s=self.response_timeout_s,
             ack_mode=ack_mode,
             command_name=command_name or f"pipette:{ascii_command}",
+            wait_for_completion=wait_for_completion,
         )
+
+    def process_pipette_message(
+        self,
+        dlc: int,
+        message: list[int] | bytes | bytearray,
+        *,
+        command_name: str | None = None,
+        received_at: float | None = None,
+    ) -> dict[str, Any]:
+        selected = command_name or self._pipette_last_command
+        self._pipette_message_state = process_pipette_message(
+            dlc,
+            message,
+            command_name=selected,
+            state=getattr(self, "_pipette_message_state", {}),
+            received_at=received_at,
+        )
+        callback = getattr(self, "_pipette_error_callback", None)
+        event_error_code = self._pipette_message_state.get("event_error_code")
+        if callable(callback) and isinstance(event_error_code, int) and event_error_code not in {0, 0x20}:
+            try:
+                callback(int(self.pipette_id), int(event_error_code))
+            except Exception as exc:  # event publication must not kill the reader owner
+                self._pipette_message_state["error_callback_error"] = repr(exc)
+        return dict(self._pipette_message_state)
+
+    def _apply_pipette_provenance(self, provenance: Any, command_name: str | None) -> dict[str, Any]:
+        state = dict(getattr(self, "_pipette_message_state", {}))
+        for frame in provenance.get("frames", []) if isinstance(provenance, dict) else []:
+            if not isinstance(frame, dict):
+                continue
+            state = self.process_pipette_message(
+                int(frame.get("dlc", len(frame.get("data", [])))),
+                list(frame.get("data", [])),
+                command_name=command_name,
+                received_at=frame.get("received_at"),
+            )
+        return state
 
     def close(self):
         shutdown = getattr(self.bus, 'shutdown', None)
@@ -434,11 +652,20 @@ class BioXpCanDriver:
     @staticmethod
     def _format_pipette_volume(volume_ul: float) -> str:
         volume_ul = float(volume_ul)
+        if not math.isfinite(volume_ul) or volume_ul < 0.0:
+            raise ValueError("pipette volume must be a finite non-negative number")
         if volume_ul >= 100.0:
             return f"{round(volume_ul):.0f}"
         if volume_ul == float(int(volume_ul)):
             return f"{int(volume_ul)}"
         return f"{volume_ul:.1f}"
+
+    @staticmethod
+    def _require_oem_pressure_profile(profile: str) -> str:
+        selected = str(profile).upper()
+        if selected != "1R":
+            raise ValueError("serial-206 OEM pipette commands require pressure profile 1R")
+        return selected
 
     @staticmethod
     def _parse_tip_loaded(result: dict[str, Any]) -> bool | None:
@@ -468,6 +695,7 @@ class BioXpCanDriver:
             return None
 
     def pipette_initialize(self, pressure_profile='1R'):
+        self._require_oem_pressure_profile(pressure_profile)
         wake_byte = 0x20 | int(self.pipette_id)
         wake = self._send_packet(0x080, [wake_byte, wake_byte], command_name="pipette_wake_address")
         self._sleep(0.100)
@@ -486,11 +714,42 @@ class BioXpCanDriver:
         result["requested_pressure_profile"] = str(pressure_profile).upper()
         return result
 
+    def _enrich_pipette_completion(self, result: dict[str, Any]) -> dict[str, Any]:
+        data = result.get("data")
+        if not isinstance(data, list):
+            return result
+        state = self.process_pipette_message(
+            int(result.get("observed_rx_dlc", len(data))),
+            data,
+            command_name=self._pipette_last_command,
+            received_at=result.get("receive_timestamp"),
+        )
+        event_error = state.get("event_error_code")
+        result["pipette_message_state"] = state
+        result["oem_error_code"] = state.get("oem_error_code")
+        result["event_error_code"] = event_error
+        result["ok"] = bool(result.get("ok") and event_error in {0, 0x20})
+        if not result["ok"] and result.get("outcome") == "completion":
+            result["outcome"] = "oem_error"
+        return result
+
     def wait_pipette_initialization_completion(self, timeout_s: float):
         wait = getattr(self.bus, "wait_pipette_completion", None)
         if not callable(wait):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
-        return wait(int(self.pipette_id), float(timeout_s))
+        raw = wait(int(self.pipette_id), float(timeout_s))
+        if not isinstance(raw, dict):
+            return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
+        return self._enrich_pipette_completion(raw)
+
+    def wait_pipette_command_completion(self, timeout_s: float):
+        wait = getattr(self.bus, "wait_pipette_completion", None)
+        if not callable(wait):
+            return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
+        raw = wait(int(self.pipette_id), float(timeout_s))
+        if not isinstance(raw, dict):
+            return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
+        return self._enrich_pipette_completion(raw)
 
     def pipette_initiate_group(self):
         result = self._send_pipette_command("WR", command_name="pipette_initiate_group")
@@ -503,13 +762,28 @@ class BioXpCanDriver:
         return result
 
     def query_firmware(self, number: int = 1):
-        return self._send_pipette_command(f"&{int(number)}", address="report", ack_mode="query", command_name="query_firmware")
+        result = self._send_pipette_command(f"&{int(number)}", address="report", ack_mode="query", command_name="query_firmware")
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
+        firmware = bytes(data[2:]).decode("ascii", errors="replace") if len(data) >= 2 else None
+        semantic_ok = bool(reply_received and firmware is not None and firmware != "")
+        return {
+            **result,
+            "ok": semantic_ok,
+            "query": f"&{int(number)}",
+            "reply_received": reply_received,
+            "firmware": firmware,
+            "semantic_ok": semantic_ok,
+            "hardware_truth_level": "hardware_query" if semantic_ok else ("unparsed_hardware_reply" if reply_received else "no_readback"),
+            "oem_source_anchor": "ClassPipette.QueryFirmware:599-619",
+        }
 
     def query_status(self):
         result = self._send_pipette_command("Q1", address="report", ack_mode="query", command_name="query_status")
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         data = list(ack.get("data", [])) if isinstance(ack, dict) else []
-        reply_received = bool(result.get("ok"))
+        reply_received = bool(ack.get("received")) if isinstance(ack, dict) and "received" in ack else bool(data)
         semantic_ok = bool(len(data) >= 3 and data[:2] == [0x20, 0x60])
         raw_statuses = [int(value) for value in data[2:]] if semantic_ok else []
         raw_status = raw_statuses[0] if raw_statuses else None
@@ -538,6 +812,7 @@ class BioXpCanDriver:
             "reply_received": reply_received,
             "semantic_ok": semantic_ok,
             "oem_raw_status": raw_status,
+            "oem_process_error_code": int(data[2]) if semantic_ok else None,
             "oem_raw_statuses": raw_statuses,
             "oem_error_code": error_code,
             "oem_error_codes": error_codes,
@@ -555,7 +830,8 @@ class BioXpCanDriver:
     def query_tip_status(self):
         result = self._send_pipette_command("?31", address="report", ack_mode="query", command_name="query_tip_status")
         tip_loaded = self._parse_tip_loaded(result)
-        reply_received = bool(result.get("ok"))
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
         semantic_ok = tip_loaded is not None
         if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"
@@ -573,7 +849,8 @@ class BioXpCanDriver:
     def query_pressure(self):
         result = self._send_pipette_command("?57", address="report", ack_mode="query", command_name="query_pressure")
         pressure = self._parse_numeric_ascii_from_ack(result)
-        reply_received = bool(result.get("ok"))
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
         semantic_ok = pressure is not None
         if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"
@@ -601,9 +878,13 @@ class BioXpCanDriver:
             "error": None if tip_loaded else "tip_not_detected",
         }
 
-    def pipette_eject_tip(self, *, initialized: bool = True):
+    def pipette_eject_tip(self, *, initialized: bool = True, wait_for_completion: bool = True):
         # OEM ClassPipette.ejectTip uses E1R after initialization and E0R otherwise.
-        return self._send_pipette_command("E1R" if initialized else "E0R", command_name="pipette_eject_tip")
+        return self._send_pipette_command(
+            "E1R" if initialized else "E0R",
+            command_name="pipette_eject_tip",
+            wait_for_completion=wait_for_completion,
+        )
 
     def terminate_pipette(self):
         return self._send_pipette_command("TR", address="control", command_name="terminate_pipette")
@@ -614,29 +895,48 @@ class BioXpCanDriver:
         result["effective_top_speed"] = value
         return result
 
-    def dispense_all(self):
-        return self._send_pipette_command("A0R", command_name="dispense_all")
-
-    def aspirate_air(self, volume_ul: float, *, air_type: int = 1, tip_pressure_profile: str = "1R"):
-        del air_type
-        formatted_vol = self._format_pipette_volume(volume_ul)
+    def dispense_all(self, *, wait_for_completion: bool = True):
         return self._send_pipette_command(
-            f"P{formatted_vol},{str(tip_pressure_profile).upper()}",
-            command_name="aspirate_air",
+            "A0R",
+            command_name="dispense_all",
+            wait_for_completion=wait_for_completion,
         )
 
-    def dispense_air(self, volume_ul: float, *, dispense_type: int = 0):
+    def aspirate_air(
+        self,
+        volume_ul: float,
+        *,
+        air_type: int = 1,
+        tip_pressure_profile: str = "1R",
+        wait_for_completion: bool = True,
+    ):
+        if int(air_type) != 1:
+            raise ValueError("OEM AspirateAir uses pressure/type literal 1R")
+        self._require_oem_pressure_profile(tip_pressure_profile)
+        formatted_vol = self._format_pipette_volume(volume_ul)
+        return self._send_pipette_command(
+            f"P{formatted_vol},1R",
+            command_name="aspirate_air",
+            wait_for_completion=wait_for_completion,
+        )
+
+    def dispense_air(self, volume_ul: float, *, dispense_type: int = 0, wait_for_completion: bool = True):
         formatted_vol = self._format_pipette_volume(volume_ul)
         return self._send_pipette_command(
             f"D{formatted_vol},{int(dispense_type)}R",
             command_name="dispense_air",
+            wait_for_completion=wait_for_completion,
         )
 
     def heartbeat(self, enabled: bool):
         return self._send_pipette_command("U60R" if enabled else "U61R", command_name="heartbeat")
 
-    def execute_diagnoses(self, number: int):
-        result = self._send_pipette_command(f"d{int(number)}R", command_name="execute_diagnoses")
+    def execute_diagnoses(self, number: int, *, wait_for_completion: bool = True):
+        result = self._send_pipette_command(
+            f"d{int(number)}R",
+            command_name="execute_diagnoses",
+            wait_for_completion=wait_for_completion,
+        )
         self._sleep(1.500)
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         data = list(ack.get("data", [])) if isinstance(ack, dict) else []
@@ -650,49 +950,145 @@ class BioXpCanDriver:
             raise ValueError("raw_byte must be between 0 and 255")
         ids = self.pipette_can_ids()
         payload = [ord("Q"), ord(":"), value, ord("1")]
+        result = self._send_packet(
+            ids["report"],
+            payload,
+            require_ack=True,
+            response_timeout_s=self.response_timeout_s,
+            ack_mode="query",
+            command_name="query_error_log",
+        )
+        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
         return {
-            **self._send_packet(
-                ids["report"],
-                payload,
-                require_ack=True,
-                response_timeout_s=self.response_timeout_s,
-                ack_mode="query",
-                command_name="query_error_log",
-            ),
+            **result,
             "raw_query": payload,
+            "oem_error_code": int(data[0]) if data else 0,
+            "oem_null_reply_default": 0,
+            "reply_received": reply_received,
+            "semantic_ok": bool(reply_received and data),
+            "query_error_queue": list(self._pipette_message_state.get("error_queue", [])),
         }
 
     def get_data(self, query: str):
-        selected = str(query)
-        if not selected.startswith("?") or len(selected) != 3 or not selected[1:].isdigit():
-            raise ValueError("diagnostic data query must be an OEM ?<two-digit> literal")
+        selected = str(query).strip()
+        if selected not in PIPETTE_DATA_QUERY_LABELS:
+            raise ValueError(
+                "diagnostic data query must be one of "
+                + ", ".join(sorted(PIPETTE_DATA_QUERY_LABELS))
+            )
+        wake = None
+        if self._pipette_message_state.get("initialized") is not True:
+            wake_byte = 0x20 | int(self.pipette_id)
+            wake = self._send_packet(0x080, [wake_byte, wake_byte], command_name="pipette_wake_address")
         result = self._send_pipette_command(selected, address="report", ack_mode="query", command_name="get_data")
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         data = list(ack.get("data", [])) if isinstance(ack, dict) else []
+        label, unit = PIPETTE_DATA_QUERY_LABELS[selected]
         result["query"] = selected
+        result["label"] = label
+        result["unit"] = unit
+        result["wake"] = wake
         result["value_bytes"] = data[2:] if len(data) >= 2 else []
         result["value_ascii"] = bytes(data[2:]).decode("ascii", errors="replace") if len(data) >= 2 else None
+        result["semantic_ok"] = bool(result.get("ok") and len(data) >= 2)
         return result
 
-    def start_fluid_detection(self):
-        return self._send_pipette_command("BR", command_name="start_fluid_detection")
+    def start_fluid_detection(self, *, wait_for_completion: bool = True):
+        return self._send_pipette_command(
+            "BR",
+            command_name="start_fluid_detection",
+            wait_for_completion=wait_for_completion,
+        )
 
-    def aspirate(self, volume_ul: float, tip_pressure_profile='1R'):
+    def aspirate(self, volume_ul: float, tip_pressure_profile='1R', *, wait_for_completion: bool = True):
         """
         Reverse Engineered from `ClassPipette.Aspirate(double volume)`.
         The DLL uses ASCII commands over the pipette CAN command ID.
         """
+        self._require_oem_pressure_profile(tip_pressure_profile)
         formatted_vol = self._format_pipette_volume(volume_ul)
-        ascii_command = f"P{formatted_vol},{str(tip_pressure_profile).upper()}"
-        return self._send_pipette_command(ascii_command, command_name="aspirate")
+        ascii_command = f"P{formatted_vol},1R"
+        return self._send_pipette_command(
+            ascii_command,
+            command_name="aspirate",
+            wait_for_completion=wait_for_completion,
+        )
 
-    def dispense(self, volume_ul: float, tip_pressure_profile='1R', blow_out=False):
+    def dispense(
+        self,
+        volume_ul: float,
+        tip_pressure_profile='1R',
+        blow_out=False,
+        dispense_type: int = 0,
+        *,
+        wait_for_completion: bool = True,
+    ):
+        self._require_oem_pressure_profile(tip_pressure_profile)
+        selected_type = int(dispense_type)
+        if selected_type not in {0, 1, 2}:
+            raise ValueError("OEM dispense type must be 0, 1, or 2")
         formatted_vol = self._format_pipette_volume(volume_ul)
-        ascii_command = f"D{formatted_vol},{str(tip_pressure_profile).upper()}"
-        result = self._send_pipette_command(ascii_command, command_name="dispense")
+        ascii_command = f"D{formatted_vol},{selected_type}R"
+        result = self._send_pipette_command(
+            ascii_command,
+            command_name="dispense",
+            wait_for_completion=wait_for_completion,
+        )
+        result["dispense_type"] = selected_type
         if blow_out:
             result["blow_out"] = True
         return result
+
+    def mix(self, volume_ul: float, count: int, tip_pressure_profile: str = "1R", *, wait_for_completion: bool = True):
+        """Execute OEM ``Mix`` as its composite P/D command sequence.
+
+        The serial-206 OEM has no dedicated Mix wire command.  For ``count - 1``
+        cycles it sends Aspirate, waits 1500 ms, sends Dispense, waits 1500 ms;
+        the final cycle sends only Aspirate and waits 1500 ms.
+        """
+        self._require_oem_pressure_profile(tip_pressure_profile)
+        cycles = int(count)
+        if cycles < 1:
+            raise ValueError("mix count must be at least one")
+        rows: list[dict[str, Any]] = []
+        for cycle in range(1, cycles):
+            aspirate = self.aspirate(
+                volume_ul,
+                tip_pressure_profile=tip_pressure_profile,
+                wait_for_completion=wait_for_completion,
+            )
+            self._sleep(1.500)
+            dispense = self.dispense(
+                volume_ul,
+                tip_pressure_profile=tip_pressure_profile,
+                blow_out=False,
+                wait_for_completion=wait_for_completion,
+            )
+            self._sleep(1.500)
+            rows.append({"cycle": cycle, "aspirate": aspirate, "dispense": dispense})
+        final_aspirate = self.aspirate(
+            volume_ul,
+            tip_pressure_profile=tip_pressure_profile,
+            wait_for_completion=wait_for_completion,
+        )
+        self._sleep(1.500)
+        rows.append({"cycle": cycles, "aspirate": final_aspirate, "dispense": None})
+        return {
+            "ok": all(
+                isinstance(row.get("aspirate"), dict)
+                and row["aspirate"].get("ok")
+                and (row.get("dispense") is None or row["dispense"].get("ok"))
+                for row in rows
+            ),
+            "command_name": "mix",
+            "volume_ul": float(volume_ul),
+            "count": cycles,
+            "cycles": rows,
+            "oem_wire_semantics": "composite_P_D_no_dedicated_mix_command",
+            "inter_command_wait_ms": 1_500,
+        }
 
     # ==========================================
     # GANTRY MOTORS (ClassMotor)

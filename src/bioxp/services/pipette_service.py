@@ -16,7 +16,7 @@ from ..pipette.receipts import PipetteReceiptError, PipetteReceiptStore
 from ..pipette.transport import PipetteTransport
 
 BlockingRunner = Callable[..., Awaitable[dict[str, Any]]]
-TransportGetter = Callable[[], PipetteTransport]
+TransportGetter = Callable[[], Any]
 PipettePreflight = Callable[[str, Any], dict[str, Any]]
 
 
@@ -49,12 +49,13 @@ async def _run_transport_call(
     timeout_s: float,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
-    operation: Callable[[PipetteTransport], dict[str, Any]],
+    operation: Callable[[Any], dict[str, Any]],
     operation_name: str | None = None,
     command: Any | None = None,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
     runtime_binding: dict[str, Any] | None = None,
+    requested_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     preflight_payload: dict[str, Any] | None = None
     try:
@@ -79,10 +80,21 @@ async def _run_transport_call(
         result.setdefault("preflight", preflight_payload)
     if receipt_store is not None and isinstance(result, dict):
         try:
+            requested_for_receipt = (
+                dict(requested_inputs)
+                if requested_inputs is not None
+                else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
+            )
+            effective_candidate = result.get("effective")
+            effective_inputs = dict(effective_candidate) if isinstance(effective_candidate, dict) else dict(requested_for_receipt)
+            if "effective_volume_ul" in result:
+                effective_inputs["volume_ul"] = result["effective_volume_ul"]
+            if "dispense_type" in result:
+                effective_inputs["dispense_type"] = result["dispense_type"]
             receipt = receipt_store.record(
                 operation=operation_name or label,
-                requested_inputs=(command.to_payload() if command is not None and hasattr(command, "to_payload") else {}),
-                effective_inputs=result.get("effective") if isinstance(result.get("effective"), dict) else {},
+                requested_inputs=requested_for_receipt,
+                effective_inputs=effective_inputs,
                 result=result,
                 runtime_binding=runtime_binding,
             )
@@ -95,6 +107,31 @@ async def _run_transport_call(
         result["receipt_truth"] = receipt["truth"]
         result["source_identity"] = receipt["source_identity"]
     return result
+
+
+async def run_pipette_operation(
+    operation_name: str,
+    operation: Callable[[Any], dict[str, Any]],
+    *,
+    get_transport: TransportGetter,
+    run_blocking: BlockingRunner,
+    timeout_s: float = 600.0,
+    receipt_store: PipetteReceiptStore | None = None,
+    requested_inputs: dict[str, Any] | None = None,
+    preflight: PipettePreflight | None = None,
+) -> dict[str, Any]:
+    """Route a non-command OEM control through the same receipt/error owner."""
+    return await _run_transport_call(
+        operation_name.replace("_", " ").title(),
+        timeout_s=timeout_s,
+        get_transport=get_transport,
+        run_blocking=run_blocking,
+        operation=operation,
+        operation_name=operation_name,
+        preflight=preflight,
+        receipt_store=receipt_store,
+        requested_inputs=requested_inputs,
+    )
 
 
 async def run_pipette_status(

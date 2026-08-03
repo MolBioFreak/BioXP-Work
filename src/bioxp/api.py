@@ -83,10 +83,14 @@ from .domain.deck import load_deck_layout
 from .pipette.receipts import PipetteReceiptStore
 from .pipette import (
     PipetteAspirateCommand,
+    PipetteDiagnosticCommand,
     PipetteDispenseCommand,
+    PipetteErrorLogCommand,
+    PipetteHeartbeatCommand,
     PipetteInitCommand,
     PipetteMixCommand,
     PipettePreflightError,
+    PipetteTerminateCommand,
     PipetteTipAction,
     PipetteTipCommand,
     build_default_pipette_transport,
@@ -106,6 +110,7 @@ from .services.pipette_service import (
     run_pipette_dispense_command,
     run_pipette_init_command,
     run_pipette_mix_command,
+    run_pipette_operation,
     run_pipette_status,
     run_pipette_tip_command,
 )
@@ -1604,6 +1609,16 @@ class PipetteTipRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class PipetteEjectAllRequest(BaseModel):
+    channels: Optional[list[int]] = None
+    check_missing_tip: bool = True
+    wait: bool = True
+
+
+class PipetteKeepTipRequest(BaseModel):
+    tip: int = Field(..., ge=0, le=3)
+
+
 class PipetteAspirateRequest(BaseModel):
     volume_ul: float = Field(..., gt=0.0, le=1000.0)
     pressure_profile: str = Field("1R", min_length=1, max_length=2, pattern=r"^[A-Za-z0-9]+$")
@@ -1639,6 +1654,60 @@ class PipetteMixRequest(BaseModel):
     liquid_class: Optional[str] = Field(None, max_length=120)
     tip_id: Optional[str] = Field(None, max_length=120)
     operator: Optional[str] = Field(None, max_length=120)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PipetteChannelsRequest(BaseModel):
+    channels: Optional[list[int]] = None
+
+
+class PipetteAirRequest(PipetteChannelsRequest):
+    volume_ul: float = Field(..., gt=0.0, le=1000.0)
+    front_air: bool = True
+    dispense_type: int = Field(0, ge=0, le=2)
+
+
+class PipetteDispenseAllRequest(PipetteChannelsRequest):
+    pass
+
+
+class PipetteSpeedRequest(PipetteChannelsRequest):
+    velocity: int = Field(..., ge=1, le=10000)
+
+
+class PipetteFirmwareRequest(BaseModel):
+    number: int = Field(1, ge=0, le=9)
+
+
+class PipetteMixAllRequest(BaseModel):
+    count: int = Field(..., ge=1, le=50)
+    volume_ul: float = Field(..., gt=0.0, le=1000.0)
+    vigorous: int = Field(100, ge=0, le=100)
+
+
+class PipetteHeartbeatRequest(BaseModel):
+    enabled: bool
+
+
+class PipetteDiagnosticRequest(BaseModel):
+    number: int = Field(..., ge=0, le=9)
+
+
+class PipetteErrorLogRequest(BaseModel):
+    raw_byte: int = Field(0, ge=0, le=255)
+
+
+class PipetteDataRequest(BaseModel):
+    query: str = Field(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")
+
+
+class PipetteFluidDetectionRequest(BaseModel):
+    dry_run: bool = True
+
+
+class PipetteTerminateRequest(BaseModel):
+    operator: Optional[str] = Field(None, max_length=120)
+    reason: Optional[str] = Field(None, max_length=120)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -7302,6 +7371,36 @@ async def liquid_tip(req: PipetteTipRequest):
     )
 
 
+@app.post("/liquid/eject-all")
+async def liquid_eject_all(req: PipetteEjectAllRequest):
+    return await run_pipette_operation(
+        "eject_all_tips",
+        lambda transport: getattr(transport, "eject_all_tips")(
+            check_missing_tip=req.check_missing_tip,
+            wait=req.wait,
+            channels=req.channels,
+        ),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(exclude_none=True),
+    )
+
+
+@app.post("/liquid/keep-tip")
+async def liquid_keep_tip(req: PipetteKeepTipRequest):
+    return await run_pipette_operation(
+        "keep_tip",
+        lambda transport: getattr(transport, "KeepTip")(req.tip),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(),
+    )
+
+
 @app.post("/liquid/aspirate")
 async def liquid_aspirate(req: PipetteAspirateRequest):
     return await run_pipette_aspirate_command(
@@ -7332,6 +7431,255 @@ async def liquid_mix(req: PipetteMixRequest):
         run_blocking=_run_blocking,
         preflight=_liquid_reference_preflight,
         receipt_store=_pipette_receipts,
+    )
+
+
+@app.post("/liquid/dispense-all")
+async def liquid_dispense_all(req: PipetteDispenseAllRequest):
+    return await run_pipette_operation(
+        "dispense_all",
+        lambda transport: transport.dispense_all(req.channels),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(exclude_none=True),
+        preflight=_liquid_reference_preflight,
+    )
+
+
+@app.post("/liquid/aspirate-air")
+async def liquid_aspirate_air(req: PipetteAirRequest):
+    return await run_pipette_operation(
+        "aspirate_air",
+        lambda transport: transport.aspirate_air(req.volume_ul, req.channels, front_air=req.front_air),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(exclude_none=True),
+        preflight=_liquid_reference_preflight,
+    )
+
+
+@app.post("/liquid/dispense-air")
+async def liquid_dispense_air(req: PipetteAirRequest):
+    requested_dispense_type = int(req.dispense_type)
+    dispense_type = requested_dispense_type if requested_dispense_type in {1, 2} else (1 if req.front_air else 2)
+    return await run_pipette_operation(
+        "dispense_air",
+        lambda transport: transport.dispense_air(req.volume_ul, dispense_type=dispense_type, channels=req.channels),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={**req.model_dump(exclude_none=True), "dispense_type": dispense_type},
+        preflight=_liquid_reference_preflight,
+    )
+
+
+@app.post("/liquid/mix-all")
+async def liquid_mix_all(req: PipetteMixAllRequest):
+    return await run_pipette_operation(
+        "mix_all",
+        lambda transport: transport.mix_all(req.count, req.volume_ul, req.vigorous),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=max(120.0, float(req.count) * 20.0),
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(),
+        preflight=_liquid_reference_preflight,
+    )
+
+
+@app.post("/liquid/fluid-detection")
+async def liquid_fluid_detection(req: PipetteFluidDetectionRequest):
+    return await run_pipette_operation(
+        "fluid_detection",
+        lambda transport: transport.detect_fluid(dry_run=req.dry_run),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(),
+        preflight=_liquid_reference_preflight,
+    )
+
+
+@app.post("/liquid/terminate")
+async def liquid_terminate(req: PipetteTerminateRequest):
+    command = PipetteTerminateCommand(
+        operator=req.operator,
+        reason=req.reason,
+        metadata=req.metadata,
+    )
+    return await run_pipette_operation(
+        "terminate",
+        lambda transport: transport.terminate(command),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=command.to_payload(),
+    )
+
+
+@app.post("/liquid/heartbeat")
+async def liquid_heartbeat(req: PipetteHeartbeatRequest):
+    command = PipetteHeartbeatCommand(enabled=req.enabled)
+    return await run_pipette_operation(
+        "heartbeat",
+        lambda transport: transport.heartbeat(command),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=command.to_payload(),
+    )
+
+
+@app.post("/liquid/diagnoses")
+async def liquid_diagnoses(req: PipetteDiagnosticRequest):
+    command = PipetteDiagnosticCommand(number=req.number)
+    return await run_pipette_operation(
+        "diagnoses",
+        lambda transport: transport.execute_diagnoses(command),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=command.to_payload(),
+    )
+
+
+@app.post("/liquid/error-log")
+async def liquid_error_log(req: PipetteErrorLogRequest):
+    command = PipetteErrorLogCommand(raw_byte=req.raw_byte)
+    return await run_pipette_operation(
+        "error_log",
+        lambda transport: transport.query_error_log(command),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=command.to_payload(),
+    )
+
+
+@app.post("/liquid/tip-status")
+async def liquid_tip_status():
+    return await run_pipette_operation(
+        "tip_status",
+        lambda transport: getattr(transport, "query_tip_status_all")(),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={},
+    )
+
+
+@app.get("/liquid/data")
+async def liquid_data(query: str = Query(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
+    return await run_pipette_operation(
+        "data",
+        lambda transport: getattr(transport, "get_data")(query),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={"query": query},
+    )
+
+
+@app.get("/liquid/fluid-detection/{channel}/timestamp")
+async def liquid_fluid_timestamp(channel: int):
+    return await run_pipette_operation(
+        "fluid_timestamp",
+        lambda transport: {"ok": True, "channel": channel, "timestamp": getattr(transport, "get_fluid_timestamp")(channel), "hardware_truth_level": "cached_oem_event"},
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=20.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={"channel": channel},
+    )
+
+
+@app.post("/liquid/set-top-speed")
+async def liquid_set_top_speed(req: PipetteSpeedRequest):
+    return await run_pipette_operation(
+        "set_top_speed",
+        lambda transport: transport.set_top_speed(req.velocity, req.channels),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(exclude_none=True),
+    )
+
+
+@app.get("/liquid/pressure")
+async def liquid_pressure():
+    return await run_pipette_operation(
+        "pressure",
+        lambda transport: getattr(transport, "read_pressure")(),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={},
+    )
+
+
+@app.post("/liquid/firmware")
+async def liquid_firmware(req: PipetteFirmwareRequest):
+    return await run_pipette_operation(
+        "firmware",
+        lambda transport: transport.query_firmware(req.number),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(),
+    )
+
+
+@app.post("/liquid/reinitialize")
+async def liquid_reinitialize():
+    return await run_pipette_operation(
+        "reinitialize",
+        lambda transport: getattr(transport, "reinitialize_pipette")(),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=180.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={},
+    )
+
+
+@app.get("/liquid/condition")
+async def liquid_condition():
+    return await run_pipette_operation(
+        "condition",
+        lambda transport: getattr(transport, "checked_pipette_condition")(),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={},
+    )
+
+
+@app.get("/liquid/status/readback")
+async def liquid_status_readback():
+    return await run_pipette_operation(
+        "status_readback",
+        lambda transport: getattr(transport, "checked_pipette_status")(),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=120.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={},
     )
 
 
@@ -7392,9 +7740,53 @@ def _protocol_live_move_handler(action, state):
     return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "relative", "move": result}
 
 
+def _protocol_live_pipette_handler(action, state):
+    del state
+    params = dict(action.params or {})
+    transport = _get_pipette_transport()
+    kind = action.kind
+    if kind is ProtocolActionKind.PIPETTE_INIT:
+        command = PipetteInitCommand.from_request(params)
+        result = transport.initialize(command)
+    elif kind is ProtocolActionKind.PIPETTE_TIP:
+        command = PipetteTipCommand.from_request(params)
+        result = transport.set_tip(command)
+    elif kind is ProtocolActionKind.TIP_EJECT:
+        command = PipetteTipCommand(action=PipetteTipAction.EJECT, metadata=params)
+        result = transport.set_tip(command)
+    elif kind is ProtocolActionKind.PIPETTE_ASPIRATE:
+        command = PipetteAspirateCommand.from_request(params)
+        _liquid_reference_preflight("pipette_aspirate", command)
+        result = transport.aspirate(command)
+    elif kind is ProtocolActionKind.PIPETTE_DISPENSE:
+        command = PipetteDispenseCommand.from_request(params)
+        _liquid_reference_preflight("pipette_dispense", command)
+        result = transport.dispense(command)
+    elif kind is ProtocolActionKind.PIPETTE_MIX:
+        command = PipetteMixCommand.from_request(params)
+        _liquid_reference_preflight("pipette_mix", command)
+        result = transport.mix(command)
+    else:  # pragma: no cover - handler map is explicit
+        raise ValueError(f"Unsupported live pipette action kind: {kind.value}")
+    payload = {**dict(result), "protocol_action_id": action.action_id, "physical_effect_verified": False}
+    receipt = _pipette_receipts.record(
+        operation=f"protocol:{kind.value}",
+        requested_inputs=command.to_payload(),
+        result=payload,
+        runtime_binding={"owner": "shared_bioxp_tester_pipette", "protocol_action_id": action.action_id},
+    )
+    return {**payload, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
+        ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
+        ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_ASPIRATE: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_DISPENSE: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_MIX: _protocol_live_pipette_handler,
     }
 
 
