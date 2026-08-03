@@ -5714,22 +5714,33 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    latch_generation = _require_non_homing_motion_recovery_pending()
+    # A clean, explicitly disarmed runtime still needs an arm operation; do
+    # not misclassify it as a stale-maintenance recovery and reject it.
+    with _maintenance_state_lock:
+        recovery_pending = (
+            _maintenance_state.get("motion_blocked") is True
+            and _maintenance_state.get("recovery_required") is True
+        )
+        latch_generation = _maintenance_latch_generation if recovery_pending else None
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
         lambda: tester.motion_arm_strict_startup(run_homing=False),
         timeout_s=90.0,
     )
-    maintenance = _complete_non_homing_motion_recovery(
-        response,
-        source="motion_arm_strict_startup",
-        expected_latch_generation=latch_generation,
-        evidence={
-            "strict_startup": response,
-            "run_homing": False,
-            "operator_reason": operator_reason,
-        },
+    maintenance = (
+        _complete_non_homing_motion_recovery(
+            response,
+            source="motion_arm_strict_startup",
+            expected_latch_generation=latch_generation,
+            evidence={
+                "strict_startup": response,
+                "run_homing": False,
+                "operator_reason": operator_reason,
+            },
+        )
+        if latch_generation is not None
+        else _maintenance_state_payload()
     )
     if isinstance(response, dict):
         response = dict(response)
