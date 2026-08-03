@@ -820,7 +820,9 @@ class Serial206ProductionPrimitiveAdapter:
         """Reconcile Z at the validated live right-reference input without motion."""
         self._z_profile()
         right = self.tester.motor_get_axis_param(4, 10, motor=1)
-        if not isinstance(right, Mapping) or right.get("ok") is not True or right.get("value") != 1:
+        # TMCL GAP reads expose completion/status provenance rather than a
+        # uniform `ok` field; the readback value itself is the predicate.
+        if not isinstance(right, Mapping) or right.get("value") != 1:
             return {"ok": False, "failure": "z_live_right_reference_not_asserted", "right_switch": right, "physical_motion": False}
         set_home = self.tester.motor_set_home(4, motor=1)
         position = self.tester.motor_get_position(4, motor=1)
