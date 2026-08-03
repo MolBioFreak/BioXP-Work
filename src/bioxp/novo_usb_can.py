@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 try:
     import usb.core  # type: ignore
@@ -206,6 +206,7 @@ class NovoUsbCanBus:
         initialization: bool = False,
         completion_timeout_s: float = 60.0,
         allow_multipart: bool = False,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         router = self._current_router()
         tx_id = int(getattr(msg, "arbitration_id"))
@@ -213,12 +214,12 @@ class NovoUsbCanBus:
         tx_dlc = int(getattr(msg, "dlc", len(tx_data)))
         payload = self.build_payload(tx_id, tx_data, tx_dlc)
         expected_rx_id = tx_id | 0x400
-        if initialization:
+        if initialization or not wait_for_completion:
             router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
         try:
             return router.transact(
                 novo_encode(payload),
-                matcher=router.pipette_matcher(
+                matcher=None if not wait_for_completion else router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
                     initialization=bool(initialization),
@@ -234,11 +235,12 @@ class NovoUsbCanBus:
                     "tx_dlc": tx_dlc,
                     "tx_data": tx_data[:tx_dlc],
                     "expected_rx_id": expected_rx_id,
-                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization else None,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
+                    "completion_deferred": bool(not wait_for_completion),
                 },
             )
         except Exception:
-            if initialization:
+            if initialization or not wait_for_completion:
                 router.wait_pipette_completion(int(channel), 0.0)
             raise
 
@@ -253,6 +255,7 @@ class NovoUsbCanBus:
         initialization: bool = False,
         completion_timeout_s: float = 60.0,
         allow_multipart: bool = True,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         router = self._current_router()
         if not messages:
@@ -265,12 +268,12 @@ class NovoUsbCanBus:
             tx_dlc = int(getattr(message, "dlc", len(tx_data)))
             payloads.append(novo_encode(self.build_payload(tx_id, tx_data, tx_dlc)))
             tx_frames.append({"tx_id": tx_id, "tx_dlc": tx_dlc, "tx_data": tx_data[:tx_dlc]})
-        if initialization:
+        if initialization or not wait_for_completion:
             router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
         try:
             return router.transact_many(
                 payloads,
-                matcher=router.pipette_matcher(
+                matcher=None if not wait_for_completion else router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
                     initialization=bool(initialization),
@@ -284,11 +287,12 @@ class NovoUsbCanBus:
                     "command_family": int(expected_function),
                     "expected_rx_id": int(getattr(messages[-1], "arbitration_id")) | 0x400,
                     "tx_frames": tx_frames,
-                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization else None,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
+                    "completion_deferred": bool(not wait_for_completion),
                 },
             )
         except Exception:
-            if initialization:
+            if initialization or not wait_for_completion:
                 router.wait_pipette_completion(int(channel), 0.0)
             raise
 
@@ -316,6 +320,7 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         response_timeout_s: float = 60.0,
         vendor_id: int = NOVO_USB_VENDOR_ID,
         product_id: int = NOVO_USB_PRODUCT_ID,
+        pipette_error_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         self.bus = NovoUsbCanBus(
             shared_usb=shared_usb,
@@ -336,6 +341,9 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         # only the inherited driver's injectable timing dependency so its
         # OEM wake -> 100 ms -> WR sequence can run.
         self._sleep = time.sleep
+        self._pipette_message_state: dict[str, Any] = {}
+        self._pipette_last_command: str | None = None
+        self._pipette_error_callback = pipette_error_callback
         self.usb = {
             "vendor_id": int(vendor_id),
             "product_id": int(product_id),
