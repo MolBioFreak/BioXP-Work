@@ -19,6 +19,7 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
     sent = []
     sleeps = []
+    axis_params = {}
     profiles = {
         "x": {"board": 5, "motor": 0},
         "y": {"board": 4, "motor": 0},
@@ -30,7 +31,25 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
     monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis: profiles[axis])
     monkeypatch.setattr(tester, "_machine_config_bundle", serial_206_immutable_machine_bundle)
     monkeypatch.setattr(tester, "_tmcl_success", lambda ack: ack and ack.get("status") == 100)
-    monkeypatch.setattr(tester, "send_tmcl_retry", lambda *args, **kwargs: sent.append((args, kwargs)) or {"status": 100})
+    def send_tmcl_retry(*args, **kwargs):
+        sent.append((args, kwargs))
+        board, command, parameter, motor, value = args[:5]
+        key = (int(board), int(parameter), int(motor))
+        if int(command) == 5:
+            axis_params[key] = int(value)
+        if int(command) == 6:
+            return {"status": 100, "value": axis_params.get(key, 0)}
+        return {"status": 100}
+
+    monkeypatch.setattr(tester, "send_tmcl_retry", send_tmcl_retry)
+    tester._oem_board_initialized = {4: False, 5: False, 6: False, 7: False}
+    tester._motor_last_tx_ts = {}
+    tester._motor_noresp_streak = {}
+    deactivation = tester.deactivate_boards()
+    activation = tester.activate_boards()
+    assert tester.oem_begin_board_lifecycle_generation(
+        deactivation=deactivation, activation=activation
+    )["ok"] is True
 
     import src.bioxp.usb_driver as driver
     monkeypatch.setattr(driver.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -44,12 +63,14 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
 
     result = tester.oem_initialize_without_motion_test_case()
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert result["test_case"] == "oem.initializeMotorsWithoutMotion.live_parity.v1"
     commands = [(args[0], args[1], args[2], args[3], args[4]) for args, _ in sent]
-    # waitForBoard activates all four initially-uninitialized boards.  Fan
-    # startup commands are intentionally interleaved after each activation.
-    assert [row for row in commands if row[1] == 64][:4] == [
+    # Normal production preparation executes the exact cmd64=0 -> cmd64=1
+    # lifecycle before profile writes; waitForBoard then observes all boards.
+    assert [row for row in commands if row[1] == 64][:8] == [
+        (4, 64, 0, 0, 0), (5, 64, 0, 0, 0),
+        (6, 64, 0, 0, 0), (7, 64, 0, 0, 0),
         (4, 64, 0, 0, 1), (5, 64, 0, 0, 1),
         (6, 64, 0, 0, 1), (7, 64, 0, 0, 1),
     ]

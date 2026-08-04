@@ -446,11 +446,18 @@ class Serial206ProductionPrimitiveAdapter:
         return {
             "ok": ok,
             "observed_generation": observed_generation,
+            "board_lifecycle_generation": raw.get("board_lifecycle_generation") if isinstance(raw, Mapping) else None,
             "board_preparation_verified": ok,
             "initialize_without_motion_verified": ok,
             "physical_motion": False,
+            "motor_output_state": "unknown",
+            "motor_torque_verified": False,
             "receipt": _json_safe(raw),
         }
+
+    def current_board_lifecycle_generation(self) -> int | None:
+        value = getattr(self.tester, "_oem_active_board_lifecycle_generation", None)
+        return int(value) if type(value) is int else None
 
     def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_home(*args, **kwargs)
@@ -854,29 +861,46 @@ class Serial206ProductionPrimitiveAdapter:
             return {"ok": False, "failure": "motion_interlock_not_ready", "interlock": interlock}
         home = self.tester.motor_oem_move_z_home(rehome=True, timeout_s=float(timeout_s))
         ok = isinstance(home, Mapping) and home.get("ok") is True
+        home_evidence = home.get("home") if isinstance(home, Mapping) else None
+        move_home = home_evidence.get("move_home") if isinstance(home_evidence, Mapping) else None
+        stop = home_evidence.get("stop") if isinstance(home_evidence, Mapping) else None
+        wait = home_evidence.get("wait") if isinstance(home_evidence, Mapping) else None
+        command_acknowledged = bool(
+            isinstance(move_home, Mapping) and move_home.get("ok") is True
+        )
+        terminal_verified = bool(
+            isinstance(stop, Mapping)
+            and stop.get("ok") is True
+            and isinstance(wait, Mapping)
+            and wait.get("stopped") is True
+            and wait.get("last_speed") == 0
+        )
         return {
             "ok": ok,
             "intent": "manual_go_home_1791",
             "source_method": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
             "interlock": interlock,
             "home": home,
-            "controller_command_acknowledged": bool(ok),
-            "controller_terminal_state_verified": bool(ok),
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal_verified,
+            "motor_output_state": "unknown",
+            "motor_torque_verified": False,
             "physical_effect_verified": False,
         }
 
     def z_right_reference(self) -> dict[str, Any]:
-        """Reconcile Z at the validated live right-reference input without motion."""
+        """Expose GAP10 as diagnostic evidence; it is not a production reference."""
         self._z_profile()
         right = self.tester.motor_get_axis_param(4, 10, motor=1)
-        # TMCL GAP reads expose completion/status provenance rather than a
-        # uniform `ok` field; the readback value itself is the predicate.
-        if not isinstance(right, Mapping) or right.get("value") != 1:
-            return {"ok": False, "failure": "z_live_right_reference_not_asserted", "right_switch": right, "physical_motion": False}
-        set_home = self.tester.motor_set_home(4, motor=1)
-        position = self.tester.motor_get_position(4, motor=1)
-        ok = bool(isinstance(set_home, Mapping) and set_home.get("ok") is True and isinstance(position, Mapping) and position.get("position") == 0)
-        return {"ok": ok, "intent": "live_right_reference", "right_switch": right, "set_home": set_home, "position": position, "physical_motion": False, "controller_command_acknowledged": bool(isinstance(set_home, Mapping) and set_home.get("ok") is True), "controller_terminal_state_verified": ok, "physical_effect_verified": True, "failure": None if ok else "z_live_right_reference_not_verified"}
+        return {
+            "ok": False,
+            "intent": "right_switch_diagnostic_only",
+            "failure": "z_live_right_reference_retired",
+            "right_switch": _json_safe(right),
+            "physical_motion": False,
+            "set_home_performed": False,
+            "physical_effect_verified": False,
+        }
 
     def z_startup_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
         self._z_profile()
@@ -1805,6 +1829,7 @@ class Serial206OemInitializationProvider:
             "schema_version": "bioxp.serial206_z_lifecycle.v1",
             "state": "unprepared",
             "generation": None,
+            "board_lifecycle_generation": None,
             "prepared_receipt": None,
             "active_receipt": None,
             "awaiting_observation_receipt_id": None,
@@ -1875,6 +1900,10 @@ class Serial206OemInitializationProvider:
         defaults = cls._new_state()
         upgraded.setdefault("used_motion_approvals", {})
         upgraded.setdefault("z_lifecycle", copy.deepcopy(defaults["z_lifecycle"]))
+        z_lifecycle = upgraded.get("z_lifecycle")
+        if isinstance(z_lifecycle, dict):
+            for key, value in defaults["z_lifecycle"].items():
+                z_lifecycle.setdefault(key, copy.deepcopy(value))
         upgraded.setdefault("x_lifecycle", copy.deepcopy(defaults["x_lifecycle"]))
         upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
         machine = upgraded.get("machine_status")
@@ -1908,6 +1937,11 @@ class Serial206OemInitializationProvider:
         z_lifecycle = state.get("z_lifecycle")
         if not isinstance(z_lifecycle, dict) or z_lifecycle.get("schema_version") != "bioxp.serial206_z_lifecycle.v1":
             raise ValueError("serial-206 Z lifecycle is invalid")
+        board_generation = z_lifecycle.get("board_lifecycle_generation")
+        if board_generation is not None and (
+            type(board_generation) is not int or int(board_generation) < 1
+        ):
+            raise ValueError("serial-206 Z board lifecycle generation is invalid")
         if z_lifecycle.get("state") not in {
             "unprepared", "prepared_unreferenced", "executing",
             "awaiting_operator_observation", "referenced_ready", "failed_latched",
@@ -2203,21 +2237,22 @@ class Serial206OemInitializationProvider:
                 return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
             except Exception as exc:
                 return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}"}
-    def notify_board_activation(self, board_id: int, ack: Any) -> dict[str, Any]:
+    def notify_board_activation(self, board_id: int, ack: Any, *, active: bool | None = None) -> dict[str, Any]:
         """Invalidate Z preparation/reference on any non-provider command-64 to board 4."""
         if int(board_id) != 4:
             return {"z_affected": False, "board": int(board_id)}
         with self._lock:
             state = self._load_state()
             z = state["z_lifecycle"]
-            active = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
-            if z.get("state") == "executing" and active.get("intent") == "prepare":
+            active_receipt = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
+            if z.get("state") == "executing" and active_receipt.get("intent") == "prepare":
                 return {"z_affected": False, "board": 4, "provider_owned_preparation": True}
             previous = str(z.get("state") or "unprepared")
             if previous == "unprepared":
                 return {"z_affected": False, "board": 4, "already_unprepared": True}
             invalidation = {
                 "reason": "board4_command64_outside_provider_preparation",
+                "command64_value": None if active is None else int(bool(active)),
                 "previous_state": previous,
                 "ack": _json_safe(ack),
                 "invalidated_at": time.time(),
@@ -2250,9 +2285,27 @@ class Serial206OemInitializationProvider:
                 z["state"] = "unprepared"
                 z["reference_state"] = "desynced"
                 z["generation_invalidated"] = True
+            board_generation_provider = getattr(
+                self.preparation_provider, "current_board_lifecycle_generation", None
+            )
+            current_board_generation = (
+                board_generation_provider() if callable(board_generation_provider) else None
+            )
+            prepared_board_generation = z.get("board_lifecycle_generation")
+            board_generation_fresh = bool(
+                type(prepared_board_generation) is int
+                and current_board_generation == prepared_board_generation
+            )
+            if z.get("state") != "unprepared" and not board_generation_fresh:
+                z["durable_state_before_board_invalidation"] = z.get("state")
+                z["state"] = "unprepared"
+                z["reference_state"] = "desynced"
+                z["board_generation_invalidated"] = True
             z.update({
                 "available": True,
                 "ownership_generation": generation,
+                "current_board_lifecycle_generation": current_board_generation,
+                "board_lifecycle_generation_fresh": board_generation_fresh,
                 "authority": type(self).__name__,
                 "board": 4,
                 "motor": 1,
@@ -2307,6 +2360,38 @@ class Serial206OemInitializationProvider:
                     "serial206.z.generation_invalidation",
                 )
                 self._save_state(state)
+            board_generation_provider = getattr(
+                self.preparation_provider, "current_board_lifecycle_generation", None
+            )
+            if callable(board_generation_provider) and z.get("state") != "unprepared":
+                stored_board_generation = z.get("board_lifecycle_generation")
+                current_board_generation = board_generation_provider()
+                if (
+                    type(stored_board_generation) is not int
+                    or current_board_generation != stored_board_generation
+                ):
+                    previous_state = str(z.get("state") or "unknown")
+                    z.update({
+                        "state": "unprepared",
+                        "generation": None,
+                        "board_lifecycle_generation": None,
+                        "prepared_receipt": None,
+                        "active_receipt": None,
+                        "awaiting_observation_receipt_id": None,
+                        "reference_state": "desynced",
+                        "last_failure": {
+                            "reason": "board_lifecycle_generation_changed",
+                            "previous_state": previous_state,
+                            "stored_board_generation": stored_board_generation,
+                            "current_board_generation": current_board_generation,
+                            "invalidated_at": time.time(),
+                        },
+                    })
+                    self._z_mark_desynced(
+                        "Board lifecycle generation changed; Z preparation/reference invalidated.",
+                        "serial206.z.board_generation_invalidation",
+                    )
+                    self._save_state(state)
             for existing in reversed(z.get("receipts") or []):
                 if existing.get("idempotency_key") == idempotency_key:
                     return {"ok": existing.get("status") == "completed", "replayed": True, "authority_receipt": existing}
@@ -2316,6 +2401,7 @@ class Serial206OemInitializationProvider:
                 "intent": intent,
                 "idempotency_key": idempotency_key,
                 "expected_generation": int(expected_generation),
+                "board_lifecycle_generation": z.get("board_lifecycle_generation"),
                 "inputs": _json_safe(values),
                 "status": "pending_admission",
                 "started_at": time.time(),
@@ -2332,7 +2418,6 @@ class Serial206OemInitializationProvider:
             allowed_by_state = {
                 "prepare": {"unprepared", "failed_latched"},
                 "reconcile_switch_masks": {"unprepared", "failed_latched"},
-                "live_right_reference": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "manual_home": {"prepared_unreferenced", "referenced_ready"},
                 "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
                 "move_steps": {"referenced_ready"},
@@ -2352,6 +2437,25 @@ class Serial206OemInitializationProvider:
                 blockers.append("z_preparation_provider_not_bound")
             if intent == "reconcile_switch_masks" and values.get("confirm") != "RECONCILE_Z_SWITCH_MASKS":
                 blockers.append("explicit_confirmation_required:RECONCILE_Z_SWITCH_MASKS")
+            if intent == "diagnostic_home_axis" and values.get("confirm") != "DIAGNOSTIC_Z_HOME_597":
+                blockers.append("explicit_confirmation_required:DIAGNOSTIC_Z_HOME_597")
+            if intent in {"manual_home", "diagnostic_home_axis", "move_steps", "move_absolute"}:
+                prepared_board_generation = z.get("board_lifecycle_generation")
+                board_generation_provider = getattr(
+                    self.preparation_provider, "current_board_lifecycle_generation", None
+                )
+                current_board_generation = (
+                    board_generation_provider()
+                    if callable(board_generation_provider)
+                    else prepared_board_generation
+                )
+                if (
+                    type(prepared_board_generation) is not int
+                    or current_board_generation != prepared_board_generation
+                ):
+                    blockers.append(
+                        f"z_board_lifecycle_generation_stale:{prepared_board_generation}:{current_board_generation}"
+                    )
             if blockers:
                 receipt.update({"status": "rejected", "finished_at": time.time(), "blockers": blockers})
                 self._append_z_receipt(z, receipt)
@@ -2373,8 +2477,6 @@ class Serial206OemInitializationProvider:
                     )
                 elif intent == "reconcile_switch_masks":
                     result = self.primitives.z_reconcile_switch_masks()
-                elif intent == "live_right_reference":
-                    result = self.primitives.z_right_reference()
                 elif intent == "manual_home":
                     result = self.primitives.z_manual_home(timeout_s=float(values.get("timeout_s", 30.0)))
                 elif intent == "diagnostic_home_axis":
@@ -2414,9 +2516,17 @@ class Serial206OemInitializationProvider:
             })
             z["active_receipt"] = None
             if ok and intent == "prepare":
+                board_generation = result.get("board_lifecycle_generation")
+                if type(board_generation) is not int and not callable(
+                    getattr(self.preparation_provider, "current_board_lifecycle_generation", None)
+                ):
+                    # Compatibility for pure unit-test providers. The production
+                    # adapter always supplies the real driver board generation.
+                    board_generation = observed_generation
                 z.update({
                     "state": "prepared_unreferenced",
                     "generation": observed_generation,
+                    "board_lifecycle_generation": board_generation,
                     "prepared_receipt": _json_safe(receipt),
                     "reference_state": "desynced",
                     "last_failure": None,
@@ -2425,22 +2535,25 @@ class Serial206OemInitializationProvider:
             elif ok and intent == "reconcile_switch_masks":
                 z.update({"state": "unprepared", "generation": None, "prepared_receipt": None, "reference_state": "desynced", "last_failure": None})
                 self._z_mark_desynced("Z switch masks reconciled; source profile must be prepared again.", "serial206.z.reconcile_switch_masks")
-            elif ok and intent == "live_right_reference":
-                z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
-                if self.reference_store is not None:
-                    reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="z", position_steps=0, source="serial206.z.live_right_reference", motion_kind="home"))
-                    if reference.get("ok") is not True or reference.get("durable_clean") is not True:
-                        result = {**dict(result), "ok": False, "reference_state": _json_safe(reference), "failure": "z_live_right_reference_not_durable"}
-                        ok = False
-                        z.update({"state": "failed_latched", "reference_state": "desynced", "last_failure": _json_safe(result)})
-            elif ok and intent in {"manual_home", "diagnostic_home_axis"}:
+            elif ok and intent == "manual_home":
                 z.update({
                     "state": "awaiting_operator_observation",
                     "awaiting_observation_receipt_id": command_id,
                     "reference_state": "desynced",
                     "last_failure": None,
                 })
-                self._z_mark_desynced("Controller home proof awaits independent physical observation.", f"serial206.z.{intent}")
+                self._z_mark_desynced("Controller home proof awaits independent physical observation.", "serial206.z.manual_home")
+            elif ok and intent == "diagnostic_home_axis":
+                z.update({
+                    "state": "prepared_unreferenced",
+                    "awaiting_observation_receipt_id": None,
+                    "reference_state": "desynced",
+                    "last_failure": None,
+                })
+                self._z_mark_desynced(
+                    "Diagnostic HomeAxis cannot establish the production Z reference.",
+                    "serial206.z.diagnostic_home_axis",
+                )
             elif ok and intent in {"move_steps", "move_absolute"}:
                 z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
             elif ok and intent == "stop":
@@ -2469,14 +2582,32 @@ class Serial206OemInitializationProvider:
         with self._lock:
             state = self._load_state()
             z = state["z_lifecycle"]
-            if int(expected_generation) != int(self.generation_provider()):
+            current_generation = int(self.generation_provider())
+            if int(expected_generation) != current_generation:
                 raise ValueError("ownership generation changed before Z observation")
+            if type(z.get("generation")) is not int or int(z["generation"]) != current_generation:
+                raise ValueError("prepared ownership generation changed before Z observation")
+            board_generation_provider = getattr(
+                self.preparation_provider, "current_board_lifecycle_generation", None
+            )
+            current_board_generation = (
+                board_generation_provider()
+                if callable(board_generation_provider)
+                else z.get("board_lifecycle_generation")
+            )
+            if (
+                type(z.get("board_lifecycle_generation")) is not int
+                or current_board_generation != z.get("board_lifecycle_generation")
+            ):
+                raise ValueError("board lifecycle generation changed before Z observation")
             if z.get("state") != "awaiting_operator_observation" or z.get("awaiting_observation_receipt_id") != command_id:
                 raise ValueError("Z lifecycle is not awaiting this observation")
             receipts = list(z.get("receipts") or [])
             match = next((row for row in reversed(receipts) if row.get("command_id") == command_id), None)
             if match is None:
                 raise ValueError("Z authority receipt is missing")
+            if match.get("board_lifecycle_generation") != z.get("board_lifecycle_generation"):
+                raise ValueError("Z authority receipt board generation is stale")
             observation = {
                 "command_id": command_id,
                 "verdict": verdict,
@@ -2488,20 +2619,48 @@ class Serial206OemInitializationProvider:
                 home_result = match.get("result") if isinstance(match.get("result"), Mapping) else {}
                 if not isinstance(home_result, Mapping) or home_result.get("ok") is not True:
                     raise ValueError("controller home proof is not successful")
-                z.update({
-                    "state": "referenced_ready",
-                    "reference_state": "referenced",
-                    "awaiting_observation_receipt_id": None,
-                    "last_failure": None,
-                })
+                reference = None
                 if self.reference_store is not None:
-                    self.reference_store.mark_referenced(
+                    reference = self.reference_store.mark_referenced(
                         MarkAxisReferencedCommand(
                             axis="z", position_steps=0,
                             source="serial206.z.operator_observation",
                             motion_kind="home",
                         )
                     )
+                    reference_ok = bool(
+                        isinstance(reference, Mapping)
+                        and reference.get("ok") is True
+                        and reference.get("persisted") is True
+                        and reference.get("verified") is True
+                        and reference.get("durable_clean") is True
+                    )
+                    observation["reference_persistence"] = _json_safe(reference)
+                    if not reference_ok:
+                        z.update({
+                            "state": "failed_latched",
+                            "reference_state": "desynced",
+                            "awaiting_observation_receipt_id": None,
+                            "last_failure": {
+                                "reason": "z_reference_persistence_failed",
+                                "reference": _json_safe(reference),
+                            },
+                        })
+                        z["last_observation"] = observation
+                        self._save_state(state)
+                        return {
+                            "ok": False,
+                            "error": "z_reference_persistence_failed",
+                            "observation": observation,
+                            "z_state": z.get("state"),
+                            "z_lifecycle": _json_safe(z),
+                        }
+                z.update({
+                    "state": "referenced_ready",
+                    "reference_state": "referenced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": None,
+                })
             else:
                 z.update({
                     "state": "failed_latched",

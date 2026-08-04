@@ -277,6 +277,7 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
     assert not any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
+    assert not any(row["informational_path"] == "/motion/oem/z/live_right_reference" for row in actions)
 
 
 def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics():

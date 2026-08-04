@@ -23,7 +23,9 @@ class FakeMotionDriver:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
-        self.activation_status = {4: 100, 5: 100, 6: 100, 7: 100}
+        self.invalidations: list[str] = []
+        self.deactivation_status: dict[int, int | None] = {4: 100, 5: 100, 6: 100, 7: 100}
+        self.activation_status: dict[int, int | None] = {4: 100, 5: 100, 6: 100, 7: 100}
         self.stop_status = {axis: 100 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.speeds = {axis: 0 for axis in self.MOTOR_FUNCTION_PRESETS}
         self.parameter_readbacks = {
@@ -53,6 +55,37 @@ class FakeMotionDriver:
                 "ok": status == 100,
             })
         return {"ok": all(row["ok"] for row in rows), "boards": rows}
+
+    def deactivate_boards(self, *, expect_reply: bool, fail_fast: bool):
+        assert expect_reply is True
+        assert fail_fast is True
+        rows = {}
+        for board_id in (4, 5, 6, 7):
+            status = self.deactivation_status[board_id]
+            self.calls.append(("deactivate", board_id))
+            rows[board_id] = None if status is None else {"status": status}
+            if status != 100:
+                break
+        return rows
+
+    def activate_boards(self, *, expect_reply: bool, fail_fast: bool):
+        assert expect_reply is True
+        assert fail_fast is True
+        rows = {}
+        for board_id in (4, 5, 6, 7):
+            status = self.activation_status[board_id]
+            self.calls.append(("activate", board_id))
+            rows[board_id] = None if status is None else {"status": status}
+            if status != 100:
+                break
+        return rows
+
+    def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
+        self.calls.append(("begin_board_generation", tuple(deactivation), tuple(activation)))
+        return {"ok": True, "board_lifecycle_generation": 1}
+
+    def _invalidate_oem_no_motion_profiles(self, *, reason):
+        self.invalidations.append(str(reason))
 
     def motor_oem_wait_for_board(self):
         self.calls.append(("wait_for_board",))
@@ -161,18 +194,25 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
     assert result["ok"] is True
     assert result["physical_motion"] is False
     assert result["homing_performed"] is False
-    assert [call for call in driver.calls if call[0] == "activate"] == [("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7)]
+    lifecycle_calls = [call for call in driver.calls if call[0] in {"deactivate", "activate", "begin_board_generation"}]
+    assert lifecycle_calls == [
+        ("deactivate", 4), ("deactivate", 5), ("deactivate", 6), ("deactivate", 7),
+        ("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7),
+        ("begin_board_generation", (4, 5, 6, 7), (4, 5, 6, 7)),
+    ]
     assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
     assert [row["stage_id"] for row in result["stage_ledger"]] == [
         "authority",
+        "rail_24v_readback",
+        "door_readback",
+        "latch_readback",
+        "deactivateBoard",
         "activateBoard",
+        "boardLifecycleGeneration",
         "waitForBoard",
         "initializeMotorsWithoutMotion",
         "z_switch_mask_precondition",
         "parameter_readback",
-        "rail_24v_readback",
-        "door_readback",
-        "latch_readback",
     ]
     assert all(row["status"] in {"passed", "not_applicable"} for row in result["stage_ledger"])
 
@@ -190,6 +230,7 @@ def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switc
     assert stage["controller_evidence"]["writes"] == {}
     assert ("write_param", 4, 1, 13, 0) not in driver.calls
     assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
+    assert driver.invalidations == ["switch_mask_precondition_failed"]
 
 
 def test_prepare_without_motion_fails_closed_on_parameter_readback_mismatch():
@@ -203,6 +244,7 @@ def test_prepare_without_motion_fails_closed_on_parameter_readback_mismatch():
     assert readback["status"] == "failed"
     assert readback["controller_evidence"]["mismatches"][0]["expected"] == 1700
     assert result["physical_motion"] is False
+    assert driver.invalidations == ["parameter_readback_failed"]
 
 
 def test_prepare_without_motion_fails_fast_on_missing_board_ack_without_initialization():
@@ -213,9 +255,22 @@ def test_prepare_without_motion_fails_fast_on_missing_board_ack_without_initiali
 
     assert result["ok"] is False
     assert not any(call[0] == "initialize_without_motion" for call in driver.calls)
-    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "waitForBoard")
+    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "activateBoard")
     assert failed["status"] == "failed"
-    assert failed["controller_evidence"]["missing"] == [5]
+    assert failed["controller_evidence"][5] is None
+
+
+def test_prepare_without_motion_stops_after_failed_deactivation():
+    driver = FakeMotionDriver()
+    driver.deactivation_status[5] = None
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is False
+    assert [call for call in driver.calls if call[0] == "activate"] == []
+    assert not any(call[0] == "initialize_without_motion" for call in driver.calls)
+    failed = next(row for row in result["stage_ledger"] if row["stage_id"] == "deactivateBoard")
+    assert failed["status"] == "failed"
 
 
 def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero_speed():

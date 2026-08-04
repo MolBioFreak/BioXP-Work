@@ -13,7 +13,7 @@ from typing import Any, Mapping
 from .oem_machine_bundle import OEM_MACHINE_SERIAL, get_active_oem_machine_snapshot
 
 
-PREPARE_SCHEMA = "bioxp.oem_prepare_without_motion.v1"
+PREPARE_SCHEMA = "bioxp.oem_prepare_without_motion.v2"
 STOP_SCHEMA = "bioxp.physical_aggregate_stop.v1"
 
 # ClassControlInterface construction for the accepted BioXP 3200 serial-206 machine.
@@ -77,6 +77,24 @@ def _ack_status(value: Any) -> int | None:
     return int(status) if type(status) is int else None
 
 
+def _board_cycle_status(rows: Any, board: int) -> int | None:
+    row = rows.get(int(board)) if isinstance(rows, Mapping) else None
+    if isinstance(row, Mapping) and isinstance(row.get("ack"), Mapping):
+        row = row["ack"]
+    status = row.get("status") if isinstance(row, Mapping) else None
+    return int(status) if type(status) is int else None
+
+
+def _board_cycle_ok(rows: Any, boards: tuple[int, ...]) -> bool:
+    if not isinstance(rows, Mapping) or any(int(board) not in rows for board in boards):
+        return False
+    return all(
+        _board_cycle_status(rows, board) == 100
+        or (int(board) == 7 and _board_cycle_status(rows, board) == 2)
+        for board in boards
+    )
+
+
 def _stage(stage_id: str, status: str, source_anchor: str, evidence: Any) -> dict[str, Any]:
     return {
         "stage_id": stage_id,
@@ -89,6 +107,13 @@ def _stage(stage_id: str, status: str, source_anchor: str, evidence: Any) -> dic
 
 def _preparation_result(authority: Serial206MotionAuthority, ledger: list[dict[str, Any]]) -> dict[str, Any]:
     ok = all(row["status"] in {"passed", "not_applicable"} for row in ledger)
+    lifecycle_row = next((row for row in ledger if row.get("stage_id") == "boardLifecycleGeneration"), None)
+    lifecycle_evidence = lifecycle_row.get("controller_evidence") if isinstance(lifecycle_row, Mapping) else None
+    board_generation = (
+        lifecycle_evidence.get("board_lifecycle_generation")
+        if isinstance(lifecycle_evidence, Mapping)
+        else None
+    )
     return {
         "schema_version": PREPARE_SCHEMA,
         "ok": ok,
@@ -97,9 +122,12 @@ def _preparation_result(authority: Serial206MotionAuthority, ledger: list[dict[s
         "controller_evidence": authority.controller_evidence(),
         "stage_ledger": ledger,
         "stage_receipts": ledger,
+        "board_lifecycle_generation": board_generation,
         "physical_motion": False,
         "physical_motion_commanded": False,
         "homing_performed": False,
+        "motor_output_state": "unknown",
+        "motor_torque_verified": False,
         "global_24v_switch_claimed": False,
     }
 
@@ -112,6 +140,11 @@ def prepare_motion_without_motion(
 ) -> dict[str, Any]:
     """Run bounded OEM activation, literal no-motion parameterization, and queries."""
     ledger: list[dict[str, Any]] = []
+
+    def invalidate_profile(reason: str) -> None:
+        invalidate = getattr(driver, "_invalidate_oem_no_motion_profiles", None)
+        if callable(invalidate):
+            invalidate(reason=reason)
     selected = tuple(dict.fromkeys(
         str(component).strip().lower()
         for component in (components or tuple(row[0] for row in authority.components))
@@ -133,18 +166,98 @@ def prepare_motion_without_motion(
     if not authority_ok:
         return _preparation_result(authority, ledger)
 
+    # Recovered ControlLib.initialCheck evaluates the machine environment before
+    # its ESM(false) -> ESM(true) command-64 transition. Keep these reads fresh;
+    # they are controller/interlock evidence, never torque or movement proof.
     try:
-        activation = driver.oem_activate_uninitialized_boards()
-        board_wait = driver.motor_oem_wait_for_board()
+        rail = driver.motor_query_24v_sensor()
     except Exception as exc:
-        activation = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        board_wait = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        rail = {"ack": None, "error": f"{type(exc).__name__}: {exc}"}
+    rail_ok = bool(
+        isinstance(rail, Mapping)
+        and _ack_status(rail) == 100
+        and rail.get("reply_valid") is True
+        and rail.get("sample_valid") is True
+        and rail.get("safety_valid") is True
+        and rail.get("oem_scalar") == 0
+    )
+    ledger.append(_stage(
+        "rail_24v_readback",
+        "passed" if rail_ok else "failed",
+        "ClassIOControl.query24VSensor lines 92-110",
+        rail,
+    ))
+    if not rail_ok:
+        return _preparation_result(authority, ledger)
+
+    for stage_id, io_type, label in (("door_readback", 1, "door"), ("latch_readback", 3, "latch")):
+        try:
+            observation = driver.deck_io_query_type(io_type)
+        except Exception as exc:
+            observation = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
+        observed_ok = bool(_ack_status(observation) == 100 and observation.get("value") == 1)
+        ledger.append(_stage(
+            stage_id,
+            "passed" if observed_ok else "failed",
+            f"ClassIOControl query {label} sensor read-only",
+            observation,
+        ))
+        if not observed_ok:
+            return _preparation_result(authority, ledger)
+
+    # Normal production initialCheck is a complete ESM(false) -> ESM(true)
+    # transition over all four constructed OEM boards. Activation-only recovery
+    # is not equivalent and must never preserve a stale motor profile.
+    cycle_boards = tuple(int(board) for board in authority.activation_boards)
+    try:
+        deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
+    except Exception as exc:
+        deactivation = {"error": f"{type(exc).__name__}: {exc}"}
+    deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
+    ledger.append(_stage(
+        "deactivateBoard",
+        "passed" if deactivation_ok else "failed",
+        "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
+        deactivation,
+    ))
+    if not deactivation_ok:
+        return _preparation_result(authority, ledger)
+
+    try:
+        activation = driver.activate_boards(expect_reply=True, fail_fast=True)
+    except Exception as exc:
+        activation = {"error": f"{type(exc).__name__}: {exc}"}
+    activation_ok = _board_cycle_ok(activation, cycle_boards)
     ledger.append(_stage(
         "activateBoard",
-        "passed" if isinstance(activation, Mapping) else "failed",
-        "ClassControlInterface.activateBoard lines 3474-3493",
+        "passed" if activation_ok else "failed",
+        "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
         activation,
     ))
+    if not activation_ok:
+        return _preparation_result(authority, ledger)
+
+    try:
+        lifecycle = driver.oem_begin_board_lifecycle_generation(
+            deactivation=deactivation,
+            activation=activation,
+        )
+    except Exception as exc:
+        lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
+    ledger.append(_stage(
+        "boardLifecycleGeneration",
+        "passed" if lifecycle_ok else "failed",
+        "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1",
+        lifecycle,
+    ))
+    if not lifecycle_ok:
+        return _preparation_result(authority, ledger)
+
+    try:
+        board_wait = driver.motor_oem_wait_for_board()
+    except Exception as exc:
+        board_wait = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     ledger.append(_stage(
         "waitForBoard",
         "passed" if isinstance(board_wait, Mapping) and board_wait.get("ok") is True else "failed",
@@ -178,6 +291,7 @@ def prepare_motion_without_motion(
         initialized,
     ))
     if not initialization_ok:
+        invalidate_profile("initialize_without_motion_evidence_failed")
         return _preparation_result(authority, ledger)
 
     # The serial-206 Z source writes neither SAP12 nor SAP13 and assumes both
@@ -208,6 +322,7 @@ def prepare_motion_without_motion(
         mask_evidence,
     ))
     if not mask_ok:
+        invalidate_profile("switch_mask_precondition_failed")
         return _preparation_result(authority, ledger)
 
     readbacks: list[dict[str, Any]] = []
@@ -246,43 +361,8 @@ def prepare_motion_without_motion(
         {"readbacks": readbacks, "mismatches": mismatches},
     ))
     if not readback_ok:
+        invalidate_profile("parameter_readback_failed")
         return _preparation_result(authority, ledger)
-
-    try:
-        rail = driver.motor_query_24v_sensor()
-    except Exception as exc:
-        rail = {"ack": None, "error": f"{type(exc).__name__}: {exc}"}
-    rail_ok = bool(
-        isinstance(rail, Mapping)
-        and _ack_status(rail) == 100
-        and rail.get("reply_valid") is True
-        and rail.get("sample_valid") is True
-        and rail.get("safety_valid") is True
-        and rail.get("oem_scalar") == 0
-    )
-    ledger.append(_stage(
-        "rail_24v_readback",
-        "passed" if rail_ok else "failed",
-        "ClassIOControl.query24VSensor lines 92-110",
-        rail,
-    ))
-    if not rail_ok:
-        return _preparation_result(authority, ledger)
-
-    for stage_id, io_type, label in (("door_readback", 1, "door"), ("latch_readback", 3, "latch")):
-        try:
-            observation = driver.deck_io_query_type(io_type)
-        except Exception as exc:
-            observation = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
-        observed_ok = bool(_ack_status(observation) == 100 and observation.get("value") == 1)
-        ledger.append(_stage(
-            stage_id,
-            "passed" if observed_ok else "failed",
-            f"ClassIOControl query {label} sensor read-only",
-            observation,
-        ))
-        if not observed_ok:
-            break
 
     return _preparation_result(authority, ledger)
 
