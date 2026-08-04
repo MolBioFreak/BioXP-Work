@@ -1161,7 +1161,14 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
         raise HTTPException(status_code=422, detail={"error": "unknown_action_inputs", "unknown": sorted(set(inputs) - allowed)})
     for name, metadata in locations.items():
         if metadata.get("implicit_operator_control"):
-            if name == "operator_ack":
+            # Semantic aliases may inject an exact server-governed operator
+            # control value through fixed_inputs. Callers cannot supply these
+            # hidden fields because invoke_action validates only the alias's
+            # visible input set. Prefer that fixed value; retain path-derived
+            # controls as the fallback for ordinary route actions.
+            if name in inputs:
+                value = inputs[name]
+            elif name == "operator_ack":
                 value = _implicit_operator_ack(path_template, inputs)
                 if value is None:
                     continue

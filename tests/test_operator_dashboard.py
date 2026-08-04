@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import FastAPI
 
 from bioxp.oem_startup_types import OemDoorEventRequest
-from bioxp.operator_controls import _assess_action, _build_catalog, _dashboard_payload, _motor_motion_action, _safety
+from bioxp.operator_controls import (
+    _assess_action,
+    _build_catalog,
+    _dashboard_payload,
+    _dispatch_asgi,
+    _motor_motion_action,
+    _safety,
+)
 
 
 def machine_state(
@@ -328,6 +337,40 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
     assert not any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
     assert not any(row["informational_path"] == "/motion/oem/z/live_right_reference" for row in actions)
+
+
+def test_dispatch_preserves_server_fixed_implicit_operator_control():
+    app = FastAPI()
+
+    @app.post("/set-home")
+    async def set_home(payload: dict[str, str]) -> dict[str, str]:
+        return payload
+
+    status, body = asyncio.run(
+        _dispatch_asgi(
+            app,
+            "POST",
+            "/set-home",
+            {
+                "note": "Christian-authorized home evidence",
+                "operator_ack": "SET_HOME_CURRENT_POSITION",
+            },
+            {
+                "note": {"location": "body", "wire_name": "note"},
+                "operator_ack": {
+                    "location": "body",
+                    "wire_name": "operator_ack",
+                    "implicit_operator_control": True,
+                },
+            },
+        )
+    )
+
+    assert status == 200
+    assert body == {
+        "note": "Christian-authorized home evidence",
+        "operator_ack": "SET_HOME_CURRENT_POSITION",
+    }
 
 
 def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics():
