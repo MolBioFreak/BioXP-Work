@@ -507,7 +507,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         ))
 
     if source_initializer or safety == "motion" or _motor_motion_action(action):
-        required_axes = [] if source_initializer else _required_reference_axes(action, values)
+        # Provider-owned Z observation is the authority transition that
+        # establishes the reference; requiring that reference beforehand
+        # creates an impossible admission cycle.
+        reference_bootstrap = source_initializer or action_id == "oem.z.observe"
+        required_axes = [] if reference_bootstrap else _required_reference_axes(action, values)
         readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(

@@ -258,6 +258,30 @@ def test_move_requires_selected_axis_reference_but_home_establishes_it():
     assert home["enabled"] is True
 
 
+def test_z_observation_can_establish_the_reference_it_does_not_yet_have():
+    state = machine_state(motion_enabled=True, z="desynced")
+    state["serial206_initialization_provider"] = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "z_authority": {"state": "awaiting_operator_observation"},
+    }
+    state["domains"]["axes"]["observation"]["rows"]["z"] = {
+        "status": {"position": {"value": 0}},
+        "switch_activity": {"left_disabled": False, "right_disabled": False},
+        "preset": {"axis_min_steps": 0, "axis_max_steps": 160000},
+    }
+    observation = action("/motion/oem/z/observation")
+    observation.update({
+        "action_id": "oem.z.observe",
+        "required_provider_capability": "initialize_motors",
+    })
+
+    assessed = _assess_action(observation, state, {"axis": "z"})
+
+    assert assessed["enabled"] is True
+    assert all(row["key"] != "axis_z_referenced" for row in assessed["dependencies"])
+
+
 def test_pipette_liquid_motion_requires_xyz_references():
     state = machine_state(motion_enabled=True, x="referenced", y="unknown", z="referenced")
     assessed = _assess_action(action("/pipette/aspirate"), state, {"channel": 0})
