@@ -506,6 +506,60 @@ def test_provider_owns_durable_z_prepare_home_observation_and_move_lifecycle(tmp
     assert primitives.calls == ["prepare", "manual-home", "move-steps:25"]
 
 
+def test_z_already_home_reference_survives_bounded_diagnostic_receipt(tmp_path):
+    primitives = FakeSerial206Primitives()
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="bounded-prepare"
+    )["ok"] is True
+    primitives.z_manual_home = lambda *, timeout_s=30.0: {
+        "ok": True,
+        "controller_command_acknowledged": True,
+        "controller_terminal_state_verified": True,
+        "home": {
+            "diagnostic_rows": [
+                {"index": index, "ack": dict(ACK), "payload": "x" * 32}
+                for index in range(96)
+            ]
+        },
+        "home_summary": {
+            "short_circuit": "MotorHome_and_CurrentPosition_zero",
+            "controller_home_proof_verified": True,
+        },
+    }
+
+    home = provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="bounded-home"
+    )
+    command_id = home["authority_receipt"]["command_id"]
+    assert home["authority_receipt"]["authority_semantics"] == {
+        "controller_command_acknowledged": True,
+        "controller_home_proof_verified": True,
+        "controller_terminal_state_verified": True,
+        "home_short_circuit": "MotorHome_and_CurrentPosition_zero",
+        "ok": True,
+    }
+
+    observation = provider.record_z_observation(
+        command_id=command_id,
+        observation_command_id="bounded-home-observation",
+        verdict="pass",
+        physical_motion_observed=False,
+        expected_direction_observed=True,
+        home_endpoint_observed=True,
+        stopped_observed=True,
+        note="Observed already at the known top home endpoint.",
+        expected_generation=11,
+    )
+
+    assert observation["annotation_only"] is False
+    assert observation["observation"]["source_already_home_short_circuit"] is True
+    assert observation["observation"]["reference_eligible"] is True
+    assert observation["z_state"] == "referenced_ready"
+    assert references.transitions[-1] == ("referenced", "z")
+
+
 def test_failed_manual_home_accepts_movement_only_observation_as_historical_annotation(tmp_path):
     primitives = FakeSerial206Primitives()
     references = ReferenceStore()

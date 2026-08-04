@@ -2723,7 +2723,42 @@ class Serial206OemInitializationProvider:
     @staticmethod
     def _append_z_receipt(z: dict[str, Any], receipt: Mapping[str, Any]) -> None:
         receipts = list(z.get("receipts") or [])
-        receipts.append(_json_safe(dict(receipt)))
+        projected_value = _json_safe(dict(receipt))
+        projected: dict[str, Any] = (
+            projected_value if isinstance(projected_value, dict) else {}
+        )
+        # Diagnostic result trees are deliberately bounded, but fields that
+        # carry lifecycle authority and receipt lineage must never depend on
+        # where they sort relative to those trees. Re-project each critical
+        # field with a fresh budget after the diagnostic projection.
+        for key in (
+            "command_id",
+            "idempotency_key",
+            "intent",
+            "status",
+            "started_at",
+            "finished_at",
+            "expected_generation",
+            "board_lifecycle_generation",
+            "authority_semantics",
+            "authority_receipt_id",
+            "authority_receipt_status",
+            "observation_receipt_id",
+            "observation_receipt_status",
+            "observes_command_id",
+            "operator_assessment",
+            "controller_command_acknowledged",
+            "controller_terminal_state_verified",
+            "robot_http_acknowledged",
+            "physical_effect_verified",
+            "authority_current",
+            "reference_eligible",
+            "annotation_only",
+            "verdict",
+        ):
+            if key in receipt:
+                projected[key] = _json_safe(receipt[key])
+        receipts.append(projected)
         z["receipts"] = receipts[-128:]
 
     @staticmethod
@@ -3389,12 +3424,34 @@ class Serial206OemInitializationProvider:
                         "interrupt_epoch": current_interrupt_epoch,
                     },
                 }
+            home_summary_value = result.get("home_summary") if isinstance(result, Mapping) else None
+            home_summary = home_summary_value if isinstance(home_summary_value, Mapping) else {}
+            authority_semantics = {
+                "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
+                "controller_command_acknowledged": bool(
+                    isinstance(result, Mapping)
+                    and result.get("controller_command_acknowledged") is True
+                ),
+                "controller_terminal_state_verified": bool(
+                    isinstance(result, Mapping)
+                    and result.get("controller_terminal_state_verified") is True
+                ),
+                "home_short_circuit": (
+                    home_summary.get("short_circuit")
+                    if isinstance(home_summary.get("short_circuit"), str)
+                    else None
+                ),
+                "controller_home_proof_verified": bool(
+                    home_summary.get("controller_home_proof_verified") is True
+                ),
+            }
             receipt.update({
                 "status": "completed" if ok else "failed",
                 "finished_at": time.time(),
                 "result": _json_safe(result),
-                "controller_command_acknowledged": bool(isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True),
-                "controller_terminal_state_verified": bool(isinstance(result, Mapping) and result.get("controller_terminal_state_verified") is True),
+                "authority_semantics": authority_semantics,
+                "controller_command_acknowledged": authority_semantics["controller_command_acknowledged"],
+                "controller_terminal_state_verified": authority_semantics["controller_terminal_state_verified"],
             })
             z["active_receipt"] = None
             if ok and intent == "prepare":
@@ -3529,21 +3586,54 @@ class Serial206OemInitializationProvider:
                     "z_state": z.get("state"),
                 }
 
-            home_result = match.get("result") if isinstance(match.get("result"), Mapping) else {}
-            home_summary_value = home_result.get("home_summary") if isinstance(home_result, Mapping) else None
+            home_result_value = match.get("result")
+            home_result: Mapping[str, Any] = (
+                home_result_value if isinstance(home_result_value, Mapping) else {}
+            )
+            home_summary_value = home_result.get("home_summary")
             home_summary: Mapping[str, Any] = (
                 home_summary_value if isinstance(home_summary_value, Mapping) else {}
             )
-            source_short_circuit = home_summary.get("short_circuit") == "MotorHome_and_CurrentPosition_zero"
+            authority_semantics_value = match.get("authority_semantics")
+            authority_semantics: Mapping[str, Any] = (
+                authority_semantics_value
+                if isinstance(authority_semantics_value, Mapping)
+                else {}
+            )
+            home_short_circuit = authority_semantics.get("home_short_circuit")
+            source_short_circuit = (
+                home_short_circuit == "MotorHome_and_CurrentPosition_zero"
+                if isinstance(home_short_circuit, str)
+                else home_summary.get("short_circuit") == "MotorHome_and_CurrentPosition_zero"
+            )
+            semantic_ok = authority_semantics.get("ok")
+            semantic_ack = authority_semantics.get("controller_command_acknowledged")
+            semantic_terminal = authority_semantics.get("controller_terminal_state_verified")
+            semantic_home_proof = authority_semantics.get("controller_home_proof_verified")
             controller_home_proof = bool(
-                isinstance(home_result, Mapping)
-                and home_result.get("ok") is True
-                and home_result.get("controller_terminal_state_verified") is True
+                (
+                    semantic_ok is True
+                    if type(semantic_ok) is bool
+                    else home_result.get("ok") is True
+                )
                 and (
-                    home_result.get("controller_command_acknowledged") is True
+                    semantic_terminal is True
+                    if type(semantic_terminal) is bool
+                    else home_result.get("controller_terminal_state_verified") is True
+                )
+                and (
+                    (
+                        semantic_ack is True
+                        if type(semantic_ack) is bool
+                        else home_result.get("controller_command_acknowledged") is True
+                    )
                     or (
                         source_short_circuit
-                        and home_summary.get("controller_home_proof_verified") is True
+                        and (
+                            semantic_home_proof is True
+                            if type(semantic_home_proof) is bool
+                            else home_summary.get("controller_home_proof_verified") is True
+                        )
                     )
                 )
             )
