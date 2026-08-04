@@ -48,7 +48,13 @@ def make_app(tmp_path: Path, monkeypatch):
     @app.post("/motion/test/home_axis")
     async def home_axis(body: dict):
         calls.append(("home_axis", body))
-        return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
+        return {
+            "ok": True,
+            "controller_command_acknowledged": True,
+            "controller_terminal_state_verified": True,
+            "authority_receipt": {"command_id": "provider-home-axis-1", "status": "completed"},
+            "stages": [{"stage_id": "home", "status": "passed"}],
+        }
 
     @app.post("/motion/oem/home_xy")
     async def home_xy():
@@ -255,6 +261,10 @@ def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_
     assert calls == [("home_axis", {"axis": "x"})]
     assert receipt["status"] == "completed"
     assert receipt["machine_assessment"] == "pass"
+    assert receipt["controller_acknowledged"] is True
+    assert receipt["controller_terminal_state_verified"] is True
+    assert receipt["authority_receipt_id"] == "provider-home-axis-1"
+    assert receipt["authority_receipt_status"] == "completed"
     assert receipt["physical_effect_verified"] is False
     assert receipt["stage_receipts"] == [{"stage_id": "home", "status": "passed"}]
     assert json.loads((tmp_path / "operator_action_receipts.json").read_text())["receipts"][0]["command_id"] == receipt["command_id"]

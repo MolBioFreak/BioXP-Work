@@ -122,8 +122,10 @@ class BoundedReceiptStore:
 
 
 def _controller_acknowledged(value: Any) -> bool:
-    """Detect a successful controller/TMCL ACK independently of HTTP status."""
+    """Detect provider-normalized or raw controller/TMCL ACK evidence."""
     if isinstance(value, Mapping):
+        if value.get("controller_command_acknowledged") is True or value.get("controller_acknowledged") is True:
+            return True
         status = value.get("status")
         if status == 100 and any(key in value for key in ("status", "raw", "command", "cmd")):
             return True
@@ -133,6 +135,17 @@ def _controller_acknowledged(value: Any) -> bool:
         return any(_controller_acknowledged(item) for item in value.values())
     if isinstance(value, list):
         return any(_controller_acknowledged(item) for item in value)
+    return False
+
+
+def _controller_terminal_state_verified(value: Any) -> bool:
+    """Project provider-owned terminal-state proof through response wrappers."""
+    if isinstance(value, Mapping):
+        if value.get("controller_terminal_state_verified") is True:
+            return True
+        return any(_controller_terminal_state_verified(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_controller_terminal_state_verified(item) for item in value)
     return False
 
 
@@ -1478,6 +1491,7 @@ def install_operator_control_plane(
                 "duration_ms": None,
                 "remote_acknowledged": False,
                 "controller_acknowledged": False,
+                "controller_terminal_state_verified": False,
                 "physical_effect_verified": False,
                 "machine_assessment": "unverified",
                 "operator_assessment": None,
@@ -1547,6 +1561,7 @@ def install_operator_control_plane(
                     "status": "completed" if ok else "failed",
                     "remote_acknowledged": 200 <= status_code < 300,
                     "controller_acknowledged": _controller_acknowledged(response),
+                    "controller_terminal_state_verified": _controller_terminal_state_verified(response),
                     "physical_effect_verified": bool(
                         isinstance(response, Mapping) and response.get("physical_effect_verified") is True
                     ),
