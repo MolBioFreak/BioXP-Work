@@ -1250,6 +1250,12 @@ class OemZReconcileRequest(BaseModel):
     confirm: Literal["RECONCILE_Z_SWITCH_MASKS"]
 
 
+class OemZDiagnosticHomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["DIAGNOSTIC_Z_HOME_597"]
+
+
 class OemMoveZHomeRequest(BaseModel):
     """Exact ClassControlInterface.MoveZHome input."""
 
@@ -6354,12 +6360,11 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
 def _record_z_home_outcome(result: dict[str, Any], *, source: str, motion_kind: str) -> dict[str, Any]:
     payload = dict(result)
     if payload.get("ok") is True:
-        payload["reference_state"] = _reference_state_store.mark_referenced(
-            MarkAxisReferencedCommand(
+        payload["reference_state"] = _reference_state_store.mark_desynced(
+            MarkAxisDesyncedCommand(
                 axis=AxisName.Z,
-                position_steps=0,
+                reason="Controller home completed; independent physical observation is still required.",
                 source=source,
-                note="OEM GAP9 home predicate, terminal stop, and setHome zero readback confirmed.",
                 motion_kind=motion_kind,
             )
         )
@@ -6405,6 +6410,19 @@ async def motion_oem_z_prepare():
     )
 
 
+
+@app.post("/motion/oem/z/live_right_reference")
+async def motion_oem_z_live_right_reference():
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "z_live_right_reference_retired",
+            "reason": "GAP10 is diagnostic evidence and cannot establish the production Z reference.",
+            "replacement": "/motion/oem/z/status",
+        },
+    )
+
+
 @app.post("/motion/oem/z/reconcile_switch_masks")
 async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
     return await _run_blocking(
@@ -6415,10 +6433,13 @@ async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
 
 
 @app.post("/motion/oem/z/diagnostic_home_axis")
-async def motion_oem_z_diagnostic_home_axis():
+async def motion_oem_z_diagnostic_home_axis(req: OemZDiagnosticHomeRequest):
     return await _run_blocking(
         "serial-206 diagnostic HomeAxis z",
-        lambda: _execute_provider_z_intent("diagnostic_home_axis", {"timeout_s": 30.0}),
+        lambda: _execute_provider_z_intent(
+            "diagnostic_home_axis",
+            {"timeout_s": 30.0, "confirm": req.confirm},
+        ),
         timeout_s=45.0,
     )
 

@@ -6,7 +6,15 @@ from bioxp.usb_driver import BioXpTester
 
 
 def _driver() -> BioXpTester:
-    return object.__new__(BioXpTester)
+    driver = object.__new__(BioXpTester)
+    driver._oem_no_motion_profile_ready = True
+    driver._oem_no_motion_profiles_ready = {"z"}
+    driver._oem_board_lifecycle_generation = 1
+    driver._oem_active_board_lifecycle_generation = 1
+    driver._oem_no_motion_profile_generations = {"z": 1}
+    driver._oem_no_motion_profile_fingerprints = {}
+    driver._oem_board_activation_observer_provider = None
+    return driver
 
 
 def _ack() -> dict:
@@ -103,6 +111,60 @@ def test_z_no_motion_profile_requires_effective_oem_switch_masks_clear(monkeypat
         driver.motor_oem_require_no_motion_profile("z")
 
     assert driver._oem_no_motion_profile_ready is False
+
+
+def test_any_command64_transition_invalidates_all_axis_profile_generations(monkeypatch):
+    driver = _driver()
+    driver._oem_no_motion_profiles_ready = {"x", "y", "z"}
+    driver._oem_no_motion_profile_generations = {"x": 1, "y": 1, "z": 1}
+    driver._oem_no_motion_profile_fingerprints = {"z": {"speed": 1791}}
+    monkeypatch.setattr(
+        driver,
+        "send_tmcl_retry",
+        lambda board, command, cmd_type, motor, value, **kwargs: {"status": 2 if board == 7 else 100},
+    )
+
+    rows = driver.deactivate_boards(expect_reply=True, fail_fast=True)
+
+    assert set(rows) == {4, 5, 6, 7}
+    assert driver._oem_no_motion_profile_ready is False
+    assert driver._oem_no_motion_profiles_ready == set()
+    assert driver._oem_no_motion_profile_generations == {}
+    assert driver._oem_no_motion_profile_fingerprints == {}
+    assert driver._oem_active_board_lifecycle_generation is None
+
+
+def test_board_generation_advances_only_after_complete_deactivate_activate_cycle():
+    driver = _driver()
+    driver._oem_board_lifecycle_generation = 7
+    driver._oem_active_board_lifecycle_generation = None
+    complete = {board: {"status": 2 if board == 7 else 100} for board in (4, 5, 6, 7)}
+
+    result = driver.oem_begin_board_lifecycle_generation(
+        deactivation=complete,
+        activation=complete,
+    )
+
+    assert result["ok"] is True
+    assert result["board_lifecycle_generation"] == 8
+    assert driver._oem_active_board_lifecycle_generation == 8
+
+
+def test_board_generation_does_not_advance_after_partial_cycle():
+    driver = _driver()
+    driver._oem_board_lifecycle_generation = 7
+    driver._oem_active_board_lifecycle_generation = None
+    incomplete = {4: _ack(), 5: _ack()}
+    complete = {board: {"status": 2 if board == 7 else 100} for board in (4, 5, 6, 7)}
+
+    result = driver.oem_begin_board_lifecycle_generation(
+        deactivation=incomplete,
+        activation=complete,
+    )
+
+    assert result["ok"] is False
+    assert driver._oem_board_lifecycle_generation == 7
+    assert driver._oem_active_board_lifecycle_generation is None
 
 
 def test_oem_z_interlock_verification_is_read_only(monkeypatch):

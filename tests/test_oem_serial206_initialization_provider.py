@@ -85,16 +85,21 @@ class PreparationProvider:
     def __init__(self, calls: list[str], generation: int = 11) -> None:
         self.calls = calls
         self.generation = generation
+        self.board_generation = 41
 
     def prepare_for_initialize_motors(self, *, expected_generation: int):
         self.calls.append("prepare")
         return {
             "ok": expected_generation == self.generation,
             "observed_generation": self.generation,
+            "board_lifecycle_generation": self.board_generation,
             "board_preparation_verified": True,
             "initialize_without_motion_verified": True,
             "physical_motion": False,
         }
+
+    def current_board_lifecycle_generation(self):
+        return self.board_generation
 
 
 class ReferenceStore:
@@ -104,7 +109,14 @@ class ReferenceStore:
     def mark_referenced(self, command):
         axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
         self.transitions.append(("referenced", axis))
-        return {"axis": axis, "state": "referenced", "persisted": True}
+        return {
+            "axis": axis,
+            "state": "referenced",
+            "ok": True,
+            "persisted": True,
+            "verified": True,
+            "durable_clean": True,
+        }
 
     def mark_desynced(self, command):
         axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
@@ -551,3 +563,156 @@ def test_production_adapter_exposes_only_source_grounded_existing_primitives(mon
     assert not hasattr(adapter, "set_tip_loaded")
     assert prep["ok"] is True
     assert prep["physical_motion"] is False
+
+
+def test_z_manual_home_rejects_stale_board_lifecycle_generation(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+
+    prepared = provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-board-generation"
+    )
+    assert prepared["ok"] is True
+    assert prepared["z_lifecycle"]["board_lifecycle_generation"] == 41
+
+    provider.preparation_provider.board_generation = 42
+    projection = provider.z_projection()
+    assert projection["state"] == "unprepared"
+    assert projection["durable_state_before_board_invalidation"] == "prepared_unreferenced"
+    assert projection["board_lifecycle_generation_fresh"] is False
+
+    home = provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="stale-board-home"
+    )
+
+    assert home["ok"] is False
+    assert "z_state_blocks_intent:unprepared:manual_home" in home["blockers"]
+    assert "manual-home" not in primitives.calls
+
+    recovered = provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-after-board-generation-change"
+    )
+    assert recovered["ok"] is True
+    assert recovered["z_lifecycle"]["board_lifecycle_generation"] == 42
+
+
+def test_diagnostic_home_requires_named_confirmation_and_never_awaits_reference_observation(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-for-diagnostic"
+    )["ok"] is True
+
+    rejected = provider.execute_z_intent(
+        "diagnostic_home_axis",
+        expected_generation=11,
+        idempotency_key="diagnostic-without-confirm",
+    )
+    assert rejected["ok"] is False
+    assert "explicit_confirmation_required:DIAGNOSTIC_Z_HOME_597" in rejected["blockers"]
+
+    diagnosed = provider.execute_z_intent(
+        "diagnostic_home_axis",
+        inputs={"confirm": "DIAGNOSTIC_Z_HOME_597"},
+        expected_generation=11,
+        idempotency_key="diagnostic-with-confirm",
+    )
+    assert diagnosed["ok"] is True
+    assert diagnosed["z_state"] == "prepared_unreferenced"
+    assert diagnosed["z_lifecycle"]["awaiting_observation_receipt_id"] is None
+
+
+def test_production_adapter_reports_command_and_terminal_receipts_from_nested_move_z_home():
+    class Tester:
+        def _motion_oem_axis_profile(self, axis):
+            assert axis == "z"
+            return {"board": 4, "motor": 1}
+
+        def motor_oem_require_no_motion_profile(self, axis):
+            assert axis == "z"
+            return {"ok": True}
+
+        def motor_oem_verify_motion_interlock(self):
+            return {"ok": True}
+
+        def motor_oem_move_z_home(self, *, rehome, timeout_s):
+            assert rehome is True
+            return {
+                "ok": True,
+                "home": {
+                    "ok": True,
+                    "move_home": {"ok": True},
+                    "stop": {"ok": True},
+                    "wait": {"stopped": True, "last_speed": 0},
+                },
+            }
+
+    adapter = subject.Serial206ProductionPrimitiveAdapter(
+        Tester(), object(), authority_provider=lambda: object(), generation_provider=lambda: 11
+    )
+    result = adapter.z_manual_home(timeout_s=30.0)
+
+    assert result["ok"] is True
+    assert result["controller_command_acknowledged"] is True
+    assert result["controller_terminal_state_verified"] is True
+    assert result["motor_output_state"] == "unknown"
+    assert result["physical_effect_verified"] is False
+
+
+def test_z_observation_rejects_board_generation_change_after_home(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives)
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-before-observation-generation"
+    )["ok"] is True
+    homed = provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="home-before-observation-generation"
+    )
+    command_id = homed["authority_receipt"]["command_id"]
+    provider.preparation_provider.board_generation = 42
+
+    with pytest.raises(ValueError, match="board lifecycle generation changed"):
+        provider.record_z_observation(
+            command_id=command_id,
+            verdict="pass",
+            note="Observation arrived after a board lifecycle change.",
+            expected_generation=11,
+        )
+
+
+def test_z_reference_is_not_published_when_durable_persistence_fails(tmp_path):
+    class FailingReferenceStore(ReferenceStore):
+        def mark_referenced(self, command):
+            axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
+            self.transitions.append(("referenced_failed", axis))
+            return {
+                "axis": axis,
+                "state": "unknown",
+                "ok": False,
+                "persisted": False,
+                "verified": False,
+                "durable_clean": False,
+                "error": "simulated persistence failure",
+            }
+
+    primitives = FakeSerial206Primitives()
+    references = FailingReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-before-persistence-failure"
+    )["ok"] is True
+    homed = provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="home-before-persistence-failure"
+    )
+
+    observed = provider.record_z_observation(
+        command_id=homed["authority_receipt"]["command_id"],
+        verdict="pass",
+        note="Physical observation passed but persistence is forced to fail.",
+        expected_generation=11,
+    )
+
+    assert observed["ok"] is False
+    assert observed["error"] == "z_reference_persistence_failed"
+    assert observed["z_state"] == "failed_latched"
+    assert observed["z_lifecycle"]["reference_state"] == "desynced"

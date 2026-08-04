@@ -124,6 +124,8 @@ def test_motor_oem_home_axis_restores_gripper_current_for_version_one(monkeypatc
 def test_motor_oem_home_axis_z_startup_dispatches_literal_axis_search(monkeypatch):
     tester, _ = _make_tester(monkeypatch)
     tester._oem_no_motion_profiles_ready = {"z"}
+    tester._oem_active_board_lifecycle_generation = 1
+    tester._oem_no_motion_profile_generations = {"z": 1}
     observed = {}
 
     def fake_prepare_axis(board_id, motor=0, **kwargs):

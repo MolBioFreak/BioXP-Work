@@ -302,6 +302,21 @@ class CanonicalLifecycleOwner:
                     deactivate_boards=deactivate,
                     activate_boards=activate,
                 )
+            begin_generation = getattr(hardware, "oem_begin_board_lifecycle_generation", None)
+            lifecycle_generation = (
+                begin_generation(deactivation=deactivate, activation=activate)
+                if callable(begin_generation)
+                else {"ok": True, "legacy_harness_without_generation_binding": True}
+            )
+            trace.append({"step": "board_lifecycle_generation", "result": lifecycle_generation})
+            if not _result_ok(lifecycle_generation):
+                return fail(
+                    "board_lifecycle_generation_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                    activate_boards=activate,
+                    board_lifecycle_generation=lifecycle_generation,
+                )
             ok = True
             return {
                 "ok": ok,
@@ -313,6 +328,7 @@ class CanonicalLifecycleOwner:
                 "door_latch": door,
                 "deactivate_boards": deactivate,
                 "activate_boards": activate,
+                "board_lifecycle_generation": lifecycle_generation,
                 "elapsed_ms": int(round((clock() - started) * 1000.0)),
                 "trace": trace,
             }

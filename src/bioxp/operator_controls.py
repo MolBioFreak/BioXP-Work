@@ -764,6 +764,7 @@ _NON_OPERATOR_COMPAT_PATHS = {
     "/motion/axis/home",
     "/motion/axis/zero",
     "/motion/oem/z/move_z_home",
+    "/motion/oem/z/live_right_reference",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/initialization/initialize_motors": "initialize_motors",
@@ -881,7 +882,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         action_id="oem.z.prepare",
         path="/motion/oem/z/prepare",
         label="Prepare OEM Z profile",
-        description="Activate board 4 once, execute only the source Z no-motion segment, and verify exact readbacks without moving.",
+        description="Run the OEM safety check and cmd64=0→1 board cycle, then execute the source Z no-motion segment and verify exact readbacks without moving.",
         source_anchor="ClassControlInterface.initializeMotorsWithoutMotion:3225-3232",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
@@ -937,7 +938,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="Diagnostic Z HomeAxis (597)",
         description="Diagnostic-only HomeAxis(\"z\") at 597; never presented as manual or startup home.",
         source_anchor="ClassControlInterface.HomeAxis:4997-5052",
-        fixed_inputs={"axis": "z"},
+        fixed_inputs={"axis": "z", "confirm": "DIAGNOSTIC_Z_HOME_597"},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -999,7 +1000,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "activation",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Activate the serial-206 motor power path using the OEM board-activation and initializeMotorsWithoutMotion sequence, then verify 24 V/door/latch readbacks. This does not home or move an axis.",
+            "description": "Prepare the serial-206 motion path using the OEM safety check, cmd64=0→1 board cycle, and initializeMotorsWithoutMotion sequence. This does not home or move an axis.",
             "source_anchor": "ClassIOControl.query24VSensor:92-110; ClassControlInterface.initializeMotorsWithoutMotion:3181-3265; activateBoard:3474-3493",
             "informational_method": "POST",
             "informational_path": "/motion/oem/prepare_without_motion",
@@ -1013,7 +1014,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": True,
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
-            "stages": ["serial-206 authority", "activate boards 4/5/6", "resolve board 7 as non-motor", "initializeMotorsWithoutMotion", "exact parameter readback", "24 V query", "door query", "latch query"],
+            "stages": ["serial-206 authority", "24 V/door/latch query", "cmd64=0 boards 4/5/6/7", "cmd64=1 boards 4/5/6/7", "mint board generation", "initializeMotorsWithoutMotion", "exact parameter readback"],
         },
         {
             "action_id": "meta.emergency_stop",
