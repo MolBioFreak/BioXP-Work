@@ -64,20 +64,20 @@ def test_arbitrary_tmcl_success_does_not_invent_board_initialized_state():
 
     tester = BioXpTester.__new__(BioXpTester)
     tester.novo_router = Router()
-    tester._oem_initialized_boards = set()
+    tester._oem_board_initialized = {4: False, 5: False, 6: False, 7: False}
     tester._record_usb_sniff_ledger = lambda *_args, **_kwargs: None
 
     result = tester._send_tmcl_locked(4, 6, 9, 0, 0)
 
     assert result["status"] == 100
-    assert tester._oem_initialized_boards == set()
+    assert tester._oem_board_initialized == {4: False, 5: False, 6: False, 7: False}
 
 
 def test_activate_board_owns_initialized_state_and_status_two_is_chiller_only(monkeypatch):
     from src.bioxp.usb_driver import BioXpTester
 
     tester = BioXpTester.__new__(BioXpTester)
-    tester._oem_initialized_boards = set()
+    tester._oem_board_initialized = {4: False, 5: False, 6: False, 7: False}
     tester.enable_motor_power = lambda: None
     monkeypatch.setattr("src.bioxp.usb_driver.time.sleep", lambda _seconds: None)
 
@@ -91,7 +91,7 @@ def test_activate_board_owns_initialized_state_and_status_two_is_chiller_only(mo
 
     tester.activate_boards(expect_reply=True)
 
-    assert tester._oem_initialized_boards == {4, 7}
+    assert tester._oem_board_initialized == {4: True, 5: False, 6: False, 7: True}
 
 
 def test_repeatable_initial_check_refuses_active_operation_without_hardware_calls():
@@ -100,8 +100,8 @@ def test_repeatable_initial_check_refuses_active_operation_without_hardware_call
     owner = CanonicalLifecycleOwner()
     owner.transport_changed(True, reason="test")
     owner.run_stage("constructor_pipette_stage", lambda: {"ok": True})
-    owner.run_stage("initialization_without_motion", lambda: {"ok": True})
     owner.run_stage("initial_check", lambda: {"ok": True})
+    owner.run_stage("initialization_without_motion", lambda: {"ok": True})
     owner.transition("running", reason="active_job")
 
     class Hardware:

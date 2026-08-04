@@ -1127,7 +1127,10 @@ class BioXpTester:
                 self._record_oem_board_activation(bid, active=active, ack=ack)
                 observer = getattr(self, "_board_activation_observer", None)
                 if callable(observer):
-                    observer(int(bid), ack, active=bool(active))
+                    try:
+                        observer(int(bid), ack, active=bool(active))
+                    except TypeError:
+                        observer(int(bid), ack)
                 if fail_fast and not self._oem_board_activation_ack_success(bid, ack):
                     break
             time.sleep(0.005)
@@ -1156,6 +1159,10 @@ class BioXpTester:
             "activation_complete": True,
             "source_order": ["cmd64=0", "cmd64=1"],
         }
+
+    def oem_current_board_lifecycle_generation(self):
+        value = getattr(self, "_oem_active_board_lifecycle_generation", None)
+        return int(value) if type(value) is int and value > 0 else None
 
     def _oem_board_state(self):
         """Lazy mirror of ClassControlInterface.m_Boards[0..3] state.
@@ -1453,7 +1460,12 @@ class BioXpTester:
         )
         self._record_oem_board_activation(int(board_id), active=True, ack=ack)
         observer = getattr(self, "_board_activation_observer", None)
-        observation = observer(int(board_id), ack, active=True) if callable(observer) else None
+        observation = None
+        if callable(observer):
+            try:
+                observation = observer(int(board_id), ack, active=True)
+            except TypeError:
+                observation = observer(int(board_id), ack)
         return {"board": int(board_id), "ack": ack, "z_authority_invalidation": observation}
 
     def board_deactivate(self, board_id):
@@ -1473,7 +1485,12 @@ class BioXpTester:
         )
         self._record_oem_board_activation(int(board_id), active=False, ack=ack)
         observer = getattr(self, "_board_activation_observer", None)
-        observation = observer(int(board_id), ack, active=False) if callable(observer) else None
+        observation = None
+        if callable(observer):
+            try:
+                observation = observer(int(board_id), ack, active=False)
+            except TypeError:
+                observation = observer(int(board_id), ack)
         return {"board": int(board_id), "ack": ack, "z_authority_invalidation": observation}
 
     def board_query_firmware(self, board_id):
@@ -5221,6 +5238,44 @@ class BioXpTester:
         sethome_init = self.motor_set_home(board, motor=motor)
         home_before = self.motor_query_home_switch(board, motor=motor)
         switches_before = self.motor_get_switch_activity(board, motor=motor)
+        sethome_init_verified = bool(
+            isinstance(sethome_init, dict)
+            and sethome_init.get("ok") is True
+            and self._tmcl_success(sethome_init.get("ack"))
+            and isinstance(sethome_init.get("readback"), dict)
+            and self._tmcl_success(sethome_init["readback"].get("ack"))
+            and sethome_init["readback"].get("value") == 0
+        )
+        home_before_verified = bool(
+            isinstance(home_before, dict)
+            and self._tmcl_success(home_before.get("ack"))
+            and type(home_before.get("value")) is int
+        )
+        if not sethome_init_verified or not home_before_verified:
+            failure = (
+                "axis_search_initial_set_home_not_verified"
+                if not sethome_init_verified else "axis_search_initial_home_readback_not_verified"
+            )
+            return {
+                "axis": str(axis_key).strip().lower(),
+                "board": board,
+                "motor": motor,
+                "speed": int(speed),
+                "oem_method": "axisSearchHome",
+                "home_active_value": active_value,
+                "sethome_init": sethome_init,
+                "home_before_axis_search": home_before,
+                "switches_before_axis_search": switches_before,
+                "preclear_move": None,
+                "preclear_wait": None,
+                "home_after_preclear": None,
+                "switches_after_preclear": None,
+                "go_home": None,
+                "max_search_abs_delta": None if max_search_abs_delta is None else int(max_search_abs_delta),
+                "ok": False,
+                "failure": failure,
+                "false_home_guard": failure,
+            }
         preclear_move = None
         preclear_wait = None
         home_after_preclear = None
@@ -5338,31 +5393,56 @@ class BioXpTester:
         board_lifecycle_generation = getattr(self, "_oem_active_board_lifecycle_generation", None)
         position_before = self.motor_get_position(board, motor=motor)
         home_before = self.motor_query_home_switch(board, motor=motor)
+        speed_before = self.motor_get_speed(board, motor=motor)
         switches_before = self.motor_get_switch_activity(board, motor=motor)
-        if (
+        already_home_predicate = bool(
             isinstance(position_before, dict)
+            and self._tmcl_success(position_before.get("ack"))
             and position_before.get("position") == 0
             and isinstance(home_before, dict)
+            and self._tmcl_success(home_before.get("ack"))
             and home_before.get("value") == active_value
-        ):
+        )
+        if already_home_predicate:
+            terminal_zero_verified = bool(
+                isinstance(speed_before, dict)
+                and self._tmcl_success(speed_before.get("ack"))
+                and type(speed_before.get("speed")) is int
+                and int(speed_before["speed"]) == 0
+            )
+            failure = None if terminal_zero_verified else "already_home_terminal_speed_not_zero"
             return {
-                "ok": True,
+                "ok": terminal_zero_verified,
                 "axis": key,
                 "board": board,
                 "motor": motor,
                 "board_lifecycle_generation": board_lifecycle_generation,
-                "source_return_code": 0,
+                "source_return_code": 0 if terminal_zero_verified else 1,
                 "short_circuit": "MotorHome_and_CurrentPosition_zero",
+                "false_home_guard": failure,
                 "controller_command_acknowledged": False,
-                "controller_terminal_state_verified": False,
+                "controller_terminal_state_verified": terminal_zero_verified,
+                "controller_home_proof_verified": terminal_zero_verified,
                 "home_predicate_confirmed": True,
-                "motor_output_state": "unknown",
+                "motor_output_state": "stopped_readback" if terminal_zero_verified else "unverified",
                 "motor_torque_verified": False,
                 "independent_physical_motion_verified": False,
                 "physical_effect_verified": False,
                 "position_before": position_before,
+                "speed_before": speed_before,
                 "home_before": home_before,
                 "switches_before": switches_before,
+                "home_decision": {
+                    "failure_predicate": failure,
+                    "controller_home_proof_verified": terminal_zero_verified,
+                    "home_search_command_acknowledged": False,
+                    "terminal_stop_verified": terminal_zero_verified,
+                    "home_after_stop_active": True,
+                    "set_home_acknowledged": False,
+                    "set_home_readback_zero": True,
+                    "position_after_sethome_zero": True,
+                    "home_after_sethome_active": True,
+                },
             }
         if key == "door":
             status_before = self.motor_thermal_door_status()
@@ -5427,30 +5507,70 @@ class BioXpTester:
 
         if search_preflight_exception is not None:
             failure = f"search_preflight_exception:{search_preflight_exception}"
+        if failure is None and not (
+            isinstance(search_start_position, dict)
+            and self._tmcl_success(search_start_position.get("ack"))
+            and type(search_start_position.get("position")) is int
+            and isinstance(search_start_home, dict)
+            and self._tmcl_success(search_start_home.get("ack"))
+            and type(search_start_home.get("value")) is int
+        ):
+            failure = "search_preflight_readback_ack_failed"
         if bool(require_switch_transition) and not seen_inactive:
             failure = failure or "home_switch_active_before_search"
         if bool(rehome):
             if rehome_exception is not None:
                 failure = failure or f"rehome_exception:{rehome_exception}"
-            elif not isinstance(rehome_move, dict) or rehome_move.get("ok") is not True:
+            elif (
+                not isinstance(rehome_move, dict)
+                or rehome_move.get("ok") is not True
+                or not self._tmcl_success(rehome_move.get("ack"))
+            ):
                 failure = failure or "rehome_move_ack_failed"
-            elif not isinstance(rehome_wait, dict) or rehome_wait.get("stopped") is not True:
+            elif not (
+                isinstance(rehome_wait, dict)
+                and rehome_wait.get("stopped") is True
+                and type(rehome_wait.get("last_speed")) is int
+                and int(rehome_wait["last_speed"]) == 0
+                and self._tmcl_success(rehome_wait.get("last_ack"))
+            ):
                 failure = failure or "rehome_move_not_stopped"
-            elif not isinstance(home_after_rehome, dict) or home_after_rehome.get("value") == active_value:
+            elif (
+                not isinstance(rehome_position, dict)
+                or not self._tmcl_success(rehome_position.get("ack"))
+                or type(rehome_position.get("position")) is not int
+            ):
+                failure = failure or "rehome_position_readback_not_verified"
+            elif (
+                not isinstance(home_after_rehome, dict)
+                or not self._tmcl_success(home_after_rehome.get("ack"))
+                or home_after_rehome.get("value") == active_value
+            ):
                 failure = failure or "rehome_did_not_deassert_home_switch"
 
+        pre_command_event_window = None
         event_window_reset = None
         if failure is None:
-            event_window_reset = self.clear_bus_event_buffer()
+            pre_command_event_window = self.begin_bus_event_window()
             try:
                 move_home = self.motor_move_left(board, speed=int(speed), motor=motor)
             except Exception as exc:
                 move_home = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if not isinstance(move_home, dict) or move_home.get("ok") is not True:
+            if (
+                not isinstance(move_home, dict)
+                or move_home.get("ok") is not True
+                or not self._tmcl_success(move_home.get("ack"))
+            ):
                 failure = "move_home_ack_failed"
+            else:
+                # Fence asynchronous evidence after the command ACK. Any event
+                # already queued before this point is not command-bound and is
+                # discarded fail-safe; long-running home events arrive after it.
+                event_window_reset = self.begin_bus_event_window()
 
         stopping_margin = max(2000, abs(int(speed)) * 2)
         stop_threshold = max(0, int(max_search_abs_delta) - stopping_margin) if max_search_abs_delta is not None else None
+        provisional_stop_before_home = False
         try:
             while failure is None and time.monotonic() < deadline:
                 if getattr(self, "_oem_active_board_lifecycle_generation", None) != board_lifecycle_generation:
@@ -5464,6 +5584,16 @@ class BioXpTester:
                 speed_value = speed_poll.get("speed") if isinstance(speed_poll, dict) else None
                 home_value = home_poll.get("value") if isinstance(home_poll, dict) else None
                 current_position = position_poll.get("position") if isinstance(position_poll, dict) else None
+                if not (
+                    isinstance(home_poll, dict)
+                    and self._tmcl_success(home_poll.get("ack"))
+                    and isinstance(speed_poll, dict)
+                    and self._tmcl_success(speed_poll.get("ack"))
+                    and isinstance(position_poll, dict)
+                    and self._tmcl_success(position_poll.get("ack"))
+                ):
+                    failure = "home_monitor_readback_ack_failed"
+                    break
                 if isinstance(speed_value, int) and speed_value != 0:
                     controller_speed_nonzero_seen = True
                 if (
@@ -5490,7 +5620,10 @@ class BioXpTester:
                     home_hit = home_poll
                     break
                 if isinstance(speed_value, int) and speed_value == 0 and controller_motion_evidence_seen:
-                    failure = "motor_stopped_before_home_switch_transition"
+                    # A home-switch sample can race the controller's terminal
+                    # speed sample. Defer the decision until the bounded post-stop
+                    # GAP9 read instead of permanently latching failure here.
+                    provisional_stop_before_home = True
                     break
                 # Axis min/max envelope is post-reference telemetry during homing; do not
                 # block the OEM home search on a pre-home/desynced controller coordinate.
@@ -5526,23 +5659,52 @@ class BioXpTester:
             home_after_stop = {"error": f"{type(exc).__name__}: {exc}"}
             source_events = []
             failure = failure or f"post_stop_evidence_exception:{type(exc).__name__}:{exc}"
+        after_sequence = (
+            event_window_reset.get("after_sequence")
+            if isinstance(event_window_reset, dict) else None
+        )
         axis_events = [
             row for row in source_events
             if isinstance(row, dict)
-            and row.get("board") in {None, board}
-            and row.get("motor") in {None, motor}
+            and row.get("board") == board
+            and row.get("motor") == motor
+            and type(row.get("event_sequence")) is int
+            and type(after_sequence) is int
+            and int(row["event_sequence"]) > int(after_sequence)
         ]
         controller_error_events = [
             row for row in axis_events if row.get("status") in {13, 14, 130}
         ]
+        post_stop_home_active = bool(
+            isinstance(home_after_stop, dict)
+            and self._tmcl_success(home_after_stop.get("ack"))
+            and home_after_stop.get("value") == active_value
+        )
+        if home_hit is None and provisional_stop_before_home and post_stop_home_active:
+            home_hit = home_after_stop
         switch_transition = bool(
             seen_inactive
             and isinstance(home_hit, dict)
             and home_hit.get("value") == active_value
         )
 
+        stop_acknowledged = bool(
+            isinstance(stop, dict)
+            and stop.get("ok") is True
+            and self._tmcl_success(stop.get("first_delivery"))
+            and self._tmcl_success(stop.get("second_delivery"))
+        )
+        terminal_zero_verified = bool(
+            isinstance(wait, dict)
+            and wait.get("stopped") is True
+            and type(wait.get("last_speed")) is int
+            and int(wait["last_speed"]) == 0
+            and self._tmcl_success(wait.get("last_ack"))
+        )
         if failure is None and controller_error_events:
             failure = f"controller_async_error_{controller_error_events[0].get('status')}"
+        if failure is None and provisional_stop_before_home and not post_stop_home_active:
+            failure = "motor_stopped_before_home_switch_transition"
         if failure is None and home_hit is None:
             failure = "home_switch_timeout_without_transition"
         controller_motion_evidence_seen = bool(
@@ -5552,14 +5714,25 @@ class BioXpTester:
             failure = "controller_motion_evidence_not_observed"
         if failure is None and bool(require_switch_transition) and not switch_transition:
             failure = "home_switch_transition_not_observed"
-        if failure is None and (not isinstance(stop, dict) or stop.get("ok") is not True):
+        if failure is None and not stop_acknowledged:
             failure = "stop_ack_failed"
         if failure is None and (not isinstance(wait, dict) or wait.get("stopped") is not True):
             failure = "motor_not_stopped"
-        if failure is None and wait.get("last_speed") != 0:
+        if failure is None and (
+            type(wait.get("last_speed")) is not int or int(wait["last_speed"]) != 0
+        ):
             failure = "post_stop_speed_nonzero_or_unknown"
+        if failure is None and not self._tmcl_success(wait.get("last_ack")):
+            failure = "post_stop_speed_readback_ack_failed"
+        if failure is None and (
+            not isinstance(position_after, dict)
+            or not self._tmcl_success(position_after.get("ack"))
+            or type(position_after.get("position")) is not int
+        ):
+            failure = "post_stop_position_readback_not_verified"
         if failure is None and (
             not isinstance(home_after_stop, dict)
+            or not self._tmcl_success(home_after_stop.get("ack"))
             or home_after_stop.get("value") != active_value
         ):
             failure = "home_switch_not_active_after_stop"
@@ -5569,20 +5742,30 @@ class BioXpTester:
         home_after = home_after_stop
         if failure is None:
             sethome = self.motor_set_home(board, motor=motor)
-            if not isinstance(sethome, dict) or sethome.get("ok") is not True:
+            if (
+                not isinstance(sethome, dict)
+                or sethome.get("ok") is not True
+                or not self._tmcl_success(sethome.get("ack"))
+            ):
                 failure = "set_home_failed"
-            elif not isinstance(sethome.get("readback"), dict) or sethome["readback"].get("value") != 0:
+            elif (
+                not isinstance(sethome.get("readback"), dict)
+                or not self._tmcl_success(sethome["readback"].get("ack"))
+                or sethome["readback"].get("value") != 0
+            ):
                 failure = "set_home_readback_not_zero"
             else:
                 position_after_sethome = self.motor_get_position(board, motor=motor)
                 if (
                     not isinstance(position_after_sethome, dict)
+                    or not self._tmcl_success(position_after_sethome.get("ack"))
                     or position_after_sethome.get("position") != 0
                 ):
                     failure = "position_after_sethome_not_zero"
                 home_after = self.motor_query_home_switch(board, motor=motor)
                 if failure is None and (
                     not isinstance(home_after, dict)
+                    or not self._tmcl_success(home_after.get("ack"))
                     or home_after.get("value") != active_value
                 ):
                     failure = "home_switch_not_active_after_sethome"
@@ -5625,6 +5808,7 @@ class BioXpTester:
             "move_home": move_home,
             "move_left": move_home,
             "move_direction": "move_left",
+            "pre_command_event_window": pre_command_event_window,
             "event_window_reset": event_window_reset,
             "source_events": axis_events,
             "controller_error_events": controller_error_events,
@@ -5632,20 +5816,66 @@ class BioXpTester:
             "stop": stop,
             "set_home": sethome,
             "controller_command_acknowledged": bool(
-                isinstance(move_home, dict) and move_home.get("ok") is True
+                isinstance(move_home, dict)
+                and move_home.get("ok") is True
+                and self._tmcl_success(move_home.get("ack"))
             ),
             "controller_terminal_state_verified": bool(
-                isinstance(stop, dict)
-                and stop.get("ok") is True
-                and isinstance(wait, dict)
-                and wait.get("stopped") is True
-                and wait.get("last_speed") == 0
+                stop_acknowledged and terminal_zero_verified
             ),
+            "controller_home_proof_verified": bool(ok),
+            "home_decision": {
+                "failure_predicate": failure,
+                "controller_home_proof_verified": bool(ok),
+                "home_search_command_acknowledged": bool(
+                    isinstance(move_home, dict)
+                    and move_home.get("ok") is True
+                    and self._tmcl_success(move_home.get("ack"))
+                ),
+                "terminal_stop_verified": bool(stop_acknowledged and terminal_zero_verified),
+                "controller_motion_evidence_seen": controller_motion_evidence_seen,
+                "seen_inactive": bool(seen_inactive),
+                "home_hit_in_loop": bool(home_hit is not None and not provisional_stop_before_home),
+                "home_hit_after_stop": bool(provisional_stop_before_home and post_stop_home_active),
+                "home_after_stop_active": post_stop_home_active,
+                "switch_transition_verified": switch_transition,
+                "set_home_acknowledged": bool(
+                    isinstance(sethome, dict)
+                    and sethome.get("ok") is True
+                    and self._tmcl_success(sethome.get("ack"))
+                ),
+                "set_home_readback_zero": bool(
+                    isinstance(sethome, dict)
+                    and isinstance(sethome.get("readback"), dict)
+                    and self._tmcl_success(sethome["readback"].get("ack"))
+                    and sethome["readback"].get("value") == 0
+                ),
+                "position_after_sethome_zero": bool(
+                    isinstance(position_after_sethome, dict)
+                    and self._tmcl_success(position_after_sethome.get("ack"))
+                    and position_after_sethome.get("position") == 0
+                ),
+                "home_after_sethome_active": bool(
+                    isinstance(home_after, dict)
+                    and self._tmcl_success(home_after.get("ack"))
+                    and home_after.get("value") == active_value
+                ),
+                "position_before": position_before.get("position") if isinstance(position_before, dict) else None,
+                "search_start_position": search_start_position.get("position") if isinstance(search_start_position, dict) else None,
+                "position_after_stop": position_after.get("position") if isinstance(position_after, dict) else None,
+                "position_after_sethome": position_after_sethome.get("position") if isinstance(position_after_sethome, dict) else None,
+                "gap9_before": home_before.get("value") if isinstance(home_before, dict) else None,
+                "gap9_after_stop": home_after_stop.get("value") if isinstance(home_after_stop, dict) else None,
+                "gap9_after_sethome": home_after.get("value") if isinstance(home_after, dict) else None,
+                "gap10_before": switches_before.get("right_state") if isinstance(switches_before, dict) else None,
+                "board_lifecycle_generation": board_lifecycle_generation,
+                "board_lifecycle_generation_after": getattr(self, "_oem_active_board_lifecycle_generation", None),
+            },
             "seen_motion": controller_motion_evidence_seen,
             "controller_motion_evidence_seen": controller_motion_evidence_seen,
             "controller_speed_nonzero_seen": controller_speed_nonzero_seen,
             "controller_position_counter_changed": controller_position_counter_changed,
-            "motor_output_state": "unknown",
+            "motor_output_state": "stopped_readback" if terminal_zero_verified else "unverified",
             "motor_torque_verified": False,
             "independent_physical_motion_verified": False,
             "physical_effect_verified": False,
@@ -6756,14 +6986,28 @@ class BioXpTester:
         pos_value = position.get("position") if isinstance(position, dict) else None
         speed_value = speed.get("speed") if isinstance(speed, dict) else None
         home_value = home.get("value") if isinstance(home, dict) else None
-        near_reference = isinstance(pos_value, int) and abs(int(pos_value)) <= int(tolerance_steps)
-        stopped = speed_value == 0
-        predicate_active = home_value == active_value
+        near_reference = bool(
+            isinstance(position, dict)
+            and self._tmcl_success(position.get("ack"))
+            and type(pos_value) is int
+            and abs(int(pos_value)) <= int(tolerance_steps)
+        )
+        stopped = bool(
+            isinstance(speed, dict)
+            and self._tmcl_success(speed.get("ack"))
+            and type(speed_value) is int
+            and int(speed_value) == 0
+        )
+        predicate_active = bool(
+            isinstance(home, dict)
+            and self._tmcl_success(home.get("ack"))
+            and type(home_value) is int
+            and int(home_value) == active_value
+        )
+        # GAP10/right is diagnostic telemetry only for Z. It must never
+        # establish or supplement the authoritative GAP9 home predicate.
         live_z_reference_active = False
-        if key == "z":
-            right_value = switches.get("right_state") if isinstance(switches, dict) else None
-            live_z_reference_active = bool(near_reference and stopped and right_value is not None and int(right_value) == active_value)
-        ok = bool(stopped and near_reference and (predicate_active or live_z_reference_active))
+        ok = bool(stopped and near_reference and predicate_active)
         return {
             "axis": key,
             "board": board,
@@ -6783,8 +7027,8 @@ class BioXpTester:
             "near_reference": bool(near_reference),
             "source_intent": "safe_reference_established_before_downstream_initialization",
             "z_reference_contract": {
-                "accepted": bool(live_z_reference_active),
-                "reason": "live Z reference is controller zero plus GAP10/right raw active; GAP9 remains OEM-source provenance but is not the live verifier on this robot",
+                "accepted": bool(ok),
+                "reason": "Only acknowledged GAP9/home plus controller zero and speed zero can satisfy Z already-home proof; GAP10/right is diagnostic-only",
             } if key == "z" else None,
         }
 

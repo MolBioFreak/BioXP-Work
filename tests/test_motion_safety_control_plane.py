@@ -35,7 +35,7 @@ class FakeMotionDriver:
             (4, 1, 13): 0,
         }
         self.rail = {"ack": {"status": 100}, "reply_valid": True, "sample_valid": True, "safety_valid": True, "oem_scalar": 0}
-        self.io = {
+        self.io: dict[int, object] = {
             1: {"ack": {"status": 100}, "value": 1, "ok": True},
             3: {"ack": {"status": 100}, "value": 1, "ok": True},
         }
@@ -217,6 +217,50 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
     assert all(row["status"] in {"passed", "not_applicable"} for row in result["stage_ledger"])
 
 
+def test_prepare_uses_initial_check_door_latch_values_as_typed_observations_not_invented_closed_gate():
+    driver = FakeMotionDriver()
+    driver.io = {
+        1: {"ack": {"status": 100}, "value": 0, "ok": True},
+        3: {"ack": {"status": 100}, "value": 0, "ok": True},
+    }
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is True
+    door = next(row for row in result["stage_ledger"] if row["stage_id"] == "door_readback")
+    latch = next(row for row in result["stage_ledger"] if row["stage_id"] == "latch_readback")
+    assert door["status"] == "passed"
+    assert latch["status"] == "passed"
+    assert door["controller_evidence"]["value"] == 0
+    assert latch["controller_evidence"]["value"] == 0
+    assert ("deactivate", 4) in driver.calls
+
+
+def test_prepare_rejects_untyped_or_malformed_initial_check_sensor_observations():
+    for bad in (True, "1", None, {"status": 100}):
+        driver = FakeMotionDriver()
+        driver.io[1] = {"ack": {"status": 100}, "value": bad, "ok": True}
+
+        result = prepare_motion_without_motion(driver, authority())
+
+        assert result["ok"] is False
+        door = next(row for row in result["stage_ledger"] if row["stage_id"] == "door_readback")
+        assert door["status"] == "failed"
+        assert not any(call[0] == "deactivate" for call in driver.calls)
+
+
+def test_prepare_rejects_non_mapping_initial_check_sensor_observation():
+    driver = FakeMotionDriver()
+    driver.io[1] = 1
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is False
+    door = next(row for row in result["stage_ledger"] if row["stage_id"] == "door_readback")
+    assert door["status"] == "failed"
+    assert not any(call[0] == "deactivate" for call in driver.calls)
+
+
 def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switch_masks():
     driver = FakeMotionDriver()
     driver.parameter_readbacks[(4, 1, 13)] = 1
@@ -363,6 +407,17 @@ def test_dashboard_and_action_admission_share_complete_motion_readiness_predicat
         dashboard = _dashboard_payload(candidate)
         assert admission["enabled"] is False, label
         assert admission["disabled_reason"] == reason, label
+
+
+def test_motion_admission_rejects_boolean_or_string_door_latch_sensor_coercion():
+    for invalid in (True, "1"):
+        state = ready_state()
+        state["domains"]["latch"]["observation"]["door_sensor"] = invalid
+
+        admission = _assess_action(motion_action(), state, {"axis": "x"})
+
+        assert admission["enabled"] is False
+        assert admission["disabled_reason"] == "Robot door is not confirmed closed and latched."
 
 
 def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_reason():

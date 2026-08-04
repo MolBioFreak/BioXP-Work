@@ -168,7 +168,7 @@ def test_startup_profiles_keep_literal_oem_xy_values_and_separate_z_recovery(mon
     assert (y["speed"], y["acc"], y["home_speed"], y["standby_current"]) == (1800, 400, 250, 20)
     assert (z["speed"], z["acc"], z["home_speed"], z["standby_current"]) == (1791, 576, 1791, 10)
     assert z["standby_current_written"] is False
-    assert "disable_right" not in x
+    assert x["disable_right"] is True
     assert "disable_left" not in x
     assert y["disable_right"] is True
     assert "disable_left" not in y
@@ -198,35 +198,37 @@ def test_motor_oem_go_home_z_uses_oem_move_left_not_linux_reversal(monkeypatch):
     monkeypatch.setattr(
         tester,
         "motor_get_position",
-        lambda board_id, motor=0: {"position": next(position_values), "board": board_id, "motor": motor},
+        lambda board_id, motor=0: {"ok": True, "ack": {"status": 100}, "position": next(position_values), "board": board_id, "motor": motor},
     )
     home_values = iter([0, 0, 0, 1, 1, 1])
     monkeypatch.setattr(
         tester,
         "motor_query_home_switch",
-        lambda board_id, motor=0: {"value": next(home_values), "board": board_id, "motor": motor},
+        lambda board_id, motor=0: {"ok": True, "ack": {"status": 100}, "value": next(home_values), "board": board_id, "motor": motor},
     )
     monkeypatch.setattr(
         tester,
         "motor_get_switch_activity",
         lambda board_id, motor=0: {"left_state": 0, "right_state": 1, "left_active": False, "right_active": True},
     )
-    monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=250, motor=0: calls.append(("move_left", board_id, motor, speed)) or {"ok": True})
-    speed_values = iter([1791, 1791])
+    monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=250, motor=0: calls.append(("move_left", board_id, motor, speed)) or {"ok": True, "ack": {"status": 100}})
+    speed_values = iter([0, 1791, 1791])
     monkeypatch.setattr(
         tester,
         "motor_get_speed",
-        lambda board_id, motor=0: {"speed": next(speed_values), "board": board_id, "motor": motor},
+        lambda board_id, motor=0: {"ack": {"status": 100}, "speed": next(speed_values), "board": board_id, "motor": motor},
     )
     monkeypatch.setattr(tester, "motor_get_switches", lambda board_id, motor=0: {"left_state": 1, "right_state": 1, "board": board_id, "motor": motor})
     monkeypatch.setattr(tester, "motor_move_right", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("OEM goHome must not use Linux-only Z reversal")))
-    monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=30.0, **kwargs: {"stopped": True, "last_speed": 0})
-    monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: calls.append(("stop", board_id, motor)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True, "readback": {"value": 0}})
+    monkeypatch.setattr(tester, "begin_bus_event_window", lambda: {"after_sequence": 7, "cleared": 0})
+    monkeypatch.setattr(tester, "collect_bus_events", lambda **kwargs: [])
+    monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=30.0, **kwargs: {"stopped": True, "last_speed": 0, "last_ack": {"status": 100}})
+    monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: calls.append(("stop", board_id, motor)) or {"ok": True, "first_delivery": {"status": 100}, "second_delivery": {"status": 100}})
+    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True, "ack": {"status": 100}, "readback": {"ack": {"status": 100}, "value": 0}})
 
     result = tester.motor_oem_go_home("z", speed=1791, rehome=False, timeout_s=1.0)
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert result["move_direction"] == "move_left"
     assert calls[0] == ("move_left", 4, 1, 1791)
     assert ("set_home", 4, 1) in calls
@@ -239,13 +241,13 @@ def test_motor_oem_axis_search_home_preserves_source_initial_sethome(monkeypatch
     calls = []
 
     monkeypatch.setattr(tester, "_motion_oem_axis_profile", lambda axis_key, startup=False: {"board": 5, "motor": 0})
-    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"value": 0, "board": board_id, "motor": motor})
+    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"ack": {"status": 100}, "value": 0, "board": board_id, "motor": motor})
     monkeypatch.setattr(
         tester,
         "motor_get_switch_activity",
         lambda board_id, motor=0: {"left_state": 0, "right_state": 1, "left_active": False, "right_active": True},
     )
-    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True})
+    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True, "ack": {"status": 100}, "readback": {"ack": {"status": 100}, "value": 0}})
     monkeypatch.setattr(
         tester,
         "motor_oem_go_home",

@@ -134,6 +134,24 @@ def test_any_command64_transition_invalidates_all_axis_profile_generations(monke
     assert driver._oem_active_board_lifecycle_generation is None
 
 
+def test_command64_observer_preserves_legacy_two_argument_callback_compatibility(monkeypatch):
+    driver = _driver()
+    observed = []
+    driver._board_activation_observer = (
+        lambda board, ack: observed.append((board, ack.get("status") if isinstance(ack, dict) else None))
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_tmcl_retry",
+        lambda board, command, cmd_type, motor, value, **kwargs: {"status": 2 if board == 7 else 100},
+    )
+
+    rows = driver.deactivate_boards(expect_reply=True, fail_fast=True)
+
+    assert set(rows) == {4, 5, 6, 7}
+    assert observed == [(4, 100), (5, 100), (6, 100), (7, 2)]
+
+
 def test_board_generation_advances_only_after_complete_deactivate_activate_cycle():
     driver = _driver()
     driver._oem_board_lifecycle_generation = 7
@@ -321,6 +339,198 @@ def test_move_z_home_is_distinct_source_method_at_1791_without_standby_write(mon
         ("get", 4, 1, 6),
         ("go_home", "z", {"speed": 1791, "rehome": True, "timeout_s": 30.0, "max_search_abs_delta": None}),
     ]
+
+
+def test_go_home_ignores_pre_window_controller_event_and_requires_exact_ack_chain(monkeypatch):
+    driver = _driver()
+    driver._oem_active_board_lifecycle_generation = 1
+    calls = []
+    positions = iter((100, 100, 50, 50, 0))
+    homes = iter((0, 0, 1, 1, 1))
+    monkeypatch.setattr(
+        driver,
+        "_motion_oem_axis_profile",
+        lambda axis: {
+            "board": 4,
+            "motor": 1,
+            "axis_min_steps": 0,
+            "axis_max_steps": 160000,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_position",
+        lambda board, *, motor: {"ok": True, "ack": _ack(), "position": next(positions)},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_query_home_switch",
+        lambda board, *, motor: {"ok": True, "ack": _ack(), "value": next(homes)},
+    )
+    monkeypatch.setattr(driver, "motor_get_switch_activity", lambda *a, **k: {"left_state": 0, "right_state": 0})
+    monkeypatch.setattr(driver, "motor_get_switches", lambda *a, **k: {"left_state": 1, "right_state": 0})
+    monkeypatch.setattr(driver, "motor_get_speed", lambda *a, **k: {"ack": _ack(), "speed": -1791})
+    monkeypatch.setattr(
+        driver,
+        "begin_bus_event_window",
+        lambda: calls.append("begin") or {"after_sequence": 7, "cleared": 1},
+    )
+    monkeypatch.setattr(
+        driver,
+        "clear_bus_event_buffer",
+        lambda: calls.append("legacy_clear") or {"after_sequence": 7, "cleared": 1},
+    )
+    monkeypatch.setattr(driver, "motor_move_left", lambda *a, **k: {"ok": True, "ack": _ack()})
+    monkeypatch.setattr(
+        driver,
+        "motor_stop",
+        lambda *a, **k: {"ok": True, "first_delivery": _ack(), "second_delivery": _ack()},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_wait_stopped",
+        lambda *a, **k: {"stopped": True, "last_speed": 0, "last_ack": _ack()},
+    )
+    monkeypatch.setattr(
+        driver,
+        "collect_bus_events",
+        lambda **kwargs: [{"board": 4, "motor": 1, "status": 130, "event_sequence": 7}],
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_set_home",
+        lambda *a, **k: {"ok": True, "ack": _ack(), "readback": {"ack": _ack(), "value": 0}},
+    )
+
+    result = driver.motor_oem_go_home(
+        "z",
+        speed=1791,
+        rehome=False,
+        timeout_s=1.0,
+        require_switch_transition=True,
+        max_search_abs_delta=None,
+    )
+
+    assert result["ok"] is True
+    assert result["controller_command_acknowledged"] is True
+    assert result["controller_terminal_state_verified"] is True
+    assert result["controller_error_events"] == []
+    assert calls == ["begin", "begin"]
+
+
+def test_already_home_short_circuit_requires_acknowledged_zero_speed(monkeypatch):
+    driver = _driver()
+    driver._oem_active_board_lifecycle_generation = 1
+    monkeypatch.setattr(
+        driver,
+        "_motion_oem_axis_profile",
+        lambda axis, startup=False: {
+            "board": 4,
+            "motor": 1,
+            "home_speed": 1791,
+            "home_search_max_abs_delta": 160000,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_position",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "position": 0},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_query_home_switch",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "value": 1},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_switch_activity",
+        lambda board, motor=0: {"left_state": 1, "right_state": 1},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_speed",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "speed": 5},
+    )
+
+    moving = driver.motor_oem_go_home("z", rehome=False, speed=1791, timeout_s=1.0)
+    assert moving["ok"] is False
+    assert moving["false_home_guard"] == "already_home_terminal_speed_not_zero"
+    assert moving["controller_home_proof_verified"] is False
+
+    monkeypatch.setattr(
+        driver,
+        "motor_get_speed",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "speed": 0},
+    )
+    stopped = driver.motor_oem_go_home("z", rehome=False, speed=1791, timeout_s=1.0)
+    assert stopped["ok"] is True
+    assert stopped["controller_terminal_state_verified"] is True
+    assert stopped["controller_home_proof_verified"] is True
+
+
+def test_z_already_home_never_promotes_gap10_right_switch_to_reference(monkeypatch):
+    driver = _driver()
+    monkeypatch.setattr(
+        driver,
+        "_motion_oem_axis_profile",
+        lambda axis, startup=False: {"board": 4, "motor": 1},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_position",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "position": 0},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_speed",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "speed": 0},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_query_home_switch",
+        lambda board, motor=0: {"ok": True, "ack": _ack(), "value": 0},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_get_switch_activity",
+        lambda board, motor=0: {"left_state": 0, "right_state": 1},
+    )
+
+    result = driver.motor_oem_axis_already_home("z")
+
+    assert result["ok"] is False
+    assert result["already_home"] is False
+    assert result["live_z_reference_active"] is False
+    assert result["z_reference_contract"]["accepted"] is False
+
+
+def test_axis_search_home_fails_before_motion_when_initial_set_home_is_unverified(monkeypatch):
+    driver = _driver()
+    monkeypatch.setattr(
+        driver,
+        "_motion_oem_axis_profile",
+        lambda axis, startup=True: {"board": 4, "motor": 1},
+    )
+    monkeypatch.setattr(
+        driver,
+        "motor_set_home",
+        lambda *a, **k: {"ok": False, "ack": {"status": 2}, "readback": None},
+    )
+    monkeypatch.setattr(driver, "motor_query_home_switch", lambda *a, **k: {"ack": _ack(), "value": 0})
+    monkeypatch.setattr(driver, "motor_get_switch_activity", lambda *a, **k: {"left_state": 0, "right_state": 0})
+    monkeypatch.setattr(
+        driver,
+        "motor_oem_go_home",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("home motion must not start")),
+    )
+
+    result = driver.motor_oem_axis_search_home(
+        "z", speed=597, timeout_s=1.0, max_search_abs_delta=160000
+    )
+
+    assert result["ok"] is False
+    assert result["failure"] == "axis_search_initial_set_home_not_verified"
+    assert result["go_home"] is None
 
 
 def test_startup_z_home_uses_existing_literal_profile_without_extra_axis_prep(monkeypatch):

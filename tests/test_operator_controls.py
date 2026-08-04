@@ -45,7 +45,7 @@ def make_app(tmp_path: Path, monkeypatch):
         calls.append(("axis_status", {"axis": axis, "verbose": verbose}))
         return {"ok": True, "axis": axis, "verbose": verbose}
 
-    @app.post("/motion/axis/home")
+    @app.post("/motion/test/home_axis")
     async def home_axis(body: dict):
         calls.append(("home_axis", body))
         return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
@@ -131,7 +131,7 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert catalog["schema_name"] == "bioxp.operator_control_catalog"
     primitive_routes = [(row["informational_method"], row["informational_path"]) for row in catalog["actions"] if row["kind"] == "primitive"]
     assert primitive_routes.count(("GET", "/motion/axis/{axis}/status")) == 1
-    assert primitive_routes.count(("POST", "/motion/axis/home")) == 1
+    assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
     assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.initialize_motors", "meta.initialize_motion"}
@@ -182,7 +182,7 @@ def test_partial_snapshot_does_not_make_unrelated_domains_block_motion(tmp_path,
 
     monkeypatch.setattr(hardware, "project", partial_project)
     catalog = TestClient(app).get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     dependencies = {row["key"]: row for row in action["dependencies"]}
     assert dependencies["canonical_snapshot"]["met"] is True
     assert dependencies["snapshot_fresh"]["met"] is True
@@ -230,7 +230,7 @@ def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_
     assert all(row["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor." for row in motor_actions)
     assert any("pipette" in row["informational_path"].lower() for row in motor_actions)
 
-    target = next(row for row in motor_actions if "/motion/axis/home" == row["informational_path"])
+    target = next(row for row in motor_actions if "/motion/test/home_axis" == row["informational_path"])
     blocked = client.post(f"/operator/actions/{target['action_id']}", json={
         "expected_generation": catalog["ownership_generation"],
         "idempotency_key": "motion-blocked-123456",
@@ -247,7 +247,7 @@ def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
     generation = catalog["ownership_generation"]
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     payload = {"expected_generation": generation, "idempotency_key": "home-axis-123456", "inputs": {"body": {"axis": "x"}}}
     response = client.post(f"/operator/actions/{action['action_id']}", json=payload)
     assert response.status_code == 200, response.text
@@ -269,7 +269,7 @@ def test_idempotent_replay_is_bound_to_ownership_generation(tmp_path, monkeypatc
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     payload = {
         "expected_generation": catalog["ownership_generation"],
         "idempotency_key": "generation-bound-replay-123",
@@ -290,7 +290,7 @@ def test_idempotent_replay_is_bound_to_ownership_generation(tmp_path, monkeypatc
 def test_motion_admission_is_recomputed_after_waiting_for_invocation_lock(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     catalog = TestClient(app).get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     original_dispatch = operator_controls._dispatch_asgi
 
     async def scenario() -> tuple[Response, Response]:
@@ -386,40 +386,55 @@ def test_catalog_preserves_inclusive_and_exclusive_numeric_bounds(tmp_path, monk
     assert inputs["number_lt"]["exclusive_maximum"] == 2.5
 
 
-def test_generic_motion_request_models_have_finite_hard_step_envelopes():
-    from bioxp.api import MoveAbsoluteRequest, MoveRelativeRequest
+def test_generic_motion_request_models_do_not_claim_z_specific_step_envelopes():
+    from bioxp.api import (
+        MoveAbsoluteRequest,
+        MoveRelativeRequest,
+        OemManualAbsoluteRequest,
+        OemManualRelativeRequest,
+        ReferenceMarkRequest,
+    )
 
     relative = MoveRelativeRequest.model_json_schema()["properties"]["steps"]
     absolute = MoveAbsoluteRequest.model_json_schema()["properties"]["position_steps"]
-    assert relative["minimum"] == -160000
-    assert relative["maximum"] == 160000
-    assert absolute["minimum"] == 0
-    assert absolute["maximum"] == 160000
+    manual_relative = OemManualRelativeRequest.model_json_schema()["properties"]["steps"]
+    manual_absolute = OemManualAbsoluteRequest.model_json_schema()["properties"]["position_steps"]
+    reference = ReferenceMarkRequest.model_json_schema()["properties"]["position_steps"]
+    for schema in (relative, absolute, manual_relative, manual_absolute, reference):
+        assert "minimum" not in schema
+        assert "maximum" not in schema
 
 
-def test_every_mutating_numeric_catalog_input_has_finite_lower_and_upper_bounds():
+def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
     from bioxp.api import app
 
     actions, _ = operator_controls._build_catalog(app)
-    missing = []
-    for action in actions:
-        if action["informational_method"] == "GET":
-            continue
-        for input_spec in action["inputs"]:
-            if input_spec["value_type"] not in {"integer", "number"}:
-                continue
-            lower = input_spec["minimum"] is not None or input_spec["exclusive_minimum"] is not None
-            upper = input_spec["maximum"] is not None or input_spec["exclusive_maximum"] is not None
-            if not (lower and upper):
-                missing.append((action["informational_path"], input_spec["wire_name"]))
-    assert missing == []
+    by_id = {action["action_id"]: action for action in actions}
+
+    relative = next(row for row in by_id["oem.z.move_steps"]["inputs"] if row["name"] == "steps")
+    absolute = next(row for row in by_id["oem.z.move_absolute"]["inputs"] if row["name"] == "position_steps")
+    assert (relative["minimum"], relative["maximum"]) == (-160000, 160000)
+    assert (absolute["minimum"], absolute["maximum"]) == (0, 160000)
+
+    generic_relative = next(
+        action for action in actions
+        if action["kind"] == "primitive" and action["informational_path"] == "/motion/oem/manual/relative"
+    )
+    generic_absolute = next(
+        action for action in actions
+        if action["kind"] == "primitive" and action["informational_path"] == "/motion/oem/manual/absolute"
+    )
+    generic_steps = next(row for row in generic_relative["inputs"] if row["name"] == "steps")
+    generic_position = next(row for row in generic_absolute["inputs"] if row["name"] == "position_steps")
+    assert generic_steps["minimum"] is None and generic_steps["maximum"] is None
+    assert generic_position["minimum"] is None and generic_position["maximum"] is None
 
 
 def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispatch(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     base = {"expected_generation": catalog["ownership_generation"], "idempotency_key": "reject-action-1234"}
     assert client.post(f"/operator/actions/{action['action_id']}", json={**base, "expected_generation": base["expected_generation"] + 1, "inputs": {"body": {}}}).status_code == 409
     assert client.post(f"/operator/actions/{action['action_id']}", json={**base, "inputs": {"wrong": 1}}).status_code == 422
@@ -441,11 +456,38 @@ def test_home_xy_meta_maps_to_one_visible_source_route(tmp_path, monkeypatch):
     assert len(response.json()["stage_receipts"]) == 2
 
 
+def test_generic_assessment_rejects_provider_owned_z_manual_home_receipt(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    BoundedReceiptStore(tmp_path).put(
+        {
+            "command_id": "operator-z-home-1",
+            "idempotency_key": "operator-z-home-1",
+            "action_id": "oem.z.manual_home",
+            "authority_receipt_id": "operator-z-home-1",
+        }
+    )
+
+    assessed = client.post(
+        "/operator/actions/receipts/operator-z-home-1/assessment",
+        json={
+            "expected_generation": 7,
+            "idempotency_key": "assessment-z-home-1",
+            "verdict": "pass",
+            "note": "Observed movement.",
+        },
+    )
+
+    assert assessed.status_code == 409
+    assert assessed.json()["detail"]["error"] == "provider_owned_z_observation_required"
+    assert assessed.json()["detail"]["replacement_action_id"] == "oem.z.observe"
+
+
 def test_human_assessment_updates_existing_receipt_and_requires_generation(tmp_path, monkeypatch):
     app, _ = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/axis/home")
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
     receipt = client.post(f"/operator/actions/{action['action_id']}", json={
         "expected_generation": catalog["ownership_generation"], "idempotency_key": "assessment-run-123", "inputs": {"body": {"axis": "x"}},
     }).json()

@@ -61,13 +61,13 @@ def test_z_oem_profile_is_literal_and_has_no_live_mask_substitution(monkeypatch)
 
 
 
-def test_z_already_home_accepts_controller_zero_gap10_live_reference(monkeypatch):
+def test_z_already_home_rejects_gap10_as_a_substitute_for_gap9(monkeypatch):
     tester = BioXpTester.__new__(BioXpTester)
     monkeypatch.setattr(tester, "motor_function_preset", lambda key: {"board": 4, "motor": 1, "speed": 1791, "acc": 576, "standby_current": 10})
     monkeypatch.setattr(tester, "_machine_config_bundle", serial_206_immutable_machine_bundle)
-    monkeypatch.setattr(tester, "motor_get_position", lambda board, motor=0: {"position": 0})
-    monkeypatch.setattr(tester, "motor_get_speed", lambda board, motor=0: {"speed": 0})
-    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board, motor=0: {"value": 0})
+    monkeypatch.setattr(tester, "motor_get_position", lambda board, motor=0: {"ack": {"status": 100}, "position": 0})
+    monkeypatch.setattr(tester, "motor_get_speed", lambda board, motor=0: {"ack": {"status": 100}, "speed": 0})
+    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board, motor=0: {"ack": {"status": 100}, "value": 0})
     monkeypatch.setattr(tester, "motor_get_switch_activity", lambda board, motor=0: {
         "right_state": 1,
         "right_raw_active": True,
@@ -79,7 +79,8 @@ def test_z_already_home_accepts_controller_zero_gap10_live_reference(monkeypatch
 
     result = tester.motor_oem_axis_already_home("z", tolerance_steps=2)
 
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["predicate_active"] is False
-    assert result["live_z_reference_active"] is True
-    assert result["z_reference_contract"]["accepted"] is True
+    assert result["live_z_reference_active"] is False
+    assert result["z_reference_contract"]["accepted"] is False
+    assert "GAP10/right is diagnostic-only" in result["z_reference_contract"]["reason"]

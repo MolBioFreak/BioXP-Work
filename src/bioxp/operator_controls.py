@@ -385,7 +385,9 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
     latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
     enclosure_ok = bool(
         isinstance(latch, Mapping)
+        and type(latch.get("door_sensor")) is int
         and latch.get("door_sensor") == 1
+        and type(latch.get("latch_sensor")) is int
         and latch.get("latch_sensor") == 1
     )
     dependencies.append(_dependency(
@@ -604,8 +606,10 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     axis_rows = axes_observation.get("rows") if isinstance(axes_observation.get("rows"), Mapping) else {}
     axes = []
     for axis, row in axis_rows.items():
-        status = row.get("status") if isinstance(row, Mapping) and isinstance(row.get("status"), Mapping) else {}
-        switches = row.get("switch_activity") if isinstance(row, Mapping) and isinstance(row.get("switch_activity"), Mapping) else {}
+        status_value = row.get("status") if isinstance(row, Mapping) else None
+        status: Mapping[str, Any] = status_value if isinstance(status_value, Mapping) else {}
+        switches_value = row.get("switch_activity") if isinstance(row, Mapping) else None
+        switches: Mapping[str, Any] = switches_value if isinstance(switches_value, Mapping) else {}
         axes.append({
             "axis": str(axis),
             "reference": ((reference_rows.get(axis) or {}).get("state") if isinstance(reference_rows.get(axis), Mapping) else "unknown") or "unknown",
@@ -615,8 +619,10 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
             "standby_current": _value(status, "standby_current"),
             "left_switch_state": switches.get("left_state"),
             "right_switch_state": switches.get("right_state"),
-            "left_switch_active": switches.get("left_raw_active"),
-            "right_switch_active": switches.get("right_raw_active"),
+            "left_switch_raw_active": switches.get("left_raw_active"),
+            "right_switch_raw_active": switches.get("right_raw_active"),
+            "left_switch_active": switches.get("left_effective_active"),
+            "right_switch_active": switches.get("right_effective_active"),
             "left_switch_disabled": switches.get("left_disabled"),
             "right_switch_disabled": switches.get("right_disabled"),
             "coordinate_contract": ((row.get("preset") or {}).get("coordinate_contract") if isinstance(row, Mapping) else None),
@@ -755,6 +761,7 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/manual/home": "initialize_motors",
     "/motion/oem/z/prepare": "initialize_motors",
     "/motion/oem/z/reconcile_switch_masks": "initialize_motors",
+    "/motion/oem/z/set_home": "initialize_motors",
     "/motion/oem/z/diagnostic_home_axis": "initialize_motors",
     "/motion/oem/z/stop": "initialize_motors",
     "/motion/oem/z/observation": "initialize_motors",
@@ -840,14 +847,30 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         if route is None:
             return
         fixed = dict(fixed_inputs or {})
-        visible_inputs = [row for row in provider.get("inputs", []) if row.get("name") not in fixed]
+        visible_inputs = [dict(row) for row in provider.get("inputs", []) if row.get("name") not in fixed]
+        z_bounds = {
+            "oem.z.move_steps": ("steps", -160000, 160000),
+            "oem.z.move_absolute": ("position_steps", 0, 160000),
+        }.get(action_id)
+        if z_bounds is not None:
+            input_name, minimum, maximum = z_bounds
+            for row in visible_inputs:
+                if row.get("name") == input_name:
+                    row.update(
+                        {
+                            "minimum": minimum,
+                            "exclusive_minimum": None,
+                            "maximum": maximum,
+                            "exclusive_maximum": None,
+                        }
+                    )
         alias = {
             **dict(provider),
             "action_id": action_id,
             "label": label,
             "description": description,
             "source_anchor": source_anchor,
-            "requires_confirmation": True,
+            "requires_confirmation": bool(provider.get("requires_confirmation", True)),
             "category": "z-axis",
             "inputs": visible_inputs,
             "required_provider_capability": required_provider_capability,
@@ -875,6 +898,15 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         description="Explicitly restore GAP12=0 and GAP13=0 after inherited Linux contamination; requires fresh Z preparation afterward.",
         source_anchor="ClassMotor param12 right-disable; param13 left-disable",
         fixed_inputs={"axis": "z"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_home",
+        path="/motion/oem/z/set_home",
+        label="Set OEM Z home at current position (no motion)",
+        description="No-motion manual home: record the current physical position as controller 0 via ClassMotor.setHome (SAP param 1 = 0) with readback and a durable reference mark.",
+        source_anchor="ClassMotor.setHome; SAP param 1 = actual position",
+        fixed_inputs={"axis": "z", "operator_ack": "SET_HOME_CURRENT_POSITION"},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -1185,6 +1217,7 @@ def install_operator_control_plane(
     by_id = {row["action_id"]: row for row in actions}
     store = BoundedReceiptStore()
     invoke_lock = asyncio.Lock()
+    interrupt_lock = asyncio.Lock()
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
 
     def machine_state() -> dict[str, Any]:
@@ -1311,6 +1344,15 @@ def install_operator_control_plane(
         row = store.by_command(command_id)
         if row is None:
             raise HTTPException(status_code=404, detail="operator action receipt not found")
+        if row.get("action_id") == "oem.z.manual_home":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "provider_owned_z_observation_required",
+                    "replacement_action_id": "oem.z.observe",
+                    "authority_receipt_id": row.get("authority_receipt_id") or command_id,
+                },
+            )
         row = dict(row)
         row["operator_assessment"] = payload.verdict
         row["operator_note"] = payload.note.strip()
@@ -1335,6 +1377,7 @@ def install_operator_control_plane(
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
         action = by_id[action_id]
+        is_safety_interrupt = action_id == "oem.z.stop"
         if action_id not in dispatch:
             assessment = _assess_action(action, machine_state(), payload.inputs)
             raise HTTPException(status_code=409, detail={"error": "action_unavailable", "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})
@@ -1345,9 +1388,70 @@ def install_operator_control_plane(
                 status_code=422,
                 detail={"error": "unknown_action_inputs", "unknown": sorted(unknown_inputs)},
             )
-        async with invoke_lock:
-            locked_state = machine_state()
-            locked_expected = int(locked_state["ownership_generation"])
+        if action_id == "oem.z.move_steps":
+            steps = payload.inputs.get("steps")
+            if type(steps) is not int or steps == 0 or not -160000 <= steps <= 160000:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "invalid_z_relative_steps",
+                        "required": "integer in [-160000, 160000], excluding 0",
+                    },
+                )
+        elif action_id == "oem.z.move_absolute":
+            position = payload.inputs.get("position_steps")
+            if type(position) is not int or not 0 <= position <= 160000:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "invalid_z_absolute_position",
+                        "required": "integer in [0, 160000]",
+                    },
+                )
+        elif action_id == "oem.z.set_home":
+            note = payload.inputs.get("note")
+            if not isinstance(note, str) or not note.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_z_set_home_note", "required": "non-empty string"},
+                )
+        elif action_id == "oem.z.observe":
+            boolean_fields = (
+                "physical_motion_observed",
+                "expected_direction_observed",
+                "home_endpoint_observed",
+                "stopped_observed",
+            )
+            invalid_boolean_fields = [
+                name for name in boolean_fields if type(payload.inputs.get(name)) is not bool
+            ]
+            command_id = payload.inputs.get("command_id")
+            verdict = payload.inputs.get("verdict")
+            note = payload.inputs.get("note")
+            if (
+                invalid_boolean_fields
+                or not isinstance(command_id, str)
+                or not command_id.strip()
+                or verdict not in {"pass", "fail"}
+                or not isinstance(note, str)
+                or len(note.strip()) < 3
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "invalid_z_observation",
+                        "invalid_boolean_fields": invalid_boolean_fields,
+                        "required": "command_id, pass/fail verdict, four booleans, and a 3+ character note",
+                    },
+                )
+        action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
+        async with action_lock:
+            locked_state = None if is_safety_interrupt else machine_state()
+            locked_expected = (
+                int(hardware_state.ownership_epoch)
+                if locked_state is None
+                else int(locked_state["ownership_generation"])
+            )
             if payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             existing = store.by_idempotency(payload.idempotency_key)
@@ -1385,7 +1489,11 @@ def install_operator_control_plane(
                 "stage_receipts": [],
             }
             store.put(receipt)
-            assessment = _assess_action(action, locked_state, effective_inputs)
+            assessment = (
+                {"enabled": True, "disabled_reason": None, "dependencies": []}
+                if is_safety_interrupt
+                else _assess_action(action, locked_state or {}, effective_inputs)
+            )
             if not assessment["enabled"]:
                 detail = {
                     "error": "action_unavailable",
@@ -1425,12 +1533,16 @@ def install_operator_control_plane(
                 bounded = _bounded_json({"http_status": status_code, "body": response}, _MAX_RESPONSE_BYTES)
                 ok = 200 <= status_code < 300 and not (isinstance(response, dict) and response.get("ok") is False)
                 stages = []
+                authority_receipt = None
+                observation_receipt = None
                 if isinstance(response, dict):
                     candidate = response.get("stage_receipts") or response.get("stages")
                     if isinstance(candidate, list):
                         stages = candidate[:128]
                     elif isinstance(candidate, dict):
                         stages = list(candidate.values())[:128]
+                    authority_receipt = response.get("authority_receipt")
+                    observation_receipt = response.get("observation_receipt")
                 receipt.update({
                     "status": "completed" if ok else "failed",
                     "remote_acknowledged": 200 <= status_code < 300,
@@ -1441,6 +1553,22 @@ def install_operator_control_plane(
                     "machine_assessment": "pass" if ok else "fail",
                     "response": bounded,
                     "error": None if ok else f"robot route returned HTTP {status_code}",
+                    "authority_receipt_id": (
+                        authority_receipt.get("command_id")
+                        if isinstance(authority_receipt, Mapping) else None
+                    ),
+                    "authority_receipt_status": (
+                        authority_receipt.get("status")
+                        if isinstance(authority_receipt, Mapping) else None
+                    ),
+                    "observation_receipt_id": (
+                        observation_receipt.get("command_id")
+                        if isinstance(observation_receipt, Mapping) else None
+                    ),
+                    "observes_command_id": (
+                        observation_receipt.get("observes_command_id")
+                        if isinstance(observation_receipt, Mapping) else None
+                    ),
                     "stage_receipts": _bounded_json(stages, _MAX_RESPONSE_BYTES),
                 })
             except asyncio.TimeoutError:

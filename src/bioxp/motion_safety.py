@@ -195,11 +195,17 @@ def prepare_motion_without_motion(
             observation = driver.deck_io_query_type(io_type)
         except Exception as exc:
             observation = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
-        observed_ok = bool(_ack_status(observation) == 100 and observation.get("value") == 1)
+        observed_value = observation.get("value") if isinstance(observation, Mapping) else None
+        observed_ok = bool(
+            isinstance(observation, Mapping)
+            and _ack_status(observation) == 100
+            and type(observed_value) is int
+            and observed_value in {0, 1}
+        )
         ledger.append(_stage(
             stage_id,
             "passed" if observed_ok else "failed",
-            f"ClassIOControl query {label} sensor read-only",
+            f"ClassIOControl query {label} sensor read-only; value is source observation, not an invented equality gate",
             observation,
         ))
         if not observed_ok:
