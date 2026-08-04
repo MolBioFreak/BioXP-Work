@@ -59,3 +59,29 @@ def test_manual_z_home_dispatches_only_provider_move_z_home_path(monkeypatch):
     assert result["ok"] is True
     assert ("manual_home", {"timeout_s": 30.0}) in calls
     assert not any(call[0] == "diagnostic_home_axis" for call in calls if isinstance(call, tuple))
+
+
+def test_z_stop_route_uses_the_safety_interrupt_lane(monkeypatch):
+    import src.bioxp.api as api
+
+    calls = []
+    tester_sentinel = object()
+
+    async def run_safety_interrupt(label, fn, *, timeout_s):
+        calls.append(("lane", label, timeout_s))
+        return fn(tester_sentinel)
+
+    def execute(intent, values=None):
+        calls.append((intent, dict(values or {})))
+        return {"ok": True, "interrupt": True}
+
+    monkeypatch.setattr(api, "_run_safety_interrupt_blocking", run_safety_interrupt)
+    monkeypatch.setattr(api, "_execute_provider_z_intent", execute)
+
+    result = asyncio.run(api.motion_oem_z_stop())
+
+    assert result == {"ok": True, "interrupt": True}
+    assert calls == [
+        ("lane", "serial-206 Z stop", 10.0),
+        ("stop", {"timeout_s": 3.0}),
+    ]

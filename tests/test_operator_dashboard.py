@@ -31,7 +31,24 @@ def machine_state(
         "domains": {
             "power": {"status": "observed", "observation": {"safety_valid": power_ready}},
             "axes": {"status": "observed", "observation": {"rows": {
-                "x": {"status": {"position": {"value": 123}, "speed": {"value": 0}, "max_current": {"value": 31}, "standby_current": {"value": 8}}, "switch_activity": {"left_raw_active": False, "right_raw_active": True}},
+                "x": {
+                    "status": {
+                        "position": {"value": 123},
+                        "speed": {"value": 0},
+                        "max_current": {"value": 31},
+                        "standby_current": {"value": 8},
+                    },
+                    "switch_activity": {
+                        "left_state": 0,
+                        "right_state": 1,
+                        "left_raw_active": False,
+                        "right_raw_active": True,
+                        "left_disabled": False,
+                        "right_disabled": True,
+                        "left_effective_active": False,
+                        "right_effective_active": False,
+                    },
+                },
             }}},
             "thermal": {"status": "observed", "observation": {"temps": {"tc_temp_c": {"value": 37000, "ok": True}, "lid_temp_c": {"temp_c": 42.125, "ok": True}, "ped_temp_c": {"value": True, "ok": True}}}},
             "chiller": {"status": "observed", "observation": {"temps": {"rc_temp_c": {"value": 12000, "ok": True}}}},
@@ -265,14 +282,23 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         "oem.z.move_absolute": ["position_steps"],
         "oem.z.prepare": [],
         "oem.z.reconcile_switch_masks": ["confirm"],
+        "oem.z.set_home": ["note"],
         "oem.z.diagnostic_home_axis": [],
         "oem.z.stop": [],
-        "oem.z.observe": ["command_id", "verdict", "note"],
+        "oem.z.observe": [
+            "command_id",
+            "verdict",
+            "physical_motion_observed",
+            "expected_direction_observed",
+            "home_endpoint_observed",
+            "stopped_observed",
+            "note",
+        ],
     }
     for action_id, input_names in required.items():
         assert action_id in by_id
         assert [row["name"] for row in by_id[action_id]["inputs"]] == input_names
-        assert by_id[action_id]["requires_confirmation"] is True
+        assert by_id[action_id]["requires_confirmation"] is (action_id != "oem.z.stop")
         assert by_id[action_id]["required_provider_capability"] == "initialize_motors"
         assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
@@ -297,10 +323,11 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     } == {
         "axis": "x", "reference": "referenced", "position_steps": 123, "speed_steps_s": 0,
         "run_current": 31, "standby_current": 8, "left_switch_active": False,
-        "right_switch_active": True, "motor_temperature_c": None,
+        "right_switch_active": False, "motor_temperature_c": None,
         "motor_temperature_available": False,
     }
-    assert {"left_switch_state", "right_switch_state", "left_switch_disabled", "right_switch_disabled", "coordinate_contract", "min_steps", "max_steps"} <= set(axis)
+    assert axis["right_switch_raw_active"] is True
+    assert {"left_switch_state", "right_switch_state", "left_switch_raw_active", "right_switch_raw_active", "left_switch_disabled", "right_switch_disabled", "coordinate_contract", "min_steps", "max_steps"} <= set(axis)
     assert dashboard["z_axis"]["authority"] == "Serial206OemInitializationProvider"
     assert dashboard["temperatures"] == [
         {"sensor": "tc_temp_c", "label": "Thermal cycler block", "unit": "°C", "temperature_c": 37.0, "available": True},
@@ -311,6 +338,48 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     assert len(dashboard["pipettes"]["channels"]) == 4
     assert dashboard["pipettes"]["channels"][0]["tip_loaded"] is True
     assert dashboard["snapshot"]["collection_triggered"] is False
+
+
+def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state():
+    from bioxp import api
+
+    values = {1: 123, 3: 0, 6: 31, 7: 8, 9: 0, 10: 1, 12: 1, 13: 0}
+
+    class Tester:
+        MOTOR_SWITCH_ACTIVE_VALUE = 1
+
+        @staticmethod
+        def _motion_oem_axis_profile(axis):
+            return {
+                "board": 4,
+                "motor": 1,
+                "axis_min_steps": 0,
+                "axis_max_steps": 160000,
+                "coordinate_contract": "oem_source_nonnegative_z",
+            }
+
+        @staticmethod
+        def query_only_tmcl(board, command, cmd_type, motor, value):
+            return {"status": 100, "value": values[cmd_type]}
+
+    row = api._query_axis_for_snapshot(Tester(), api.AxisName.Z)
+
+    assert row["switch_activity"] == {
+        "left_state": 0,
+        "right_state": 1,
+        "left_raw_active": False,
+        "right_raw_active": True,
+        "left_disabled": False,
+        "right_disabled": True,
+        "left_effective_active": False,
+        "right_effective_active": False,
+    }
+    state = machine_state(motion_enabled=True, z="referenced")
+    state["domains"]["axes"]["observation"]["rows"] = {"z": row}
+    z = _dashboard_payload(state)["axes"][0]
+    assert z["right_switch_state"] == 1
+    assert z["right_switch_raw_active"] is True
+    assert z["right_switch_active"] is False
 
 
 def test_dashboard_reports_active_motion_independently_from_homing_and_uses_live_latch_evidence():

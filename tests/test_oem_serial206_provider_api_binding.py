@@ -38,12 +38,43 @@ class PartialProvider:
         return {"ok": True, "z_state": "referenced_ready"}
 
 
+def test_z_set_home_requires_explicit_current_position_confirmation():
+    assert set(api.OemZSetHomeRequest.model_fields) == {"operator_ack", "note"}
+    with pytest.raises(ValidationError):
+        api.OemZSetHomeRequest(operator_ack="SET_HOME", note="Confirm")
+    with pytest.raises(ValidationError):
+        api.OemZSetHomeRequest(
+            operator_ack="SET_HOME_CURRENT_POSITION",
+            note="   ",
+        )
+
+
 def test_z_observation_request_is_strict():
-    assert set(api.OemZObservationRequest.model_fields) == {"command_id", "verdict", "note"}
+    expected = {
+        "command_id",
+        "verdict",
+        "physical_motion_observed",
+        "expected_direction_observed",
+        "home_endpoint_observed",
+        "stopped_observed",
+        "note",
+    }
+    assert set(api.OemZObservationRequest.model_fields) == expected
+    base = {
+        "command_id": "z-1",
+        "verdict": "pass",
+        "physical_motion_observed": True,
+        "expected_direction_observed": True,
+        "home_endpoint_observed": True,
+        "stopped_observed": True,
+        "note": "Observed",
+    }
     with pytest.raises(ValidationError):
-        api.OemZObservationRequest(command_id="z-1", verdict=True, note="Observed")
+        api.OemZObservationRequest(**{**base, "verdict": True})
     with pytest.raises(ValidationError):
-        api.OemZObservationRequest(command_id="z-1", verdict="pass", note="   ")
+        api.OemZObservationRequest(**{**base, "physical_motion_observed": 1})
+    with pytest.raises(ValidationError):
+        api.OemZObservationRequest(**{**base, "note": "   "})
 
 
 def test_provider_status_is_truthful_for_unbound_and_partial_provider(monkeypatch):
@@ -56,6 +87,31 @@ def test_provider_status_is_truthful_for_unbound_and_partial_provider(monkeypatc
     assert partial["bound"] is True
     assert partial["initialize_motors_live_available"] is True
     assert partial["z_authority"]["state"] == "prepared_unreferenced"
+
+
+def test_liquid_preflight_requires_provider_z_lifecycle_authority(monkeypatch):
+    class References:
+        @staticmethod
+        def snapshot(axes):
+            return {"rows": {axis: {"state": "referenced"} for axis in axes}}
+
+    class Provider:
+        @staticmethod
+        def z_projection():
+            return {
+                "available": True,
+                "state": "executing",
+                "reference_state": "referenced",
+                "board_lifecycle_generation_fresh": True,
+            }
+
+    monkeypatch.setattr(api, "_reference_state_store", References())
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", Provider())
+
+    with pytest.raises(api.PipettePreflightError) as exc:
+        api._liquid_reference_preflight("aspirate")
+
+    assert "serial206_z_lifecycle_not_referenced_ready" in exc.value.details["authority_blockers"]
 
 
 def test_z_mutations_are_rejected_outside_operator_dispatch_context(monkeypatch):
@@ -82,7 +138,7 @@ def test_operator_dispatch_context_reaches_provider_with_generation_and_idempote
 
     assert result["ok"] is True
     assert provider.z_calls == [("move_steps", {
-        "inputs": {"steps": 10},
+        "inputs": {"steps": 10, "command_id": "operator-1"},
         "expected_generation": 11,
         "idempotency_key": "idem-1",
     })]

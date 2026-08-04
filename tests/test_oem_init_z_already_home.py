@@ -1,3 +1,5 @@
+import pytest
+
 from src.bioxp.usb_driver import BioXpTester
 from support_oem_machine_bundle import serial_206_immutable_machine_bundle
 
@@ -19,15 +21,15 @@ class FakeTester(BioXpTester):
 
     def motor_get_position(self, board, motor=0):
         self.calls.append(("pos", board, motor))
-        return {"position": self.position}
+        return {"ack": {"status": 100}, "position": self.position}
 
     def motor_get_speed(self, board, motor=0):
         self.calls.append(("speed", board, motor))
-        return {"speed": self.speed}
+        return {"ack": {"status": 100}, "speed": self.speed}
 
     def motor_query_home_switch(self, board, motor=0):
         self.calls.append(("home", board, motor))
-        return {"value": self.home, "ok": True}
+        return {"ack": {"status": 100}, "value": self.home, "ok": True}
 
     def motor_get_switch_activity(self, board, motor=0):
         self.calls.append(("switches", board, motor))
@@ -83,11 +85,10 @@ def test_startup_homing_mimic_does_not_skip_literal_z_axis_search_when_near_refe
 
     tester = StartupTester(position=-1, speed=0, home=1)
 
-    result = tester.motor_startup_homing_mimic()
+    with pytest.raises(RuntimeError, match="retired duplicate startup authority"):
+        tester.motor_startup_homing_mimic()
 
-    assert result["aborted_at"] == "z_home"
-    assert ("searched_home", "z", True) in tester.calls
-    assert not any(call[0] == "z_clear" for call in tester.calls)
+    assert tester.calls == []
 
 
 def test_startup_homing_mimic_uses_literal_z_axis_search_not_coordinate_recovery():
@@ -119,9 +120,7 @@ def test_startup_homing_mimic_uses_literal_z_axis_search_not_coordinate_recovery
 
     tester = StartupTester(position=-100, speed=0, home=0)
 
-    result = tester.motor_startup_homing_mimic()
+    with pytest.raises(RuntimeError, match="retired duplicate startup authority"):
+        tester.motor_startup_homing_mimic()
 
-    assert result["aborted_at"] == "z_clear_for_xy"
-    assert result["z_reference_return"] is None
-    assert result["z_reference_verify_after_return"] is None
-    assert ("searched_home", "z", True, None) in tester.calls
+    assert tester.calls == []

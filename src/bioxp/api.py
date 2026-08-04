@@ -733,9 +733,11 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     execute = getattr(provider, "execute_z_intent", None)
     if not callable(execute):
         raise HTTPException(status_code=409, detail={"error": "serial206_z_authority_not_bound"})
+    provider_inputs = dict(inputs or {})
+    provider_inputs["command_id"] = str(context["operator_command_id"])
     result = execute(
         intent,
-        inputs=dict(inputs or {}),
+        inputs=provider_inputs,
         expected_generation=int(context["expected_ownership_generation"]),
         idempotency_key=str(context["idempotency_key"]),
     )
@@ -1197,7 +1199,7 @@ class OemManualRelativeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     axis: Literal["x", "y", "z", "g"]
-    steps: int = Field(..., ge=-160000, le=160000)
+    steps: int
 
 
 class OemManualHomeRequest(BaseModel):
@@ -1228,12 +1230,28 @@ class OemManualAbsoluteRequest(BaseModel):
     wait_timeout_s: float = Field(default=20.0, ge=0.5, le=60.0)
 
 
-class OemZObservationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class OemZSetHomeRequest(BaseModel):
+    operator_ack: Literal["SET_HOME_CURRENT_POSITION"]
+    note: StrictStr = Field(..., min_length=1, max_length=240)
 
-    command_id: str = Field(min_length=1, max_length=128)
+    @field_validator("note")
+    @classmethod
+    def _note_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("note must not be blank")
+        return value.strip()
+
+
+class OemZObservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: StrictStr = Field(min_length=1, max_length=128)
     verdict: Literal["pass", "fail"]
-    note: str = Field(min_length=3, max_length=1000)
+    physical_motion_observed: StrictBool
+    expected_direction_observed: StrictBool
+    home_endpoint_observed: StrictBool
+    stopped_observed: StrictBool
+    note: StrictStr = Field(min_length=3, max_length=1000)
 
     @field_validator("command_id", "note")
     @classmethod
@@ -1307,19 +1325,38 @@ def _liquid_reference_preflight(operation: str, command: Any | None = None) -> d
         row = rows.get(axis_key, {}) if isinstance(rows, dict) else {}
         if not isinstance(row, dict) or row.get("state") != "referenced":
             missing_axes.append(axis_key)
+    provider = _serial206_oem_initialization_provider
+    projection_fn = getattr(provider, "z_projection", None) if provider is not None else None
+    z_authority = None
+    if callable(projection_fn):
+        try:
+            z_authority = projection_fn()
+        except Exception as exc:
+            z_authority = {"available": False, "failure": f"{type(exc).__name__}: {exc}"}
+    authority_blockers = []
+    if not (
+        isinstance(z_authority, Mapping)
+        and z_authority.get("available") is True
+        and z_authority.get("state") == "referenced_ready"
+        and z_authority.get("reference_state") == "referenced"
+        and z_authority.get("board_lifecycle_generation_fresh") is True
+    ):
+        authority_blockers.append("serial206_z_lifecycle_not_referenced_ready")
     requested = command.to_payload() if hasattr(command, "to_payload") else None
     payload = {
-        "ok": not missing_axes,
+        "ok": not missing_axes and not authority_blockers,
         "operation": str(operation),
         "required_reference_axes": [axis.value for axis in _LIQUID_REQUIRED_REFERENCE_AXES],
         "missing_reference_axes": missing_axes,
+        "authority_blockers": authority_blockers,
+        "serial206_z_authority": z_authority,
         "reference_snapshot": snapshot,
         "hardware_truth_required": True,
         "requested": requested,
     }
-    if missing_axes:
+    if missing_axes or authority_blockers:
         raise PipettePreflightError(
-            "Liquid operation requires referenced x/y/z axes before hardware pipetting.",
+            "Liquid operation requires referenced x/y/z axes and current provider-owned Z authority before hardware pipetting.",
             details=payload,
         )
     return payload
@@ -1366,9 +1403,7 @@ class MoveRelativeRequest(MotionArtifactRequest):
     axis: AxisName
     steps: int = Field(
         ...,
-        ge=-160000,
-        le=160000,
-        description="Relative target in motor steps. Hard envelope only; immutable serial-206 per-axis limits are enforced downstream.",
+        description="Relative target in motor steps. Axis-specific limits are enforced by the selected robot-owned motion provider.",
     )
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
     speed: Optional[int] = Field(
@@ -1396,9 +1431,7 @@ class MoveAbsoluteRequest(MotionArtifactRequest):
     axis: AxisName
     position_steps: int = Field(
         ...,
-        ge=0,
-        le=160000,
-        description="Absolute target in motor steps. Hard envelope only; immutable serial-206 per-axis limits are enforced downstream.",
+        description="Absolute target in motor steps. Axis-specific limits are enforced by the selected robot-owned motion provider.",
     )
     wait_timeout_s: float = Field(12.0, gt=0.1, le=60.0)
     speed: Optional[int] = Field(
@@ -1437,7 +1470,7 @@ class MoveAxisZeroRequest(MotionArtifactRequest):
 
 class ReferenceMarkRequest(BaseModel):
     axis: AxisName
-    position_steps: int = Field(0, ge=-160000, le=160000, description="Controller position to treat as the trusted reference origin within the serial-206 hard travel envelope.")
+    position_steps: int = Field(0, description="Controller position to treat as the trusted reference origin; axis-specific authority validates the coordinate.")
     source: str = Field("manual", max_length=120)
     note: Optional[str] = Field(None, max_length=2000)
 
@@ -3852,9 +3885,13 @@ def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, A
     board, motor = int(preset["board"]), int(preset["motor"])
     params = {param: _query_motor(tester, board, 6, param, motor) for param in (1, 3, 6, 7, 9, 10, 12, 13)}
     left, right = params[9]["value"], params[10]["value"]
-    left_disabled = None if params[13]["value"] is None else bool(int(params[13]["value"]) != 0)
-    right_disabled = None if params[12]["value"] is None else bool(int(params[12]["value"]) != 0)
+    left_state = int(left) if type(left) is int else None
+    right_state = int(right) if type(right) is int else None
+    left_disabled = None if type(params[13]["value"]) is not int else bool(int(params[13]["value"]) != 0)
+    right_disabled = None if type(params[12]["value"]) is not int else bool(int(params[12]["value"]) != 0)
     active = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
+    left_raw_active = None if left_state is None else left_state == active
+    right_raw_active = None if right_state is None else right_state == active
     return {
         "axis": axis.value,
         "preset": preset,
@@ -3868,10 +3905,14 @@ def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, A
             "switches": {"left": params[9], "right": params[10], "right_disable": params[12], "left_disable": params[13]},
         },
         "switch_activity": {
-            "left_raw_active": None if left is None else int(left) == active,
-            "right_raw_active": None if right is None else int(right) == active,
+            "left_state": left_state,
+            "right_state": right_state,
+            "left_raw_active": left_raw_active,
+            "right_raw_active": right_raw_active,
             "left_disabled": left_disabled,
             "right_disabled": right_disabled,
+            "left_effective_active": None if left_raw_active is None or left_disabled is None else (left_raw_active and not left_disabled),
+            "right_effective_active": None if right_raw_active is None or right_disabled is None else (right_raw_active and not right_disabled),
         },
     }
 
@@ -6446,9 +6487,9 @@ async def motion_oem_z_diagnostic_home_axis(req: OemZDiagnosticHomeRequest):
 
 @app.post("/motion/oem/z/stop")
 async def motion_oem_z_stop():
-    return await _run_blocking(
+    return await _run_safety_interrupt_blocking(
         "serial-206 Z stop",
-        lambda: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
+        lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
         timeout_s=10.0,
     )
 
@@ -6465,7 +6506,12 @@ async def motion_oem_z_observation(req: OemZObservationRequest):
     try:
         return record(
             command_id=req.command_id,
+            observation_command_id=str(context["operator_command_id"]),
             verdict=req.verdict,
+            physical_motion_observed=req.physical_motion_observed,
+            expected_direction_observed=req.expected_direction_observed,
+            home_endpoint_observed=req.home_endpoint_observed,
+            stopped_observed=req.stopped_observed,
             note=req.note,
             expected_generation=int(context["expected_ownership_generation"]),
         )
@@ -6474,10 +6520,13 @@ async def motion_oem_z_observation(req: OemZObservationRequest):
 
 
 @app.post("/motion/oem/z/set_home")
-async def motion_oem_z_set_home():
+async def motion_oem_z_set_home(req: OemZSetHomeRequest):
     return await _run_blocking(
         "serial-206 Z manual set-home (no motion)",
-        lambda: _execute_provider_z_intent("set_home"),
+        lambda: _execute_provider_z_intent(
+            "set_home",
+            {"operator_ack": req.operator_ack, "note": req.note},
+        ),
         timeout_s=60.0,
     )
 
