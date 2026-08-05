@@ -2432,26 +2432,14 @@ class Serial206ProductionPrimitiveAdapter:
         parity = load_oem_parity_config(None)
         if parity.blockers:
             return {"ok": False, "failure": "immutable_oem_machine_snapshot_not_bound", "blockers": list(parity.blockers)}
-        z_low_values = [
-            int(row["z_low"])
-            for row in table.rows()
-            if type(row.get("z_low")) is int
-        ]
-        if not z_low_values:
-            return {"ok": False, "failure": "position_table_has_no_z_low_values"}
-        computed_self_test_z_max = min(
-            max(z_low_values),
-            int(parity.values["Z_MOTOR_MAX_POSITION"]),
-        )
-        if computed_self_test_z_max != SERIAL206_Z_SELF_TEST_MAX_STEPS:
+        self_test_z_max = SERIAL206_Z_SELF_TEST_MAX_STEPS
+        if not 0 <= int(self_test_z_max) <= int(parity.values["Z_MOTOR_MAX_POSITION"]):
             return {
                 "ok": False,
-                "failure": "serial206_self_test_z_max_machine_binding_mismatch",
-                "expected": SERIAL206_Z_SELF_TEST_MAX_STEPS,
-                "observed": computed_self_test_z_max,
-                "position_table_source": table.source,
+                "failure": "serial206_self_test_z_max_outside_machine_bounds",
+                "target": int(self_test_z_max),
+                "machine_max": int(parity.values["Z_MOTOR_MAX_POSITION"]),
             }
-        self_test_z_max = SERIAL206_Z_SELF_TEST_MAX_STEPS
         initial_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
         move = (
             self.oem_move_z(

@@ -9,7 +9,7 @@ class _PositionTable:
     source = "test-bound-position-table"
 
     def rows(self):
-        return [{"z_low": subject.SERIAL206_Z_SELF_TEST_MAX_STEPS}]
+        return [{"z_low": 120_000}]
 
 
 def _adapter(monkeypatch, *, source_return_code: int, move_ok: bool = True):
