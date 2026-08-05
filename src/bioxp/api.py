@@ -1281,14 +1281,6 @@ class OemManualAbsoluteRequest(BaseModel):
 
 class OemZSetHomeRequest(BaseModel):
     operator_ack: Literal["SET_HOME_CURRENT_POSITION"] = "SET_HOME_CURRENT_POSITION"
-    note: StrictStr = Field(..., min_length=1, max_length=240)
-
-    @field_validator("note")
-    @classmethod
-    def _note_not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("note must not be blank")
-        return value.strip()
 
 
 class OemZObservationRequest(BaseModel):
@@ -6683,7 +6675,7 @@ async def motion_oem_z_set_home(req: OemZSetHomeRequest):
         "serial-206 Z manual set-home (no motion)",
         lambda: _execute_provider_z_intent(
             "set_home",
-            {"operator_ack": req.operator_ack, "note": req.note},
+            {"operator_ack": req.operator_ack},
         ),
         timeout_s=60.0,
     )

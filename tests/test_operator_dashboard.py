@@ -284,7 +284,7 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         "oem.z.move_absolute": ["position_steps"],
         "oem.z.prepare": [],
         "oem.z.reconcile_switch_masks": ["confirm"],
-        "oem.z.set_home": ["note"],
+        "oem.z.set_home": [],
         "oem.z.diagnostic_home_axis": [],
         "oem.z.stop": [],
         "oem.z.observe": [
