@@ -461,6 +461,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "oem.z.manual_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.z.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
             "oem.z.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
+            "oem.z.resume_after_abort": {"failed_latched"},
             "oem.z.move_steps": {"referenced_ready"},
             "oem.z.move_absolute": {"referenced_ready"},
             "oem.z.observe": {"awaiting_operator_observation"},
@@ -505,7 +506,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         ))
 
     if source_initializer or safety == "motion" or _motor_motion_action(action):
-        z_state_establishing = _z_no_motion_state_action(action)
+        z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
         readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
