@@ -6670,12 +6670,13 @@ async def motion_oem_z_observation(req: OemZObservationRequest):
 
 
 @app.post("/motion/oem/z/set_home")
-async def motion_oem_z_set_home(req: OemZSetHomeRequest):
+async def motion_oem_z_set_home(req: OemZSetHomeRequest | None = None):
+    request = req or OemZSetHomeRequest()
     return await _run_blocking(
         "serial-206 Z manual set-home (no motion)",
         lambda: _execute_provider_z_intent(
             "set_home",
-            {"operator_ack": req.operator_ack},
+            {"operator_ack": request.operator_ack},
         ),
         timeout_s=60.0,
     )
