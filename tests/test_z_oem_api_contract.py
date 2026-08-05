@@ -30,8 +30,7 @@ def test_diagnostic_home_stays_separate_without_non_oem_confirmation_gate(monkey
     monkeypatch.setattr(api, "_run_blocking", run_blocking)
     monkeypatch.setattr(api, "_execute_provider_z_intent", execute)
 
-    request = api.OemZDiagnosticHomeRequest()
-    result = asyncio.run(api.motion_oem_z_diagnostic_home_axis(request))
+    result = asyncio.run(api.motion_oem_z_diagnostic_home_axis())
 
     assert result["ok"] is True
     assert ("diagnostic_home_axis", {"timeout_s": 30.0}) in calls

@@ -6609,7 +6609,7 @@ async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
 
 
 @app.post("/motion/oem/z/diagnostic_home_axis")
-async def motion_oem_z_diagnostic_home_axis(req: OemZDiagnosticHomeRequest):
+async def motion_oem_z_diagnostic_home_axis():
     return await _run_blocking(
         "serial-206 diagnostic HomeAxis z",
         lambda: _execute_provider_z_intent(
@@ -6630,7 +6630,7 @@ async def motion_oem_z_stop():
 
 
 @app.post("/motion/oem/z/abort")
-async def motion_oem_z_abort(req: OemZAbortRequest):
+async def motion_oem_z_abort():
     return await _run_safety_interrupt_blocking(
         "serial-206 Z abort",
         lambda _tester: _execute_provider_z_intent(

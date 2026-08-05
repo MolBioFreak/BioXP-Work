@@ -1105,7 +1105,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="Diagnostic Z HomeAxis (597)",
         description="Diagnostic-only HomeAxis(\"z\") at 597; never presented as manual or startup home.",
         source_anchor="ClassControlInterface.HomeAxis:4997-5052",
-        fixed_inputs={"axis": "z", "body": {}},
+        fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -1123,7 +1123,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="OEM full-machine forceAbortMotion",
         description="From the Z recovery controls, invoke OEM forceAbortMotion across every present motor board, then verify Z terminal zero speed. This is not Z-only.",
         source_anchor="ClassControlInterface.forceAbortMotion:5095-5121",
-        fixed_inputs={"body": {}},
+        fixed_inputs={},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
