@@ -6407,6 +6407,75 @@ class BioXpTester:
         out["home"] = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
         return finish()
 
+    def motor_oem_move_gz(self, *, gripper_position, z_position, timeout_s=5.0):
+        """Literal ``ClassControlInterface.moveGZ`` with controller proof."""
+        z_raw = self._motion_oem_axis_profile("z", startup=False)
+        g_raw = self._motion_oem_axis_profile("g", startup=False)
+        if not isinstance(z_raw, dict) or not isinstance(g_raw, dict):
+            raise RuntimeError("moveGZ requires bound Z/G axis profiles")
+        z_profile = dict(z_raw)
+        g_profile = dict(g_raw)
+        if not self._oem_board_present(int(z_profile["board"])):
+            return {
+                "ok": True,
+                "source_noop": "z_board_null",
+                "source_anchor": "ClassControlInterface.cs:4369-4399",
+            }
+        g_board, g_motor = int(g_profile["board"]), int(g_profile["motor"])
+        z_board, z_motor = int(z_profile["board"]), int(z_profile["motor"])
+        g_target, z_target = int(gripper_position), int(z_position)
+        g_move = self.motor_move_absolute(g_board, g_target, motor=g_motor)
+        z_move = self.motor_move_absolute(z_board, z_target, motor=z_motor)
+        time.sleep(0.005)
+        bounded_timeout = min(max(float(timeout_s), 0.5), 5.0)
+        g_wait = self.motor_wait_stopped(
+            g_board,
+            motor=g_motor,
+            timeout_s=bounded_timeout,
+            require_seen_nonzero=True,
+            target_position=g_target,
+        )
+        z_wait = self.motor_wait_stopped(
+            z_board,
+            motor=z_motor,
+            timeout_s=bounded_timeout,
+            require_seen_nonzero=True,
+            target_position=z_target,
+        )
+        g_after = self.motor_get_position(g_board, motor=g_motor)
+        z_after = self.motor_get_position(z_board, motor=z_motor)
+        g_speed = self.motor_get_speed(g_board, motor=g_motor)
+        z_speed = self.motor_get_speed(z_board, motor=z_motor)
+        ok = bool(
+            isinstance(g_move, Mapping) and g_move.get("ok") is True and self._tmcl_success(g_move.get("ack"))
+            and isinstance(z_move, Mapping) and z_move.get("ok") is True and self._tmcl_success(z_move.get("ack"))
+            and isinstance(g_wait, Mapping) and g_wait.get("stopped") is True
+            and isinstance(z_wait, Mapping) and z_wait.get("stopped") is True
+            and isinstance(g_after, Mapping) and g_after.get("ok") is True and g_after.get("position") == g_target
+            and isinstance(z_after, Mapping) and z_after.get("ok") is True and z_after.get("position") == z_target
+            and isinstance(g_speed, Mapping) and g_speed.get("speed") == 0
+            and isinstance(z_speed, Mapping) and z_speed.get("speed") == 0
+        )
+        return {
+            "ok": ok,
+            "source_method": "ClassControlInterface.moveGZ",
+            "source_anchor": "ClassControlInterface.cs:4369-4399",
+            "gripper_move": g_move,
+            "z_move": z_move,
+            "gripper_wait": g_wait,
+            "z_wait": z_wait,
+            "gripper_after": g_after,
+            "z_after": z_after,
+            "gripper_speed_after": g_speed,
+            "z_speed_after": z_speed,
+            "controller_command_acknowledged": bool(
+                isinstance(g_move, Mapping) and g_move.get("ok") is True
+                and isinstance(z_move, Mapping) and z_move.get("ok") is True
+            ),
+            "controller_terminal_state_verified": ok,
+            "failure": None if ok else "move_gz_controller_evidence_unverified",
+        }
+
     def motor_oem_home_gz(
         self,
         *,

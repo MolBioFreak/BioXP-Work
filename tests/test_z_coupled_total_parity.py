@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from src.bioxp import oem_serial206_initialization as subject
+from src.bioxp.usb_driver import BioXpTester
 
 
 class _HomeGZTester:
@@ -70,3 +71,38 @@ def test_pipette_methods_keep_exact_source_names_and_targets(monkeypatch):
     assert lift["source_method"] == "ClassControlInterface.liftPipette"
     assert lift["target_position_steps"] == 200
     assert calls == [("z", 5030, True), ("z", 200, True)]
+
+
+def test_production_move_gz_sends_both_nonwaiting_targets_and_verifies_terminal_state():
+    driver = object.__new__(BioXpTester)
+    targets = {}
+    driver._motion_oem_axis_profile = lambda axis, startup=False: {  # type: ignore[method-assign]
+        "board": 4,
+        "motor": 1 if axis == "z" else 0,
+    }
+    driver._oem_board_present = lambda board: True  # type: ignore[method-assign]
+    def move(board, position, *, motor=0):
+        targets[motor] = position
+        return {"ok": True, "ack": {"status": 100}}
+    driver.motor_move_absolute = move  # type: ignore[method-assign]
+    driver.motor_wait_stopped = lambda board, *, motor=0, target_position=None, **kwargs: {  # type: ignore[method-assign]
+        "stopped": True,
+        "last_speed": 0,
+        "last_ack": {"status": 100},
+        "target_reached": targets[motor] == target_position,
+    }
+    driver.motor_get_position = lambda board, *, motor=0: {  # type: ignore[method-assign]
+        "ok": True,
+        "ack": {"status": 100},
+        "position": targets[motor],
+    }
+    driver.motor_get_speed = lambda board, *, motor=0: {  # type: ignore[method-assign]
+        "ok": True,
+        "ack": {"status": 100},
+        "speed": 0,
+    }
+
+    result = driver.motor_oem_move_gz(gripper_position=27350, z_position=65000)
+
+    assert result["ok"] is True
+    assert targets == {0: 27350, 1: 65000}
