@@ -134,6 +134,7 @@ _HOME_STAGE_AXIS = {
 _STATE_SCHEMA = "bioxp.serial206_oem_initialization_state.v2"
 _MOTION_LEDGER_SCHEMA = "bioxp.serial206_initializeMotion_ledger.v2"
 _Z_LIFECYCLE_SCHEMA = "bioxp.serial206_z_lifecycle.v2"
+SERIAL206_Z_SELF_TEST_MAX_STEPS = 92049
 _LEGACY_Z_LIFECYCLE_SCHEMAS = frozenset({"bioxp.serial206_z_lifecycle.v1"})
 _INITIALIZE_MOTION_PARTIAL = (
     "initializeMotion.queryTipStatus.initial",
@@ -320,6 +321,10 @@ class Serial206ProductionPrimitiveAdapter:
         self.reference_store = reference_store
         self._last_tip_channels: list[int] | None = None
         self._pending_move_position_before: Any = None
+        # These source methods intentionally mutate the active Z profile. Keep
+        # their verified values bound to this process/board lifecycle so later
+        # source commands validate the profile they actually inherit.
+        self._z_profile_overrides: dict[int, int] = {}
 
     def capability_status(self) -> dict[str, Any]:
         blockers = [f"mandatory_primitive_not_bound:{name}" for name in self._MOTOR_METHODS if not callable(getattr(self.tester, name, None))]
@@ -702,11 +707,105 @@ class Serial206ProductionPrimitiveAdapter:
         profile = dict(self.tester._motion_oem_axis_profile("z"))
         if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
             raise RuntimeError("serial-206 Z authority must resolve to board 4 motor 1")
-        self.tester.motor_oem_require_no_motion_profile("z")
+        self.tester.motor_oem_require_no_motion_profile(
+            "z", expected_overrides=dict(self._z_profile_overrides)
+        )
         interlock = self.tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, Mapping) or interlock.get("ok") is not True:
             raise RuntimeError(f"serial-206 Z interlock failed: {interlock}")
         return profile
+
+    def _z_set_profile_parameter(
+        self,
+        *,
+        param: int,
+        value: int,
+        intent: str,
+        source_method: str,
+    ) -> dict[str, Any]:
+        profile = self._z_profile()
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        write = self.tester.motor_set_axis_param(board, int(param), int(value), motor=motor)
+        readback = self.tester.motor_get_axis_param(board, int(param), motor=motor)
+        acknowledged = bool(
+            isinstance(write, Mapping)
+            and write.get("ok") is True
+            and self._z_tmcl_success(write.get("ack"))
+        )
+        verified = bool(
+            acknowledged
+            and self._z_tmcl_success(readback.get("ack") if isinstance(readback, Mapping) else None)
+            and self._z_value(readback) == int(value)
+        )
+        if verified:
+            self._z_profile_overrides[int(param)] = int(value)
+        return {
+            "ok": verified,
+            "intent": intent,
+            "source_method": source_method,
+            "source_anchor": "ClassControlInterface.cs:4835-4867",
+            "board": board,
+            "motor": motor,
+            "param": int(param),
+            "value": int(value),
+            "write": _json_safe(write),
+            "readback": _json_safe(readback),
+            "controller_command_acknowledged": acknowledged,
+            "controller_terminal_state_verified": verified,
+            "physical_motion": False,
+            "physical_effect_verified": False,
+            "failure": None if verified else "z_profile_parameter_readback_mismatch",
+        }
+
+    def z_set_max_speed(self, value: int = 1791) -> dict[str, Any]:
+        selected = 1791 if int(value) == 0 else int(value)
+        return self._z_set_profile_parameter(
+            param=4,
+            value=selected,
+            intent="set_max_speed",
+            source_method="ClassControlInterface.setMaxSpeed(z)",
+        )
+
+    def z_set_max_acc(self, value: int = 576) -> dict[str, Any]:
+        selected = 576 if int(value) == 0 else int(value)
+        return self._z_set_profile_parameter(
+            param=5,
+            value=selected,
+            intent="set_max_acc",
+            source_method="ClassControlInterface.setMaxAcc(z)",
+        )
+
+    def z_set_vmax(self, value: int = 0) -> dict[str, Any]:
+        selected = 1791 if int(value) == 0 else int(value)
+        return self._z_set_profile_parameter(
+            param=4,
+            value=selected,
+            intent="set_vmax",
+            source_method="ClassControlInterface.setZaxisVmax",
+        )
+
+    def z_set_current_max(self, value: int | None = None) -> dict[str, Any]:
+        profile = self._z_profile()
+        source_value = 100 if value is None else int(value)
+        selected = int(profile["down_current"]) if source_value == 100 else source_value
+        return self._z_set_profile_parameter(
+            param=6,
+            value=selected,
+            intent="set_current_max",
+            source_method="ClassControlInterface.setZaxisCurrentmax(current=100)",
+        )
+
+    def z_restore_original_speed(self) -> dict[str, Any]:
+        return self._z_set_profile_parameter(
+            param=4,
+            value=1791,
+            intent="restore_original_speed",
+            source_method="ClassControlInterface.restoreOriginalZSpeed",
+        )
+
+    def z_clear_profile_overrides(self) -> None:
+        self._z_profile_overrides.clear()
 
     @staticmethod
     def _z_value(row: Any) -> int | None:
@@ -946,12 +1045,38 @@ class Serial206ProductionPrimitiveAdapter:
         })
         return result
 
-    def z_manual_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+    def z_manual_home(
+        self,
+        *,
+        timeout_s: float = 30.0,
+        _source_identity: str = "manual_panel",
+    ) -> dict[str, Any]:
         self._z_profile()
         interlock = self.tester.motor_oem_verify_motion_interlock()
         if interlock.get("ok") is not True:
             return {"ok": False, "failure": "motion_interlock_not_ready", "interlock": interlock}
-        home = self.tester.motor_oem_move_z_home(rehome=True, timeout_s=float(timeout_s))
+        if _source_identity == "move_z_home":
+            home = self.tester.motor_oem_move_z_home(rehome=True, timeout_s=float(timeout_s))
+            self._z_profile_overrides[6] = 31
+            intent_name = "move_z_home"
+            source_method = "ClassControlInterface.MoveZHome -> setZaxisCurrentmax + goHome(rehome=true, 1791)"
+            source_anchor = "ClassControlInterface.cs:4623-4632"
+        else:
+            manual_home = self.tester.motor_oem_go_home(
+                "z",
+                speed=1791,
+                rehome=True,
+                timeout_s=float(timeout_s),
+                require_switch_transition=False,
+                max_search_abs_delta=160000,
+            )
+            home = {
+                "ok": isinstance(manual_home, Mapping) and manual_home.get("ok") is True,
+                "home": manual_home,
+            }
+            intent_name = "manual_home"
+            source_method = "ClassControlInterface.btnHomeZ_Click -> goHome(rehome=true, 1791)"
+            source_anchor = "ClassControlInterface.cs:2370-2378"
         ok = isinstance(home, Mapping) and home.get("ok") is True
         home_evidence = home.get("home") if isinstance(home, Mapping) else None
         move_home = home_evidence.get("move_home") if isinstance(home_evidence, Mapping) else None
@@ -991,7 +1116,7 @@ class Serial206ProductionPrimitiveAdapter:
             if isinstance(false_guard, str) and false_guard
             else str(home.get("failure"))
             if isinstance(home, Mapping) and isinstance(home.get("failure"), str)
-            else "z_manual_home_evidence_not_verified"
+            else f"z_{intent_name}_evidence_not_verified"
         )
         home_summary = {
             "failure": failure,
@@ -1028,8 +1153,9 @@ class Serial206ProductionPrimitiveAdapter:
         return {
             "ok": ok,
             "failure": failure,
-            "intent": "manual_go_home_1791",
-            "source_method": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
+            "intent": intent_name,
+            "source_method": source_method,
+            "source_anchor": source_anchor,
             "interlock": interlock,
             "home_summary": home_summary,
             "home": _json_safe(home),
@@ -1039,6 +1165,12 @@ class Serial206ProductionPrimitiveAdapter:
             "motor_torque_verified": False,
             "physical_effect_verified": False,
         }
+
+    def z_move_z_home(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        return self.z_manual_home(
+            timeout_s=float(timeout_s),
+            _source_identity="move_z_home",
+        )
 
     def z_set_home(self, *, source: str = "oem.z.set_home") -> dict[str, Any]:
         """No-motion manual home: record the current physical position as controller 0.
@@ -1174,6 +1306,93 @@ class Serial206ProductionPrimitiveAdapter:
             ),
             "stop": _json_safe(stop),
             "wait": _json_safe(wait),
+        }
+
+    def z_abort(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        abort = self.tester.motor_oem_force_abort_motion(reason="oem.z.abort")
+        stop = self.z_stop(timeout_s=float(timeout_s))
+        ok = bool(
+            isinstance(abort, Mapping)
+            and abort.get("ok") is True
+            and abort.get("no24v") is True
+            and stop.get("ok") is True
+        )
+        return {
+            "ok": ok,
+            "intent": "full_machine_force_abort_from_z_recovery_context",
+            "source_method": "ClassControlInterface.forceAbortMotion",
+            "source_anchor": "ClassControlInterface.cs:5095-5121",
+            "physical_scope": "all_present_motor_boards_then_explicit_z_terminal_verification",
+            "z_only": False,
+            "abort": _json_safe(abort),
+            "stop": _json_safe(stop),
+            "no24v": bool(self.tester.oem_no24v_state()),
+            "controller_command_acknowledged": stop.get("controller_command_acknowledged") is True,
+            "controller_terminal_state_verified": stop.get("controller_terminal_state_verified") is True,
+            "physical_effect_verified": False,
+            "failure": None if ok else "z_abort_not_verified",
+        }
+
+    def z_resume_after_abort(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        rail = self.tester.motor_query_24v_sensor()
+        initial_check_ok = bool(
+            isinstance(rail, Mapping)
+            and rail.get("reply_valid") is True
+            and rail.get("sample_valid") is True
+            and rail.get("oem_no24v") is False
+            and rail.get("oem_scalar") == 0
+        )
+        if not initial_check_ok:
+            return {
+                "ok": False,
+                "intent": "resume_after_abort",
+                "failure": "wakefrompause_initial_check_24v_failed",
+                "initial_check_24v": _json_safe(rail),
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+            }
+        profile = self._z_profile()
+        home = self.tester.motor_oem_axis_search_home(
+            "z",
+            speed=1791,
+            timeout_s=float(timeout_s),
+            max_search_abs_delta=int(profile["home_search_max_abs_delta"]),
+        )
+        command_acknowledged = bool(
+            isinstance(home, Mapping)
+            and home.get("controller_command_acknowledged") is True
+        )
+        terminal_verified = bool(
+            isinstance(home, Mapping)
+            and home.get("controller_terminal_state_verified") is True
+            and home.get("controller_home_proof_verified") is True
+        )
+        ok = bool(
+            isinstance(home, Mapping)
+            and home.get("ok") is True
+            and command_acknowledged
+            and terminal_verified
+        )
+        return {
+            "ok": ok,
+            "intent": "resume_after_abort",
+            "source_method": "wakefrompause -> initialCheck -> rehome/initializeMotors Z stage",
+            "source_anchor": "ControlLib.wakefrompause; ControlLib.rehome:8784-8796; ClassControlInterface.initializeMotors:3350-3353",
+            "source_non_z_span": "restore thermal-door state and resume TC/output-chiller temperatures (not executed by Z-only projection)",
+            "initial_check_24v": _json_safe(rail),
+            "home": _json_safe(home),
+            "home_summary": {
+                "short_circuit": home.get("short_circuit") if isinstance(home, Mapping) else None,
+                "controller_home_proof_verified": bool(
+                    isinstance(home, Mapping)
+                    and home.get("controller_home_proof_verified") is True
+                ),
+                "source_return_code": home.get("source_return_code") if isinstance(home, Mapping) else None,
+            },
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal_verified,
+            "physical_effect_verified": False,
+            "failure": None if ok else "z_resume_rehome_controller_evidence_unverified",
         }
 
     def z_reconcile_switch_masks(self) -> dict[str, Any]:
@@ -1647,17 +1866,64 @@ class Serial206ProductionPrimitiveAdapter:
             return first_result + [second_result]
 
         if target == {"x": 0, "y": 0, "z": 0}:
+            z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
+            xy_results: dict[str, Any] = {}
+            xy_errors: list[str] = []
+
+            def home_xy_axis(axis: str, speed: int) -> None:
+                try:
+                    xy_results[axis] = self.tester.motor_oem_go_home(
+                        axis,
+                        speed=int(speed),
+                        rehome=True,
+                        timeout_s=float(wait_timeout_s),
+                        require_switch_transition=False,
+                    )
+                except Exception as exc:
+                    xy_errors.append(f"{axis}:{type(exc).__name__}:{exc}")
+
+            if bool(run_in_parallel):
+                tx = threading.Thread(target=home_xy_axis, args=("x", 1700), daemon=False)
+                ty = threading.Thread(target=home_xy_axis, args=("y", 1800), daemon=False)
+                tx.start(); ty.start(); tx.join(); ty.join()
+            else:
+                home_xy_axis("x", 1700)
+                home_xy_axis("y", 1800)
+            xy_ok = not xy_errors and all(
+                isinstance(xy_results.get(axis), Mapping)
+                and xy_results[axis].get("ok") is True
+                for axis in ("x", "y")
+            )
+            reference = None
+            if xy_ok and self.reference_store is not None:
+                reference = self.reference_store.mark_referenced_many(
+                    (
+                        MarkAxisReferencedCommand(axis="x", position_steps=0, source="oem_move_to_zero", motion_kind="go_home"),
+                        MarkAxisReferencedCommand(axis="y", position_steps=0, source="oem_move_to_zero", motion_kind="go_home"),
+                    )
+                )
+                xy_ok = bool(reference.get("ok") is True and reference.get("durable_clean") is True)
+            ok = bool(z_home.get("ok") is True and xy_ok)
             return {
-                "ok": False,
-                "source_return_code": 1,
-                "branch": "all_zero_home_quarantined",
-                "failure": "all_zero_move_to_requires_provider_owned_z_lifecycle",
+                "ok": ok,
+                "source_return_code": 0 if ok else 1,
+                "branch": "all_zero_home",
                 "source_home_semantics": {
                     "z": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
                     "x": "ClassControlInterface.goHome(true,X,1700,true)",
                     "y": "ClassControlInterface.goHome(true,Y,1800,true)",
                 },
-                "physical_motion_commanded": False,
+                "run_in_parallel": bool(run_in_parallel),
+                "z_home": _json_safe(z_home),
+                "xy_home": _json_safe(xy_results),
+                "xy_errors": xy_errors,
+                "xy_reference_state": _json_safe(reference),
+                "z_home_reference_verified": bool(z_home.get("ok") is True),
+                "home_summary": _json_safe(z_home.get("home_summary")),
+                "controller_command_acknowledged": bool(z_home.get("controller_command_acknowledged") is True),
+                "controller_terminal_state_verified": bool(z_home.get("controller_terminal_state_verified") is True),
+                "physical_motion_commanded": bool(ok),
+                "failure": None if ok else "all_zero_move_to_home_failed",
                 "source_anchor": "ClassControlInterface.moveTo:4463-4506",
             }
 
@@ -1940,6 +2206,309 @@ class Serial206ProductionPrimitiveAdapter:
             "waits": _json_safe(waits),
         }
 
+    def z_execute_path(
+        self,
+        *,
+        steps: list[dict[str, Any]],
+        wait_timeout_s: float,
+        pseudo_home_steps: int,
+    ) -> dict[str, Any]:
+        self._z_profile()
+        execution = _execute_oem_steps_live(
+            list(steps),
+            self,
+            wait_timeout_s=float(wait_timeout_s),
+            speed=None,
+            acc=None,
+            pseudo_z_home_steps=int(pseudo_home_steps),
+        )
+
+        def find_home(value: Any) -> Mapping[str, Any] | None:
+            if isinstance(value, Mapping):
+                if value.get("z_home_reference_verified") is True:
+                    return value
+                for child in value.values():
+                    match = find_home(child)
+                    if match is not None:
+                        return match
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    match = find_home(child)
+                    if match is not None:
+                        return match
+            return None
+
+        home = find_home(execution)
+        ok = bool(isinstance(execution, Mapping) and execution.get("ok") is True)
+        return {
+            "ok": ok,
+            "intent": "path_execute",
+            "source_method": "ClassControlInterface.scriptmoveTo/moveTo",
+            "source_anchor": "ClassControlInterface.cs:3718-4014;4463-4620",
+            "execution": _json_safe(execution),
+            "z_home_reference_verified": home is not None,
+            "home_summary": _json_safe(home.get("home_summary") if home is not None else None),
+            "controller_command_acknowledged": ok,
+            "controller_terminal_state_verified": ok,
+            "physical_effect_verified": False,
+            "failure": None if ok else "z_coordinated_path_execution_failed",
+        }
+
+    def z_move_gz(
+        self,
+        *,
+        gripper_position_steps: int,
+        z_position_steps: int,
+        wait_timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        z_profile = self._z_profile()
+        self.tester.motor_oem_require_no_motion_profile("g")
+        g_profile = self._axis_profile("g")
+        g_target = int(gripper_position_steps)
+        z_target = int(z_position_steps)
+        for axis, target, profile in (
+            ("g", g_target, g_profile),
+            ("z", z_target, z_profile),
+        ):
+            lower = int(profile.get("axis_min_steps", 0))
+            upper = int(profile["axis_max_steps"])
+            if target < lower or target > upper:
+                return {
+                    "ok": False,
+                    "failure": f"{axis}_target_out_of_bounds:{target}:{lower}:{upper}",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                }
+        event_window = self.tester.begin_bus_event_window()
+        g_move = self.tester.motor_oem_move_absolute(
+            int(g_profile["board"]),
+            g_target,
+            motor=int(g_profile.get("motor", 0)),
+            wait_for_stop=False,
+            max_position=int(g_profile["axis_max_steps"]),
+        )
+        z_move = self.tester.motor_oem_move_absolute(
+            int(z_profile["board"]),
+            z_target,
+            motor=int(z_profile["motor"]),
+            wait_for_stop=False,
+            max_position=int(z_profile["axis_max_steps"]),
+        )
+        time.sleep(0.005)
+        wait = self.tester.motor_oem_wait_targets_reached(
+            (
+                (int(g_profile["board"]), int(g_profile.get("motor", 0))),
+                (int(z_profile["board"]), int(z_profile["motor"])),
+            ),
+            timeout_s=float(wait_timeout_s),
+            event_window=event_window,
+        )
+        acknowledged = bool(g_move.get("ok") is True and z_move.get("ok") is True)
+        terminal = bool(isinstance(wait, Mapping) and wait.get("ok") is True)
+        return {
+            "ok": bool(acknowledged and terminal),
+            "intent": "move_gz",
+            "source_method": "ClassControlInterface.moveGZ",
+            "source_anchor": "ClassControlInterface.cs:4369-4399",
+            "targets": {"g": g_target, "z": z_target},
+            "commands": {"g": _json_safe(g_move), "z": _json_safe(z_move)},
+            "wait": _json_safe(wait),
+            "controller_command_acknowledged": acknowledged,
+            "controller_terminal_state_verified": terminal,
+            "physical_effect_verified": False,
+            "failure": None if acknowledged and terminal else "move_gz_controller_evidence_unverified",
+        }
+
+    def z_home_gz(
+        self,
+        *,
+        pseudo_z_home_steps: int,
+        delay_s: int = 0,
+        wait_timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        profile = self._z_profile()
+        parity = load_oem_parity_config(None)
+        if parity.blockers:
+            return {"ok": False, "failure": "immutable_oem_machine_snapshot_not_bound", "blockers": list(parity.blockers)}
+        result = self.tester.motor_oem_home_gz(
+            delay_s=int(delay_s),
+            pseudo_z_home=int(pseudo_z_home_steps),
+            gripper_version=int(parity.values["GripperVersion"]),
+            development_machine=False,
+            timeout_s=float(wait_timeout_s),
+        )
+        # homeGZ writes the source high Z current before gripper homing. The
+        # caught-plate exception branch occurs after that write, so retain the
+        # verified active value even when the composite result is failed.
+        z_current = result.get("z_current") if isinstance(result, Mapping) else None
+        z_current_readback = z_current.get("readback") if isinstance(z_current, Mapping) else None
+        if (
+            isinstance(z_current, Mapping)
+            and z_current.get("ok") is True
+            and self._z_value(z_current_readback) == int(profile["run_current"])
+        ):
+            self._z_profile_overrides[6] = int(profile["run_current"])
+        ok = bool(isinstance(result, Mapping) and result.get("ok") is True)
+        return {
+            "ok": ok,
+            "intent": "home_gz",
+            "source_method": "ClassControlInterface.homeGZ",
+            "source_anchor": "ClassControlInterface.cs:4657-4687",
+            "pseudo_z_home_steps": int(pseudo_z_home_steps),
+            "development_machine": False,
+            "result": _json_safe(result),
+            "controller_command_acknowledged": ok,
+            "controller_terminal_state_verified": ok,
+            "physical_effect_verified": False,
+            "failure": None if ok else "home_gz_controller_evidence_unverified",
+        }
+
+    def z_pipette_position(
+        self,
+        *,
+        location_id: str | int,
+        operation: str,
+        overpress: bool = False,
+    ) -> dict[str, Any]:
+        self._z_profile()
+        table = load_bound_oem_position_table()
+        target_row = table.resolve(location_id=str(location_id))
+        if operation == "lower_pipette":
+            if target_row.z_low is None:
+                return {"ok": False, "failure": "position_table_z_low_missing"}
+            target = int(target_row.z_low) + (4030 if bool(overpress) else 0)
+            source_anchor = "ClassControlInterface.cs:4401-4421"
+        elif operation == "lift_pipette":
+            if target_row.z_high is None:
+                return {"ok": False, "failure": "position_table_z_high_missing"}
+            target = int(target_row.z_high)
+            source_anchor = "ClassControlInterface.cs:4423-4431"
+        else:
+            raise ValueError(f"unsupported pipette Z operation: {operation}")
+        move = self.oem_move_axis_absolute("z", target, wait_for_stop=True)
+        if operation == "lower_pipette":
+            time.sleep(1.0)
+        ok = bool(move.get("ok") is True)
+        return {
+            "ok": ok,
+            "intent": operation,
+            "source_method": (
+                "ClassControlInterface.lowerPipette"
+                if operation == "lower_pipette"
+                else "ClassControlInterface.liftPipette"
+            ),
+            "source_anchor": source_anchor,
+            "location_id": str(location_id),
+            "overpress": bool(overpress) if operation == "lower_pipette" else False,
+            "target_position_steps": target,
+            "position_table_source": table.source,
+            "move": _json_safe(move),
+            "controller_command_acknowledged": ok,
+            "controller_terminal_state_verified": ok,
+            "physical_effect_verified": False,
+            "failure": None if ok else f"{operation}_controller_evidence_unverified",
+        }
+
+    def z_self_test(
+        self,
+        *,
+        pseudo_z_home_steps: int,
+        wait_timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        self._z_profile()
+        table = load_bound_oem_position_table()
+        parity = load_oem_parity_config(None)
+        if parity.blockers:
+            return {"ok": False, "failure": "immutable_oem_machine_snapshot_not_bound", "blockers": list(parity.blockers)}
+        z_low_values = [
+            int(row["z_low"])
+            for row in table.rows()
+            if type(row.get("z_low")) is int
+        ]
+        if not z_low_values:
+            return {"ok": False, "failure": "position_table_has_no_z_low_values"}
+        computed_self_test_z_max = min(
+            max(z_low_values),
+            int(parity.values["Z_MOTOR_MAX_POSITION"]),
+        )
+        if computed_self_test_z_max != SERIAL206_Z_SELF_TEST_MAX_STEPS:
+            return {
+                "ok": False,
+                "failure": "serial206_self_test_z_max_machine_binding_mismatch",
+                "expected": SERIAL206_Z_SELF_TEST_MAX_STEPS,
+                "observed": computed_self_test_z_max,
+                "position_table_source": table.source,
+            }
+        self_test_z_max = SERIAL206_Z_SELF_TEST_MAX_STEPS
+        initial_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
+        move = (
+            self.oem_move_z(
+                self_test_z_max,
+                pseudo_home_steps=int(pseudo_z_home_steps),
+                motor_current=int(parity.values["Z_MOTOR_MAX_CURRENT_UP"]),
+                wait_for_stop=True,
+            )
+            if initial_home.get("ok") is True
+            else {"ok": False, "failure": "z_self_test_initial_move_z_home_failed"}
+        )
+        self._z_profile_overrides[6] = int(parity.values["Z_MOTOR_MAX_CURRENT_UP"])
+        home = self.z_diagnostic_home_axis(timeout_s=float(wait_timeout_s))
+        home_wrapper = home.get("home") if isinstance(home, Mapping) else None
+        axis_home = home_wrapper.get("home") if isinstance(home_wrapper, Mapping) else None
+        source_return_code = axis_home.get("source_return_code") if isinstance(axis_home, Mapping) else None
+        travel_error_steps = (
+            abs(int(source_return_code) - int(self_test_z_max))
+            if type(source_return_code) is int
+            else None
+        )
+        self_test_pass = bool(
+            initial_home.get("ok") is True
+            and move.get("ok") is True
+            and isinstance(home, Mapping)
+            and home.get("ok") is True
+            and type(travel_error_steps) is int
+            and travel_error_steps <= 100
+        )
+        home_summary = {
+            "short_circuit": axis_home.get("short_circuit") if isinstance(axis_home, Mapping) else None,
+            "controller_home_proof_verified": bool(
+                isinstance(axis_home, Mapping)
+                and axis_home.get("controller_home_proof_verified") is True
+            ),
+            "source_return_code": source_return_code,
+            "self_test_z_max": self_test_z_max,
+            "travel_error_steps": travel_error_steps,
+        }
+        return {
+            "ok": self_test_pass,
+            "intent": "self_test",
+            "source_method": "ControlLib.selfTest Z segment",
+            "source_anchor": "ControlLib.cs:10744-10749; ClassBioXPSettings.SelfTestZMax",
+            "source_non_z_span": "HomeAxis(x/y) -> moveX/moveY -> HomeXY (not executed by Z-only projection)",
+            "self_test_z_max": self_test_z_max,
+            "self_test_tolerance_steps": 100,
+            "source_return_code": source_return_code,
+            "travel_error_steps": travel_error_steps,
+            "self_test_pass": self_test_pass,
+            "position_table_source": table.source,
+            "initial_move_z_home": _json_safe(initial_home),
+            "move": _json_safe(move),
+            "home": _json_safe(home),
+            "home_summary": home_summary,
+            "controller_command_acknowledged": bool(
+                initial_home.get("controller_command_acknowledged") is True
+                and move.get("ok") is True
+                and isinstance(home, Mapping)
+                and home.get("controller_command_acknowledged") is True
+            ),
+            "controller_terminal_state_verified": bool(
+                isinstance(home, Mapping)
+                and home.get("controller_terminal_state_verified") is True
+            ),
+            "physical_effect_verified": False,
+            "failure": None if self_test_pass else "z_self_test_failed",
+        }
+
     @staticmethod
     def sleep(milliseconds: int) -> dict[str, Any]:
         delay_s = max(0.0, min(float(milliseconds) / 1000.0, 30.0))
@@ -2110,6 +2679,8 @@ class Serial206OemInitializationProvider:
                 "thermal_door_open": None,
                 "tip_loaded": None,
                 "tip_dirty": None,
+                "tip_location": -1,
+                "clean_path": False,
                 "plate_on_gantry": None,
                 "psudo_z_home_steps": 65000,
                 "current_location": None,
@@ -2705,6 +3276,74 @@ class Serial206OemInitializationProvider:
                     "failure": f"{type(exc).__name__}: {exc}",
                 }
 
+    def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
+        """Return provider-owned live ``scriptmoveTo`` branch authority."""
+        observed_generation = int(self.generation_provider())
+        if int(expected_generation) != observed_generation:
+            return {
+                "ok": False,
+                "blockers": ["ownership_generation_changed"],
+                "expected_generation": int(expected_generation),
+                "observed_generation": observed_generation,
+            }
+        with self._lock:
+            state = self._load_state()
+            z = state["z_lifecycle"]
+            machine = dict(state.get("machine_status") or {})
+        if z.get("state") != "referenced_ready" or z.get("reference_state") != "referenced":
+            return {"ok": False, "blockers": ["z_reference_not_ready"]}
+        if type(machine.get("tip_loaded")) is not bool or type(machine.get("tip_dirty")) is not bool:
+            return {"ok": False, "blockers": ["tip_state_not_authoritative"]}
+        if type(machine.get("clean_path")) is not bool:
+            return {"ok": False, "blockers": ["clean_path_not_authoritative"]}
+        if machine.get("current_location") is None or machine.get("current_well") is None:
+            return {"ok": False, "blockers": ["current_location_not_authoritative"]}
+        pseudo = machine.get("psudo_z_home_steps")
+        if type(pseudo) is not int or pseudo not in {500, 65000}:
+            return {"ok": False, "blockers": ["pseudo_z_home_not_authoritative"]}
+        tip_location = machine.get("tip_location", -1)
+        if type(tip_location) is not int:
+            return {"ok": False, "blockers": ["tip_location_not_authoritative"]}
+        if machine["tip_loaded"] is True and tip_location < 0:
+            return {"ok": False, "blockers": ["loaded_tip_location_not_authoritative"]}
+        read_position = getattr(self.primitives, "_read_axis_position", None)
+        if not callable(read_position):
+            return {"ok": False, "blockers": ["controller_position_reader_not_bound"]}
+        try:
+            coordinates = {axis: read_position(axis) for axis in ("x", "y", "z")}
+        except Exception as exc:
+            return {"ok": False, "blockers": [f"controller_position_read_failed:{type(exc).__name__}:{exc}"]}
+        if any(type(value) is not int for value in coordinates.values()):
+            return {"ok": False, "blockers": ["controller_position_not_strict_integer"]}
+        if self.reference_store is None:
+            return {"ok": False, "blockers": ["reference_store_not_bound"]}
+        references = self.reference_store.snapshot(("g",))
+        g_row = (references.get("rows") or {}).get("g") if isinstance(references, Mapping) else None
+        gripper_confirmed = bool(
+            isinstance(references, Mapping)
+            and references.get("ok") is True
+            and isinstance(g_row, Mapping)
+            and g_row.get("state") == "referenced"
+        )
+        return {
+            "ok": True,
+            "generation": observed_generation,
+            "board_lifecycle_generation": z.get("board_lifecycle_generation"),
+            "current_x": coordinates["x"],
+            "current_y": coordinates["y"],
+            "current_z": coordinates["z"],
+            "current_loc": machine["current_location"],
+            "current_well": machine["current_well"],
+            "tip_loaded": machine["tip_loaded"],
+            "tip_dirty": machine["tip_dirty"],
+            "clean_path": machine["clean_path"],
+            "tip_location": tip_location,
+            "gripper_confirmed": gripper_confirmed,
+            "plate_on_gantry": machine.get("plate_on_gantry"),
+            "pseudo_z_home": pseudo,
+            "source": "provider_controller_reference_store",
+        }
+
     @staticmethod
     def _append_z_receipt(z: dict[str, Any], receipt: Mapping[str, Any]) -> None:
         receipts = list(z.get("receipts") or [])
@@ -2778,6 +3417,7 @@ class Serial206OemInitializationProvider:
         inputs: Mapping[str, Any] | None = None,
         expected_generation: int,
         idempotency_key: str,
+        abort: bool = False,
     ) -> dict[str, Any]:
         """Deliver Z STOP before waiting for the provider lifecycle lock.
 
@@ -2789,11 +3429,12 @@ class Serial206OemInitializationProvider:
         """
 
         values = dict(inputs or {})
+        interrupt_intent = "abort" if bool(abort) else "stop"
         supplied_command_id = values.get("command_id")
         command_id = (
             supplied_command_id
             if isinstance(supplied_command_id, str) and supplied_command_id.strip()
-            else f"z_stop_{int(time.time() * 1000)}"
+            else f"z_{interrupt_intent}_{int(time.time() * 1000)}"
         )
         safe_inputs = _json_safe(values)
         with self._z_interrupt_dispatch_lock:
@@ -2828,14 +3469,16 @@ class Serial206OemInitializationProvider:
                     snapshot_active = None
 
                 try:
-                    raw_result = self.primitives.z_stop(
-                        timeout_s=float(values.get("timeout_s", 3.0))
+                    raw_result = (
+                        self.primitives.z_abort(timeout_s=float(values.get("timeout_s", 3.0)))
+                        if abort
+                        else self.primitives.z_stop(timeout_s=float(values.get("timeout_s", 3.0)))
                     )
                 except Exception as exc:
                     raw_result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 result = dict(raw_result) if isinstance(raw_result, Mapping) else {
                     "ok": False,
-                    "failure": "z_stop_result_not_mapping",
+                    "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
 
@@ -2844,9 +3487,16 @@ class Serial206OemInitializationProvider:
                     z = state["z_lifecycle"]
                     movement_intents = {
                         "manual_home",
+                        "move_z_home",
                         "diagnostic_home_axis",
                         "move_steps",
                         "move_absolute",
+                        "path_execute",
+                        "move_gz",
+                        "home_gz",
+                        "lower_pipette",
+                        "lift_pipette",
+                        "self_test",
                     }
                     interrupted_ids: set[str] = set()
                     if (
@@ -2902,7 +3552,7 @@ class Serial206OemInitializationProvider:
                     )
                     receipt = {
                         "command_id": command_id,
-                        "intent": "stop",
+                        "intent": interrupt_intent,
                         "idempotency_key": idempotency_key,
                         "expected_generation": int(expected_generation),
                         "observed_generation": observed_generation,
@@ -2920,7 +3570,7 @@ class Serial206OemInitializationProvider:
                         "result": _json_safe(result),
                         "operator_assessment": None,
                     }
-                    must_desync = bool(interrupted_ids or not stop_verified or not generation_match)
+                    must_desync = bool(abort or interrupted_ids or not stop_verified or not generation_match)
                     authority_state_verified = True
                     if must_desync:
                         z.update(
@@ -2931,7 +3581,9 @@ class Serial206OemInitializationProvider:
                                 "reference_state": "desynced",
                                 "last_failure": {
                                     "reason": (
-                                        "z_safety_stop_interrupted_active_intent"
+                                        "z_abort_latched"
+                                        if abort
+                                        else "z_safety_stop_interrupted_active_intent"
                                         if interrupted_ids
                                         else "z_safety_stop_unverified"
                                         if not stop_verified
@@ -2944,8 +3596,12 @@ class Serial206OemInitializationProvider:
                         try:
                             result["reference_desync"] = _json_safe(
                                 self._z_mark_desynced(
-                                    "Z safety stop interrupted or could not conclusively preserve reference authority.",
-                                    "serial206.z.stop_interrupt",
+                                    (
+                                        "Z abort invalidated reference authority."
+                                        if abort
+                                        else "Z safety stop interrupted or could not conclusively preserve reference authority."
+                                    ),
+                                    f"serial206.z.{interrupt_intent}_interrupt",
                                 )
                             )
                         except Exception as exc:
@@ -2980,11 +3636,12 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         intent = str(intent).strip()
         values = dict(inputs or {})
-        if intent == "stop":
+        if intent in {"stop", "abort"}:
             return self.execute_z_stop_interrupt(
                 inputs=values,
                 expected_generation=expected_generation,
                 idempotency_key=idempotency_key,
+                abort=intent == "abort",
             )
         with self._z_interrupt_state_lock:
             admitted_interrupt_epoch = self._z_interrupt_epoch
@@ -3101,7 +3758,14 @@ class Serial206OemInitializationProvider:
                 "prepare": {"unprepared", "failed_latched"},
                 "reconcile_switch_masks": {"unprepared", "failed_latched"},
                 "manual_home": {"prepared_unreferenced", "referenced_ready"},
+                "move_z_home": {"prepared_unreferenced", "referenced_ready"},
                 "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+                "set_max_speed": {"prepared_unreferenced", "referenced_ready"},
+                "set_max_acc": {"prepared_unreferenced", "referenced_ready"},
+                "set_vmax": {"prepared_unreferenced", "referenced_ready"},
+                "set_current_max": {"prepared_unreferenced", "referenced_ready"},
+                "restore_original_speed": {"prepared_unreferenced", "referenced_ready"},
+                "set_clean_path": {"prepared_unreferenced", "referenced_ready"},
                 # ClassMotor.setHome is the no-motion state-establishing OEM
                 # primitive.  It cannot require the prepared/reference state it
                 # creates; otherwise a stale controller position has no canonical
@@ -3110,6 +3774,13 @@ class Serial206OemInitializationProvider:
                 "set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "move_steps": {"referenced_ready"},
                 "move_absolute": {"referenced_ready"},
+                "path_execute": {"referenced_ready"},
+                "move_gz": {"referenced_ready"},
+                "home_gz": {"referenced_ready"},
+                "lower_pipette": {"referenced_ready"},
+                "lift_pipette": {"referenced_ready"},
+                "self_test": {"referenced_ready"},
+                "resume_after_abort": {"failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched"},
             }
             blockers = []
@@ -3128,8 +3799,7 @@ class Serial206OemInitializationProvider:
                 blockers.append("z_reference_store_not_bound")
             if intent == "reconcile_switch_masks" and values.get("confirm") != "RECONCILE_Z_SWITCH_MASKS":
                 blockers.append("explicit_confirmation_required:RECONCILE_Z_SWITCH_MASKS")
-            if intent == "diagnostic_home_axis" and values.get("confirm") != "DIAGNOSTIC_Z_HOME_597":
-                blockers.append("explicit_confirmation_required:DIAGNOSTIC_Z_HOME_597")
+
             if intent == "move_steps":
                 steps_value = values.get("steps")
                 if type(steps_value) is not int:
@@ -3138,6 +3808,45 @@ class Serial206OemInitializationProvider:
                     blockers.append("z_relative_steps_must_be_nonzero")
             if intent == "move_absolute" and type(values.get("position_steps")) is not int:
                 blockers.append("z_absolute_position_must_be_integer")
+            if intent == "path_execute":
+                steps_value = values.get("steps")
+                if not isinstance(steps_value, list) or not 1 <= len(steps_value) <= 256:
+                    blockers.append("z_path_steps_must_be_nonempty_bounded_list")
+                elif any(not isinstance(row, Mapping) for row in steps_value):
+                    blockers.append("z_path_steps_must_be_objects")
+                path_context = values.get("path_context")
+                if not isinstance(path_context, Mapping):
+                    blockers.append("z_path_context_must_be_object")
+                elif type(path_context.get("current_location")) not in {str, int}:
+                    blockers.append("z_path_context_location_must_be_string_or_integer")
+                elif type(path_context.get("current_well")) is not int:
+                    blockers.append("z_path_context_well_must_be_integer")
+            if intent == "set_clean_path" and type(values.get("enabled")) is not bool:
+                blockers.append("z_clean_path_enabled_must_be_boolean")
+            if intent == "move_gz":
+                if type(values.get("gripper_position_steps")) is not int:
+                    blockers.append("move_gz_gripper_position_must_be_integer")
+                if type(values.get("z_position_steps")) is not int:
+                    blockers.append("move_gz_z_position_must_be_integer")
+            if intent in {"lower_pipette", "lift_pipette"}:
+                location_value = values.get("location_id")
+                if type(location_value) not in {str, int}:
+                    blockers.append(f"{intent}_location_id_must_be_string_or_integer")
+            if intent == "lower_pipette" and type(values.get("overpress", False)) is not bool:
+                blockers.append("lower_pipette_overpress_must_be_boolean")
+
+            if intent in {"set_max_speed", "set_max_acc", "set_vmax"}:
+                control_value = values.get("value")
+                if type(control_value) is not int:
+                    blockers.append(f"z_{intent}_value_must_be_integer")
+                elif control_value < 0 or control_value > 2_147_483_647:
+                    blockers.append(f"z_{intent}_value_out_of_int32_range")
+            if intent == "set_current_max":
+                control_value = values.get("value")
+                if control_value is not None and type(control_value) is not int:
+                    blockers.append("z_set_current_max_value_must_be_integer_or_null")
+                elif type(control_value) is int and (control_value < 0 or control_value > 31):
+                    blockers.append("z_set_current_max_value_out_of_range_0_31")
             if intent == "set_home":
                 if values.get("operator_ack") != "SET_HOME_CURRENT_POSITION":
                     blockers.append("explicit_confirmation_required:SET_HOME_CURRENT_POSITION")
@@ -3150,7 +3859,14 @@ class Serial206OemInitializationProvider:
                 set_home_admitted_board_generation = current_board_generation
                 if type(current_board_generation) is not int or current_board_generation < 1:
                     blockers.append("z_board_lifecycle_generation_unavailable_for_set_home")
-            if intent in {"manual_home", "diagnostic_home_axis", "move_steps", "move_absolute"}:
+            if intent in {
+                "manual_home", "move_z_home", "diagnostic_home_axis",
+                "move_steps", "move_absolute", "path_execute", "move_gz", "home_gz",
+                "lower_pipette", "lift_pipette", "self_test", "resume_after_abort",
+                "set_max_speed", "set_max_acc",
+                "set_vmax", "set_current_max", "restore_original_speed",
+                "set_clean_path",
+            }:
                 prepared_board_generation = z.get("board_lifecycle_generation")
                 board_generation_provider = getattr(
                     self.preparation_provider, "current_board_lifecycle_generation", None
@@ -3212,6 +3928,8 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_reconcile_switch_masks()
                 elif intent == "manual_home":
                     result = self.primitives.z_manual_home(timeout_s=float(values.get("timeout_s", 30.0)))
+                elif intent == "move_z_home":
+                    result = self.primitives.z_move_z_home(timeout_s=float(values.get("timeout_s", 30.0)))
                 elif intent == "set_home":
                     result = self.primitives.z_set_home()
                 elif intent == "diagnostic_home_axis":
@@ -3231,6 +3949,73 @@ class Serial206OemInitializationProvider:
                         pseudo_home_steps=int(pseudo_home),
                         wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
                     )
+                elif intent == "path_execute":
+                    machine_status = state.get("machine_status") or {}
+                    pseudo_home = machine_status.get("psudo_z_home_steps")
+                    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+                        raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    result = self.primitives.z_execute_path(
+                        steps=[dict(row) for row in values["steps"]],
+                        wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
+                        pseudo_home_steps=int(pseudo_home),
+                    )
+                elif intent == "move_gz":
+                    result = self.primitives.z_move_gz(
+                        gripper_position_steps=int(values["gripper_position_steps"]),
+                        z_position_steps=int(values["z_position_steps"]),
+                        wait_timeout_s=float(values.get("wait_timeout_s", 5.0)),
+                    )
+                elif intent == "home_gz":
+                    machine_status = state.get("machine_status") or {}
+                    pseudo_home = machine_status.get("psudo_z_home_steps")
+                    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+                        raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    result = self.primitives.z_home_gz(
+                        pseudo_z_home_steps=int(pseudo_home),
+                        delay_s=int(values.get("delay_s", 0)),
+                        wait_timeout_s=float(values.get("wait_timeout_s", 30.0)),
+                    )
+                elif intent in {"lower_pipette", "lift_pipette"}:
+                    result = self.primitives.z_pipette_position(
+                        location_id=values["location_id"],
+                        operation=intent,
+                        overpress=bool(values.get("overpress", False)),
+                    )
+                elif intent == "self_test":
+                    machine_status = state.get("machine_status") or {}
+                    pseudo_home = machine_status.get("psudo_z_home_steps")
+                    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+                        raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    result = self.primitives.z_self_test(
+                        pseudo_z_home_steps=int(pseudo_home),
+                        wait_timeout_s=float(values.get("wait_timeout_s", 30.0)),
+                    )
+                elif intent == "resume_after_abort":
+                    result = self.primitives.z_resume_after_abort(
+                        timeout_s=float(values.get("wait_timeout_s", 30.0))
+                    )
+                elif intent == "set_max_speed":
+                    result = self.primitives.z_set_max_speed(int(values.get("value", 0)))
+                elif intent == "set_max_acc":
+                    result = self.primitives.z_set_max_acc(int(values.get("value", 0)))
+                elif intent == "set_vmax":
+                    result = self.primitives.z_set_vmax(int(values.get("value", 0)))
+                elif intent == "set_current_max":
+                    raw_value = values.get("value")
+                    result = self.primitives.z_set_current_max(
+                        None if raw_value is None else int(raw_value)
+                    )
+                elif intent == "restore_original_speed":
+                    result = self.primitives.z_restore_original_speed()
+                elif intent == "set_clean_path":
+                    result = {
+                        "ok": True,
+                        "source_state": "m_controlLib.cleanPath",
+                        "clean_path": bool(values["enabled"]),
+                        "controller_command_acknowledged": True,
+                        "controller_terminal_state_verified": True,
+                        "motion_commanded": False,
+                    }
                 else:
                     result = self.primitives.z_stop()
             except Exception as exc:
@@ -3256,6 +4041,7 @@ class Serial206OemInitializationProvider:
                 )
             ok = result.get("ok") is True
             if ok and intent == "prepare":
+                self.primitives.z_clear_profile_overrides()
                 board_generation = result.get("board_lifecycle_generation")
                 board_generation_provider = getattr(
                     self.preparation_provider, "current_board_lifecycle_generation", None
@@ -3270,7 +4056,13 @@ class Serial206OemInitializationProvider:
                     ok = False
                 else:
                     result["board_lifecycle_generation"] = int(board_generation)
-            if ok and intent in {"diagnostic_home_axis", "set_home", "move_steps", "move_absolute", "stop"}:
+            if ok and intent in {
+                "diagnostic_home_axis", "set_home", "move_steps", "move_absolute", "path_execute",
+                "move_gz", "home_gz", "lower_pipette", "lift_pipette", "stop",
+                "self_test", "resume_after_abort",
+                "set_max_speed", "set_max_acc", "set_vmax", "set_current_max",
+                "restore_original_speed",
+            }:
                 if (
                     result.get("controller_command_acknowledged") is not True
                     or result.get("controller_terminal_state_verified") is not True
@@ -3280,7 +4072,7 @@ class Serial206OemInitializationProvider:
                         "failure": result.get("failure") or "z_controller_command_or_terminal_evidence_unverified",
                     })
                     ok = False
-            if ok and intent == "manual_home":
+            if ok and intent in {"manual_home", "move_z_home"}:
                 summary = result.get("home_summary")
                 source_short_circuit = bool(
                     isinstance(summary, Mapping)
@@ -3346,11 +4138,21 @@ class Serial206OemInitializationProvider:
                     )
                     ok = False
             reference_published = False
-            if ok and intent == "set_home":
+            reference_intents = {
+                "set_home",
+                "manual_home",
+                "move_z_home",
+                "diagnostic_home_axis",
+                "self_test",
+                "resume_after_abort",
+            }
+            if ok and intent == "path_execute" and result.get("z_home_reference_verified") is True:
+                reference_intents.add("path_execute")
+            if ok and intent in reference_intents:
                 try:
                     reference = self._z_mark_referenced(
-                        source="serial206.z.set_home",
-                        motion_kind="manual_set_home",
+                        source=f"serial206.z.{intent}",
+                        motion_kind="manual_set_home" if intent == "set_home" else "controller_proven_home",
                     )
                 except Exception as exc:
                     result.update(
@@ -3394,7 +4196,7 @@ class Serial206OemInitializationProvider:
                     "reference_state": "desynced",
                     "last_failure": None,
                 })
-                self._z_mark_desynced("Z profile prepared; homing observation still required.", "serial206.z.prepare")
+                self._z_mark_desynced("Z profile prepared; a source home or explicit setHome is required.", "serial206.z.prepare")
             elif ok and intent == "reconcile_switch_masks":
                 z.update({
                     "state": "unprepared",
@@ -3422,27 +4224,46 @@ class Serial206OemInitializationProvider:
                     "awaiting_observation_receipt_id": None,
                     "last_failure": None,
                 })
-            elif ok and intent == "manual_home":
+            elif ok and intent in {
+                "manual_home", "move_z_home", "diagnostic_home_axis",
+                "self_test", "resume_after_abort",
+            }:
                 z.update({
-                    "state": "awaiting_operator_observation",
-                    "awaiting_observation_receipt_id": command_id,
-                    "reference_state": "desynced",
-                    "last_failure": None,
-                })
-                self._z_mark_desynced("Controller home proof awaits independent physical observation.", "serial206.z.manual_home")
-            elif ok and intent == "diagnostic_home_axis":
-                z.update({
-                    "state": "prepared_unreferenced",
+                    "state": "referenced_ready",
                     "awaiting_observation_receipt_id": None,
-                    "reference_state": "desynced",
+                    "reference_state": "referenced",
                     "last_failure": None,
                 })
-                self._z_mark_desynced(
-                    "Diagnostic HomeAxis cannot establish the production Z reference.",
-                    "serial206.z.diagnostic_home_axis",
-                )
-            elif ok and intent in {"move_steps", "move_absolute"}:
+            elif ok and intent in {
+                "move_steps", "move_absolute", "move_gz", "home_gz",
+                "lower_pipette", "lift_pipette",
+            }:
                 z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
+            elif ok and intent == "path_execute":
+                path_context = dict(values["path_context"])
+                machine_status = state.setdefault("machine_status", {})
+                machine_status["current_location"] = path_context["current_location"]
+                machine_status["current_well"] = path_context["current_well"]
+                result["path_context_persisted"] = _json_safe(path_context)
+                if result.get("z_home_reference_verified") is True:
+                    z.update({
+                        "state": "referenced_ready",
+                        "awaiting_observation_receipt_id": None,
+                        "reference_state": "referenced",
+                        "last_failure": None,
+                    })
+                else:
+                    z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
+            elif ok and intent == "set_clean_path":
+                machine_status = state.setdefault("machine_status", {})
+                machine_status["clean_path"] = bool(values["enabled"])
+                result["clean_path_persisted"] = True
+                z.update({"state": previous_state, "last_failure": None})
+            elif ok and intent in {
+                "set_max_speed", "set_max_acc", "set_vmax", "set_current_max",
+                "restore_original_speed",
+            }:
+                z.update({"state": previous_state, "last_failure": None})
             elif ok and intent == "stop":
                 z["state"] = previous_state if previous_state != "executing" else "failed_latched"
             else:

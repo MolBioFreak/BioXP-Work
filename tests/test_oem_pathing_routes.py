@@ -67,12 +67,12 @@ def test_scriptmove_plan_route_is_read_only_and_uses_path_planner(tmp_path, monk
 
 
 def test_scriptmove_execute_route_defaults_to_no_motion_preview(tmp_path, monkeypatch):
-    from src.bioxp.oem_homing_routes import execute_oem_scriptmove_path
+    from src.bioxp.oem_homing_routes import OemScriptMoveExecuteRequest, execute_oem_scriptmove_path
     _bind_test_position_table(monkeypatch)
     _write_bundle(tmp_path)
     monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
 
-    payload = asyncio.run(execute_oem_scriptmove_path({
+    payload = asyncio.run(execute_oem_scriptmove_path(OemScriptMoveExecuteRequest(**{
         "location_id": "LOC_MS",
         "current_loc": "LOC_MS",
         "current_x": 0,
@@ -82,7 +82,7 @@ def test_scriptmove_execute_route_defaults_to_no_motion_preview(tmp_path, monkey
         "row": 3,
         "positionflag": 1,
         "gripper_confirmed": True,
-    }))
+    })))
 
     assert payload["ok"] is True
     assert payload["schema_version"] == "bioxp.oem_scriptmove_execution.v1"
@@ -97,20 +97,20 @@ def test_scriptmove_execute_route_defaults_to_no_motion_preview(tmp_path, monkey
 
 def test_scriptmove_execute_live_requires_explicit_ack(tmp_path, monkeypatch):
     from fastapi import HTTPException
-    from src.bioxp.oem_homing_routes import execute_oem_scriptmove_path
+    from src.bioxp.oem_homing_routes import OemScriptMoveExecuteRequest, execute_oem_scriptmove_path
     _bind_test_position_table(monkeypatch)
     _write_bundle(tmp_path)
     monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
 
     try:
-        asyncio.run(execute_oem_scriptmove_path({
+        asyncio.run(execute_oem_scriptmove_path(OemScriptMoveExecuteRequest(**{
             "mode": "live",
             "location_id": "LOC_MS",
             "current_loc": "LOC_MS",
             "gripper_confirmed": True,
-        }))
+        })))
     except HTTPException as exc:
         assert exc.status_code == 409
-        assert "quarantined" in str(exc.detail).lower()
+        assert "ack" in str(exc.detail).lower()
     else:
         raise AssertionError("live execution without ack should fail closed")

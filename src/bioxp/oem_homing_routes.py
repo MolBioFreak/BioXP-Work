@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 from .oem_config import find_oem_machine_config_bundle
 from .oem_homing_runtime import OemHomingDryRunRuntime
@@ -24,6 +26,47 @@ from .oem_shadow_readback_live import build_shadow_readback_artifact
 from .runtime_state import OemRuntimeStateError, get_active_oem_runtime_state_store
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
+
+
+class OemScriptMoveExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mode: Literal["dry_run", "preview", "live"] = "dry_run"
+    operator_ack: Literal["OEM_PATH_EXECUTE"] | None = None
+    reason: StrictStr | None = Field(default=None, max_length=240)
+    location_id: StrictStr = Field(min_length=1, max_length=64)
+    current_loc: StrictStr | StrictInt | None = None
+    current_well: StrictStr | StrictInt | None = None
+    column: StrictInt = 0
+    row: StrictInt = 0
+    positionflag: StrictInt = 0
+    current_x: StrictInt = 0
+    current_y: StrictInt = 0
+    current_z: StrictInt = 0
+    tip_loaded: StrictBool = False
+    tip_dirty: StrictBool = False
+    tip_location: StrictInt = -1
+    clean_path: StrictBool = False
+    device_type: StrictStr = "BIOXP"
+    gripper_confirmed: StrictBool = False
+    plate_on_gantry: StrictInt | StrictStr | None = None
+    location19_y: StrictInt | None = None
+    pseudo_z_home: Literal[500, 65000] | None = None
+    run_in_parallel: StrictBool = True
+    wait_timeout_s: float = Field(default=12.0, ge=0.5, le=60.0)
+    speed: StrictInt | None = None
+    acc: StrictInt | None = None
+    root_dir: StrictStr | None = None
+
+
+class OemHomeGZRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mode: Literal["dry_run", "preview", "live"] = "dry_run"
+    operator_ack: Literal["OEM_HOME_GZ"] | None = None
+    reason: StrictStr | None = Field(default=None, max_length=240)
+    delay_s: StrictInt = Field(default=0, ge=0, le=60)
+    wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
 
 
 def _plain_response(value: Any) -> Any:
@@ -431,11 +474,57 @@ def _execute_oem_step_live(
         if _step_result_failed(sub):
             result.update({"ok": False, "error": "sleep step failed"})
     elif op == "parallel":
-        result.update({
-            "ok": False,
-            "parallel_semantics": "fail_closed_exact_parallel_leaf_not_bound",
-            "error": "exact OEM parallel leaf executor is not bound",
-        })
+        children = step.get("steps")
+        if (
+            not isinstance(children, list)
+            or len(children) != 2
+            or {str(child.get("op")) for child in children if isinstance(child, Mapping)} != {"moveX", "moveY"}
+        ):
+            result.update({
+                "ok": False,
+                "parallel_semantics": "unsupported_parallel_shape",
+                "error": "OEM parallel step must contain exactly moveX and moveY",
+            })
+        else:
+            child_results: list[dict[str, Any] | None] = [None, None]
+            child_errors: list[str] = []
+
+            def run_child(index: int, child: dict[str, Any]) -> None:
+                try:
+                    child_results[index] = _execute_oem_step_live(
+                        child,
+                        motion_executor,
+                        wait_timeout_s=wait_timeout_s,
+                        speed=speed,
+                        acc=acc,
+                        path=f"{path}.parallel[{index}]",
+                        pseudo_z_home_steps=pseudo_z_home_steps,
+                    )
+                except Exception as exc:
+                    child_errors.append(f"{index}:{type(exc).__name__}:{exc}")
+
+            threads = [
+                threading.Thread(target=run_child, args=(index, dict(child)), daemon=False)
+                for index, child in enumerate(children)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            completed = [row for row in child_results if isinstance(row, dict)]
+            parallel_ok = bool(
+                not child_errors
+                and len(completed) == 2
+                and all(row.get("ok") is True for row in completed)
+            )
+            result.update({
+                "ok": parallel_ok,
+                "parallel_semantics": "source_task_wait_all_move_x_move_y",
+                "results": completed,
+                "parallel_errors": child_errors,
+            })
+            if not parallel_ok:
+                result["error"] = "OEM parallel moveX/moveY execution failed"
     else:
         result.update({"ok": False, "error": f"unsupported OEM path step op: {op}"})
     return result
@@ -496,38 +585,82 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
     mode = str(payload.get("mode") or "dry_run").strip().lower()
     if mode not in {"dry_run", "preview", "live"}:
         raise HTTPException(status_code=400, detail=f"unsupported scriptmove_execute mode: {mode}")
-    if mode == "live":
-        raise HTTPException(
-            status_code=409,
-            detail="legacy generic scriptmove live execution is quarantined; only typed OEM lifecycle parity work is permitted",
-        )
-    live_enabled = False
+    live_enabled = mode == "live"
     if live_enabled and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
         raise HTTPException(status_code=409, detail="operator_ack OEM_PATH_EXECUTE required for live OEM path execution")
     reason = str(payload.get("reason") or payload.get("operator_note") or "").strip()
     if live_enabled and not reason:
         raise HTTPException(status_code=409, detail="live OEM path execution requires a non-empty reason/operator_note")
+    planning_payload = dict(payload)
+    path_authority: Mapping[str, Any] | None = None
+    if live_enabled:
+        if motion_executor is None:
+            from . import api as api_mod
+
+            provider = api_mod._require_serial206_oem_initialization_provider("initialize_motors")
+            path_authority = provider.path_planning_authority(
+                expected_generation=int(api_mod.hardware_state.ownership_epoch)
+            )
+        else:
+            authority_reader = getattr(motion_executor, "path_planning_authority", None)
+            if callable(authority_reader):
+                candidate = authority_reader()
+                if isinstance(candidate, Mapping):
+                    path_authority = dict(candidate)
+        if not isinstance(path_authority, Mapping) or path_authority.get("ok") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "provider_owned_path_authority_unavailable",
+                    "authority": _plain_response(path_authority),
+                },
+            )
+        loc19 = load_bound_oem_position_table().resolve(location_id="LOC19")
+        planning_payload.update({
+            "current_loc": path_authority.get("current_loc"),
+            "current_well": path_authority.get("current_well"),
+            "current_x": path_authority.get("current_x"),
+            "current_y": path_authority.get("current_y"),
+            "current_z": path_authority.get("current_z"),
+            "tip_loaded": path_authority.get("tip_loaded"),
+            "tip_dirty": path_authority.get("tip_dirty"),
+            "clean_path": path_authority.get("clean_path"),
+            "tip_location": path_authority.get("tip_location"),
+            "gripper_confirmed": path_authority.get("gripper_confirmed"),
+            "plate_on_gantry": path_authority.get("plate_on_gantry"),
+            "location19_y": int(loc19.coordinates["y"]),
+            "pseudo_z_home": path_authority.get("pseudo_z_home"),
+            "device_type": "BIOXP",
+        })
+    def strict_int(name: str, default: int | None = None) -> int:
+        value = planning_payload.get(name)
+        if value is None:
+            value = default
+        if type(value) is not int:
+            raise HTTPException(status_code=409, detail=f"{name} must be a strict provider-owned integer")
+        return value
+
     plan = await plan_oem_scriptmove_path(
-        location_id=str(payload.get("location_id") or "UNKNOWN"),
-        current_loc=payload.get("current_loc"),
-        current_well=payload.get("current_well"),
-        column=int(payload.get("column") or 0),
-        row=int(payload.get("row") or 0),
-        positionflag=int(payload.get("positionflag") or 0),
-        current_x=int(payload.get("current_x") or 0),
-        current_y=int(payload.get("current_y") or 0),
-        current_z=int(payload.get("current_z") or 0),
-        tip_loaded=bool(payload.get("tip_loaded") or False),
-        tip_dirty=bool(payload.get("tip_dirty") or False),
-        tip_location=int(payload.get("tip_location") if payload.get("tip_location") is not None else -1),
-        clean_path=bool(payload.get("clean_path") or False),
-        device_type=str(payload.get("device_type") or ""),
-        gripper_confirmed=bool(payload.get("gripper_confirmed") or False),
-        plate_on_gantry=payload.get("plate_on_gantry"),
-        location19_y=payload.get("location19_y"),
-        pseudo_z_home=payload.get("pseudo_z_home"),
-        run_in_parallel=bool(payload.get("run_in_parallel") if payload.get("run_in_parallel") is not None else True),
-        root_dir=payload.get("root_dir"),
+        location_id=str(planning_payload.get("location_id") or "UNKNOWN"),
+        current_loc=planning_payload.get("current_loc"),
+        current_well=planning_payload.get("current_well"),
+        column=strict_int("column", 0),
+        row=strict_int("row", 0),
+        positionflag=strict_int("positionflag", 0),
+        current_x=strict_int("current_x", 0),
+        current_y=strict_int("current_y", 0),
+        current_z=strict_int("current_z", 0),
+        tip_loaded=bool(planning_payload.get("tip_loaded") or False),
+        tip_dirty=bool(planning_payload.get("tip_dirty") or False),
+        tip_location=strict_int("tip_location", -1),
+        clean_path=bool(planning_payload.get("clean_path") or False),
+        device_type=str(planning_payload.get("device_type") or ""),
+        gripper_confirmed=bool(planning_payload.get("gripper_confirmed") or False),
+        plate_on_gantry=planning_payload.get("plate_on_gantry"),
+        location19_y=planning_payload.get("location19_y"),
+        pseudo_z_home=planning_payload.get("pseudo_z_home"),
+        run_in_parallel=bool(planning_payload.get("run_in_parallel") if planning_payload.get("run_in_parallel") is not None else True),
+        root_dir=planning_payload.get("root_dir"),
     )
     execution_steps = [_execution_preview_for_step(step) for step in plan.get("steps") or []]
     base = {
@@ -543,6 +676,7 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
         "switch_mask_mutation_commanded": False,
         "operator_ack": payload.get("operator_ack") if live_enabled else None,
         "reason": reason or None,
+        "path_planning_authority": _plain_response(path_authority),
         "live_motion_note": "Controller execution is not independent physical proof; supervised operator/camera observation is still required.",
     }
     if not live_enabled:
@@ -554,20 +688,37 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
     acc = payload.get("acc")
     speed_i = None if speed is None else int(speed)
     acc_i = None if acc is None else int(acc)
+    if live_enabled and (speed_i is not None or acc_i is not None):
+        raise HTTPException(
+            status_code=409,
+            detail="live OEM path speed/acceleration are source-owned; use the distinct OEM Z tuning actions",
+        )
 
     if motion_executor is None:
         from . import api as api_mod
 
         def _run_live() -> dict[str, Any]:
             api_mod._require_motion_route_ready()
-            executor = _ApiPathMotionExecutor(api_mod)
-            return _execute_oem_steps_live(
-                list(plan.get("steps") or []),
-                executor,
-                wait_timeout_s=wait_timeout_s,
-                speed=speed_i,
-                acc=acc_i,
+            provider_result = api_mod._execute_provider_z_intent(
+                "path_execute",
+                {
+                    "steps": list(plan.get("steps") or []),
+                    "wait_timeout_s": wait_timeout_s,
+                    "path_context": {
+                        "current_location": payload.get("location_id"),
+                        "current_well": strict_int("row", 0) * 12 + strict_int("column", 0),
+                    },
+                },
             )
+            inner = provider_result.get("result") if isinstance(provider_result, Mapping) else None
+            execution = inner.get("execution") if isinstance(inner, Mapping) else None
+            return {
+                "ok": provider_result.get("ok") is True,
+                "executor_status": "provider_owned_z_path_complete",
+                "provider_result": provider_result,
+                "execution_results": execution,
+                "motion_commanded": True,
+            }
 
         live_result = await api_mod._run_blocking(
             "OEM scriptmoveTo guarded live executor",
@@ -591,25 +742,31 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
 
 
 @router.post("/motion/oem/pathing/scriptmove_execute")
-async def execute_oem_scriptmove_path(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return await _execute_oem_scriptmove_path_impl(payload)
+async def execute_oem_scriptmove_path(payload: OemScriptMoveExecuteRequest) -> dict[str, Any]:
+    return await _execute_oem_scriptmove_path_impl(payload.model_dump(exclude_none=True))
 
 
 @router.post("/motion/oem/home_gz")
-async def execute_oem_home_gz(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def execute_oem_home_gz(req: OemHomeGZRequest) -> dict[str, Any]:
     """Dedicated ClassControlInterface.homeGZ composite command."""
-    payload = payload or {}
-    mode = str(payload.get("mode") or "dry_run").strip().lower()
-    if mode not in {"dry_run", "preview", "live"}:
-        raise HTTPException(status_code=400, detail=f"unsupported homeGZ mode: {mode}")
+    payload = req.model_dump(exclude_none=True)
+    mode = req.mode
     if mode == "live":
-        raise HTTPException(
-            status_code=409,
-            detail="homeGZ live execution remains quarantined by caught_plate_recovery_not_live_proven",
+        if req.operator_ack != "OEM_HOME_GZ":
+            raise HTTPException(status_code=409, detail="operator_ack OEM_HOME_GZ required")
+        reason = str(req.reason or "").strip()
+        if not reason:
+            raise HTTPException(status_code=409, detail="live homeGZ requires a non-empty reason")
+        from . import api as api_mod
+        return await api_mod._run_blocking(
+            "OEM homeGZ provider execution",
+            lambda: api_mod._execute_provider_z_intent(
+                "home_gz",
+                {"delay_s": int(req.delay_s), "wait_timeout_s": float(req.wait_timeout_s)},
+            ),
+            timeout_s=float(req.wait_timeout_s) + 30.0,
         )
-    delay_s = int(payload.get("delay_s") or payload.get("delay") or 0)
-    if delay_s < 0 or delay_s > 60:
-        raise HTTPException(status_code=400, detail="homeGZ delay must be between 0 and 60 seconds")
+    delay_s = int(payload.get("delay_s") or 0)
     dry_run = {
         "ok": True,
         "mode": "dry_run",

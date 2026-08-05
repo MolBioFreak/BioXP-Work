@@ -5103,7 +5103,7 @@ class BioXpTester:
         self._oem_no_motion_profile_ready = bool(report["ok"] and {"x", "y", "z", "g", "door"}.issubset(ready))
         return report
 
-    def motor_oem_require_no_motion_profile(self, axis_key=None):
+    def motor_oem_require_no_motion_profile(self, axis_key=None, *, expected_overrides=None):
         """Require and verify OEM activation -> profile initialization ordering."""
         ready = set(getattr(self, "_oem_no_motion_profiles_ready", set()))
         current_generation = getattr(self, "_oem_active_board_lifecycle_generation", None)
@@ -5150,6 +5150,15 @@ class BioXpTester:
             6: int(preset["run_current"]),
             205: int(preset["stall_guard"]),
         }
+        if expected_overrides is not None:
+            if key != "z" or not isinstance(expected_overrides, dict):
+                raise ValueError("OEM profile overrides are supported only for serial-206 Z")
+            for raw_param, raw_value in expected_overrides.items():
+                if type(raw_param) is not int or raw_param not in {4, 5, 6}:
+                    raise ValueError(f"unsupported serial-206 Z profile override: {raw_param!r}")
+                if type(raw_value) is not int:
+                    raise ValueError(f"serial-206 Z profile override {raw_param} must be an integer")
+                expected[int(raw_param)] = int(raw_value)
         if preset.get("disable_right") is not None:
             expected[12] = int(bool(preset["disable_right"]))
         if preset.get("disable_left") is not None:
@@ -6469,7 +6478,21 @@ class BioXpTester:
                 "solenoid": solenoid,
                 "latch_status": False,
             }
-            raise RuntimeError("Plate caught in gripper after plate press")
+            return {
+                "ok": False,
+                "branch": "caught_plate_recovery",
+                "failure": "Plate caught in gripper after plate press",
+                "source_exception": "System.Exception",
+                "set_gripper_current": set_gripper_current,
+                "z_current": z_move,
+                "z_move": z_move_result,
+                "delay_s": int(delay_s),
+                "gripper_home": gripper_home,
+                "caught_plate": True,
+                "recovery": recovery,
+                "restore_gripper_idle_current": None,
+                "source_anchor": "ClassControlInterface.homeGZ:4674-4680",
+            }
 
         z_restore = self.motor_oem_move_absolute(
             z_profile["board"],
@@ -6483,8 +6506,15 @@ class BioXpTester:
             restore_idle = self.motor_set_axis_param(
                 g_profile["board"], 6, 10, motor=g_profile.get("motor", 0)
             )
+        command_results = [set_gripper_current, z_move, z_move_result, gripper_home, z_restore]
+        if restore_idle is not None:
+            command_results.append(restore_idle)
+        all_commands_ok = all(
+            isinstance(row, dict) and row.get("ok") is True
+            for row in command_results
+        )
         return {
-            "ok": bool(z_restore.get("ok") is True),
+            "ok": all_commands_ok,
             "branch": "normal_home_gz",
             "set_gripper_current": set_gripper_current,
             "z_current": z_move,
@@ -6494,6 +6524,7 @@ class BioXpTester:
             "caught_plate": False,
             "z_restore": z_restore,
             "restore_gripper_idle_current": restore_idle,
+            "failure": None if all_commands_ok else "home_gz_source_command_not_acknowledged",
             "source_anchor": "ClassControlInterface.homeGZ:4657-4687",
         }
 

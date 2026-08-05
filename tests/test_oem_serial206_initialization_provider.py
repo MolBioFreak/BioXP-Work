@@ -100,6 +100,15 @@ class FakeSerial206Primitives:
             "controller_terminal_state_verified": True,
         }
 
+    def z_execute_path(self, *, steps, wait_timeout_s, pseudo_home_steps):
+        self.calls.append("path")
+        return {
+            "ok": True,
+            "controller_command_acknowledged": True,
+            "controller_terminal_state_verified": True,
+            "execution": [{"ok": True, "op": dict(steps[0]).get("op")}],
+        }
+
     def z_set_home(self):
         self.calls.append("set-home")
         return {
@@ -119,6 +128,9 @@ class FakeSerial206Primitives:
             "controller_command_acknowledged": True,
             "controller_terminal_state_verified": True,
         }
+
+    def z_clear_profile_overrides(self):
+        return None
 
     def z_reconcile_switch_masks(self):
         self.calls.append("reconcile-switch-masks")
@@ -170,6 +182,12 @@ class ReferenceStore:
         axis = command.axis.value if hasattr(command.axis, "value") else str(command.axis)
         self.transitions.append(("desynced", axis))
         return {"axis": axis, "state": "desynced", "persisted": True}
+
+    def snapshot(self, axes):
+        return {
+            "ok": True,
+            "rows": {str(axis): {"axis": str(axis), "state": "referenced"} for axis in axes},
+        }
 
 
 def _commissioning(generation: int = 11):
@@ -448,7 +466,7 @@ def test_initialize_motion_live_is_truthfully_unavailable_when_exact_sequence_is
     assert primitives.calls == []
 
 
-def test_provider_owns_durable_z_prepare_home_observation_and_move_lifecycle(tmp_path):
+def test_provider_owns_durable_z_prepare_controller_home_and_move_lifecycle(tmp_path):
     primitives = FakeSerial206Primitives()
     references = ReferenceStore()
     provider = _provider(tmp_path, primitives, references)
@@ -472,28 +490,9 @@ def test_provider_owns_durable_z_prepare_home_observation_and_move_lifecycle(tmp
         "manual_home", expected_generation=11, idempotency_key="z-home-1"
     )
     assert home["ok"] is True
-    assert home["z_state"] == "awaiting_operator_observation"
-    assert references.transitions == [("desynced", "z"), ("desynced", "z")]
-
-    command_id = home["authority_receipt"]["command_id"]
-    observation = provider.record_z_observation(
-        command_id=command_id,
-        observation_command_id="operator-z-observation-1",
-        verdict="pass",
-        physical_motion_observed=True,
-        expected_direction_observed=True,
-        home_endpoint_observed=True,
-        stopped_observed=True,
-        note="Observed Z shaft reach the home switch and stop",
-        expected_generation=11,
-    )
-    assert observation["ok"] is True
-    assert observation["z_state"] == "referenced_ready"
-    assert observation["observation_receipt"]["command_id"] == "operator-z-observation-1"
-    assert observation["observation_receipt"]["observes_command_id"] == command_id
-    assert observation["authority_receipt"]["observation_receipt_id"] == "operator-z-observation-1"
-    assert observation["authority_receipt"]["operator_assessment"]["home_endpoint_observed"] is True
-    assert references.transitions[-1] == ("referenced", "z")
+    assert home["z_state"] == "referenced_ready"
+    assert home["result"]["reference_persistence"]["ok"] is True
+    assert references.transitions == [("desynced", "z"), ("referenced", "z")]
 
     move = provider.execute_z_intent(
         "move_steps",
@@ -504,6 +503,91 @@ def test_provider_owns_durable_z_prepare_home_observation_and_move_lifecycle(tmp
     assert move["ok"] is True
     assert move["z_state"] == "referenced_ready"
     assert primitives.calls == ["prepare", "manual-home", "move-steps:25"]
+
+
+def test_live_path_planning_authority_comes_from_provider_controller_and_durable_state(tmp_path):
+    primitives = FakeSerial206Primitives()
+    setattr(primitives, "_read_axis_position", lambda axis: {"x": 101, "y": 202, "z": 303}[axis])
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-path-authority"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="home-path-authority"
+    )["ok"] is True
+    state = provider.state_store.read_oem_serial206_initialization_state()
+    state["machine_status"].update({
+        "tip_loaded": False,
+        "tip_dirty": False,
+        "tip_location": -1,
+        "plate_on_gantry": None,
+        "current_location": 6,
+        "current_well": 0,
+        "psudo_z_home_steps": 65000,
+    })
+    provider.state_store.write_oem_serial206_initialization_state(state)
+
+    authority = provider.path_planning_authority(expected_generation=11)
+
+    assert authority["ok"] is True
+    assert (authority["current_x"], authority["current_y"], authority["current_z"]) == (101, 202, 303)
+    assert authority["current_loc"] == 6
+    assert authority["tip_loaded"] is False
+    assert authority["clean_path"] is False
+    assert authority["gripper_confirmed"] is True
+
+    clean_mode = provider.execute_z_intent(
+        intent="set_clean_path",
+        inputs={"enabled": True},
+        expected_generation=11,
+        idempotency_key="clean-path-on",
+    )
+    assert clean_mode["ok"] is True
+    assert clean_mode["result"]["clean_path_persisted"] is True
+    assert provider.path_planning_authority(expected_generation=11)["clean_path"] is True
+
+    executed = provider.execute_z_intent(
+        intent="path_execute",
+        inputs={
+            "steps": [{"op": "moveZ", "z": 1000}],
+            "path_context": {"current_location": "LOC_MS", "current_well": 25},
+        },
+        expected_generation=11,
+        idempotency_key="path-authority-update",
+    )
+    assert executed["ok"] is True
+    assert executed["result"]["path_context_persisted"] == {
+        "current_location": "LOC_MS",
+        "current_well": 25,
+    }
+    authority_after = provider.path_planning_authority(expected_generation=11)
+    assert authority_after["current_loc"] == "LOC_MS"
+    assert authority_after["current_well"] == 25
+
+
+def test_live_path_authority_rejects_loaded_tip_without_authoritative_tip_location(tmp_path):
+    primitives = FakeSerial206Primitives()
+    setattr(primitives, "_read_axis_position", lambda axis: 0)
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="prepare-loaded-tip-authority"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="home-loaded-tip-authority"
+    )["ok"] is True
+    state = provider.state_store.read_oem_serial206_initialization_state()
+    state["machine_status"].update({
+        "tip_loaded": True,
+        "tip_dirty": False,
+        "tip_location": -1,
+        "current_location": 6,
+        "current_well": 0,
+    })
+    provider.state_store.write_oem_serial206_initialization_state(state)
+
+    authority = provider.path_planning_authority(expected_generation=11)
+
+    assert authority == {"ok": False, "blockers": ["loaded_tip_location_not_authoritative"]}
 
 
 def test_failed_manual_home_accepts_movement_only_observation_as_historical_annotation(tmp_path):
@@ -734,30 +818,24 @@ def test_z_manual_home_rejects_stale_board_lifecycle_generation(tmp_path):
     assert recovered["z_lifecycle"]["board_lifecycle_generation"] == 42
 
 
-def test_diagnostic_home_requires_named_confirmation_and_never_awaits_reference_observation(tmp_path):
+def test_diagnostic_home_has_no_non_oem_confirmation_or_observation_gate(tmp_path):
     primitives = FakeSerial206Primitives()
-    provider = _provider(tmp_path, primitives, ReferenceStore())
+    references = ReferenceStore()
+    provider = _provider(tmp_path, primitives, references)
     assert provider.execute_z_intent(
         "prepare", expected_generation=11, idempotency_key="prepare-for-diagnostic"
     )["ok"] is True
 
-    rejected = provider.execute_z_intent(
+    diagnosed = provider.execute_z_intent(
         "diagnostic_home_axis",
         expected_generation=11,
         idempotency_key="diagnostic-without-confirm",
     )
-    assert rejected["ok"] is False
-    assert "explicit_confirmation_required:DIAGNOSTIC_Z_HOME_597" in rejected["blockers"]
-
-    diagnosed = provider.execute_z_intent(
-        "diagnostic_home_axis",
-        inputs={"confirm": "DIAGNOSTIC_Z_HOME_597"},
-        expected_generation=11,
-        idempotency_key="diagnostic-with-confirm",
-    )
     assert diagnosed["ok"] is True
-    assert diagnosed["z_state"] == "prepared_unreferenced"
+    assert diagnosed["z_state"] == "referenced_ready"
+    assert diagnosed["result"]["reference_persistence"]["ok"] is True
     assert diagnosed["z_lifecycle"]["awaiting_observation_receipt_id"] is None
+    assert references.transitions[-1] == ("referenced", "z")
 
 
 def test_production_adapter_reports_command_and_terminal_receipts_from_nested_move_z_home():
@@ -766,7 +844,7 @@ def test_production_adapter_reports_command_and_terminal_receipts_from_nested_mo
             assert axis == "z"
             return {"board": 4, "motor": 1}
 
-        def motor_oem_require_no_motion_profile(self, axis):
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
             assert axis == "z"
             return {"ok": True}
 
@@ -788,38 +866,13 @@ def test_production_adapter_reports_command_and_terminal_receipts_from_nested_mo
     adapter = subject.Serial206ProductionPrimitiveAdapter(
         Tester(), object(), authority_provider=lambda: object(), generation_provider=lambda: 11
     )
-    result = adapter.z_manual_home(timeout_s=30.0)
+    result = adapter.z_move_z_home(timeout_s=30.0)
 
     assert result["ok"] is True
     assert result["controller_command_acknowledged"] is True
     assert result["controller_terminal_state_verified"] is True
     assert result["motor_output_state"] == "stopped_readback"
     assert result["physical_effect_verified"] is False
-
-
-def test_z_observation_rejects_board_generation_change_after_home(tmp_path):
-    primitives = FakeSerial206Primitives()
-    provider = _provider(tmp_path, primitives, ReferenceStore())
-    assert provider.execute_z_intent(
-        "prepare", expected_generation=11, idempotency_key="prepare-before-observation-generation"
-    )["ok"] is True
-    homed = provider.execute_z_intent(
-        "manual_home", expected_generation=11, idempotency_key="home-before-observation-generation"
-    )
-    command_id = homed["authority_receipt"]["command_id"]
-    provider.preparation_provider.board_generation = 42
-
-    with pytest.raises(ValueError, match="board lifecycle generation changed"):
-        provider.record_z_observation(
-            command_id=command_id,
-            verdict="pass",
-        physical_motion_observed=True,
-        expected_direction_observed=True,
-        home_endpoint_observed=True,
-        stopped_observed=True,
-            note="Observation arrived after a board lifecycle change.",
-            expected_generation=11,
-        )
 
 
 def test_z_reference_is_not_published_when_durable_persistence_fails(tmp_path):
@@ -847,21 +900,10 @@ def test_z_reference_is_not_published_when_durable_persistence_fails(tmp_path):
         "manual_home", expected_generation=11, idempotency_key="home-before-persistence-failure"
     )
 
-    observed = provider.record_z_observation(
-        command_id=homed["authority_receipt"]["command_id"],
-        verdict="pass",
-        physical_motion_observed=True,
-        expected_direction_observed=True,
-        home_endpoint_observed=True,
-        stopped_observed=True,
-        note="Physical observation passed but persistence is forced to fail.",
-        expected_generation=11,
-    )
-
-    assert observed["ok"] is False
-    assert observed["error"] == "z_reference_persistence_failed"
-    assert observed["z_state"] == "failed_latched"
-    assert observed["z_lifecycle"]["reference_state"] == "desynced"
+    assert homed["ok"] is False
+    assert homed["result"]["failure"].startswith("z_reference_publication_failed:")
+    assert homed["z_state"] == "failed_latched"
+    assert homed["z_lifecycle"]["reference_state"] == "desynced"
 
 
 def test_reference_publication_is_compensated_when_final_lifecycle_commit_fails(tmp_path):
@@ -995,25 +1037,14 @@ def test_z_observation_cannot_publish_reference_without_durable_reference_store(
     assert provider.execute_z_intent(
         "prepare", expected_generation=11, idempotency_key="prepare-no-reference-store"
     )["ok"] is True
+    provider.reference_store = None
     home = provider.execute_z_intent(
         "manual_home", expected_generation=11, idempotency_key="home-no-reference-store"
     )
-    provider.reference_store = None
 
-    observed = provider.record_z_observation(
-        command_id=home["authority_receipt"]["command_id"],
-        verdict="pass",
-        physical_motion_observed=True,
-        expected_direction_observed=True,
-        home_endpoint_observed=True,
-        stopped_observed=True,
-        note="Physical movement observed, but durable reference storage is unavailable.",
-        expected_generation=11,
-    )
-
-    assert observed["ok"] is False
-    assert observed["error"] == "z_reference_persistence_failed"
-    assert observed["z_state"] == "failed_latched"
+    assert home["ok"] is False
+    assert home["blockers"] == ["z_reference_store_not_bound"]
+    assert "manual-home" not in primitives.calls
 
 
 def test_z_position_value_accepts_controller_position_key_without_coercion():
@@ -1258,7 +1289,7 @@ def test_diagnostic_home_reports_nested_command_and_terminal_evidence_truthfully
             assert axis == "z"
             return {"board": 4, "motor": 1}
 
-        def motor_oem_require_no_motion_profile(self, axis):
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
             assert axis == "z"
             return {"ok": True}
 
@@ -1293,27 +1324,25 @@ def test_manual_home_preserves_compact_false_home_guard_and_controller_summary()
         def _motion_oem_axis_profile(self, axis):
             return {"board": 4, "motor": 1}
 
-        def motor_oem_require_no_motion_profile(self, axis):
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
             return {"ok": True}
 
         def motor_oem_verify_motion_interlock(self):
             return {"ok": True}
 
-        def motor_oem_move_z_home(self, *, rehome, timeout_s):
+        def motor_oem_go_home(self, axis, **kwargs):
+            assert axis == "z"
             return {
                 "ok": False,
-                "home": {
-                    "ok": False,
-                    "false_home_guard": "controller_async_error_130",
-                    "move_home": {"ok": True, "ack": dict(ACK)},
-                    "stop": {"ok": True, "first_delivery": dict(ACK), "second_delivery": dict(ACK)},
-                    "wait": {"stopped": True, "last_speed": 0, "last_ack": dict(ACK)},
-                    "position_before": {"position": -1808468},
-                    "position_after": {"position": -1969141},
-                    "home_before": {"value": 0},
-                    "home_after_stop": {"value": 1},
-                    "trace_tail": [{"position": index} for index in range(200)],
-                },
+                "false_home_guard": "controller_async_error_130",
+                "move_home": {"ok": True, "ack": dict(ACK)},
+                "stop": {"ok": True, "first_delivery": dict(ACK), "second_delivery": dict(ACK)},
+                "wait": {"stopped": True, "last_speed": 0, "last_ack": dict(ACK)},
+                "position_before": {"position": -1808468},
+                "position_after": {"position": -1969141},
+                "home_before": {"value": 0},
+                "home_after_stop": {"value": 1},
+                "trace_tail": [{"position": index} for index in range(200)],
             }
 
     adapter = subject.Serial206ProductionPrimitiveAdapter(
@@ -1329,17 +1358,36 @@ def test_manual_home_preserves_compact_false_home_guard_and_controller_summary()
     assert result["home_summary"]["home_after_stop"] == 1
 
 
-def test_all_zero_move_to_cannot_bypass_provider_owned_z_home_lifecycle():
+def test_all_zero_move_to_executes_source_compound_home_branch():
     class Tester:
         def __init__(self):
             self.calls = []
 
-        def motor_oem_move_z_home(self, **kwargs):
-            self.calls.append(("raw_z_home", kwargs))
+        def _motion_oem_axis_profile(self, axis):
+            assert axis == "z"
+            return {"board": 4, "motor": 1}
+
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
+            assert axis == "z"
             return {"ok": True}
 
+        def motor_oem_verify_motion_interlock(self):
+            return {"ok": True}
+
+        def motor_oem_move_z_home(self, **kwargs):
+            self.calls.append(("z_home", kwargs))
+            return {
+                "ok": True,
+                "home": {
+                    "ok": True,
+                    "move_home": {"ok": True, "ack": dict(ACK)},
+                    "stop": {"ok": True, "first_delivery": dict(ACK), "second_delivery": dict(ACK)},
+                    "wait": {"stopped": True, "last_speed": 0, "last_ack": dict(ACK)},
+                },
+            }
+
         def motor_oem_go_home(self, axis, **kwargs):
-            self.calls.append(("raw_axis_home", axis, kwargs))
+            self.calls.append(("axis_home", axis, kwargs))
             return {"ok": True}
 
     tester = Tester()
@@ -1354,10 +1402,11 @@ def test_all_zero_move_to_cannot_bypass_provider_owned_z_home_lifecycle():
         tip_loaded=False,
     )
 
-    assert result["ok"] is False
-    assert result["failure"] == "all_zero_move_to_requires_provider_owned_z_lifecycle"
-    assert result["physical_motion_commanded"] is False
-    assert tester.calls == []
+    assert result["ok"] is True
+    assert result["branch"] == "all_zero_home"
+    assert result["z_home_reference_verified"] is True
+    assert [row[0] for row in tester.calls].count("z_home") == 1
+    assert sorted(row[1] for row in tester.calls if row[0] == "axis_home") == ["x", "y"]
 
 
 def test_legacy_referenced_z_state_is_durably_desynced_during_migration(tmp_path):
@@ -1427,7 +1476,7 @@ def test_z_absolute_move_refuses_motion_without_valid_pre_position():
         def _motion_oem_axis_profile(self, axis):
             return {"board": 4, "motor": 1, "run_current": 31}
 
-        def motor_oem_require_no_motion_profile(self, axis):
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
             return {"ok": True}
 
         def motor_oem_verify_motion_interlock(self):
@@ -1470,7 +1519,7 @@ def test_z_relative_move_requires_fresh_target_event_and_acknowledged_zero_speed
         def _motion_oem_axis_profile(self, axis):
             return {"board": 4, "motor": 1, "axis_min_steps": 0, "axis_max_steps": 160000}
 
-        def motor_oem_require_no_motion_profile(self, axis):
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
             return {"ok": True}
 
         def motor_oem_verify_motion_interlock(self):

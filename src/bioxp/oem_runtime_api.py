@@ -83,11 +83,16 @@ def configure_runtime(
     *,
     store_root: str | None = None,
     terminal_snapshot_hook=None,
+    z_abort_provider=None,
+    z_resume_provider=None,
     autostart: bool = True,
 ):
     global _store, _worker, _events, _status, _full_lifecycle_runs
     _store = OEMRuntimeStore(store_root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
-    handlers = OEMRuntimeCommandHandlers()
+    handlers = OEMRuntimeCommandHandlers(
+        z_abort_provider=z_abort_provider,
+        z_resume_provider=z_resume_provider,
+    )
     from .oem_runtime_worker import OEMRuntimeWorker
     _full_lifecycle_runs = OemFullLifecycleRuns(_store)
     _full_lifecycle_runs.recover_all()
@@ -467,7 +472,7 @@ def runtime_event_pause():
 @router.post("/events/resume")
 def runtime_event_resume(req: RuntimeCommandRequest = RuntimeCommandRequest()):
     _, _, events, _ = _require_runtime()
-    return events.handle_resume(mode=req.mode)
+    return events.handle_resume(mode=req.mode, artifact_root=req.artifact_root)
 
 
 @router.post("/recover")

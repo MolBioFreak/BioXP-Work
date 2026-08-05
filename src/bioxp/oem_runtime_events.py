@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .oem_runtime_store import OEMRuntimeStore
-from .oem_runtime_types import OEMCommandName, OEMRuntimeCommand, OEMRuntimeEvent, OEMRuntimeStateName
+from .oem_runtime_types import OEMRuntimeEvent
 from .lifecycle_state import lifecycle_state
 
 
@@ -21,7 +21,11 @@ class OEMRuntimeEventRouter:
         lifecycle_before = lifecycle_state.projection()
         if lifecycle_before["operation_state"] == "paused":
             if door_closed and latch_closed:
-                actions.append("explicit_resume_required")
+                actions.extend([
+                    "door_close_observed_while_paused",
+                    "full_oem_wakefrompause_not_implemented",
+                    "use_explicit_z_resume_after_abort_for_z_recovery_only",
+                ])
             else:
                 actions.append("operator_close_door_required")
         elif door_open:
@@ -45,11 +49,30 @@ class OEMRuntimeEventRouter:
         row = self.store.append_event(OEMRuntimeEvent(event_type="pause", source=source, actions_taken=["user_paused=true"]).to_dict())
         return {"ok": True, "event": row, "runtime_state": lifecycle["operation_state"], "lifecycle": lifecycle}
 
-    def handle_resume(self, *, source: str = "api", mode: str = "dry_run") -> dict[str, Any]:
-        queued = self.worker.enqueue(OEMRuntimeCommand(name=OEMCommandName.WAKE_FROM_PAUSE.value, mode=mode, source="resume_event"))
+    def handle_resume(
+        self,
+        *,
+        source: str = "api",
+        mode: str = "dry_run",
+        artifact_root: str | None = None,
+    ) -> dict[str, Any]:
         lifecycle = lifecycle_state.projection()
-        row = self.store.append_event(OEMRuntimeEvent(event_type="resume", source=source, actions_taken=["queued_wakefrompause"]).to_dict())
-        return {"ok": True, "event": row, "queued": queued, "runtime_state": lifecycle["operation_state"], "lifecycle": lifecycle}
+        actions = [
+            "full_oem_wakefrompause_not_implemented",
+            "use_explicit_z_resume_after_abort_for_z_recovery_only",
+        ]
+        row = self.store.append_event(
+            OEMRuntimeEvent(event_type="resume", source=source, actions_taken=actions).to_dict()
+        )
+        return {
+            "ok": False,
+            "event": row,
+            "queued": False,
+            "blockers": ["full_oem_wakefrompause_not_implemented"],
+            "replacement_z_action": "/motion/oem/z/resume_after_abort",
+            "runtime_state": lifecycle["operation_state"],
+            "lifecycle": lifecycle,
+        }
 
     def record_physical_emergency_stop(
         self,

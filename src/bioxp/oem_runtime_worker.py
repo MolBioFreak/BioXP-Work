@@ -60,7 +60,12 @@ class OEMRuntimeWorker:
         self.store.append_command_queue(cmd.to_dict())
         self._queue.put(cmd)
         self.state = OEMWorkerStateName.QUEUED.value
-        lifecycle_state.transition("waiting", reason=f"runtime_command_queued:{cmd.name}")
+        lifecycle = lifecycle_state.projection()
+        if not (
+            cmd.name == "wakefrompause"
+            and lifecycle.get("operation_state") == "paused"
+        ):
+            lifecycle_state.transition("waiting", reason=f"runtime_command_queued:{cmd.name}")
         self._write_snapshot(OEMRuntimeStateName.IDLE_NOT_READY.value)
         return {"ok": True, "queued": True, "command": cmd.to_dict(), "queue_depth": self._queue.qsize()}
 
@@ -92,11 +97,17 @@ class OEMRuntimeWorker:
             self._run_command(cmd)
 
     def _run_command(self, cmd: OEMRuntimeCommand) -> dict[str, Any]:
+        is_resume = cmd.name == "wakefrompause"
+        resume_completed = False
         with self._state_lock:
             self.active_command = cmd
             self.state = OEMWorkerStateName.RUNNING.value
             self.gantry_available = False
-            lifecycle_state.transition("running", reason=f"runtime_worker:{cmd.name}")
+            if not (
+                is_resume
+                and lifecycle_state.projection().get("operation_state") == "paused"
+            ):
+                lifecycle_state.transition("running", reason=f"runtime_worker:{cmd.name}")
             self._write_snapshot(OEMRuntimeStateName.IDLE_NOT_READY.value)
         started = utc_ts()
         history = {"command": cmd.to_dict(), "started_at": started, "gantry_available_before": False}
@@ -107,8 +118,9 @@ class OEMRuntimeWorker:
             result = handler(cmd)
             handler_state = result.get("state")
             handler_ok = bool(result.get("ok", True))
+            resume_completed = bool(is_resume and handler_ok and result.get("ready") is True)
             lifecycle_state.transition(
-                "stopped" if handler_ok else "error",
+                "stopped" if (handler_ok and (not is_resume or resume_completed)) else "paused" if is_resume else "error",
                 reason=f"runtime_command_{'completed' if handler_ok else 'failed'}:{cmd.name}",
             )
             lifecycle = lifecycle_state.projection()
@@ -124,7 +136,10 @@ class OEMRuntimeWorker:
             history.update({"ok": handler_ok, "result": result, "finished_at": utc_ts()})
             if not history["ok"]:
                 self.state = OEMWorkerStateName.FAILED.value
-                lifecycle_state.transition("error", reason=f"runtime_command_failed:{cmd.name}")
+                lifecycle_state.transition(
+                    "paused" if is_resume else "error",
+                    reason=f"runtime_command_failed:{cmd.name}",
+                )
             self.store.append_command_history(history)
             return {"ok": history["ok"], "ran": True, "result": result, "worker": self.snapshot()}
         except Exception as exc:
@@ -134,7 +149,10 @@ class OEMRuntimeWorker:
             row = {**history, "ok": False, "error": str(exc), "result": failed_result, "finished_at": utc_ts()}
             self.store.append_command_history(row)
             self.store.append_error({"error_situation": "command_error", "command": cmd.to_dict(), "error": str(exc)})
-            lifecycle_state.transition("error", reason=f"runtime_worker_failed:{cmd.name}")
+            lifecycle_state.transition(
+                "paused" if is_resume else "error",
+                reason=f"runtime_worker_failed:{cmd.name}",
+            )
             return {"ok": False, "ran": True, "error": str(exc), "worker": self.snapshot()}
         finally:
             with self._state_lock:
@@ -142,7 +160,10 @@ class OEMRuntimeWorker:
                 self.gantry_available = True
                 if self.state != OEMWorkerStateName.FAILED.value:
                     self.state = OEMWorkerStateName.IDLE.value
-                    lifecycle_state.transition("stopped", reason=f"runtime_worker_completed:{cmd.name}")
+                    lifecycle_state.transition(
+                        "stopped" if (not is_resume or resume_completed) else "paused",
+                        reason=f"runtime_worker_completed:{cmd.name}",
+                    )
                 self._write_snapshot(OEMRuntimeStateName.IDLE_NOT_READY.value)
 
     def _attach_terminal_hardware_snapshot(self, cmd: OEMRuntimeCommand, result: dict[str, Any]) -> None:

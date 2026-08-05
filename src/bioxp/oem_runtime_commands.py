@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .oem_runtime_types import OEMRuntimeCommand
 
@@ -29,8 +29,26 @@ PREPARE_TO_RUN_JOB_READINESS_STEPS = [
     ("park_gantry", "BioXPMainWindow.cs:1760"),
 ]
 
+OEM_WARNING_SITUATIONS = frozenset({
+    "ENCLOSURE_OPEN", "ENCLOSURE_CLOSE", "UNLOCK_DOOR", "ABORT_JOB",
+    "WAIT_INITIALIZATION", "POWER_OFF", "MONITOR_SLEEP", "ABORTING_JOB",
+    "OPEN_DOOR_EVENT", "NETWORK_PROBLEM", "SOFTWARE_UPDATE",
+    "SOFTWARE_UPDATE_DOWNLOAD_FAILURE", "ABORT_PREP", "THERMAL_FAULT",
+    "ABORT_DELAY_START", "EXITPROGRAM", "LOCAL_MODE_WARNING",
+    "LOCAL_MODE_CHANGE", "REAGENT_BLOCK_SIZE",
+})
+
 
 class OEMRuntimeCommandHandlers:
+    def __init__(
+        self,
+        *,
+        z_abort_provider: Callable[[OEMRuntimeCommand], dict[str, Any]] | None = None,
+        z_resume_provider: Callable[[OEMRuntimeCommand], dict[str, Any]] | None = None,
+    ) -> None:
+        self.z_abort_provider = z_abort_provider
+        self.z_resume_provider = z_resume_provider
+
     def handlers(self) -> dict[str, Any]:
         return {
             "unlockProcess": self.handle_unimplemented_source_blocked,
@@ -86,13 +104,83 @@ class OEMRuntimeCommandHandlers:
         return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "blockers": [f"{command.name}_source_parity_not_implemented"]}
 
     def handle_abortjob(self, command: OEMRuntimeCommand) -> dict[str, Any]:
+        action = (command.params or {}).get("action", "ABORT_JOB")
+        if type(action) is not str or action not in OEM_WARNING_SITUATIONS:
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "blockers": ["invalid_oem_warning_situation"],
+            }
+        if command.mode != "live":
+            return {
+                "ok": True,
+                "ready": False,
+                "state": "abortjob_dry_run_complete",
+                "command": command.name,
+                "warning_situation": action,
+                "safe_action_taken": "would_execute_provider_owned_z_abort",
+                "physical_motion_commanded": False,
+            }
+        if self.z_abort_provider is None:
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "blockers": ["live_z_abort_provider_not_bound"],
+            }
+        result = self.z_abort_provider(command)
+        ok = bool(isinstance(result, dict) and result.get("ok") is True)
         return {
-            "ok": True,
+            "ok": ok,
             "ready": False,
-            "state": "aborting_job",
+            "state": "aborting_job" if ok else "recovery_required",
             "command": command.name,
-            "safe_action_taken": "abortjob_journaled_force_abort_required",
+            "warning_situation": action,
+            "safe_action_taken": "provider_owned_z_abort_executed",
+            "z_abort": result,
+            "physical_effect_verified": False,
         }
 
     def handle_wakefrompause(self, command: OEMRuntimeCommand) -> dict[str, Any]:
-        return {"ok": False, "ready": False, "state": "failed_closed", "command": command.name, "blockers": ["wakefrompause_rehome_predicates_unproven"]}
+        if command.mode != "live":
+            return {
+                "ok": True,
+                "ready": False,
+                "state": "wakefrompause_dry_run_complete",
+                "command": command.name,
+                "source_order": ["initialCheck", "rehome", "status_update", "dresumeJob"],
+                "physical_motion_commanded": False,
+            }
+        if self.z_resume_provider is None:
+            return {
+                "ok": False,
+                "ready": False,
+                "state": "failed_closed",
+                "command": command.name,
+                "blockers": ["live_z_resume_provider_not_bound"],
+            }
+        result = self.z_resume_provider(command)
+        z_recovered = bool(
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("z_state") == "referenced_ready"
+        )
+        return {
+            "ok": z_recovered,
+            "ready": False,
+            "state": "z_recovered_full_wake_required" if z_recovered else "recovery_required",
+            "command": command.name,
+            "source_order": ["initialCheck", "z_rehome"],
+            "z_recovery": result,
+            "omitted_non_z_source_work": ["full_rehome", "status_update", "dresumeJob"],
+            "blockers": (
+                ["full_oem_wakefrompause_not_implemented"]
+                if z_recovered
+                else ["z_rehome_failed_or_ambiguous"]
+            ),
+            "truth_level": "z_bearing_projection_only_not_full_wakefrompause",
+            "physical_effect_verified": False,
+        }

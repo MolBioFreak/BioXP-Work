@@ -79,6 +79,9 @@ class _ZPrimitiveSpy:
             "controller_terminal_state_verified": True,
         }
 
+    def z_clear_profile_overrides(self):
+        return None
+
     def current_board_lifecycle_generation(self):
         return self.board_generation
 
@@ -150,20 +153,8 @@ def test_provider_owns_z_lifecycle_and_routes_only_source_positive_intents():
         "manual_home", expected_generation=1, idempotency_key="home-12345678"
     )
     assert homed["ok"] is True
-    command_id = homed["authority_receipt"]["command_id"]
-    assert homed["z_state"] == "awaiting_operator_observation"
-
-    observed = provider.record_z_observation(
-        command_id=command_id,
-        verdict="pass",
-        physical_motion_observed=True,
-        expected_direction_observed=True,
-        home_endpoint_observed=True,
-        stopped_observed=True,
-        note="Independent physical observation recorded.",
-        expected_generation=1,
-    )
-    assert observed["z_state"] == "referenced_ready"
+    assert homed["z_state"] == "referenced_ready"
+    assert homed["result"]["reference_persistence"]["ok"] is True
 
     moved = provider.execute_z_intent(
         "move_steps",

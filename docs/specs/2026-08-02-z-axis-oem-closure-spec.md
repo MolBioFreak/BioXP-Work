@@ -30,14 +30,27 @@
 | OEM mode | Linux semantic | Live status |
 |---|---|---|
 | `initializeMotors` M01 | `axisSearchHome(Z,1791)` | Provider initialization ledger only |
-| panel/manual Z Home | `goHome(true,Z,1791,true)` | `oem.z.manual_home` |
-| board-test `HomeAxis("z")` | current `31`, then `axisSearchHome(Z,597)` | Explicitly confirmed diagnostic action only |
-| `MoveZHome` | current `31`, then `goHome(rehome,Z,1791,true)` | Production primitive under manual-home provider intent |
+| panel/manual Z Home | `goHome(true,Z,1791,true)` | `oem.z.manual_home`; exact controller home proof publishes reference |
+| board-test `HomeAxis("z")` | current `31`, then `axisSearchHome(Z,597)` | Distinct diagnostic intent; exact controller home proof publishes reference |
+| `MoveZHome` | current `31`, then `goHome(rehome,Z,1791,true)` | Separate `oem.z.move_z_home` intent and source identity |
 | no-motion `setHome` | `SAP1=0` plus exact zero readback and durable reference publication | `oem.z.set_home`; never motion proof |
 | `moveSteps` | bounded relative movement from an ACKed current position | `oem.z.move_steps` after `referenced_ready` |
 | `moveZ` | `max(PSUDO_Z_HOME, requested)`, current `31`, absolute movement | `oem.z.move_absolute` after `referenced_ready` |
-| `homeGZ` | coupled Z/gripper source transaction | Preserved as source primitive; not independently live-admitted as Z authority |
-| `moveTo(0,0,0)` | composite home in OEM source | Quarantined at this boundary; returns `all_zero_move_to_requires_provider_owned_z_lifecycle` without motion |
+| `homeGZ` | coupled Z/gripper source transaction | Distinct provider-owned live intent with caught-plate recovery evidence |
+| `moveTo(0,0,0)` | composite home in OEM source | Provider-owned compound home, not a generic zero-distance move |
+| `scriptmoveTo` | source path planner/executor | Strict provider-backed live route preserving serial order and parallel X/Y leaves |
+| Z profile controls | `setMaxSpeed`, `setMaxAcc`, `setZaxisVmax`, `setZaxisCurrentmax`, restore original speed | Distinct provider controls with exact readback |
+| coupled pipette methods | `moveGZ`, `lowerPipette`, `liftPipette` | Distinct provider intents and receipts |
+| Z self-test projection | `MoveZHome -> moveZ(92049,31,false) -> HomeAxis(Z,597)`; tolerance `±100` | Live Z-only projection; non-Z self-test stages are not claimed |
+| Z abort/recovery projection | full-machine `forceAbortMotion`; Z recovery `initialCheck -> Z rehome` | Abort is explicitly machine-wide; Z recovery is explicit and does not claim or release full `wakefrompause` job readiness |
+
+For live `scriptmoveTo`, destination/options remain operator inputs, but current X/Y/Z positions, current location/well, tip state, gripper reference, plate state, pseudo-home, and LOC19 Y are provider/controller/durable-state authority. Caller-supplied preview machine-state fields are ignored in live mode.
+
+The generic runtime `wakefrompause` command stays paused and reports
+`full_oem_wakefrompause_not_implemented`. Door-close events do not queue the
+Z-only recovery projection under that full-system name. Operators may invoke
+`/motion/oem/z/resume_after_abort` to recover Z reference authority after the
+machine-wide abort, but this does not restore thermal state or resume a job.
 
 ## 3. Canonical lifecycle and durable authority
 
@@ -51,6 +64,11 @@ States:
 4. `awaiting_operator_observation`
 5. `referenced_ready`
 6. `failed_latched`
+
+`awaiting_operator_observation` remains readable for legacy/interrupted receipts,
+but successful controller-proven home, self-test, composite home, and resume paths
+publish reference immediately. Physical observation is optional commissioning
+evidence, not a normal-operation admission gate.
 
 Authority is valid only when all applicable identities agree:
 
@@ -90,13 +108,13 @@ Failure invokes provider STOP and latches/desynchronizes reference authority. Th
 - Uses literal `goHome(true,1791)` without a Linux coordinate-distance cutoff.
 - Requires a fresh event window, ACKed move-left command, ACKed double STOP, ACKed speed-zero terminal readback, GAP9 home predicate, and ACKed `SAP1=0`/position-zero proof.
 - Preserves a compact `home_summary` with the exact `false_home_guard`, before/after positions, switch values, and controller evidence even when the bounded raw trace is omitted.
-- A successful controller home enters `awaiting_operator_observation`; it does not publish reference authority until independent operator observation and durable reference persistence both pass.
+- A successful controller home publishes durable reference authority immediately from GAP9, position-zero, speed-zero, ACK, and terminal evidence. Independent observation remains optional commissioning evidence.
 
 ### Diagnostic `HomeAxis("z")`
 
 - Remains separate at speed `597`.
-- Requires explicit `DIAGNOSTIC_Z_HOME_597` confirmation.
-- Never grants production reference authority or creates an observation wait.
+- Uses the distinct diagnostic route and source identity without an additional confirmation phrase.
+- Exact GAP9/position/speed terminal proof publishes reference and does not create an observation wait.
 
 ### No-motion `setHome`
 
@@ -127,7 +145,7 @@ Preparation performs no homing and no movement. Its acknowledged order is:
 
 ## 7. STOP contract
 
-Z STOP is the source double-delivery command. It is the only Z semantic action admitted on the safety-interrupt lane: the cockpit does not put it behind the normal-command pending state or a confirmation dialog, BMS does not fetch the full catalog before dispatch, and the robot operator plane does not queue its controller delivery behind the normal invocation/provider lifecycle locks. HTTP completion still waits for durable lifecycle/reference reconciliation after delivery.
+Z STOP is the source double-delivery command. STOP and abort are the Z semantic actions admitted on the independent interrupt lane: the cockpit must not put either behind normal-command pending state or catalog fetch, and the robot operator plane must not queue controller delivery behind normal invocation/provider lifecycle locks. HTTP completion may still wait for durable lifecycle/reference reconciliation after delivery.
 
 The provider increments a Z interrupt epoch before controller delivery. A normal Z intent that was waiting before that epoch is rejected; an intent already executing is STOPped and its lifecycle/reference authority is durably failed-latched and desynchronized after controller delivery.
 
@@ -145,7 +163,7 @@ Success requires:
 | 1 | No fakes in live path | Production provider binds only to managed tester/pipette owner; tests use fakes only as contracts | Closed |
 | 2 | Six source home contexts stay distinct | Startup, manual, diagnostic, `MoveZHome`, `homeGZ`, and composite `moveTo` remain separately named | Closed |
 | 3 | Manual `goHome(true,1791)` literal | No coordinate cutoff; compact false-guard evidence retained | Closed |
-| 4 | Diagnostic `axisSearchHome(597)` separate | Explicit confirmation; cannot reference | Closed |
+| 4 | Diagnostic `axisSearchHome(597)` separate | Distinct source identity; exact controller home proof publishes reference | Implemented; final acceptance pending |
 | 5 | Current semantics | Z source current `31`; no invented standby write in manual/diagnostic paths | Closed |
 | 6 | GAP9 exact home predicate | Raw active value `1`; ACKed readback and transition evidence | Closed |
 | 7 | GAP10 diagnostic only | Live-right-reference route retired | Closed |
@@ -153,16 +171,16 @@ Success requires:
 | 9 | Relative `moveSteps` | Production keyword binding, live current-position bounds, ACK/terminal/event/final-position proof | Closed |
 | 10 | Absolute `moveZ` | Dynamic pseudo-home clamp, current write/readback, guarded production primitive | Closed |
 | 11 | Coordinate bounds | `0..160000`; unreferenced/pre-home values are never motion authority | Closed |
-| 12 | STOP | Double ACK plus ACKed zero speed | Closed |
+| 12 | STOP/abort interruption | STOP double ACK and zero speed; abort shares the independent lane and invalidates reference | Implemented; active-motion acceptance pending |
 | 13 | Async event freshness | Monotonic window cursor; stale `128/130` ignored, fresh `130` fails | Closed |
 | 14 | Startup ordering | Full acknowledged board cycle precedes profile generation | Closed |
-| 15 | Composite source semantics | `homeGZ`/nonzero `moveTo` preserved; all-zero branch quarantined; incomplete composite live binding remains unavailable | Closed fail-closed boundary |
+| 15 | Composite source semantics | `homeGZ`, nonzero pathing, all-zero compound home, `moveGZ`, and pipette methods remain distinct provider-owned operations | Implemented; final acceptance pending |
 | 16 | `PSUDO_Z_HOME` state | Durable machine status uses exact `500` or `65000`; absolute move consumes it | Closed |
-| 17 | Persistent lifecycle and evidence boundary | Schema `v2`, migration, idempotent receipts, separate physical observation | Closed |
+| 17 | Persistent lifecycle and evidence boundary | Schema `v2`, migration, idempotent receipts; observation is evidence rather than an operational gate | Implemented; final acceptance pending |
 | 18 | Snapshot/interlock authority | Fresh canonical snapshot, typed enclosure, rail, arm, references | Closed |
-| 19 | Operator API | Semantic Z actions, admission, history, command-ID linkage, generation binding | Closed |
-| 20 | Tests and hardware separation | RED/GREEN source tests; software verification never labeled physical | Closed |
-| 21 | Explicit reporting | This ledger plus release/controller/physical ledgers in the deployment report | Closed |
+| 19 | Operator API | Semantic Z actions, admission, history, command-ID linkage, generation binding, independent STOP/abort dispatch | Implemented; BMS/cockpit acceptance pending |
+| 20 | Tests and hardware separation | Executable source contracts and live evidence stay separate; includes profile/path/coupled/self-test coverage | Acceptance pending |
+| 21 | Explicit reporting | This ledger plus release/controller/physical ledgers in the deployment report | Acceptance pending |
 
 ## 9. Physical evidence boundary
 

@@ -769,7 +769,6 @@ _NON_OPERATOR_COMPAT_PATHS = {
     "/motion/axis/absolute",
     "/motion/axis/home",
     "/motion/axis/zero",
-    "/motion/oem/z/move_z_home",
     "/motion/oem/z/live_right_reference",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
@@ -779,10 +778,21 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/manual/absolute": "initialize_motors",
     "/motion/oem/manual/home": "initialize_motors",
     "/motion/oem/z/prepare": "initialize_motors",
+    "/motion/oem/z/move_z_home": "initialize_motors",
+    "/motion/oem/z/control": "initialize_motors",
+    "/motion/oem/z/path_clean_mode": "initialize_motors",
+    "/motion/oem/pathing/scriptmove_execute": "initialize_motors",
+    "/motion/oem/home_gz": "initialize_motors",
+    "/motion/oem/z/move_gz": "initialize_motors",
+    "/motion/oem/z/lower_pipette": "initialize_motors",
+    "/motion/oem/z/lift_pipette": "initialize_motors",
+    "/motion/oem/z/self_test": "initialize_motors",
     "/motion/oem/z/reconcile_switch_masks": "initialize_motors",
     "/motion/oem/z/set_home": "initialize_motors",
     "/motion/oem/z/diagnostic_home_axis": "initialize_motors",
     "/motion/oem/z/stop": "initialize_motors",
+    "/motion/oem/z/abort": "initialize_motors",
+    "/motion/oem/z/resume_after_abort": "initialize_motors",
     "/motion/oem/z/observation": "initialize_motors",
 }
 
@@ -889,7 +899,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "label": label,
             "description": description,
             "source_anchor": source_anchor,
-            "requires_confirmation": bool(provider.get("requires_confirmation", True)),
+            "requires_confirmation": action_id in {
+                "oem.z.reconcile_switch_masks",
+                "oem.z.set_home",
+            },
             "category": "z-axis",
             "inputs": visible_inputs,
             "required_provider_capability": required_provider_capability,
@@ -950,9 +963,140 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         action_id="oem.z.manual_home",
         path="/motion/oem/manual/home",
         label="OEM Z manual goHome (1791)",
-        description="Source manual Z home: goHome(rehome=true, speed=1791) with post-home controller proof.",
-        source_anchor="ClassControlInterface.MoveZHome:4623-4632",
+        description="Source btnHomeZ_Click Z home: goHome(rehome=true, speed=1791) with post-home controller proof.",
+        source_anchor="ClassControlInterface.btnHomeZ_Click:2370-2378",
         fixed_inputs={"axis": "z"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.move_z_home",
+        path="/motion/oem/z/move_z_home",
+        label="OEM Z MoveZHome",
+        description="Distinct source MoveZHome identity: set Z max current, then goHome(rehome=true, speed=1791).",
+        source_anchor="ClassControlInterface.MoveZHome:4623-4632",
+        fixed_inputs={"rehome": True},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_max_speed",
+        path="/motion/oem/z/control",
+        label="OEM Z setMaxSpeed",
+        description="Set the Z maximum speed; the OEM default argument 0 is mapped to 1791.",
+        source_anchor="ClassControlInterface.setMaxSpeed:4689-4724",
+        fixed_inputs={"operation": "set_max_speed"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_max_acc",
+        path="/motion/oem/z/control",
+        label="OEM Z setMaxAcc",
+        description="Set the Z maximum acceleration; zero restores the source default 576.",
+        source_anchor="ClassControlInterface.setMaxAcc:4729-4764",
+        fixed_inputs={"operation": "set_max_acc"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_vmax",
+        path="/motion/oem/z/control",
+        label="OEM Z setZaxisVmax",
+        description="Set source Z Vmax/speed parameter 4; OEM argument zero restores 1791.",
+        source_anchor="ClassControlInterface.setZaxisVmax:4835-4848",
+        fixed_inputs={"operation": "set_vmax"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_current_max",
+        path="/motion/oem/z/control",
+        label="OEM Z setZaxisCurrentmax",
+        description="Set Z maximum current; OEM default sentinel 100 or omission selects the machine-bound down-current value.",
+        source_anchor="ClassControlInterface.setZaxisCurrentmax:4850-4860",
+        fixed_inputs={"operation": "set_current_max"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.restore_original_speed",
+        path="/motion/oem/z/control",
+        label="OEM Z restoreOriginalSpeed",
+        description="Restore source-original Z speed parameter 4 to 1791.",
+        source_anchor="ClassControlInterface.restoreOriginalSpeed:4769-4792",
+        fixed_inputs={"operation": "restore_original_speed"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.set_clean_path",
+        path="/motion/oem/z/path_clean_mode",
+        label="Set OEM clean-path mode",
+        description="Persist m_controlLib.cleanPath under the current provider generation; subsequent live scriptmoveTo planning reads this state instead of caller payload.",
+        source_anchor="ClassControlInterface.scriptmoveTo:3875-3903",
+        fixed_inputs={"axis": "z"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.scriptmove_to",
+        path="/motion/oem/pathing/scriptmove_execute",
+        label="OEM Z coordinated scriptmoveTo",
+        description="Execute source-shaped coordinated moveTo/scriptmoveTo with every Z leg owned by the serial-206 Z lifecycle.",
+        source_anchor="ClassControlInterface.scriptmoveTo:3718-4014; moveTo:4463-4620",
+        fixed_inputs={
+            "mode": "live",
+            "operator_ack": "OEM_PATH_EXECUTE",
+            "current_loc": None,
+            "current_well": None,
+            "current_x": 0,
+            "current_y": 0,
+            "current_z": 0,
+            "tip_loaded": False,
+            "tip_dirty": False,
+            "tip_location": -1,
+            "clean_path": False,
+            "device_type": "BIOXP",
+            "gripper_confirmed": False,
+            "plate_on_gantry": None,
+            "location19_y": None,
+            "pseudo_z_home": None,
+        },
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.move_gz",
+        path="/motion/oem/z/move_gz",
+        label="OEM Z moveGZ",
+        description="Launch gripper and Z absolute targets together and wait for both source events.",
+        source_anchor="ClassControlInterface.moveGZ:4369-4399",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.home_gz",
+        path="/motion/oem/home_gz",
+        label="OEM Z homeGZ",
+        description="Execute source homeGZ pseudo-home, gripper-home, caught-plate branch, and current restore transaction.",
+        source_anchor="ClassControlInterface.homeGZ:4657-4687",
+        fixed_inputs={"mode": "live", "operator_ack": "OEM_HOME_GZ"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.lower_pipette",
+        path="/motion/oem/z/lower_pipette",
+        label="OEM Z lowerPipette",
+        description="Move Z to immutable PositionTable zLow, with the exact optional +4030 overpress branch and one-second settle.",
+        source_anchor="ClassControlInterface.lowerPipette:4401-4421",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.lift_pipette",
+        path="/motion/oem/z/lift_pipette",
+        label="OEM Z liftPipette",
+        description="Move Z to immutable PositionTable zHigh.",
+        source_anchor="ClassControlInterface.liftPipette:4423-4431",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.self_test",
+        path="/motion/oem/z/self_test",
+        label="OEM Z self-test",
+        description="Run the source-bearing Z self-test order: MoveZHome, move to immutable SelfTestZMax, final HomeAxis(\"z\"), and require travel error at most 100 steps.",
+        source_anchor="ControlLib.selfTest:10744-10749; ClassBioXPSettings.SelfTestZMax",
+        fixed_inputs={},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -961,7 +1105,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="Diagnostic Z HomeAxis (597)",
         description="Diagnostic-only HomeAxis(\"z\") at 597; never presented as manual or startup home.",
         source_anchor="ClassControlInterface.HomeAxis:4997-5052",
-        fixed_inputs={"axis": "z", "confirm": "DIAGNOSTIC_Z_HOME_597"},
+        fixed_inputs={"axis": "z", "body": {}},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -971,6 +1115,24 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         description="Send the source-shaped unconditional double StopMotor and verify terminal zero speed.",
         source_anchor="ClassMotor.StopMotor:161-182",
         fixed_inputs={"axis": "z"},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.abort",
+        path="/motion/oem/z/abort",
+        label="OEM full-machine forceAbortMotion",
+        description="From the Z recovery controls, invoke OEM forceAbortMotion across every present motor board, then verify Z terminal zero speed. This is not Z-only.",
+        source_anchor="ClassControlInterface.forceAbortMotion:5095-5121",
+        fixed_inputs={"body": {}},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.resume_after_abort",
+        path="/motion/oem/z/resume_after_abort",
+        label="OEM Z after-abort recovery rehome",
+        description="Execute only the Z-bearing recovery sequence: powered initialCheck, then startup axisSearchHome(1791). This does not claim or release full application wakefrompause readiness.",
+        source_anchor="ControlLib.wakefrompause; ControlLib.rehome:8784-8796; initializeMotors Z stage:3350-3353",
+        fixed_inputs={},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -1390,7 +1552,7 @@ def install_operator_control_plane(
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
         action = by_id[action_id]
-        is_safety_interrupt = action_id == "oem.z.stop"
+        is_safety_interrupt = action_id in {"oem.z.stop", "oem.z.abort"}
         if action_id not in dispatch:
             assessment = _assess_action(action, machine_state(), payload.inputs)
             raise HTTPException(status_code=409, detail={"error": "action_unavailable", "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})

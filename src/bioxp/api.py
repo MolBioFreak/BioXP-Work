@@ -647,6 +647,8 @@ async def lifespan(app: FastAPI):
     # homing or motion from generic API lifespan.
     configure_oem_runtime(
         store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
+        z_abort_provider=_runtime_z_abort_provider,
+        z_resume_provider=_runtime_z_resume_provider,
         autostart=True,
     )
     try:
@@ -750,6 +752,47 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
+
+
+def _execute_runtime_provider_z_intent(
+    intent: str,
+    command: Any,
+    inputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    execute = getattr(provider, "execute_z_intent", None)
+    if not callable(execute):
+        return {"ok": False, "failure": "serial206_z_authority_not_bound"}
+    provider_inputs = dict(inputs)
+    provider_inputs["command_id"] = str(command.command_id)
+    result = execute(
+        intent,
+        inputs=provider_inputs,
+        expected_generation=int(hardware_state.ownership_epoch),
+        idempotency_key=f"runtime:{command.command_id}:{intent}",
+    )
+    return result if isinstance(result, dict) else {
+        "ok": False,
+        "failure": "serial206_z_provider_returned_non_object",
+    }
+
+
+def _runtime_z_abort_provider(command: Any) -> dict[str, Any]:
+    return _execute_runtime_provider_z_intent(
+        "abort",
+        command,
+        {"timeout_s": min(float(command.timeout_s), 3.0)},
+    )
+
+
+def _runtime_z_resume_provider(command: Any) -> dict[str, Any]:
+    return _execute_runtime_provider_z_intent(
+        "resume_after_abort",
+        command,
+        {
+            "wait_timeout_s": min(float(command.timeout_s), 60.0),
+        },
+    )
 
 
 def _get_tester() -> BioXpTester:
@@ -1277,15 +1320,92 @@ class OemZReconcileRequest(BaseModel):
 class OemZDiagnosticHomeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    confirm: Literal["DIAGNOSTIC_Z_HOME_597"]
-
 
 class OemMoveZHomeRequest(BaseModel):
     """Exact ClassControlInterface.MoveZHome input."""
 
     model_config = ConfigDict(extra="forbid")
 
-    rehome: bool = True
+    rehome: Literal[True] = True
+    wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
+
+
+class OemZControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operation: Literal[
+        "set_max_speed",
+        "set_max_acc",
+        "set_vmax",
+        "set_current_max",
+        "restore_original_speed",
+    ]
+    value: StrictInt | None = None
+
+    @model_validator(mode="after")
+    def _validate_control_value(self):
+        source_defaults = {
+            "set_max_speed": 0,
+            "set_max_acc": 0,
+            "set_vmax": 0,
+        }
+        if self.value is None and self.operation in source_defaults:
+            self.value = source_defaults[self.operation]
+        if self.operation == "restore_original_speed":
+            if self.value is not None:
+                raise ValueError("restore_original_speed does not accept value")
+            return self
+        if self.operation == "set_current_max":
+            if self.value is not None and self.value != 100 and not 0 <= self.value <= 31:
+                raise ValueError("set_current_max value must be in [0,31] or OEM default sentinel 100")
+            return self
+        if self.value is None:
+            raise ValueError(f"{self.operation} requires value")
+        if not 0 <= self.value <= 2_147_483_647:
+            raise ValueError(f"{self.operation} value must fit signed int32")
+        return self
+
+
+class OemZCleanPathRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: StrictBool
+
+
+class OemMoveGZRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    gripper_position_steps: StrictInt
+    z_position_steps: StrictInt = Field(ge=0, le=160000)
+    wait_timeout_s: float = Field(default=5.0, ge=0.5, le=60.0)
+
+
+class OemLowerPipetteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    location_id: StrictStr | StrictInt
+    overpress: StrictBool = False
+
+
+class OemLiftPipetteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    location_id: StrictStr | StrictInt
+
+
+class OemZSelfTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
+
+
+class OemZAbortRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class OemZResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
 
 
@@ -6494,7 +6614,7 @@ async def motion_oem_z_diagnostic_home_axis(req: OemZDiagnosticHomeRequest):
         "serial-206 diagnostic HomeAxis z",
         lambda: _execute_provider_z_intent(
             "diagnostic_home_axis",
-            {"timeout_s": 30.0, "confirm": req.confirm},
+            {"timeout_s": 30.0},
         ),
         timeout_s=45.0,
     )
@@ -6506,6 +6626,29 @@ async def motion_oem_z_stop():
         "serial-206 Z stop",
         lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
         timeout_s=10.0,
+    )
+
+
+@app.post("/motion/oem/z/abort")
+async def motion_oem_z_abort(req: OemZAbortRequest):
+    return await _run_safety_interrupt_blocking(
+        "serial-206 Z abort",
+        lambda _tester: _execute_provider_z_intent(
+            "abort", {"timeout_s": 3.0}
+        ),
+        timeout_s=10.0,
+    )
+
+
+@app.post("/motion/oem/z/resume_after_abort")
+async def motion_oem_z_resume_after_abort(req: OemZResumeRequest):
+    return await _run_blocking(
+        "serial-206 Z wakefrompause rehome",
+        lambda: _execute_provider_z_intent(
+            "resume_after_abort",
+            {"wait_timeout_s": float(req.wait_timeout_s)},
+        ),
+        timeout_s=float(req.wait_timeout_s) + 15.0,
     )
 
 
@@ -6548,14 +6691,88 @@ async def motion_oem_z_set_home(req: OemZSetHomeRequest):
 
 @app.post("/motion/oem/z/move_z_home")
 async def motion_oem_move_z_home(req: OemMoveZHomeRequest):
-    del req
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "duplicate_z_home_route_retired",
-            "replacement": "oem.z.manual_home",
-            "authority": "Serial206OemInitializationProvider",
-        },
+    return await _run_blocking(
+        "serial-206 ClassControlInterface.MoveZHome",
+        lambda: _execute_provider_z_intent(
+            "move_z_home",
+            {"timeout_s": float(req.wait_timeout_s), "rehome": bool(req.rehome)},
+        ),
+        timeout_s=float(req.wait_timeout_s) + 15.0,
+    )
+
+
+@app.post("/motion/oem/z/control")
+async def motion_oem_z_control(req: OemZControlRequest):
+    inputs: dict[str, Any] = {}
+    if req.value is not None:
+        inputs["value"] = int(req.value)
+    return await _run_blocking(
+        f"serial-206 Z {req.operation}",
+        lambda: _execute_provider_z_intent(req.operation, inputs),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/z/path_clean_mode")
+async def motion_oem_z_path_clean_mode(req: OemZCleanPathRequest):
+    return await _run_blocking(
+        "serial-206 provider-owned m_controlLib.cleanPath state",
+        lambda: _execute_provider_z_intent(
+            "set_clean_path", {"enabled": bool(req.enabled)}
+        ),
+        timeout_s=10.0,
+    )
+
+
+@app.post("/motion/oem/z/move_gz")
+async def motion_oem_z_move_gz(req: OemMoveGZRequest):
+    return await _run_blocking(
+        "serial-206 ClassControlInterface.moveGZ",
+        lambda: _execute_provider_z_intent(
+            "move_gz",
+            {
+                "gripper_position_steps": int(req.gripper_position_steps),
+                "z_position_steps": int(req.z_position_steps),
+                "wait_timeout_s": float(req.wait_timeout_s),
+            },
+        ),
+        timeout_s=float(req.wait_timeout_s) + 15.0,
+    )
+
+
+@app.post("/motion/oem/z/lower_pipette")
+async def motion_oem_z_lower_pipette(req: OemLowerPipetteRequest):
+    return await _run_blocking(
+        "serial-206 ClassControlInterface.lowerPipette",
+        lambda: _execute_provider_z_intent(
+            "lower_pipette",
+            {"location_id": req.location_id, "overpress": bool(req.overpress)},
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/z/lift_pipette")
+async def motion_oem_z_lift_pipette(req: OemLiftPipetteRequest):
+    return await _run_blocking(
+        "serial-206 ClassControlInterface.liftPipette",
+        lambda: _execute_provider_z_intent(
+            "lift_pipette",
+            {"location_id": req.location_id},
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/z/self_test")
+async def motion_oem_z_self_test(req: OemZSelfTestRequest):
+    return await _run_blocking(
+        "serial-206 ControlLib.selfTest Z segment",
+        lambda: _execute_provider_z_intent(
+            "self_test",
+            {"wait_timeout_s": float(req.wait_timeout_s)},
+        ),
+        timeout_s=float(req.wait_timeout_s) + 60.0,
     )
 
 

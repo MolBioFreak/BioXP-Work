@@ -14,7 +14,7 @@ def test_live_right_reference_route_is_retired():
     assert exc.value.detail["error"] == "z_live_right_reference_retired"
 
 
-def test_diagnostic_home_requires_named_597_confirmation_and_stays_separate(monkeypatch):
+def test_diagnostic_home_stays_separate_without_non_oem_confirmation_gate(monkeypatch):
     import src.bioxp.api as api
 
     calls = []
@@ -30,11 +30,11 @@ def test_diagnostic_home_requires_named_597_confirmation_and_stays_separate(monk
     monkeypatch.setattr(api, "_run_blocking", run_blocking)
     monkeypatch.setattr(api, "_execute_provider_z_intent", execute)
 
-    request = api.OemZDiagnosticHomeRequest(confirm="DIAGNOSTIC_Z_HOME_597")
+    request = api.OemZDiagnosticHomeRequest()
     result = asyncio.run(api.motion_oem_z_diagnostic_home_axis(request))
 
     assert result["ok"] is True
-    assert ("diagnostic_home_axis", {"timeout_s": 30.0, "confirm": "DIAGNOSTIC_Z_HOME_597"}) in calls
+    assert ("diagnostic_home_axis", {"timeout_s": 30.0}) in calls
 
 
 def test_manual_z_home_dispatches_only_provider_move_z_home_path(monkeypatch):

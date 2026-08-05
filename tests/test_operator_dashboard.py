@@ -278,6 +278,8 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
     by_id = {row["action_id"]: row for row in actions}
     required = {
         "oem.z.manual_home": [],
+        "oem.z.move_z_home": ["wait_timeout_s"],
+        "oem.z.set_clean_path": ["enabled"],
         "oem.z.move_steps": ["steps"],
         "oem.z.move_absolute": ["position_steps"],
         "oem.z.prepare": [],
@@ -298,12 +300,35 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
     for action_id, input_names in required.items():
         assert action_id in by_id
         assert [row["name"] for row in by_id[action_id]["inputs"]] == input_names
-        assert by_id[action_id]["requires_confirmation"] is (action_id != "oem.z.stop")
+        assert by_id[action_id]["requires_confirmation"] is (
+            action_id in {"oem.z.reconcile_switch_masks", "oem.z.set_home"}
+        )
         assert by_id[action_id]["required_provider_capability"] == "initialize_motors"
-        assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
+        if action_id == "oem.z.move_z_home":
+            assert dispatch[action_id]["fixed_inputs"]["rehome"] is True
+        else:
+            assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
-    assert not any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
+    assert any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
     assert not any(row["informational_path"] == "/motion/oem/z/live_right_reference" for row in actions)
+    assert {
+        "oem.z.set_max_speed",
+        "oem.z.set_max_acc",
+        "oem.z.set_vmax",
+        "oem.z.set_current_max",
+        "oem.z.restore_original_speed",
+        "oem.z.scriptmove_to",
+        "oem.z.move_gz",
+        "oem.z.home_gz",
+        "oem.z.lower_pipette",
+        "oem.z.lift_pipette",
+        "oem.z.self_test",
+        "oem.z.abort",
+        "oem.z.resume_after_abort",
+    } <= set(by_id)
+    assert by_id["oem.z.abort"]["inputs"] == []
+    assert by_id["oem.z.diagnostic_home_axis"]["inputs"] == []
+    assert by_id["oem.z.abort"]["requires_confirmation"] is False
 
 
 def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics():

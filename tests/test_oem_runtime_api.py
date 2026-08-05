@@ -15,7 +15,7 @@ def test_runtime_api_preserves_unrelated_abortjob_command(tmp_path, monkeypatch)
     assert queued.json()["queued"] is True
     terminal = runtime["worker"].run_next_for_tests()
     assert terminal["ok"] is True
-    assert terminal["result"]["safe_action_taken"] == "abortjob_journaled_force_abort_required"
+    assert terminal["result"]["safe_action_taken"] == "would_execute_provider_owned_z_abort"
 
 
 def test_runtime_api_rejects_unknown_generic_command_with_409(tmp_path, monkeypatch):
