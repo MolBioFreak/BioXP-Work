@@ -1280,7 +1280,7 @@ class OemManualAbsoluteRequest(BaseModel):
 
 
 class OemZSetHomeRequest(BaseModel):
-    operator_ack: Literal["SET_HOME_CURRENT_POSITION"]
+    operator_ack: Literal["SET_HOME_CURRENT_POSITION"] = "SET_HOME_CURRENT_POSITION"
     note: StrictStr = Field(..., min_length=1, max_length=240)
 
     @field_validator("note")

@@ -938,7 +938,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="Set OEM Z home at current position (no motion)",
         description="No-motion manual home: record the current physical position as controller 0 via ClassMotor.setHome (SAP param 1 = 0) with readback and a durable reference mark.",
         source_anchor="ClassMotor.setHome; SAP param 1 = actual position",
-        fixed_inputs={"axis": "z", "operator_ack": "SET_HOME_CURRENT_POSITION"},
+        fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(

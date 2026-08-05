@@ -36,6 +36,14 @@ def test_diagnostic_home_stays_separate_without_non_oem_confirmation_gate(monkey
     assert ("diagnostic_home_axis", {"timeout_s": 30.0}) in calls
 
 
+def test_set_home_defaults_its_only_valid_ack_literal():
+    import src.bioxp.api as api
+
+    request = api.OemZSetHomeRequest(note="Commissioned controller zero")
+
+    assert request.operator_ack == "SET_HOME_CURRENT_POSITION"
+
+
 def test_manual_z_home_dispatches_only_provider_move_z_home_path(monkeypatch):
     import src.bioxp.api as api
 
