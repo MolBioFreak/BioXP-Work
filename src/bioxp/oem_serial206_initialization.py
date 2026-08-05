@@ -788,7 +788,7 @@ class Serial206ProductionPrimitiveAdapter:
     def z_set_current_max(self, value: int | None = None) -> dict[str, Any]:
         profile = self._z_profile()
         source_value = 100 if value is None else int(value)
-        selected = int(profile["down_current"]) if source_value == 100 else source_value
+        selected = int(profile["run_current"]) if source_value == 100 else source_value
         return self._z_set_profile_parameter(
             param=6,
             value=selected,

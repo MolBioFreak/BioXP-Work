@@ -13,7 +13,7 @@ class _ProfileTester:
 
     def _motion_oem_axis_profile(self, axis):
         assert axis == "z"
-        return {"board": 4, "motor": 1, "down_current": 31}
+        return {"board": 4, "motor": 1, "run_current": 31}
 
     def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides):
         self.calls.append(("verify-profile", axis, dict(expected_overrides)))
