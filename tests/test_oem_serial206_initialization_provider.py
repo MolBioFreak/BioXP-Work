@@ -1541,8 +1541,16 @@ def test_z_relative_move_requires_fresh_target_event_and_acknowledged_zero_speed
         def motor_stop(self, board, *, motor):
             return {"ok": True, "first_delivery": dict(ACK), "second_delivery": dict(ACK)}
 
-        def motor_wait_stopped(self, board, *, motor, timeout_s, require_seen_nonzero):
-            return {"stopped": True, "last_speed": 0, "last_ack": dict(ACK)}
+        def motor_wait_stopped(self, board, *, motor, timeout_s, require_seen_nonzero, target_position=None):
+            return {
+                "stopped": True,
+                "last_speed": 0,
+                "seen_nonzero": True,
+                "target_position": target_position,
+                "target_reached": True,
+                "last_position": target_position,
+                "last_ack": dict(ACK),
+            }
 
         def collect_bus_events(self, *, duration_s, timeout_ms, max_events):
             sequence = self.window_calls * 10 + (1 if self.fresh_event else 0)

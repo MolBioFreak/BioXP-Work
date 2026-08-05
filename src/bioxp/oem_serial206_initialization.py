@@ -858,7 +858,11 @@ class Serial206ProductionPrimitiveAdapter:
         board = int(profile["board"])
         motor = int(profile["motor"])
         wait = self.tester.motor_wait_stopped(
-            board, motor=motor, timeout_s=float(wait_timeout_s), require_seen_nonzero=False
+            board,
+            motor=motor,
+            timeout_s=float(wait_timeout_s),
+            require_seen_nonzero=True,
+            target_position=int(target),
         )
         events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
         after_sequence = event_window.get("after_sequence") if isinstance(event_window, Mapping) else None

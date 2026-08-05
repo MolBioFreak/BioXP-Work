@@ -7126,13 +7126,24 @@ class BioXpTester:
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
 
-    def motor_wait_stopped(self, board_id, motor=0, timeout_s=4.0, poll_s=0.06, require_seen_nonzero=False, min_polls=3):
+    def motor_wait_stopped(
+        self,
+        board_id,
+        motor=0,
+        timeout_s=4.0,
+        poll_s=0.06,
+        require_seen_nonzero=False,
+        min_polls=3,
+        target_position=None,
+    ):
         t0 = time.monotonic()
         deadline = t0 + max(0.3, float(timeout_s))
         polls = 0
         last = None
         last_speed = None
         seen_nonzero = False
+        last_position = None
+        target_reached = False
         while time.monotonic() < deadline:
             row = self.motor_get_speed(board_id, motor=motor)
             polls += 1
@@ -7144,7 +7155,28 @@ class BioXpTester:
                 isinstance(last_speed, int)
                 and last_speed == 0
                 and polls >= int(max(1, min_polls))
-                and (not bool(require_seen_nonzero) or seen_nonzero)
+                and type(target_position) is int
+            ):
+                position_row = self.motor_get_position(board_id, motor=motor)
+                if (
+                    isinstance(position_row, Mapping)
+                    and position_row.get("ok") is True
+                    and isinstance(position_row.get("ack"), Mapping)
+                    and position_row["ack"].get("status") == 100
+                ):
+                    position_value = position_row.get("position")
+                    if type(position_value) is int:
+                        last_position = int(position_value)
+                        target_reached = last_position == int(target_position)
+            if (
+                isinstance(last_speed, int)
+                and last_speed == 0
+                and polls >= int(max(1, min_polls))
+                and (
+                    not bool(require_seen_nonzero)
+                    or seen_nonzero
+                    or target_reached
+                )
             ):
                 return {
                     "stopped": True,
@@ -7152,6 +7184,9 @@ class BioXpTester:
                     "polls": polls,
                     "last_speed": last_speed,
                     "seen_nonzero": seen_nonzero,
+                    "target_position": target_position,
+                    "target_reached": target_reached,
+                    "last_position": last_position,
                     "last_ack": last,
                 }
             time.sleep(max(0.02, float(poll_s)))
@@ -7161,7 +7196,10 @@ class BioXpTester:
             "polls": polls,
             "last_speed": last_speed,
             "seen_nonzero": seen_nonzero,
-            "ambiguous_no_motion": bool(require_seen_nonzero) and not seen_nonzero,
+            "target_position": target_position,
+            "target_reached": target_reached,
+            "last_position": last_position,
+            "ambiguous_no_motion": bool(require_seen_nonzero) and not seen_nonzero and not target_reached,
             "last_ack": last,
         }
 
