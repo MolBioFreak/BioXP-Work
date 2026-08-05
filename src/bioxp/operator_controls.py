@@ -1584,13 +1584,6 @@ def install_operator_control_plane(
                         "required": "integer in [0, 160000]",
                     },
                 )
-        elif action_id == "oem.z.set_home":
-            note = payload.inputs.get("note")
-            if not isinstance(note, str) or not note.strip():
-                raise HTTPException(
-                    status_code=422,
-                    detail={"error": "invalid_z_set_home_note", "required": "non-empty string"},
-                )
         elif action_id == "oem.z.observe":
             boolean_fields = (
                 "physical_motion_observed",
