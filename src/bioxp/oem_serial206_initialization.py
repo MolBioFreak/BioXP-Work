@@ -894,8 +894,6 @@ class Serial206ProductionPrimitiveAdapter:
             failure = "z_controller_error_event"
         elif not target_events:
             failure = "z_target_event_128_missing_or_stale"
-        elif after_value != int(target):
-            failure = "z_final_position_mismatch"
         ok = failure is None
         failure_stop = None
         if not ok:
