@@ -1370,14 +1370,15 @@ class Serial206ProductionPrimitiveAdapter:
             timeout_s=float(timeout_s),
             max_search_abs_delta=int(profile["home_search_max_abs_delta"]),
         )
+        go_home = home.get("go_home") if isinstance(home, Mapping) else None
         command_acknowledged = bool(
-            isinstance(home, Mapping)
-            and home.get("controller_command_acknowledged") is True
+            isinstance(go_home, Mapping)
+            and go_home.get("controller_command_acknowledged") is True
         )
         terminal_verified = bool(
-            isinstance(home, Mapping)
-            and home.get("controller_terminal_state_verified") is True
-            and home.get("controller_home_proof_verified") is True
+            isinstance(go_home, Mapping)
+            and go_home.get("controller_terminal_state_verified") is True
+            and go_home.get("controller_home_proof_verified") is True
         )
         ok = bool(
             isinstance(home, Mapping)
@@ -1394,10 +1395,10 @@ class Serial206ProductionPrimitiveAdapter:
             "initial_check_24v": _json_safe(rail),
             "home": _json_safe(home),
             "home_summary": {
-                "short_circuit": home.get("short_circuit") if isinstance(home, Mapping) else None,
+                "short_circuit": go_home.get("short_circuit") if isinstance(go_home, Mapping) else None,
                 "controller_home_proof_verified": bool(
-                    isinstance(home, Mapping)
-                    and home.get("controller_home_proof_verified") is True
+                    isinstance(go_home, Mapping)
+                    and go_home.get("controller_home_proof_verified") is True
                 ),
                 "source_return_code": home.get("source_return_code") if isinstance(home, Mapping) else None,
             },
