@@ -5265,7 +5265,8 @@ class BioXpTester:
                 board,
                 motor=motor,
                 timeout_s=min(float(timeout_s), 20.0),
-                require_seen_nonzero=False,
+                require_seen_nonzero=True,
+                target_position=10000,
             )
             time.sleep(0.50)
             home_after_preclear = self.motor_query_home_switch(board, motor=motor)
@@ -5448,7 +5449,8 @@ class BioXpTester:
                     board,
                     motor=motor,
                     timeout_s=min(float(timeout_s), 20.0),
-                    require_seen_nonzero=False,
+                    require_seen_nonzero=True,
+                    target_position=10000,
                 )
                 time.sleep(0.50)
                 rehome_position = self.motor_get_position(board, motor=motor)
