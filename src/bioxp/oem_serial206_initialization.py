@@ -1400,12 +1400,16 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_reconcile_switch_masks(self) -> dict[str, Any]:
+        expected = {12: 1, 13: 0}
         before = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
-        writes = {param: self.tester.motor_set_axis_param(4, param, 0, motor=1) for param in (12, 13)}
+        writes = {
+            param: self.tester.motor_set_axis_param(4, param, expected[param], motor=1)
+            for param in (12, 13)
+        }
         after = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
         ok = all(
             isinstance(writes[param], Mapping) and writes[param].get("ok") is True
-            and self._z_value(after[param]) == 0
+            and self._z_value(after[param]) == expected[param]
             for param in (12, 13)
         )
         return {
@@ -1417,7 +1421,11 @@ class Serial206ProductionPrimitiveAdapter:
             "writes": _json_safe(writes),
             "after": _json_safe(after),
             "source_exact": False,
-            "recovery_reason": "restore serial-206 source precondition GAP12=0 GAP13=0",
+            "machine_bound_expected": expected,
+            "recovery_reason": (
+                "restore serial-206 persistent Z wiring contract: "
+                "GAP12/right disabled, GAP13/GAP9-left enabled"
+            ),
         }
 
     def motor_get_axis_param(self, *args: Any, **kwargs: Any) -> Any:

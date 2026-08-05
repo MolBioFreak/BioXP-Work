@@ -111,8 +111,12 @@ class BioXpTester:
             "standby_current": 10,
             # Serial-206 immutable OEM machine config m_Z_MOTOR_STALL_GUARD_THRESHOLD.
             "stall_guard": 3,
-            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
-            # Absence means no-write; do not actively force controller mask params to 0.
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z;
+            # it relies on persistent machine configuration.  Serial-206 live
+            # evidence proves GAP10/right is asserted at GAP9 top and travel only
+            # works with the persistent right inhibit disabled.  GAP9/left stays
+            # enabled and remains the sole top-home authority.
+            "disable_right": True,
             "warm_enable": True,
         },
         "g": {

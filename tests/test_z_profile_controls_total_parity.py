@@ -68,6 +68,20 @@ def test_z_profile_control_rejects_readback_mismatch_without_recording_override(
     assert adapter._z_profile_overrides == {}
 
 
+def test_z_mask_reconciliation_restores_machine_bound_right_disabled_left_enabled():
+    tester = _ProfileTester()
+    tester.values[12] = 0
+    tester.values[13] = 1
+    adapter = _adapter(tester)
+
+    result = adapter.z_reconcile_switch_masks()
+
+    assert result["ok"] is True
+    assert result["machine_bound_expected"] == {12: 1, 13: 0}
+    assert tester.values[12] == 1
+    assert tester.values[13] == 0
+
+
 def test_z_current_max_oem_sentinel_100_selects_machine_down_current():
     adapter = _adapter(_ProfileTester())
 

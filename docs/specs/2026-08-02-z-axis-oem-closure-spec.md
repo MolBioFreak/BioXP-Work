@@ -141,7 +141,7 @@ Preparation performs no homing and no movement. Its acknowledged order is:
 4. mint board-lifecycle generation;
 5. wait for board state;
 6. initialize exact source profiles without motion;
-7. verify inherited Z switch masks and exact parameter readbacks.
+7. verify serial-206 persistent Z wiring state (`GAP12=1`, `GAP13=0`) and exact parameter readbacks; OEM source initialization leaves these Z parameters unchanged.
 
 ## 7. STOP contract
 
@@ -166,8 +166,8 @@ Success requires:
 | 4 | Diagnostic `axisSearchHome(597)` separate | Distinct source identity; exact controller home proof publishes reference | Implemented; final acceptance pending |
 | 5 | Current semantics | Z source current `31`; no invented standby write in manual/diagnostic paths | Closed |
 | 6 | GAP9 exact home predicate | Raw active value `1`; ACKed readback and transition evidence | Closed |
-| 7 | GAP10 diagnostic only | Live-right-reference route retired | Closed |
-| 8 | Switch-mask truth | GAP12/GAP13 precondition verified; explicit recovery requires re-prepare | Closed |
+| 7 | GAP10 diagnostic only | Live-right-reference route retired; its simultaneous assertion at GAP9 top is not opposite-end travel authority | Closed |
+| 8 | Switch-mask truth | Machine-bound `GAP12/right-disable=1`; `GAP13/GAP9-left-disable=0`; explicit recovery requires re-prepare | Closed |
 | 9 | Relative `moveSteps` | Production keyword binding, live current-position bounds, ACK/terminal/event/final-position proof | Closed |
 | 10 | Absolute `moveZ` | Dynamic pseudo-home clamp, current write/readback, guarded production primitive | Closed |
 | 11 | Coordinate bounds | `0..160000`; unreferenced/pre-home values are never motion authority | Closed |

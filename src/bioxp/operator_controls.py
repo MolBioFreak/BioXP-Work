@@ -522,17 +522,17 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             z_status = z_row.get("status") if isinstance(z_row, Mapping) else None
             z_switches = z_row.get("switch_activity") if isinstance(z_row, Mapping) else None
             z_preset = z_row.get("preset") if isinstance(z_row, Mapping) else None
-            left_mask_clear = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
-            right_mask_clear = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is False
+            left_home_enabled = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
+            right_inhibit_disabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is True
             # Reconciliation is the state-establishing action for this exact
             # precondition.  Requiring masks to be clear here makes recovery
             # impossible.  Preparation remains ordered after reconciliation.
             if action_id != "oem.z.reconcile_switch_masks":
                 dependencies.append(_dependency(
-                    "z_switch_masks_clear",
-                    "Z GAP12/GAP13 switch masks clear",
-                    left_mask_clear and right_mask_clear,
-                    "Z switch-disable masks are not both clear; restore the OEM no-motion profile.",
+                    "z_switch_masks_machine_bound",
+                    "Z machine-bound GAP12/GAP13 state",
+                    left_home_enabled and right_inhibit_disabled,
+                    "Expected GAP12/right disabled and GAP13/GAP9-left enabled; run Z mask reconciliation.",
                 ))
             # Preparation and mask reconciliation do not move Z and therefore
             # must not require an already-valid OEM coordinate.  Movement and
@@ -927,7 +927,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         action_id="oem.z.reconcile_switch_masks",
         path="/motion/oem/z/reconcile_switch_masks",
         label="Reconcile OEM Z switch masks",
-        description="Explicitly restore GAP12=0 and GAP13=0 after inherited Linux contamination; requires fresh Z preparation afterward.",
+        description="Restore the serial-206 persistent Z wiring state: disable mirrored GAP10/right inhibit while keeping GAP9/left home protection enabled; requires fresh Z preparation afterward.",
         source_anchor="ClassMotor param12 right-disable; param13 left-disable",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
