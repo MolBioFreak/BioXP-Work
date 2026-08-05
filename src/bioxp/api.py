@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Mapping, Optional, Protocol, cast
@@ -4638,10 +4639,14 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         async with _tester_transition_lock:
             tester = _get_tester()
             loop = asyncio.get_running_loop()
+            interrupt_context = copy_context()
+
+            def invoke_interrupt():
+                return interrupt_context.run(func, tester)
+
             return await loop.run_in_executor(
                 _safety_interrupt_executor,
-                func,
-                tester,
+                invoke_interrupt,
             )
 
     worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
