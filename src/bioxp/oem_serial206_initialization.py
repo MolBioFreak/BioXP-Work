@@ -1090,10 +1090,18 @@ class Serial206ProductionPrimitiveAdapter:
             isinstance(home_evidence, Mapping)
             and home_evidence.get("short_circuit") == "MotorHome_and_CurrentPosition_zero"
         )
-        command_acknowledged = bool(
-            isinstance(move_home, Mapping)
-            and move_home.get("ok") is True
-            and self._z_tmcl_success(move_home.get("ack"))
+        command_acknowledged = (
+            bool(
+                isinstance(home_evidence, Mapping)
+                and home_evidence.get("controller_home_proof_verified") is True
+                and home_evidence.get("controller_terminal_state_verified") is True
+            )
+            if source_short_circuit
+            else bool(
+                isinstance(move_home, Mapping)
+                and move_home.get("ok") is True
+                and self._z_tmcl_success(move_home.get("ack"))
+            )
         )
         terminal_verified = (
             bool(
