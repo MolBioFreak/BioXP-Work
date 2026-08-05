@@ -4177,9 +4177,20 @@ class Serial206OemInitializationProvider:
                         "interrupt_epoch": current_interrupt_epoch,
                     },
                 }
+            result_summary = {
+                "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
+                "failure": result.get("failure") if isinstance(result, Mapping) else None,
+                "source_return_code": result.get("source_return_code") if isinstance(result, Mapping) else None,
+                "travel_error_steps": result.get("travel_error_steps") if isinstance(result, Mapping) else None,
+                "self_test_pass": result.get("self_test_pass") if isinstance(result, Mapping) else None,
+                "initial_home_ok": bool(isinstance(result, Mapping) and isinstance(result.get("initial_move_z_home"), Mapping) and result["initial_move_z_home"].get("ok") is True),
+                "move_ok": bool(isinstance(result, Mapping) and isinstance(result.get("move"), Mapping) and result["move"].get("ok") is True),
+                "final_home_ok": bool(isinstance(result, Mapping) and isinstance(result.get("home"), Mapping) and result["home"].get("ok") is True),
+            }
             receipt.update({
                 "status": "completed" if ok else "failed",
                 "finished_at": time.time(),
+                "result_summary": result_summary,
                 "result": _json_safe(result),
                 "controller_command_acknowledged": bool(isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True),
                 "controller_terminal_state_verified": bool(isinstance(result, Mapping) and result.get("controller_terminal_state_verified") is True),
@@ -4283,7 +4294,7 @@ class Serial206OemInitializationProvider:
                     )
                 raise
             z = state["z_lifecycle"]
-            return {"ok": ok, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
+            return {"ok": ok, "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
 
     def record_z_observation(
         self,
