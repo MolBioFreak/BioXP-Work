@@ -3857,8 +3857,8 @@ class Serial206OemInitializationProvider:
                 control_value = values.get("value")
                 if control_value is not None and type(control_value) is not int:
                     blockers.append("z_set_current_max_value_must_be_integer_or_null")
-                elif type(control_value) is int and (control_value < 0 or control_value > 31):
-                    blockers.append("z_set_current_max_value_out_of_range_0_31")
+                elif type(control_value) is int and not (0 <= control_value <= 31 or control_value == 100):
+                    blockers.append("z_set_current_max_value_out_of_range_0_31_or_oem_sentinel_100")
             if intent == "set_home":
                 if values.get("operator_ack") != "SET_HOME_CURRENT_POSITION":
                     blockers.append("explicit_confirmation_required:SET_HOME_CURRENT_POSITION")

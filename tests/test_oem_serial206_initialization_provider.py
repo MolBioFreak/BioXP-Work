@@ -109,6 +109,18 @@ class FakeSerial206Primitives:
             "execution": [{"ok": True, "op": dict(steps[0]).get("op")}],
         }
 
+    def z_set_current_max(self, value=None):
+        selected = 31 if value in {None, 100} else value
+        return {
+            "ok": True,
+            "param": 6,
+            "value": selected,
+            "readback": {"ok": True, "ack": {"status": 100}, "value": selected},
+            "controller_command_acknowledged": True,
+            "controller_terminal_state_verified": True,
+            "physical_motion": False,
+        }
+
     def z_set_home(self):
         self.calls.append("set-home")
         return {
@@ -503,6 +515,28 @@ def test_provider_owns_durable_z_prepare_controller_home_and_move_lifecycle(tmp_
     assert move["ok"] is True
     assert move["z_state"] == "referenced_ready"
     assert primitives.calls == ["prepare", "manual-home", "move-steps:25"]
+
+
+def test_provider_accepts_oem_current_sentinel_100_and_resolves_machine_default(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+
+    prepared = provider.execute_z_intent(
+        intent="prepare",
+        expected_generation=11,
+        idempotency_key="z-prepare-current-sentinel",
+    )
+    assert prepared["ok"] is True
+
+    result = provider.execute_z_intent(
+        intent="set_current_max",
+        inputs={"value": 100},
+        expected_generation=11,
+        idempotency_key="z-current-sentinel-100",
+    )
+
+    assert result["ok"] is True, result
+    assert result["result"]["value"] == 31
 
 
 def test_live_path_planning_authority_comes_from_provider_controller_and_durable_state(tmp_path):
