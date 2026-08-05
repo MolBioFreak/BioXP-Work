@@ -1285,7 +1285,7 @@ class Serial206ProductionPrimitiveAdapter:
             "intent": "diagnostic_home_axis_597",
             "source_method": "ClassControlInterface.HomeAxis(z) -> axisSearchHome(597)",
             "interlock": interlock,
-            "home": _json_safe(home),
+            "home": home,
             "controller_command_acknowledged": command_acknowledged,
             "controller_terminal_state_verified": terminal_verified,
             "physical_effect_verified": False,
