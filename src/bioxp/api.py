@@ -6633,14 +6633,15 @@ async def motion_oem_z_abort():
 
 
 @app.post("/motion/oem/z/resume_after_abort")
-async def motion_oem_z_resume_after_abort(req: OemZResumeRequest):
+async def motion_oem_z_resume_after_abort(req: OemZResumeRequest | None = None):
+    request = req or OemZResumeRequest()
     return await _run_blocking(
         "serial-206 Z wakefrompause rehome",
         lambda: _execute_provider_z_intent(
             "resume_after_abort",
-            {"wait_timeout_s": float(req.wait_timeout_s)},
+            {"wait_timeout_s": float(request.wait_timeout_s)},
         ),
-        timeout_s=float(req.wait_timeout_s) + 15.0,
+        timeout_s=float(request.wait_timeout_s) + 15.0,
     )
 
 
