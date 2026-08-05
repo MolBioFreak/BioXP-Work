@@ -2453,7 +2453,8 @@ class Serial206ProductionPrimitiveAdapter:
         )
         self._z_profile_overrides[6] = int(parity.values["Z_MOTOR_MAX_CURRENT_UP"])
         home = self.z_diagnostic_home_axis(timeout_s=float(wait_timeout_s))
-        axis_home = home.get("home") if isinstance(home, Mapping) else None
+        home_wrapper = home.get("home") if isinstance(home, Mapping) else None
+        axis_home = home_wrapper.get("home") if isinstance(home_wrapper, Mapping) else None
         source_return_code = axis_home.get("source_return_code") if isinstance(axis_home, Mapping) else None
         travel_error_steps = (
             abs(int(source_return_code) - int(self_test_z_max))
