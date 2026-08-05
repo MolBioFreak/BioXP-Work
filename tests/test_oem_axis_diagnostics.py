@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -327,6 +328,33 @@ def test_safety_interrupt_uses_reserved_worker_when_general_threadpool_is_satura
     assert called_before_release is True
     assert normal_result == {"ok": True, "lane": "normal"}
     assert safety_result == {"ok": True, "lane": "safety"}
+
+
+def test_safety_interrupt_preserves_operator_dispatch_context(monkeypatch):
+    from src.bioxp import api
+
+    tester = object()
+    dispatch_authority: ContextVar[str | None] = ContextVar("dispatch_authority", default=None)
+
+    def safety_operation(active_tester):
+        assert active_tester is tester
+        return {"authority": dispatch_authority.get()}
+
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+
+    async def scenario():
+        token = dispatch_authority.set("operator-context")
+        try:
+            return await api._run_safety_interrupt_blocking(
+                "context propagation",
+                safety_operation,
+                timeout_s=1.0,
+            )
+        finally:
+            dispatch_authority.reset(token)
+
+    assert asyncio.run(scenario()) == {"authority": "operator-context"}
 
 
 def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
