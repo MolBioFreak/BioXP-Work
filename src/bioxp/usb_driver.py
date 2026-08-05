@@ -5297,6 +5297,7 @@ class BioXpTester:
             "ok": bool(isinstance(go_home, dict) and go_home.get("ok") is True),
             "home_after": go_home.get("home_after") if isinstance(go_home, dict) else None,
             "set_home": go_home.get("set_home") if isinstance(go_home, dict) else None,
+            "source_return_code": go_home.get("source_return_code") if isinstance(go_home, dict) else None,
             "switch_transition": go_home.get("switch_transition") if isinstance(go_home, dict) else None,
             "false_home_guard": go_home.get("false_home_guard") if isinstance(go_home, dict) else None,
         }
