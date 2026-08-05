@@ -34,11 +34,9 @@ def _adapter(monkeypatch, *, source_return_code: int, move_ok: bool = True):
         "controller_command_acknowledged": True,
         "controller_terminal_state_verified": True,
         "home": {
-            "home": {
-                "source_return_code": source_return_code,
-                "controller_home_proof_verified": True,
-                "short_circuit": None,
-            }
+            "source_return_code": source_return_code,
+            "controller_home_proof_verified": True,
+            "short_circuit": None,
         },
     }
     monkeypatch.setattr(subject, "load_bound_oem_position_table", lambda: _PositionTable())
