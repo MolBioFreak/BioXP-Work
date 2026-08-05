@@ -41,9 +41,7 @@ def test_z_profile_is_source_positive_board_four_motor_one(monkeypatch):
     assert profile["axis_max_steps"] == 160000
     assert profile["home_speed"] == 1791
     assert profile["oem_home_step"] == "MotorZ.axisSearchHome(speed=1791)"
-    # Source initialization leaves Z GAP12/GAP13 unchanged; the serial-206
-    # machine bundle restores its proven persistent state explicitly.
-    assert profile["disable_right"] is True
+    assert "disable_right" not in profile
     assert "disable_left" not in profile
 
 

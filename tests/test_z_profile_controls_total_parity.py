@@ -1,4 +1,5 @@
 from src.bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
+from src.bioxp.usb_driver import BioXpTester
 
 
 ACK = {"status": 100, "value": 0}
@@ -80,6 +81,34 @@ def test_z_mask_reconciliation_restores_machine_bound_right_disabled_left_enable
     assert result["machine_bound_expected"] == {12: 1, 13: 0}
     assert tester.values[12] == 1
     assert tester.values[13] == 0
+
+
+def test_z_profile_verifier_accepts_only_reconciled_persistent_masks():
+    driver = object.__new__(BioXpTester)
+    driver._oem_no_motion_profiles_ready = {"z"}
+    driver._oem_active_board_lifecycle_generation = 7
+    driver._oem_no_motion_profile_generations = {"z": 7}
+    driver._oem_no_motion_profile_fingerprints = {"z": {}}
+    driver._motion_oem_axis_profile = lambda axis: {  # type: ignore[method-assign]
+        "board": 4,
+        "motor": 1,
+        "speed": 1791,
+        "acc": 576,
+        "run_current": 31,
+        "stall_guard": 3,
+    }
+    values = {4: 1791, 5: 576, 6: 31, 205: 3, 12: 1, 13: 0}
+    driver.motor_get_axis_param = lambda board, param, *, motor: {  # type: ignore[method-assign]
+        "ok": True,
+        "ack": {"status": 100},
+        "value": values[param],
+    }
+
+    result = driver.motor_oem_require_no_motion_profile("z")
+
+    assert result["ok"] is True
+    assert result["readbacks"][12]["value"] == 1
+    assert result["readbacks"][13]["value"] == 0
 
 
 def test_z_current_max_oem_sentinel_100_selects_machine_down_current():

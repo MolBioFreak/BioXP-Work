@@ -111,12 +111,9 @@ class BioXpTester:
             "standby_current": 10,
             # Serial-206 immutable OEM machine config m_Z_MOTOR_STALL_GUARD_THRESHOLD.
             "stall_guard": 3,
-            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z;
-            # it relies on persistent machine configuration.  Serial-206 live
-            # evidence proves GAP10/right is asserted at GAP9 top and travel only
-            # works with the persistent right inhibit disabled.  GAP9/left stays
-            # enabled and remains the sole top-home authority.
-            "disable_right": True,
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
+            # The explicit provider reconciliation action establishes the
+            # serial-206 persistent state; source preparation must preserve it.
             "warm_enable": True,
         },
         "g": {
@@ -5168,10 +5165,9 @@ class BioXpTester:
         if preset.get("disable_left") is not None:
             expected[13] = int(bool(preset["disable_left"]))
         if str(axis_key).strip().lower() == "z":
-            # Serial-206 OEM does not issue Z SAP12/SAP13 writes because both
-            # effective switch masks are expected to be clear. Verify that state
-            # explicitly so stale compatibility writes cannot survive unnoticed.
-            expected[12] = 0
+            # Source preparation leaves Z SAP12/SAP13 untouched.  Verify the
+            # separately reconciled serial-206 persistent wiring state.
+            expected[12] = 1
             expected[13] = 0
         readbacks = {}
         mismatches = []

@@ -300,25 +300,28 @@ def prepare_motion_without_motion(
         invalidate_profile("initialize_without_motion_evidence_failed")
         return _preparation_result(authority, ledger)
 
-    # The serial-206 Z source writes neither SAP12 nor SAP13 and assumes both
-    # switch-disable masks are already zero. Preparation verifies that precondition
-    # but never repairs it implicitly; recovery is a separately receipted provider intent.
+    # The serial-206 Z source writes neither SAP12 nor SAP13 and relies on
+    # persistent machine configuration. GAP10/right is asserted at GAP9 top on
+    # this machine, so its inhibit must be disabled while GAP9/left stays enabled.
+    # Preparation verifies but never repairs that state implicitly.
     mask_evidence: dict[str, Any] = {"board": 4, "motor": 1, "writes": {}}
     mask_ok = True
     if "z" in selected:
         mask_rows: dict[str, Any] = {}
+        expected_masks = {12: 1, 13: 0}
         for parameter, label in ((12, "right_disable_param12"), (13, "left_disable_param13")):
             try:
                 row = driver.motor_get_axis_param(4, parameter, motor=1)
             except Exception as exc:
                 row = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
             mask_rows[label] = row
-            if _ack_status(row) != 100 or row.get("value") != 0:
+            if _ack_status(row) != 100 or row.get("value") != expected_masks[parameter]:
                 mask_ok = False
         mask_evidence.update({
             "readbacks": mask_rows,
             "source_sequence_modified": False,
             "blocker": None if mask_ok else "z_switch_mask_incompatible",
+            "machine_bound_expected": expected_masks,
             "source_anchor": "ClassMotor param12 right-disable; param13 left-disable; serial-206 Z source omits both writes",
         })
     ledger.append(_stage(

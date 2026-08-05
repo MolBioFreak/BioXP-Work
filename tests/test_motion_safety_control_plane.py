@@ -31,7 +31,7 @@ class FakeMotionDriver:
         self.parameter_readbacks = {
             (5, 0, 4): 1700,
             (4, 0, 4): 1800,
-            (4, 1, 12): 0,
+            (4, 1, 12): 1,
             (4, 1, 13): 0,
         }
         self.rail = {"ack": {"status": 100}, "reply_valid": True, "sample_valid": True, "safety_valid": True, "oem_scalar": 0}
@@ -275,6 +275,21 @@ def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switc
     assert ("write_param", 4, 1, 13, 0) not in driver.calls
     assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
     assert driver.invalidations == ["switch_mask_precondition_failed"]
+
+
+def test_prepare_without_motion_requires_reconciled_z_right_mask():
+    driver = FakeMotionDriver()
+    driver.parameter_readbacks[(4, 1, 12)] = 0
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is False
+    stage = next(row for row in result["stage_ledger"] if row["stage_id"] == "z_switch_mask_precondition")
+    assert stage["status"] == "failed"
+    assert stage["controller_evidence"]["machine_bound_expected"] == {12: 1, 13: 0}
+    assert stage["controller_evidence"]["readbacks"]["right_disable_param12"]["value"] == 0
+    assert stage["controller_evidence"]["writes"] == {}
+    assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
 
 
 def test_prepare_without_motion_fails_closed_on_parameter_readback_mismatch():
