@@ -276,6 +276,59 @@ def test_diagnostic_stop_preempts_inflight_normal_tester_lock(monkeypatch):
     assert result["verified_stopped"] is True
 
 
+def test_safety_interrupt_uses_reserved_worker_when_general_threadpool_is_saturated(monkeypatch):
+    from src.bioxp import api
+
+    tester = object()
+    general_worker_started = asyncio.Event()
+    release_general_worker = asyncio.Event()
+    general_pool_token = asyncio.Lock()
+    safety_called = threading.Event()
+
+    def normal_operation():
+        return {"ok": True, "lane": "normal"}
+
+    def safety_operation(active_tester):
+        assert active_tester is tester
+        safety_called.set()
+        return {"ok": True, "lane": "safety"}
+
+    async def single_worker_general_pool(func, *args):
+        async with general_pool_token:
+            if func is normal_operation:
+                general_worker_started.set()
+                await release_general_worker.wait()
+            return func(*args)
+
+    monkeypatch.setattr(api, "run_in_threadpool", single_worker_general_pool)
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+
+    async def scenario():
+        normal_task = asyncio.create_task(
+            api._run_blocking("saturate general pool", normal_operation, timeout_s=1.0)
+        )
+        await general_worker_started.wait()
+        safety_task = asyncio.create_task(
+            api._run_safety_interrupt_blocking(
+                "reserved safety worker",
+                safety_operation,
+                timeout_s=1.0,
+            )
+        )
+        called_before_release = await asyncio.to_thread(safety_called.wait, 0.15)
+        release_general_worker.set()
+        normal_result = await normal_task
+        safety_result = await safety_task
+        return called_before_release, normal_result, safety_result
+
+    called_before_release, normal_result, safety_result = asyncio.run(scenario())
+    assert called_before_release is True
+    assert normal_result == {"ok": True, "lane": "normal"}
+    assert safety_result == {"ok": True, "lane": "safety"}
+
+
 def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
     from src.bioxp import api
 

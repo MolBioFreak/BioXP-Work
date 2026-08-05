@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
@@ -174,6 +175,10 @@ _tester_lock = asyncio.Lock()
 # lane. Normal tester work deliberately does not, so a stop can still preempt
 # an in-flight diagnostic without racing release/rebind.
 _tester_transition_lock = asyncio.Lock()
+_safety_interrupt_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="bioxp-safety",
+)
 _camera_stream_lock = asyncio.Lock()
 _oem_startup_program: Optional[OEMStartupProgram] = None
 _camera_provider = CameraProvider()
@@ -4632,7 +4637,12 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
     async def leased_interrupt():
         async with _tester_transition_lock:
             tester = _get_tester()
-            return await run_in_threadpool(func, tester)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _safety_interrupt_executor,
+                func,
+                tester,
+            )
 
     worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
     try:
