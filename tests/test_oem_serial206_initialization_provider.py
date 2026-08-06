@@ -15,6 +15,55 @@ from bioxp import oem_serial206_initialization as subject
 ACK = {"status": 100, "value": 0}
 
 
+def test_terminal_projection_preserves_stopped_state_across_no_motion_set_home():
+    z = {
+        "receipts": [
+            {
+                "status": "completed",
+                "intent": "move_absolute",
+                "command_id": "move-1",
+                "finished_at": 10.0,
+                "result": {
+                    "after_position_steps": 92049,
+                    "controller_terminal_state_verified": True,
+                },
+            },
+            {
+                "status": "completed",
+                "intent": "set_home",
+                "command_id": "home-1",
+                "finished_at": 11.0,
+                "result": {
+                    "physical_motion": False,
+                    "position": {"position": 0},
+                    "controller_terminal_state_verified": True,
+                    "terminal_z_state": {
+                        "ok": True,
+                        "position_steps": 0,
+                        "speed_steps_s": 0,
+                        "left_switch_state": 1,
+                        "right_switch_state": 1,
+                        "left_switch_disabled": False,
+                        "right_switch_disabled": False,
+                    },
+                },
+            },
+        ]
+    }
+
+    assert subject.Serial206OemInitializationProvider._z_terminal_state_from_receipts(z) == {
+        "position_steps": 0,
+        "speed_steps_s": 0,
+        "left_switch_state": 1,
+        "right_switch_state": 1,
+        "left_switch_disabled": False,
+        "right_switch_disabled": False,
+        "source_command_id": "home-1",
+        "observed_at": 11.0,
+        "authority": "provider_receipt_terminal_state",
+    }
+
+
 def _write(value: int):
     return {"ok": True, "ack": dict(ACK), "set_value": value, "readback": {"ack": dict(ACK), "value": value}}
 

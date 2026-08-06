@@ -429,6 +429,49 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
     }
 
 
+def _provider_z_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, Any]:
+    """Readiness owned by the stable Serial-206 Z lifecycle.
+
+    The provider performs live controller/interlock checks inside each command.
+    Its motion admission must not depend on the short-lived global analytics
+    snapshot, which is collected through the same serialized USB transport.
+    """
+    ownership = machine_state.get("ownership") if isinstance(machine_state.get("ownership"), Mapping) else {}
+    maintenance = machine_state.get("maintenance") if isinstance(machine_state.get("maintenance"), Mapping) else {}
+    provider = (
+        machine_state.get("serial206_initialization_provider")
+        if isinstance(machine_state.get("serial206_initialization_provider"), Mapping)
+        else {}
+    )
+    z_authority = provider.get("z_authority") if isinstance(provider.get("z_authority"), Mapping) else {}
+    dependencies = [
+        _dependency(
+            "can_ready",
+            "Same-epoch CAN ready",
+            ownership.get("CAN_READY") is True,
+            "Same-epoch CAN readiness has not been established.",
+        ),
+        _dependency(
+            "motion_enabled",
+            "Motion enabled",
+            maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False,
+            "Motion is inactive. Activate motion before moving this motor.",
+        ),
+        _dependency(
+            "z_board_lifecycle_fresh",
+            "Serial-206 Z board lifecycle current",
+            z_authority.get("board_lifecycle_generation_fresh") is True,
+            "Z board lifecycle changed; activate motion again.",
+        ),
+    ]
+    failed = next((row for row in dependencies if not row["met"]), None)
+    return {
+        "enabled": failed is None,
+        "disabled_reason": None if failed is None else failed["reason"],
+        "dependencies": dependencies,
+    }
+
+
 def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assess one action using only already-published machine state."""
     values = dict(inputs or {})
@@ -449,6 +492,18 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     action_id = str(action.get("action_id") or "")
+    if action_id == "meta.activate_motion":
+        maintenance = machine_state.get("maintenance") if isinstance(machine_state.get("maintenance"), Mapping) else {}
+        already_active = bool(
+            maintenance.get("motion_blocked") is False
+            and maintenance.get("recovery_required") is False
+        )
+        dependencies.append(_dependency(
+            "motion_activation_required",
+            "Motion activation required",
+            not already_active,
+            "Motion is already active.",
+        ))
     if action_id.startswith("oem.z.") and action_id != "oem.z.status":
         provider_state_value = machine_state.get("serial206_initialization_provider")
         provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
@@ -505,16 +560,25 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "Use the corresponding oem.z.* action ID; generic route-derived Z actions are retired.",
         ))
 
+    provider_owned_z_motion = bool(
+        action_id.startswith("oem.z.")
+        and action_id not in _Z_NO_MOTION_STATE_ACTIONS
+        and action_id not in {"oem.z.status", "oem.z.stop", "oem.z.abort", "oem.z.observe"}
+    )
     if source_initializer or safety == "motion" or _motor_motion_action(action):
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
-        readiness = _motion_readiness(machine_state, required_axes)
+        readiness = (
+            _provider_z_motion_readiness(machine_state)
+            if provider_owned_z_motion
+            else _motion_readiness(machine_state, required_axes)
+        )
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
         )
         effective_axis = str(values.get("axis") or "").lower()
-        if effective_axis == "z":
+        if effective_axis == "z" and not provider_owned_z_motion:
             domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
             axes_domain = domains.get("axes") if isinstance(domains, Mapping) else None
             axes_observation = axes_domain.get("observation") if isinstance(axes_domain, Mapping) else None
@@ -567,6 +631,14 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                         target_ok,
                         "Requested Z target is outside the OEM nonnegative envelope.",
                     ))
+        elif provider_owned_z_motion and action_id == "oem.z.move_absolute":
+            target = values.get("position_steps")
+            dependencies.append(_dependency(
+                "z_target_oem_envelope",
+                "Z target in OEM 0..160000 envelope",
+                type(target) is int and 0 <= target <= 160000,
+                "Requested Z target is outside the OEM nonnegative envelope.",
+            ))
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
@@ -670,14 +742,50 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
     freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {"state": "missing", "age_s": None, "fresh_for_s": None}
     connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running")
-    # Report power/interlock readiness independently from per-axis homing.
-    # Individual movement actions still enforce their own axis references.
-    motion_readiness = _motion_readiness(machine_state, [])
+    # Report Z motion readiness from its stable provider authority. Other axes
+    # continue to use the canonical analytics snapshot.
     z_axis = next((row for row in axes if row.get("axis") == "z"), None)
     provider_state = machine_state.get("serial206_initialization_provider") if isinstance(machine_state.get("serial206_initialization_provider"), Mapping) else {}
     initialize_motors = provider_state.get("initialize_motors") if isinstance(provider_state, Mapping) else None
     z_authority_value = provider_state.get("z_authority") if isinstance(provider_state, Mapping) else None
     z_authority: Mapping[str, Any] = z_authority_value if isinstance(z_authority_value, Mapping) else {}
+    terminal_state = z_authority.get("terminal_state") if isinstance(z_authority.get("terminal_state"), Mapping) else {}
+    if z_axis is None and (
+        type(terminal_state.get("position_steps")) is int
+        or type(terminal_state.get("speed_steps_s")) is int
+    ):
+        z_axis = {
+            "axis": "z",
+            "reference": z_authority.get("reference_state") or "unknown",
+            "position_steps": terminal_state.get("position_steps"),
+            "speed_steps_s": terminal_state.get("speed_steps_s"),
+            "run_current": None,
+            "standby_current": None,
+            "left_switch_state": terminal_state.get("left_switch_state"),
+            "right_switch_state": terminal_state.get("right_switch_state"),
+            "left_switch_raw_active": None,
+            "right_switch_raw_active": None,
+            "left_switch_active": None,
+            "right_switch_active": None,
+            "left_switch_disabled": terminal_state.get("left_switch_disabled"),
+            "right_switch_disabled": terminal_state.get("right_switch_disabled"),
+            "coordinate_contract": z_authority.get("coordinate_contract"),
+            "min_steps": z_authority.get("source_min_steps"),
+            "max_steps": z_authority.get("source_max_steps"),
+            "motor_temperature_c": None,
+            "motor_temperature_available": False,
+            "telemetry_authority": terminal_state.get("authority"),
+        }
+        axes.append(z_axis)
+    provider_z_available = bool(
+        provider_state.get("bound") is True
+        and z_authority.get("state") not in {None, "unbound", "corrupt"}
+    )
+    motion_readiness = (
+        _provider_z_motion_readiness(machine_state)
+        if provider_z_available
+        else _motion_readiness(machine_state, [])
+    )
     z_provider = {
         **z_authority,
         "bound": provider_state.get("bound") if isinstance(provider_state, Mapping) else False,

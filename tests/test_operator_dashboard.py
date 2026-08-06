@@ -61,9 +61,9 @@ def machine_state(
     }
 
 
-def action(path: str, *, method="POST", safety="motion", provider=True):
+def action(path: str, *, method="POST", safety="motion", provider=True, action_id="route.test"):
     return {
-        "action_id": "route.test",
+        "action_id": action_id,
         "kind": "primitive",
         "informational_method": method,
         "informational_path": path,
@@ -71,6 +71,81 @@ def action(path: str, *, method="POST", safety="motion", provider=True):
         "provider_available": provider,
         "provider_unavailable_reason": None if provider else "provider not bound",
     }
+
+
+def test_provider_owned_z_motion_does_not_depend_on_expiring_global_snapshot():
+    state = machine_state(motion_enabled=True, z="referenced")
+    state["snapshot_id"] = None
+    state["freshness"] = {"state": "missing", "age_s": None, "fresh_for_s": 30.0}
+    state["domains"] = {}
+    state["serial206_initialization_provider"] = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "z_authority": {
+            "state": "referenced_ready",
+            "reference_state": "referenced",
+            "current_board_lifecycle_generation": 4,
+            "board_lifecycle_generation": 4,
+            "board_lifecycle_generation_fresh": True,
+            "terminal_state": {"position_steps": 0, "speed_steps_s": 0},
+        },
+    }
+
+    home = _assess_action(
+        action("/motion/oem/manual/home", action_id="oem.z.manual_home"),
+        state,
+        {"axis": "z"},
+    )
+    absolute = _assess_action(
+        action("/motion/oem/manual/absolute", action_id="oem.z.move_absolute"),
+        state,
+        {"axis": "z", "position_steps": 92049},
+    )
+    generic = _assess_action(action("/motion/axis/move"), state, {"axis": "x"})
+
+    assert home["enabled"] is True
+    assert absolute["enabled"] is True
+    assert all(row["key"] != "canonical_snapshot" for row in absolute["dependencies"])
+    assert generic["enabled"] is False
+    assert generic["disabled_reason"] == "Fresh canonical hardware snapshot is unavailable."
+
+
+def test_provider_owned_z_motion_still_requires_live_transport_can_motion_and_lifecycle():
+    state = machine_state(motion_enabled=True, z="referenced")
+    state["snapshot_id"] = None
+    state["freshness"] = {"state": "missing"}
+    state["domains"] = {}
+    state["serial206_initialization_provider"] = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "z_authority": {"state": "referenced_ready", "reference_state": "referenced"},
+    }
+    move = action("/motion/oem/manual/relative", action_id="oem.z.move_steps")
+
+    state["ownership"]["CAN_READY"] = None
+    assert _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"] == "Same-epoch CAN readiness has not been established."
+    state["ownership"]["CAN_READY"] = True
+    state["maintenance"]["motion_blocked"] = True
+    assert _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
+    state["maintenance"] = {"motion_blocked": False, "recovery_required": False}
+    state["serial206_initialization_provider"]["z_authority"]["state"] = "unprepared"
+    assert "Current Z lifecycle state" in _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"]
+
+
+def test_activate_motion_is_disabled_when_recovery_is_already_complete():
+    state = machine_state(motion_enabled=True)
+    activate = action(
+        "/motion/oem/prepare_without_motion",
+        safety="service",
+        action_id="meta.activate_motion",
+    )
+
+    assessed = _assess_action(activate, state, {})
+
+    assert assessed["enabled"] is False
+    assert assessed["disabled_reason"] == "Motion is already active."
+    state["maintenance"] = {"motion_blocked": True, "recovery_required": True}
+    assert _assess_action(activate, state, {})["enabled"] is True
 
 
 def test_local_only_maintenance_routes_are_visible_but_never_dispatchable():

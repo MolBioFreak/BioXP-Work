@@ -5821,6 +5821,10 @@ async def motion_oem_prepare_without_motion():
         ownership_bootstrap = await reconnect_runtime()
     with _maintenance_state_lock:
         recovery_latch_generation = int(_maintenance_latch_generation)
+        recovery_pending = (
+            _maintenance_state.get("motion_blocked") is True
+            and _maintenance_state.get("recovery_required") is True
+        )
     hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
     tester = _get_tester()
     result = await _run_blocking(
@@ -5835,14 +5839,18 @@ async def motion_oem_prepare_without_motion():
     }
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=response)
-    response["maintenance_state"] = _clear_post_maintenance_motion_block(
-        source="oem_prepare_without_motion_completed",
-        expected_latch_generation=recovery_latch_generation,
-        evidence={
-            "physical_motion_commanded": False,
-            "profile": "initializeMotorsWithoutMotion",
-            "result_ok": True,
-        },
+    response["maintenance_state"] = (
+        _clear_post_maintenance_motion_block(
+            source="oem_prepare_without_motion_completed",
+            expected_latch_generation=recovery_latch_generation,
+            evidence={
+                "physical_motion_commanded": False,
+                "profile": "initializeMotorsWithoutMotion",
+                "result_ok": True,
+            },
+        )
+        if recovery_pending
+        else _maintenance_state_payload()
     )
     return response
 
@@ -5974,33 +5982,25 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
                 "maintenance_state": _maintenance_state_payload(),
             },
         )
-    # A non-homing strict startup is the explicit operator-controlled way to
-    # establish the live arm.  It is valid both after a maintenance latch and
-    # from a clean, deliberately disarmed service state; requiring an existing
-    # maintenance latch made the arm state permanently unreachable after boot.
-    maintenance_before = _maintenance_state_payload()
-    latch_generation = None
-    if maintenance_before.get("recovery_required") is True:
-        latch_generation = _require_non_homing_motion_recovery_pending()
+    # Strict recovery is only valid while the maintenance latch requires it.
+    # Normal clean-state activation uses /motion/oem/prepare_without_motion.
+    latch_generation = _require_non_homing_motion_recovery_pending()
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
         lambda: tester.motion_arm_strict_startup(run_homing=False),
         timeout_s=90.0,
     )
-    if latch_generation is not None:
-        maintenance = _complete_non_homing_motion_recovery(
-            response,
-            source="motion_arm_strict_startup",
-            expected_latch_generation=latch_generation,
-            evidence={
-                "strict_startup": response,
-                "run_homing": False,
-                "operator_reason": operator_reason,
-            },
-        )
-    else:
-        maintenance = _maintenance_state_payload()
+    maintenance = _complete_non_homing_motion_recovery(
+        response,
+        source="motion_arm_strict_startup",
+        expected_latch_generation=latch_generation,
+        evidence={
+            "strict_startup": response,
+            "run_homing": False,
+            "operator_reason": operator_reason,
+        },
+    )
     if isinstance(response, dict):
         response = dict(response)
         response["maintenance_state"] = maintenance

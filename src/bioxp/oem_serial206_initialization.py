@@ -817,6 +817,32 @@ class Serial206ProductionPrimitiveAdapter:
                 return int(value)
         return None
 
+    def z_terminal_status(self) -> dict[str, Any]:
+        """Read the compact terminal Z state needed by the operator cockpit."""
+        profile = dict(self.tester._motion_oem_axis_profile("z"))
+        board = int(profile["board"])
+        motor = int(profile["motor"])
+        rows = {
+            param: self.tester.motor_get_axis_param(board, param, motor=motor)
+            for param in (1, 3, 9, 10, 12, 13)
+        }
+        values = {param: self._z_value(row) for param, row in rows.items()}
+        verified = all(
+            isinstance(row, Mapping) and self._z_tmcl_success(row.get("ack"))
+            for row in rows.values()
+        )
+        return {
+            "ok": verified,
+            "position_steps": values[1],
+            "speed_steps_s": values[3],
+            "left_switch_state": values[9],
+            "right_switch_state": values[10],
+            "right_switch_disabled": None if values[12] is None else values[12] != 0,
+            "left_switch_disabled": None if values[13] is None else values[13] != 0,
+            "readbacks": _json_safe(rows),
+            "authority": "serial206_terminal_register_readback",
+        }
+
     def _z_tmcl_success(self, ack: Any) -> bool:
         verifier = getattr(self.tester, "_tmcl_success", None)
         if callable(verifier):
@@ -3273,6 +3299,7 @@ class Serial206OemInitializationProvider:
                     "coordinate_contract": "oem_source_nonnegative_z",
                     "source_min_steps": 0,
                     "source_max_steps": 160000,
+                    "terminal_state": self._z_terminal_state_from_receipts(z),
                 })
                 return projection
             except Exception as exc:
@@ -3282,6 +3309,76 @@ class Serial206OemInitializationProvider:
                     "blockers": ["durable_serial206_state_corrupt"],
                     "failure": f"{type(exc).__name__}: {exc}",
                 }
+
+    @staticmethod
+    def _z_terminal_state_from_receipts(z: Mapping[str, Any]) -> dict[str, Any]:
+        """Project compact terminal Z state from provider-owned receipts."""
+        position_steps: int | None = None
+        speed_steps_s: int | None = None
+        left_switch_state: int | None = None
+        right_switch_state: int | None = None
+        left_switch_disabled: bool | None = None
+        right_switch_disabled: bool | None = None
+        source_command_id: str | None = None
+        observed_at: float | None = None
+        for receipt in list(z.get("receipts") or []):
+            if not isinstance(receipt, Mapping) or receipt.get("status") != "completed":
+                continue
+            result = receipt.get("result")
+            if not isinstance(result, Mapping):
+                continue
+            intent = str(receipt.get("intent") or "")
+            next_position: int | None = None
+            terminal = result.get("terminal_z_state")
+            if isinstance(terminal, Mapping) and terminal.get("ok") is True:
+                if type(terminal.get("position_steps")) is int:
+                    next_position = int(terminal["position_steps"])
+                if type(terminal.get("speed_steps_s")) is int:
+                    speed_steps_s = int(terminal["speed_steps_s"])
+                if type(terminal.get("left_switch_state")) is int:
+                    left_switch_state = int(terminal["left_switch_state"])
+                if type(terminal.get("right_switch_state")) is int:
+                    right_switch_state = int(terminal["right_switch_state"])
+                if type(terminal.get("left_switch_disabled")) is bool:
+                    left_switch_disabled = bool(terminal["left_switch_disabled"])
+                if type(terminal.get("right_switch_disabled")) is bool:
+                    right_switch_disabled = bool(terminal["right_switch_disabled"])
+            if next_position is None and intent == "set_home" and result.get("physical_motion") is False:
+                position = result.get("position")
+                value = position.get("position") if isinstance(position, Mapping) else None
+                if type(value) is int:
+                    next_position = value
+            elif next_position is None and intent in {"move_steps", "move_absolute"}:
+                value = result.get("after_position_steps")
+                if type(value) is int:
+                    next_position = value
+            elif next_position is None and intent in {"manual_home", "move_z_home", "diagnostic_home_axis", "self_test", "resume_after_abort"}:
+                summary = result.get("home_summary")
+                if isinstance(summary, Mapping):
+                    for key in ("after_set_home_position_steps", "after_position_steps"):
+                        value = summary.get(key)
+                        if type(value) is int:
+                            next_position = value
+                            break
+            if next_position is not None:
+                position_steps = next_position
+                source_command_id = str(receipt.get("command_id") or "") or source_command_id
+                finished_at = receipt.get("finished_at")
+                if type(finished_at) in {int, float}:
+                    observed_at = float(finished_at)
+            if result.get("controller_terminal_state_verified") is True and intent != "set_home":
+                speed_steps_s = 0
+        return {
+            "position_steps": position_steps,
+            "speed_steps_s": speed_steps_s,
+            "left_switch_state": left_switch_state,
+            "right_switch_state": right_switch_state,
+            "left_switch_disabled": left_switch_disabled,
+            "right_switch_disabled": right_switch_disabled,
+            "source_command_id": source_command_id,
+            "observed_at": observed_at,
+            "authority": "provider_receipt_terminal_state",
+        }
 
     def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
         """Return provider-owned live ``scriptmoveTo`` branch authority."""
@@ -4105,6 +4202,26 @@ class Serial206OemInitializationProvider:
                         "failure": result.get("failure") or "z_manual_home_controller_evidence_unverified",
                     })
                     ok = False
+            if ok and intent in {
+                "prepare", "set_home", "manual_home", "move_z_home",
+                "diagnostic_home_axis", "move_steps", "move_absolute",
+                "self_test", "resume_after_abort", "stop",
+            }:
+                terminal_reader = getattr(self.primitives, "z_terminal_status", None)
+                if callable(terminal_reader):
+                    try:
+                        terminal_state = terminal_reader()
+                    except Exception as exc:
+                        terminal_state = {
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "authority": "serial206_terminal_register_readback",
+                        }
+                    result["terminal_z_state"] = _json_safe(terminal_state)
+                    if terminal_state.get("ok") is not True:
+                        result["terminal_state_refresh_error"] = (
+                            terminal_state.get("error") or "terminal Z register readback was incomplete"
+                        )
             if ok and intent not in {"reconcile_switch_masks", "stop"}:
                 final_generation = int(self.generation_provider())
                 final_board_generation_provider = getattr(
