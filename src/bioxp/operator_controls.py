@@ -492,18 +492,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     action_id = str(action.get("action_id") or "")
-    if action_id == "meta.activate_motion":
-        maintenance = machine_state.get("maintenance") if isinstance(machine_state.get("maintenance"), Mapping) else {}
-        already_active = bool(
-            maintenance.get("motion_blocked") is False
-            and maintenance.get("recovery_required") is False
-        )
-        dependencies.append(_dependency(
-            "motion_activation_required",
-            "Motion activation required",
-            not already_active,
-            "Motion is already active.",
-        ))
     if action_id.startswith("oem.z.") and action_id != "oem.z.status":
         provider_state_value = machine_state.get("serial206_initialization_provider")
         provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
@@ -569,11 +557,16 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     if source_initializer or safety == "motion" or _motor_motion_action(action):
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
-        readiness = (
-            _provider_z_motion_readiness(machine_state)
-            if provider_owned_z_motion
-            else _motion_readiness(machine_state, required_axes)
-        )
+        if z_state_establishing:
+            # OEM state-establishing operations create board/profile/reference
+            # readiness. Requiring their own outputs here creates a deadlock.
+            readiness = {"dependencies": []}
+        else:
+            readiness = (
+                _provider_z_motion_readiness(machine_state)
+                if provider_owned_z_motion
+                else _motion_readiness(machine_state, required_axes)
+            )
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
