@@ -1,5 +1,5 @@
 
-from bioxp.oem_initialize_motion_scaffold import initialize_motion_parity_plan
+from src.bioxp.oem_initialize_motion_scaffold import initialize_motion_parity_plan
 
 
 def test_initialize_motion_plan_includes_pipette_and_vision_blockers():

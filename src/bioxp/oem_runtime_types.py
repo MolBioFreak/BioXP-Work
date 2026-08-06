@@ -8,7 +8,6 @@ from typing import Any
 
 
 class OEMCommandName(str, Enum):
-    INITIALIZE_SYSTEM = "initializeSystem"
     UNLOCK_PROCESS = "unlockProcess"
     PREPARE_TO_RUN_JOB = "PrepareToRunJob"
     ABORT_JOB = "abortjob"

@@ -1,5 +1,5 @@
 
-from bioxp.oem_fresh_runtime_worker import OemFreshRuntimeWorker
+from src.bioxp.oem_fresh_runtime_worker import OemFreshRuntimeWorker
 
 
 def test_worker_runs_fresh_dry_run_command_and_serializes_history(tmp_path):

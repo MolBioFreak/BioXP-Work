@@ -18,7 +18,10 @@ OEM_EVIDENCE_SCHEMA_ID = "bioxp.oem_evidence_lock.v4"
 OEM_EVIDENCE_SCHEMA_VERSION = 4
 OEM_ACQUISITION_ID = "20260719T024740Z-4a7fe6783205846c"
 OEM_MACHINE_SERIAL = 206
-OEM_LOCK_SHA256 = "148b224828fc2a0437897b63b352efa7cb80715df8045d8aa8e19d6d8e7cb1fa"
+# Current canonical bytes named by the movement registry. The historical
+# acceptance package recorded an earlier revision (148b...); it must not be
+# reported as the hash of the present authoritative lock file.
+OEM_LOCK_SHA256 = "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
 
 
 class OemMachineBundleError(RuntimeError):

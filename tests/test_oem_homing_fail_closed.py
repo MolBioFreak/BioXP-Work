@@ -40,17 +40,17 @@ class _HomingRig:
     def position(self, board, motor=0):
         value = self._next(self.position_values, self.last_position)
         self.last_position = value
-        return {"ok": True, "board": board, "motor": motor, "position": value}
+        return {"ok": True, "ack": {"status": 100}, "board": board, "motor": motor, "position": value}
 
     def home(self, board, motor=0):
         value = self._next(self.home_values, self.last_home)
         self.last_home = value
-        return {"ok": True, "board": board, "motor": motor, "value": value}
+        return {"ok": True, "ack": {"status": 100}, "board": board, "motor": motor, "value": value}
 
     def speed(self, board, motor=0):
         value = self._next(self.speed_values, self.last_speed)
         self.last_speed = value
-        return {"ok": True, "board": board, "motor": motor, "speed": value}
+        return {"ok": True, "ack": {"status": 100}, "board": board, "motor": motor, "speed": value}
 
 
 def _run(monkeypatch, rig, *, require_switch_transition=True):
@@ -93,7 +93,8 @@ def _run(monkeypatch, rig, *, require_switch_transition=True):
         rig.calls.append("stop")
         return {
             "ok": rig.stop_ok,
-            "ack": {"status": 100 if rig.stop_ok else 4},
+            "first_delivery": {"status": 100 if rig.stop_ok else 4},
+            "second_delivery": {"status": 100 if rig.stop_ok else 4},
             "board": board,
             "motor": motor,
         }
@@ -103,6 +104,7 @@ def _run(monkeypatch, rig, *, require_switch_transition=True):
         return {
             "stopped": rig.wait_stopped,
             "last_speed": rig.wait_last_speed,
+            "last_ack": {"status": 100},
             "seen_nonzero": True,
         }
 
@@ -111,12 +113,14 @@ def _run(monkeypatch, rig, *, require_switch_transition=True):
         return {
             "ok": rig.sethome_ok,
             "ack": {"status": 100 if rig.sethome_ok else 4},
-            "readback": {"value": rig.sethome_readback},
+            "readback": {"ack": {"status": 100}, "value": rig.sethome_readback},
             "board": board,
             "motor": motor,
         }
 
     monkeypatch.setattr(tester, "motor_move_left", move_left)
+    monkeypatch.setattr(tester, "begin_bus_event_window", lambda: {"after_sequence": 7, "cleared": 0})
+    monkeypatch.setattr(tester, "collect_bus_events", lambda **kwargs: [])
     monkeypatch.setattr(tester, "motor_stop", stop)
     monkeypatch.setattr(tester, "motor_wait_stopped", wait_stopped)
     monkeypatch.setattr(tester, "motor_set_home", set_home)
@@ -128,7 +132,7 @@ def _run(monkeypatch, rig, *, require_switch_transition=True):
         rehome=False,
         timeout_s=0.2,
         require_switch_transition=require_switch_transition,
-        max_search_abs_delta=500,
+        max_search_abs_delta=5000,
     )
 
 
@@ -137,6 +141,11 @@ def test_moving_home_requires_complete_evidence_and_zero_readback(monkeypatch):
 
     assert result["ok"] is True
     assert result["seen_motion"] is True
+    assert result["controller_motion_evidence_seen"] is True
+    assert result["controller_speed_nonzero_seen"] is True
+    assert result["independent_physical_motion_verified"] is False
+    assert result["motor_output_state"] == "stopped_readback"
+    assert result["physical_effect_verified"] is False
     assert result["switch_transition"] is True
     assert result["stop"]["ok"] is True
     assert result["wait"]["stopped"] is True
@@ -164,6 +173,25 @@ def test_stale_active_switch_and_failed_move_ack_cannot_publish_home(monkeypatch
     }
 
 
+def test_search_preflight_exception_still_delivers_and_verifies_stop(monkeypatch):
+    class FailingSearchRig(_HomingRig):
+        position_calls = 0
+
+        def position(self, board, motor=0):
+            self.position_calls += 1
+            if self.position_calls == 2:
+                raise RuntimeError("search position read failed")
+            return super().position(board, motor=motor)
+
+    rig = FailingSearchRig()
+    result = _run(monkeypatch, rig)
+
+    assert result["ok"] is False
+    assert result["false_home_guard"].startswith("search_preflight_exception:RuntimeError")
+    assert "move_left" not in rig.calls
+    assert rig.calls[:2] == ["stop", "wait_stopped"]
+
+
 @pytest.mark.parametrize(
     ("rig", "expected_failure"),
     [
@@ -173,7 +201,7 @@ def test_stale_active_switch_and_failed_move_ack_cannot_publish_home(monkeypatch
                 speed_values=(0,),
                 position_values=(100, 100, 100, 100, 0),
             ),
-            "motion_not_observed",
+            "controller_motion_evidence_not_observed",
         ),
         (_HomingRig(stop_ok=False), "stop_ack_failed"),
         (_HomingRig(wait_stopped=False), "motor_not_stopped"),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 try:
     import usb.core  # type: ignore
@@ -31,16 +31,23 @@ def novo_checksum(payload: bytes | bytearray | list[int]) -> int:
     return sum(int(byte) & 0xFF for byte in payload) & 0xFF
 
 
+def _validate_novo_payload(payload: bytes) -> bytes:
+    if len(payload) < 5:
+        raise NovoUsbCanError("Novo CAN payload is shorter than module-id plus DLC")
+    dlc = int(payload[4])
+    if dlc > 8:
+        raise NovoUsbCanError(f"Novo CAN payload has invalid DLC: {dlc}")
+    expected_length = 5 + dlc
+    if len(payload) != expected_length:
+        raise NovoUsbCanError(
+            f"Novo CAN payload/DLC mismatch: dlc={dlc}, payload_length={len(payload) - 5}"
+        )
+    return payload
+
+
 def novo_encode(payload: bytes | bytearray | list[int]) -> bytes:
-    """Encode the OEM Novo USB-CAN payload using NovoEncoding.cs framing.
-
-    The payload is the unescaped CAN record used by OEM CanInterfaceBoard:
-    4-byte big-endian module/arbitration id, 1-byte DLC, then DLC data bytes.
-    NovoEncoding appends an 8-bit additive checksum, escapes 0x7e/0x7d, and
-    wraps the result in 0x7e frame delimiters.
-    """
-
-    src = bytes(int(byte) & 0xFF for byte in payload)
+    """Encode one validated OEM Novo USB-CAN CAN record."""
+    src = _validate_novo_payload(bytes(int(byte) & 0xFF for byte in payload))
     out = bytearray([NOVO_FRAME])
     for byte in src + bytes([novo_checksum(src)]):
         if byte in (NOVO_FRAME, NOVO_ESCAPE):
@@ -53,21 +60,19 @@ def novo_encode(payload: bytes | bytearray | list[int]) -> bytes:
 
 
 def novo_decode(frame: bytes | bytearray | list[int], *, verify_checksum: bool = True) -> bytes:
-    """Decode one OEM Novo USB-CAN framed packet.
+    """Decode exactly one validated OEM Novo USB-CAN framed packet.
 
-    Unlike the decompiled NovoEncoding.Decode, this validates the delimiter and
-    checksum so bad reads are reported explicitly instead of poisoning demux.
+    The vendor decoder is permissive; Linux deliberately rejects concatenated,
+    partial, malformed, or structurally invalid frames before router demux.
     """
-
     raw = bytes(int(byte) & 0xFF for byte in frame)
-    try:
-        start = raw.index(NOVO_FRAME)
-        end = raw.rindex(NOVO_FRAME)
-    except ValueError as exc:
-        raise NovoUsbCanError("Novo USB frame is missing 0x7e delimiter") from exc
-    if end <= start + 1:
+    if len(raw) < 4 or raw[0] != NOVO_FRAME or raw[-1] != NOVO_FRAME:
+        raise NovoUsbCanError("Novo USB frame must start and end with 0x7e")
+    if raw.count(NOVO_FRAME) != 2:
+        raise NovoUsbCanError("Novo USB read contains more than one frame")
+    body = raw[1:-1]
+    if not body:
         raise NovoUsbCanError("Novo USB frame is empty")
-    body = raw[start + 1 : end]
     decoded = bytearray()
     i = 0
     while i < len(body):
@@ -78,6 +83,8 @@ def novo_decode(frame: bytes | bytearray | list[int], *, verify_checksum: bool =
                 raise NovoUsbCanError("Novo USB frame has a dangling escape byte")
             decoded.append(body[i] ^ NOVO_ESCAPE_XOR)
         else:
+            if byte == NOVO_FRAME:
+                raise NovoUsbCanError("Novo USB frame contains an unescaped delimiter")
             decoded.append(byte)
         i += 1
     if len(decoded) < 2:
@@ -87,7 +94,7 @@ def novo_decode(frame: bytes | bytearray | list[int], *, verify_checksum: bool =
     expected = novo_checksum(payload)
     if verify_checksum and checksum != expected:
         raise NovoUsbCanError(f"Novo USB checksum mismatch: got 0x{checksum:02x}, expected 0x{expected:02x}")
-    return payload
+    return _validate_novo_payload(payload)
 
 
 class NovoUsbCanBus:
@@ -198,6 +205,8 @@ class NovoUsbCanBus:
         matcher_name: str,
         initialization: bool = False,
         completion_timeout_s: float = 60.0,
+        allow_multipart: bool = False,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         router = self._current_router()
         tx_id = int(getattr(msg, "arbitration_id"))
@@ -205,15 +214,16 @@ class NovoUsbCanBus:
         tx_dlc = int(getattr(msg, "dlc", len(tx_data)))
         payload = self.build_payload(tx_id, tx_data, tx_dlc)
         expected_rx_id = tx_id | 0x400
-        if initialization:
+        if initialization or not wait_for_completion:
             router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
         try:
             return router.transact(
                 novo_encode(payload),
-                matcher=router.pipette_matcher(
+                matcher=None if not wait_for_completion else router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
                     initialization=bool(initialization),
+                    allow_multipart=bool(allow_multipart),
                 ),
                 matcher_name=matcher_name,
                 timeout_s=float(timeout_s),
@@ -225,11 +235,64 @@ class NovoUsbCanBus:
                     "tx_dlc": tx_dlc,
                     "tx_data": tx_data[:tx_dlc],
                     "expected_rx_id": expected_rx_id,
-                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization else None,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
+                    "completion_deferred": bool(not wait_for_completion),
                 },
             )
         except Exception:
-            if initialization:
+            if initialization or not wait_for_completion:
+                router.wait_pipette_completion(int(channel), 0.0)
+            raise
+
+    def transact_can_many(
+        self,
+        messages: list[Any] | tuple[Any, ...],
+        *,
+        channel: int,
+        expected_function: int,
+        timeout_s: float,
+        matcher_name: str,
+        initialization: bool = False,
+        completion_timeout_s: float = 60.0,
+        allow_multipart: bool = True,
+        wait_for_completion: bool = True,
+    ) -> dict[str, Any]:
+        router = self._current_router()
+        if not messages:
+            raise NovoUsbCanError("multi-frame CAN transaction requires at least one message")
+        payloads: list[bytes] = []
+        tx_frames: list[dict[str, Any]] = []
+        for message in messages:
+            tx_id = int(getattr(message, "arbitration_id"))
+            tx_data = list(getattr(message, "data", []))
+            tx_dlc = int(getattr(message, "dlc", len(tx_data)))
+            payloads.append(novo_encode(self.build_payload(tx_id, tx_data, tx_dlc)))
+            tx_frames.append({"tx_id": tx_id, "tx_dlc": tx_dlc, "tx_data": tx_data[:tx_dlc]})
+        if initialization or not wait_for_completion:
+            router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
+        try:
+            return router.transact_many(
+                payloads,
+                matcher=None if not wait_for_completion else router.pipette_matcher(
+                    channel=int(channel),
+                    expected_function=int(expected_function),
+                    initialization=bool(initialization),
+                    allow_multipart=bool(allow_multipart),
+                ),
+                matcher_name=matcher_name,
+                timeout_s=float(timeout_s),
+                write_timeout_ms=self.write_timeout_ms,
+                provenance={
+                    "channel": int(channel),
+                    "command_family": int(expected_function),
+                    "expected_rx_id": int(getattr(messages[-1], "arbitration_id")) | 0x400,
+                    "tx_frames": tx_frames,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
+                    "completion_deferred": bool(not wait_for_completion),
+                },
+            )
+        except Exception:
+            if initialization or not wait_for_completion:
                 router.wait_pipette_completion(int(channel), 0.0)
             raise
 
@@ -257,6 +320,7 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         response_timeout_s: float = 60.0,
         vendor_id: int = NOVO_USB_VENDOR_ID,
         product_id: int = NOVO_USB_PRODUCT_ID,
+        pipette_error_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         self.bus = NovoUsbCanBus(
             shared_usb=shared_usb,
@@ -266,13 +330,20 @@ class BioXpNovoUsbDriver(BioXpCanDriver):
         )
         self.channel = "novo-usb-shared" if shared_usb is not None else "novo-usb"
         self.bitrate = 0
-        self.pipette_id = int(pipette_id)
+        self.pipette_id = self._validate_pipette_id(pipette_id)
+        # This shared-USB subclass cannot call BioXpCanDriver.__init__ (it would
+        # claim SocketCAN), but its OEM pipette commands retain the base 100 ms
+        # post-wake delay contract.
+        self._sleep = time.sleep
         self.response_timeout_s = 60.0
         # Do not invoke BioXpCanDriver.__init__: it opens SocketCAN, whereas
         # this subclass is owned by the shared OEM Novo USB router.  Retain
         # only the inherited driver's injectable timing dependency so its
         # OEM wake -> 100 ms -> WR sequence can run.
         self._sleep = time.sleep
+        self._pipette_message_state: dict[str, Any] = {}
+        self._pipette_last_command: str | None = None
+        self._pipette_error_callback = pipette_error_callback
         self.usb = {
             "vendor_id": int(vendor_id),
             "product_id": int(product_id),

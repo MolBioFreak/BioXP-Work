@@ -218,23 +218,11 @@ What you want to see:
 
 Telemetry is necessary but not sufficient. Physical supervision still matters.
 
-## Full strict startup homing, if you want the OEM startup sequence
+## Strict startup homing is intentionally disabled
 
-Preferred assistant-operated wrapper:
+Do **not** invoke `--homing` or send `{"run_homing":true}` to `/motion/arm/strict_startup`. The monolithic strict-startup homing route is disabled/fail-closed because prior live testing showed it could wedge USB and obscure incorrect motion.
 
-```bash
-BIOXP_BASE_URL="$BIOXP_BASE_URL" /home/dalab/Desktop/bioxp_re/scripts/bioxp_supervised_strict_startup.sh --homing
-```
-
-Equivalent raw API call:
-
-```bash
-curl -sS -X POST "$BIOXP_BASE_URL/motion/arm/strict_startup" \
-  -H 'Content-Type: application/json' \
-  -d '{"run_homing":true}'
-```
-
-Current startup sequence in code is OEM-style:
+The OEM-style sequence below is **historical source provenance only**, not an executable or approved current procedure:
 
 1. reconnect / activate boards
 2. initialize without motion
@@ -248,6 +236,8 @@ Current startup sequence in code is OEM-style:
 10. Y home
 11. `setHome(Y)`
 12. door home
+
+Use only separately authorized, supervised stepwise commissioning procedures with explicit per-step proof; this runbook does not authorize physical homing.
 
 ## Re-reference / calibration metadata
 

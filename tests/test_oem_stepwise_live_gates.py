@@ -1,5 +1,5 @@
 
-from bioxp.oem_stepwise_live_gates import build_stepwise_live_contract
+from src.bioxp.oem_stepwise_live_gates import build_stepwise_live_contract
 
 
 def test_live_contract_rejects_without_ack_or_shadow_safe():

@@ -22,6 +22,12 @@ class OemDefaultParameters:
         return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)
 
     def gantry_load(self, *, tiploaded: Any = None, plateloaded: Any = None) -> "OemDefaultParameters":
+        if isinstance(tiploaded, str) and tiploaded.strip().lower() in {"true", "false"}:
+            raise ValueError("tiploaded must be a typed boolean or OEM pipetteTipType value")
+        if tiploaded is True:
+            return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)
+        if tiploaded is False:
+            tiploaded = None
         # OEM: if tiploaded.HasValue && tiploaded != UNKNOWN => 500.
         if tiploaded not in UNKNOWN_TIP_VALUES:
             return OemDefaultParameters(pseudo_z_home=PSEUDO_Z_HOME_HIGH)
@@ -59,6 +65,8 @@ class OemMachineState:
     tip_loaded: bool = False
     tip_dirty: bool = False
     tip_location: int = -1
+    plate_on_gantry: int | str | None = None
+    location19_y: int | None = None
     clean_path: bool = False
     device_type: str = ""
     axis_confirmed: Mapping[str, bool] = field(default_factory=dict)
@@ -88,6 +96,8 @@ class OemMachineState:
             tip_loaded=self.tip_loaded,
             tip_dirty=self.tip_dirty,
             tip_location=self.tip_location,
+            plate_on_gantry=self.plate_on_gantry,
+            location19_y=self.location19_y,
             clean_path=self.clean_path,
             device_type=self.device_type,
             axis_confirmed=dict(self.axis_confirmed),
@@ -113,6 +123,8 @@ class OemMachineState:
             "tip_loaded": self.tip_loaded,
             "tip_dirty": self.tip_dirty,
             "tip_location": self.tip_location,
+            "plate_on_gantry": self.plate_on_gantry,
+            "location19_y": self.location19_y,
             "clean_path": self.clean_path,
             "device_type": self.device_type,
             "axis_confirmed": dict(self.axis_confirmed),

@@ -14,6 +14,31 @@ class PipetteTipAction(str, Enum):
     EJECT = "eject"
 
 
+class PipetteStatusCode(int, Enum):
+    NOT_DETERMINED = 0
+    STATUS_FALSE = 1
+    STATUS_TRUE = 2
+
+
+class PipetteErrorCode(int, Enum):
+    NO_ERROR = 32
+    INITIALIZATION_ERROR = 33
+    INVALID_COMMAND = 34
+    INVALID_OPERAND = 35
+    PRESSURE_ERROR = 36
+    OVER_PRESSURE = 37
+    LIQUIE_LEVEL_DETECT_FAILURE = 38
+    DEVICE_NOT_INITIALIZED = 39
+    TIP_EJECT_FAILURE = 40
+    PLUNGER_OVERLOAD = 41
+    TIP_LOST = 42
+    NOT_USED = 43
+    EXTENDED_ERROR = 44
+    NVMEM_ACCESS_FAILURE = 45
+    COMMAND_BUFFFER_EMPTY = 46
+    COMMAND_BUFFER_OVERFLOW = 47
+
+
 class PipetteError(Exception):
     def __init__(
         self,
@@ -455,3 +480,70 @@ class PipetteMixCommand:
             "operator": self.operator,
             "metadata": dict(self.metadata),
         }
+
+
+@dataclass(frozen=True)
+class PipetteTerminateCommand:
+    operator: str | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operator", _normalize_optional_text(self.operator, field_name="operator"))
+        object.__setattr__(self, "reason", _normalize_optional_text(self.reason, field_name="reason"))
+        object.__setattr__(self, "metadata", _normalize_metadata(self.metadata))
+
+    @classmethod
+    def from_request(cls, req: Any) -> "PipetteTerminateCommand":
+        return cls(
+            operator=_mapping_get(req, "operator"),
+            reason=_mapping_get(req, "reason"),
+            metadata=_mapping_get(req, "metadata", {}),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "operator": self.operator,
+            "reason": self.reason,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class PipetteHeartbeatCommand:
+    enabled: bool
+
+    @classmethod
+    def from_request(cls, req: Any) -> "PipetteHeartbeatCommand":
+        return cls(enabled=bool(_mapping_get(req, "enabled")))
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"enabled": bool(self.enabled)}
+
+
+@dataclass(frozen=True)
+class PipetteDiagnosticCommand:
+    number: int
+
+    def __post_init__(self) -> None:
+        number = int(self.number)
+        if number < 0 or number > 9:
+            raise PipetteValidationError("diagnostic number must be an ASCII digit 0..9")
+        object.__setattr__(self, "number", number)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"number": int(self.number)}
+
+
+@dataclass(frozen=True)
+class PipetteErrorLogCommand:
+    raw_byte: int = 0
+
+    def __post_init__(self) -> None:
+        value = int(self.raw_byte)
+        if value < 0 or value > 255:
+            raise PipetteValidationError("error-log raw_byte must be between 0 and 255")
+        object.__setattr__(self, "raw_byte", value)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"raw_byte": int(self.raw_byte)}

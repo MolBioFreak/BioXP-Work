@@ -142,14 +142,13 @@
     },
     {
       "deviations": [
-        "Runs one supervised startup step at a time, not the OEM monolithic initializeMotors call.",
-        "Live adaptations exist for axes whose raw switches were non-informative."
+        "The provider owns admission, physical execution, atomic state, observation, and receipts."
       ],
-      "source_mode": "initializeMotors/startup_step",
+      "source_mode": "initializeMotors/initializeMotion",
       "target_file": "src/bioxp/api.py",
-      "target_line": 2714,
-      "target_status": "stepwise_guarded_subset_not_monolithic_oem",
-      "target_symbol": "motion_oem_startup_step / _execute_oem_startup_step"
+      "target_line": 1307,
+      "target_status": "canonical_atomic_serial206_authority",
+      "target_symbol": "Serial206OemInitializationProvider"
     },
     {
       "deviations": [
@@ -195,33 +194,15 @@
     },
     {
       "deviations": [
-        "No direct parallel HomeXY source-mode implementation identified in current live code."
+        "Direct HomeXY label/setup/restore surface exists.",
+        "X and Y goHome(false, axis, 200, true) are launched concurrently to match OEM Task.Run/WaitAll semantics.",
+        "This is a source-parity surface, not a manual single-axis home or controller-zero route."
       ],
       "source_mode": "HomeXY",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 0,
-      "target_status": "missing_direct_port",
-      "target_symbol": "no direct one-to-one function found"
-    },
-    {
-      "deviations": [
-        "Door-state save/restore wrapper semantics are not represented as a clean ControlLib.rehome port."
-      ],
-      "source_mode": "ControlLib.rehome",
-      "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 4003,
-      "target_status": "approximated_by_stepwise_startup_not_rehome_wrapper",
-      "target_symbol": "motor_startup_homing_mimic / startup_step routes"
-    },
-    {
-      "deviations": [
-        "Includes artifacts/readiness gates and separates live motion; not a full OEM initializeMotion clone."
-      ],
-      "source_mode": "ControlLib.initializeMotion",
-      "target_file": "src/bioxp/oem_startup_program.py",
-      "target_line": 461,
-      "target_status": "artifact_state_machine_not_full_live_motion_equivalent",
-      "target_symbol": "OEMStartupProgram.request_startup"
+      "target_line": 3925,
+      "target_status": "direct_oem_parallel_task_run_waitall",
+      "target_symbol": "BioXpTester.motor_oem_home_xy / motion_oem_home_xy"
     }
   ],
   "manual_home": {
@@ -367,10 +348,28 @@
   },
   "raw_fastapi_route_table": [
     {
-      "classification": "stepwise initializeMotors subset",
+      "classification": "direct HomeXY mode surface; guarded X/Y switch-search",
       "methods": "POST",
-      "name": "motion_oem_startup_step",
-      "path": "/motion/oem/startup_step"
+      "name": "motion_oem_home_xy",
+      "path": "/motion/oem/home_xy"
+    },
+    {
+      "classification": "canonical serial-206 initializeMotors provider",
+      "methods": "POST",
+      "name": "motion_oem_serial206_initialize_motors",
+      "path": "/motion/oem/initialization/initialize_motors"
+    },
+    {
+      "classification": "canonical serial-206 initializeMotion provider",
+      "methods": "POST",
+      "name": "motion_oem_serial206_initialize_motion",
+      "path": "/motion/oem/initialization/initialize_motion"
+    },
+    {
+      "classification": "canonical serial-206 initialization state",
+      "methods": "GET",
+      "name": "motion_oem_initialization_provider_status",
+      "path": "/motion/oem/initialization/provider-status"
     },
     {
       "classification": "manual/goHome-style route",
@@ -417,14 +416,34 @@
   ],
   "routes": [
     {
-      "equivalence": "not-equivalent-to-manual-home",
-      "maps_to": "stepwise initializeMotors subset",
+      "equivalence": "not-equivalent-to-single-axis-home-or-zero",
+      "maps_to": "direct HomeXY mode surface",
       "method": "POST",
       "notes": [
-        "Raw FastAPI lives inside robot/container network in this setup.",
-        "Use this for supervised OEM startup steps, not as a generic Home button."
+        "Preserves HomeXY source-mode label and launches X/Y goHome concurrently like OEM Task.Run/WaitAll.",
+        "This is not manual single-axis Home and not controller Zero."
       ],
-      "route": "/motion/oem/startup_step",
+      "route": "/motion/oem/home_xy",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "canonical-provider-authority",
+      "maps_to": "canonical serial-206 initializeMotors stage",
+      "method": "POST",
+      "notes": [
+        "Admission, execution, observation, and receipt state are atomic in the serial-206 provider."
+      ],
+      "route": "/motion/oem/initialization/initialize_motors",
+      "surface": "raw-fastapi"
+    },
+    {
+      "equivalence": "canonical-provider-authority",
+      "maps_to": "canonical serial-206 initializeMotion stage",
+      "method": "POST",
+      "notes": [
+        "The provider advances only the expected approved stage."
+      ],
+      "route": "/motion/oem/initialization/initialize_motion",
       "surface": "raw-fastapi"
     },
     {
@@ -450,22 +469,12 @@
     },
     {
       "equivalence": "proxy-not-authority",
-      "maps_to": "proxy/linkage to raw startup_step when exposed",
+      "maps_to": "robot-owned catalog action invocation",
       "method": "POST",
       "notes": [
-        "BMS may expose/proxy a subset and status shape can differ from raw robot API."
+        "BMS forwards robot action identifiers and robot admission receipts without local mutation policy."
       ],
-      "route": "/api/bioxp/motion/oem/startup_step",
-      "surface": "bms-proxy"
-    },
-    {
-      "equivalence": "proxy-not-authority",
-      "maps_to": "proxy/linkage to raw manual home when exposed",
-      "method": "POST",
-      "notes": [
-        "Do not assume this is present or a full mirror; probe route existence separately."
-      ],
-      "route": "/api/bioxp/motion/axis/home",
+      "route": "/api/bioxp/operator-controls/actions/{action_id}/invoke",
       "surface": "bms-proxy"
     }
   ],

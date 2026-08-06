@@ -3,7 +3,7 @@ import importlib
 
 
 def test_fresh_spec_module_is_no_usb_and_lists_required_programs():
-    spec = importlib.import_module("bioxp.oem_homing_spec")
+    spec = importlib.import_module("src.bioxp.oem_homing_spec")
     assert spec.NO_USB_IMPORTS is True
     names = set(spec.program_names())
     assert {
@@ -25,21 +25,29 @@ def test_fresh_spec_module_is_no_usb_and_lists_required_programs():
 
 
 def test_initialize_motors_spec_preserves_oem_order_and_g_current_invariant():
-    from bioxp.oem_homing_spec import get_program
+    from src.bioxp.oem_homing_spec import get_program
     prog = get_program("initialize_motors")
     assert prog.live_allowed_default is False
-    assert [s.step_id for s in prog.steps[:12]] == [
+    assert [s.step_id for s in prog.steps] == [
         "z.axisSearchHome",
-        "g.setMaxCurrent.before_clear",
+        "g.setGripperCurrent.before_clear",
         "g.clear.moveSteps",
         "g.axisSearchHome",
         "x.axisSearchHome",
+        "x.sleep.after_home",
         "x.setHome",
         "x.setSpeed.restore",
+        "x.sleep.after_speed",
         "x.park_6000",
         "y.axisSearchHome",
         "door.doorSearchHome",
+        "door.open_after_failed_close",
+        "door.throw_after_failed_close",
         "y.setHome.final",
+        "ui.zero_calibrated_positions",
+        "chiller.setCoolRate.OC",
+        "chiller.setCoolRate.RC",
+        "status.initialized",
         "g.restore_current.version1",
     ]
     assert "g_current_invariant" in prog.required_artifact_fields
@@ -47,7 +55,7 @@ def test_initialize_motors_spec_preserves_oem_order_and_g_current_invariant():
 
 
 def test_without_motion_spec_includes_non_motor_side_effects():
-    from bioxp.oem_homing_spec import get_program
+    from src.bioxp.oem_homing_spec import get_program
     prog = get_program("initialize_motors_without_motion")
     ids = {s.step_id for s in prog.steps}
     assert {"waitForBoard", "turnOffHeater", "setChillerPWM", "setChillerCoolRate.OC", "setChillerCoolRate.RC", "setTCHeatCoolRate", "setColor.white"} <= ids
@@ -55,7 +63,7 @@ def test_without_motion_spec_includes_non_motor_side_effects():
 
 
 def test_move_z_home_home_gz_and_initialize_motion_are_explicit_blocked_programs():
-    from bioxp.oem_homing_spec import get_program
+    from src.bioxp.oem_homing_spec import get_program
     assert get_program("move_z_home").blockers
     assert get_program("home_gz").blockers
     init_motion = get_program("initialize_motion")

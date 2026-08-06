@@ -224,27 +224,33 @@ def test_liquid_routes_delegate_to_pipette_service(monkeypatch):
         calls.append(("mix", command))
         return {"ok": True, "cycles": command.cycles}
 
+    class FakeTransport:
+        def initialize(self, command):
+            calls.append(("init", command))
+            return {"ok": True, "initialized": True}
+
     monkeypatch.setattr(api, "run_pipette_status", fake_status)
-    monkeypatch.setattr(api, "run_pipette_init_command", fake_init)
     monkeypatch.setattr(api, "run_pipette_tip_command", fake_tip)
     monkeypatch.setattr(api, "run_pipette_aspirate_command", fake_aspirate)
     monkeypatch.setattr(api, "run_pipette_dispense_command", fake_dispense)
     monkeypatch.setattr(api, "run_pipette_mix_command", fake_mix)
+    monkeypatch.setattr(api, "_can_ready_observation", lambda: True)
+    monkeypatch.setattr(api, "_get_pipette_transport", lambda: FakeTransport())
+    api.lifecycle_state.transport_changed(True, reason="test_can_ready")
 
-    status = asyncio.run(api.liquid_status())
     init = asyncio.run(api.liquid_init(api.PipetteInitRequest(pressure_profile="1R")))
     tip = asyncio.run(api.liquid_tip(api.PipetteTipRequest(action=api.PipetteTipAction.LOAD)))
     aspirate = asyncio.run(api.liquid_aspirate(api.PipetteAspirateRequest(volume_ul=20.0, pressure_profile="1R")))
     dispense = asyncio.run(api.liquid_dispense(api.PipetteDispenseRequest(volume_ul=20.0, pressure_profile="1R", blow_out=True)))
     mix = asyncio.run(api.liquid_mix(api.PipetteMixRequest(volume_ul=10.0, cycles=2, pressure_profile="1R")))
 
-    assert status["transport"] == "fake"
-    assert init["initialized"] is True
+    assert init["ok"] is True
+    assert init["lifecycle"]["startup"]["stages"]["constructor_pipette_stage"]["state"] == "passed"
     assert tip["action"] == "load"
     assert aspirate["volume_ul"] == 20.0
     assert dispense["volume_ul"] == 20.0
     assert mix["cycles"] == 2
-    assert [name for name, _ in calls] == ["status", "init", "tip", "aspirate", "dispense", "mix"]
+    assert [name for name, _ in calls] == ["init", "tip", "aspirate", "dispense", "mix"]
 
 
 def test_liquid_aspirate_request_validates_positive_volume(monkeypatch):

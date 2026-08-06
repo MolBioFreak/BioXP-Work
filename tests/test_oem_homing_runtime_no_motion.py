@@ -1,6 +1,6 @@
 
 from pathlib import Path
-from bioxp.oem_homing_runtime import OemHomingDryRunRuntime
+from src.bioxp.oem_homing_runtime import OemHomingDryRunRuntime
 
 
 def test_dry_run_runtime_executes_all_programs_without_usb_or_motion(tmp_path):
@@ -14,7 +14,7 @@ def test_dry_run_runtime_executes_all_programs_without_usb_or_motion(tmp_path):
     assert Path(result["artifact_path"]).exists()
     assert [step["step_id"] for step in result["steps_planned"]][:4] == [
         "z.axisSearchHome",
-        "g.setMaxCurrent.before_clear",
+        "g.setGripperCurrent.before_clear",
         "g.clear.moveSteps",
         "g.axisSearchHome",
     ]

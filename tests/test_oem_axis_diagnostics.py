@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -31,7 +32,10 @@ def test_catalog_exposes_complete_finite_robot_owned_actions():
     assert projection["schema"] == "bioxp.oem_axis_diagnostics.v1"
     assert projection["caller_supplied_motion_values"] is False
     assert projection["axes"]["x"]["move-positive"]["steps"] == 100
+    assert projection["axes"]["y"]["move-negative"]["steps"] == -100
+    assert projection["axes"]["z"]["move-positive"]["steps"] == 100
     assert projection["axes"]["x"]["park-6000"]["position_steps"] == 6000
+    assert projection["axes"]["g"]["commission-home"]["temporary_action_current_internal"] is True
     assert projection["axes"]["g"]["commission-home"]["required_idle_readback"] == {
         "run": 10,
         "standby": 10,
@@ -51,6 +55,31 @@ def test_resolver_rejects_unknown_and_cross_axis_actions():
     ):
         with pytest.raises(AxisDiagnosticContractError):
             resolve_axis_diagnostic(axis, operation)
+
+
+@pytest.mark.parametrize(
+    ("axis", "operation", "executor", "value"),
+    [
+        ("x", "move-negative", "relative", -100),
+        ("x", "move-positive", "relative", 100),
+        ("y", "move-positive", "relative", 100),
+        ("z", "move-negative", "relative", -100),
+        ("x", "park-6000", "absolute", 6000),
+        ("y", "home", "home", None),
+        ("g", "commission-home", "gripper-commission-home", None),
+        ("g", "open-wide", "gripper-open-wide", None),
+        ("door", "close", "door-close", None),
+        ("door", "stop", "stop", None),
+    ],
+)
+def test_resolver_maps_only_robot_owned_oem_actions(axis, operation, executor, value):
+    from src.bioxp.oem_axis_diagnostics import resolve_axis_diagnostic
+
+    action = resolve_axis_diagnostic(axis, operation)
+    assert action.axis == axis
+    assert action.operation == operation
+    assert action.executor == executor
+    assert action.value == value
 
 
 def test_robot_api_publishes_only_finite_diagnostic_models_and_routes():
@@ -246,6 +275,86 @@ def test_diagnostic_stop_preempts_inflight_normal_tester_lock(monkeypatch):
     called_before_release, result = asyncio.run(scenario())
     assert called_before_release is True
     assert result["verified_stopped"] is True
+
+
+def test_safety_interrupt_uses_reserved_worker_when_general_threadpool_is_saturated(monkeypatch):
+    from src.bioxp import api
+
+    tester = object()
+    general_worker_started = asyncio.Event()
+    release_general_worker = asyncio.Event()
+    general_pool_token = asyncio.Lock()
+    safety_called = threading.Event()
+
+    def normal_operation():
+        return {"ok": True, "lane": "normal"}
+
+    def safety_operation(active_tester):
+        assert active_tester is tester
+        safety_called.set()
+        return {"ok": True, "lane": "safety"}
+
+    async def single_worker_general_pool(func, *args):
+        async with general_pool_token:
+            if func is normal_operation:
+                general_worker_started.set()
+                await release_general_worker.wait()
+            return func(*args)
+
+    monkeypatch.setattr(api, "run_in_threadpool", single_worker_general_pool)
+    monkeypatch.setattr(api, "_tester_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+
+    async def scenario():
+        normal_task = asyncio.create_task(
+            api._run_blocking("saturate general pool", normal_operation, timeout_s=1.0)
+        )
+        await general_worker_started.wait()
+        safety_task = asyncio.create_task(
+            api._run_safety_interrupt_blocking(
+                "reserved safety worker",
+                safety_operation,
+                timeout_s=1.0,
+            )
+        )
+        called_before_release = await asyncio.to_thread(safety_called.wait, 0.15)
+        release_general_worker.set()
+        normal_result = await normal_task
+        safety_result = await safety_task
+        return called_before_release, normal_result, safety_result
+
+    called_before_release, normal_result, safety_result = asyncio.run(scenario())
+    assert called_before_release is True
+    assert normal_result == {"ok": True, "lane": "normal"}
+    assert safety_result == {"ok": True, "lane": "safety"}
+
+
+def test_safety_interrupt_preserves_operator_dispatch_context(monkeypatch):
+    from src.bioxp import api
+
+    tester = object()
+    dispatch_authority: ContextVar[str | None] = ContextVar("dispatch_authority", default=None)
+
+    def safety_operation(active_tester):
+        assert active_tester is tester
+        return {"authority": dispatch_authority.get()}
+
+    monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_tester", tester)
+
+    async def scenario():
+        token = dispatch_authority.set("operator-context")
+        try:
+            return await api._run_safety_interrupt_blocking(
+                "context propagation",
+                safety_operation,
+                timeout_s=1.0,
+            )
+        finally:
+            dispatch_authority.reset(token)
+
+    assert asyncio.run(scenario()) == {"authority": "operator-context"}
 
 
 def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
@@ -826,7 +935,7 @@ def test_quarantined_release_invalidates_fresh_snapshot_and_blocks_motion(monkey
     assert before["available"] is True and before["cache_state"] == "fresh"
     assert after["snapshot_id"] is None
     assert after["available"] is False and after["cache_state"] == "missing"
-    assert after["runtime_available"] is None
+    assert after["runtime_available"] is False
     assert after["hardware_connected"] is False
     assert after["ownership"] == {"transport": "quarantined", "usb": "quarantined", "router": "stopped", "CAN_READY": False}
     assert after["maintenance_state"]["usb_owner"] == "quarantined"
@@ -834,3 +943,57 @@ def test_quarantined_release_invalidates_fresh_snapshot_and_blocks_motion(monkey
     assert after["maintenance_state"]["recovery_required"] is True
     assert api._tester is None
     assert api._tester_quarantine is tester
+
+
+def test_gripper_stop_restores_idle_and_verifies_stop(monkeypatch):
+    from src.bioxp import api
+
+    events: list[str] = []
+
+    class Tester:
+        def _motion_oem_axis_profile(self, axis, startup=False):
+            assert axis == "g"
+            return {"board": 4, "motor": 2}
+
+        def motor_stop(self, board, motor):
+            assert (board, motor) == (4, 2)
+            events.append("stop")
+            return {"ok": True}
+
+    async def immediate(_label, fn, **_kwargs):
+        return fn()
+
+    monkeypatch.setattr(api, "_get_tester", lambda: Tester())
+    monkeypatch.setattr(api, "_run_blocking", immediate)
+    monkeypatch.setattr(
+        api,
+        "restore_gripper_idle_current",
+        lambda _tester, **_kwargs: events.append("restore") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        api,
+        "gripper_status",
+        lambda _tester: {
+            "ok": True,
+            "speed": {"speed": 0},
+            "current": {"run_current_param6": 10, "standby_current_param7": 10},
+        },
+    )
+
+    response = asyncio.run(
+        api.motion_diagnostics_stop(
+            api.AxisDiagnosticStopRequest(
+                axis="g",
+                operator_ack="STOP_AXIS",
+                reason="operator stop",
+                operator="diagnostic test",
+            )
+        )
+    )
+
+    assert events == ["stop", "restore"]
+    assert response["ok"] is True
+    assert response["terminal_status"]["rows"]["g"]["current"] == {
+        "run_current_param6": 10,
+        "standby_current_param7": 10,
+    }

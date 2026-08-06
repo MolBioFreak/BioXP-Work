@@ -18,7 +18,7 @@ CONTAINER_NAME=bioxp-robot-handler-prod
 PORT=8123
 LOCK_DIR=/var/lib/bioxp-oem-authority
 LOCK_FILE=/var/lib/bioxp-oem-authority/OEM_EVIDENCE_LOCK.json
-STATE_DIR=/home/molbiofreak/bioxp_re/.oem_runtime_state
+STATE_DIR=/var/lib/bioxp-oem-runtime
 
 SCRIPT_PATH="$($READLINK -f -- "${BASH_SOURCE[0]}")"
 APP_DIR="$(cd "$($DIRNAME "$SCRIPT_PATH")/.." && /bin/pwd -P)"
@@ -45,6 +45,8 @@ if ! $GIT -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   echo "[bioxp-guard] release source must be a clean Git worktree" >&2
   exit 96
 fi
+RELEASE_SHA="$($GIT -C "$APP_DIR" rev-parse HEAD)"
+RELEASE_TREE="$($GIT -C "$APP_DIR" rev-parse HEAD^{tree})"
 
 if [[ -L "$LOCK_FILE" || ! -f "$LOCK_FILE" || -w "$LOCK_FILE" \
   || "$($STAT -c '%U:%G:%a' "$LOCK_FILE")" != 'root:root:444' \
@@ -77,4 +79,4 @@ exec "$UDOCKER_BIN" run \
   --volume=/run/udev:/run/udev \
   --workdir=/app \
   "$CONTAINER_NAME" \
-  /bin/sh -lc "PYTHONPATH=/app/src BIOXP_RUNTIME_OWNER=udocker-container BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port $PORT"
+  /bin/sh -lc "PYTHONPATH=/app/src BIOXP_RUNTIME_OWNER=udocker-container BIOXP_RELEASE_SHA=$RELEASE_SHA BIOXP_RELEASE_TREE=$RELEASE_TREE BIOXP_RELEASE_SOURCE_MOUNT=/app BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port $PORT"

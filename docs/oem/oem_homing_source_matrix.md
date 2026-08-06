@@ -33,13 +33,13 @@ This artifact separates OEM homing modes and route surfaces before any further l
 
 ## Raw FastAPI vs BMS/proxy topology
 
-- Raw FastAPI route `/motion/oem/startup_step` (POST): stepwise supervised startup path; maps to an `initializeMotors` subset. In this setup it may be reachable only inside the robot/container network.
 - Raw FastAPI route `/motion/oem/home_xy` (POST): direct `HomeXY` mode surface with X/Y speedacc envelope and concurrent X/Y `goHome(false, axis, 200, true)` execution matching OEM `Task.Run`/`Task.WaitAll`; not equivalent to single-axis Home or Zero.
-- Raw FastAPI route `/motion/oem/rehome` (POST): direct `ControlLib.rehome` wrapper; defaults fail-closed unless `run_homing=true`; not equivalent to manual axis home.
-- Raw FastAPI route `/motion/oem/initialize_motion` (POST): direct `ControlLib.initializeMotion` wrapper; no-homing diagnostic by default, homing requires a distinct ack.
+- Raw FastAPI route `/motion/oem/initialization/initialize_motors` (POST): canonical serial-206 provider entry point for the next approved `initializeMotors` stage.
+- Raw FastAPI route `/motion/oem/initialization/initialize_motion` (POST): canonical serial-206 provider entry point for the next approved `initializeMotion` stage.
+- Raw FastAPI route `/motion/oem/initialization/provider-status` (GET): canonical atomic initialization-state projection.
 - Raw FastAPI route `/motion/axis/home` (POST): manual-button/goHome-style route (`startup=False` historically), not equivalent to startup `axisSearchHome`/full re-reference.
 - Raw FastAPI route `/motion/axis/zero` (POST): Linux absolute controller-zero route, not OEM switch/reference homing.
-- BMS `/api/bioxp/*`: proxy/linkage layer. It may expose only a subset of raw robot routes and can have status-shape differences. Probe BMS route existence separately; do not assume it is a full mirror of raw FastAPI.
+- BMS `/api/bioxp/operator-controls/actions/{action_id}/invoke`: thin proxy for robot-owned catalog actions and receipts; BMS does not own a second mutation policy.
 
 ## Live Linux deviation note
 
@@ -53,12 +53,11 @@ Machine-readable matrix source: `src/bioxp/oem_homing_model.py::source_matrix()`
 This is the part that was missing from the first pass. Current Linux target status is explicitly not clean parity:
 
 - `initializeMotorsWithoutMotion` -> `BioXpTester.motor_oem_initialize_without_motion` (`usb_driver.py:3397`): source-shaped setup, constants partly reconstructed/defaulted without recovered `config.xml`.
-- `initializeMotors` -> `/motion/oem/startup_step` / `_execute_oem_startup_step` (`api.py:2714`, route at `2800` before this patch series): stepwise guarded subset, not OEM monolithic `initializeMotors`.
+- `initializeMotors` and `initializeMotion` -> `Serial206OemInitializationProvider`: one atomic authority owns admission, expected-stage execution, observation, persistence, and receipts.
 - startup `axisSearchHome` -> `motor_oem_axis_search_home` (`usb_driver.py:3418`): partial guarded reconstruction; Z may use GAP10/controller-zero workaround instead of source GAP9 search.
 - manual button `goHome(true)` -> `motor_oem_go_home` / `motor_oem_home_axis(startup=False)` (`usb_driver.py:3510`, `3833`; `/motion/axis/home` at `api.py:2894`): unsafe until predicate matrix and deassert->active proof are fixed.
 - `doorSearchHome` -> `motor_oem_door_search_home` (`usb_driver.py:3725`): separate partial reconstruction, needs physical predicate proof.
 - `HomeXY` -> `BioXpTester.motor_oem_home_xy` / `/motion/oem/home_xy`: direct mode label/setup/restore surface now exists; X/Y `goHome(false, axis, 200, true)` calls are launched concurrently to match OEM `Task.Run`/`Task.WaitAll`; this is separate from manual single-axis Home and Zero.
-- `ControlLib.rehome` -> `BioXpTester.motor_oem_rehome` / `/motion/oem/rehome`: direct wrapper now exists around the initializeMotors body; door-state save/restore gap is explicit because no trusted Linux source-equivalent setter is exposed; raw route defaults fail-closed unless `run_homing=true`.
-- `ControlLib.initializeMotion` -> `BioXpTester.motor_oem_initialize_motion` / `/motion/oem/initialize_motion`: direct wrapper now exists; no-homing diagnostic path calls initialize-without-motion; `run_homing=true` delegates to the rehome/initializeMotors wrapper; tip/pipette cleanup remains labeled not ported.
+- Retired compatibility wrappers (`startup_step`, `rehome`, the no-homing `initialize_motion` diagnostic, and `initialization/run`) are absent from executable source and route topology.
 
 Raw FastAPI route table was enumerated by importing `src.bioxp.api:app` only; no USB or motion endpoint was called.

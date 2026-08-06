@@ -4,17 +4,17 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bioxp_supervised_strict_startup.sh [--homing] [--base-url URL] [--log-root DIR]
+  bioxp_supervised_strict_startup.sh [--homing (disabled)] [--base-url URL] [--log-root DIR]
 
 What it does:
   - captures pre-startup status/power/latch/axes snapshots
-  - runs POST /motion/arm/strict_startup
+  - runs the no-homing POST /motion/arm/strict_startup surface
   - captures post-startup status/power/latch/axes snapshots
   - attempts reference-status checks when the route exists
   - saves every payload into a timestamped log directory
 
 Flags:
-  --homing       run OEM startup homing sequence (run_homing=true)
+  --homing       disabled compatibility flag; exits without sending a motion request
 
 Defaults:
   BIOXP_BASE_URL=http://127.0.0.1:8000/api/bioxp
@@ -23,8 +23,7 @@ Defaults:
 
 Examples:
   ./scripts/bioxp_supervised_strict_startup.sh
-  ./scripts/bioxp_supervised_strict_startup.sh --homing
-  BIOXP_BASE_URL=http://127.0.0.1:8123 ./scripts/bioxp_supervised_strict_startup.sh --homing
+  BIOXP_BASE_URL=http://127.0.0.1:8123 ./scripts/bioxp_supervised_strict_startup.sh
 EOF
 }
 
@@ -126,7 +125,7 @@ echo "RUN_DIR=${RUN_DIR}"
 if [[ "$RUN_HOMING" -eq 1 ]]; then
   echo
   echo "DISABLED: monolithic --homing is blocked after live testing showed it can wedge USB and hide wrong motion."
-  echo "Use ./scripts/bioxp_supervised_oem_startup_homing_stepwise.sh instead; it logs and confirms each physical step."
+  echo "Use the serial-206 initialization provider via /motion/oem/initialization/initialize_motors or the robot-owned operator catalog; it admits one exact OEM stage at a time."
   exit 2
 fi
 

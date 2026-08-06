@@ -8,13 +8,18 @@ __all__ = [
     "BioXpCanDriver",
     "BoardAssy",
     "MotorAxis",
+    "process_pipette_message",
+    "PIPETTE_DATA_QUERY_LABELS",
+    "lifecycle_state",
 ]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "lifecycle_state":
+        return import_module(".lifecycle_state", __name__)
     if name == "BioXpTester":
         return import_module(".usb_driver", __name__).BioXpTester
-    if name in {"BioXpCanDriver", "BoardAssy", "MotorAxis"}:
+    if name in {"BioXpCanDriver", "BoardAssy", "MotorAxis", "process_pipette_message", "PIPETTE_DATA_QUERY_LABELS"}:
         try:
             module = import_module(".can_driver", __name__)
         except Exception:  # pragma: no cover - legacy optional dependency surface

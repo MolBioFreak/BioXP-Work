@@ -12,15 +12,35 @@ from ..pipette.models import (
     PipetteTipCommand,
     PipetteValidationError,
 )
+from ..pipette.receipts import PipetteReceiptError, PipetteReceiptStore
 from ..pipette.transport import PipetteTransport
 
 BlockingRunner = Callable[..., Awaitable[dict[str, Any]]]
-TransportGetter = Callable[[], PipetteTransport]
+TransportGetter = Callable[[], Any]
 PipettePreflight = Callable[[str, Any], dict[str, Any]]
 
 
 def _pipette_error_to_http_exception(exc: PipetteError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.to_payload())
+
+
+def _validate_oem_admission(operation_name: str | None, command: Any | None) -> None:
+    if command is None:
+        return
+    profile = getattr(command, "pressure_profile", None)
+    if profile is not None and str(profile).upper() != "1R":
+        raise PipetteValidationError(
+            "Only OEM-backed pressure profile 1R is admitted; arbitrary profiles are not source-validated."
+        )
+    if operation_name in {"aspirate", "dispense", "mix"}:
+        if getattr(command, "air_gap_ul", None) is not None:
+            raise PipetteValidationError(
+                "air_gap_ul is not an OEM ClassPipette operation and is rejected until mapped to pinned evidence."
+            )
+        if operation_name == "dispense" and bool(getattr(command, "blow_out", False)):
+            raise PipetteValidationError(
+                "blow_out is not an OEM ClassPipette operation; use an explicit A0R workflow after physical acceptance."
+            )
 
 
 async def _run_transport_call(
@@ -29,12 +49,19 @@ async def _run_transport_call(
     timeout_s: float,
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
-    operation: Callable[[PipetteTransport], dict[str, Any]],
+    operation: Callable[[Any], dict[str, Any]],
     operation_name: str | None = None,
     command: Any | None = None,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
+    requested_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     preflight_payload: dict[str, Any] | None = None
+    try:
+        _validate_oem_admission(operation_name, command)
+    except PipetteError as exc:
+        raise _pipette_error_to_http_exception(exc) from exc
     if preflight is not None:
         try:
             preflight_payload = preflight(operation_name or label, command)
@@ -51,10 +78,68 @@ async def _run_transport_call(
         raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
     if preflight_payload is not None and isinstance(result, dict):
         result.setdefault("preflight", preflight_payload)
+    if receipt_store is not None and isinstance(result, dict):
+        try:
+            requested_for_receipt = (
+                dict(requested_inputs)
+                if requested_inputs is not None
+                else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
+            )
+            effective_candidate = result.get("effective")
+            effective_inputs = dict(effective_candidate) if isinstance(effective_candidate, dict) else dict(requested_for_receipt)
+            if "effective_volume_ul" in result:
+                effective_inputs["volume_ul"] = result["effective_volume_ul"]
+            if "dispense_type" in result:
+                effective_inputs["dispense_type"] = result["dispense_type"]
+            receipt = receipt_store.record(
+                operation=operation_name or label,
+                requested_inputs=requested_for_receipt,
+                effective_inputs=effective_inputs,
+                result=result,
+                runtime_binding=runtime_binding,
+            )
+        except PipetteReceiptError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "pipette_receipt_persistence_failed", "message": str(exc)},
+            ) from exc
+        result["receipt_id"] = receipt["receipt_id"]
+        result["receipt_truth"] = receipt["truth"]
+        result["source_identity"] = receipt["source_identity"]
     return result
 
 
-async def run_pipette_status(*, get_transport: TransportGetter, run_blocking: BlockingRunner) -> dict[str, Any]:
+async def run_pipette_operation(
+    operation_name: str,
+    operation: Callable[[Any], dict[str, Any]],
+    *,
+    get_transport: TransportGetter,
+    run_blocking: BlockingRunner,
+    timeout_s: float = 600.0,
+    receipt_store: PipetteReceiptStore | None = None,
+    requested_inputs: dict[str, Any] | None = None,
+    preflight: PipettePreflight | None = None,
+) -> dict[str, Any]:
+    """Route a non-command OEM control through the same receipt/error owner."""
+    return await _run_transport_call(
+        operation_name.replace("_", " ").title(),
+        timeout_s=timeout_s,
+        get_transport=get_transport,
+        run_blocking=run_blocking,
+        operation=operation,
+        operation_name=operation_name,
+        preflight=preflight,
+        receipt_store=receipt_store,
+        requested_inputs=requested_inputs,
+    )
+
+
+async def run_pipette_status(
+    *,
+    get_transport: TransportGetter,
+    run_blocking: BlockingRunner,
+    receipt_store: PipetteReceiptStore | None = None,
+) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette status",
         timeout_s=600.0,
@@ -62,6 +147,7 @@ async def run_pipette_status(*, get_transport: TransportGetter, run_blocking: Bl
         run_blocking=run_blocking,
         operation=lambda transport: transport.get_status(),
         operation_name="status",
+        receipt_store=receipt_store,
     )
 
 
@@ -71,6 +157,7 @@ async def run_pipette_init_command(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette init",
@@ -81,6 +168,7 @@ async def run_pipette_init_command(
         operation_name="init",
         command=command,
         preflight=preflight,
+        receipt_store=receipt_store,
     )
 
 
@@ -90,6 +178,7 @@ async def run_pipette_tip_command(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette tip",
@@ -100,6 +189,7 @@ async def run_pipette_tip_command(
         operation_name="tip",
         command=command,
         preflight=preflight,
+        receipt_store=receipt_store,
     )
 
 
@@ -109,6 +199,7 @@ async def run_pipette_aspirate_command(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette aspirate",
@@ -119,6 +210,7 @@ async def run_pipette_aspirate_command(
         operation_name="aspirate",
         command=command,
         preflight=preflight,
+        receipt_store=receipt_store,
     )
 
 
@@ -128,6 +220,7 @@ async def run_pipette_dispense_command(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette dispense",
@@ -138,6 +231,7 @@ async def run_pipette_dispense_command(
         operation_name="dispense",
         command=command,
         preflight=preflight,
+        receipt_store=receipt_store,
     )
 
 
@@ -147,6 +241,7 @@ async def run_pipette_mix_command(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
+    receipt_store: PipetteReceiptStore | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette mix",
@@ -157,4 +252,5 @@ async def run_pipette_mix_command(
         operation_name="mix",
         command=command,
         preflight=preflight,
+        receipt_store=receipt_store,
     )

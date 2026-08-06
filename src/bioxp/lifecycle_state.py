@@ -14,11 +14,11 @@ from typing import Any, Callable, Mapping
 
 
 PUBLIC_OPERATION_STATES = frozenset({"waiting", "running", "paused", "stopped", "emergency", "error"})
-STARTUP_STAGES = ("constructor_pipette_stage", "initialization_without_motion", "initial_check")
+STARTUP_STAGES = ("constructor_pipette_stage", "initial_check", "initialization_without_motion")
 _PREDECESSOR = {
     "constructor_pipette_stage": None,
-    "initialization_without_motion": "constructor_pipette_stage",
-    "initial_check": "initialization_without_motion",
+    "initial_check": "constructor_pipette_stage",
+    "initialization_without_motion": "initial_check",
 }
 
 
@@ -31,10 +31,13 @@ def _stage_template(name: str) -> dict[str, Any]:
         "name": name,
         "state": "not_run" if _PREDECESSOR[name] is None else "blocked",
         "prerequisite": _PREDECESSOR[name],
+        "repeatable": name == "initial_check",
         "attempt_id": None,
+        "attempt_count": 0,
         "started_at": None,
         "completed_at": None,
         "evidence": None,
+        "history": [],
         "error": None,
     }
 
@@ -135,12 +138,48 @@ class CanonicalLifecycleOwner:
                 raise LifecycleStateError(
                     f"{name} requires passed predecessor evidence from {predecessor}"
                 )
-            if row["state"] == "passed":
+            if row["state"] == "passed" and name != "initial_check":
                 raise LifecycleStateError(f"{name} already passed in this ownership epoch")
+            if name == "initial_check" and self._operation_state in {"running", "paused", "emergency"}:
+                raise LifecycleStateError(
+                    f"initial_check cannot run during active operation state {self._operation_state}"
+                )
+            if name == "initial_check" and row.get("evidence") is not None:
+                row.setdefault("history", []).append({
+                    "attempt_id": row.get("attempt_id"),
+                    "started_at": row.get("started_at"),
+                    "completed_at": row.get("completed_at"),
+                    "state": row.get("state"),
+                    "evidence": copy.deepcopy(row.get("evidence")),
+                    "error": row.get("error"),
+                })
+                successor = self._stages["initialization_without_motion"]
+                if successor.get("state") == "passed":
+                    successor.setdefault("history", []).append(
+                        {
+                            "attempt_id": successor.get("attempt_id"),
+                            "started_at": successor.get("started_at"),
+                            "completed_at": successor.get("completed_at"),
+                            "state": successor.get("state"),
+                            "evidence": copy.deepcopy(successor.get("evidence")),
+                            "error": "invalidated_by_repeat_initial_check",
+                        }
+                    )
+                    successor.update(
+                        {
+                            "state": "blocked",
+                            "attempt_id": None,
+                            "started_at": None,
+                            "completed_at": None,
+                            "evidence": None,
+                            "error": "invalidated_by_repeat_initial_check",
+                        }
+                    )
             attempt_id = uuid.uuid4().hex
             row.update({
                 "state": "running",
                 "attempt_id": attempt_id,
+                "attempt_count": int(row.get("attempt_count") or 0) + 1,
                 "started_at": _utc_now(),
                 "completed_at": None,
                 "evidence": None,
@@ -197,6 +236,19 @@ class CanonicalLifecycleOwner:
             started = clock()
             trace: list[dict[str, Any]] = []
             sleeps: list[int] = []
+
+            def fail(error: str, **evidence: Any) -> dict[str, Any]:
+                return {
+                    "ok": False,
+                    "error": error,
+                    "can_ready_attempts": len([value for value in sleeps if value == 200]),
+                    "sleep_count": len(sleeps),
+                    "sleeps_ms": list(sleeps),
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "trace": list(trace),
+                    **evidence,
+                }
+
             num = 0
             while can_ready() is not True:
                 sleep(0.200)
@@ -214,21 +266,6 @@ class CanonicalLifecycleOwner:
                     }
                 num += 1
 
-            camera = self._camera_dependency()
-            trace.append({"step": "CheckCamera_dependency", "result": camera})
-            if not camera["ok"]:
-                return {
-                    "ok": False,
-                    "error": camera["error"],
-                    "camera_dependency": camera,
-                    "can_ready_attempts": len(sleeps),
-                    "sleep_count": len(sleeps),
-                    "sleeps_ms": sleeps,
-                    "side_effects_performed": False,
-                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                    "trace": trace,
-                }
-
             if self._board_test_mode:
                 # Exact ControlLib.initialCheck BoardTestMode branch:
                 # result=true; activateBoard().  It does not run LED, door/latch,
@@ -243,7 +280,6 @@ class CanonicalLifecycleOwner:
                     "sleep_count": len(sleeps),
                     "sleeps_ms": list(sleeps),
                     "power": None,
-                    "camera_dependency": camera,
                     "led_write_performed": False,
                     "latch_write_performed": False,
                     "live_voltage_sample_performed": False,
@@ -254,6 +290,8 @@ class CanonicalLifecycleOwner:
 
             led = hardware.set_led_rgb(255, 255, 255)
             trace.append({"step": "LED_white", "rgb": [255, 255, 255], "result": led})
+            if not _result_ok(led):
+                return fail("LED_white_failed", led=led)
             sleep(0.050)
             sleeps.append(50)
             trace.append({"step": "LED_white_wait", "sleep_ms": 50})
@@ -271,25 +309,62 @@ class CanonicalLifecycleOwner:
                 }
             deactivate = hardware.deactivate_boards()
             trace.append({"step": "deactivate_boards", "result": deactivate})
+            if not _result_ok(deactivate):
+                return fail(
+                    "deactivate_boards_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                )
             activate = hardware.activate_boards()
             trace.append({"step": "activate_boards", "result": activate})
-            ok = bool(camera["ok"] and _result_ok(led) and _result_ok(deactivate) and _result_ok(activate))
+            if not _result_ok(activate):
+                return fail(
+                    "activate_boards_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                    activate_boards=activate,
+                )
+            begin_generation = getattr(hardware, "oem_begin_board_lifecycle_generation", None)
+            lifecycle_generation = (
+                begin_generation(deactivation=deactivate, activation=activate)
+                if callable(begin_generation)
+                else {"ok": True, "legacy_harness_without_generation_binding": True}
+            )
+            trace.append({"step": "board_lifecycle_generation", "result": lifecycle_generation})
+            if not _result_ok(lifecycle_generation):
+                return fail(
+                    "board_lifecycle_generation_failed",
+                    door_latch=door,
+                    deactivate_boards=deactivate,
+                    activate_boards=activate,
+                    board_lifecycle_generation=lifecycle_generation,
+                )
+            ok = True
             return {
                 "ok": ok,
-                "error": None if ok else "initialCheck_side_effect_or_camera_dependency_failed",
+                "error": None if ok else "initialCheck_side_effect_failed",
                 "board_test_mode": False,
                 "can_ready_attempts": len([value for value in sleeps if value == 200]),
                 "sleep_count": len(sleeps),
                 "sleeps_ms": sleeps,
                 "door_latch": door,
-                "camera_dependency": camera,
                 "deactivate_boards": deactivate,
                 "activate_boards": activate,
+                "board_lifecycle_generation": lifecycle_generation,
                 "elapsed_ms": int(round((clock() - started) * 1000.0)),
                 "trace": trace,
             }
 
         return self.run_stage("initial_check", action)
+
+    def initialize_system_camera_dependency(self) -> dict[str, Any]:
+        """Evaluate the OEM camera gate at its initializeSystem boundary."""
+        result = self._camera_dependency()
+        return {
+            **result,
+            "stage": "initializeSystem_after_initializeMotion_before_inspectCover",
+            "source_anchor": "BioXPMainWindow.initializeSystem lines 1172-1181",
+        }
 
     def _camera_dependency(self) -> dict[str, Any]:
         if not self._check_camera:
@@ -324,8 +399,12 @@ class CanonicalLifecycleOwner:
         trace.append({"step": "checkDoorStatus_wait", "sleep_ms": 500})
         door = hardware.query_door()
         trace.append({"step": "query_door", "result": door})
+        if not _result_ok(door):
+            return {"ok": False, "error": "query_door_failed", "door": door}
         latch = hardware.query_latch()
         trace.append({"step": "query_latch", "result": latch})
+        if not _result_ok(latch):
+            return {"ok": False, "error": "query_latch_failed", "door": door, "latch": latch}
         latch_value = _observation_value(latch)
         latch_action = None
         door_requery = None
@@ -333,18 +412,56 @@ class CanonicalLifecycleOwner:
         if latch_value == 1:
             latch_action = hardware.set_solenoid(1)
             trace.append({"step": "set_solenoid", "value": 1, "result": latch_action})
+            if not _result_ok(latch_action):
+                return {
+                    "ok": False,
+                    "error": "set_solenoid_latch_failed",
+                    "door": door,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                }
             sleep(0.800)
             sleeps.append(800)
             trace.append({"step": "latch_wait", "sleep_ms": 800})
             door_requery = hardware.query_door()
             trace.append({"step": "requery_door", "result": door_requery})
+            if not _result_ok(door_requery):
+                return {
+                    "ok": False,
+                    "error": "requery_door_failed",
+                    "door": door,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                    "door_requery": door_requery,
+                }
             latch_requery = hardware.query_latch()
             trace.append({"step": "requery_latch", "result": latch_requery})
+            if not _result_ok(latch_requery):
+                return {
+                    "ok": False,
+                    "error": "requery_latch_failed",
+                    "door": door_requery,
+                    "latch": latch,
+                    "latch_action": latch_action,
+                    "door_requery": door_requery,
+                    "latch_requery": latch_requery,
+                }
             door = door_requery
             latch_value = _observation_value(latch_requery)
         voltage = hardware.query_voltage()
         power = self.voltage_observation_from_result(voltage)
         trace.append({"step": "query_24V", "result": voltage, "observation": power})
+        if not _result_ok(voltage):
+            return {
+                "ok": False,
+                "error": "query_24V_failed",
+                "door": door,
+                "latch": latch,
+                "door_requery": door_requery,
+                "latch_requery": latch_requery,
+                "latch_action": latch_action,
+                "power": power,
+            }
         door_value = _observation_value(door)
         door_closed = None if door_value is None else bool(door_value)
         latch_closed = None if latch_value is None else bool(latch_value)
@@ -354,6 +471,18 @@ class CanonicalLifecycleOwner:
         if power["oem_no24v"] is True:
             release = hardware.set_solenoid(0)
             trace.append({"step": "set_solenoid", "value": 0, "result": release})
+            if not _result_ok(release):
+                return {
+                    "ok": False,
+                    "error": "set_solenoid_release_failed",
+                    "door": door,
+                    "latch": latch,
+                    "door_requery": door_requery,
+                    "latch_requery": latch_requery,
+                    "latch_action": latch_action,
+                    "low_voltage_release": release,
+                    "power": power,
+                }
             with self._lock:
                 self._record_door_locked(door_closed=False, latch_closed=latch_closed, source="initialCheck.low_24V")
             sleep(0.300)
@@ -482,7 +611,17 @@ def _observation_value(result: Any) -> Any:
 def _result_ok(result: Any) -> bool:
     if not isinstance(result, Mapping):
         return bool(result)
-    return bool(result.get("ok", "error" not in result) and "error" not in result)
+    if "error" in result:
+        return False
+    explicit = result.get("ok")
+    if isinstance(explicit, bool):
+        return explicit
+    ack = result.get("ack")
+    if isinstance(ack, Mapping):
+        return ack.get("status") == 100
+    if "oem_status" in result or "reply_present" in result:
+        return result.get("reply_present") is True and result.get("oem_status") == 100
+    return False
 
 
 lifecycle_state = CanonicalLifecycleOwner()

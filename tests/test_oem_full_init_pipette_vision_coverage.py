@@ -87,7 +87,7 @@ def test_oem_pipette_collection_live_mode_is_still_no_hardware_dry_run_truth():
     assert plan["planned_physical_motion_if_live_oem_bound"] is True
 
 
-def test_startup_worker_writes_oem_shaped_post_home_pipette_artifact(tmp_path):
+def test_legacy_startup_worker_refuses_unbound_post_home_provider(tmp_path):
     program = OEMStartupProgram(
         hardware=DryRunStartupHardware(config_status=_loaded_config()),
         artifact_base=tmp_path,
@@ -102,35 +102,20 @@ def test_startup_worker_writes_oem_shaped_post_home_pipette_artifact(tmp_path):
             "run_post_home": True,
         }
     )
-    assert requested["queued"] is True
-
-    result = program.run_next_worker_command()
-    assert result["ok"] is True
-
-    artifact_root = Path(requested["artifact_root"])
-    payload = json.loads((artifact_root / "post_home_pipette_cleanup.json").read_text())
-    assert payload["artifact_format"] == "bioxp-oem-pipette-init-v1"
-    assert payload["source_anchor"] == "ControlLib.cs:8797-8856"
-    assert payload["ok"] is False
-    assert payload["live_ready"] is False
-    assert payload["steps"][0]["operation"] == "query_tip_status_before"
-    assert payload["steps"][0]["source_anchor"] == "ClassPipetteCollection.cs:1336-1357"
-    assert "pipette_can_shadow_proof_required_before_live" in payload["blockers"]
+    assert requested["queued"] is False
+    assert requested["state"] == "waiting_for_constructor_pipette_stage"
+    assert requested["next_action"] == "POST /oem/startup/constructor_pipettes"
+    assert requested["lifecycle"]["startup"]["stages"]["initial_check"]["state"] == "blocked"
 
 
-def test_vision_coverage_matrix_is_present_but_startup_vision_still_blocks_ready(tmp_path):
+def test_vision_coverage_matrix_and_unbound_provider_fail_closed():
     from src.bioxp.oem_pipette_collection import OEM_FULL_INIT_SOURCE_COVERAGE
 
     assert OEM_FULL_INIT_SOURCE_COVERAGE["ControlLib.inspectCover"] == "ControlLib.cs:3663-3768"
     assert OEM_FULL_INIT_SOURCE_COVERAGE["ClassFrameGrabber.locateCover"] == "ClassFrameGrabber.cs:4578"
 
-    program = OEMStartupProgram(
-        hardware=DryRunStartupHardware(config_status=_loaded_config(), vision_required=True),
-        artifact_base=tmp_path,
-    )
-    requested = program.request_startup({"mode": "dry_run", "require_config": False, "run_homing": False})
-    program.run_next_worker_command()
-    payload = json.loads((Path(requested["artifact_root"]) / "vision_inspection.json").read_text())
+    payload = DryRunStartupHardware(vision_required=True).vision_startup_check(mode="dry_run")
     assert payload["ok"] is False
     assert payload["blocks_ready"] is True
+    assert payload["required"] is True
     assert "CVisionLib" in payload["reason"] or "vision" in payload["reason"].lower()
