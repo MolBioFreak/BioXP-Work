@@ -985,6 +985,15 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
             },
         },
     )
+    monkeypatch.setattr(
+        api.hardware_state,
+        "publish_can_ready_from_preparation",
+        lambda **kwargs: {
+            "published": True,
+            "already_ready": False,
+            "ownership_epoch": kwargs["expected_ownership_epoch"],
+        },
+    )
     api._set_maintenance_state(
         transition="test_recovery_complete",
         motion_blocked=False,
@@ -999,6 +1008,32 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
     assert result["ok"] is True
     assert result["maintenance_state"]["motion_blocked"] is False
     assert result["maintenance_state"]["recovery_required"] is False
+
+
+def test_preparation_can_ready_publication_requires_same_owned_epoch():
+    from src.bioxp.hardware_status import HardwareStateOwner
+
+    owner = HardwareStateOwner()
+    epoch = owner.change_ownership(
+        reason="test_service_claim",
+        transport="owned",
+        usb="service",
+        router="running",
+    )
+
+    published = owner.publish_can_ready_from_preparation(
+        expected_ownership_epoch=epoch,
+        reason="test_preparation_completed",
+    )
+    assert published["published"] is True
+    assert owner.ownership_projection()["ownership"]["CAN_READY"] is True
+
+    owner.change_ownership(reason="new_owner", transport="owned", usb="service", router="running")
+    stale = owner.publish_can_ready_from_preparation(
+        expected_ownership_epoch=epoch,
+        reason="stale_preparation",
+    )
+    assert stale == {"published": False, "reason": "ownership_epoch_changed"}
 
 
 def test_service_start_defaults_to_pending_non_homing_recovery(monkeypatch):

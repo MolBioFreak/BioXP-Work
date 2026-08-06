@@ -128,6 +128,32 @@ class HardwareStateOwner:
         with self._lock:
             return copy.deepcopy(self._snapshot)
 
+    def publish_can_ready_from_preparation(
+        self,
+        *,
+        expected_ownership_epoch: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Promote same-epoch no-motion board preparation into transport readiness."""
+        with self._lock:
+            if int(expected_ownership_epoch) != self._epoch:
+                return {"published": False, "reason": "ownership_epoch_changed"}
+            if self._ownership.get("transport") != "owned":
+                return {"published": False, "reason": "transport_not_owned"}
+            if self._ownership.get("usb") != "service":
+                return {"published": False, "reason": "usb_not_service_owned"}
+            if self._ownership.get("router") != "running":
+                return {"published": False, "reason": "router_not_running"}
+            already_ready = self._ownership.get("CAN_READY") is True
+            self._ownership["CAN_READY"] = True
+            lifecycle_state.transport_changed(True, reason=str(reason))
+            return {
+                "published": True,
+                "already_ready": already_ready,
+                "ownership_epoch": self._epoch,
+                "reason": str(reason),
+            }
+
     def publish_can_ready_from_snapshot(self, *, snapshot_id: str, reason: str) -> dict[str, Any]:
         """Promote explicit same-epoch snapshot evidence into canonical ownership.
 

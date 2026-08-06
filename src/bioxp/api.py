@@ -5840,11 +5840,17 @@ async def motion_oem_prepare_without_motion():
             isinstance(z_receipt, Mapping)
             and z_receipt.get("ok") is True
         )
+        can_ready = hardware_state.publish_can_ready_from_preparation(
+            expected_ownership_epoch=hardware_state.ownership_epoch,
+            reason="oem_prepare_without_motion_completed",
+        )
+        ready = bool(z_prepared and can_ready.get("published") is True)
         return {
             **dict(global_result),
-            "ok": z_prepared,
+            "ok": ready,
             "z_prepare_receipt": _json_safe(z_receipt),
-            "failure": None if z_prepared else "z_provider_preparation_failed",
+            "can_ready_publication": _json_safe(can_ready),
+            "failure": None if ready else "operator_motion_state_publication_failed",
         }
 
     result = await _run_blocking(
@@ -5855,7 +5861,7 @@ async def motion_oem_prepare_without_motion():
     response = {
         **result,
         "ownership_bootstrap": ownership_bootstrap,
-        "next_required_action": "Collect a new canonical hardware snapshot before any motion admission.",
+        "next_required_action": "Home Z from the normal cockpit to establish the operator reference.",
     }
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=response)
