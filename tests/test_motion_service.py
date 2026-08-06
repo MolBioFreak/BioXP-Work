@@ -974,6 +974,14 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
         "prepare_motion_without_motion",
         lambda tester, authority: {"ok": True, "physical_motion_commanded": False},
     )
+    monkeypatch.setattr(
+        api,
+        "_execute_provider_z_intent",
+        lambda intent, inputs: {
+            "status": "completed",
+            "result": {"ok": True, "physical_motion": False},
+        },
+    )
     api._set_maintenance_state(
         transition="test_recovery_complete",
         motion_blocked=False,

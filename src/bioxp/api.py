@@ -5827,10 +5827,32 @@ async def motion_oem_prepare_without_motion():
         )
     hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
     tester = _get_tester()
+
+    def prepare_operator_motion_state() -> dict[str, Any]:
+        global_result = prepare_motion_without_motion(tester, authority=authority)
+        if not isinstance(global_result, Mapping) or global_result.get("ok") is not True:
+            return dict(global_result) if isinstance(global_result, Mapping) else {
+                "ok": False,
+                "failure": "global_motion_preparation_result_invalid",
+            }
+        z_receipt = _execute_provider_z_intent("prepare", {})
+        z_prepared = bool(
+            isinstance(z_receipt, Mapping)
+            and z_receipt.get("status") == "completed"
+            and isinstance(z_receipt.get("result"), Mapping)
+            and z_receipt["result"].get("ok") is True
+        )
+        return {
+            **dict(global_result),
+            "ok": z_prepared,
+            "z_prepare_receipt": _json_safe(z_receipt),
+            "failure": None if z_prepared else "z_provider_preparation_failed",
+        }
+
     result = await _run_blocking(
-        "OEM no-motion preparation",
-        lambda: prepare_motion_without_motion(tester, authority),
-        timeout_s=120.0,
+        "OEM motion preparation without movement",
+        prepare_operator_motion_state,
+        timeout_s=60.0,
     )
     response = {
         **result,
