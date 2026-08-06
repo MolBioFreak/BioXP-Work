@@ -741,16 +741,81 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     execute = getattr(provider, "execute_z_intent", None)
     if not callable(execute):
         raise HTTPException(status_code=409, detail={"error": "serial206_z_authority_not_bound"})
+    operator_command_id = str(context["operator_command_id"])
+    expected_generation = int(context["expected_ownership_generation"])
+    idempotency_key = str(context["idempotency_key"])
+    automatic_prerequisites: list[dict[str, Any]] = []
+
+    def execute_stage(stage: str, stage_inputs: Mapping[str, Any], key_suffix: str) -> dict[str, Any]:
+        payload = dict(stage_inputs)
+        payload["command_id"] = f"{operator_command_id}:{key_suffix}"
+        stage_result = execute(
+            stage,
+            inputs=payload,
+            expected_generation=expected_generation,
+            idempotency_key=f"{idempotency_key}:{key_suffix}",
+        )
+        return stage_result if isinstance(stage_result, dict) else {
+            "ok": False,
+            "failure": "serial206_z_provider_returned_non_object",
+        }
+
+    auto_prepare_intents = {
+        "manual_home", "move_z_home", "diagnostic_home_axis",
+        "move_steps", "move_absolute", "clear", "path_execute",
+        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
+    }
+    auto_home_intents = {
+        "move_steps", "move_absolute", "clear", "path_execute",
+        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
+    }
+    projection_reader = getattr(provider, "z_projection", None)
+    projection = projection_reader() if callable(projection_reader) else {}
+    z_state = str(projection.get("state") or "unknown") if isinstance(projection, Mapping) else "unknown"
+
+    if intent in auto_prepare_intents and z_state in {"unprepared", "failed_latched"}:
+        preparation = execute_stage("prepare", {}, "auto_prepare")
+        automatic_prerequisites.append({"stage": "auto_prepare", "result": preparation})
+        if preparation.get("ok") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "z_automatic_prerequisite_failed",
+                    "failed_stage": "auto_prepare",
+                    "requested_intent": intent,
+                    "requested_motion_dispatched": False,
+                    "prerequisite": preparation,
+                },
+            )
+        z_state = str(preparation.get("z_state") or "prepared_unreferenced")
+
+    if intent in auto_home_intents and z_state == "prepared_unreferenced":
+        homing = execute_stage("manual_home", {"timeout_s": 8.0}, "auto_home")
+        automatic_prerequisites.append({"stage": "auto_home", "result": homing})
+        if homing.get("ok") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "z_automatic_prerequisite_failed",
+                    "failed_stage": "auto_home",
+                    "requested_intent": intent,
+                    "requested_motion_dispatched": False,
+                    "prerequisite": homing,
+                },
+            )
+
     provider_inputs = dict(inputs or {})
-    provider_inputs["command_id"] = str(context["operator_command_id"])
+    provider_inputs["command_id"] = operator_command_id
     result = execute(
         intent,
         inputs=provider_inputs,
-        expected_generation=int(context["expected_ownership_generation"]),
-        idempotency_key=str(context["idempotency_key"]),
+        expected_generation=expected_generation,
+        idempotency_key=idempotency_key,
     )
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
+    if automatic_prerequisites:
+        result = {**result, "automatic_prerequisites": automatic_prerequisites}
     return result
 
 
@@ -6427,7 +6492,6 @@ def _record_z_motion_outcome(result: dict[str, Any], *, source: str, motion_kind
 @app.post("/motion/oem/manual/relative")
 async def motion_oem_manual_relative(req: OemManualRelativeRequest):
     """Dispatch literal OEM moveSteps(axis, steps) with robot-owned bounds/evidence."""
-    _require_motion_route_ready()
     axis = AxisName(req.axis)
     if axis is AxisName.Z:
         return await _run_blocking(
@@ -6438,6 +6502,7 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
             ),
             timeout_s=30.0,
         )
+    _require_motion_route_ready()
     tester = _get_tester()
     _require_oem_no_motion_profile_or_409(tester, axis.value)
     result = await _run_blocking(
@@ -6472,7 +6537,6 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
 @app.post("/motion/oem/manual/absolute")
 async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
     """Dispatch exact OEM moveX/moveY/moveZ/moveG absolute semantics."""
-    _require_motion_route_ready()
     axis = AxisName(req.axis)
     if axis is AxisName.Z:
         return await _run_blocking(
@@ -6486,6 +6550,7 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
             ),
             timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
         )
+    _require_motion_route_ready()
     requested = int(req.position_steps)
     pseudo_home: dict[str, Any] | None = None
     if axis is AxisName.X:
@@ -6808,13 +6873,13 @@ async def motion_oem_z_self_test(req: OemZSelfTestRequest):
 @app.post("/motion/oem/manual/home")
 async def motion_oem_manual_home(req: OemManualHomeRequest):
     """Dispatch source-exact manual home; Z is goHome(true, 1791)."""
-    _require_motion_route_ready()
     if req.axis == "z":
         return await _run_blocking(
             "serial-206 Z manual goHome",
             lambda: _execute_provider_z_intent("manual_home", {"timeout_s": 30.0}),
             timeout_s=45.0,
         )
+    _require_motion_route_ready()
     tester = _get_tester()
     _require_oem_no_motion_profile_or_409(tester, req.axis)
 

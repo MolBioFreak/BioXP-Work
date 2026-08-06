@@ -296,6 +296,14 @@ _Z_NO_MOTION_STATE_ACTIONS = frozenset({
     "oem.z.set_home",
 })
 
+_Z_AUTO_PREREQUISITE_ACTIONS = frozenset({
+    "oem.z.manual_home",
+    "oem.z.diagnostic_home_axis",
+    "oem.z.move_steps",
+    "oem.z.move_absolute",
+    "oem.z.clear",
+})
+
 
 def _z_no_motion_state_action(action: Mapping[str, Any]) -> bool:
     return str(action.get("action_id") or "") in _Z_NO_MOTION_STATE_ACTIONS
@@ -501,13 +509,13 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         allowed_by_action = {
             "oem.z.prepare": {"unprepared", "failed_latched"},
             "oem.z.reconcile_switch_masks": {"unprepared", "failed_latched"},
-            "oem.z.manual_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.z.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+            "oem.z.manual_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
+            "oem.z.diagnostic_home_axis": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
             "oem.z.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
             "oem.z.resume_after_abort": {"failed_latched"},
-            "oem.z.move_steps": {"referenced_ready"},
-            "oem.z.move_absolute": {"referenced_ready"},
-            "oem.z.clear": {"referenced_ready"},
+            "oem.z.move_steps": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
+            "oem.z.move_absolute": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
+            "oem.z.clear": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
             "oem.z.observe": {"awaiting_operator_observation"},
         }
         allowed = allowed_by_action.get(action_id)
@@ -557,9 +565,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     if source_initializer or safety == "motion" or _motor_motion_action(action):
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
-        if z_state_establishing:
-            # OEM state-establishing operations create board/profile/reference
-            # readiness. Requiring their own outputs here creates a deadlock.
+        if z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
+            # OEM state-establishing operations create readiness. Normal Z
+            # controls also compose missing preparation/reference work inside
+            # the provider transaction, so cached readiness must not pre-disable
+            # the operator's requested action.
             readiness = {"dependencies": []}
         else:
             readiness = (
