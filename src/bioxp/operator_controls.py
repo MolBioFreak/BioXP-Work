@@ -583,10 +583,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             z_preset = z_row.get("preset") if isinstance(z_row, Mapping) else None
             left_home_enabled = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
             right_inhibit_disabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is True
-            # Reconciliation is the state-establishing action for this exact
-            # precondition.  Requiring masks to be clear here makes recovery
-            # impossible.  Preparation remains ordered after reconciliation.
-            if action_id != "oem.z.reconcile_switch_masks":
+            # OEM no-motion preparation establishes the motor profile without
+            # a prior Z GAP12/GAP13 snapshot. Keep this replacement check only
+            # on ordinary generic Z operations, never on state-establishing
+            # recovery actions.
+            if not z_state_establishing:
                 dependencies.append(_dependency(
                     "z_switch_masks_machine_bound",
                     "Z machine-bound GAP12/GAP13 state",
