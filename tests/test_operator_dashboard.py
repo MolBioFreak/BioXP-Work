@@ -353,6 +353,7 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
     by_id = {row["action_id"]: row for row in actions}
     required = {
         "oem.z.manual_home": [],
+        "oem.z.clear": [],
         "oem.z.move_z_home": ["wait_timeout_s"],
         "oem.z.set_clean_path": ["enabled"],
         "oem.z.move_steps": ["steps"],

@@ -6604,6 +6604,15 @@ async def motion_oem_z_prepare():
     )
 
 
+@app.post("/motion/oem/z/clear")
+async def motion_oem_z_clear():
+    """Move Z to the robot-owned OEM pseudo-home selected from gantry state."""
+    return await _run_blocking(
+        "serial-206 Z clear to robot-owned PSUDO_Z_HOME",
+        lambda: _execute_provider_z_intent("clear", {"wait_timeout_s": 20.0}),
+        timeout_s=35.0,
+    )
+
 
 @app.post("/motion/oem/z/live_right_reference")
 async def motion_oem_z_live_right_reference():

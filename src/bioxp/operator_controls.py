@@ -519,6 +519,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "oem.z.resume_after_abort": {"failed_latched"},
             "oem.z.move_steps": {"referenced_ready"},
             "oem.z.move_absolute": {"referenced_ready"},
+            "oem.z.clear": {"referenced_ready"},
             "oem.z.observe": {"awaiting_operator_observation"},
         }
         allowed = allowed_by_action.get(action_id)
@@ -1066,6 +1067,15 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         description="Source-shaped absolute Z movement with robot-owned DefaultParameters.PSUDO_Z_HOME.",
         source_anchor="ClassControlInterface.moveZ:4254-4265; DefaultParameters:47-84",
         fixed_inputs={"axis": "z", "wait_timeout_s": 20.0},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.clear",
+        path="/motion/oem/z/clear",
+        label="OEM Z Clear",
+        description="Move Z from the home interlock to the robot-owned PSUDO_Z_HOME selected from durable tip and gantry state.",
+        source_anchor="DefaultParameters:47-84; ClassControlInterface.moveZ:4254-4265",
+        fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(

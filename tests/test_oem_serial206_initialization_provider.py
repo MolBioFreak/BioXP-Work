@@ -297,6 +297,69 @@ def _provider(tmp_path: Path, primitives: FakeSerial206Primitives, references: R
     return provider
 
 
+def test_initialize_motion_projection_releases_provider_lock_before_copying_ledgers(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, FakeSerial206Primitives(), ReferenceStore())
+    state = provider._load_state()
+    lock_available: list[bool] = []
+    real_deepcopy = subject.copy.deepcopy
+
+    monkeypatch.setattr(provider, "_load_state", lambda: state)
+
+    def observed_deepcopy(value):
+        if value is state["initialize_motion_ledger"]:
+            acquired: list[bool] = []
+
+            def probe_lock():
+                locked = provider._lock.acquire(blocking=False)
+                acquired.append(locked)
+                if locked:
+                    provider._lock.release()
+
+            thread = threading.Thread(target=probe_lock)
+            thread.start()
+            thread.join(timeout=1.0)
+            lock_available.extend(acquired)
+        return real_deepcopy(value)
+
+    monkeypatch.setattr(subject.copy, "deepcopy", observed_deepcopy)
+
+    projection = provider.initialize_motion_projection()
+
+    assert projection["initialize_motion_ledger"] == state["initialize_motion_ledger"]
+    assert lock_available == [True]
+
+
+@pytest.mark.parametrize("pseudo_home_steps", [500, 65000])
+def test_z_clear_moves_to_robot_owned_pseudo_home(tmp_path, pseudo_home_steps):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key=f"clear-prepare-{pseudo_home_steps}"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "set_home",
+        inputs={"operator_ack": "SET_HOME_CURRENT_POSITION"},
+        expected_generation=11,
+        idempotency_key=f"clear-home-{pseudo_home_steps}",
+    )["ok"] is True
+    state = provider.state_store.read_oem_serial206_initialization_state()
+    state["machine_status"]["psudo_z_home_steps"] = pseudo_home_steps
+    provider.state_store.write_oem_serial206_initialization_state(state)
+
+    result = provider.execute_z_intent(
+        "clear",
+        inputs={"wait_timeout_s": 20.0},
+        expected_generation=11,
+        idempotency_key=f"clear-{pseudo_home_steps}",
+    )
+
+    assert result["ok"] is True
+    assert primitives.calls[-1] == f"move-absolute:{pseudo_home_steps}:{pseudo_home_steps}"
+    receipt = result["authority_receipt"]
+    assert receipt["intent"] == "clear"
+    assert receipt["result"]["selected_pseudo_home_steps"] == pseudo_home_steps
+
+
 def test_z_first_stage_requires_only_source_specific_z_commissioning_and_not_prior_reference(tmp_path):
     primitives = FakeSerial206Primitives()
     provider = _provider(tmp_path, primitives)

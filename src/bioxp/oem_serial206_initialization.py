@@ -3883,6 +3883,7 @@ class Serial206OemInitializationProvider:
                 "set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
                 "move_steps": {"referenced_ready"},
                 "move_absolute": {"referenced_ready"},
+                "clear": {"referenced_ready"},
                 "path_execute": {"referenced_ready"},
                 "move_gz": {"referenced_ready"},
                 "home_gz": {"referenced_ready"},
@@ -3970,7 +3971,7 @@ class Serial206OemInitializationProvider:
                     blockers.append("z_board_lifecycle_generation_unavailable_for_set_home")
             if intent in {
                 "manual_home", "move_z_home", "diagnostic_home_axis",
-                "move_steps", "move_absolute", "path_execute", "move_gz", "home_gz",
+                "move_steps", "move_absolute", "clear", "path_execute", "move_gz", "home_gz",
                 "lower_pipette", "lift_pipette", "self_test", "resume_after_abort",
                 "set_max_speed", "set_max_acc",
                 "set_vmax", "set_current_max", "restore_original_speed",
@@ -4058,6 +4059,18 @@ class Serial206OemInitializationProvider:
                         pseudo_home_steps=int(pseudo_home),
                         wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
                     )
+                elif intent == "clear":
+                    machine_status = state.get("machine_status") or {}
+                    pseudo_home = machine_status.get("psudo_z_home_steps")
+                    if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
+                        raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    result = self.primitives.z_move_absolute(
+                        requested_position_steps=int(pseudo_home),
+                        pseudo_home_steps=int(pseudo_home),
+                        wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
+                    )
+                    if isinstance(result, Mapping):
+                        result = {**dict(result), "selected_pseudo_home_steps": int(pseudo_home)}
                 elif intent == "path_execute":
                     machine_status = state.get("machine_status") or {}
                     pseudo_home = machine_status.get("psudo_z_home_steps")
@@ -4166,7 +4179,7 @@ class Serial206OemInitializationProvider:
                 else:
                     result["board_lifecycle_generation"] = int(board_generation)
             if ok and intent in {
-                "diagnostic_home_axis", "set_home", "move_steps", "move_absolute", "path_execute",
+                "diagnostic_home_axis", "set_home", "move_steps", "move_absolute", "clear", "path_execute",
                 "move_gz", "home_gz", "lower_pipette", "lift_pipette", "stop",
                 "self_test", "resume_after_abort",
                 "set_max_speed", "set_max_acc", "set_vmax", "set_current_max",
@@ -4209,7 +4222,7 @@ class Serial206OemInitializationProvider:
                     ok = False
             if ok and intent in {
                 "prepare", "set_home", "manual_home", "move_z_home",
-                "diagnostic_home_axis", "move_steps", "move_absolute",
+                "diagnostic_home_axis", "move_steps", "move_absolute", "clear",
                 "self_test", "resume_after_abort", "stop",
             }:
                 terminal_reader = getattr(self.primitives, "z_terminal_status", None)
@@ -4723,26 +4736,26 @@ class Serial206OemInitializationProvider:
             }
 
     def initialize_motion_projection(self) -> dict[str, Any]:
-        with self._lock:
-            try:
+        try:
+            with self._lock:
                 state = self._load_state()
-                return {
-                    "initialize_motion_ledger": copy.deepcopy(state["initialize_motion_ledger"]),
-                    "machine_status": copy.deepcopy(state["machine_status"]),
-                    "initialize_motors": copy.deepcopy(state["movement_ledger"]),
-                }
-            except Exception:
-                return {
-                    "initialize_motion_ledger": {
-                        "schema_version": _MOTION_LEDGER_SCHEMA,
-                        "terminal_state": "failed_closed",
-                        "expected_next_stage": None,
-                        "compatibility_blocker": "durable_serial206_state_corrupt",
-                        "stage_receipts": [],
-                    },
-                    "machine_status": None,
-                    "initialize_motors": self._corrupt_projection(),
-                }
+            return {
+                "initialize_motion_ledger": copy.deepcopy(state["initialize_motion_ledger"]),
+                "machine_status": copy.deepcopy(state["machine_status"]),
+                "initialize_motors": copy.deepcopy(state["movement_ledger"]),
+            }
+        except Exception:
+            return {
+                "initialize_motion_ledger": {
+                    "schema_version": _MOTION_LEDGER_SCHEMA,
+                    "terminal_state": "failed_closed",
+                    "expected_next_stage": None,
+                    "compatibility_blocker": "durable_serial206_state_corrupt",
+                    "stage_receipts": [],
+                },
+                "machine_status": None,
+                "initialize_motors": self._corrupt_projection(),
+            }
 
     def capability_status(self) -> dict[str, Any]:
         primitive_status = (
