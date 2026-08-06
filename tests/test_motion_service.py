@@ -978,8 +978,11 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
         api,
         "_execute_provider_z_intent",
         lambda intent, inputs: {
-            "status": "completed",
-            "result": {"ok": True, "physical_motion": False},
+            "ok": True,
+            "receipt": {
+                "status": "completed",
+                "result": {"ok": True, "physical_motion": False},
+            },
         },
     )
     api._set_maintenance_state(

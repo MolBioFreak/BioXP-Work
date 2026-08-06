@@ -2671,6 +2671,7 @@ class Serial206OemInitializationProvider:
             "active_receipt": None,
             "awaiting_observation_receipt_id": None,
             "reference_state": "unknown",
+            "terminal_state": None,
             "last_failure": None,
             "receipts": [],
         }
@@ -3299,7 +3300,11 @@ class Serial206OemInitializationProvider:
                     "coordinate_contract": "oem_source_nonnegative_z",
                     "source_min_steps": 0,
                     "source_max_steps": 160000,
-                    "terminal_state": self._z_terminal_state_from_receipts(z),
+                    "terminal_state": (
+                        copy.deepcopy(z.get("terminal_state"))
+                        if isinstance(z.get("terminal_state"), Mapping)
+                        else self._z_terminal_state_from_receipts(z)
+                    ),
                 })
                 return projection
             except Exception as exc:
@@ -4218,6 +4223,20 @@ class Serial206OemInitializationProvider:
                             "authority": "serial206_terminal_register_readback",
                         }
                     result["terminal_z_state"] = _json_safe(terminal_state)
+                    if terminal_state.get("ok") is True:
+                        z["terminal_state"] = {
+                            key: terminal_state.get(key)
+                            for key in (
+                                "position_steps", "speed_steps_s",
+                                "left_switch_state", "right_switch_state",
+                                "left_switch_disabled", "right_switch_disabled",
+                                "authority",
+                            )
+                        }
+                        z["terminal_state"].update({
+                            "source_command_id": command_id,
+                            "observed_at": time.time(),
+                        })
                     if terminal_state.get("ok") is not True:
                         result["terminal_state_refresh_error"] = (
                             terminal_state.get("error") or "terminal Z register readback was incomplete"

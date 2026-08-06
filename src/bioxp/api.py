@@ -5838,9 +5838,7 @@ async def motion_oem_prepare_without_motion():
         z_receipt = _execute_provider_z_intent("prepare", {})
         z_prepared = bool(
             isinstance(z_receipt, Mapping)
-            and z_receipt.get("status") == "completed"
-            and isinstance(z_receipt.get("result"), Mapping)
-            and z_receipt["result"].get("ok") is True
+            and z_receipt.get("ok") is True
         )
         return {
             **dict(global_result),
