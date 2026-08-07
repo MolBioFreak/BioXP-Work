@@ -29,6 +29,18 @@ class PartialProvider:
     def z_projection(self):
         return {"available": True, "state": "prepared_unreferenced", "authority": type(self).__name__}
 
+    def z_command_lease(self):
+        provider = self
+
+        class Lease:
+            def __enter__(self):
+                provider.z_calls.append(("lease_enter", {}))
+
+            def __exit__(self, exc_type, exc, traceback):
+                provider.z_calls.append(("lease_exit", {}))
+
+        return Lease()
+
     def execute_z_intent(self, intent, **kwargs):
         self.z_calls.append((intent, kwargs))
         return {"ok": True, "z_state": "prepared_unreferenced", "authority_receipt": {"command_id": "z-1"}}
@@ -137,11 +149,20 @@ def test_operator_dispatch_context_reaches_provider_with_generation_and_idempote
         operator_controls._DISPATCH_CONTEXT.reset(token)
 
     assert result["ok"] is True
-    assert provider.z_calls == [("move_steps", {
-        "inputs": {"steps": 10, "command_id": "operator-1"},
-        "expected_generation": 11,
-        "idempotency_key": "idem-1",
-    })]
+    assert provider.z_calls == [
+        ("lease_enter", {}),
+        ("manual_home", {
+            "inputs": {"timeout_s": 8.0, "command_id": "operator-1:auto_home"},
+            "expected_generation": 11,
+            "idempotency_key": "idem-1:auto_home",
+        }),
+        ("move_steps", {
+            "inputs": {"steps": 10, "command_id": "operator-1"},
+            "expected_generation": 11,
+            "idempotency_key": "idem-1",
+        }),
+        ("lease_exit", {}),
+    ]
 
 
 def test_usb_ownership_sync_binds_and_clears_production_provider(monkeypatch):

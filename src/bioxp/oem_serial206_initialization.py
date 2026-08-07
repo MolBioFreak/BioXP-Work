@@ -12,6 +12,7 @@ import json
 import math
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -145,6 +146,71 @@ _INITIALIZE_MOTION_MISSING = tuple(
     spec.key for spec in SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
     if spec.key not in _INITIALIZE_MOTION_PARTIAL and spec.key != "initializeMotion.initializeMotors"
 )
+
+
+class _MutationPriorityRLock:
+    """Reentrant mutex that admits queued mutations before later readers."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._owner: int | None = None
+        self._depth = 0
+        self._mutation_waiters = 0
+
+    def acquire(
+        self,
+        blocking: bool = True,
+        timeout: float = -1,
+        *,
+        mutation: bool = False,
+    ) -> bool:
+        owner = threading.get_ident()
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        with self._condition:
+            if self._owner == owner:
+                self._depth += 1
+                return True
+            if mutation:
+                self._mutation_waiters += 1
+            try:
+                while self._owner is not None or (not mutation and self._mutation_waiters > 0):
+                    if not blocking:
+                        return False
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                self._owner = owner
+                self._depth = 1
+                return True
+            finally:
+                if mutation:
+                    self._mutation_waiters -= 1
+
+    def release(self) -> None:
+        owner = threading.get_ident()
+        with self._condition:
+            if self._owner != owner:
+                raise RuntimeError("priority lock released by non-owner")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._condition.notify_all()
+
+    def __enter__(self) -> "_MutationPriorityRLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.release()
+
+    @contextmanager
+    def mutation(self):
+        self.acquire(mutation=True)
+        try:
+            yield self
+        finally:
+            self.release()
 
 
 _EVIDENCE_MAX_DEPTH = 8
@@ -2665,13 +2731,19 @@ class Serial206OemInitializationProvider:
             import time
             sleep = time.sleep
         self.sleep = sleep
-        self._lock = threading.RLock()
+        self._lock = _MutationPriorityRLock()
         self._z_interrupt_state_lock = threading.Lock()
         self._z_interrupt_dispatch_lock = threading.Lock()
         self._z_interrupt_epoch = 0
         self._z_interrupt_active = False
         self._memory_state: dict[str, Any] | None = None
         self._board_transition_scope: dict[str, Any] | None = None
+
+    @contextmanager
+    def z_command_lease(self):
+        """Give one Z command priority over status readers for its full composition."""
+        with self._lock.mutation():
+            yield
 
     @staticmethod
     def _new_z_lifecycle() -> dict[str, Any]:

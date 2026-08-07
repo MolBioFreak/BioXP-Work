@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 from bioxp import oem_serial206_initialization as subject
@@ -146,6 +148,46 @@ def test_terminal_projection_converts_compaction_markers_to_unknown_values():
     assert terminal["right_switch_state"] is None
     assert terminal["left_switch_disabled"] is False
     assert terminal["right_switch_disabled"] is None
+
+
+def test_mutation_priority_lock_admits_waiting_command_before_later_reader():
+    lock = subject._MutationPriorityRLock()
+    first_reader_entered = threading.Event()
+    release_first_reader = threading.Event()
+    order: list[str] = []
+
+    def first_reader():
+        with lock:
+            first_reader_entered.set()
+            release_first_reader.wait(1.0)
+            order.append("first_reader")
+
+    def mutation():
+        with lock.mutation():
+            with lock:
+                order.append("mutation")
+
+    def later_reader():
+        with lock:
+            order.append("later_reader")
+
+    first = threading.Thread(target=first_reader)
+    command = threading.Thread(target=mutation)
+    later = threading.Thread(target=later_reader)
+    first.start()
+    assert first_reader_entered.wait(1.0)
+    command.start()
+    deadline = time.monotonic() + 1.0
+    while lock._mutation_waiters != 1 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert lock._mutation_waiters == 1
+    later.start()
+    release_first_reader.set()
+    for thread in (first, command, later):
+        thread.join(1.0)
+        assert thread.is_alive() is False
+
+    assert order == ["first_reader", "mutation", "later_reader"]
 
 
 def test_command_capability_check_does_not_build_full_provider_status(monkeypatch):

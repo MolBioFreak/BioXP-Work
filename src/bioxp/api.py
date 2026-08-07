@@ -773,54 +773,58 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
         "move_steps", "move_absolute", "clear", "path_execute",
         "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
     }
-    projection_reader = getattr(provider, "z_projection", None)
-    projection = projection_reader() if callable(projection_reader) else {}
-    z_state = str(projection.get("state") or "unknown") if isinstance(projection, Mapping) else "unknown"
+    command_lease = getattr(provider, "z_command_lease", None)
+    if not callable(command_lease):
+        raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
+    with command_lease():
+        projection_reader = getattr(provider, "z_projection", None)
+        projection = projection_reader() if callable(projection_reader) else {}
+        z_state = str(projection.get("state") or "unknown") if isinstance(projection, Mapping) else "unknown"
 
-    if intent in auto_prepare_intents and z_state in {"unprepared", "failed_latched"}:
-        preparation = execute_stage("prepare", {}, "auto_prepare")
-        automatic_prerequisites.append({"stage": "auto_prepare", "result": preparation})
-        if preparation.get("ok") is not True:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "z_automatic_prerequisite_failed",
-                    "failed_stage": "auto_prepare",
-                    "requested_intent": intent,
-                    "requested_motion_dispatched": False,
-                    "prerequisite": preparation,
-                },
-            )
-        z_state = str(preparation.get("z_state") or "prepared_unreferenced")
+        if intent in auto_prepare_intents and z_state in {"unprepared", "failed_latched"}:
+            preparation = execute_stage("prepare", {}, "auto_prepare")
+            automatic_prerequisites.append({"stage": "auto_prepare", "result": preparation})
+            if preparation.get("ok") is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "z_automatic_prerequisite_failed",
+                        "failed_stage": "auto_prepare",
+                        "requested_intent": intent,
+                        "requested_motion_dispatched": False,
+                        "prerequisite": preparation,
+                    },
+                )
+            z_state = str(preparation.get("z_state") or "prepared_unreferenced")
 
-    if intent in auto_home_intents and z_state == "prepared_unreferenced":
-        homing = execute_stage("manual_home", {"timeout_s": 8.0}, "auto_home")
-        automatic_prerequisites.append({"stage": "auto_home", "result": homing})
-        if homing.get("ok") is not True:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "z_automatic_prerequisite_failed",
-                    "failed_stage": "auto_home",
-                    "requested_intent": intent,
-                    "requested_motion_dispatched": False,
-                    "prerequisite": homing,
-                },
-            )
+        if intent in auto_home_intents and z_state == "prepared_unreferenced":
+            homing = execute_stage("manual_home", {"timeout_s": 8.0}, "auto_home")
+            automatic_prerequisites.append({"stage": "auto_home", "result": homing})
+            if homing.get("ok") is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "z_automatic_prerequisite_failed",
+                        "failed_stage": "auto_home",
+                        "requested_intent": intent,
+                        "requested_motion_dispatched": False,
+                        "prerequisite": homing,
+                    },
+                )
 
-    provider_inputs = dict(inputs or {})
-    provider_inputs["command_id"] = operator_command_id
-    result = execute(
-        intent,
-        inputs=provider_inputs,
-        expected_generation=expected_generation,
-        idempotency_key=idempotency_key,
-    )
-    if not isinstance(result, dict) or result.get("ok") is not True:
-        raise HTTPException(status_code=409, detail=result)
-    if automatic_prerequisites:
-        result = {**result, "automatic_prerequisites": automatic_prerequisites}
-    return result
+        provider_inputs = dict(inputs or {})
+        provider_inputs["command_id"] = operator_command_id
+        result = execute(
+            intent,
+            inputs=provider_inputs,
+            expected_generation=expected_generation,
+            idempotency_key=idempotency_key,
+        )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise HTTPException(status_code=409, detail=result)
+        if automatic_prerequisites:
+            result = {**result, "automatic_prerequisites": automatic_prerequisites}
+        return result
 
 
 def _execute_runtime_provider_z_intent(
