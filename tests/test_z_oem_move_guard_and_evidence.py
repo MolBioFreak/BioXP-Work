@@ -104,6 +104,22 @@ def test_failed_move_terminal_readback_updates_position_without_restoring_refere
     }
 
 
+def test_partial_compacted_terminal_state_cannot_overwrite_live_register_projection():
+    result = {
+        "terminal_z_state": {
+            "ok": True,
+            "position_steps": 0,
+            "speed_steps_s": {"omitted": "item_limit"},
+        },
+    }
+
+    assert subject.Serial206OemInitializationProvider._z_terminal_state_from_result(
+        result,
+        command_id="operator-home",
+        observed_at=124.0,
+    ) is None
+
+
 def test_command_capability_check_does_not_build_full_provider_status(monkeypatch):
     from bioxp import api
 

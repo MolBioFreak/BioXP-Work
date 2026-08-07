@@ -3520,7 +3520,12 @@ class Serial206OemInitializationProvider:
         if not isinstance(result, Mapping):
             return None
         terminal = result.get("terminal_z_state")
-        if isinstance(terminal, Mapping) and terminal.get("ok") is True:
+        if (
+            isinstance(terminal, Mapping)
+            and terminal.get("ok") is True
+            and type(terminal.get("position_steps")) is int
+            and type(terminal.get("speed_steps_s")) is int
+        ):
             return {
                 "authority": "serial206_terminal_register_readback",
                 "position_steps": terminal.get("position_steps"),
