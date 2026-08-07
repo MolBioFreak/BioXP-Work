@@ -975,14 +975,28 @@ class Serial206ProductionPrimitiveAdapter:
                 "source_max_steps": 160000,
                 "physical_motion_commanded": False,
             }
+        source_limit_margin_steps = 20
+        if target < source_limit_margin_steps or target > 160000 - source_limit_margin_steps:
+            return {
+                "ok": False,
+                "error": "z_source_coordinate_inside_limit_margin",
+                "failure": "z_source_coordinate_inside_limit_margin",
+                "before_position_steps": before_value,
+                "requested_steps": int(steps),
+                "target_position_steps": target,
+                "source_min_steps": 0,
+                "source_max_steps": 160000,
+                "source_limit_margin_steps": source_limit_margin_steps,
+                "physical_motion_commanded": False,
+                "source_anchor": "ClassMotor.moveSteps: lowPosLimits/highPosLimits 20-step margin",
+            }
         pre_command_event_window = self.tester.begin_bus_event_window()
         move = self.tester.motor_move_relative(4, int(steps), motor=1)
-        event_window = self.tester.begin_bus_event_window()
         result = self._z_finalize_position_move(
             profile=profile, before=before, target=target, move=move,
             wait_timeout_s=wait_timeout_s,
             pre_command_event_window=pre_command_event_window,
-            event_window=event_window,
+            event_window=pre_command_event_window,
         )
         result.update({
             "intent": "move_steps",
@@ -1057,12 +1071,11 @@ class Serial206ProductionPrimitiveAdapter:
             }
         pre_command_event_window = self.tester.begin_bus_event_window()
         move = self.tester.motor_move_absolute(4, effective, motor=1)
-        event_window = self.tester.begin_bus_event_window()
         result = self._z_finalize_position_move(
             profile=profile, before=before, target=effective, move=move,
             wait_timeout_s=wait_timeout_s,
             pre_command_event_window=pre_command_event_window,
-            event_window=event_window,
+            event_window=pre_command_event_window,
         )
         result.update({
             "intent": "move_absolute",
@@ -3456,8 +3469,91 @@ class Serial206OemInitializationProvider:
     @staticmethod
     def _append_z_receipt(z: dict[str, Any], receipt: Mapping[str, Any]) -> None:
         receipts = list(z.get("receipts") or [])
-        receipts.append(_json_safe(dict(receipt)))
+        bounded = _json_safe(dict(receipt))
+        # Preserve decision-grade evidence outside the deeply bounded result.
+        # A large TMCL trace must not consume the global item budget before the
+        # failure, endpoint, or controller-event fields are serialized.
+        bounded["result_summary"] = _json_safe(receipt.get("result_summary"))
+        bounded["critical_evidence"] = Serial206OemInitializationProvider._critical_z_result_evidence(
+            receipt.get("result")
+        )
+        receipts.append(bounded)
         z["receipts"] = receipts[-128:]
+
+    @staticmethod
+    def _critical_z_result_evidence(result: Any) -> dict[str, Any]:
+        row = result if isinstance(result, Mapping) else {}
+        wait = row.get("wait") if isinstance(row.get("wait"), Mapping) else {}
+
+        def event_rows(key: str) -> list[dict[str, Any]]:
+            events = row.get(key)
+            if not isinstance(events, list):
+                return []
+            return [
+                {
+                    field: event.get(field)
+                    for field in ("status", "event_sequence")
+                    if event.get(field) is not None
+                }
+                for event in events
+                if isinstance(event, Mapping)
+            ][:32]
+
+        return {
+            "failure": row.get("failure"),
+            "before_position_steps": row.get("before_position_steps"),
+            "target_position_steps": row.get("target_position_steps"),
+            "after_position_steps": row.get("after_position_steps"),
+            "terminal_speed_steps_s": wait.get("last_speed"),
+            "terminal_stopped": wait.get("stopped"),
+            "target_events": event_rows("target_events"),
+            "controller_error_events": event_rows("controller_error_events"),
+        }
+
+    @staticmethod
+    def _z_terminal_state_from_result(
+        result: Any,
+        *,
+        command_id: str,
+        observed_at: float,
+    ) -> dict[str, Any] | None:
+        if not isinstance(result, Mapping):
+            return None
+        terminal = result.get("terminal_z_state")
+        if isinstance(terminal, Mapping) and terminal.get("ok") is True:
+            return {
+                "authority": "serial206_terminal_register_readback",
+                "position_steps": terminal.get("position_steps"),
+                "speed_steps_s": terminal.get("speed_steps_s"),
+                "left_switch_state": terminal.get("left_switch_state"),
+                "right_switch_state": terminal.get("right_switch_state"),
+                "left_switch_disabled": terminal.get("left_switch_disabled"),
+                "right_switch_disabled": terminal.get("right_switch_disabled"),
+                "source_command_id": command_id,
+                "observed_at": observed_at,
+            }
+        wait = result.get("wait") if isinstance(result.get("wait"), Mapping) else {}
+        after = result.get("after") if isinstance(result.get("after"), Mapping) else {}
+        after_ack = after.get("ack") if isinstance(after.get("ack"), Mapping) else {}
+        position = result.get("after_position_steps")
+        if (
+            type(position) is not int
+            or after_ack.get("status") != 100
+            or wait.get("stopped") is not True
+            or type(wait.get("last_speed")) is not int
+        ):
+            return None
+        return {
+            "authority": "serial206_terminal_register_readback",
+            "position_steps": int(position),
+            "speed_steps_s": int(wait["last_speed"]),
+            "left_switch_state": None,
+            "right_switch_state": None,
+            "left_switch_disabled": None,
+            "right_switch_disabled": None,
+            "source_command_id": command_id,
+            "observed_at": observed_at,
+        }
 
     @staticmethod
     def _z_lifecycle_projection(z: Mapping[str, Any]) -> dict[str, Any]:
@@ -4352,6 +4448,13 @@ class Serial206OemInitializationProvider:
                 "controller_command_acknowledged": bool(isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True),
                 "controller_terminal_state_verified": bool(isinstance(result, Mapping) and result.get("controller_terminal_state_verified") is True),
             })
+            terminal_state = self._z_terminal_state_from_result(
+                result,
+                command_id=str(receipt["command_id"]),
+                observed_at=float(receipt["finished_at"]),
+            )
+            if terminal_state is not None:
+                z["terminal_state"] = terminal_state
             z["active_receipt"] = None
             if ok and intent == "prepare":
                 board_generation = int(result["board_lifecycle_generation"])

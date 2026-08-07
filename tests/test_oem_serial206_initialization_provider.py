@@ -1714,13 +1714,13 @@ def test_z_relative_move_requires_fresh_target_event_and_acknowledged_zero_speed
     tester.fresh_event = True
     fresh = adapter.z_move_steps(steps=25, wait_timeout_s=1.0)
     assert fresh["ok"] is True
-    assert tester.window_calls == 4
+    assert tester.window_calls == 2
 
     tester.event_motor = None
     unqualified = adapter.z_move_steps(steps=25, wait_timeout_s=1.0)
     assert unqualified["ok"] is False
     assert unqualified["failure"] == "z_target_event_128_missing_or_stale"
-    assert tester.window_calls == 6
+    assert tester.window_calls == 3
 
 
 def test_board_deactivation_clears_all_preparation_derived_z_authority(tmp_path):

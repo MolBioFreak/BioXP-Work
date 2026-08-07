@@ -275,15 +275,19 @@ def _require_serial206_oem_initialization_provider(
     capability: Literal["initialize_motors", "initialize_motion"] = "initialize_motors",
 ) -> Serial206OemInitializationProvider:
     provider = _serial206_oem_initialization_provider
-    status = serial206_oem_initialization_provider_status()
     available_field = f"{capability}_live_available"
-    if provider is None or status.get(available_field) is not True:
+    capabilities = provider.capability_status() if provider is not None else {}
+    if provider is None or capabilities.get(available_field) is not True:
         raise HTTPException(
             status_code=503,
             detail={
                 "error": "serial206_oem_initialization_provider_unavailable",
                 "required_capability": capability,
-                "provider_status": status,
+                "provider_status": {
+                    "bound": provider is not None,
+                    **dict(capabilities),
+                    "binding_error": _serial206_oem_initialization_provider_binding_error,
+                },
                 "physical_motion_commanded": False,
             },
         )
