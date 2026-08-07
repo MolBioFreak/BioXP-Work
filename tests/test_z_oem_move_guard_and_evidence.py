@@ -120,6 +120,25 @@ def test_partial_compacted_terminal_state_cannot_overwrite_live_register_project
     ) is None
 
 
+def test_terminal_projection_converts_compaction_markers_to_unknown_values():
+    terminal = subject.Serial206OemInitializationProvider._sanitize_z_terminal_state({
+        "authority": "serial206_terminal_register_readback",
+        "position_steps": 0,
+        "speed_steps_s": {"omitted": "item_limit"},
+        "left_switch_state": 1,
+        "right_switch_state": {"omitted": "item_limit"},
+        "left_switch_disabled": False,
+        "right_switch_disabled": {"omitted": "item_limit"},
+    })
+
+    assert terminal["position_steps"] == 0
+    assert terminal["speed_steps_s"] is None
+    assert terminal["left_switch_state"] == 1
+    assert terminal["right_switch_state"] is None
+    assert terminal["left_switch_disabled"] is False
+    assert terminal["right_switch_disabled"] is None
+
+
 def test_command_capability_check_does_not_build_full_provider_status(monkeypatch):
     from bioxp import api
 

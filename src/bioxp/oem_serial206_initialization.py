@@ -3313,7 +3313,7 @@ class Serial206OemInitializationProvider:
                     "coordinate_contract": "oem_source_nonnegative_z",
                     "source_min_steps": 0,
                     "source_max_steps": 160000,
-                    "terminal_state": (
+                    "terminal_state": self._sanitize_z_terminal_state(
                         copy.deepcopy(z.get("terminal_state"))
                         if isinstance(z.get("terminal_state"), Mapping)
                         else self._z_terminal_state_from_receipts(z)
@@ -3327,6 +3327,22 @@ class Serial206OemInitializationProvider:
                     "blockers": ["durable_serial206_state_corrupt"],
                     "failure": f"{type(exc).__name__}: {exc}",
                 }
+
+    @staticmethod
+    def _sanitize_z_terminal_state(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        return {
+            "authority": value.get("authority") if isinstance(value.get("authority"), str) else None,
+            "position_steps": value.get("position_steps") if type(value.get("position_steps")) is int else None,
+            "speed_steps_s": value.get("speed_steps_s") if type(value.get("speed_steps_s")) is int else None,
+            "left_switch_state": value.get("left_switch_state") if type(value.get("left_switch_state")) is int else None,
+            "right_switch_state": value.get("right_switch_state") if type(value.get("right_switch_state")) is int else None,
+            "left_switch_disabled": value.get("left_switch_disabled") if type(value.get("left_switch_disabled")) is bool else None,
+            "right_switch_disabled": value.get("right_switch_disabled") if type(value.get("right_switch_disabled")) is bool else None,
+            "source_command_id": value.get("source_command_id") if isinstance(value.get("source_command_id"), str) else None,
+            "observed_at": value.get("observed_at") if type(value.get("observed_at")) in {int, float} else None,
+        }
 
     @staticmethod
     def _z_terminal_state_from_receipts(z: Mapping[str, Any]) -> dict[str, Any]:
