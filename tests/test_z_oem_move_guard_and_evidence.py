@@ -49,6 +49,10 @@ def test_critical_receipt_evidence_survives_deep_result_compaction():
         "command_id": "operator-test",
         "intent": "move_steps",
         "status": "failed",
+        "started_at": 120.0,
+        "finished_at": 123.0,
+        "controller_command_acknowledged": True,
+        "controller_terminal_state_verified": True,
         "result_summary": {"ok": False, "failure": "z_target_event_128_missing_or_stale"},
         "result": {
             "failure": "z_target_event_128_missing_or_stale",
@@ -66,6 +70,11 @@ def test_critical_receipt_evidence_survives_deep_result_compaction():
     subject.Serial206OemInitializationProvider._append_z_receipt(z, receipt)
 
     stored = z["receipts"][0]
+    assert stored["status"] == "failed"
+    assert stored["started_at"] == 120.0
+    assert stored["finished_at"] == 123.0
+    assert stored["controller_command_acknowledged"] is True
+    assert stored["controller_terminal_state_verified"] is True
     assert stored["critical_evidence"] == {
         "failure": "z_target_event_128_missing_or_stale",
         "before_position_steps": 10_000,

@@ -3493,6 +3493,14 @@ class Serial206OemInitializationProvider:
         bounded["critical_evidence"] = Serial206OemInitializationProvider._critical_z_result_evidence(
             receipt.get("result")
         )
+        for key in (
+            "command_id", "intent", "idempotency_key", "expected_generation",
+            "board_lifecycle_generation", "status", "started_at", "finished_at",
+            "robot_http_acknowledged", "controller_command_acknowledged",
+            "controller_terminal_state_verified", "physical_effect_verified",
+            "operator_assessment",
+        ):
+            bounded[key] = _json_safe(receipt.get(key))
         receipts.append(bounded)
         z["receipts"] = receipts[-128:]
 
