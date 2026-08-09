@@ -134,30 +134,32 @@ def test_z_mutations_are_rejected_outside_operator_dispatch_context(monkeypatch)
     assert exc.value.detail["error"] == "direct_z_mutation_retired"
 
 
-def test_operator_dispatch_context_reaches_provider_with_generation_and_idempotency(monkeypatch):
+@pytest.mark.parametrize(
+    ("intent", "inputs"),
+    (
+        ("move_steps", {"steps": 10}),
+        ("move_absolute", {"position_steps": 500}),
+    ),
+)
+def test_manual_z_move_dispatch_never_inserts_automatic_homing(monkeypatch, intent, inputs):
     provider = PartialProvider()
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", provider)
     token = operator_controls._DISPATCH_CONTEXT.set({
         "operator_command_id": "operator-1",
         "idempotency_key": "idem-1",
         "expected_ownership_generation": 11,
-        "action_id": "oem.z.move_steps",
+        "action_id": f"oem.z.{intent}",
     })
     try:
-        result = api._execute_provider_z_intent("move_steps", {"steps": 10})
+        result = api._execute_provider_z_intent(intent, inputs)
     finally:
         operator_controls._DISPATCH_CONTEXT.reset(token)
 
     assert result["ok"] is True
     assert provider.z_calls == [
         ("lease_enter", {}),
-        ("manual_home", {
-            "inputs": {"timeout_s": 8.0, "command_id": "operator-1:auto_home"},
-            "expected_generation": 11,
-            "idempotency_key": "idem-1:auto_home",
-        }),
-        ("move_steps", {
-            "inputs": {"steps": 10, "command_id": "operator-1"},
+        (intent, {
+            "inputs": {**inputs, "command_id": "operator-1"},
             "expected_generation": 11,
             "idempotency_key": "idem-1",
         }),

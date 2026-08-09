@@ -764,13 +764,15 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
             "failure": "serial206_z_provider_returned_non_object",
         }
 
+    # Exact manual moves preserve the OEM button contract. They must fail closed
+    # in an invalid Z state instead of inserting an unrequested prepare or home.
     auto_prepare_intents = {
         "manual_home", "move_z_home", "diagnostic_home_axis",
-        "move_steps", "move_absolute", "clear", "path_execute",
+        "clear", "path_execute",
         "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
     }
     auto_home_intents = {
-        "move_steps", "move_absolute", "clear", "path_execute",
+        "clear", "path_execute",
         "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
     }
     command_lease = getattr(provider, "z_command_lease", None)
