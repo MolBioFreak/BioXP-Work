@@ -5191,7 +5191,7 @@ class Serial206OemInitializationProvider:
                     "last_failure": None,
                 })
             elif ok and intent in {
-                "move_steps", "move_absolute", "move_gz", "home_gz",
+                "move_steps", "move_absolute", "clear", "move_gz", "home_gz",
                 "lower_pipette", "lift_pipette",
             }:
                 z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})

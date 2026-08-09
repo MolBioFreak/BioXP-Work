@@ -443,7 +443,17 @@ def physical_aggregate_stop(
         speed = terminal.get("terminal_speed") if isinstance(terminal, Mapping) else None
         if speed is None and isinstance(terminal, Mapping):
             speed = terminal.get("speed")
-        zero_speed = bool(isinstance(terminal, Mapping) and terminal.get("ok") is True and type(speed) is int and speed == 0)
+        if speed is None and isinstance(terminal, Mapping):
+            speed = terminal.get("last_speed")
+        terminal_completion_verified = bool(
+            isinstance(terminal, Mapping)
+            and (
+                terminal.get("stopped") is True
+                if "stopped" in terminal
+                else terminal.get("ok") is True
+            )
+        )
+        zero_speed = bool(terminal_completion_verified and type(speed) is int and speed == 0)
         verified = row["stop_acknowledged"] is True and zero_speed
         row.update({
             "status": "stopped" if verified else "failed",

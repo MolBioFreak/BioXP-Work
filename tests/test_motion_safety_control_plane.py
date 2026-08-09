@@ -349,6 +349,78 @@ def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero
     assert all(row["stop_acknowledged"] is True and row["zero_speed_verified"] is True for row in result["components"])
 
 
+def test_physical_aggregate_stop_accepts_live_wait_stopped_last_speed_readback():
+    class LiveReadbackMotionDriver(FakeMotionDriver):
+        def motor_wait_stopped(self, board_id: int, *, motor: int, timeout_s: float, require_seen_nonzero: bool):
+            terminal = super().motor_wait_stopped(
+                board_id,
+                motor=motor,
+                timeout_s=timeout_s,
+                require_seen_nonzero=require_seen_nonzero,
+            )
+            speed = terminal.pop("terminal_speed")
+            terminal.pop("ok")
+            return {**terminal, "last_speed": speed, "stopped": speed == 0}
+
+    result = physical_aggregate_stop(LiveReadbackMotionDriver(), authority())
+
+    assert result["ok"] is True
+    assert result["state"] == "stopped"
+    assert result["controller_terminal_state_verified"] is True
+    assert all(
+        row["terminal_speed"] == 0
+        and row["zero_speed_verified"] is True
+        and row["terminal_readback"]["last_speed"] == 0
+        for row in result["components"]
+    )
+
+
+def test_physical_aggregate_stop_rejects_last_speed_zero_without_live_stopped_verdict():
+    class UnverifiedLiveReadbackMotionDriver(FakeMotionDriver):
+        def motor_wait_stopped(self, board_id: int, *, motor: int, timeout_s: float, require_seen_nonzero: bool):
+            terminal = super().motor_wait_stopped(
+                board_id,
+                motor=motor,
+                timeout_s=timeout_s,
+                require_seen_nonzero=require_seen_nonzero,
+            )
+            speed = terminal.pop("terminal_speed")
+            terminal.pop("ok")
+            return {**terminal, "last_speed": speed, "stopped": False}
+
+    result = physical_aggregate_stop(UnverifiedLiveReadbackMotionDriver(), authority())
+
+    assert result["ok"] is False
+    assert result["state"] == "failed_ambiguous"
+    assert result["controller_terminal_state_verified"] is False
+    assert all(
+        row["terminal_speed"] == 0
+        and row["zero_speed_verified"] is False
+        and row["status"] == "failed"
+        for row in result["components"]
+    )
+
+
+def test_physical_aggregate_stop_rejects_contradictory_ok_true_stopped_false():
+    class ContradictoryReadbackMotionDriver(FakeMotionDriver):
+        def motor_wait_stopped(self, board_id: int, *, motor: int, timeout_s: float, require_seen_nonzero: bool):
+            terminal = super().motor_wait_stopped(
+                board_id,
+                motor=motor,
+                timeout_s=timeout_s,
+                require_seen_nonzero=require_seen_nonzero,
+            )
+            terminal["stopped"] = False
+            return terminal
+
+    result = physical_aggregate_stop(ContradictoryReadbackMotionDriver(), authority())
+
+    assert result["ok"] is False
+    assert result["state"] == "failed_ambiguous"
+    assert result["controller_terminal_state_verified"] is False
+    assert all(row["zero_speed_verified"] is False for row in result["components"])
+
+
 def test_physical_aggregate_stop_attempts_all_components_and_fails_on_partial_failure_or_missing_ack():
     for axis, status in (("y", 7), ("g", None)):
         driver = FakeMotionDriver()

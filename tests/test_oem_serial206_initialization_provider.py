@@ -436,10 +436,17 @@ def test_z_clear_moves_to_robot_owned_pseudo_home(tmp_path, pseudo_home_steps):
     )
 
     assert result["ok"] is True
+    assert result["z_state"] == "referenced_ready"
+    assert result["z_lifecycle"]["state"] == "referenced_ready"
+    assert result["z_lifecycle"]["reference_state"] == "referenced"
     assert primitives.calls[-1] == f"move-absolute:{pseudo_home_steps}:{pseudo_home_steps}"
     receipt = result["authority_receipt"]
     assert receipt["intent"] == "clear"
     assert receipt["result"]["selected_pseudo_home_steps"] == pseudo_home_steps
+    persisted = provider.state_store.read_oem_serial206_initialization_state()["z_lifecycle"]
+    assert persisted["state"] == "referenced_ready"
+    assert persisted["reference_state"] == "referenced"
+    assert persisted["last_failure"] is None
 
 
 def test_z_first_stage_requires_only_source_specific_z_commissioning_and_not_prior_reference(tmp_path):
