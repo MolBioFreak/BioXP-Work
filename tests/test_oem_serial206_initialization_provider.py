@@ -297,15 +297,96 @@ def _provider(tmp_path: Path, primitives: FakeSerial206Primitives, references: R
     return provider
 
 
+def test_z_terminal_authority_is_saved_before_sql_receipt(tmp_path, monkeypatch):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    events: list[tuple[str, str]] = []
+    real_save = provider._save_state
+    real_persist = provider._persist_z_receipt
+
+    def save(state):
+        events.append(("authority", str(state["z_lifecycle"]["state"])))
+        return real_save(state)
+
+    def persist(row):
+        events.append(("sql", str(row["status"])))
+        return real_persist(row)
+
+    monkeypatch.setattr(provider, "_save_state", save)
+    monkeypatch.setattr(provider, "_persist_z_receipt", persist)
+
+    result = provider.execute_z_intent(
+        "prepare",
+        expected_generation=11,
+        idempotency_key="z-authority-order",
+    )
+
+    assert result["ok"] is True
+    assert events[-2:] == [("authority", "prepared_unreferenced"), ("sql", "completed")]
+
+
+def test_z_sql_failure_after_authority_save_replays_without_redispatch(tmp_path, monkeypatch):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+
+    def fail_persist(_row):
+        raise OSError("injected serial receipt failure")
+
+    monkeypatch.setattr(provider, "_persist_z_receipt", fail_persist)
+    with pytest.raises(OSError, match="injected serial receipt failure"):
+        provider.execute_z_intent(
+            "prepare",
+            expected_generation=11,
+            idempotency_key="z-sql-failure",
+        )
+    dispatch_count = len(primitives.calls)
+    state = provider.state_store.read_oem_serial206_initialization_state()
+    assert state["z_lifecycle"]["state"] == "prepared_unreferenced"
+    assert state["z_lifecycle"]["receipts"][-1]["idempotency_key"] == "z-sql-failure"
+
+    restarted = _provider(tmp_path, primitives, ReferenceStore())
+    replay = restarted.execute_z_intent(
+        "prepare",
+        expected_generation=11,
+        idempotency_key="z-sql-failure",
+    )
+
+    assert replay["ok"] is True
+    assert len(primitives.calls) == dispatch_count
+
+
+def test_z_completed_replay_fails_closed_after_generation_invalidation(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare",
+        expected_generation=11,
+        idempotency_key="z-generation-bound",
+    )["ok"] is True
+    dispatch_count = len(primitives.calls)
+    provider.generation_provider = lambda: 12
+
+    replay = provider.execute_z_intent(
+        "prepare",
+        expected_generation=11,
+        idempotency_key="z-generation-bound",
+    )
+
+    assert replay["ok"] is False
+    assert replay["replayed"] is True
+    assert replay["blockers"] == ["z_replay_authority_invalidated"]
+    assert len(primitives.calls) == dispatch_count
+
+
 def test_initialize_motion_projection_releases_provider_lock_before_copying_ledgers(tmp_path, monkeypatch):
     provider = _provider(tmp_path, FakeSerial206Primitives(), ReferenceStore())
     state = provider._load_state()
     lock_available: list[bool] = []
-    real_deepcopy = subject.copy.deepcopy
+    real_projection = provider._ledger_status_projection
 
     monkeypatch.setattr(provider, "_load_state", lambda: state)
 
-    def observed_deepcopy(value):
+    def observed_projection(value):
         if value is state["initialize_motion_ledger"]:
             acquired: list[bool] = []
 
@@ -319,13 +400,14 @@ def test_initialize_motion_projection_releases_provider_lock_before_copying_ledg
             thread.start()
             thread.join(timeout=1.0)
             lock_available.extend(acquired)
-        return real_deepcopy(value)
+        return real_projection(value)
 
-    monkeypatch.setattr(subject.copy, "deepcopy", observed_deepcopy)
+    monkeypatch.setattr(provider, "_ledger_status_projection", observed_projection)
 
     projection = provider.initialize_motion_projection()
 
-    assert projection["initialize_motion_ledger"] == state["initialize_motion_ledger"]
+    assert projection["initialize_motion_ledger"]["stage_receipt_count"] == 0
+    assert "stage_receipts" not in projection["initialize_motion_ledger"]
     assert lock_available == [True]
 
 
@@ -773,6 +855,10 @@ def test_failed_manual_home_accepts_movement_only_observation_as_historical_anno
     assert annotated["observation"]["reference_eligible"] is False
     assert annotated["authority_receipt"]["physical_effect_verified"] is True
     assert annotated["authority_receipt"]["observation_receipt_id"] == "operator-historical-observation"
+    durable_authority = provider.state_store.read_serial206_receipt("z", authority_id)
+    assert durable_authority["physical_effect_verified"] is True
+    assert durable_authority["observation_receipt_id"] == "operator-historical-observation"
+    assert durable_authority["operator_assessment"]["verdict"] == "pass"
     assert references.transitions[-1] == ("desynced", "z")
 
 
@@ -782,7 +868,7 @@ def test_z_motion_failure_attempts_hardware_stop_and_latches_reference_desynced(
     provider = _provider(tmp_path, primitives, references)
     provider.execute_z_intent("prepare", expected_generation=11, idempotency_key="prepare-failure-case")
     home = provider.execute_z_intent("manual_home", expected_generation=11, idempotency_key="home-failure-case")
-    provider.record_z_observation(
+    observed = provider.record_z_observation(
         command_id=home["authority_receipt"]["command_id"],
         verdict="pass",
         physical_motion_observed=True,
@@ -792,6 +878,11 @@ def test_z_motion_failure_attempts_hardware_stop_and_latches_reference_desynced(
         note="Observed home before failure case",
         expected_generation=11,
     )
+    durable_authority = provider.state_store.read_serial206_receipt(
+        "z", home["authority_receipt"]["command_id"]
+    )
+    assert durable_authority["observation_receipt_id"] == observed["observation_receipt"]["command_id"]
+    assert durable_authority["operator_assessment"]["verdict"] == "pass"
     primitives.z_move_steps = lambda *, steps, wait_timeout_s=20.0: {
         "ok": False,
         "failure": "target_event_128_missing",
@@ -1365,6 +1456,40 @@ def test_z_stop_interrupt_dispatches_before_normal_intent_releases_provider_lock
     assert outcomes["stop"]["z_state"] == "failed_latched"
     assert primitives.calls.count("z-stop") == 1
     assert references.transitions[-1] == ("desynced", "z")
+
+
+def test_repeated_z_stop_interrupt_key_dispatches_and_persists_each_receipt(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+
+    first = provider.execute_z_stop_interrupt(
+        inputs={"command_id": "stop-command-repeat-1"},
+        expected_generation=11,
+        idempotency_key="repeated-stop-interrupt-key",
+    )
+    second = provider.execute_z_stop_interrupt(
+        inputs={"command_id": "stop-command-repeat-1"},
+        expected_generation=11,
+        idempotency_key="repeated-stop-interrupt-key",
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert primitives.calls.count("z-stop") == 2
+    durable = provider.state_store.list_serial206_receipts("z")
+    repeated = [
+        row for row in durable
+        if row.get("idempotency_key") == "repeated-stop-interrupt-key"
+    ]
+    assert [row["command_id"] for row in repeated] == [
+        "stop-command-repeat-1",
+        "stop-command-repeat-1",
+    ]
+    assert len({row["receipt_id"] for row in repeated}) == 2
+    assert all(row["idempotency_replay_enabled"] is False for row in repeated)
+    assert provider.state_store.read_serial206_receipt_by_idempotency(
+        "z", "repeated-stop-interrupt-key"
+    ) is None
 
 
 def test_z_stop_interrupt_fails_closed_when_terminal_zero_is_unverified(tmp_path):

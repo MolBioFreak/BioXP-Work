@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -10,7 +10,8 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import BaseModel, Field
 
 import bioxp.operator_controls as operator_controls
-from bioxp.operator_controls import BoundedReceiptStore, install_operator_control_plane
+from bioxp.operator_controls import install_operator_control_plane
+from bioxp.operator_receipt_store import OperatorReceiptStore
 
 
 class CamelBody(BaseModel):
@@ -54,6 +55,16 @@ def make_app(tmp_path: Path, monkeypatch):
     async def home_xy():
         calls.append(("home_xy", None))
         return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
+
+    @app.post("/motion/emergency_stop")
+    async def emergency_stop():
+        calls.append(("emergency_stop", None))
+        return {"ok": True, "controller_acknowledged": True}
+
+    @app.post("/motion/diagnostics/stop")
+    async def diagnostic_stop():
+        calls.append(("diagnostic_stop", None))
+        return {"ok": True, "verified_stopped": True}
 
     @app.post("/motion/camel")
     async def camel(body: CamelBody):
@@ -107,7 +118,9 @@ def make_app(tmp_path: Path, monkeypatch):
             }
 
     maintenance = {"motion_blocked": False, "recovery_required": False, "block_reason": None}
+    lifecycle = {"operation_state": "stopped", "operation_reason": "test", "door": {"door_closed": True, "latch_closed": True}}
     app.state.operator_test_maintenance = maintenance
+    app.state.operator_test_lifecycle = lifecycle
     hardware = FakeHardwareState()
     app.state.operator_test_hardware = hardware
     monkeypatch.setattr(operator_controls, "hardware_state", hardware)
@@ -115,7 +128,7 @@ def make_app(tmp_path: Path, monkeypatch):
         app,
         maintenance_state_provider=lambda: maintenance,
         reference_state_provider=lambda: {"rows": {axis: {"state": "referenced"} for axis in ("x", "y", "z", "g", "door")}},
-        lifecycle_state_provider=lambda: {"operation_state": "stopped", "operation_reason": "test", "door": {"door_closed": True, "latch_closed": True}},
+        lifecycle_state_provider=lambda: lifecycle,
     )
     return app, calls
 
@@ -237,12 +250,79 @@ def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_
     assert receipt["status"] == "completed"
     assert receipt["machine_assessment"] == "pass"
     assert receipt["physical_effect_verified"] is False
-    assert receipt["stage_receipts"] == [{"stage_id": "home", "status": "passed"}]
-    assert json.loads((tmp_path / "operator_action_receipts.json").read_text())["receipts"][0]["command_id"] == receipt["command_id"]
+    assert receipt["stage_receipts"] == []
+    assert (
+        receipt["request_received_at"]
+        <= receipt["lock_acquired_at"]
+        <= receipt["admission_completed_at"]
+        <= receipt["provider_entry_at"]
+        <= receipt["provider_returned_at"]
+        <= receipt["receipt_persist_started_at"]
+    )
+    stored = OperatorReceiptStore(tmp_path).by_command(receipt["command_id"])
+    assert stored is not None
+    assert stored["command_id"] == receipt["command_id"]
+    assert stored["response"]["body"] == {
+        "ok": True,
+        "controller_acknowledged": True,
+        "stages": [{"stage_id": "home", "status": "passed"}],
+    }
+    detailed = client.get(
+        f"/operator/actions/receipts/{receipt['command_id']}?detail=true"
+    ).json()
+    assert detailed["response"]["body"]["stages"] == [
+        {"stage_id": "home", "status": "passed"}
+    ]
 
     replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
     assert replay.status_code == 200
     assert replay.json()["command_id"] == receipt["command_id"]
+    assert calls == [("home_axis", {"axis": "x"})]
+
+
+def test_idempotent_replay_rechecks_current_admission_state(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "fresh-admission-replay-123",
+        "inputs": {"body": {"axis": "x"}},
+    }
+
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    assert first.status_code == 200
+    app.state.operator_test_maintenance.update({
+        "motion_blocked": True,
+        "recovery_required": True,
+        "block_reason": "injected current maintenance block",
+    })
+    replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["error"] == "action_unavailable"
+    assert calls == [("home_axis", {"axis": "x"})]
+
+
+def test_idempotent_replay_rejects_changed_current_authority_when_action_remains_enabled(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "authority-fingerprint-replay-123",
+        "inputs": {"body": {"axis": "x"}},
+    }
+
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    assert first.status_code == 200
+    app.state.operator_test_lifecycle["operation_reason"] = "current lifecycle authority changed"
+    replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == "idempotency replay current authority mismatch"
     assert calls == [("home_axis", {"axis": "x"})]
 
 
@@ -319,6 +399,124 @@ def test_motion_admission_is_recomputed_after_waiting_for_invocation_lock(tmp_pa
     assert calls == [("home_axis", {"axis": "x"})]
 
 
+def test_emergency_stop_dispatch_bypasses_blocked_normal_database_claim(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    catalog = TestClient(app).get("/operator/control-catalog").json()
+    normal = action_for(catalog, "POST", "/motion/test/home_axis")
+    original_claim = OperatorReceiptStore.claim
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+
+    def blocked_claim(store, receipt):
+        if receipt.get("action_id") == normal["action_id"]:
+            claim_entered.set()
+            assert release_claim.wait(timeout=5)
+        return original_claim(store, receipt)
+
+    monkeypatch.setattr(OperatorReceiptStore, "claim", blocked_claim)
+
+    async def scenario():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            normal_task = asyncio.create_task(
+                client.post(
+                    f"/operator/actions/{normal['action_id']}",
+                    json={
+                        "expected_generation": catalog["ownership_generation"],
+                        "idempotency_key": "blocked-normal-claim",
+                        "inputs": {"body": {"axis": "x"}},
+                    },
+                )
+            )
+            assert await asyncio.to_thread(claim_entered.wait, 3)
+            stop = await asyncio.wait_for(
+                client.post(
+                    "/operator/actions/meta.emergency_stop",
+                    json={
+                        "expected_generation": catalog["ownership_generation"],
+                        "idempotency_key": "interrupt-bypass-claim",
+                        "inputs": {},
+                    },
+                ),
+                timeout=3,
+            )
+            assert stop.status_code == 200, stop.text
+            assert calls == [("emergency_stop", None)]
+            release_claim.set()
+            return await asyncio.wait_for(normal_task, timeout=3)
+
+    normal_response = asyncio.run(scenario())
+    assert normal_response.status_code == 200
+    assert calls == [("emergency_stop", None), ("home_axis", {"axis": "x"})]
+
+
+def test_repeated_emergency_stop_key_dispatches_and_persists_each_receipt(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "repeated-emergency-stop",
+        "inputs": {},
+    }
+
+    first = client.post("/operator/actions/meta.emergency_stop", json=payload)
+    second = client.post("/operator/actions/meta.emergency_stop", json=payload)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["command_id"] != second.json()["command_id"]
+    assert first.json()["idempotency_replay_enabled"] is False
+    assert second.json()["idempotency_replay_enabled"] is False
+    assert calls == [("emergency_stop", None), ("emergency_stop", None)]
+    store = OperatorReceiptStore(tmp_path)
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key=?",
+        (payload["idempotency_key"],),
+    ).fetchone()[0] == 2
+    assert store.by_idempotency(payload["idempotency_key"], include_evidence=False) is None
+
+
+def test_raw_emergency_route_is_nonreplayable_interrupt(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/emergency_stop")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "raw-repeated-emergency-stop",
+        "inputs": {},
+    }
+
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    second = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["command_id"] != second.json()["command_id"]
+    assert calls == [("emergency_stop", None), ("emergency_stop", None)]
+
+
+def test_raw_diagnostic_stop_is_nonreplayable_interrupt(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/diagnostics/stop")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "raw-repeated-diagnostic-stop",
+        "inputs": {},
+    }
+
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    second = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["command_id"] != second.json()["command_id"]
+    assert calls == [("diagnostic_stop", None), ("diagnostic_stop", None)]
+
+
 def test_path_and_query_inputs_are_bound_from_catalog_not_browser_routes(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
@@ -334,7 +532,13 @@ def test_path_and_query_inputs_are_bound_from_catalog_not_browser_routes(tmp_pat
     })
     assert response.status_code == 200, response.text
     assert calls == [("axis_status", {"axis": "y", "verbose": True})]
-    assert response.json()["response"]["body"]["axis"] == "y"
+    receipt = response.json()
+    assert receipt["requested_inputs"] == {"axis": "y", "verbose": True}
+    assert receipt["response"]["body"] == {"ok": True}
+    detailed = client.get(
+        f"/operator/actions/receipts/{receipt['command_id']}?detail=true"
+    ).json()
+    assert detailed["response"]["body"]["axis"] == "y"
 
 
 def test_normalized_field_keeps_original_body_wire_name(tmp_path, monkeypatch):
@@ -434,17 +638,25 @@ def test_home_xy_meta_maps_to_one_visible_source_route(tmp_path, monkeypatch):
     })
     assert response.status_code == 200, response.text
     assert calls == [("home_xy", None)]
-    assert len(response.json()["stage_receipts"]) == 2
+    receipt = response.json()
+    assert receipt["stage_receipts"] == []
+    detailed = client.get(
+        f"/operator/actions/receipts/{receipt['command_id']}?detail=true"
+    ).json()
+    assert len(detailed["response"]["body"]["stages"]) == 2
 
 
 def test_generic_assessment_rejects_provider_owned_z_manual_home_receipt(tmp_path, monkeypatch):
     app, _ = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
-    BoundedReceiptStore(tmp_path).put(
+    OperatorReceiptStore(tmp_path).put(
         {
             "command_id": "operator-z-home-1",
             "idempotency_key": "operator-z-home-1",
             "action_id": "oem.z.manual_home",
+            "ownership_generation": 7,
+            "started_at": "1.0",
+            "status": "completed",
             "authority_receipt_id": "operator-z-home-1",
         }
     )
@@ -480,14 +692,30 @@ def test_human_assessment_updates_existing_receipt_and_requires_generation(tmp_p
     assert assessed.json()["operator_note"] == "Observed both reference indicators."
 
 
-def test_receipt_store_is_bounded_and_replaces_by_command_id(tmp_path):
-    store = BoundedReceiptStore(tmp_path)
+def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path):
+    store = OperatorReceiptStore(tmp_path)
     for index in range(520):
-        store.put({"command_id": f"cmd-{index}", "idempotency_key": f"key-{index}"})
+        store.put({
+            "command_id": f"cmd-{index}",
+            "idempotency_key": f"key-{index}",
+            "action_id": "query.status",
+            "ownership_generation": 7,
+            "started_at": str(index),
+            "status": "completed",
+        })
     rows = store.list(200)
-    on_disk = json.loads(store.path.read_text())["receipts"]
-    assert len(on_disk) == 512
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
+    assert store.by_command("cmd-7") is None
+    assert store.by_command("cmd-8") is not None
     assert rows[0]["command_id"] == "cmd-519"
-    store.put({"command_id": "cmd-519", "idempotency_key": "key-519", "operator_assessment": "fail"})
-    assert len(json.loads(store.path.read_text())["receipts"]) == 512
+    store.put({
+        "command_id": "cmd-519",
+        "idempotency_key": "key-519",
+        "action_id": "query.status",
+        "ownership_generation": 7,
+        "started_at": "519",
+        "status": "completed",
+        "operator_assessment": "fail",
+    })
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
     assert store.by_command("cmd-519")["operator_assessment"] == "fail"

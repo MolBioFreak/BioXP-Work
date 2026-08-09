@@ -12,13 +12,10 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import re
-import threading
 import time
 import uuid
 from contextvars import ContextVar
-from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
@@ -34,6 +31,7 @@ from .oem_full_lifecycle import (
     current_registry_sha256,
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
+from .operator_receipt_store import OperatorReceiptStore
 from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGE_KEYS
 from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
 
@@ -52,7 +50,7 @@ def current_operator_dispatch_context() -> dict[str, Any] | None:
 
 _MAX_INPUT_BYTES = 65_536
 _MAX_RESPONSE_BYTES = 131_072
-_MAX_RECEIPTS = 512
+_MAX_INTERNAL_RESPONSE_BYTES = 8_388_608
 _ACTION_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
@@ -78,47 +76,8 @@ class AssessmentRequest(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
 
 
-class BoundedReceiptStore:
-    def __init__(self, root: str | Path | None = None) -> None:
-        base = Path(root or os.environ.get("BIOXP_OEM_RUNTIME_ROOT") or "/tmp/bioxp-oem-runtime")
-        base.mkdir(parents=True, exist_ok=True)
-        self.path = base / "operator_action_receipts.json"
-        self.lock = threading.RLock()
-
-    def _read(self) -> list[dict[str, Any]]:
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return []
-        rows: Any = payload.get("receipts") if isinstance(payload, dict) else None
-        return [row for row in rows if isinstance(row, dict)][-_MAX_RECEIPTS:] if isinstance(rows, list) else []
-
-    def _write(self, rows: list[dict[str, Any]]) -> None:
-        payload = {"schema_version": HISTORY_SCHEMA, "receipts": rows[-_MAX_RECEIPTS:]}
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-        tmp.replace(self.path)
-
-    def list(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self.lock:
-            return list(reversed(self._read()[-max(1, min(limit, 200)):]))
-
-    def by_command(self, command_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            return next((row for row in reversed(self._read()) if row.get("command_id") == command_id), None)
-
-    def by_idempotency(self, key: str) -> dict[str, Any] | None:
-        with self.lock:
-            return next((row for row in reversed(self._read()) if row.get("idempotency_key") == key), None)
-
-    def put(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        row = dict(receipt)
-        command_id = row.get("command_id")
-        with self.lock:
-            rows = [item for item in self._read() if item.get("command_id") != command_id]
-            rows.append(row)
-            self._write(rows)
-        return row
+# Keep the old import surface while replacing its full-document JSON behavior.
+BoundedReceiptStore = OperatorReceiptStore
 
 
 def _controller_acknowledged(value: Any) -> bool:
@@ -1500,8 +1459,14 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
     await app(scope, receive, send)
     status = int(response_start.get("status", 500))
     raw = b"".join(chunks)
-    if len(raw) > _MAX_RESPONSE_BYTES:
-        return status, _bounded_json({"raw": raw.decode("utf-8", "replace")}, _MAX_RESPONSE_BYTES)
+    if len(raw) > _MAX_INTERNAL_RESPONSE_BYTES:
+        return status, {
+            "ok": False,
+            "failure": "internal_response_exceeded_evidence_limit",
+            "response_bytes": len(raw),
+            "evidence_limit_bytes": _MAX_INTERNAL_RESPONSE_BYTES,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
     try:
         return status, json.loads(raw) if raw else {}
     except json.JSONDecodeError:
@@ -1519,7 +1484,8 @@ def install_operator_control_plane(
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
     by_id = {row["action_id"]: row for row in actions}
-    store = BoundedReceiptStore()
+    store = OperatorReceiptStore()
+    store.reconcile_nonterminal_receipts()
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
@@ -1572,6 +1538,26 @@ def install_operator_control_plane(
             "snapshot_id": snapshot_id,
         }
 
+    def replay_authority_fingerprint(state: Mapping[str, Any]) -> str:
+        authority_projection = {
+            "ownership_generation": state.get("ownership_generation"),
+            "ownership": state.get("ownership"),
+            "maintenance": state.get("maintenance"),
+            "lifecycle": state.get("lifecycle"),
+            "serial206_initialization_provider": state.get("serial206_initialization_provider"),
+            "references": state.get("references"),
+            "domains": state.get("domains"),
+            "freshness_state": (state.get("freshness") or {}).get("state"),
+            "snapshot_id": state.get("snapshot_id"),
+        }
+        encoded = json.dumps(
+            authority_projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def assessed_action(action: Mapping[str, Any], state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
         assessment = _assess_action(action, state, inputs)
         return {
@@ -1622,11 +1608,16 @@ def install_operator_control_plane(
 
     @router.get("/actions/history")
     async def action_history(limit: int = 100) -> dict[str, Any]:
-        return {"schema_version": HISTORY_SCHEMA, "receipts": store.list(limit)}
+        rows = await asyncio.to_thread(store.list, limit)
+        return {"schema_version": HISTORY_SCHEMA, "receipts": rows}
 
     @router.get("/actions/receipts/{command_id}")
-    async def action_receipt(command_id: str) -> dict[str, Any]:
-        row = store.by_command(command_id)
+    async def action_receipt(command_id: str, detail: bool = False) -> dict[str, Any]:
+        row = await asyncio.to_thread(
+            store.by_command,
+            command_id,
+            include_evidence=detail,
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="operator action receipt not found")
         return row
@@ -1639,7 +1630,7 @@ def install_operator_control_plane(
             raise HTTPException(status_code=422, detail="verdict must be pass or fail")
         if not _IDEMPOTENCY_RE.fullmatch(payload.idempotency_key):
             raise HTTPException(status_code=422, detail="invalid idempotency_key")
-        row = store.by_command(command_id)
+        row = await asyncio.to_thread(store.by_command, command_id)
         if row is None:
             raise HTTPException(status_code=404, detail="operator action receipt not found")
         if row.get("action_id") == "oem.z.manual_home":
@@ -1660,10 +1651,11 @@ def install_operator_control_plane(
             row["physical_effect_verified"] = False
         row["operator_assessment_idempotency_key"] = payload.idempotency_key
         row["operator_assessed_at"] = time.time()
-        return store.put(row)
+        return await asyncio.to_thread(store.put, row)
 
     @router.post("/actions/{action_id}")
     async def invoke_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
+        request_received_at = time.time()
         if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
             raise HTTPException(status_code=404, detail="unknown operator action_id")
         if not _IDEMPOTENCY_RE.fullmatch(payload.idempotency_key):
@@ -1675,11 +1667,26 @@ def install_operator_control_plane(
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
         action = by_id[action_id]
-        is_safety_interrupt = action_id in {"oem.z.stop", "oem.z.abort"}
+        is_safety_interrupt = action_id in {
+            "meta.emergency_stop",
+            "oem.z.stop",
+            "oem.z.abort",
+        }
         if action_id not in dispatch:
             assessment = _assess_action(action, machine_state(), payload.inputs)
             raise HTTPException(status_code=409, detail={"error": "action_unavailable", "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})
         target = dispatch[action_id]
+        is_safety_interrupt = is_safety_interrupt or (
+            target.get("method") == "POST"
+            and target.get("path") in {
+                "/motion/emergency_stop",
+                "/motion/diagnostics/stop",
+                "/motion/oem/x/stop",
+                "/motion/oem/x/abort",
+                "/motion/oem/z/stop",
+                "/motion/oem/z/abort",
+            }
+        )
         unknown_inputs = set(payload.inputs) - set(target["inputs"])
         if unknown_inputs:
             raise HTTPException(
@@ -1737,6 +1744,7 @@ def install_operator_control_plane(
                 )
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
         async with action_lock:
+            lock_acquired_at = time.time()
             locked_state = None if is_safety_interrupt else machine_state()
             locked_expected = (
                 int(hardware_state.ownership_epoch)
@@ -1745,16 +1753,35 @@ def install_operator_control_plane(
             )
             if payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
-            existing = store.by_idempotency(payload.idempotency_key)
+            effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
+            current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
+            existing = None
+            if not is_safety_interrupt:
+                existing = await asyncio.to_thread(
+                    store.by_idempotency,
+                    payload.idempotency_key,
+                    include_evidence=False,
+                )
             if existing is not None:
                 if existing.get("action_id") != action_id or existing.get("requested_inputs", existing.get("inputs")) != payload.inputs:
                     raise HTTPException(status_code=409, detail="idempotency_key already bound to different action request")
                 if int(existing.get("ownership_generation", -1)) != locked_expected:
                     raise HTTPException(status_code=409, detail="idempotency receipt ownership generation mismatch")
+                replay_assessment = _assess_action(action, locked_state or {}, effective_inputs)
+                if not replay_assessment["enabled"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "action_unavailable",
+                            "reason": replay_assessment["disabled_reason"],
+                            "dependencies": replay_assessment["dependencies"],
+                        },
+                    )
+                if existing.get("authority_fingerprint") != current_authority_fingerprint:
+                    raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
                 return existing
             command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
             started = time.time()
-            effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
             receipt = {
                 "schema_version": RECEIPT_SCHEMA,
                 "command_id": command_id,
@@ -1763,8 +1790,15 @@ def install_operator_control_plane(
                 "safety_class": action["safety_class"],
                 "status": "admission_pending",
                 "idempotency_key": payload.idempotency_key,
+                "idempotency_replay_enabled": not is_safety_interrupt,
                 "ownership_generation": locked_expected,
+                "authority_fingerprint": current_authority_fingerprint,
                 "started_at": str(started),
+                "request_received_at": request_received_at,
+                "lock_acquired_at": lock_acquired_at,
+                "admission_completed_at": None,
+                "provider_entry_at": None,
+                "provider_returned_at": None,
                 "finished_at": None,
                 "duration_ms": None,
                 "remote_acknowledged": False,
@@ -1779,7 +1813,6 @@ def install_operator_control_plane(
                 "error": None,
                 "stage_receipts": [],
             }
-            store.put(receipt)
             assessment = (
                 {"enabled": True, "disabled_reason": None, "dependencies": []}
                 if is_safety_interrupt
@@ -1800,10 +1833,46 @@ def install_operator_control_plane(
                     "response": _bounded_json({"http_status": 409, "body": {"detail": detail}}, _MAX_RESPONSE_BYTES),
                     "error": "operator admission returned HTTP 409",
                 })
-                store.put(receipt)
+                claimed, created = await asyncio.to_thread(store.claim, receipt)
+                if not created:
+                    if claimed.get("action_id") != action_id or claimed.get(
+                        "requested_inputs", claimed.get("inputs")
+                    ) != payload.inputs:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency_key already bound to different action request",
+                        )
+                    if int(claimed.get("ownership_generation", -1)) != locked_expected:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency receipt ownership generation mismatch",
+                        )
+                    if claimed.get("authority_fingerprint") != current_authority_fingerprint:
+                        raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
+                    if claimed.get("status") == "completed":
+                        raise HTTPException(status_code=409, detail=detail)
+                    return claimed
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
-            store.put(receipt)
+            if not is_safety_interrupt:
+                claimed, created = await asyncio.to_thread(store.claim, receipt)
+                if not created:
+                    if claimed.get("action_id") != action_id or claimed.get(
+                        "requested_inputs", claimed.get("inputs")
+                    ) != payload.inputs:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency_key already bound to different action request",
+                        )
+                    if int(claimed.get("ownership_generation", -1)) != locked_expected:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency receipt ownership generation mismatch",
+                        )
+                    if claimed.get("authority_fingerprint") != current_authority_fingerprint:
+                        raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
+                    return claimed
+            receipt["admission_completed_at"] = time.time()
             target = dispatch[action_id]
             wire_inputs = {
                 name: value
@@ -1817,21 +1886,17 @@ def install_operator_control_plane(
                 "action_id": action_id,
             })
             try:
+                receipt["provider_entry_at"] = time.time()
                 status_code, response = await asyncio.wait_for(
                     _dispatch_asgi(app, target["method"], target["path"], wire_inputs, target["locations"]),
                     timeout=float(action["timeout_seconds"]),
                 )
-                bounded = _bounded_json({"http_status": status_code, "body": response}, _MAX_RESPONSE_BYTES)
+                receipt["provider_returned_at"] = time.time()
+                full_response = {"http_status": status_code, "body": response}
                 ok = 200 <= status_code < 300 and not (isinstance(response, dict) and response.get("ok") is False)
-                stages = []
                 authority_receipt = None
                 observation_receipt = None
                 if isinstance(response, dict):
-                    candidate = response.get("stage_receipts") or response.get("stages")
-                    if isinstance(candidate, list):
-                        stages = candidate[:128]
-                    elif isinstance(candidate, dict):
-                        stages = list(candidate.values())[:128]
                     authority_receipt = response.get("authority_receipt")
                     observation_receipt = response.get("observation_receipt")
                 receipt.update({
@@ -1842,7 +1907,7 @@ def install_operator_control_plane(
                         isinstance(response, Mapping) and response.get("physical_effect_verified") is True
                     ),
                     "machine_assessment": "pass" if ok else "fail",
-                    "response": bounded,
+                    "response": full_response,
                     "error": None if ok else f"robot route returned HTTP {status_code}",
                     "authority_receipt_id": (
                         authority_receipt.get("command_id")
@@ -1860,18 +1925,22 @@ def install_operator_control_plane(
                         observation_receipt.get("observes_command_id")
                         if isinstance(observation_receipt, Mapping) else None
                     ),
-                    "stage_receipts": _bounded_json(stages, _MAX_RESPONSE_BYTES),
+                    "stage_receipts": [],
                 })
             except asyncio.TimeoutError:
+                receipt["provider_returned_at"] = time.time()
                 receipt.update({"status": "failed", "machine_assessment": "fail", "error": "operator action timed out"})
             except Exception as exc:
+                receipt["provider_returned_at"] = time.time()
                 receipt.update({"status": "failed", "machine_assessment": "fail", "error": f"{type(exc).__name__}: {exc}"[:2000]})
             finally:
                 _DISPATCH_CONTEXT.reset(context_token)
             finished = time.time()
             receipt["finished_at"] = str(finished)
             receipt["duration_ms"] = (finished - started) * 1000.0
-            return store.put(receipt)
+            receipt["receipt_persist_started_at"] = time.time()
+            persist_receipt = store.put_interrupt if is_safety_interrupt else store.put
+            return await asyncio.to_thread(persist_receipt, receipt)
 
     app.include_router(router)
     app.openapi_schema = None

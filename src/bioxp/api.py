@@ -6405,10 +6405,17 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     def stop_and_verify(tester) -> dict[str, Any]:
-        profile = tester._motion_oem_axis_profile(req.axis, startup=False)
-        board = int(profile["board"])
-        motor = int(profile["motor"])
-        stop = tester.motor_stop(board, motor=motor)
+        if req.axis == "x":
+            provider_stop = _execute_serial206_motion_intent(
+                "stop",
+                {"command_id": f"diagnostic-x-stop-{time.time_ns()}"},
+            )
+            stop = provider_stop.get("result", provider_stop)
+        else:
+            profile = tester._motion_oem_axis_profile(req.axis, startup=False)
+            board = int(profile["board"])
+            motor = int(profile["motor"])
+            stop = tester.motor_stop(board, motor=motor)
         restore_idle = None
         if req.axis == "g":
             restore_idle = restore_gripper_idle_current(tester, reason="axis_diagnostic_stop")

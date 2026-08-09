@@ -69,7 +69,8 @@ def test_critical_receipt_evidence_survives_deep_result_compaction():
     }
     z = {"receipts": []}
 
-    subject.Serial206OemInitializationProvider._append_z_receipt(z, receipt)
+    provider = subject.Serial206OemInitializationProvider(object())
+    provider._append_z_receipt(z, receipt)
 
     stored = z["receipts"][0]
     assert stored["status"] == "failed"

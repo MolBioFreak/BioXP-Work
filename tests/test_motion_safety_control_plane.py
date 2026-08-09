@@ -9,7 +9,8 @@ from bioxp.motion_safety import (
     physical_aggregate_stop,
     prepare_motion_without_motion,
 )
-from bioxp.operator_controls import BoundedReceiptStore, _assess_action, _build_catalog, _dashboard_payload
+from bioxp.operator_controls import _assess_action, _build_catalog, _dashboard_payload
+from bioxp.operator_receipt_store import OperatorReceiptStore
 
 
 class FakeMotionDriver:
@@ -449,12 +450,15 @@ def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_rea
     assert dashboard["motion"] == {"enabled": False, "reason": "Same-epoch CAN readiness has not been established."}
 
 
-def test_operator_store_persists_safety_receipts_with_required_evidence(tmp_path, monkeypatch):
-    monkeypatch.setattr("bioxp.operator_controls._MAX_RECEIPTS", 2)
-    store = BoundedReceiptStore(tmp_path)
+def test_operator_store_persists_safety_receipts_with_required_evidence(tmp_path):
+    store = OperatorReceiptStore(tmp_path)
     for index in range(3):
         store.put({
             "command_id": f"command-{index}",
+            "idempotency_key": f"safety-{index}",
+            "action_id": "meta.emergency_stop",
+            "status": "completed",
+            "started_at": str(index),
             "exact_route": "/motion/emergency_stop",
             "ownership_generation": 9,
             "controller_evidence": {"component_count": 5, "sequence": index},
@@ -463,9 +467,10 @@ def test_operator_store_persists_safety_receipts_with_required_evidence(tmp_path
             "response": {"ok": index == 2},
         })
 
-    rows = list(reversed(store.list()))
-    assert [row["command_id"] for row in rows] == ["command-1", "command-2"]
-    receipt = rows[-1]
+    rows = store.list()
+    assert [row["command_id"] for row in rows] == ["command-2", "command-1", "command-0"]
+    receipt = store.by_command("command-2")
+    assert receipt is not None
     assert receipt["exact_route"] == "/motion/emergency_stop"
     assert receipt["ownership_generation"] == 9
     assert receipt["controller_evidence"] == {"component_count": 5, "sequence": 2}

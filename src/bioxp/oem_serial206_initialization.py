@@ -2732,6 +2732,10 @@ class Serial206OemInitializationProvider:
             sleep = time.sleep
         self.sleep = sleep
         self._lock = _MutationPriorityRLock()
+        self._x_interrupt_state_lock = threading.Lock()
+        self._x_interrupt_dispatch_lock = threading.Lock()
+        self._x_interrupt_epoch = 0
+        self._x_interrupt_active = False
         self._z_interrupt_state_lock = threading.Lock()
         self._z_interrupt_dispatch_lock = threading.Lock()
         self._z_interrupt_epoch = 0
@@ -3108,6 +3112,18 @@ class Serial206OemInitializationProvider:
         self._memory_state = copy.deepcopy(payload)
         return payload
 
+    def _durable_serial206_receipt(self, stream: str, command_id: str) -> dict[str, Any] | None:
+        if self.state_store is None or not hasattr(self.state_store, "read_serial206_receipt"):
+            return None
+        row = self.state_store.read_serial206_receipt(stream, command_id)
+        return dict(row) if isinstance(row, Mapping) else None
+
+    def _durable_serial206_receipt_by_idempotency(self, stream: str, key: str) -> dict[str, Any] | None:
+        if self.state_store is None or not hasattr(self.state_store, "read_serial206_receipt_by_idempotency"):
+            return None
+        row = self.state_store.read_serial206_receipt_by_idempotency(stream, key)
+        return dict(row) if isinstance(row, Mapping) else None
+
     def _corrupt_projection(self) -> dict[str, Any]:
         return {
             "schema_version": SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA,
@@ -3128,30 +3144,248 @@ class Serial206OemInitializationProvider:
         with self._lock:
             try:
                 state = self._load_state()
-                lifecycle = copy.deepcopy(state["x_lifecycle"])
+                source_lifecycle = state["x_lifecycle"]
+                current_generation = int(self.generation_provider())
+                lifecycle_generation = source_lifecycle.get("generation")
+                if (
+                    isinstance(lifecycle_generation, int)
+                    and lifecycle_generation != current_generation
+                    and source_lifecycle.get("state") != "unprepared"
+                ):
+                    source_lifecycle.update({
+                        "state": "failed_latched",
+                        "generation": current_generation,
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                        "last_failure": {
+                            "failure": "x_generation_changed",
+                            "recorded_generation": lifecycle_generation,
+                            "current_generation": current_generation,
+                        },
+                    })
+                    self._save_state(state)
+                lifecycle = {
+                    str(key): _json_safe(value)
+                    for key, value in source_lifecycle.items()
+                    if key not in {"receipts", "receipts_omitted_to_sqlite"}
+                }
+                receipts = [
+                    row for row in list(source_lifecycle.get("receipts") or [])
+                    if isinstance(row, Mapping)
+                ]
+                latest = receipts[-1] if receipts else None
+                lifecycle.update({
+                    "receipt_storage": "robot_sqlite",
+                    "receipt_detail_on_request": True,
+                    "recent_receipt_count": len(receipts),
+                    "latest_receipt": None if latest is None else {
+                        key: _json_safe(latest.get(key))
+                        for key in ("command_id", "intent", "status")
+                    },
+                })
                 reference = self.reference_store.snapshot(("x",)) if self.reference_store is not None else {"ok": False, "authority_untrusted": True}
                 return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "lifecycle": lifecycle, "reference": _json_safe(reference)}
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
+    def execute_x_stop_interrupt(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        abort: bool = False,
+    ) -> dict[str, Any]:
+        values = dict(values or {})
+        selected = "abort" if abort else "stop"
+        supplied_command_id = values.get("command_id")
+        command_id = (
+            supplied_command_id
+            if isinstance(supplied_command_id, str) and supplied_command_id.strip()
+            else f"x-{selected}-{time.time_ns()}"
+        )
+        idempotency_key = values.get("idempotency_key")
+        idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
+        safe_inputs = _json_safe(values)
+        with self._x_interrupt_dispatch_lock:
+            with self._x_interrupt_state_lock:
+                self._x_interrupt_epoch += 1
+                interrupt_epoch = self._x_interrupt_epoch
+                self._x_interrupt_active = True
+            started_at = time.time()
+            try:
+                snapshot_active: Mapping[str, Any] | None = None
+                try:
+                    if self.state_store is not None and hasattr(
+                        self.state_store, "read_oem_serial206_initialization_state"
+                    ):
+                        stored = self.state_store.read_oem_serial206_initialization_state()
+                        snapshot = self._validate_state(self._upgrade_state(stored or self._new_state()))
+                        candidate = snapshot.get("x_lifecycle", {}).get("active_receipt")
+                        if isinstance(candidate, Mapping):
+                            snapshot_active = copy.deepcopy(candidate)
+                except Exception:
+                    snapshot_active = None
+                try:
+                    raw_result = (
+                        self.primitives.x_abort(reason=str(values.get("reason") or "forceAbortMotion"))
+                        if abort
+                        else self.primitives.x_stop(timeout_s=float(values.get("timeout_s", 3.0)))
+                    )
+                except Exception as exc:
+                    raw_result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                result = dict(raw_result) if isinstance(raw_result, Mapping) else {
+                    "ok": False,
+                    "failure": f"x_{selected}_result_not_mapping",
+                }
+                with self._lock:
+                    state = self._load_state()
+                    lifecycle = state["x_lifecycle"]
+                    current_active = lifecycle.get("active_receipt")
+                    interrupted_ids = {
+                        str(row["command_id"])
+                        for row in (snapshot_active, current_active)
+                        if isinstance(row, Mapping) and row.get("command_id")
+                    }
+                    generation = int(self.generation_provider())
+                    result.update({
+                        "interrupt_epoch": interrupt_epoch,
+                        "interrupted_command_ids": sorted(interrupted_ids),
+                    })
+                    receipt = {
+                        "command_id": str(command_id),
+                        "receipt_id": f"{command_id}:{time.time_ns()}",
+                        "intent": selected,
+                        "idempotency_key": idempotency_key,
+                        "idempotency_replay_enabled": False,
+                        "generation": generation,
+                        "inputs": safe_inputs,
+                        "status": "completed" if result.get("ok") is True else "failed",
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                        "interrupt_epoch": interrupt_epoch,
+                        "interrupted_command_ids": sorted(interrupted_ids),
+                        "result": _json_safe(result),
+                    }
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "generation": generation,
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                        "reference_state": "desynced",
+                        "last_failure": {
+                            "reason": f"x_safety_{selected}_dispatched",
+                            "receipt": _json_safe(receipt),
+                        },
+                    })
+                    lifecycle["receipts"].append(receipt)
+                    lifecycle["receipts"] = lifecycle["receipts"][-8:]
+                    self._save_state(state)
+                    if self.state_store is not None and hasattr(
+                        self.state_store, "append_serial206_interrupt_receipt"
+                    ):
+                        self.state_store.append_serial206_interrupt_receipt("x", receipt)
+                    return {
+                        "ok": result.get("ok") is True,
+                        "axis": "x",
+                        "intent": selected,
+                        "state": "failed_latched",
+                        "result": _json_safe(result),
+                        "authority_receipt": _json_safe(receipt),
+                    }
+            finally:
+                with self._x_interrupt_state_lock:
+                    self._x_interrupt_active = False
+
     def execute_x_intent(self, intent: str, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
         selected = str(intent).strip().lower()
+        if selected in {"stop", "abort"}:
+            return self.execute_x_stop_interrupt(values, abort=selected == "abort")
+        with self._x_interrupt_state_lock:
+            admitted_interrupt_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "axis": "x", "failure": "x_safety_interrupt_in_progress"}
         with self._lock:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
+                    return {"ok": False, "axis": "x", "failure": "x_intent_superseded_by_safety_interrupt"}
             try:
                 state = self._load_state()
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"durable_state_unavailable:{exc}"}
             lifecycle = state["x_lifecycle"]
             generation = int(self.generation_provider())
-            command_id = str(values.get("command_id") or values.get("idempotency_key") or f"x-{selected}-{generation}")
-            if lifecycle.get("state") == "executing" and selected != "wait_for_motor":
+            interrupt = False
+            idempotency_key = values.get("idempotency_key")
+            idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
+            default_command_id = (
+                f"x-{selected}-{generation}-{time.time_ns()}"
+                if interrupt
+                else idempotency_key or f"x-{selected}-{generation}"
+            )
+            command_id = str(values.get("command_id") or default_command_id)
+            safe_inputs = _json_safe(values)
+            if not interrupt:
+                existing = next(
+                    (
+                        row for row in reversed(lifecycle.get("receipts") or [])
+                        if isinstance(row, Mapping)
+                        and (row.get("command_id") == command_id or (
+                            idempotency_key is not None and row.get("idempotency_key") == idempotency_key
+                        ))
+                    ),
+                    None,
+                )
+                if existing is None:
+                    existing = self._durable_serial206_receipt("x", command_id)
+                if existing is None and idempotency_key is not None:
+                    existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
+                if isinstance(existing, Mapping):
+                    if (
+                        existing.get("intent") != selected
+                        or existing.get("inputs") != safe_inputs
+                        or existing.get("generation") != generation
+                    ):
+                        return {
+                            "ok": False,
+                            "axis": "x",
+                            "state": lifecycle.get("state"),
+                            "failure": "x_replay_authority_or_request_mismatch",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing),
+                        }
+                    replay_requires_reference = selected != "prepare"
+                    replay_authority_valid = (
+                        lifecycle.get("generation") == generation
+                        and lifecycle.get("state") not in {"unprepared", "failed_latched", "executing"}
+                        and (
+                            not replay_requires_reference
+                            or (
+                                lifecycle.get("state") == "referenced_ready"
+                                and lifecycle.get("reference_state") == "referenced"
+                            )
+                        )
+                    )
+                    if existing.get("status") == "completed" and not replay_authority_valid:
+                        return {
+                            "ok": False,
+                            "axis": "x",
+                            "state": lifecycle.get("state"),
+                            "failure": "x_replay_current_authority_invalid",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing),
+                        }
+                    replayed_result = dict(existing.get("result") or {})
+                    replayed_result.setdefault("ok", existing.get("status") == "completed")
+                    replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing)})
+                    return replayed_result
+            if lifecycle.get("state") == "executing" and selected not in {"wait_for_motor", "stop", "abort"}:
                 lifecycle.update({"state": "failed_latched", "reference_state": "desynced", "last_failure": "restart_or_reentry_during_executing", "active_receipt": None, "pending_ticket": None})
                 try: self._save_state(state)
                 except Exception: pass
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": "x_executing_outcome_ambiguous"}
             active = lifecycle.get("active_receipt")
-            if isinstance(active, Mapping) and active.get("command_id") == command_id and selected != "wait_for_motor":
+            if isinstance(active, Mapping) and active.get("command_id") == command_id and selected not in {"wait_for_motor", "stop", "abort"}:
                 return copy.deepcopy(dict(active.get("result") or active))
             if selected == "prepare":
                 prepare_fn = getattr(self.primitives, "prepare_x", None) or getattr(self.primitives, "prepare_for_initialize_motors")
@@ -3166,7 +3400,7 @@ class Serial206OemInitializationProvider:
                     return {"ok": False, "axis": "x", "failure": "x_pending_ticket_missing", "state": lifecycle.get("state")}
                 result = self.primitives.x_wait_for_motor(pending_ticket=pending, wait_timeout_s=float(values.get("wait_timeout_s", 20.0)))
             else:
-                active_receipt = {"command_id": command_id, "intent": selected, "generation": generation, "status": "executing", "result": None}
+                active_receipt = {"command_id": command_id, "intent": selected, "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active_receipt, "pending_ticket": None})
                 self._save_state(state)
                 try:
@@ -3184,63 +3418,337 @@ class Serial206OemInitializationProvider:
                 except Exception as exc:
                     result = {"ok": False, "failure": f"x_intent_exception:{type(exc).__name__}:{exc}", "command_issued": False}
             result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_result_not_mapping"}
+            with self._x_interrupt_state_lock:
+                if admitted_interrupt_epoch != self._x_interrupt_epoch:
+                    result = {
+                        "ok": False,
+                        "failure": "x_intent_interrupted_by_safety_command",
+                        "command_issued": result.get("command_issued", True),
+                        "interrupt_epoch": self._x_interrupt_epoch,
+                    }
+            current_generation = int(self.generation_provider())
+            if current_generation != generation:
+                result = {
+                    "ok": False,
+                    "failure": "x_generation_changed_during_command",
+                    "command_issued": result.get("command_issued", True),
+                    "recorded_generation": generation,
+                    "current_generation": current_generation,
+                    "primitive_result": _json_safe(result),
+                }
+            receipt: dict[str, Any] | None = None
             if selected != "wait_for_motor" and result.get("pending_motion") is True:
                 lifecycle.update({"state": "executing", "active_receipt": {"command_id": command_id, "intent": selected, "status": "executing", "result": _json_safe(result)}, "pending_ticket": _json_safe(result)})
             elif result.get("ok") is True:
                 lifecycle.update({"state": "referenced_ready", "active_receipt": None, "pending_ticket": None, "reference_state": "referenced", "last_failure": None})
-                lifecycle["receipts"].append({"command_id": command_id, "intent": selected, "result": _json_safe(result)})
-                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+                receipt = {"command_id": command_id, "receipt_id": f"{command_id}:{time.time_ns()}" if interrupt else command_id, "intent": selected, "idempotency_key": idempotency_key, "idempotency_replay_enabled": not interrupt, "generation": generation, "inputs": safe_inputs, "status": "completed", "result": _json_safe(result)}
+                lifecycle["receipts"].append(receipt)
+                lifecycle["receipts"] = lifecycle["receipts"][-8:]
             else:
                 lifecycle.update({"state": "failed_latched", "active_receipt": None, "pending_ticket": None, "reference_state": "desynced", "last_failure": _json_safe(result)})
+                receipt = {"command_id": command_id, "receipt_id": f"{command_id}:{time.time_ns()}" if interrupt else command_id, "intent": selected, "idempotency_key": idempotency_key, "idempotency_replay_enabled": not interrupt, "generation": generation, "inputs": safe_inputs, "status": "failed", "result": _json_safe(result)}
+                lifecycle["receipts"].append(receipt)
+                lifecycle["receipts"] = lifecycle["receipts"][-8:]
             self._save_state(state)
+            if (
+                receipt is not None
+                and self.state_store is not None
+                and hasattr(self.state_store, "append_serial206_receipt")
+            ):
+                if interrupt and hasattr(self.state_store, "append_serial206_interrupt_receipt"):
+                    self.state_store.append_serial206_interrupt_receipt("x", receipt)
+                else:
+                    self.state_store.append_serial206_receipt("x", receipt)
             return {"ok": result.get("ok") is True, "axis": "x", "intent": selected, "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
 
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
+        with self._x_interrupt_state_lock:
+            admitted_interrupt_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "xy_blocked_by_x_interrupt"}
         with self._lock:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or self._x_interrupt_epoch != admitted_interrupt_epoch:
+                    return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "xy_blocked_by_x_interrupt"}
+            terminal_authority_saved = False
+            state: dict[str, Any] = {}
+            lifecycle: dict[str, Any] = {}
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
                 generation = int(self.generation_provider())
-                command_id = str(values.get("command_id") or values.get("idempotency_key") or f"xy-{generation}-{int(x)}-{int(y)}")
-                for receipt in lifecycle.get("receipts", []):
-                    if isinstance(receipt, Mapping) and receipt.get("command_id") == command_id:
-                        return copy.deepcopy(dict(receipt.get("result") or receipt))
-                active = {"command_id": command_id, "intent": "move_xy", "generation": generation, "status": "executing", "result": None}
+                idempotency_key = values.get("idempotency_key")
+                idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
+                command_id = str(values.get("command_id") or idempotency_key or f"xy-{generation}-{int(x)}-{int(y)}")
+                safe_inputs = _json_safe(values)
+                if lifecycle.get("state") == "executing":
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": "xy_restart_or_reentry_during_executing",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                    })
+                    self._save_state(state)
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "failed_latched",
+                        "failure": "xy_executing_outcome_ambiguous",
+                    }
+                existing_receipt = next(
+                    (
+                        receipt for receipt in lifecycle.get("receipts", [])
+                        if isinstance(receipt, Mapping) and receipt.get("command_id") == command_id
+                    ),
+                    None,
+                )
+                if existing_receipt is None:
+                    existing_receipt = self._durable_serial206_receipt("x", command_id)
+                if existing_receipt is None and idempotency_key is not None:
+                    existing_receipt = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
+                if isinstance(existing_receipt, Mapping):
+                    request_matches = (
+                        existing_receipt.get("intent") == "move_xy"
+                        and existing_receipt.get("generation") == generation
+                        and existing_receipt.get("target_x") == int(x)
+                        and existing_receipt.get("target_y") == int(y)
+                        and existing_receipt.get("inputs") == safe_inputs
+                    )
+                    authority_valid = (
+                        lifecycle.get("generation") == generation
+                        and lifecycle.get("state") == "referenced_ready"
+                        and lifecycle.get("reference_state") == "referenced"
+                    )
+                    if not request_matches or (
+                        existing_receipt.get("status") == "completed" and not authority_valid
+                    ):
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": "xy_replay_current_authority_or_request_invalid",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing_receipt),
+                        }
+                    replayed_result = copy.deepcopy(dict(existing_receipt.get("result") or {}))
+                    replayed_result.setdefault("ok", existing_receipt.get("status") == "completed")
+                    replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing_receipt)})
+                    return replayed_result
+                active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
+                with self._x_interrupt_state_lock:
+                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
+                if interrupted or int(self.generation_provider()) != generation:
+                    result = {
+                        "ok": False,
+                        "failure": "xy_interrupted_or_generation_changed",
+                        "primitive_result": _json_safe(result),
+                    }
                 if result.get("ok") is True:
                     lifecycle.update({"state": "referenced_ready", "active_receipt": None, "reference_state": "referenced", "last_failure": None})
                 else:
                     lifecycle.update({"state": "failed_latched", "active_receipt": None, "reference_state": "desynced", "last_failure": _json_safe(result)})
-                lifecycle["receipts"].append({"command_id": command_id, "intent": "move_xy", "result": _json_safe(result)})
-                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+                receipt = {
+                    "command_id": command_id,
+                    "intent": "move_xy",
+                    "idempotency_key": idempotency_key,
+                    "idempotency_replay_enabled": True,
+                    "generation": generation,
+                    "target_x": int(x),
+                    "target_y": int(y),
+                    "inputs": safe_inputs,
+                    "status": "completed" if result.get("ok") is True else "failed",
+                    "result": _json_safe(result),
+                }
+                lifecycle["receipts"].append(receipt)
+                lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
+                terminal_authority_saved = True
+                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
+                    self.state_store.append_serial206_receipt("x", receipt)
                 return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
             except Exception as exc:
+                if terminal_authority_saved:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state", "reconciliation_required"),
+                        "failure": f"xy_receipt_publication_exception:{type(exc).__name__}:{exc}",
+                    }
+                if not state or not lifecycle:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "reconciliation_required",
+                        "failure": f"xy_authority_load_exception:{type(exc).__name__}:{exc}",
+                    }
+                try:
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                        "last_failure": f"xy_intent_exception:{type(exc).__name__}:{exc}",
+                    })
+                    self._save_state(state)
+                except Exception as save_exc:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "reconciliation_required",
+                        "failure": f"xy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
+                    }
                 return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}"}
 
     def execute_homexy_intent(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
+        with self._x_interrupt_state_lock:
+            admitted_interrupt_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "homexy_blocked_by_x_interrupt"}
         with self._lock:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or self._x_interrupt_epoch != admitted_interrupt_epoch:
+                    return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "homexy_blocked_by_x_interrupt"}
+            terminal_authority_saved = False
+            state: dict[str, Any] = {}
+            lifecycle: dict[str, Any] = {}
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
                 generation = int(self.generation_provider())
-                command_id = str(values.get("command_id") or f"homexy-{generation}")
-                active = {"command_id": command_id, "intent": "home_xy", "generation": generation, "status": "executing", "result": None}
+                idempotency_key = values.get("idempotency_key")
+                idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
+                command_id = str(values.get("command_id") or idempotency_key or f"homexy-{generation}")
+                safe_inputs = _json_safe(values)
+                if lifecycle.get("state") == "executing":
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": "homexy_restart_or_reentry_during_executing",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                    })
+                    self._save_state(state)
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "failed_latched",
+                        "failure": "homexy_executing_outcome_ambiguous",
+                    }
+                existing = next(
+                    (
+                        row for row in reversed(lifecycle.get("receipts") or [])
+                        if isinstance(row, Mapping)
+                        and (row.get("command_id") == command_id or (
+                            idempotency_key is not None and row.get("idempotency_key") == idempotency_key
+                        ))
+                    ),
+                    None,
+                )
+                if existing is None:
+                    existing = self._durable_serial206_receipt("x", command_id)
+                if existing is None and idempotency_key is not None:
+                    existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
+                if isinstance(existing, Mapping):
+                    if (
+                        existing.get("intent") != "home_xy"
+                        or existing.get("inputs") != safe_inputs
+                        or existing.get("generation") != generation
+                    ):
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": "homexy_replay_authority_or_request_mismatch",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing),
+                        }
+                    replay_authority_valid = (
+                        lifecycle.get("generation") == generation
+                        and lifecycle.get("state") == "referenced_ready"
+                        and lifecycle.get("reference_state") == "referenced"
+                    )
+                    if existing.get("status") == "completed" and not replay_authority_valid:
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": "homexy_replay_current_authority_invalid",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing),
+                        }
+                    replayed_result = dict(existing.get("result") or {})
+                    replayed_result.setdefault("ok", existing.get("status") == "completed")
+                    replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing)})
+                    return replayed_result
+                active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.home_xy(timeout_s=float(values.get("timeout_s", 30.0)), allow_implementation_mapped_predicate=bool(values.get("allow_implementation_mapped_predicate", False)))
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "homexy_result_not_mapping"}
+                with self._x_interrupt_state_lock:
+                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
+                if interrupted or int(self.generation_provider()) != generation:
+                    result = {
+                        "ok": False,
+                        "failure": "homexy_interrupted_or_generation_changed",
+                        "primitive_result": _json_safe(result),
+                    }
                 lifecycle.update({"state": "referenced_ready" if result.get("ok") is True else "failed_latched", "active_receipt": None, "reference_state": "referenced" if result.get("ok") is True else "desynced", "last_failure": None if result.get("ok") is True else _json_safe(result)})
-                lifecycle["receipts"].append({"command_id": command_id, "intent": "home_xy", "result": _json_safe(result)})
-                lifecycle["receipts"] = lifecycle["receipts"][-128:]
+                receipt = {
+                    "command_id": command_id,
+                    "intent": "home_xy",
+                    "idempotency_key": idempotency_key,
+                    "idempotency_replay_enabled": True,
+                    "generation": generation,
+                    "inputs": safe_inputs,
+                    "status": "completed" if result.get("ok") is True else "failed",
+                    "result": _json_safe(result),
+                }
+                lifecycle["receipts"].append(receipt)
+                lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
+                terminal_authority_saved = True
+                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
+                    self.state_store.append_serial206_receipt("x", receipt)
                 return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
             except Exception as exc:
+                if terminal_authority_saved:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state", "reconciliation_required"),
+                        "failure": f"homexy_receipt_publication_exception:{type(exc).__name__}:{exc}",
+                    }
+                if not state or not lifecycle:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "reconciliation_required",
+                        "failure": f"homexy_authority_load_exception:{type(exc).__name__}:{exc}",
+                    }
+                try:
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                        "last_failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}",
+                    })
+                    self._save_state(state)
+                except Exception as save_exc:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": "reconciliation_required",
+                        "failure": f"homexy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
+                    }
                 return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}"}
     def notify_board_activation(self, board_id: int, ack: Any, *, active: bool | None = None) -> dict[str, Any]:
         """Invalidate Z preparation/reference on any non-provider command-64 to board 4."""
@@ -3373,8 +3881,24 @@ class Serial206OemInitializationProvider:
                     state = self._save_state(state)
                     z = state["z_lifecycle"]
                     board_generation_fresh = False
-                projection = copy.deepcopy(z)
+                projection = {
+                    str(key): _json_safe(value)
+                    for key, value in z.items()
+                    if key not in {"receipts", "receipts_omitted_to_sqlite"}
+                }
+                receipts = [
+                    row for row in list(z.get("receipts") or [])
+                    if isinstance(row, Mapping)
+                ]
+                latest = receipts[-1] if receipts else None
                 projection.update({
+                    "receipt_storage": "robot_sqlite",
+                    "receipt_detail_on_request": True,
+                    "recent_receipt_count": len(receipts),
+                    "latest_receipt": None if latest is None else {
+                        key: _json_safe(latest.get(key))
+                        for key in ("command_id", "intent", "status")
+                    },
                     "available": True,
                     "ownership_generation": generation,
                     "current_board_lifecycle_generation": current_board_generation,
@@ -3554,8 +4078,7 @@ class Serial206OemInitializationProvider:
             "source": "provider_controller_reference_store",
         }
 
-    @staticmethod
-    def _append_z_receipt(z: dict[str, Any], receipt: Mapping[str, Any]) -> None:
+    def _append_z_receipt(self, z: dict[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
         receipts = list(z.get("receipts") or [])
         bounded = _json_safe(dict(receipt))
         # Preserve decision-grade evidence outside the deeply bounded result.
@@ -3566,7 +4089,8 @@ class Serial206OemInitializationProvider:
             receipt.get("result")
         )
         for key in (
-            "command_id", "intent", "idempotency_key", "expected_generation",
+            "command_id", "intent", "idempotency_key", "idempotency_replay_enabled",
+            "expected_generation",
             "board_lifecycle_generation", "status", "started_at", "finished_at",
             "robot_http_acknowledged", "controller_command_acknowledged",
             "controller_terminal_state_verified", "physical_effect_verified",
@@ -3574,7 +4098,23 @@ class Serial206OemInitializationProvider:
         ):
             bounded[key] = _json_safe(receipt.get(key))
         receipts.append(bounded)
-        z["receipts"] = receipts[-128:]
+        z["receipts"] = receipts[-8:]
+        return bounded
+
+    def _persist_z_receipt(self, receipt: Mapping[str, Any]) -> None:
+        if (
+            receipt.get("status") not in {"completed", "failed", "rejected", "ambiguous", "cancelled"}
+            or self.state_store is None
+            or not hasattr(self.state_store, "append_serial206_receipt")
+        ):
+            return
+        if (
+            receipt.get("intent") in {"stop", "abort"}
+            and hasattr(self.state_store, "append_serial206_interrupt_receipt")
+        ):
+            self.state_store.append_serial206_interrupt_receipt("z", receipt)
+        else:
+            self.state_store.append_serial206_receipt("z", receipt)
 
     @staticmethod
     def _critical_z_result_evidence(result: Any) -> dict[str, Any]:
@@ -3658,17 +4198,30 @@ class Serial206OemInitializationProvider:
 
     @staticmethod
     def _z_lifecycle_projection(z: Mapping[str, Any]) -> dict[str, Any]:
-        """Bound receipt evidence without dropping authoritative lifecycle fields."""
+        """Project current Z authority without transferring receipt transcripts."""
         projection = {
             str(key): _json_safe(value)
             for key, value in z.items()
-            if key != "receipts"
+            if key not in {"receipts", "receipts_omitted_to_sqlite"}
         }
-        receipts = list(z.get("receipts") or [])
-        projected_receipts = receipts[-32:]
-        projection["receipts"] = [_json_safe(row) for row in projected_receipts]
-        if len(receipts) > len(projected_receipts):
-            projection["receipts_omitted"] = len(receipts) - len(projected_receipts)
+        receipts = [row for row in list(z.get("receipts") or []) if isinstance(row, Mapping)]
+        latest = receipts[-1] if receipts else None
+        projection["receipt_storage"] = "robot_sqlite"
+        projection["receipt_detail_on_request"] = True
+        projection["recent_receipt_count"] = len(receipts)
+        projection["latest_receipt"] = None if latest is None else {
+            key: _json_safe(latest.get(key))
+            for key in (
+                "command_id",
+                "intent",
+                "status",
+                "started_at",
+                "finished_at",
+                "controller_command_acknowledged",
+                "controller_terminal_state_verified",
+                "physical_effect_verified",
+            )
+        }
         return projection
 
     @staticmethod
@@ -3858,8 +4411,10 @@ class Serial206OemInitializationProvider:
                     )
                     receipt = {
                         "command_id": command_id,
+                        "receipt_id": f"{command_id}:{time.time_ns()}",
                         "intent": interrupt_intent,
                         "idempotency_key": idempotency_key,
+                        "idempotency_replay_enabled": False,
                         "expected_generation": int(expected_generation),
                         "observed_generation": observed_generation,
                         "board_lifecycle_generation": z.get("board_lifecycle_generation"),
@@ -3918,8 +4473,9 @@ class Serial206OemInitializationProvider:
                             receipt["status"] = "failed"
                         receipt["authority_state_verified"] = authority_state_verified
                         receipt["result"] = _json_safe(result)
-                    self._append_z_receipt(z, receipt)
+                    durable_receipt = self._append_z_receipt(z, receipt)
                     state = self._save_state(state)
+                    self._persist_z_receipt(durable_receipt)
                     final_z = state["z_lifecycle"]
                     return {
                         "ok": bool(stop_verified and authority_state_verified),
@@ -3992,6 +4548,7 @@ class Serial206OemInitializationProvider:
             board_generation_provider = getattr(
                 self.preparation_provider, "current_board_lifecycle_generation", None
             )
+            current_board_generation = None
             if callable(board_generation_provider) and z.get("state") != "unprepared":
                 stored_board_generation = z.get("board_lifecycle_generation")
                 current_board_generation = board_generation_provider()
@@ -4022,19 +4579,46 @@ class Serial206OemInitializationProvider:
                     )
                     self._save_state(state)
             safe_inputs = _json_safe(values)
-            for existing in reversed(z.get("receipts") or []):
-                if existing.get("idempotency_key") == idempotency_key:
-                    if (
-                        existing.get("intent") != intent
-                        or existing.get("inputs") != safe_inputs
-                        or existing.get("expected_generation") != int(expected_generation)
-                    ):
-                        return {
-                            "ok": False,
-                            "blockers": ["z_idempotency_key_bound_to_different_request"],
-                            "authority_receipt": existing,
-                        }
-                    return {"ok": existing.get("status") == "completed", "replayed": True, "authority_receipt": existing}
+            existing = next(
+                (
+                    row for row in reversed(z.get("receipts") or [])
+                    if row.get("idempotency_key") == idempotency_key
+                ),
+                None,
+            )
+            if existing is None:
+                existing = self._durable_serial206_receipt_by_idempotency("z", idempotency_key)
+            if existing is not None:
+                if (
+                    existing.get("intent") != intent
+                    or existing.get("inputs") != safe_inputs
+                    or existing.get("expected_generation") != int(expected_generation)
+                ):
+                    return {
+                        "ok": False,
+                        "blockers": ["z_idempotency_key_bound_to_different_request"],
+                        "authority_receipt": existing,
+                    }
+                replay_authority_valid = (
+                    int(expected_generation) == observed_generation
+                    and z.get("generation") == observed_generation
+                    and z.get("state") not in {"unprepared", "failed_latched"}
+                    and (
+                        not callable(board_generation_provider)
+                        or (
+                            type(z.get("board_lifecycle_generation")) is int
+                            and z.get("board_lifecycle_generation") == current_board_generation
+                        )
+                    )
+                )
+                if existing.get("status") == "completed" and not replay_authority_valid:
+                    return {
+                        "ok": False,
+                        "replayed": True,
+                        "blockers": ["z_replay_authority_invalidated"],
+                        "authority_receipt": existing,
+                    }
+                return {"ok": existing.get("status") == "completed", "replayed": True, "authority_receipt": existing}
             supplied_command_id = values.get("command_id")
             command_id = (
                 supplied_command_id
@@ -4192,8 +4776,9 @@ class Serial206OemInitializationProvider:
                     )
             if blockers:
                 receipt.update({"status": "rejected", "finished_at": time.time(), "blockers": blockers})
-                self._append_z_receipt(z, receipt)
+                durable_receipt = self._append_z_receipt(z, receipt)
                 self._save_state(state)
+                self._persist_z_receipt(durable_receipt)
                 return {"ok": False, "blockers": blockers, "authority_receipt": receipt}
 
             previous_state = z.get("state")
@@ -4644,7 +5229,7 @@ class Serial206OemInitializationProvider:
                     "last_failure": _json_safe(receipt),
                 })
                 self._z_mark_desynced(f"Failed serial-206 Z intent {intent}.", f"serial206.z.{intent}")
-            self._append_z_receipt(z, receipt)
+            durable_receipt = self._append_z_receipt(z, receipt)
             try:
                 state = self._save_state(state)
             except Exception:
@@ -4654,6 +5239,7 @@ class Serial206OemInitializationProvider:
                         "serial206.z.reference_commit_compensation",
                     )
                 raise
+            self._persist_z_receipt(durable_receipt)
             z = state["z_lifecycle"]
             return {"ok": ok, "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
 
@@ -4686,6 +5272,8 @@ class Serial206OemInitializationProvider:
             receipts = list(z.get("receipts") or [])
             match_row = next((row for row in reversed(receipts) if row.get("command_id") == command_id), None)
             if match_row is None:
+                match_row = self._durable_serial206_receipt("z", command_id)
+            if match_row is None:
                 raise ValueError("Z authority receipt is missing")
             match: dict[str, Any] = match_row
             observation_id = (
@@ -4697,6 +5285,8 @@ class Serial206OemInitializationProvider:
                 (row for row in reversed(receipts) if row.get("command_id") == observation_id),
                 None,
             )
+            if existing_observation is None:
+                existing_observation = self._durable_serial206_receipt("z", observation_id)
             if existing_observation is not None:
                 if existing_observation.get("observes_command_id") != command_id:
                     raise ValueError("Z observation command is bound to a different authority receipt")
@@ -4763,9 +5353,14 @@ class Serial206OemInitializationProvider:
                 match["physical_effect_verified"] = bool(physical_motion_observed)
                 match["observation_receipt_id"] = observation_id
                 z["receipts"] = receipts[-128:]
-                self._append_z_receipt(z, observation_receipt)
+                durable_observation = self._append_z_receipt(z, observation_receipt)
                 z["last_observation"] = _json_safe(observation)
                 state = self._save_state(state)
+                self._persist_z_receipt(durable_observation)
+                if self.state_store is not None and hasattr(
+                    self.state_store, "append_serial206_receipt"
+                ):
+                    self.state_store.append_serial206_receipt("z", match)
                 return {
                     "ok": True,
                     "annotation_only": True,
@@ -4869,7 +5464,7 @@ class Serial206OemInitializationProvider:
             match["physical_effect_verified"] = bool(physical_motion_observed)
             match["observation_receipt_id"] = observation_id
             z["receipts"] = receipts[-128:]
-            self._append_z_receipt(z, observation_receipt)
+            durable_observation = self._append_z_receipt(z, observation_receipt)
             z["last_observation"] = _json_safe(observation)
             try:
                 state = self._save_state(state)
@@ -4880,6 +5475,11 @@ class Serial206OemInitializationProvider:
                         "serial206.z.observation_commit_compensation",
                     )
                 raise
+            self._persist_z_receipt(durable_observation)
+            if self.state_store is not None and hasattr(
+                self.state_store, "append_serial206_receipt"
+            ):
+                self.state_store.append_serial206_receipt("z", match)
             return {
                 "ok": operation_ok,
                 "error": error,
@@ -4939,14 +5539,76 @@ class Serial206OemInitializationProvider:
                 },
             }
 
+    @staticmethod
+    def _stage_status_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+        fields = (
+            "stage",
+            "component",
+            "state",
+            "status",
+            "ok",
+            "failure",
+            "error",
+            "approval_id",
+            "command_id",
+            "observed_command_id",
+            "started_at",
+            "finished_at",
+            "duration_ms",
+            "controller_command_acknowledged",
+            "controller_terminal_state_verified",
+            "physical_effect_verified",
+        )
+        return {
+            key: _json_safe(row.get(key))
+            for key in fields
+            if key in row
+        }
+
+    @classmethod
+    def _ledger_status_projection(cls, ledger: Mapping[str, Any]) -> dict[str, Any]:
+        projection = {
+            str(key): _json_safe(value)
+            for key, value in ledger.items()
+            if key not in {"stages", "stage_receipts", "raw_result", "result", "receipt"}
+        }
+        stages = ledger.get("stages")
+        if isinstance(stages, Mapping):
+            projection["stages"] = {
+                str(key): cls._stage_status_projection(value)
+                for key, value in stages.items()
+                if isinstance(value, Mapping)
+            }
+        receipts = ledger.get("stage_receipts")
+        if isinstance(receipts, list):
+            projected_receipts = [
+                cls._stage_status_projection(row)
+                for row in receipts
+                if isinstance(row, Mapping)
+            ]
+            projection["stage_receipt_count"] = len(projected_receipts)
+            projection["latest_stage_receipt"] = projected_receipts[-1] if projected_receipts else None
+        projection["detail_source"] = "robot_local_state_and_command_evidence"
+        projection["detail_on_request"] = True
+        return projection
+
     def initialize_motion_projection(self) -> dict[str, Any]:
         try:
             with self._lock:
                 state = self._load_state()
+            machine_status = copy.deepcopy(state["machine_status"])
+            errors = machine_status.get("error_events")
+            if isinstance(errors, list):
+                machine_status["error_event_count"] = len(errors)
+                machine_status["error_events"] = [
+                    self._stage_status_projection(row)
+                    for row in errors[-4:]
+                    if isinstance(row, Mapping)
+                ]
             return {
-                "initialize_motion_ledger": copy.deepcopy(state["initialize_motion_ledger"]),
-                "machine_status": copy.deepcopy(state["machine_status"]),
-                "initialize_motors": copy.deepcopy(state["movement_ledger"]),
+                "initialize_motion_ledger": self._ledger_status_projection(state["initialize_motion_ledger"]),
+                "machine_status": machine_status,
+                "initialize_motors": self._ledger_status_projection(state["movement_ledger"]),
             }
         except Exception:
             return {
@@ -5292,7 +5954,7 @@ class Serial206OemInitializationProvider:
                     "result": _json_safe(receipt),
                     "physical_effect_verified": False,
                 }
-                self._append_z_receipt(z, z_receipt)
+                durable_z_receipt = self._append_z_receipt(z, z_receipt)
                 if receipt["ok"] is True:
                     z.update({
                         "state": "awaiting_operator_observation",
@@ -5317,6 +5979,8 @@ class Serial206OemInitializationProvider:
                     stage_receipts=[receipt],
                     physical_motion_commanded=spec.movement,
                 )
+            if spec.component == "z":
+                self._persist_z_receipt(durable_z_receipt)
             return self._result_from_state(
                 state,
                 ok=receipt["ok"] is True,

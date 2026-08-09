@@ -244,6 +244,14 @@ def test_diagnostic_stop_preempts_inflight_normal_tester_lock(monkeypatch):
             return {"ok": True, "active": False}
 
     monkeypatch.setattr(api, "_get_tester", lambda: Tester())
+    monkeypatch.setattr(
+        api,
+        "_execute_serial206_motion_intent",
+        lambda intent, _inputs: (
+            stop_called.set()
+            or {"ok": True, "result": {"ok": True, "command_issued": True, "stopped": True}}
+        ) if intent == "stop" else {"ok": False},
+    )
 
     async def scenario():
         lock_held = asyncio.Event()
@@ -389,6 +397,15 @@ def test_diagnostic_stop_holds_connection_lease_against_release(monkeypatch):
     monkeypatch.setattr(api, "_tester_transition_lock", asyncio.Lock())
     monkeypatch.setattr(api, "_tester", tester)
     monkeypatch.setattr(api, "_pipette_transport", None)
+
+    def provider_stop(intent, _inputs):
+        assert intent == "stop"
+        stop_entered.set()
+        assert allow_stop.wait(1.0)
+        assert tester.disconnected is False
+        return {"ok": True, "result": {"ok": True, "command_issued": True, "stopped": True}}
+
+    monkeypatch.setattr(api, "_execute_serial206_motion_intent", provider_stop)
 
     async def scenario():
         stop_task = asyncio.create_task(
@@ -621,6 +638,14 @@ def test_public_reconnect_holds_transition_lease_against_stop(monkeypatch):
     monkeypatch.setattr(api, "_pipette_transport", None)
     monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: {"tester": shared_usb})
     monkeypatch.setattr(api, "_status_payload", lambda: {"available": True})
+    monkeypatch.setattr(
+        api,
+        "_execute_serial206_motion_intent",
+        lambda intent, _inputs: (
+            stop_called.set()
+            or {"ok": True, "result": {"ok": True, "command_issued": True, "stopped": True}}
+        ) if intent == "stop" else {"ok": False},
+    )
 
     async def scenario():
         reconnect_task = asyncio.create_task(api.reconnect_runtime())
@@ -698,6 +723,14 @@ def test_transport_replacing_hard_reset_holds_transition_lease_against_stop(monk
     monkeypatch.setattr(api, "_reference_state_store", ReferenceStore())
     monkeypatch.setattr(api, "_ownership_changed", lambda **kwargs: None)
     monkeypatch.setattr(api, "_mark_post_maintenance_motion_block", lambda **kwargs: {})
+    monkeypatch.setattr(
+        api,
+        "_execute_serial206_motion_intent",
+        lambda intent, _inputs: (
+            stop_called.set()
+            or {"ok": True, "result": {"ok": True, "command_issued": True, "stopped": True}}
+        ) if intent == "stop" else {"ok": False},
+    )
 
     async def scenario():
         if route_name == "motion":
