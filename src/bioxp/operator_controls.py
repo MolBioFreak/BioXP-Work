@@ -316,9 +316,21 @@ _CAN_BOOTSTRAP_PATHS = {
 }
 
 
+def _operation_motion_dependency(machine_state: Mapping[str, Any]) -> dict[str, Any]:
+    lifecycle_value = machine_state.get("lifecycle")
+    lifecycle: Mapping[str, Any] = lifecycle_value if isinstance(lifecycle_value, Mapping) else {}
+    operation_state = lifecycle.get("operation_state")
+    return _dependency(
+        "operation_allows_motion",
+        "Operation state allows motion",
+        operation_state != "emergency",
+        "Motion is blocked while operation state is emergency.",
+    )
+
+
 def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]) -> dict[str, Any]:
     """One fail-closed predicate shared by motion admission and dashboard truth."""
-    dependencies: list[dict[str, Any]] = []
+    dependencies: list[dict[str, Any]] = [_operation_motion_dependency(machine_state)]
     ownership_value = machine_state.get("ownership")
     ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
     transport_live = bool(
@@ -412,6 +424,7 @@ def _provider_z_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
     )
     z_authority = provider.get("z_authority") if isinstance(provider.get("z_authority"), Mapping) else {}
     dependencies = [
+        _operation_motion_dependency(machine_state),
         _dependency(
             "can_ready",
             "Same-epoch CAN ready",
@@ -521,7 +534,9 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         and action_id not in _Z_NO_MOTION_STATE_ACTIONS
         and action_id not in {"oem.z.status", "oem.z.stop", "oem.z.abort", "oem.z.observe"}
     )
-    if source_initializer or safety == "motion" or _motor_motion_action(action):
+    motion_action = source_initializer or safety == "motion" or _motor_motion_action(action)
+    if motion_action:
+        dependencies.append(_operation_motion_dependency(machine_state))
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
         if z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
