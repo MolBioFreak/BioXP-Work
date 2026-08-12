@@ -1781,6 +1781,222 @@ def test_z_absolute_move_refuses_motion_without_valid_pre_position():
     assert result["physical_motion_commanded"] is False
 
 
+def test_z_absolute_same_effective_target_is_verified_noop_without_dispatch():
+    class Tester:
+        def __init__(self):
+            self.calls = []
+
+        def _motion_oem_axis_profile(self, axis):
+            return {"board": 4, "motor": 1, "run_current": 31}
+
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides=None):
+            return {"ok": True}
+
+        def motor_oem_verify_motion_interlock(self):
+            return {"ok": True}
+
+        def motor_get_position(self, board, *, motor):
+            self.calls.append("get-position")
+            return {"ok": True, "ack": dict(ACK), "position": 65000}
+
+        def motor_wait_stopped(self, board, *, motor, timeout_s, require_seen_nonzero, target_position=None):
+            self.calls.append("wait-stopped")
+            assert require_seen_nonzero is False
+            assert target_position == 65000
+            return {
+                "stopped": True,
+                "last_speed": 0,
+                "last_ack": dict(ACK),
+                "target_position": target_position,
+                "target_reached": True,
+            }
+
+        def motor_set_axis_param(self, *args, **kwargs):
+            raise AssertionError("same-target no-op must not write motor current")
+
+        def begin_bus_event_window(self):
+            raise AssertionError("same-target no-op must not open a movement event window")
+
+        def motor_move_absolute(self, *args, **kwargs):
+            raise AssertionError("same-target no-op must not dispatch movement")
+
+    tester = Tester()
+    adapter = subject.Serial206ProductionPrimitiveAdapter(
+        tester, object(), authority_provider=lambda: object(), generation_provider=lambda: 11
+    )
+
+    result = adapter.z_move_absolute(
+        requested_position_steps=0,
+        pseudo_home_steps=65000,
+        wait_timeout_s=2.0,
+    )
+
+    assert result["ok"] is True
+    assert result["source_noop"] is True
+    assert result["noop_reason"] == "already_at_effective_target"
+    assert result["requested_position_steps"] == 0
+    assert result["effective_position_steps"] == 65000
+    assert result["before_position_steps"] == 65000
+    assert result["after_position_steps"] == 65000
+    assert result["physical_motion_commanded"] is False
+    assert result["controller_command_acknowledged"] is False
+    assert result["controller_terminal_state_verified"] is True
+    assert tester.calls == ["get-position", "wait-stopped", "get-position"]
+
+
+def test_provider_accepts_verified_z_absolute_noop_without_fake_command_ack(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="noop-prepare"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="noop-home"
+    )["ok"] is True
+
+    primitives.z_move_absolute = lambda **kwargs: {
+        "ok": True,
+        "failure": None,
+        "source_noop": True,
+        "noop_reason": "already_at_effective_target",
+        "physical_motion_commanded": False,
+        "controller_command_acknowledged": False,
+        "controller_terminal_state_verified": True,
+        "before_position_steps": 65000,
+        "target_position_steps": 65000,
+        "after_position_steps": 65000,
+        "requested_position_steps": 0,
+        "pseudo_home_steps": 65000,
+        "effective_position_steps": 65000,
+    }
+
+    result = provider.execute_z_intent(
+        "move_absolute",
+        inputs={"position_steps": 0},
+        expected_generation=11,
+        idempotency_key="verified-noop-absolute",
+    )
+
+    assert result["ok"] is True
+    assert result["authority_receipt"]["status"] == "completed"
+    assert result["authority_receipt"]["controller_command_acknowledged"] is False
+    assert result["authority_receipt"]["controller_terminal_state_verified"] is True
+    assert result["result"]["source_noop"] is True
+    assert result["z_state"] == "referenced_ready"
+
+
+def test_provider_rejects_z_noop_with_wrong_effective_target(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="wrong-target-prepare"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="wrong-target-home"
+    )["ok"] is True
+
+    primitives.z_move_absolute = lambda **kwargs: {
+        "ok": True,
+        "failure": None,
+        "source_noop": True,
+        "noop_reason": "already_at_effective_target",
+        "physical_motion_commanded": False,
+        "controller_command_acknowledged": False,
+        "controller_terminal_state_verified": True,
+        "before_position_steps": 65001,
+        "target_position_steps": 65001,
+        "after_position_steps": 65001,
+        "requested_position_steps": 0,
+        "pseudo_home_steps": 65000,
+        "effective_position_steps": 65001,
+    }
+
+    result = provider.execute_z_intent(
+        "move_absolute",
+        inputs={"position_steps": 0},
+        expected_generation=11,
+        idempotency_key="wrong-effective-noop",
+    )
+
+    assert result["ok"] is False
+    assert result["authority_receipt"]["status"] == "failed"
+    assert result["result"]["failure"] == "z_controller_command_or_terminal_evidence_unverified"
+
+
+def test_provider_rejects_z_noop_marker_on_relative_move(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="wrong-intent-prepare"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="wrong-intent-home"
+    )["ok"] is True
+
+    primitives.z_move_steps = lambda **kwargs: {
+        "ok": True,
+        "failure": None,
+        "source_noop": True,
+        "noop_reason": "already_at_effective_target",
+        "physical_motion_commanded": False,
+        "controller_command_acknowledged": False,
+        "controller_terminal_state_verified": True,
+        "before_position_steps": 65000,
+        "target_position_steps": 65000,
+        "after_position_steps": 65000,
+        "effective_position_steps": 65000,
+    }
+
+    result = provider.execute_z_intent(
+        "move_steps",
+        inputs={"steps": 1000},
+        expected_generation=11,
+        idempotency_key="wrong-intent-noop",
+    )
+
+    assert result["ok"] is False
+    assert result["authority_receipt"]["status"] == "failed"
+    assert result["result"]["failure"] == "z_controller_command_or_terminal_evidence_unverified"
+
+
+def test_provider_accepts_verified_z_clear_noop_at_selected_pseudo_home(tmp_path):
+    primitives = FakeSerial206Primitives()
+    provider = _provider(tmp_path, primitives, ReferenceStore())
+    assert provider.execute_z_intent(
+        "prepare", expected_generation=11, idempotency_key="clear-noop-prepare"
+    )["ok"] is True
+    assert provider.execute_z_intent(
+        "manual_home", expected_generation=11, idempotency_key="clear-noop-home"
+    )["ok"] is True
+
+    primitives.z_move_absolute = lambda **kwargs: {
+        "ok": True,
+        "failure": None,
+        "source_noop": True,
+        "noop_reason": "already_at_effective_target",
+        "physical_motion_commanded": False,
+        "controller_command_acknowledged": False,
+        "controller_terminal_state_verified": True,
+        "before_position_steps": 65000,
+        "target_position_steps": 65000,
+        "after_position_steps": 65000,
+        "requested_position_steps": 65000,
+        "pseudo_home_steps": 65000,
+        "effective_position_steps": 65000,
+    }
+
+    result = provider.execute_z_intent(
+        "clear",
+        expected_generation=11,
+        idempotency_key="verified-clear-noop",
+    )
+
+    assert result["ok"] is True
+    assert result["authority_receipt"]["status"] == "completed"
+    assert result["authority_receipt"]["controller_command_acknowledged"] is False
+    assert result["result"]["selected_pseudo_home_steps"] == 65000
+
+
 def test_z_relative_move_requires_fresh_target_event_and_acknowledged_zero_speed():
     class Tester:
         fresh_event = False

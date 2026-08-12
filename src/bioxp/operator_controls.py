@@ -83,6 +83,10 @@ BoundedReceiptStore = OperatorReceiptStore
 def _controller_acknowledged(value: Any) -> bool:
     """Detect a successful controller/TMCL ACK independently of HTTP status."""
     if isinstance(value, Mapping):
+        for key in ("controller_command_acknowledged", "controller_acknowledged"):
+            explicit = value.get(key)
+            if type(explicit) is bool:
+                return explicit
         status = value.get("status")
         if status == 100 and any(key in value for key in ("status", "raw", "command", "cmd")):
             return True
@@ -1914,10 +1918,22 @@ def install_operator_control_plane(
                 if isinstance(response, dict):
                     authority_receipt = response.get("authority_receipt")
                     observation_receipt = response.get("observation_receipt")
+                authority_controller_acknowledged = (
+                    authority_receipt.get("controller_command_acknowledged")
+                    if (
+                        isinstance(authority_receipt, Mapping)
+                        and type(authority_receipt.get("controller_command_acknowledged")) is bool
+                    )
+                    else None
+                )
                 receipt.update({
                     "status": "completed" if ok else "failed",
                     "remote_acknowledged": 200 <= status_code < 300,
-                    "controller_acknowledged": _controller_acknowledged(response),
+                    "controller_acknowledged": (
+                        authority_controller_acknowledged
+                        if type(authority_controller_acknowledged) is bool
+                        else _controller_acknowledged(response)
+                    ),
                     "physical_effect_verified": bool(
                         isinstance(response, Mapping) and response.get("physical_effect_verified") is True
                     ),

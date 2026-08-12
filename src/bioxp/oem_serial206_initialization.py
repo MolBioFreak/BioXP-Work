@@ -1117,6 +1117,47 @@ class Serial206ProductionPrimitiveAdapter:
                 "source_max_steps": 160000,
                 "physical_motion_commanded": False,
             }
+        if before_value == effective:
+            wait = self.tester.motor_wait_stopped(
+                4,
+                motor=1,
+                timeout_s=float(wait_timeout_s),
+                require_seen_nonzero=False,
+                target_position=effective,
+            )
+            after = self.tester.motor_get_position(4, motor=1)
+            after_value = self._z_value(after)
+            terminal_verified = bool(
+                self._z_terminal_zero_verified(wait)
+                and isinstance(after, Mapping)
+                and after.get("ok") is True
+                and self._z_tmcl_success(after.get("ack"))
+                and after_value == effective
+            )
+            return {
+                "ok": terminal_verified,
+                "failure": None if terminal_verified else "z_noop_terminal_state_unverified",
+                "axis": "z",
+                "intent": "move_absolute",
+                "source_anchor": "ClassHeadBoard.cs:174-177",
+                "source_noop": True,
+                "noop_reason": "already_at_effective_target",
+                "requested_position_steps": requested,
+                "pseudo_home_steps": int(pseudo_home_steps),
+                "effective_position_steps": effective,
+                "target_position_steps": effective,
+                "effective_target_clamped": effective != requested,
+                "before": _json_safe(before),
+                "before_position_steps": before_value,
+                "after": _json_safe(after),
+                "after_position_steps": after_value,
+                "wait": _json_safe(wait),
+                "target_position_verified": after_value == effective,
+                "physical_motion_commanded": False,
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": terminal_verified,
+                "physical_effect_verified": False,
+            }
         current_write = self.tester.motor_set_axis_param(4, 6, int(profile["run_current"]), motor=1)
         current_readback = self.tester.motor_get_axis_param(4, 6, motor=1)
         if not (
@@ -4786,6 +4827,9 @@ class Serial206OemInitializationProvider:
             z["active_receipt"] = copy.deepcopy(receipt)
             z["state"] = "executing"
             self._save_state(state)
+            expected_noop_requested: int | None = None
+            expected_noop_pseudo_home: int | None = None
+            expected_noop_effective_target: int | None = None
             try:
                 if intent == "prepare":
                     preparer = self.preparation_provider
@@ -4836,9 +4880,15 @@ class Serial206OemInitializationProvider:
                     pseudo_home = machine_status.get("psudo_z_home_steps")
                     if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
                         raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    expected_noop_requested = int(values["position_steps"])
+                    expected_noop_pseudo_home = int(pseudo_home)
+                    expected_noop_effective_target = max(
+                        expected_noop_pseudo_home,
+                        expected_noop_requested,
+                    )
                     result = self.primitives.z_move_absolute(
-                        requested_position_steps=int(values["position_steps"]),
-                        pseudo_home_steps=int(pseudo_home),
+                        requested_position_steps=expected_noop_requested,
+                        pseudo_home_steps=expected_noop_pseudo_home,
                         wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
                     )
                 elif intent == "clear":
@@ -4846,9 +4896,12 @@ class Serial206OemInitializationProvider:
                     pseudo_home = machine_status.get("psudo_z_home_steps")
                     if type(pseudo_home) is not int or pseudo_home not in {500, 65000}:
                         raise RuntimeError("PSUDO_Z_HOME state is invalid")
+                    expected_noop_requested = int(pseudo_home)
+                    expected_noop_pseudo_home = int(pseudo_home)
+                    expected_noop_effective_target = int(pseudo_home)
                     result = self.primitives.z_move_absolute(
-                        requested_position_steps=int(pseudo_home),
-                        pseudo_home_steps=int(pseudo_home),
+                        requested_position_steps=expected_noop_requested,
+                        pseudo_home_steps=expected_noop_pseudo_home,
                         wait_timeout_s=float(values.get("wait_timeout_s", 20.0)),
                     )
                     if isinstance(result, Mapping):
@@ -4967,8 +5020,30 @@ class Serial206OemInitializationProvider:
                 "set_max_speed", "set_max_acc", "set_vmax", "set_current_max",
                 "restore_original_speed",
             }:
+                noop_effective = result.get("effective_position_steps")
+                verified_no_command_noop = bool(
+                    intent in {"move_absolute", "clear"}
+                    and type(expected_noop_requested) is int
+                    and type(expected_noop_pseudo_home) is int
+                    and type(expected_noop_effective_target) is int
+                    and result.get("source_noop") is True
+                    and result.get("noop_reason") == "already_at_effective_target"
+                    and result.get("physical_motion_commanded") is False
+                    and result.get("controller_command_acknowledged") is False
+                    and result.get("controller_terminal_state_verified") is True
+                    and type(noop_effective) is int
+                    and result.get("requested_position_steps") == expected_noop_requested
+                    and result.get("pseudo_home_steps") == expected_noop_pseudo_home
+                    and noop_effective == expected_noop_effective_target
+                    and result.get("target_position_steps") == expected_noop_effective_target
+                    and result.get("before_position_steps") == expected_noop_effective_target
+                    and result.get("after_position_steps") == expected_noop_effective_target
+                )
                 if (
-                    result.get("controller_command_acknowledged") is not True
+                    (
+                        result.get("controller_command_acknowledged") is not True
+                        and not verified_no_command_noop
+                    )
                     or result.get("controller_terminal_state_verified") is not True
                 ):
                     result.update({

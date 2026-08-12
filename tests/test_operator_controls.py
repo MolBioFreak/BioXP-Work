@@ -49,6 +49,9 @@ def make_app(tmp_path: Path, monkeypatch):
     @app.post("/motion/test/home_axis")
     async def home_axis(body: dict):
         calls.append(("home_axis", body))
+        override = getattr(app.state, "operator_test_home_axis_response", None)
+        if override is not None:
+            return override
         return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
 
     @app.post("/motion/oem/home_xy")
@@ -277,6 +280,47 @@ def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_
     replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
     assert replay.status_code == 200
     assert replay.json()["command_id"] == receipt["command_id"]
+    assert calls == [("home_axis", {"axis": "x"})]
+
+
+def test_operator_receipt_preserves_explicit_no_command_ack_over_nested_readback_acks(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    app.state.operator_test_home_axis_response = {
+        "ok": True,
+        "result": {
+            "source_noop": True,
+            "physical_motion_commanded": False,
+            "wait": {"last_ack": {"status": 100, "command": 6}},
+            "after": {"ack": {"status": 100, "command": 6}},
+        },
+        "authority_receipt": {
+            "command_id": "serial206-noop-command",
+            "status": "completed",
+            "controller_command_acknowledged": False,
+            "controller_terminal_state_verified": True,
+        },
+    }
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+
+    response = client.post(
+        f"/operator/actions/{action['action_id']}",
+        json={
+            "expected_generation": catalog["ownership_generation"],
+            "idempotency_key": "verified-no-command-ack-123",
+            "inputs": {"body": {"axis": "x"}},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    receipt = response.json()
+    assert receipt["status"] == "completed"
+    assert receipt["controller_acknowledged"] is False
+    assert receipt["authority_receipt_status"] == "completed"
+    stored = OperatorReceiptStore().by_command(receipt["command_id"])
+    assert stored is not None
+    assert stored["controller_acknowledged"] is False
     assert calls == [("home_axis", {"axis": "x"})]
 
 
