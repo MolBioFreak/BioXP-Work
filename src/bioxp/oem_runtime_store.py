@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +402,75 @@ class OEMRuntimeStore:
         with self._lock:
             _atomic_json(self.serial206_initialization_state_path, stored_payload)
         return payload
+
+    def append_serial206_receipts_atomic(
+        self,
+        receipts: Iterable[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Persist several stream receipts in one SQLite transaction."""
+        normalized: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = []
+        for stream, receipt in receipts:
+            selected_stream = str(stream).strip().lower()
+            if selected_stream not in {"x", "z", "initialize_motion"}:
+                raise ValueError("unsupported serial-206 receipt stream")
+            payload = dict(receipt)
+            replay_enabled = payload.get("idempotency_replay_enabled")
+            if replay_enabled is None:
+                replay_enabled = payload.get("intent") not in {"stop", "abort"}
+            replay_enabled = bool(replay_enabled)
+            payload["idempotency_replay_enabled"] = replay_enabled
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            command_id = payload.get("command_id")
+            command_text = str(command_id) if isinstance(command_id, str) and command_id else None
+            idempotency_key = payload.get("idempotency_key")
+            idempotency_text = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
+            status = payload.get("status")
+            status_text = status if isinstance(status, str) and status else None
+            supplied_receipt_id = payload.get("receipt_id")
+            receipt_id = str(supplied_receipt_id) if isinstance(supplied_receipt_id, str) and supplied_receipt_id else command_text or hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            try:
+                observed_at = float(payload.get("finished_at") or payload.get("started_at") or payload.get("observed_at") or utc_ts())
+            except (TypeError, ValueError, OverflowError):
+                observed_at = float(utc_ts())
+            normalized.append((selected_stream, payload, (selected_stream, receipt_id, command_text, idempotency_text, int(replay_enabled), status_text, observed_at, encoded)))
+        if not normalized:
+            raise ValueError("at least one serial-206 receipt required")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for selected_stream, _payload, row in normalized:
+                    self._db.execute(
+                        """
+                        INSERT INTO serial206_receipts(
+                            stream,receipt_id,command_id,idempotency_key,
+                            idempotency_replay_enabled,status,observed_at,receipt_json
+                        ) VALUES(?,?,?,?,?,?,?,?)
+                        ON CONFLICT(stream,receipt_id) DO UPDATE SET
+                            command_id=excluded.command_id,
+                            idempotency_key=excluded.idempotency_key,
+                            idempotency_replay_enabled=excluded.idempotency_replay_enabled,
+                            status=excluded.status,
+                            observed_at=excluded.observed_at,
+                            receipt_json=excluded.receipt_json
+                        """,
+                        row,
+                    )
+                    self._db.execute(
+                        """
+                        DELETE FROM serial206_receipts
+                        WHERE stream=? AND receipt_id IN (
+                            SELECT receipt_id FROM serial206_receipts
+                            WHERE stream=? ORDER BY observed_at DESC, receipt_id DESC
+                            LIMIT -1 OFFSET ?
+                        )
+                        """,
+                        (selected_stream, selected_stream, MAX_SERIAL206_RECEIPTS_PER_STREAM),
+                    )
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        return [payload for _stream, payload, _row in normalized]
 
     def append_serial206_receipt(self, stream: str, receipt: dict[str, Any]) -> dict[str, Any]:
         """Persist one provider receipt without expanding the current-state file."""

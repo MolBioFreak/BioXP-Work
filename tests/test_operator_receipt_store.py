@@ -351,6 +351,120 @@ def test_interrupt_evidence_write_failure_uses_fsynced_fallback(tmp_path: Path, 
     assert store.interrupt_fallback_path.exists()
 
 
+def test_existing_database_migrates_replay_column_before_replacing_unique_index(
+    tmp_path: Path,
+) -> None:
+    database = sqlite3.connect(tmp_path / "bioxp_runtime.db")
+    database.executescript(
+        """
+        CREATE TABLE operator_commands (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            safety_class TEXT,
+            ownership_generation INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_ms REAL,
+            controller_acknowledged INTEGER NOT NULL DEFAULT 0,
+            physical_effect_verified INTEGER NOT NULL DEFAULT 0,
+            receipt_json TEXT NOT NULL,
+            response_summary_json TEXT,
+            evidence_relpath TEXT,
+            evidence_sha256 TEXT,
+            evidence_bytes INTEGER,
+            updated_at REAL NOT NULL
+        );
+        CREATE UNIQUE INDEX operator_commands_idempotency_key_idx
+            ON operator_commands(idempotency_key);
+        """
+    )
+    actions = (
+        "oem.z.stop",
+        "oem.z.abort",
+        "oem.x.stop",
+        "oem.abort_all",
+        "meta.emergency_stop",
+        "query.status",
+    )
+    for index, action_id in enumerate(actions):
+        selected = receipt(f"existing-{index}", key=f"existing-key-{index}")
+        selected["action_id"] = action_id
+        database.execute(
+            """
+            INSERT INTO operator_commands(
+                command_id,idempotency_key,action_id,status,safety_class,
+                ownership_generation,started_at,finished_at,duration_ms,
+                controller_acknowledged,physical_effect_verified,receipt_json,
+                response_summary_json,evidence_relpath,evidence_sha256,evidence_bytes,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                selected["command_id"],
+                selected["idempotency_key"],
+                action_id,
+                selected["status"],
+                None,
+                selected["ownership_generation"],
+                selected["started_at"],
+                selected["finished_at"],
+                None,
+                0,
+                0,
+                json.dumps(selected),
+                None,
+                None,
+                None,
+                None,
+                float(index),
+            ),
+        )
+    database.commit()
+    database.close()
+
+    store = OperatorReceiptStore(tmp_path)
+
+    columns = {
+        row["name"]: row
+        for row in store.connection.execute("PRAGMA table_info(operator_commands)")
+    }
+    assert columns["idempotency_replay_enabled"]["notnull"] == 1
+    assert columns["idempotency_replay_enabled"]["dflt_value"] == "1"
+    replay_by_action = dict(store.connection.execute(
+        "SELECT action_id,idempotency_replay_enabled FROM operator_commands"
+    ).fetchall())
+    assert replay_by_action == {
+        "oem.z.stop": 0,
+        "oem.z.abort": 0,
+        "oem.x.stop": 0,
+        "oem.abort_all": 0,
+        "meta.emergency_stop": 0,
+        "query.status": 1,
+    }
+    index_sql = store.connection.execute(
+        "SELECT sql FROM sqlite_master WHERE name='operator_commands_replay_key_idx'"
+    ).fetchone()[0]
+    assert "WHERE idempotency_replay_enabled=1" in index_sql
+
+    repeated = receipt("repeated-x-stop", key="existing-key-2")
+    repeated["action_id"] = "oem.x.stop"
+    store.put_interrupt(repeated)
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key='existing-key-2'"
+    ).fetchone()[0] == 2
+
+    store.connection.close()
+    restarted = OperatorReceiptStore(tmp_path)
+    assert restarted.connection.execute(
+        "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key='existing-key-2'"
+    ).fetchone()[0] == 2
+    assert restarted.connection.execute(
+        "SELECT idempotency_replay_enabled FROM operator_commands WHERE command_id='repeated-x-stop'"
+    ).fetchone()[0] == 0
+
+
 def test_legacy_repeated_safety_keys_import_as_nonreplayable(tmp_path: Path) -> None:
     first = receipt("legacy-stop-1", key="same-stop-key")
     first["action_id"] = "oem.z.stop"

@@ -111,6 +111,38 @@ def test_serial206_embedded_compact_placeholders_stay_in_json_not_sql_indexes(tm
     assert isinstance(indexed["observed_at"], float)
 
 
+def test_serial206_multi_stream_receipts_commit_atomically(tmp_path: Path) -> None:
+    store = OEMRuntimeStore(tmp_path)
+    stored = store.append_serial206_receipts_atomic((
+        ("x", {"command_id": "xyz-current", "receipt_id": "xyz-current", "status": "completed"}),
+        ("z", {"command_id": "xyz-current", "receipt_id": "xyz-current", "status": "completed"}),
+    ))
+    assert len(stored) == 2
+    assert store.read_serial206_receipt("x", "xyz-current") is not None
+    assert store.read_serial206_receipt("z", "xyz-current") is not None
+
+
+def test_serial206_multi_stream_receipts_roll_back_if_second_stream_fails(tmp_path: Path) -> None:
+    store = OEMRuntimeStore(tmp_path)
+    store._db.execute(
+        """
+        CREATE TRIGGER reject_z_multi_stream_receipt
+        BEFORE INSERT ON serial206_receipts
+        WHEN NEW.stream='z'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected z receipt failure');
+        END
+        """
+    )
+    with pytest.raises(sqlite3.DatabaseError, match="injected z receipt failure"):
+        store.append_serial206_receipts_atomic((
+            ("x", {"command_id": "xyz-rollback", "receipt_id": "xyz-rollback", "status": "completed"}),
+            ("z", {"command_id": "xyz-rollback", "receipt_id": "xyz-rollback", "status": "completed"}),
+        ))
+    assert store.read_serial206_receipt("x", "xyz-rollback") is None
+    assert store.read_serial206_receipt("z", "xyz-rollback") is None
+
+
 def test_serial206_receipt_retention_keeps_128_newest_per_stream(tmp_path: Path) -> None:
     store = OEMRuntimeStore(tmp_path)
     for index in range(129):

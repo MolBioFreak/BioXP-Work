@@ -472,6 +472,9 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     assert axis["right_switch_raw_active"] is True
     assert {"left_switch_state", "right_switch_state", "left_switch_raw_active", "right_switch_raw_active", "left_switch_disabled", "right_switch_disabled", "coordinate_contract", "min_steps", "max_steps"} <= set(axis)
     assert dashboard["z_axis"]["authority"] == "Serial206OemInitializationProvider"
+    assert dashboard["x_axis"]["status"] == axis
+    assert dashboard["x_axis"]["authority"] == "unbound"
+    assert dashboard["x_axis"]["physical_position_verified"] is False
     assert dashboard["temperatures"] == [
         {"sensor": "tc_temp_c", "label": "Thermal cycler block", "unit": "°C", "temperature_c": 37.0, "available": True},
         {"sensor": "lid_temp_c", "label": "Thermal cycler lid", "unit": "°C", "temperature_c": 42.125, "available": True},
@@ -481,6 +484,62 @@ def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics(
     assert len(dashboard["pipettes"]["channels"]) == 4
     assert dashboard["pipettes"]["channels"][0]["tip_loaded"] is True
     assert dashboard["snapshot"]["collection_triggered"] is False
+
+
+def test_dashboard_uses_provider_owned_x_authority_and_never_claims_physical_position_proof():
+    state = machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced")
+    state["serial206_initialization_provider"] = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "x_authority": {
+            "authority": "Serial206OemInitializationProvider",
+            "axis": "x",
+            "source_min_steps": 0,
+            "source_max_steps": 90263,
+            "effective_absolute_min_steps": 60,
+            "relative_limit_margin_steps": 20,
+            "current_generation": 12,
+            "current_board_lifecycle_generation": 9,
+            "board_generation_fresh": True,
+            "lifecycle": {
+                "state": "referenced_ready",
+                "reference_state": "referenced",
+                "last_failure": {"reason": "historical_only"},
+                "latest_receipt": {"command_id": "x-move-1", "intent": "move_absolute", "status": "completed"},
+            },
+            "live_status": {
+                "ok": True,
+                "position_steps": 4321,
+                "speed_steps_s": 0,
+                "max_current": 31,
+                "left_switch_state": 0,
+                "right_switch_state": 1,
+                "left_switch_disabled": False,
+                "right_switch_disabled": True,
+                "profile_verified": True,
+                "switch_mask_verified": True,
+                "authority": "serial206_x_terminal_register_readback",
+            },
+            "profile": {"verified": True},
+            "switch_masks": {"verified": True},
+        },
+    }
+
+    dashboard = _dashboard_payload(state)
+    x = dashboard["x_axis"]
+
+    assert x["authority"] == "Serial206OemInitializationProvider"
+    assert x["status"]["position_steps"] == 4321
+    assert x["status"]["speed_steps_s"] == 0
+    assert x["status"]["reference"] == "referenced"
+    assert x["status"]["min_steps"] == 0
+    assert x["status"]["max_steps"] == 90263
+    assert x["status"]["physical_position_verified"] is False
+    assert x["provider"]["profile"]["verified"] is True
+    assert x["provider"]["switch_masks"]["verified"] is True
+    assert x["latest_receipt"]["command_id"] == "x-move-1"
+    assert x["last_failure"] == {"reason": "historical_only"}
+    assert x["physical_position_verified"] is False
 
 
 def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state():

@@ -153,6 +153,7 @@ _IMPLICIT_OPERATOR_ACK_BY_PATH = {
     "/diagnostics/usb-sniff/start": "USB_SNIFF",
     "/diagnostics/usb-sniff/stop": "USB_SNIFF",
     "/maintenance/usb/recover_motion": "RECOVER",
+    "/motion/oem/x/set_home": "SET_HOME_CURRENT_POSITION",
     "/motion/arm/strict_startup": "RECOVER_MOTION",
     "/motion/diagnostics/execute": "RUN_AXIS_DIAGNOSTIC",
     "/motion/diagnostics/stop": "STOP_AXIS",
@@ -160,6 +161,7 @@ _IMPLICIT_OPERATOR_ACK_BY_PATH = {
     "/motion/gripper/home": "GRIPPER_HOME",
     "/motion/interlock/override": "INTERLOCK_OVERRIDE",
     "/motion/oem/home_xy": "HOMEXY",
+    "/motion/oem/move_xy": "MOVEXY",
     "/motion/oem/initialization/initialize_motors": "INITIALIZE_MOTORS_STAGE",
     "/motion/oem/initialization/initialize_motion": "INITIALIZE_MOTION_STAGE",
     "/motion/thermal_door/home": "HOME_THERMAL_DOOR",
@@ -191,6 +193,13 @@ _NO_MOTION_PREPARATION_PATHS = {
     # movement/homing action.  It must remain available to repair a stale Z
     # coordinate while the physical-motion arm is deliberately disarmed.
     "/motion/oem/z/set_home",
+    "/motion/oem/x/prepare",
+    "/motion/oem/x/reconcile_switch_masks",
+    "/motion/oem/x/set_home",
+    "/motion/oem/x/set_max_speed",
+    "/motion/oem/x/set_max_acc",
+    "/motion/oem/x/restore_original_speed",
+    "/motion/oem/x/set_stall_guard",
 }
 
 
@@ -259,6 +268,18 @@ _Z_NO_MOTION_STATE_ACTIONS = frozenset({
     "oem.z.set_home",
 })
 
+_X_NO_MOTION_STATE_ACTIONS = frozenset({
+    "oem.x.prepare",
+    "oem.x.reconcile_switch_masks",
+    "oem.x.set_home",
+    "oem.x.set_max_speed",
+    "oem.x.set_max_acc",
+    "oem.x.restore_original_speed",
+    "oem.x.set_stall_guard",
+    "oem.xy.enable",
+    "oem.xyz.enable",
+})
+
 _Z_AUTO_PREREQUISITE_ACTIONS = frozenset({
     "oem.z.manual_home",
     "oem.z.diagnostic_home_axis",
@@ -275,6 +296,8 @@ def _z_no_motion_state_action(action: Mapping[str, Any]) -> bool:
 def _required_reference_axes(action: Mapping[str, Any], inputs: Mapping[str, Any]) -> list[str]:
     if not _motor_motion_action(action) or _home_action(action):
         return []
+    if str(action.get("action_id") or "") in {"oem.z.scriptmove_to", "oem.xyz.move_to"}:
+        return ["x", "y", "z"]
     path = str(action.get("informational_path") or "").lower()
     if any(token in path for token in ("pipette", "aspirate", "dispense", "mix")):
         return ["x", "y", "z"]
@@ -456,11 +479,35 @@ def _provider_z_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _provider_x_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, Any]:
+    ownership_value = machine_state.get("ownership")
+    ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
+    maintenance_value = machine_state.get("maintenance")
+    maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
+    provider_value = machine_state.get("serial206_initialization_provider")
+    provider: Mapping[str, Any] = provider_value if isinstance(provider_value, Mapping) else {}
+    x_authority_value = provider.get("x_authority")
+    x_authority: Mapping[str, Any] = x_authority_value if isinstance(x_authority_value, Mapping) else {}
+    lifecycle_value = x_authority.get("lifecycle")
+    lifecycle: Mapping[str, Any] = lifecycle_value if isinstance(lifecycle_value, Mapping) else x_authority
+    board_fresh = lifecycle.get("board_lifecycle_generation_fresh")
+    dependencies = [
+        _operation_motion_dependency(machine_state),
+        _dependency("can_ready", "Same-epoch CAN ready", ownership.get("CAN_READY") is True, "Same-epoch CAN readiness has not been established."),
+        _dependency("motion_enabled", "Motion enabled", maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False, "Motion is inactive. Activate motion before moving this motor."),
+        _dependency("x_board_lifecycle_fresh", "Serial-206 X board lifecycle current", board_fresh is not False, "X board lifecycle changed; prepare X again."),
+    ]
+    failed = next((row for row in dependencies if not row["met"]), None)
+    return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
+
+
 def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assess one action using only already-published machine state."""
     values = dict(inputs or {})
     if str(action.get("action_id") or "").startswith("oem.z."):
         values.setdefault("axis", "z")
+    if str(action.get("action_id") or "").startswith("oem.x."):
+        values.setdefault("axis", "x")
     dependencies: list[dict[str, Any]] = []
     provider_available = bool(action.get("provider_available", action.get("available", True)))
     provider_reason = str(action.get("provider_unavailable_reason") or action.get("unavailable_reason") or "Robot provider is not available.")
@@ -476,6 +523,45 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     action_id = str(action.get("action_id") or "")
+    x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
+    if x_provider_action and action_id != "oem.x.status":
+        provider_state_value = machine_state.get("serial206_initialization_provider")
+        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
+        x_authority_value = provider_state.get("x_authority")
+        x_authority = x_authority_value if isinstance(x_authority_value, Mapping) else {}
+        x_lifecycle_value = x_authority.get("lifecycle")
+        x_lifecycle = x_lifecycle_value if isinstance(x_lifecycle_value, Mapping) else x_authority
+        x_state = str(x_lifecycle.get("state") or "unbound")
+        allowed_by_action = {
+            "oem.x.prepare": {"unprepared", "failed_latched", "reconciliation_required"},
+            "oem.x.reconcile_switch_masks": {"unprepared", "failed_latched", "reconciliation_required"},
+            "oem.x.manual_panel_home": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.startup_home": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.move_to_origin_home": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.caught_plate_recovery_home": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
+            "oem.x.move_steps": {"referenced_ready"},
+            "oem.x.move_absolute": {"referenced_ready"},
+            "oem.x.set_max_speed": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.set_max_acc": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.restore_original_speed": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.set_stall_guard": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.observe": {"awaiting_operator_observation"},
+            "oem.x.stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
+            "oem.abort_all": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
+            "oem.xy.home_xy": {"prepared_unreferenced", "referenced_ready"},
+            "oem.xy.move_xy": {"referenced_ready"},
+            "oem.xyz.move_to": {"prepared_unreferenced", "referenced_ready", "failed_latched"},
+        }
+        allowed = allowed_by_action.get(action_id)
+        if allowed is not None:
+            dependencies.append(_dependency(
+                "serial206_x_lifecycle",
+                "Serial-206 X lifecycle",
+                x_state in allowed,
+                f"Current X lifecycle state {x_state!r}; expected one of {sorted(allowed)}.",
+            ))
     if action_id.startswith("oem.z.") and action_id != "oem.z.status":
         provider_state_value = machine_state.get("serial206_initialization_provider")
         provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
@@ -533,6 +619,23 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "Use the corresponding oem.z.* action ID; generic route-derived Z actions are retired.",
         ))
 
+    if (
+        str(values.get("axis") or "").lower() == "x"
+        and path in {"/motion/oem/manual/relative", "/motion/oem/manual/absolute", "/motion/oem/manual/home"}
+        and not action_id.startswith("oem.x.")
+    ):
+        dependencies.append(_dependency(
+            "stable_x_semantic_action",
+            "Stable provider-owned X semantic action",
+            False,
+            "Use the corresponding oem.x.* action ID; generic route-derived X actions are retired.",
+        ))
+
+    provider_owned_x_motion = bool(
+        x_provider_action
+        and action_id not in _X_NO_MOTION_STATE_ACTIONS
+        and action_id not in {"oem.x.status", "oem.x.stop", "oem.abort_all", "oem.x.observe"}
+    )
     provider_owned_z_motion = bool(
         action_id.startswith("oem.z.")
         and action_id not in _Z_NO_MOTION_STATE_ACTIONS
@@ -541,9 +644,14 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     motion_action = source_initializer or safety == "motion" or _motor_motion_action(action)
     if motion_action:
         dependencies.append(_operation_motion_dependency(machine_state))
+        x_state_establishing = action_id in _X_NO_MOTION_STATE_ACTIONS
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
-        required_axes = [] if source_initializer or z_state_establishing else _required_reference_axes(action, values)
-        if z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
+        required_axes = [] if source_initializer or z_state_establishing or x_state_establishing else _required_reference_axes(action, values)
+        if x_state_establishing:
+            readiness = {"dependencies": []}
+        elif provider_owned_x_motion:
+            readiness = _provider_x_motion_readiness(machine_state)
+        elif z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
             # OEM state-establishing operations create readiness. Normal Z
             # controls also compose missing preparation/reference work inside
             # the provider transaction, so cached readiness must not pre-disable
@@ -559,6 +667,12 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
         )
+        if action_id == "oem.xy.move_xy":
+            existing_keys = {str(row.get("key")) for row in dependencies}
+            y_readiness = _motion_readiness(machine_state, ["y"])
+            dependencies.extend(
+                row for row in y_readiness["dependencies"] if str(row.get("key")) not in existing_keys
+            )
         effective_axis = str(values.get("axis") or "").lower()
         if effective_axis == "z" and not provider_owned_z_motion:
             domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
@@ -621,6 +735,22 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                 "Z target in OEM 0..160000 envelope",
                 type(target) is int and 0 <= target <= 160000,
                 "Requested Z target is outside the OEM nonnegative envelope.",
+            ))
+        elif provider_owned_x_motion and action_id == "oem.x.move_absolute":
+            target = values.get("position_steps")
+            dependencies.append(_dependency(
+                "x_target_oem_envelope",
+                "X target in OEM 0..90263 envelope (effective minimum 60)",
+                type(target) is int and 0 <= target <= 90263,
+                "Requested X target is outside the OEM 0..90263 envelope.",
+            ))
+        elif provider_owned_x_motion and action_id == "oem.x.move_steps":
+            steps = values.get("steps")
+            dependencies.append(_dependency(
+                "x_relative_oem_envelope",
+                "X relative request respects the source 20-step inner margin",
+                type(steps) is int and -90243 <= steps <= 90243,
+                "Requested X relative delta exceeds the maximum source-margin span; live target preflight remains provider-owned.",
             ))
 
     failed = next((row for row in dependencies if not row["met"]), None)
@@ -723,13 +853,63 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     enclosure = lifecycle.get("door") if isinstance(lifecycle.get("door"), Mapping) else {}
     latch_row = domains.get("latch") if isinstance(domains.get("latch"), Mapping) else {}
     latch = latch_row.get("observation") if isinstance(latch_row, Mapping) else None
-    freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {"state": "missing", "age_s": None, "fresh_for_s": None}
+    freshness_value = machine_state.get("freshness")
+    freshness: Mapping[str, Any] = (
+        freshness_value
+        if isinstance(freshness_value, Mapping)
+        else {"state": "missing", "age_s": None, "fresh_for_s": None}
+    )
     connection_live = bool(ownership.get("transport") == "owned" and ownership.get("usb") == "service" and ownership.get("router") == "running")
-    # Report Z motion readiness from its stable provider authority. Other axes
-    # continue to use the canonical analytics snapshot.
+    # Report X and Z motion status from their stable provider authorities. The
+    # cached analytics row remains available in ``axes`` but cannot replace a
+    # bound provider's authority-bearing terminal projection.
+    cached_x_axis = next((row for row in axes if row.get("axis") == "x"), None)
     z_axis = next((row for row in axes if row.get("axis") == "z"), None)
-    provider_state = machine_state.get("serial206_initialization_provider") if isinstance(machine_state.get("serial206_initialization_provider"), Mapping) else {}
-    initialize_motors = provider_state.get("initialize_motors") if isinstance(provider_state, Mapping) else None
+    provider_state_value = machine_state.get("serial206_initialization_provider")
+    provider_state: Mapping[str, Any] = provider_state_value if isinstance(provider_state_value, Mapping) else {}
+    initialize_motors = provider_state.get("initialize_motors")
+    x_authority_value = provider_state.get("x_authority") if isinstance(provider_state, Mapping) else None
+    x_authority: Mapping[str, Any] = x_authority_value if isinstance(x_authority_value, Mapping) else {}
+    x_lifecycle_value = x_authority.get("lifecycle")
+    x_lifecycle: Mapping[str, Any] = x_lifecycle_value if isinstance(x_lifecycle_value, Mapping) else {}
+    x_live_value = x_authority.get("live_status")
+    x_live_status: Mapping[str, Any] = x_live_value if isinstance(x_live_value, Mapping) else {}
+    provider_x_available = bool(
+        provider_state.get("bound") is True
+        and x_authority.get("authority") == "Serial206OemInitializationProvider"
+    )
+    x_axis = (
+        {
+            "axis": "x",
+            "reference": x_lifecycle.get("reference_state") or "unknown",
+            "position_steps": x_live_status.get("position_steps"),
+            "speed_steps_s": x_live_status.get("speed_steps_s"),
+            "run_current": x_live_status.get("max_current"),
+            "standby_current": None,
+            "left_switch_state": x_live_status.get("left_switch_state"),
+            "right_switch_state": x_live_status.get("right_switch_state"),
+            "left_switch_raw_active": None,
+            "right_switch_raw_active": None,
+            "left_switch_active": None,
+            "right_switch_active": None,
+            "left_switch_disabled": x_live_status.get("left_switch_disabled"),
+            "right_switch_disabled": x_live_status.get("right_switch_disabled"),
+            "coordinate_contract": "serial206_x_source_0_90263_effective_min_60_relative_margin_20",
+            "min_steps": x_authority.get("source_min_steps"),
+            "max_steps": x_authority.get("source_max_steps"),
+            "motor_temperature_c": None,
+            "motor_temperature_available": False,
+            "telemetry_authority": x_live_status.get("authority"),
+            "physical_position_verified": False,
+        }
+        if provider_x_available
+        else cached_x_axis
+    )
+    x_provider = {
+        **x_authority,
+        "bound": provider_state.get("bound") is True,
+        "physical_position_verified": False,
+    }
     z_authority_value = provider_state.get("z_authority") if isinstance(provider_state, Mapping) else None
     z_authority: Mapping[str, Any] = z_authority_value if isinstance(z_authority_value, Mapping) else {}
     terminal_state = z_authority.get("terminal_state") if isinstance(z_authority.get("terminal_state"), Mapping) else {}
@@ -786,6 +966,15 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
             "latch_closed": (latch.get("latch_sensor") == 1) if isinstance(latch, Mapping) else None,
         },
         "axes": axes,
+        "x_axis": {
+            "status": x_axis,
+            "provider": x_provider,
+            "snapshot_freshness": dict(freshness),
+            "last_failure": x_lifecycle.get("last_failure"),
+            "latest_receipt": x_lifecycle.get("latest_receipt"),
+            "authority": "Serial206OemInitializationProvider" if provider_x_available else "unbound",
+            "physical_position_verified": False,
+        },
         "z_axis": {
             "status": z_axis,
             "provider": z_provider,
@@ -869,6 +1058,21 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/manual/relative": "initialize_motors",
     "/motion/oem/manual/absolute": "initialize_motors",
     "/motion/oem/manual/home": "initialize_motors",
+    "/motion/oem/x/status": "initialize_motors",
+    "/motion/oem/x/prepare": "initialize_motors",
+    "/motion/oem/x/reconcile_switch_masks": "initialize_motors",
+    "/motion/oem/x/move_steps": "initialize_motors",
+    "/motion/oem/x/move_absolute": "initialize_motors",
+    "/motion/oem/x/manual_home": "initialize_motors",
+    "/motion/oem/x/diagnostic_home_axis": "initialize_motors",
+    "/motion/oem/x/set_home": "initialize_motors",
+    "/motion/oem/x/set_max_speed": "initialize_motors",
+    "/motion/oem/x/set_max_acc": "initialize_motors",
+    "/motion/oem/x/restore_original_speed": "initialize_motors",
+    "/motion/oem/x/set_stall_guard": "initialize_motors",
+    "/motion/oem/x/stop": "initialize_motors",
+    "/motion/oem/x/abort": "initialize_motors",
+    "/motion/oem/x/observation": "initialize_motors",
     "/motion/oem/z/prepare": "initialize_motors",
     "/motion/oem/z/move_z_home": "initialize_motors",
     "/motion/oem/z/control": "initialize_motors",
@@ -969,12 +1173,14 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             return
         fixed = dict(fixed_inputs or {})
         visible_inputs = [dict(row) for row in provider.get("inputs", []) if row.get("name") not in fixed]
-        z_bounds = {
+        action_bounds = {
             "oem.z.move_steps": ("steps", -160000, 160000),
             "oem.z.move_absolute": ("position_steps", 0, 160000),
+            "oem.x.move_steps": ("steps", -90243, 90243),
+            "oem.x.move_absolute": ("position_steps", 0, 90263),
         }.get(action_id)
-        if z_bounds is not None:
-            input_name, minimum, maximum = z_bounds
+        if action_bounds is not None:
+            input_name, minimum, maximum = action_bounds
             for row in visible_inputs:
                 if row.get("name") == input_name:
                     row.update(
@@ -994,8 +1200,16 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": action_id in {
                 "oem.z.reconcile_switch_masks",
                 "oem.z.set_home",
+                "oem.x.reconcile_switch_masks",
+                "oem.x.set_home",
             },
-            "category": "z-axis",
+            "category": (
+                "x-axis"
+                if action_id.startswith("oem.x.")
+                else "x-composite"
+                if action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.")
+                else "z-axis"
+            ),
             "inputs": visible_inputs,
             "required_provider_capability": required_provider_capability,
         }
@@ -1005,6 +1219,49 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "fixed_inputs": fixed,
             "inputs": {row["name"] for row in visible_inputs},
         }
+
+    x_semantic_actions = (
+        ("oem.x.status", "/motion/oem/x/status", "X axis authority status", "Provider-owned X lifecycle, terminal telemetry, reconciliation state, and durable receipt projection.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
+        ("oem.x.prepare", "/motion/oem/x/prepare", "Prepare OEM X profile", "Run the exact X no-motion profile and verify the Serial-206 machine tuple without movement.", "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195"),
+        ("oem.x.reconcile_switch_masks", "/motion/oem/x/reconcile_switch_masks", "Reconcile Serial-206 X switch masks", "Apply the explicit Serial-206 machine adaptation SAP12=1 and verify GAP12=1/GAP13=0; invalidates X preparation/reference.", "Serial-206 D1 machine safety adaptation"),
+        ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Source-shaped relative X movement with the provider-owned 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
+        ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Source-shaped absolute X movement in 0..90263 with effective minimum 60 and optional temporary acceleration.", "ClassControlInterface.moveX:4206-4243"),
+        ("oem.x.manual_panel_home", "/motion/oem/x/manual_home", "OEM X manual panel Home", "Exact manual-panel goHome(rehome=true, speed=500) identity.", "ClassControlInterface manual panel Home:2270-2278"),
+        ("oem.x.diagnostic_home_axis", "/motion/oem/x/diagnostic_home_axis", "Diagnostic X HomeAxis", "Exact diagnostic axisSearchHome(X,250) identity; not the manual Home action.", "ClassControlInterface.HomeAxis:4997-5008"),
+        ("oem.x.startup_home", "/motion/oem/x/startup_home", "OEM X startup home", "Exact startup axisSearchHome(X,250), setHome, profile restore, and park sequence.", "ClassControlInterface.initializeMotors:3203-3220"),
+        ("oem.x.move_to_origin_home", "/motion/oem/x/move_to_origin_home", "OEM X moveTo-origin home", "Exact all-zero moveTo X child goHome(rehome=true, speed=1700).", "ClassControlInterface.moveTo:4463-4506"),
+        ("oem.x.caught_plate_recovery_home", "/motion/oem/x/caught_plate_recovery_home", "OEM X caught-plate recovery home", "Exact caught-plate recovery X child goHome(rehome=false, speed=1700).", "ClassControlInterface.homeGZ:4657-4687"),
+        ("oem.x.set_home", "/motion/oem/x/set_home", "Set OEM X home at current position", "Recovery-only no-motion SAP1=0 with direct readback and observation-gated reference publication.", "ClassMotor.setHome"),
+        ("oem.x.set_max_speed", "/motion/oem/x/set_max_speed", "OEM X setMaxSpeed", "Set X maximum speed; input zero selects source default 1700.", "ClassControlInterface.setMaxSpeed:4689-4703"),
+        ("oem.x.set_max_acc", "/motion/oem/x/set_max_acc", "OEM X setMaxAcc", "Set X maximum acceleration; input zero selects source default 350.", "ClassControlInterface.setMaxAcc:4729-4743"),
+        ("oem.x.restore_original_speed", "/motion/oem/x/restore_original_speed", "OEM X restoreOriginalSpeed", "Restore X speed parameter 4 to source default 1700.", "ClassControlInterface.restoreOriginalSpeed:4769-4779"),
+        ("oem.x.set_stall_guard", "/motion/oem/x/set_stall_guard", "OEM X setStallGuard", "Set X stall guard; input zero selects source default 16.", "ClassControlInterface.setStallGuard:4869-4883"),
+        ("oem.x.stop", "/motion/oem/x/stop", "OEM X double-stop", "Interrupt-safe source double StopMotor with terminal zero-speed evidence.", "ClassMotor.StopMotor:161-183"),
+        ("oem.abort_all", "/motion/oem/x/abort", "Aggregate OEM abort (all boards)", "Invoke forceAbortMotion across all present OEM motion boards. This action has aggregate machine scope.", "ClassControlInterface.forceAbortMotion:5095-5106"),
+        ("oem.x.observe", "/motion/oem/x/observation", "Record physical X observation", "Bind an independent physical pass/fail observation to the exact provider command and ownership generation.", "Serial206OemInitializationProvider X observation contract"),
+        ("oem.xy.home_xy", "/motion/oem/home_xy", "OEM HomeXY", "Source-shaped concurrent X/Y home with signed source returns and provider-owned reference publication.", "ClassControlInterface.HomeXY:5054-5070"),
+        ("oem.xy.move_xy", "/motion/oem/move_xy", "OEM moveXY", "Source-shaped X/Y coordinated movement, including the literal missing-board fallbacks.", "ClassControlInterface.moveXY:4285-4367"),
+        ("oem.xyz.move_to", "/motion/oem/move_to", "OEM moveTo", "Provider-owned XYZ moveTo composite with X lifecycle and all-zero observation authority.", "ClassControlInterface.moveTo:4463-4506"),
+        ("oem.xy.enable", "/motion/oem/x/internal/enable_xy", "OEM enableXY current mode", "Provider-owned X/Y current transaction. Advanced catalog only; this is not a normal X-card action.", "ClassControlInterface.enableXY:5161-5194"),
+        ("oem.xyz.enable", "/motion/oem/x/internal/enable_xyz", "OEM enableXYZ current mode", "Provider-owned X/Y/Z current transaction. Advanced catalog only; this is not a normal X-card action.", "ClassControlInterface.enableXYZ:5113-5159"),
+    )
+    for action_id, path, label, description, source_anchor in x_semantic_actions:
+        add_semantic_alias(
+            action_id=action_id,
+            path=path,
+            label=label,
+            description=description,
+            source_anchor=source_anchor,
+            required_provider_capability="initialize_motors",
+        )
+    x_abort_action = next((row for row in actions if row.get("action_id") == "oem.abort_all"), None)
+    if x_abort_action is not None:
+        x_abort_action.update({
+            "aggregate_abort": True,
+            "physical_scope": "aggregate_oem_all_present_boards",
+            "x_only": False,
+            "category": "x-axis",
+        })
 
     add_semantic_alias(
         action_id="oem.z.prepare",
