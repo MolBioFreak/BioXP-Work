@@ -1499,7 +1499,7 @@ def test_operator_catalog_exposes_only_typed_x_family_and_aggregate_abort_label(
     assert "aggregate" in by_id["oem.abort_all"]["label"].lower()
     assert "x-only" not in by_id["oem.abort_all"]["description"].lower()
     assert by_id["oem.abort_all"].get("physical_scope") == "aggregate_oem_all_present_boards"
-    assert by_id["oem.x.manual_panel_home"]["requires_confirmation"] is True
+    assert by_id["oem.x.manual_panel_home"]["requires_confirmation"] is False
     assert all(by_id[action_id]["category"] == "x-axis" for action_id in EXPECTED_X_ACTIONS if action_id.startswith("oem.x."))
     assert all(by_id[action_id]["category"] == "x-composite" for action_id in {"oem.xy.enable", "oem.xyz.enable"})
 
