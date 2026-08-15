@@ -4333,6 +4333,71 @@ class Serial206OemInitializationProvider:
                 if callable(current_board_generation_fn)
                 else lifecycle.get("board_lifecycle_generation")
             )
+            automatic_prerequisites: list[dict[str, Any]] = []
+            if selected == "manual_panel_home" and prior_state == "unprepared":
+                prepare_fn = getattr(self.primitives, "prepare_x", None) or getattr(
+                    self.primitives, "prepare_for_initialize_motors"
+                )
+                try:
+                    preparation = prepare_fn(expected_generation=generation)
+                except Exception as exc:
+                    preparation = {
+                        "ok": False,
+                        "failure": f"x_automatic_prepare_exception:{type(exc).__name__}:{exc}",
+                    }
+                preparation = dict(preparation) if isinstance(preparation, Mapping) else {
+                    "ok": False,
+                    "failure": "x_automatic_prepare_result_not_mapping",
+                }
+                prepared_board_generation = (
+                    current_board_generation_fn()
+                    if callable(current_board_generation_fn)
+                    else preparation.get("board_lifecycle_generation")
+                )
+                prepare_ok = bool(
+                    preparation.get("ok") is True
+                    and preparation.get("physical_motion") is False
+                    and type(prepared_board_generation) is int
+                )
+                prerequisite = {
+                    "stage": "auto_prepare",
+                    "physical_motion_commanded": False,
+                    "result": _json_safe(preparation),
+                }
+                automatic_prerequisites.append(prerequisite)
+                if not prepare_ok:
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "generation": generation,
+                        "board_lifecycle_generation": None,
+                        "prepared_receipt": _json_safe(preparation),
+                        "reference_state": "unknown",
+                        "last_failure": _json_safe(preparation),
+                    })
+                    self._save_state(state)
+                    return {
+                        "ok": False,
+                        "axis": "x",
+                        "intent": selected,
+                        "state": lifecycle["state"],
+                        "failure": "x_automatic_prerequisite_failed",
+                        "failed_stage": "auto_prepare",
+                        "requested_motion_dispatched": False,
+                        "automatic_prerequisites": automatic_prerequisites,
+                        "generation": generation,
+                    }
+                lifecycle.update({
+                    "state": "prepared_unreferenced",
+                    "generation": generation,
+                    "board_lifecycle_generation": prepared_board_generation,
+                    "prepared_receipt": _json_safe(preparation),
+                    "reference_state": "desynced",
+                    "last_failure": None,
+                })
+                self._save_state(state)
+                prior_state = "prepared_unreferenced"
+                prior_reference_state = "desynced"
+                current_board_generation = prepared_board_generation
             if selected == "observe_home":
                 expected_receipt = lifecycle.get("awaiting_observation_receipt_id")
                 observed_receipt = values.get("receipt_id")
@@ -4496,6 +4561,8 @@ class Serial206OemInitializationProvider:
                 except Exception as exc:
                     result = {"ok": False, "failure": f"x_intent_exception:{type(exc).__name__}:{exc}", "command_issued": False}
             result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_result_not_mapping"}
+            if automatic_prerequisites:
+                result["automatic_prerequisites"] = automatic_prerequisites
             if selected in home_intents and not (
                 result.get("home_predicate_confirmed") is True
                 and result.get("controller_terminal_state_verified") is True

@@ -644,6 +644,57 @@ def execute_x_intent(provider, intent, values=None):
     return Serial206OemInitializationProvider.execute_x_intent(provider, intent, bound_values)
 
 
+def test_manual_panel_home_automatically_prepares_unprepared_x_without_motion():
+    primitives = ProviderPrimitives()
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+
+    result = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-auto-prepare"})
+
+    assert result["ok"] is True
+    assert [name for name, _inputs in primitives.calls] == ["prepare", "manual_panel_home"]
+    assert result["result"]["automatic_prerequisites"][0]["stage"] == "auto_prepare"
+    assert result["result"]["automatic_prerequisites"][0]["physical_motion_commanded"] is False
+    assert provider.x_projection()["lifecycle"]["state"] == "awaiting_operator_observation"
+
+
+def test_manual_panel_home_admission_stays_open_while_x_is_automatically_preparable():
+    from bioxp import operator_controls
+
+    action = {
+        "action_id": "oem.x.manual_panel_home",
+        "provider_available": True,
+        "required_provider_capability": "initialize_motors",
+        "informational_method": "POST",
+        "informational_path": "/motion/oem/x/manual_home",
+        "safety_class": "motion",
+    }
+    machine_state = {
+        "lifecycle": {"operation_state": "idle"},
+        "ownership": {
+            "transport": "owned",
+            "usb": "service",
+            "router": "running",
+            "CAN_READY": True,
+        },
+        "maintenance": {"motion_blocked": False, "recovery_required": False},
+        "serial206_initialization_provider": {
+            "bound": True,
+            "initialize_motors_live_available": True,
+            "x_authority": {
+                "lifecycle": {
+                    "state": "unprepared",
+                    "board_lifecycle_generation_fresh": False,
+                },
+            },
+        },
+    }
+
+    assessment = operator_controls._assess_action(action, machine_state, {})
+
+    assert assessment["enabled"] is True
+    assert assessment["disabled_reason"] is None
+
+
 def test_x_projection_preserves_complete_typed_terminal_status_without_omission_markers():
     class RichTerminalStatus(ProviderPrimitives):
         def x_terminal_status(self):

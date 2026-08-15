@@ -280,6 +280,10 @@ _X_NO_MOTION_STATE_ACTIONS = frozenset({
     "oem.xyz.enable",
 })
 
+_X_AUTO_PREREQUISITE_ACTIONS = frozenset({
+    "oem.x.manual_panel_home",
+})
+
 _Z_AUTO_PREREQUISITE_ACTIONS = frozenset({
     "oem.z.manual_home",
     "oem.z.diagnostic_home_axis",
@@ -535,7 +539,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         allowed_by_action = {
             "oem.x.prepare": {"unprepared", "failed_latched", "reconciliation_required"},
             "oem.x.reconcile_switch_masks": {"unprepared", "failed_latched", "reconciliation_required"},
-            "oem.x.manual_panel_home": {"prepared_unreferenced", "referenced_ready"},
+            "oem.x.manual_panel_home": {"unprepared", "prepared_unreferenced", "referenced_ready"},
             "oem.x.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.startup_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.move_to_origin_home": {"prepared_unreferenced", "referenced_ready"},
@@ -648,6 +652,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         required_axes = [] if source_initializer or z_state_establishing or x_state_establishing else _required_reference_axes(action, values)
         if x_state_establishing:
+            readiness = {"dependencies": []}
+        elif action_id in _X_AUTO_PREREQUISITE_ACTIONS:
+            # Manual X Home composes the source-backed no-motion preparation
+            # inside the provider transaction. Cached lifecycle and board
+            # freshness must not pre-disable the operator's requested Home.
             readiness = {"dependencies": []}
         elif provider_owned_x_motion:
             readiness = _provider_x_motion_readiness(machine_state)
