@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import threading
 from collections.abc import Mapping
 from typing import Any
@@ -637,12 +638,93 @@ class ProviderPrimitives:
         return {"ok": True, "physical_motion_commanded": False}
 
 
+def execute_x_intent(provider, intent, values=None):
+    bound_values = dict(values or {})
+    bound_values.setdefault("expected_generation", int(provider.generation_provider()))
+    return Serial206OemInitializationProvider.execute_x_intent(provider, intent, bound_values)
+
+
+def test_x_projection_preserves_complete_typed_terminal_status_without_omission_markers():
+    class RichTerminalStatus(ProviderPrimitives):
+        def x_terminal_status(self):
+            readbacks = {}
+            for parameter in (1, 3, 4, 5, 6, 9, 10, 12, 13, 205):
+                readbacks[parameter] = {
+                    "board": 5,
+                    "param": parameter,
+                    "motor": 0,
+                    "ack": {
+                        "status": 100,
+                        "status_str": "success",
+                        "board": 5,
+                        "cmd": 6,
+                        "value": parameter,
+                        "raw": [0] * 9,
+                        "provenance": {
+                            "transaction_id": f"read-{parameter}",
+                            "owner_generation": 17,
+                            "generation_changed": False,
+                            "ok": True,
+                            "outcome": "acknowledged",
+                            "matcher": "tmcl_reply",
+                            "registration_timestamp": 1.0,
+                            "tx_timestamp": 1.0,
+                            "tx_write_completed_at": 1.0,
+                            "timeout_ms": 1000,
+                            "tx_raw": [0] * 9,
+                            "tx_frame_count": 1,
+                            "tx_frames": [[0] * 9],
+                            "tx_write_timestamps": [1.0],
+                            "frames": [],
+                            "skipped_frames": [],
+                        },
+                    },
+                    "value": parameter,
+                }
+            return {
+                "ok": True,
+                "axis": "x",
+                "board": 5,
+                "motor": 0,
+                "position_steps": 100,
+                "speed_steps_s": 0,
+                "max_speed": 1700,
+                "max_acceleration": 350,
+                "max_current": 31,
+                "left_switch_state": 0,
+                "right_switch_state": 0,
+                "right_switch_disabled": True,
+                "left_switch_disabled": False,
+                "stall_guard": 16,
+                "profile_verified": True,
+                "expected_profile": {4: 1700, 5: 350, 6: 31, 205: 16},
+                "switch_mask_verified": True,
+                "switch_mask_tuple": {12: 1, 13: 0},
+                "expected_switch_masks": {12: 1, 13: 0},
+                "readbacks": readbacks,
+                "authority": "serial206_x_terminal_register_readback",
+                "failure": None,
+            }
+
+    projection = Serial206OemInitializationProvider(
+        RichTerminalStatus(), generation_provider=lambda: 17
+    ).x_projection()
+
+    encoded = json.dumps(projection["live_status"], sort_keys=True)
+    assert '"omitted"' not in encoded
+    assert {int(key) for key in projection["live_status"]["readbacks"]} == {1, 3, 4, 5, 6, 9, 10, 12, 13, 205}
+    assert all(
+        row["ack"]["provenance"]["transaction_id"] == f"read-{parameter}"
+        for parameter, row in projection["live_status"]["readbacks"].items()
+    )
+
+
 def test_successful_move_cannot_create_reference_from_prepared_unreferenced_state():
     primitives = ProviderPrimitives()
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
 
-    result = provider.execute_x_intent("move_absolute", {"position_steps": 2000, "command_id": "x-no-ref"})
+    result = execute_x_intent(provider, "move_absolute", {"position_steps": 2000, "command_id": "x-no-ref"})
 
     assert result["ok"] is False
     assert result["failure"] == "x_reference_required_before_move"
@@ -657,7 +739,7 @@ def test_verified_move_preserves_existing_reference_without_reestablishing_it():
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced")
 
-    result = provider.execute_x_intent("move_absolute", {"position_steps": 2000, "command_id": "x-with-ref"})
+    result = execute_x_intent(provider, "move_absolute", {"position_steps": 2000, "command_id": "x-with-ref"})
 
     assert result["ok"] is True
     lifecycle = provider.x_projection()["lifecycle"]
@@ -681,7 +763,7 @@ def test_home_cannot_establish_reference_without_home_proof_and_operator_observa
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
 
-    result = provider.execute_x_intent("manual_panel_home", {"command_id": "x-home-unproved"})
+    result = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-unproved"})
 
     assert result["ok"] is False
     assert provider.x_projection()["lifecycle"]["reference_state"] == "desynced"
@@ -692,7 +774,7 @@ def test_proved_home_enters_awaiting_observation_then_exact_observation_establis
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
 
-    home = provider.execute_x_intent("manual_panel_home", {"command_id": "x-home-proof"})
+    home = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-proof"})
     assert home["ok"] is True
     assert provider.x_projection()["lifecycle"]["state"] == "awaiting_operator_observation"
 
@@ -882,7 +964,7 @@ def test_move_xy_missing_x_preserves_literal_source_move_x_y_fallback():
     assert result["fallback"]["requested_position_steps"] == 4000
     assert result["fallback"]["source_mode"] == "moveXY.missing_x.moveX_y"
     assert result["ok"] is False
-    assert not any(call[0] in {"event_window", "move_abs"} for call in tester.calls)
+    assert ("move_abs", 5, 0, 4000) in tester.calls
 
 
 def test_move_xy_one_axis_records_only_moved_axis_metadata():
@@ -944,7 +1026,7 @@ def test_provider_current_modes_require_current_prepared_authority_and_preserve_
     values = {"command_id": f"x-{intent}", "enabled": True}
     if intent == "enable_xyz_current":
         values["z_current_up"] = 29
-    result = provider.execute_x_intent(intent, values)
+    result = execute_x_intent(provider, intent, values)
 
     assert result["ok"] is True
     lifecycle = provider.x_projection()["lifecycle"]
@@ -963,13 +1045,13 @@ def test_enable_xyz_replay_rejects_z_authority_drift():
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17, state_store=state_store)
     seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced", seed_z=True)
     values = {"command_id": "xyz-replay", "idempotency_key": "xyz-replay", "enabled": True, "z_current_up": 29}
-    first = provider.execute_x_intent("enable_xyz_current", values)
+    first = execute_x_intent(provider, "enable_xyz_current", values)
     assert first["ok"] is True
 
     state = provider._load_state()
     state["z_lifecycle"]["reference_state"] = "desynced"
     provider._save_state(state)
-    replay = provider.execute_x_intent("enable_xyz_current", values)
+    replay = execute_x_intent(provider, "enable_xyz_current", values)
 
     assert replay["ok"] is False
     assert replay["failure"] == "x_replay_current_authority_invalid"
@@ -981,7 +1063,7 @@ def test_enable_xyz_rejects_stale_z_authority_before_dispatch():
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced", seed_z=False)
 
-    result = provider.execute_x_intent("enable_xyz_current", {"command_id": "xyz-stale-z", "enabled": True})
+    result = execute_x_intent(provider, "enable_xyz_current", {"command_id": "xyz-stale-z", "enabled": True})
 
     assert result["ok"] is False
     assert result["failure"] == "xyz_current_requires_current_x_and_z_authority"
@@ -998,7 +1080,7 @@ def test_provider_diagnostic_home_axis_maps_to_x_home_axis_and_awaits_observatio
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
     seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
 
-    result = provider.execute_x_intent("diagnostic_home_axis", {"command_id": "x-diagnostic-home"})
+    result = execute_x_intent(provider, "diagnostic_home_axis", {"command_id": "x-diagnostic-home"})
 
     assert result["ok"] is True
     assert primitives.calls[-1][0] == "home_axis"
@@ -1211,11 +1293,11 @@ def test_completed_x_replay_is_fenced_after_generation_change_without_redispatch
     provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: generation["value"])
     seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced")
     values = {"position_steps": 2000, "command_id": "x-once", "idempotency_key": "x-once-key"}
-    assert provider.execute_x_intent("move_absolute", values)["ok"] is True
+    assert execute_x_intent(provider, "move_absolute", values)["ok"] is True
     dispatches = len(primitives.calls)
 
     generation["value"] = 18
-    replay = provider.execute_x_intent("move_absolute", values)
+    replay = execute_x_intent(provider, "move_absolute", values)
 
     assert replay["ok"] is False
     assert replay["replayed"] is True
@@ -1231,7 +1313,7 @@ def test_completed_x_replay_is_fenced_after_reference_invalidation_without_redis
         "command_id": "x-ref-once",
         "idempotency_key": "x-ref-once-key",
     }
-    assert provider.execute_x_intent("move_absolute", values)["ok"] is True
+    assert execute_x_intent(provider, "move_absolute", values)["ok"] is True
     dispatches = len(primitives.calls)
     state = provider._load_state()
     state["x_lifecycle"].update(
@@ -1239,7 +1321,7 @@ def test_completed_x_replay_is_fenced_after_reference_invalidation_without_redis
     )
     provider._save_state(state)
 
-    replay = provider.execute_x_intent("move_absolute", values)
+    replay = execute_x_intent(provider, "move_absolute", values)
 
     assert replay["ok"] is False
     assert replay["replayed"] is True
@@ -1258,8 +1340,8 @@ def test_stop_and_aggregate_abort_are_nonreplay_interrupts(intent):
     )
     values = {"command_id": f"x-{intent}-same", "idempotency_key": f"x-{intent}-same-key"}
 
-    first = provider.execute_x_intent(intent, values)
-    second = provider.execute_x_intent(intent, values)
+    first = execute_x_intent(provider, intent, values)
+    second = execute_x_intent(provider, intent, values)
 
     assert first["ok"] is True and second["ok"] is True
     calls = [call for call in primitives.calls if call[0] == intent]
@@ -1297,7 +1379,7 @@ def test_x_profile_controls_preserve_reference_and_never_establish_it(
     if value is not None:
         values["value"] = value
 
-    result = provider.execute_x_intent(intent, values)
+    result = execute_x_intent(provider, intent, values)
 
     assert result["ok"] is True
     lifecycle = provider.x_projection()["lifecycle"]

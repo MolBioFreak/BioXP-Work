@@ -222,15 +222,23 @@ _EVIDENCE_MAX_KEY = 96
 _EVIDENCE_MAX_BYTES = 8192
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(
+    value: Any,
+    *,
+    max_depth: int = _EVIDENCE_MAX_DEPTH,
+    max_items: int = _EVIDENCE_MAX_ITEMS,
+    max_string: int = _EVIDENCE_MAX_STRING,
+    max_key: int = _EVIDENCE_MAX_KEY,
+    max_bytes: int = _EVIDENCE_MAX_BYTES,
+) -> Any:
     """Return a deterministic, cycle-safe, strictly bounded JSON projection."""
-    remaining = [_EVIDENCE_MAX_ITEMS]
+    remaining = [max_items]
     active: set[int] = set()
 
     def omitted(reason: str, kind: str | None = None) -> dict[str, Any]:
         row: dict[str, Any] = {"omitted": reason}
         if kind:
-            row["type"] = kind[:_EVIDENCE_MAX_KEY]
+            row["type"] = kind[:max_key]
         return row
 
     def key_text(key: Any) -> str:
@@ -242,8 +250,8 @@ def _json_safe(value: Any) -> Any:
             text = str(key)
         else:
             text = f"<{type(key).__name__}>"
-        if len(text) > _EVIDENCE_MAX_KEY:
-            text = text[: _EVIDENCE_MAX_KEY - 14] + "...[truncated]"
+        if len(text) > max_key:
+            text = text[: max_key - 14] + "...[truncated]"
         return text
 
     def visit(item: Any, depth: int) -> Any:
@@ -255,14 +263,14 @@ def _json_safe(value: Any) -> Any:
         if type(item) is float:
             return item if math.isfinite(item) else omitted("non_finite_float")
         if type(item) is str:
-            if len(item) <= _EVIDENCE_MAX_STRING:
+            if len(item) <= max_string:
                 return item
             return {
                 "omitted": "string_limit",
-                "prefix": item[:_EVIDENCE_MAX_STRING],
+                "prefix": item[:max_string],
                 "original_length": len(item),
             }
-        if depth >= _EVIDENCE_MAX_DEPTH:
+        if depth >= max_depth:
             return omitted("depth_limit", type(item).__name__)
         if isinstance(item, (Mapping, list, tuple)):
             identity = id(item)
@@ -281,7 +289,7 @@ def _json_safe(value: Any) -> Any:
                             pairs.append(("<omitted>", omitted("item_limit")))
                             break
                         pairs.append((key_text(raw_key), raw_value))
-                        if len(pairs) >= _EVIDENCE_MAX_ITEMS:
+                        if len(pairs) >= max_items:
                             pairs.append(("<omitted>", omitted("mapping_width_limit")))
                             break
                     pairs.sort(key=lambda pair: pair[0])
@@ -296,7 +304,7 @@ def _json_safe(value: Any) -> Any:
                     return output
                 output_list = []
                 for index, raw_value in enumerate(item):
-                    if index >= _EVIDENCE_MAX_ITEMS or remaining[0] <= 0:
+                    if index >= max_items or remaining[0] <= 0:
                         output_list.append(omitted("sequence_width_limit"))
                         break
                     output_list.append(visit(raw_value, depth + 1))
@@ -313,8 +321,33 @@ def _json_safe(value: Any) -> Any:
         encoded = json.dumps(projected, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except Exception:
         return omitted("serialization_error", type(value).__name__)
-    if len(encoded) > _EVIDENCE_MAX_BYTES:
+    if len(encoded) > max_bytes:
         return {"omitted": "byte_limit", "encoded_bytes": len(encoded)}
+    return projected
+
+
+def _json_contract_safe(value: Any) -> Any:
+    """Project a typed API value without inserting omission markers into its fields."""
+    projected = _json_safe(
+        value,
+        max_depth=24,
+        max_items=32_768,
+        max_string=16_384,
+        max_key=256,
+        max_bytes=2_097_152,
+    )
+
+    def contains_omission(item: Any) -> bool:
+        if isinstance(item, Mapping):
+            if "omitted" in item:
+                return True
+            return any(contains_omission(entry) for entry in item.values())
+        if isinstance(item, list):
+            return any(contains_omission(entry) for entry in item)
+        return False
+
+    if contains_omission(projected):
+        raise ValueError("typed JSON contract cannot contain omission markers")
     return projected
 
 
@@ -4042,7 +4075,7 @@ class Serial206OemInitializationProvider:
                     live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
                 except Exception as exc:
                     live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
-                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_safe(live_status), "switch_masks": {"expected": dict(SERIAL206_X_SWITCH_MASKS), "verified": isinstance(live_status, Mapping) and live_status.get("switch_mask_verified") is True}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
+                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_contract_safe(live_status), "switch_masks": {"expected": dict(SERIAL206_X_SWITCH_MASKS), "verified": isinstance(live_status, Mapping) and live_status.get("switch_mask_verified") is True}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
