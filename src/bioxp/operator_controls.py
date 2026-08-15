@@ -1263,6 +1263,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             source_anchor=source_anchor,
             required_provider_capability="initialize_motors",
         )
+    x_home_action = next((row for row in actions if row.get("action_id") == "oem.x.manual_panel_home"), None)
+    if x_home_action is not None:
+        x_home_action["requires_confirmation"] = True
     x_abort_action = next((row for row in actions if row.get("action_id") == "oem.abort_all"), None)
     if x_abort_action is not None:
         x_abort_action.update({
