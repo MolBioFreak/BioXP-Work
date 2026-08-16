@@ -84,7 +84,7 @@ class PipetteTransport(Protocol):
 
     def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]: ...
 
-    def set_top_speed(self, velocity: int, channels: list[int] | None = None) -> dict[str, Any]: ...
+    def set_top_speed(self, velocity: float, channels: list[int] | None = None) -> dict[str, Any]: ...
 
     def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]: ...
 
@@ -162,7 +162,13 @@ class CanPipetteTransport:
 
     def _status_payload(self, **extra: Any) -> dict[str, Any]:
         ok = bool(extra.pop("ok", True))
+        delivery_verified = bool(extra.pop("delivery_verified", False))
         controller_acknowledged = extra.pop("controller_acknowledged", None)
+        completion_verified = bool(extra.pop("completion_verified", False))
+        hardware_precondition_verified = bool(extra.pop("hardware_precondition_verified", False))
+        hardware_postcondition_verified = bool(extra.pop("hardware_postcondition_verified", False))
+        state_reconciled = bool(extra.pop("state_reconciled", False))
+        state_reconciliation_source = extra.pop("state_reconciliation_source", None)
         physical_effect_verified = bool(extra.pop("physical_effect_verified", False))
         raw_message_state = getattr(self._driver, "_pipette_message_state", {}) if self._driver is not None else {}
         message_state = dict(raw_message_state) if isinstance(raw_message_state, Mapping) else {}
@@ -194,11 +200,13 @@ class CanPipetteTransport:
             "hardware_pressure": self._last_pressure,
             "hardware_truth_level": "software_shadow",
             "ack_required": True,
+            "delivery_verified": delivery_verified,
             "controller_acknowledged": controller_acknowledged,
-            "hardware_postcondition_verified": bool(
-                isinstance(self._last_tip_status, dict)
-                and self._last_tip_status.get("hardware_truth_level") == "hardware_query"
-            ),
+            "completion_verified": completion_verified,
+            "hardware_precondition_verified": hardware_precondition_verified,
+            "hardware_postcondition_verified": hardware_postcondition_verified,
+            "state_reconciled": state_reconciled,
+            "state_reconciliation_source": state_reconciliation_source,
             "physical_effect_verified": physical_effect_verified,
             "response_timeout_s": self._response_timeout_s,
             "liquid_level_ul": self._liquid_level_ul,
@@ -207,6 +215,82 @@ class CanPipetteTransport:
         }
         payload.update(extra)
         return payload
+
+    @staticmethod
+    def _driver_evidence(result: Mapping[str, Any]) -> dict[str, bool]:
+        delivery = result.get("delivery_verified")
+        if not isinstance(delivery, bool):
+            delivery = bool(result.get("tx_ok", False))
+
+        controller = result.get("controller_acknowledged")
+        if not isinstance(controller, bool):
+            ack_result = result.get("ack")
+            ack = ack_result if isinstance(ack_result, Mapping) else {}
+            controller = bool(ack.get("ok") and ack.get("received"))
+
+        completion = result.get("completion_verified")
+        if not isinstance(completion, bool):
+            provenance_result = result.get("provenance")
+            provenance = provenance_result if isinstance(provenance_result, Mapping) else {}
+            completion = bool(provenance.get("completion_received", False))
+            if not completion:
+                completion = bool(
+                    result.get("ok") is True
+                    and result.get("outcome") in {"completion", "initialized"}
+                )
+
+        return {
+            "delivery_verified": bool(delivery),
+            "controller_acknowledged": bool(controller),
+            "completion_verified": bool(completion),
+        }
+
+    def apply_completed_effect(self, command: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply deterministic host accounting only after correlated completion."""
+        operation = str(command).replace(" ", "_")
+        volume = float(result.get("volume_ul", 0.0) or 0.0)
+        if operation == "aspirate":
+            self._liquid_level_ul += volume
+        elif operation == "dispense":
+            dispense_type = int(result.get("dispense_type", 0) or 0)
+            if dispense_type == 0:
+                self._liquid_level_ul = max(0.0, self._liquid_level_ul - volume)
+            elif dispense_type == 1:
+                self._front_air_level_ul = max(0.0, self._front_air_level_ul - volume)
+            else:
+                self._rear_air_level_ul -= volume
+        elif operation == "mix":
+            self._liquid_level_ul += volume
+        elif operation == "dispense_all":
+            self._liquid_level_ul = 0.0
+            self._front_air_level_ul = 0.0
+            self._rear_air_level_ul = 0.0
+        elif operation == "aspirate_air":
+            if bool(result.get("front_air", True)):
+                self._front_air_level_ul += volume
+            else:
+                self._rear_air_level_ul += volume
+        elif operation == "dispense_air":
+            dispense_type = int(result.get("dispense_type", 0) or 0)
+            if dispense_type == 0:
+                self._liquid_level_ul -= volume
+                if self._liquid_level_ul < 0.0:
+                    self._rear_air_level_ul += self._liquid_level_ul
+                    self._liquid_level_ul = 0.0
+            elif dispense_type == 1:
+                self._front_air_level_ul -= volume
+                if self._front_air_level_ul < 0.0:
+                    self._liquid_level_ul += self._front_air_level_ul
+                    self._front_air_level_ul = 0.0
+            else:
+                self._rear_air_level_ul -= volume
+        return {
+            "state_reconciled": True,
+            "state_reconciliation_source": "correlated_controller_completion_accounting",
+            "liquid_level_ul": self._liquid_level_ul,
+            "front_air_level_ul": self._front_air_level_ul,
+            "rear_air_level_ul": self._rear_air_level_ul,
+        }
 
     def _require_initialized(self) -> None:
         if not self._initialized:
@@ -339,7 +423,7 @@ class CanPipetteTransport:
             command="initialize",
             driver_result=init_result,
             requested=command.to_payload(),
-            controller_acknowledged=bool(init_result.get("ok")),
+            **self._driver_evidence(init_result),
             physical_effect_verified=False,
             hardware_truth_level="acknowledged_command",
         )
@@ -380,7 +464,7 @@ class CanPipetteTransport:
             action=command.action.value,
             requested=command.to_payload(),
             driver_result=driver_result,
-            controller_acknowledged=bool(driver_result.get("ok")),
+            **self._driver_evidence(driver_result),
             hardware_postcondition_verified=bool(
                 isinstance(self._last_tip_status, dict)
                 and self._last_tip_status.get("hardware_truth_level") == "hardware_query"
@@ -404,14 +488,23 @@ class CanPipetteTransport:
         )
         self._pressure_profile = command.pressure_profile
         self._last_command = "aspirate"
-        self._liquid_level_ul += float(command.volume_ul)
+        evidence = self._driver_evidence(driver_result)
+        state = (
+            self.apply_completed_effect("aspirate", {"volume_ul": float(command.volume_ul)})
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         return self._status_payload(
             command="aspirate",
             requested=command.to_payload(),
             volume_ul=float(command.volume_ul),
             driver_result=driver_result,
-            controller_acknowledged=bool(driver_result.get("ok")),
-            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            **evidence,
+            hardware_precondition_verified=bool(
+                tip_status and tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
@@ -434,7 +527,15 @@ class CanPipetteTransport:
         )
         self._pressure_profile = command.pressure_profile
         self._last_command = "dispense"
-        self._liquid_level_ul = max(0.0, self._liquid_level_ul - float(command.volume_ul))
+        evidence = self._driver_evidence(driver_result)
+        state = (
+            self.apply_completed_effect(
+                "dispense",
+                {"volume_ul": float(command.volume_ul), "dispense_type": dispense_type},
+            )
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         return self._status_payload(
             command="dispense",
             requested=command.to_payload(),
@@ -442,8 +543,12 @@ class CanPipetteTransport:
             blow_out=bool(command.blow_out),
             dispense_type=dispense_type,
             driver_result=driver_result,
-            controller_acknowledged=bool(driver_result.get("ok")),
-            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            **evidence,
+            hardware_precondition_verified=bool(
+                tip_status and tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
@@ -465,9 +570,12 @@ class CanPipetteTransport:
         )
         self._pressure_profile = command.pressure_profile
         self._last_command = "mix"
-        # OEM Mix ends with an aspirate and therefore leaves one volume in the
-        # channel; intermediate P/D pairs net to zero local fluid change.
-        self._liquid_level_ul += float(command.volume_ul)
+        evidence = self._driver_evidence(driver_result)
+        state = (
+            self.apply_completed_effect("mix", {"volume_ul": float(command.volume_ul)})
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         cycle_results = driver_result.get("cycles", [])
         return self._status_payload(
             command="mix",
@@ -476,8 +584,12 @@ class CanPipetteTransport:
             volume_ul=float(command.volume_ul),
             cycle_results=cycle_results,
             driver_result=driver_result,
-            controller_acknowledged=bool(driver_result.get("ok")),
-            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            **evidence,
+            hardware_precondition_verified=bool(
+                tip_status and tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
@@ -489,17 +601,24 @@ class CanPipetteTransport:
         tip_status = self._require_tip_loaded(driver)
         result = self._assert_driver_result("dispense_all", driver.dispense_all(wait_for_completion=wait_for_completion))
         previous_level = self._liquid_level_ul
-        self._liquid_level_ul = 0.0
-        self._front_air_level_ul = 0.0
-        self._rear_air_level_ul = 0.0
+        evidence = self._driver_evidence(result)
+        state = (
+            self.apply_completed_effect("dispense_all", {})
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         self._last_command = "dispense_all"
         return self._status_payload(
             command="dispense_all",
             previous_liquid_level_ul=previous_level,
             requested_wire_command="A0R",
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
-            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            **evidence,
+            hardware_precondition_verified=bool(
+                tip_status and tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
@@ -513,17 +632,24 @@ class CanPipetteTransport:
             driver.aspirate_air(float(volume_ul), air_type=int(air_type), wait_for_completion=wait_for_completion),
         )
         volume = float(volume_ul)
-        if bool(front_air):
-            self._front_air_level_ul += volume
-        else:
-            self._rear_air_level_ul += volume
+        evidence = self._driver_evidence(result)
+        state = (
+            self.apply_completed_effect(
+                "aspirate_air",
+                {"volume_ul": volume, "front_air": bool(front_air)},
+            )
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         self._last_command = "aspirate_air"
         return self._status_payload(
             command="aspirate_air",
             volume_ul=float(volume_ul),
+            front_air=bool(front_air),
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
+            **evidence,
             hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=None,
             hardware_truth_level="controller_acknowledged",
@@ -541,26 +667,27 @@ class CanPipetteTransport:
             driver.dispense_air(float(volume_ul), dispense_type=selected_type, wait_for_completion=wait_for_completion),
         )
         volume = float(volume_ul)
-        if selected_type == 0:
-            self._liquid_level_ul -= volume
-            if self._liquid_level_ul < 0.0:
-                self._rear_air_level_ul += self._liquid_level_ul
-                self._liquid_level_ul = 0.0
-        elif selected_type == 1:
-            self._front_air_level_ul -= volume
-            if self._front_air_level_ul < 0.0:
-                self._liquid_level_ul += self._front_air_level_ul
-                self._front_air_level_ul = 0.0
-        else:
-            self._rear_air_level_ul -= volume
+        evidence = self._driver_evidence(result)
+        state = (
+            self.apply_completed_effect(
+                "dispense_air",
+                {"volume_ul": volume, "dispense_type": selected_type},
+            )
+            if evidence["completion_verified"]
+            else {"state_reconciled": False, "state_reconciliation_source": None}
+        )
         self._last_command = "dispense_air"
         return self._status_payload(
             command="dispense_air",
             volume_ul=float(volume_ul),
             dispense_type=selected_type,
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
-            hardware_postcondition_verified=bool(tip_status and tip_status.get("hardware_truth_level") == "hardware_query"),
+            **evidence,
+            hardware_precondition_verified=bool(
+                tip_status and tip_status.get("hardware_truth_level") == "hardware_query"
+            ),
+            hardware_postcondition_verified=False,
+            **state,
             physical_effect_verified=False,
             hardware_tip_status=tip_status,
             hardware_truth_level="acknowledged_command_with_tip_readback",
@@ -587,14 +714,14 @@ class CanPipetteTransport:
             command="terminate",
             driver_result=result,
             initialized=False,
-            controller_acknowledged=bool(result.get("ok")),
+            **self._driver_evidence(result),
             physical_effect_verified=False,
             hardware_truth_level="controller_acknowledged",
         )
 
-    def set_top_speed(self, velocity: int) -> dict[str, Any]:
+    def set_top_speed(self, velocity: float) -> dict[str, Any]:
         driver = self._get_driver()
-        value = int(velocity)
+        value = float(velocity)
         result = self._assert_driver_result("set_top_speed", driver.set_top_speed(value))
         self._top_speed = float(value)
         self._last_command = "set_top_speed"
@@ -603,7 +730,7 @@ class CanPipetteTransport:
             requested={"velocity": value},
             effective={"velocity": value},
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
+            **self._driver_evidence(result),
             physical_effect_verified=False,
             hardware_truth_level="controller_acknowledged",
         )
@@ -616,7 +743,7 @@ class CanPipetteTransport:
             command=self._last_command,
             requested=command.to_payload(),
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
+            **self._driver_evidence(result),
             physical_effect_verified=False,
             hardware_truth_level="controller_acknowledged",
         )
@@ -647,6 +774,27 @@ class CanPipetteTransport:
         self._last_transaction = result
         return {"ok": bool(isinstance(result, dict) and result.get("ok")), "query": str(query), "result": result, "hardware_truth_level": "hardware_query"}
 
+    def get_all_data(self, queries: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        driver = self._get_driver()
+        wake = None
+        if not self._initialized:
+            wake_byte = 0x20 | int(self._pipette_id)
+            wake = driver._send_packet(
+                0x080,
+                [wake_byte, wake_byte],
+                command_name="pipette_wake_address",
+            )
+        results = [driver.get_data(query, wake_if_needed=False) for query in queries]
+        self._last_transaction = {"wake": wake, "results": results}
+        return {
+            "ok": all(isinstance(result, dict) and result.get("ok") is True for result in results),
+            "wake": wake,
+            "queries": list(queries),
+            "results": results,
+            "wake_count": 1 if wake is not None else 0,
+            "oem_source_anchor": "ClassPipette.getData:211-261",
+        }
+
     def start_fluid_detection(self, *, wait_for_completion: bool = True) -> dict[str, Any]:
         result = self._assert_driver_result(
             "start_fluid_detection",
@@ -656,7 +804,7 @@ class CanPipetteTransport:
         return self._status_payload(
             command="start_fluid_detection",
             driver_result=result,
-            controller_acknowledged=bool(result.get("ok")),
+            **self._driver_evidence(result),
             physical_effect_verified=False,
             hardware_truth_level="controller_acknowledged",
         )
@@ -675,6 +823,10 @@ class FourPipetteTransport:
     """Production ClassPipetteCollection-shaped owner for channels 0..3."""
 
     CHANNELS = (0, 1, 2, 3)
+    OEM_DATA_QUERIES = (
+        "?40", "?41", "?42", "?44", "?45", "?47",
+        "?51", "?52", "?53", "?54", "?55", "?58", "?59",
+    )
 
     def __init__(
         self,
@@ -963,6 +1115,13 @@ class FourPipetteTransport:
             raise ValueError("channels must not contain duplicates")
         return selected
 
+    def _cached_tip_channels(
+        self,
+        channels: list[int] | tuple[int, ...] | None = None,
+    ) -> list[int]:
+        selected = self._selected_channels(channels)
+        return [channel for channel in selected if self._transports[channel]._tip_loaded is True]
+
     def reinitialize_pipette(self) -> dict[str, Any]:
         """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait."""
         with self._transaction_lock:
@@ -1020,7 +1179,7 @@ class FourPipetteTransport:
         return self.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
 
     def read_pressure(self, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._selected_channels(channels)
+        selected = self._cached_tip_channels(channels)
         rows = [{"channel": channel, "result": self._transports[channel].query_pressure()} for channel in selected]
         return {
             "ok": all(row["result"].get("ok") is True for row in rows),
@@ -1030,16 +1189,26 @@ class FourPipetteTransport:
             "oem_source_anchor": "ClassPipetteCollection.readPressure:248-258; ClassPipette.QueryPressure:622-628",
         }
 
-    def set_top_speed(self, velocity: int, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._selected_channels(channels)
+    def set_top_speed(self, velocity: float, channels: list[int] | None = None) -> dict[str, Any]:
+        value = float(velocity)
+        if float(self._transports[0]._top_speed) == value:
+            return {
+                "ok": True,
+                "outcome": "unchanged_channel_zero_speed",
+                "velocity": value,
+                "channels": [],
+                "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed:756-758",
+            }
+        selected = self._cached_tip_channels(channels)
         with self._transaction_lock:
             rows = []
             for channel in selected:
-                result = self._transports[channel].set_top_speed(int(velocity))
+                result = self._transports[channel].set_top_speed(value)
                 rows.append({"channel": channel, "result": result})
+                self._sleep(0.010)
             return {
                 "ok": all(row["result"].get("ok") for row in rows),
-                "velocity": int(velocity),
+                "velocity": value,
                 "channels": rows,
                 "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed",
             }
@@ -1055,7 +1224,7 @@ class FourPipetteTransport:
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1"}
 
     def execute_diagnoses(self, command: PipetteDiagnosticCommand, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._selected_channels(channels)
+        selected = self._cached_tip_channels(channels)
         with self._transaction_lock:
             rows: list[dict[str, Any]] = []
             for position, channel in enumerate(selected):
@@ -1085,10 +1254,33 @@ class FourPipetteTransport:
                 "oem_source_anchor": "ClassPipetteCollection.diagnoses:261-283",
             }
 
-    def get_data(self, query: str, channels: list[int] | None = None) -> dict[str, Any]:
+    def get_data(self, query: str | None = None, channels: list[int] | None = None) -> dict[str, Any]:
         selected = self._selected_channels(channels)
-        rows = [{"channel": channel, "result": self._transports[channel].get_data(query)} for channel in selected]
-        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": str(query)}
+        queries = [str(query)] if query is not None else list(self.OEM_DATA_QUERIES)
+        rows: list[dict[str, Any]] = []
+        for channel in selected:
+            transport = self._transports[channel]
+            aggregate = None
+            get_all = getattr(transport, "get_all_data", None)
+            if query is None and callable(get_all):
+                aggregate_result = get_all(queries)
+                aggregate = aggregate_result if isinstance(aggregate_result, Mapping) else None
+                results = list(aggregate.get("results", [])) if aggregate is not None else []
+            else:
+                results = [transport.get_data(item) for item in queries]
+            rows.append({"channel": channel, "results": results, "aggregate": aggregate})
+        return {
+            "ok": all(
+                result.get("ok") is True
+                for row in rows
+                for result in row["results"]
+            ),
+            "channels": rows,
+            "query": None if query is None else str(query),
+            "queries": queries,
+            "aggregate_oem_sweep": query is None,
+            "oem_source_anchor": "ClassPipette.getData:211-261",
+        }
 
     def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
         with self._transaction_lock:
@@ -1112,7 +1304,11 @@ class FourPipetteTransport:
 
     def _channels_from_metadata(self, metadata: Mapping[str, Any] | None) -> list[int]:
         raw = metadata.get("channels") if isinstance(metadata, Mapping) else None
-        return self._selected_channels(None if raw is None else list(raw))
+        if raw is not None:
+            return self._selected_channels(list(raw))
+        if self._tip_location == -1:
+            return list(self.CHANNELS)
+        return self._selected_channels([self._tip_location])
 
     def _require_liquid_mutation(self, operation: str) -> None:
         if not self._liquid_mutation_enabled:
@@ -1158,6 +1354,14 @@ class FourPipetteTransport:
                     completion = self._transports[channel].wait_for_completion(remaining)
                     row["completion"] = completion
                     completion_rows.append({"channel": channel, "result": completion})
+                    if isinstance(completion, Mapping) and completion.get("ok") is True:
+                        state = self._transports[channel].apply_completed_effect(operation, row["result"])
+                        row["result"].update(state)
+                        row["result"]["controller_acknowledged"] = True
+                        row["result"]["completion_verified"] = True
+                    else:
+                        row["result"]["state_reconciled"] = False
+                        row["result"]["state_reconciliation_source"] = None
 
             ok = all(
                 row["result"].get("ok") is True
@@ -1172,6 +1376,19 @@ class FourPipetteTransport:
                 "timeout_ms": int(timeout_ms),
                 "allow_to_stop": self._allow_to_stop,
                 "liquid_mutation_enabled": self._liquid_mutation_enabled,
+                "delivery_verified": all(
+                    row["result"].get("delivery_verified") is True for row in rows
+                ),
+                "controller_acknowledged": all(
+                    row["result"].get("controller_acknowledged") is True for row in rows
+                ),
+                "completion_verified": bool(
+                    not defer_completion
+                    or all(row.get("completion", {}).get("ok") is True for row in rows)
+                ),
+                "state_reconciled": all(
+                    row["result"].get("state_reconciled") is True for row in rows
+                ),
                 "physical_effect_verified": False,
                 "send_order": list(channels),
                 "completion_order": [row["channel"] for row in completion_rows],

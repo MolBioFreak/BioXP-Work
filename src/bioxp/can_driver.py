@@ -205,6 +205,7 @@ class BioXpCanDriver:
         self._sleep = time.sleep
         self._pipette_message_state: dict[str, Any] = {}
         self._pipette_last_command: str | None = None
+        self._pipette_completion_owner_token: str | None = None
         self._pipette_error_callback = pipette_error_callback
 
     def pipette_can_ids(self) -> dict[str, int]:
@@ -352,6 +353,9 @@ class BioXpCanDriver:
         )
         base = {
             "ok": False,
+            "delivery_verified": False,
+            "controller_acknowledged": False,
+            "completion_verified": False,
             "board_id": int(board_id),
             "payload": payload,
             "dlc": len(payload),
@@ -376,6 +380,10 @@ class BioXpCanDriver:
                 )
             except Exception as exc:
                 return {**base, "tx_ok": False, "error": str(exc), "provenance": None}
+            if isinstance(provenance, dict):
+                owner_token = provenance.get("completion_owner_token")
+                if isinstance(owner_token, str) and owner_token:
+                    self._pipette_completion_owner_token = owner_token
             frames = list(provenance.get("frames", []))
             data: list[int] = []
             for frame in frames:
@@ -410,6 +418,11 @@ class BioXpCanDriver:
                 **base,
                 "ok": ack_ok,
                 "tx_ok": True,
+                "delivery_verified": True,
+                "controller_acknowledged": bool(ack_ok and frames),
+                "completion_verified": bool(
+                    provenance.get("completion_received", False) if isinstance(provenance, dict) else False
+                ),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -432,6 +445,9 @@ class BioXpCanDriver:
             return {
                 **base,
                 "ok": True,
+                "delivery_verified": True,
+                "controller_acknowledged": False,
+                "completion_verified": False,
             }
         ack = self._receive_reply(
             timeout_s=timeout_s,
@@ -447,6 +463,9 @@ class BioXpCanDriver:
         return {
             **base,
             "ok": bool(ack.get("ok")),
+            "delivery_verified": bool(base.get("tx_ok")),
+            "controller_acknowledged": bool(ack.get("ok") and ack.get("received")),
+            "completion_verified": bool(ack.get("ok") and ack.get("received")),
             "ack": ack,
             "pipette_message_state": message_state,
             "error": None if ack.get("ok") else ack.get("error", "ack_failed"),
@@ -490,6 +509,10 @@ class BioXpCanDriver:
                 completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
                 wait_for_completion=wait_for_completion,
             )
+            if isinstance(provenance, dict):
+                owner_token = provenance.get("completion_owner_token")
+                if isinstance(owner_token, str) and owner_token:
+                    self._pipette_completion_owner_token = owner_token
             frames = list(provenance.get("frames", []))
             data = [int(byte) for frame in frames for byte in frame.get("data", [])]
             observed = frames[-1] if frames else {}
@@ -521,6 +544,11 @@ class BioXpCanDriver:
             return {
                 "ok": ack_ok,
                 "tx_ok": True,
+                "delivery_verified": True,
+                "controller_acknowledged": bool(ack_ok and frames),
+                "completion_verified": bool(
+                    provenance.get("completion_received", False) if isinstance(provenance, dict) else False
+                ),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -655,7 +683,7 @@ class BioXpCanDriver:
         if not math.isfinite(volume_ul) or volume_ul < 0.0:
             raise ValueError("pipette volume must be a finite non-negative number")
         if volume_ul >= 100.0:
-            return f"{round(volume_ul):.0f}"
+            return str(int(volume_ul + 0.5))
         if volume_ul == float(int(volume_ul)):
             return f"{int(volume_ul)}"
         return f"{volume_ul:.1f}"
@@ -733,23 +761,32 @@ class BioXpCanDriver:
             result["outcome"] = "oem_error"
         return result
 
-    def wait_pipette_initialization_completion(self, timeout_s: float):
+    def _wait_owned_pipette_completion(self, timeout_s: float) -> dict[str, Any]:
         wait = getattr(self.bus, "wait_pipette_completion", None)
         if not callable(wait):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
-        raw = wait(int(self.pipette_id), float(timeout_s))
+        owner_token = self._pipette_completion_owner_token
+        try:
+            raw = wait(
+                int(self.pipette_id),
+                float(timeout_s),
+                owner_token=owner_token,
+            )
+        except TypeError:
+            if owner_token is not None:
+                raise
+            raw = wait(int(self.pipette_id), float(timeout_s))
+        if owner_token == self._pipette_completion_owner_token:
+            self._pipette_completion_owner_token = None
         if not isinstance(raw, dict):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
         return self._enrich_pipette_completion(raw)
 
+    def wait_pipette_initialization_completion(self, timeout_s: float):
+        return self._wait_owned_pipette_completion(timeout_s)
+
     def wait_pipette_command_completion(self, timeout_s: float):
-        wait = getattr(self.bus, "wait_pipette_completion", None)
-        if not callable(wait):
-            return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
-        raw = wait(int(self.pipette_id), float(timeout_s))
-        if not isinstance(raw, dict):
-            return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
-        return self._enrich_pipette_completion(raw)
+        return self._wait_owned_pipette_completion(timeout_s)
 
     def pipette_initiate_group(self):
         result = self._send_pipette_command("WR", command_name="pipette_initiate_group")
@@ -889,9 +926,12 @@ class BioXpCanDriver:
     def terminate_pipette(self):
         return self._send_pipette_command("TR", address="control", command_name="terminate_pipette")
 
-    def set_top_speed(self, velocity: int):
-        value = int(velocity)
-        result = self._send_pipette_command(f"V{value},1R", command_name="set_top_speed")
+    def set_top_speed(self, velocity: float):
+        value = float(velocity)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("pipette top speed must be a finite positive number")
+        encoded = format(value, "g")
+        result = self._send_pipette_command(f"V{encoded},1R", command_name="set_top_speed")
         result["effective_top_speed"] = value
         return result
 
@@ -971,7 +1011,7 @@ class BioXpCanDriver:
             "query_error_queue": list(self._pipette_message_state.get("error_queue", [])),
         }
 
-    def get_data(self, query: str):
+    def get_data(self, query: str, *, wake_if_needed: bool = True):
         selected = str(query).strip()
         if selected not in PIPETTE_DATA_QUERY_LABELS:
             raise ValueError(
@@ -979,7 +1019,7 @@ class BioXpCanDriver:
                 + ", ".join(sorted(PIPETTE_DATA_QUERY_LABELS))
             )
         wake = None
-        if self._pipette_message_state.get("initialized") is not True:
+        if wake_if_needed and self._pipette_message_state.get("initialized") is not True:
             wake_byte = 0x20 | int(self.pipette_id)
             wake = self._send_packet(0x080, [wake_byte, wake_byte], command_name="pipette_wake_address")
         result = self._send_pipette_command(selected, address="report", ack_mode="query", command_name="get_data")

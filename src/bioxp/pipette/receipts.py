@@ -95,16 +95,48 @@ class PipetteReceiptStore:
 
     @staticmethod
     def _truth(result: Mapping[str, Any]) -> dict[str, Any]:
+        driver_result = result.get("driver_result")
+        driver = driver_result if isinstance(driver_result, Mapping) else {}
+        provenance_result = driver.get("provenance")
+        provenance = provenance_result if isinstance(provenance_result, Mapping) else {}
+
+        delivery = result.get("delivery_verified")
+        if not isinstance(delivery, bool):
+            driver_delivery = driver.get("delivery_verified")
+            delivery = driver_delivery if isinstance(driver_delivery, bool) else bool(driver.get("tx_ok", False))
+
         controller = result.get("controller_acknowledged")
         if not isinstance(controller, bool):
-            driver_result = result.get("driver_result")
-            controller = bool(driver_result.get("ok")) if isinstance(driver_result, Mapping) else None
+            driver_controller = driver.get("controller_acknowledged")
+            controller = driver_controller if isinstance(driver_controller, bool) else False
+
+        completion = result.get("completion_verified")
+        completion_explicit = isinstance(completion, bool)
+        if not completion_explicit:
+            driver_completion = driver.get("completion_verified")
+            if isinstance(driver_completion, bool):
+                completion = driver_completion
+                completion_explicit = True
+            else:
+                completion = bool(provenance.get("completion_received", False))
+        if not completion_explicit and not completion:
+            completion = bool(
+                result.get("ok") is True
+                and result.get("outcome") in {"completion", "initialized"}
+            )
+
+        precondition = result.get("hardware_precondition_verified")
+        if not isinstance(precondition, bool):
+            precondition = False
         hardware = result.get("hardware_postcondition_verified")
         if not isinstance(hardware, bool):
-            hardware = bool(result.get("hardware_query_verified"))
-        # No caller in the authorized WP0-WP4 envelope can certify physical effect.
+            hardware = False
+        # No caller in the authorized no-motion envelope can certify physical effect.
         return {
-            "controller_acknowledged": controller,
+            "delivery_verified": bool(delivery),
+            "controller_acknowledged": bool(controller),
+            "completion_verified": bool(completion),
+            "hardware_precondition_verified": bool(precondition),
             "hardware_postcondition_verified": bool(hardware),
             "physical_effect_verified": False,
             "physical_effect_claim_suppressed": True,

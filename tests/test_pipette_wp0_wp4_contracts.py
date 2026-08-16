@@ -11,10 +11,11 @@ from fastapi import HTTPException
 
 from src.bioxp.can_driver import BioXpCanDriver
 from src.bioxp import api
-from src.bioxp.novo_router import NovoFrame, NovoRouter
+from src.bioxp.novo_router import NovoFrame, NovoRouter, NovoRouterError
 from src.bioxp.novo_usb_can import NovoUsbCanError, novo_decode, novo_encode
 from src.bioxp.pipette.models import PipetteAspirateCommand, PipetteDispenseCommand
 from src.bioxp.pipette.receipts import PipetteReceiptStore
+from src.bioxp.pipette.transport import CanPipetteTransport
 from src.bioxp.services.pipette_service import run_pipette_dispense_command, run_pipette_status
 
 
@@ -29,6 +30,35 @@ def test_wp0_matrix_has_all_gap_rows_and_no_unclassified_rows():
     assert matrix["matrix_invariants"]["unclassified_row_count"] == 0
     assert all(row.get("classification") for row in matrix["gap_rows"])
     assert all(row.get("status") for row in matrix["gap_rows"])
+
+
+def test_wp0_application_call_site_denominator_is_row_level():
+    matrix = json.loads((ROOT / "docs/specs/2026-08-02-pipette-oem-parity-matrix.json").read_text())
+    rows = matrix["denominator"]["application_call_sites"]
+    required = {
+        "id",
+        "source_file",
+        "source_sha256",
+        "source_line",
+        "source_member",
+        "call_expression",
+        "classification",
+        "status",
+    }
+
+    assert rows
+    assert all(required <= row.keys() for row in rows)
+    assert all(row["id"].startswith("APP-CS-") for row in rows)
+    assert all(isinstance(row["source_line"], int) and row["source_line"] > 0 for row in rows)
+    assert all(len(row["source_sha256"]) == 64 for row in rows)
+    assert all(row["blocker"] for row in rows if row["status"] == "blocked")
+    identities = {
+        (row["source_file"], row["source_line"], row["call_expression"])
+        for row in rows
+    }
+    assert len(identities) == len(rows)
+    assert matrix["matrix_invariants"]["application_call_site_count"] == len(rows)
+    assert not any("inventory remains open" in row.get("blocker", "") for row in rows)
 
 
 def test_novo_router_has_twenty_normal_ids_and_four_pressure_ids():
@@ -136,6 +166,112 @@ def test_receipt_store_binds_authority_redacts_metadata_and_suppresses_physical_
     assert store.latest()["receipt_id"] == receipt["receipt_id"]
 
 
+def test_receipt_truth_does_not_promote_tx_only_delivery_to_controller_ack():
+    truth = PipetteReceiptStore._truth(
+        {
+            "ok": True,
+            "driver_result": {
+                "ok": True,
+                "tx_ok": True,
+                "provenance": {"ok": True, "outcome": "tx_only", "frames": []},
+            },
+        }
+    )
+
+    assert truth["delivery_verified"] is True
+    assert truth["controller_acknowledged"] is False
+    assert truth["completion_verified"] is False
+    assert truth["hardware_postcondition_verified"] is False
+
+
+def test_transport_keeps_tip_precondition_separate_from_liquid_postcondition():
+    class Driver:
+        _pipette_message_state = {}
+
+        @staticmethod
+        def query_tip_status():
+            return {
+                "ok": True,
+                "tip_loaded": True,
+                "hardware_truth_level": "hardware_query",
+            }
+
+        @staticmethod
+        def aspirate(volume_ul, *, tip_pressure_profile, wait_for_completion):
+            del volume_ul, tip_pressure_profile, wait_for_completion
+            return {
+                "ok": True,
+                "tx_ok": True,
+                "delivery_verified": True,
+                "controller_acknowledged": False,
+                "completion_verified": False,
+                "provenance": {"outcome": "tx_only", "frames": []},
+            }
+
+    transport = CanPipetteTransport(driver_factory=Driver)
+    transport._initialized = True
+    result = transport.aspirate(
+        PipetteAspirateCommand(volume_ul=10.0),
+        wait_for_completion=False,
+    )
+
+    assert result["hardware_precondition_verified"] is True
+    assert result["hardware_postcondition_verified"] is False
+    assert result["controller_acknowledged"] is False
+    assert result["completion_verified"] is False
+    assert result["state_reconciled"] is False
+    assert result["liquid_level_ul"] == 0.0
+    assert result["physical_effect_verified"] is False
+
+
+def test_driver_deferred_send_reports_delivery_without_ack_or_completion():
+    class Bus:
+        @staticmethod
+        def transact_can(message, **kwargs):
+            del message, kwargs
+            return {
+                "ok": True,
+                "outcome": "tx_only",
+                "frames": [],
+                "completion_received": False,
+            }
+
+    driver = BioXpCanDriver.__new__(BioXpCanDriver)
+    driver.bus = Bus()
+    driver.pipette_id = 0
+    driver.response_timeout_s = 0.01
+    driver._pipette_message_state = {}
+    driver._pipette_last_command = None
+    result = driver._send_pipette_command(
+        "P10R1,",
+        command_name="pipette_aspirate",
+        wait_for_completion=False,
+    )
+
+    assert result["ok"] is True
+    assert result["delivery_verified"] is True
+    assert result["controller_acknowledged"] is False
+    assert result["completion_verified"] is False
+
+
+def test_driver_uses_oem_numeric_command_formatting():
+    assert BioXpCanDriver._format_pipette_volume(100.5) == "101"
+
+    driver = BioXpCanDriver.__new__(BioXpCanDriver)
+    captured = {}
+
+    def send(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return {"ok": True}
+
+    driver.__dict__["_send_pipette_command"] = send
+    result = driver.set_top_speed(12.5)
+
+    assert captured["command"] == "V12.5,1R"
+    assert result["effective_top_speed"] == 12.5
+
+
 def test_service_status_can_persist_a_source_bound_receipt(tmp_path):
     store = PipetteReceiptStore(tmp_path / "receipts")
     result = asyncio.run(
@@ -192,13 +328,79 @@ def test_generation_matched_pipette_completion_accepts_only_oem_initialized_byte
         dlc=3,
         data=bytes((0x20, 0x60, 0)),
         raw=b"raw",
-        received_at=1.0,
+        received_at=router._clock(),
         classification="pipette_report",
     )
     router._dispatch(frame)
     result = router.wait_pipette_completion(1, 0.0)
     assert result["ok"] is True
     assert result["generation_changed"] is False
+
+
+def test_pipette_completion_requires_bound_command_owner_and_matching_token():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    token = router.prepare_pipette_completion(
+        1,
+        10.0,
+        command_family=1,
+        command_name="pipette_aspirate",
+    )
+    router.bind_pipette_completion(
+        1,
+        owner_token=token,
+        transaction_id="tx-1",
+        tx_started_at=10.0,
+    )
+
+    mismatch = router.wait_pipette_completion(1, 0.0, owner_token="wrong-token")
+    assert mismatch["ok"] is False
+    assert mismatch["outcome"] == "completion_owner_mismatch"
+
+    router._dispatch(
+        NovoFrame(
+            arbitration_id=0x509,
+            dlc=3,
+            data=bytes((0x20, 0x60, 0)),
+            raw=b"raw",
+            received_at=10.1,
+            classification="pipette_report",
+        )
+    )
+    result = router.wait_pipette_completion(1, 0.0, owner_token=token)
+    assert result["ok"] is True
+    assert result["owner_token"] == token
+    assert result["transaction_id"] == "tx-1"
+    assert result["command_name"] == "pipette_aspirate"
+    assert result["command_family"] == 1
+
+
+def test_completion_timeout_taints_channel_until_router_rebind():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    token = router.prepare_pipette_completion(
+        1,
+        10.0,
+        command_family=1,
+        command_name="pipette_aspirate",
+    )
+    router.bind_pipette_completion(
+        1,
+        owner_token=token,
+        transaction_id="tx-timeout",
+        tx_started_at=router._clock(),
+    )
+
+    timeout = router.wait_pipette_completion(1, 0.0, owner_token=token)
+    assert timeout["ok"] is False
+    assert timeout["outcome"] == "timeout"
+    taint = router.pipette_completion_taint(1)
+    assert taint is not None
+    assert taint["reason"] == "completion_timeout"
+    with pytest.raises(NovoRouterError, match="router rebind is required"):
+        router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
+
+    router.shutdown()
+    assert router.pipette_completion_taint(1) is None
+    router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
 
 
 def test_api_init_rejects_unmapped_pressure_profile_before_readiness_gate():

@@ -388,6 +388,18 @@ def test_liquid_route_attaches_reference_preflight_and_location_context(monkeypa
         return {"ok": True, **command.to_payload(), "preflight": preflight}
 
     monkeypatch.setattr(api, "_reference_state_store", ReferenceStore())
+    monkeypatch.setattr(
+        api,
+        "_serial206_oem_initialization_provider",
+        types.SimpleNamespace(
+            z_projection=lambda: {
+                "available": True,
+                "state": "referenced_ready",
+                "reference_state": "referenced",
+                "board_lifecycle_generation_fresh": True,
+            }
+        ),
+    )
     monkeypatch.setattr(api, "run_pipette_aspirate_command", fake_aspirate)
 
     result = asyncio.run(

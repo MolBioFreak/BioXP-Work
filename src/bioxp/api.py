@@ -83,6 +83,7 @@ from starlette.responses import Response, StreamingResponse
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
 from .pipette.receipts import PipetteReceiptStore
+from .pipette.application import PipetteApplicationPlanner
 from .pipette import (
     PipetteAspirateCommand,
     PipetteDiagnosticCommand,
@@ -210,6 +211,7 @@ _reference_state_store = ReferenceStateStore(
 )
 _pipette_transport = None
 _pipette_receipts = PipetteReceiptStore()
+_pipette_application = PipetteApplicationPlanner()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 
@@ -2069,7 +2071,7 @@ class PipetteDispenseAllRequest(PipetteChannelsRequest):
 
 
 class PipetteSpeedRequest(PipetteChannelsRequest):
-    velocity: int = Field(..., ge=1, le=10000)
+    velocity: float = Field(..., gt=0, le=10000)
 
 
 class PipetteFirmwareRequest(BaseModel):
@@ -2100,6 +2102,16 @@ class PipetteDataRequest(BaseModel):
 
 class PipetteFluidDetectionRequest(BaseModel):
     dry_run: bool = True
+
+
+class PipetteApplicationPlanRequest(BaseModel):
+    operation: Literal["load_tip", "move_to_waste", "detect_fluid", "plunger_up", "plunger_down"]
+    tip_tray: Optional[str] = Field(None, max_length=120)
+    tip_well: Optional[str] = Field(None, max_length=32)
+    tip_type: Optional[int] = None
+    tip_location: Optional[int] = Field(None, ge=0, le=3)
+    home_z_after: bool = True
+    fluid_class: Optional[Literal["TC", "MS", "OC", "RC", "STRIP"]] = None
 
 
 class PipetteTerminateRequest(BaseModel):
@@ -8337,6 +8349,32 @@ async def camera_mjpeg(
     )
 
 
+@app.get("/liquid/application/status")
+async def liquid_application_status():
+    return _pipette_application.status()
+
+
+@app.post("/liquid/application/plan")
+async def liquid_application_plan(req: PipetteApplicationPlanRequest):
+    if req.operation == "load_tip":
+        if req.tip_tray is None or req.tip_well is None or req.tip_type is None or req.tip_location is None:
+            raise HTTPException(status_code=422, detail="load_tip requires tip_tray, tip_well, tip_type, and tip_location")
+        return _pipette_application.plan_load_tip(
+            tip_tray=req.tip_tray,
+            tip_well=req.tip_well,
+            tip_type=req.tip_type,
+            tip_location=req.tip_location,
+            home_z_after=req.home_z_after,
+        )
+    if req.operation == "move_to_waste":
+        return _pipette_application.plan_move_to_waste()
+    if req.operation == "detect_fluid":
+        if req.fluid_class is None:
+            raise HTTPException(status_code=422, detail="detect_fluid requires fluid_class")
+        return _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
+    return _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
+
+
 @app.get("/liquid/status")
 async def liquid_status():
     projection = hardware_state.project("pipette")
@@ -8348,6 +8386,7 @@ async def liquid_status():
         "live_query_performed": False,
         "truth_source": "hardware_state_projection_only",
         "latest_receipt": _pipette_receipts.latest(),
+        "application": _pipette_application.status(),
     }
 
 
@@ -8611,7 +8650,7 @@ async def liquid_tip_status():
 
 
 @app.get("/liquid/data")
-async def liquid_data(query: str = Query(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
+async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
     return await run_pipette_operation(
         "data",
         lambda transport: getattr(transport, "get_data")(query),

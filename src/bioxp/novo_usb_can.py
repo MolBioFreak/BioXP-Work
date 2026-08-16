@@ -214,8 +214,14 @@ class NovoUsbCanBus:
         tx_dlc = int(getattr(msg, "dlc", len(tx_data)))
         payload = self.build_payload(tx_id, tx_data, tx_dlc)
         expected_rx_id = tx_id | 0x400
+        completion_owner_token: str | None = None
         if initialization or not wait_for_completion:
-            router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
+            completion_owner_token = router.prepare_pipette_completion(
+                int(channel),
+                float(completion_timeout_s),
+                command_family=int(expected_function),
+                command_name=str(matcher_name),
+            )
         try:
             return router.transact(
                 novo_encode(payload),
@@ -237,11 +243,16 @@ class NovoUsbCanBus:
                     "expected_rx_id": expected_rx_id,
                     "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
                     "completion_deferred": bool(not wait_for_completion),
+                    "completion_owner_token": completion_owner_token,
                 },
             )
         except Exception:
             if initialization or not wait_for_completion:
-                router.wait_pipette_completion(int(channel), 0.0)
+                router.wait_pipette_completion(
+                    int(channel),
+                    0.0,
+                    owner_token=completion_owner_token,
+                )
             raise
 
     def transact_can_many(
@@ -268,8 +279,14 @@ class NovoUsbCanBus:
             tx_dlc = int(getattr(message, "dlc", len(tx_data)))
             payloads.append(novo_encode(self.build_payload(tx_id, tx_data, tx_dlc)))
             tx_frames.append({"tx_id": tx_id, "tx_dlc": tx_dlc, "tx_data": tx_data[:tx_dlc]})
+        completion_owner_token: str | None = None
         if initialization or not wait_for_completion:
-            router.prepare_pipette_completion(int(channel), float(completion_timeout_s))
+            completion_owner_token = router.prepare_pipette_completion(
+                int(channel),
+                float(completion_timeout_s),
+                command_family=int(expected_function),
+                command_name=str(matcher_name),
+            )
         try:
             return router.transact_many(
                 payloads,
@@ -289,15 +306,30 @@ class NovoUsbCanBus:
                     "tx_frames": tx_frames,
                     "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if initialization or not wait_for_completion else None,
                     "completion_deferred": bool(not wait_for_completion),
+                    "completion_owner_token": completion_owner_token,
                 },
             )
         except Exception:
             if initialization or not wait_for_completion:
-                router.wait_pipette_completion(int(channel), 0.0)
+                router.wait_pipette_completion(
+                    int(channel),
+                    0.0,
+                    owner_token=completion_owner_token,
+                )
             raise
 
-    def wait_pipette_completion(self, channel: int, timeout_s: float) -> dict[str, Any]:
-        return self._current_router().wait_pipette_completion(int(channel), float(timeout_s))
+    def wait_pipette_completion(
+        self,
+        channel: int,
+        timeout_s: float,
+        *,
+        owner_token: str | None = None,
+    ) -> dict[str, Any]:
+        return self._current_router().wait_pipette_completion(
+            int(channel),
+            float(timeout_s),
+            owner_token=owner_token,
+        )
 
     def shutdown(self) -> None:
         # The shared BioXpTester is the lifecycle owner; a client cannot stop
