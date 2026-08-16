@@ -4683,7 +4683,16 @@ class Serial206OemInitializationProvider:
                     self.state_store.append_serial206_interrupt_receipt("x", receipt)
                 else:
                     self.state_store.append_serial206_receipt("x", receipt)
-            return {"ok": result.get("ok") is True, "axis": "xyz" if selected == "enable_xyz_current" else "x", "intent": selected, "state": lifecycle["state"], "z_state": z_lifecycle.get("state") if selected == "enable_xyz_current" else None, "result": _json_safe(result), "generation": generation}
+            return {
+                "ok": result.get("ok") is True,
+                "axis": "xyz" if selected == "enable_xyz_current" else "x",
+                "intent": selected,
+                "state": lifecycle["state"],
+                "z_state": z_lifecycle.get("state") if selected == "enable_xyz_current" else None,
+                "result": _json_safe(result),
+                "generation": generation,
+                "authority_receipt": _json_safe(receipt),
+            }
 
     def record_x_observation(
         self,
@@ -4800,6 +4809,7 @@ class Serial206OemInitializationProvider:
                 "ok": eligible,
                 "axis": "x",
                 "observation": _json_safe(observation),
+                "observation_receipt": _json_safe(observation),
                 "state": lifecycle.get("state"),
             }
 

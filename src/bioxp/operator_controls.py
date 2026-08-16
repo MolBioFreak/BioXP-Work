@@ -650,8 +650,13 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         dependencies.append(_operation_motion_dependency(machine_state))
         x_state_establishing = action_id in _X_NO_MOTION_STATE_ACTIONS
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
-        required_axes = [] if source_initializer or z_state_establishing or x_state_establishing else _required_reference_axes(action, values)
-        if x_state_establishing:
+        observation_action = action_id in {"oem.x.observe", "oem.z.observe"}
+        required_axes = (
+            []
+            if source_initializer or z_state_establishing or x_state_establishing or observation_action
+            else _required_reference_axes(action, values)
+        )
+        if x_state_establishing or observation_action:
             readiness = {"dependencies": []}
         elif action_id in _X_AUTO_PREREQUISITE_ACTIONS:
             # Manual X Home composes the source-backed no-motion preparation

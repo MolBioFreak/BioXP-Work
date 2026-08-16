@@ -654,6 +654,8 @@ def test_manual_panel_home_automatically_prepares_unprepared_x_without_motion():
     assert [name for name, _inputs in primitives.calls] == ["prepare", "manual_panel_home"]
     assert result["result"]["automatic_prerequisites"][0]["stage"] == "auto_prepare"
     assert result["result"]["automatic_prerequisites"][0]["physical_motion_commanded"] is False
+    assert result["authority_receipt"]["command_id"] == "x-home-auto-prepare"
+    assert result["authority_receipt"]["status"] == "completed"
     assert provider.x_projection()["lifecycle"]["state"] == "awaiting_operator_observation"
 
 
@@ -693,6 +695,47 @@ def test_manual_panel_home_admission_stays_open_while_x_is_automatically_prepara
 
     assert assessment["enabled"] is True
     assert assessment["disabled_reason"] is None
+
+
+def test_x_observation_admission_requires_pending_lifecycle_but_not_motion_readiness():
+    from bioxp import operator_controls
+
+    action = {
+        "action_id": "oem.x.observe",
+        "provider_available": True,
+        "required_provider_capability": "initialize_motors",
+        "informational_method": "POST",
+        "informational_path": "/motion/oem/x/observation",
+        "safety_class": "motion",
+    }
+    machine_state = {
+        "lifecycle": {"operation_state": "idle"},
+        "ownership": {
+            "transport": "owned",
+            "usb": "service",
+            "router": "running",
+            "CAN_READY": True,
+        },
+        "maintenance": {"motion_blocked": True, "recovery_required": True},
+        "serial206_initialization_provider": {
+            "bound": True,
+            "initialize_motors_live_available": True,
+            "x_authority": {
+                "lifecycle": {"state": "awaiting_operator_observation"},
+            },
+        },
+    }
+
+    assessment = operator_controls._assess_action(action, machine_state, {})
+
+    assert assessment["enabled"] is True
+    assert assessment["disabled_reason"] is None
+    assert {row["key"] for row in assessment["dependencies"]} == {
+        "provider_available",
+        "serial206_x_lifecycle",
+        "transport_live",
+        "operation_allows_motion",
+    }
 
 
 def test_x_projection_preserves_complete_typed_terminal_status_without_omission_markers():
@@ -841,6 +884,9 @@ def test_proved_home_enters_awaiting_observation_then_exact_observation_establis
         expected_generation=17,
     )
     assert observed["ok"] is True
+    assert observed["observation_receipt"]["command_id"] == "x-observe-proof"
+    assert observed["observation_receipt"]["observes_command_id"] == "x-home-proof"
+    assert observed["observation_receipt"]["status"] == "completed"
     assert provider.x_projection()["lifecycle"]["state"] == "referenced_ready"
 
 
