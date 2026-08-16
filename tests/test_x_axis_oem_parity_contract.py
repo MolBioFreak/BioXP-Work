@@ -1385,6 +1385,16 @@ def test_restart_recovers_pending_home_observation_after_prior_projection_invali
     home = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-recoverable"})
     assert home["ok"] is True
     state = provider._load_state()
+    state["x_lifecycle"]["receipts"][-1]["result"] = {
+        "ok": {"omitted": "item_limit"},
+        "controller_command_acknowledged": True,
+        "controller_terminal_state_verified": True,
+        "reference_publication_required": {"omitted": "item_limit"},
+        "home": {
+            "controller_home_proof_verified": True,
+            "controller_terminal_state_verified": True,
+        },
+    }
     state["x_lifecycle"].update(
         {
             "state": "unprepared",

@@ -4024,6 +4024,28 @@ class Serial206OemInitializationProvider:
             None,
         )
         result = receipt.get("result") if isinstance(receipt, Mapping) else None
+        home = result.get("home") if isinstance(result, Mapping) else None
+        command_acknowledged = bool(
+            isinstance(result, Mapping)
+            and (
+                result.get("controller_command_acknowledged") is True
+                or result.get("command_issued") is True
+            )
+        )
+        home_evidence = bool(
+            isinstance(result, Mapping)
+            and (
+                (
+                    result.get("home_predicate_confirmed") is True
+                    and result.get("reference_publication_required") is True
+                )
+                or (
+                    isinstance(home, Mapping)
+                    and home.get("controller_home_proof_verified") is True
+                    and home.get("controller_terminal_state_verified") is True
+                )
+            )
+        )
         if not (
             isinstance(receipt, Mapping)
             and receipt.get("receipt_id") == command_id
@@ -4033,10 +4055,9 @@ class Serial206OemInitializationProvider:
             and receipt.get("generation") == generation
             and receipt.get("board_lifecycle_generation") == board_lifecycle_generation
             and isinstance(result, Mapping)
-            and result.get("ok") is True
-            and result.get("home_predicate_confirmed") is True
+            and command_acknowledged
             and result.get("controller_terminal_state_verified") is True
-            and result.get("reference_publication_required") is True
+            and home_evidence
         ):
             return None
         return receipt
