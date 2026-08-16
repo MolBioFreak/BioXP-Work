@@ -4714,10 +4714,13 @@ class Serial206OemInitializationProvider:
                     "ok": False,
                     "failure": "x_automatic_home_result_not_mapping",
                 }
+                home_evidence = homing.get("home")
                 home_ok = bool(
                     homing.get("ok") is True
-                    and homing.get("home_predicate_confirmed") is True
                     and homing.get("controller_terminal_state_verified") is True
+                    and isinstance(home_evidence, Mapping)
+                    and home_evidence.get("home_predicate_confirmed") is True
+                    and home_evidence.get("controller_terminal_state_verified") is True
                 )
                 prerequisite = {
                     "stage": "auto_home",
