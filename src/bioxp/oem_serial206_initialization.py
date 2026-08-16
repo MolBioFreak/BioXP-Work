@@ -4006,6 +4006,48 @@ class Serial206OemInitializationProvider:
                 return self._corrupt_projection()
 
     @staticmethod
+    def _recoverable_observed_x_reference(
+        lifecycle: Mapping[str, Any],
+        *,
+        generation: int | None,
+        board_lifecycle_generation: int | None,
+    ) -> Mapping[str, Any] | None:
+        if type(generation) is not int or type(board_lifecycle_generation) is not int:
+            return None
+        receipts = lifecycle.get("receipts")
+        if not isinstance(receipts, list):
+            return None
+        for receipt in reversed(receipts):
+            reference = receipt.get("reference_persistence") if isinstance(receipt, Mapping) else None
+            if (
+                isinstance(receipt, Mapping)
+                and isinstance(receipt.get("command_id"), str)
+                and isinstance(receipt.get("observes_command_id"), str)
+                and receipt.get("intent") == "observation"
+                and receipt.get("status") == "completed"
+                and receipt.get("generation") == generation
+                and receipt.get("board_lifecycle_generation") == board_lifecycle_generation
+                and receipt.get("verdict") == "pass"
+                and receipt.get("physical_motion_observed") is True
+                and receipt.get("expected_direction_observed") is True
+                and receipt.get("home_endpoint_observed") is True
+                and receipt.get("stopped_observed") is True
+                and receipt.get("reference_eligible") is True
+                and isinstance(reference, Mapping)
+                and reference.get("ok") is True
+                and reference.get("persisted") is True
+                and reference.get("verified") is True
+                and reference.get("durable_clean") is True
+                and reference.get("axis") == "x"
+                and reference.get("state") == "referenced"
+                and reference.get("origin_position_steps") == 0
+                and reference.get("source") == "serial206.x.operator_observation"
+                and reference.get("last_motion_kind") == "home"
+            ):
+                return receipt
+        return None
+
+    @staticmethod
     def _recoverable_pending_x_home_receipt(
         lifecycle: Mapping[str, Any],
         *,
@@ -4089,36 +4131,70 @@ class Serial206OemInitializationProvider:
                 ):
                     recovered_generation = int(last_failure["recorded_generation"])
                     recovered_board_generation = int(last_failure["recorded_board_lifecycle_generation"])
-                    recoverable_receipt = next(
-                        (
-                            row
-                            for row in reversed(list(source_lifecycle.get("receipts") or []))
-                            if isinstance(row, Mapping)
-                            and self._recoverable_pending_x_home_receipt(
-                                source_lifecycle,
-                                command_id=row.get("command_id") if isinstance(row.get("command_id"), str) else None,
-                                generation=recovered_generation,
-                                board_lifecycle_generation=recovered_board_generation,
-                            )
-                            is not None
-                        ),
-                        None,
+                    recovered_observation = self._recoverable_observed_x_reference(
+                        source_lifecycle,
+                        generation=recovered_generation,
+                        board_lifecycle_generation=recovered_board_generation,
                     )
-                    if isinstance(recoverable_receipt, Mapping):
-                        recovered_receipt_id = recoverable_receipt.get("receipt_id")
+                    reference_recovery = None
+                    if isinstance(recovered_observation, Mapping) and self.reference_store is not None:
+                        reference_recovery = self.reference_store.mark_referenced(
+                            MarkAxisReferencedCommand(
+                                axis="x",
+                                position_steps=0,
+                                source="serial206.x.operator_observation",
+                                motion_kind="home",
+                            )
+                        )
+                    if (
+                        isinstance(reference_recovery, Mapping)
+                        and reference_recovery.get("ok") is True
+                        and reference_recovery.get("durable_clean") is True
+                    ):
                         source_lifecycle.update({
-                            "state": "awaiting_operator_observation",
+                            "state": "referenced_ready",
                             "generation": recovered_generation,
                             "board_lifecycle_generation": recovered_board_generation,
-                            "reference_state": "desynced",
+                            "reference_state": "referenced",
                             "active_receipt": None,
                             "pending_ticket": None,
-                            "awaiting_observation_receipt_id": recovered_receipt_id,
+                            "awaiting_observation_receipt_id": None,
                             "last_failure": None,
                         })
                         self._save_state(state)
                         lifecycle_generation = recovered_generation
                         prepared_board_generation = recovered_board_generation
+                    else:
+                        recoverable_receipt = next(
+                            (
+                                row
+                                for row in reversed(list(source_lifecycle.get("receipts") or []))
+                                if isinstance(row, Mapping)
+                                and self._recoverable_pending_x_home_receipt(
+                                    source_lifecycle,
+                                    command_id=row.get("command_id") if isinstance(row.get("command_id"), str) else None,
+                                    generation=recovered_generation,
+                                    board_lifecycle_generation=recovered_board_generation,
+                                )
+                                is not None
+                            ),
+                            None,
+                        )
+                        if isinstance(recoverable_receipt, Mapping):
+                            recovered_receipt_id = recoverable_receipt.get("receipt_id")
+                            source_lifecycle.update({
+                                "state": "awaiting_operator_observation",
+                                "generation": recovered_generation,
+                                "board_lifecycle_generation": recovered_board_generation,
+                                "reference_state": "desynced",
+                                "active_receipt": None,
+                                "pending_ticket": None,
+                                "awaiting_observation_receipt_id": recovered_receipt_id,
+                                "last_failure": None,
+                            })
+                            self._save_state(state)
+                            lifecycle_generation = recovered_generation
+                            prepared_board_generation = recovered_board_generation
                 pending_home_receipt = self._recoverable_pending_x_home_receipt(
                     source_lifecycle,
                     command_id=(
@@ -4126,6 +4202,15 @@ class Serial206OemInitializationProvider:
                         if isinstance(source_lifecycle.get("awaiting_observation_receipt_id"), str)
                         else None
                     ),
+                    generation=current_generation,
+                    board_lifecycle_generation=(
+                        prepared_board_generation
+                        if type(prepared_board_generation) is int
+                        else -1
+                    ),
+                )
+                observed_reference_receipt = self._recoverable_observed_x_reference(
+                    source_lifecycle,
                     generation=current_generation,
                     board_lifecycle_generation=(
                         prepared_board_generation
@@ -4144,6 +4229,11 @@ class Serial206OemInitializationProvider:
                         source_lifecycle.get("state") == "awaiting_operator_observation"
                         and current_board_generation is None
                         and pending_home_receipt is not None
+                    )
+                    and not (
+                        source_lifecycle.get("state") == "referenced_ready"
+                        and current_board_generation is None
+                        and observed_reference_receipt is not None
                     )
                 )
                 if (generation_drift or board_drift) and source_lifecycle.get("state") != "unprepared":

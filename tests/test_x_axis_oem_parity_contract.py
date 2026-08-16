@@ -89,7 +89,17 @@ class InMemoryReferenceStore:
     def mark_referenced(self, command):
         self.events.append(("referenced", command))
         self.state = "referenced"
-        return {"ok": True, "durable_clean": True, "state": "referenced"}
+        return {
+            "ok": True,
+            "persisted": True,
+            "verified": True,
+            "durable_clean": True,
+            "axis": "x",
+            "state": "referenced",
+            "origin_position_steps": 0,
+            "source": "serial206.x.operator_observation",
+            "last_motion_kind": "home",
+        }
 
     def mark_referenced_many(self, commands):
         rows = list(commands)
@@ -1470,6 +1480,93 @@ def test_restart_pending_home_without_controller_evidence_is_invalidated():
     assert projection["lifecycle"]["state"] == "unprepared"
     assert projection["lifecycle"]["awaiting_observation_receipt_id"] is None
     assert projection["lifecycle"]["last_failure"]["failure"] == "x_board_lifecycle_generation_changed"
+    assert primitives.calls == []
+
+
+def test_restart_without_process_local_board_generation_preserves_durable_observed_reference():
+    primitives = ProviderPrimitives()
+    references = InMemoryReferenceStore("desynced")
+    provider = Serial206OemInitializationProvider(
+        primitives,
+        generation_provider=lambda: 17,
+        reference_store=references,
+    )
+    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
+    assert execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-observed-restart"})["ok"] is True
+    observed = provider.record_x_observation(
+        command_id="x-home-observed-restart",
+        observation_command_id="x-observe-restart",
+        expected_generation=17,
+        verdict="pass",
+        physical_motion_observed=True,
+        expected_direction_observed=True,
+        home_endpoint_observed=True,
+        stopped_observed=True,
+        note="Observed X Home reached the endpoint and stopped.",
+    )
+    assert observed["ok"] is True
+    primitives.calls.clear()
+    primitives.board_generation = None
+
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "referenced_ready"
+    assert projection["lifecycle"]["reference_state"] == "referenced"
+    assert projection["lifecycle"]["last_failure"] is None
+    assert primitives.calls == []
+
+
+def test_restart_recovers_durable_observed_reference_after_prior_projection_invalidation():
+    primitives = ProviderPrimitives()
+    references = InMemoryReferenceStore("desynced")
+    provider = Serial206OemInitializationProvider(
+        primitives,
+        generation_provider=lambda: 17,
+        reference_store=references,
+    )
+    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
+    assert execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-observed-recover"})["ok"] is True
+    assert provider.record_x_observation(
+        command_id="x-home-observed-recover",
+        observation_command_id="x-observe-recover",
+        expected_generation=17,
+        verdict="pass",
+        physical_motion_observed=True,
+        expected_direction_observed=True,
+        home_endpoint_observed=True,
+        stopped_observed=True,
+        note="Observed X Home reached the endpoint and stopped.",
+    )["ok"] is True
+    state = provider._load_state()
+    state["x_lifecycle"].update(
+        {
+            "state": "unprepared",
+            "generation": None,
+            "board_lifecycle_generation": None,
+            "reference_state": "desynced",
+            "awaiting_observation_receipt_id": None,
+            "last_failure": {
+                "failure": "x_board_lifecycle_generation_changed",
+                "recorded_generation": 17,
+                "current_generation": 17,
+                "recorded_board_lifecycle_generation": 9,
+                "current_board_lifecycle_generation": None,
+            },
+        }
+    )
+    provider._save_state(state)
+    references.state = "desynced"
+    references.events.clear()
+    primitives.calls.clear()
+    primitives.board_generation = None
+
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "referenced_ready"
+    assert projection["lifecycle"]["reference_state"] == "referenced"
+    assert projection["lifecycle"]["last_failure"] is None
+    assert references.state == "referenced"
+    assert [event for event, _ in references.events] == ["referenced"]
     assert primitives.calls == []
 
 
