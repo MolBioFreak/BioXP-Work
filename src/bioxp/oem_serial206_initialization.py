@@ -3946,6 +3946,35 @@ class Serial206OemInitializationProvider:
                 )
                 payload = self._save_state(payload)
             x_lifecycle = payload["x_lifecycle"]
+            last_x_failure = x_lifecycle.get("last_failure")
+            last_x_home = (
+                last_x_failure.get("home")
+                if isinstance(last_x_failure, Mapping)
+                else None
+            )
+            automatic_home_false_latch = bool(
+                x_lifecycle.get("state") == "failed_latched"
+                and isinstance(last_x_failure, Mapping)
+                and last_x_failure.get("axis") == "x"
+                and last_x_failure.get("failure") is None
+                and last_x_failure.get("controller_terminal_state_verified") is True
+                and isinstance(last_x_home, Mapping)
+                and last_x_home.get("controller_home_proof_verified") is True
+                and last_x_home.get("controller_terminal_state_verified") is True
+            )
+            if automatic_home_false_latch:
+                x_lifecycle.update({
+                    "state": "unprepared",
+                    "generation": None,
+                    "board_lifecycle_generation": None,
+                    "prepared_receipt": None,
+                    "active_receipt": None,
+                    "pending_ticket": None,
+                    "awaiting_observation_receipt_id": None,
+                    "reference_state": "desynced",
+                    "last_failure": None,
+                })
+                payload = self._save_state(payload)
             if x_lifecycle.get("state") == "executing":
                 if self.reference_store is not None:
                     desync = getattr(self.primitives, "_x_desync", None)
