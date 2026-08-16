@@ -4543,7 +4543,7 @@ class Serial206OemInitializationProvider:
                 else lifecycle.get("board_lifecycle_generation")
             )
             automatic_prerequisites: list[dict[str, Any]] = []
-            if selected == "manual_panel_home" and prior_state == "unprepared":
+            if selected in {"manual_panel_home", "move_steps", "move_absolute"} and prior_state == "unprepared":
                 prepare_fn = getattr(self.primitives, "prepare_x", None) or getattr(
                     self.primitives, "prepare_for_initialize_motors"
                 )
@@ -4684,6 +4684,102 @@ class Serial206OemInitializationProvider:
                         "generation": generation,
                         "board_lifecycle_generation": current_board_generation,
                     }
+            if selected in {"move_steps", "move_absolute"} and prior_state == "prepared_unreferenced":
+                commissioned = any(
+                    isinstance(row, Mapping)
+                    and row.get("intent") == "observation"
+                    and row.get("status") == "completed"
+                    and row.get("reference_eligible") is True
+                    for row in lifecycle.get("receipts") or []
+                )
+                if not commissioned:
+                    return {
+                        "ok": False,
+                        "axis": "x",
+                        "state": prior_state,
+                        "failure": "x_observed_commissioning_required_before_automatic_home",
+                        "requested_motion_dispatched": False,
+                        "automatic_prerequisites": automatic_prerequisites,
+                    }
+                try:
+                    homing = self.primitives.x_manual_panel_home(
+                        timeout_s=float(values.get("home_timeout_s", 30.0))
+                    )
+                except Exception as exc:
+                    homing = {
+                        "ok": False,
+                        "failure": f"x_automatic_home_exception:{type(exc).__name__}:{exc}",
+                    }
+                homing = dict(homing) if isinstance(homing, Mapping) else {
+                    "ok": False,
+                    "failure": "x_automatic_home_result_not_mapping",
+                }
+                home_ok = bool(
+                    homing.get("ok") is True
+                    and homing.get("home_predicate_confirmed") is True
+                    and homing.get("controller_terminal_state_verified") is True
+                )
+                prerequisite = {
+                    "stage": "auto_home",
+                    "physical_motion_commanded": homing.get("physical_motion_commanded") is True,
+                    "result": _json_safe(homing),
+                }
+                automatic_prerequisites.append(prerequisite)
+                if not home_ok or self.reference_store is None:
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": _json_safe(homing),
+                    })
+                    self._save_state(state)
+                    return {
+                        "ok": False,
+                        "axis": "x",
+                        "state": lifecycle["state"],
+                        "failure": "x_automatic_prerequisite_failed",
+                        "failed_stage": "auto_home",
+                        "requested_motion_dispatched": False,
+                        "automatic_prerequisites": automatic_prerequisites,
+                    }
+                reference = self.reference_store.mark_referenced(
+                    MarkAxisReferencedCommand(
+                        axis="x",
+                        position_steps=0,
+                        source="serial206.x.automatic_operational_home",
+                        motion_kind="home",
+                    )
+                )
+                reference_ok = bool(
+                    isinstance(reference, Mapping)
+                    and reference.get("ok") is True
+                    and reference.get("durable_clean") is True
+                )
+                prerequisite["reference_publication"] = _json_safe(reference)
+                if not reference_ok:
+                    lifecycle.update({
+                        "state": "failed_latched",
+                        "reference_state": "desynced",
+                        "last_failure": _json_safe(reference),
+                    })
+                    self._save_state(state)
+                    return {
+                        "ok": False,
+                        "axis": "x",
+                        "state": lifecycle["state"],
+                        "failure": "x_automatic_reference_publication_failed",
+                        "failed_stage": "auto_home",
+                        "requested_motion_dispatched": False,
+                        "automatic_prerequisites": automatic_prerequisites,
+                    }
+                lifecycle.update({
+                    "state": "referenced_ready",
+                    "reference_state": "referenced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": None,
+                })
+                self._save_state(state)
+                prior_state = "referenced_ready"
+                prior_reference_state = "referenced"
             if selected in motion_intents and not move_to_all_zero and (prior_state != "referenced_ready" or prior_reference_state != "referenced"):
                 return {"ok": False, "axis": "x", "state": prior_state, "failure": "x_reference_required_before_move"}
             if move_to_all_zero and prior_state not in {"prepared_unreferenced", "referenced_ready", "failed_latched"}:

@@ -282,6 +282,8 @@ _X_NO_MOTION_STATE_ACTIONS = frozenset({
 
 _X_AUTO_PREREQUISITE_ACTIONS = frozenset({
     "oem.x.manual_panel_home",
+    "oem.x.move_steps",
+    "oem.x.move_absolute",
 })
 
 _Z_AUTO_PREREQUISITE_ACTIONS = frozenset({
@@ -545,8 +547,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             "oem.x.move_to_origin_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.caught_plate_recovery_home": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_steps": {"referenced_ready"},
-            "oem.x.move_absolute": {"referenced_ready"},
+            "oem.x.move_steps": {"unprepared", "prepared_unreferenced", "referenced_ready"},
+            "oem.x.move_absolute": {"unprepared", "prepared_unreferenced", "referenced_ready"},
             "oem.x.set_max_speed": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.set_max_acc": {"prepared_unreferenced", "referenced_ready"},
             "oem.x.restore_original_speed": {"prepared_unreferenced", "referenced_ready"},
@@ -659,9 +661,9 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         if x_state_establishing or observation_action:
             readiness = {"dependencies": []}
         elif action_id in _X_AUTO_PREREQUISITE_ACTIONS:
-            # Manual X Home composes the source-backed no-motion preparation
-            # inside the provider transaction. Cached lifecycle and board
-            # freshness must not pre-disable the operator's requested Home.
+            # Normal X controls compose missing preparation and operational
+            # homing inside the provider transaction. Cached lifecycle and
+            # board freshness must not pre-disable the requested action.
             readiness = {"dependencies": []}
         elif provider_owned_x_motion:
             readiness = _provider_x_motion_readiness(machine_state)
