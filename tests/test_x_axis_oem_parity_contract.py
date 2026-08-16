@@ -559,7 +559,7 @@ class ProviderPrimitives:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.reference_store = InMemoryReferenceStore("desynced")
-        self.board_generation = 9
+        self.board_generation: int | None = 9
 
     def current_board_lifecycle_generation(self):
         return self.board_generation
@@ -1356,6 +1356,109 @@ def test_passive_projection_invalidates_stale_board_generation_without_dispatch(
 
     assert projection["lifecycle"]["state"] == "unprepared"
     assert projection["lifecycle"]["reference_state"] == "desynced"
+    assert projection["lifecycle"]["last_failure"]["failure"] == "x_board_lifecycle_generation_changed"
+    assert primitives.calls == []
+
+
+def test_restart_without_process_local_board_generation_preserves_pending_home_observation():
+    primitives = ProviderPrimitives()
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
+    home = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-before-restart"})
+    assert home["ok"] is True
+
+    primitives.board_generation = None
+    primitives.calls.clear()
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "awaiting_operator_observation"
+    assert projection["lifecycle"]["awaiting_observation_receipt_id"] == "x-home-before-restart"
+    assert projection["lifecycle"]["board_lifecycle_generation"] == 9
+    assert projection["lifecycle"]["last_failure"] is None
+    assert primitives.calls == []
+
+
+def test_restart_recovers_pending_home_observation_after_prior_projection_invalidation():
+    primitives = ProviderPrimitives()
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
+    home = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-recoverable"})
+    assert home["ok"] is True
+    state = provider._load_state()
+    state["x_lifecycle"].update(
+        {
+            "state": "unprepared",
+            "generation": None,
+            "board_lifecycle_generation": None,
+            "prepared_receipt": None,
+            "reference_state": "desynced",
+            "awaiting_observation_receipt_id": None,
+            "last_failure": {
+                "failure": "x_board_lifecycle_generation_changed",
+                "recorded_generation": 17,
+                "current_generation": 17,
+                "recorded_board_lifecycle_generation": 9,
+                "current_board_lifecycle_generation": None,
+            },
+        }
+    )
+    provider._save_state(state)
+    primitives.board_generation = None
+    primitives.calls.clear()
+
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "awaiting_operator_observation"
+    assert projection["lifecycle"]["generation"] == 17
+    assert projection["lifecycle"]["board_lifecycle_generation"] == 9
+    assert projection["lifecycle"]["awaiting_observation_receipt_id"] == "x-home-recoverable"
+    assert projection["lifecycle"]["last_failure"] is None
+    assert primitives.calls == []
+
+
+def test_restart_without_board_generation_still_invalidates_referenced_x():
+    primitives = ProviderPrimitives()
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+    seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced")
+    primitives.board_generation = None
+
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "unprepared"
+    assert projection["lifecycle"]["reference_state"] == "desynced"
+    assert projection["lifecycle"]["last_failure"]["failure"] == "x_board_lifecycle_generation_changed"
+    assert primitives.calls == []
+
+
+def test_restart_pending_home_without_controller_evidence_is_invalidated():
+    primitives = ProviderPrimitives()
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+    seed_x_lifecycle(provider, state="awaiting_operator_observation", reference_state="desynced")
+    state = provider._load_state()
+    state["x_lifecycle"].update(
+        {
+            "awaiting_observation_receipt_id": "x-home-incomplete",
+            "receipts": [
+                {
+                    "command_id": "x-home-incomplete",
+                    "receipt_id": "x-home-incomplete",
+                    "intent": "manual_panel_home",
+                    "motion_kind": "home",
+                    "status": "completed",
+                    "generation": 17,
+                    "board_lifecycle_generation": 9,
+                    "result": {"ok": True},
+                }
+            ],
+        }
+    )
+    provider._save_state(state)
+    primitives.board_generation = None
+
+    projection = provider.x_projection()
+
+    assert projection["lifecycle"]["state"] == "unprepared"
+    assert projection["lifecycle"]["awaiting_observation_receipt_id"] is None
     assert projection["lifecycle"]["last_failure"]["failure"] == "x_board_lifecycle_generation_changed"
     assert primitives.calls == []
 

@@ -4005,6 +4005,42 @@ class Serial206OemInitializationProvider:
             except Exception:
                 return self._corrupt_projection()
 
+    @staticmethod
+    def _recoverable_pending_x_home_receipt(
+        lifecycle: Mapping[str, Any],
+        *,
+        command_id: str | None,
+        generation: int,
+        board_lifecycle_generation: int,
+    ) -> Mapping[str, Any] | None:
+        if not isinstance(command_id, str) or not command_id:
+            return None
+        receipt = next(
+            (
+                row
+                for row in reversed(list(lifecycle.get("receipts") or []))
+                if isinstance(row, Mapping) and row.get("command_id") == command_id
+            ),
+            None,
+        )
+        result = receipt.get("result") if isinstance(receipt, Mapping) else None
+        if not (
+            isinstance(receipt, Mapping)
+            and receipt.get("receipt_id") == command_id
+            and receipt.get("intent") == "manual_panel_home"
+            and receipt.get("motion_kind") == "home"
+            and receipt.get("status") == "completed"
+            and receipt.get("generation") == generation
+            and receipt.get("board_lifecycle_generation") == board_lifecycle_generation
+            and isinstance(result, Mapping)
+            and result.get("ok") is True
+            and result.get("home_predicate_confirmed") is True
+            and result.get("controller_terminal_state_verified") is True
+            and result.get("reference_publication_required") is True
+        ):
+            return None
+        return receipt
+
     def x_projection(self) -> dict[str, Any]:
         with self._lock:
             try:
@@ -4019,12 +4055,74 @@ class Serial206OemInitializationProvider:
                     if callable(board_generation_provider)
                     else prepared_board_generation
                 )
+                last_failure = source_lifecycle.get("last_failure")
+                if (
+                    source_lifecycle.get("state") == "unprepared"
+                    and current_board_generation is None
+                    and isinstance(last_failure, Mapping)
+                    and last_failure.get("failure") == "x_board_lifecycle_generation_changed"
+                    and last_failure.get("recorded_generation") == current_generation
+                    and last_failure.get("current_generation") == current_generation
+                    and type(last_failure.get("recorded_board_lifecycle_generation")) is int
+                    and last_failure.get("current_board_lifecycle_generation") is None
+                ):
+                    recovered_generation = int(last_failure["recorded_generation"])
+                    recovered_board_generation = int(last_failure["recorded_board_lifecycle_generation"])
+                    recoverable_receipt = next(
+                        (
+                            row
+                            for row in reversed(list(source_lifecycle.get("receipts") or []))
+                            if isinstance(row, Mapping)
+                            and self._recoverable_pending_x_home_receipt(
+                                source_lifecycle,
+                                command_id=row.get("command_id") if isinstance(row.get("command_id"), str) else None,
+                                generation=recovered_generation,
+                                board_lifecycle_generation=recovered_board_generation,
+                            )
+                            is not None
+                        ),
+                        None,
+                    )
+                    if isinstance(recoverable_receipt, Mapping):
+                        recovered_receipt_id = recoverable_receipt.get("receipt_id")
+                        source_lifecycle.update({
+                            "state": "awaiting_operator_observation",
+                            "generation": recovered_generation,
+                            "board_lifecycle_generation": recovered_board_generation,
+                            "reference_state": "desynced",
+                            "active_receipt": None,
+                            "pending_ticket": None,
+                            "awaiting_observation_receipt_id": recovered_receipt_id,
+                            "last_failure": None,
+                        })
+                        self._save_state(state)
+                        lifecycle_generation = recovered_generation
+                        prepared_board_generation = recovered_board_generation
+                pending_home_receipt = self._recoverable_pending_x_home_receipt(
+                    source_lifecycle,
+                    command_id=(
+                        source_lifecycle.get("awaiting_observation_receipt_id")
+                        if isinstance(source_lifecycle.get("awaiting_observation_receipt_id"), str)
+                        else None
+                    ),
+                    generation=current_generation,
+                    board_lifecycle_generation=(
+                        prepared_board_generation
+                        if type(prepared_board_generation) is int
+                        else -1
+                    ),
+                )
                 generation_drift = bool(isinstance(lifecycle_generation, int) and lifecycle_generation != current_generation)
                 board_drift = bool(
                     source_lifecycle.get("state") != "unprepared"
                     and (
                         type(prepared_board_generation) is not int
                         or prepared_board_generation != current_board_generation
+                    )
+                    and not (
+                        source_lifecycle.get("state") == "awaiting_operator_observation"
+                        and current_board_generation is None
+                        and pending_home_receipt is not None
                     )
                 )
                 if (generation_drift or board_drift) and source_lifecycle.get("state") != "unprepared":
