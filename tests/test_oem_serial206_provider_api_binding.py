@@ -29,6 +29,18 @@ class PartialProvider:
     def z_projection(self):
         return {"available": True, "state": "prepared_unreferenced", "authority": type(self).__name__}
 
+    def z_command_lease(self):
+        provider = self
+
+        class Lease:
+            def __enter__(self):
+                provider.z_calls.append(("lease_enter", {}))
+
+            def __exit__(self, exc_type, exc, traceback):
+                provider.z_calls.append(("lease_exit", {}))
+
+        return Lease()
+
     def execute_z_intent(self, intent, **kwargs):
         self.z_calls.append((intent, kwargs))
         return {"ok": True, "z_state": "prepared_unreferenced", "authority_receipt": {"command_id": "z-1"}}
@@ -122,26 +134,37 @@ def test_z_mutations_are_rejected_outside_operator_dispatch_context(monkeypatch)
     assert exc.value.detail["error"] == "direct_z_mutation_retired"
 
 
-def test_operator_dispatch_context_reaches_provider_with_generation_and_idempotency(monkeypatch):
+@pytest.mark.parametrize(
+    ("intent", "inputs"),
+    (
+        ("move_steps", {"steps": 10}),
+        ("move_absolute", {"position_steps": 500}),
+    ),
+)
+def test_manual_z_move_dispatch_never_inserts_automatic_homing(monkeypatch, intent, inputs):
     provider = PartialProvider()
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", provider)
     token = operator_controls._DISPATCH_CONTEXT.set({
         "operator_command_id": "operator-1",
         "idempotency_key": "idem-1",
         "expected_ownership_generation": 11,
-        "action_id": "oem.z.move_steps",
+        "action_id": f"oem.z.{intent}",
     })
     try:
-        result = api._execute_provider_z_intent("move_steps", {"steps": 10})
+        result = api._execute_provider_z_intent(intent, inputs)
     finally:
         operator_controls._DISPATCH_CONTEXT.reset(token)
 
     assert result["ok"] is True
-    assert provider.z_calls == [("move_steps", {
-        "inputs": {"steps": 10, "command_id": "operator-1"},
-        "expected_generation": 11,
-        "idempotency_key": "idem-1",
-    })]
+    assert provider.z_calls == [
+        ("lease_enter", {}),
+        (intent, {
+            "inputs": {**inputs, "command_id": "operator-1"},
+            "expected_generation": 11,
+            "idempotency_key": "idem-1",
+        }),
+        ("lease_exit", {}),
+    ]
 
 
 def test_usb_ownership_sync_binds_and_clears_production_provider(monkeypatch):

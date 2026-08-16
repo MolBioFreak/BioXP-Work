@@ -79,4 +79,4 @@ exec "$UDOCKER_BIN" run \
   --volume=/run/udev:/run/udev \
   --workdir=/app \
   "$CONTAINER_NAME" \
-  /bin/sh -lc "PYTHONPATH=/app/src BIOXP_RUNTIME_OWNER=udocker-container BIOXP_RELEASE_SHA=$RELEASE_SHA BIOXP_RELEASE_TREE=$RELEASE_TREE BIOXP_RELEASE_SOURCE_MOUNT=/app BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port $PORT"
+  /bin/sh -lc "PYTHONPATH=/app/src BIOXP_RUNTIME_OWNER=udocker-container BIOXP_RELEASE_SHA=$RELEASE_SHA BIOXP_RELEASE_TREE=$RELEASE_TREE BIOXP_RELEASE_SOURCE_MOUNT=/app BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port $PORT"

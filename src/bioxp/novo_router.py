@@ -330,6 +330,7 @@ class NovoRouter:
                 "tx_frame_count": len(frames),
                 "tx_frames": [list(frame) for frame in frames],
                 "tx_write_timestamps": write_timestamps,
+                "tx_write_completed_at": write_timestamps[-1] if write_timestamps else tx_at,
                 **provenance,
                 "tx_write_policy": "one_frame_per_oem_sendcommand",
             }
@@ -413,6 +414,7 @@ class NovoRouter:
             tx_at = self._clock()
             try:
                 self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                tx_write_completed_at = self._clock()
             except Exception:
                 with self._pending_lock:
                     if self._pending is pending:
@@ -424,6 +426,7 @@ class NovoRouter:
                 "matcher": matcher_name,
                 "registration_timestamp": registered_at,
                 "tx_timestamp": tx_at,
+                "tx_write_completed_at": tx_write_completed_at,
                 "timeout_ms": int(round(float(timeout_s) * 1000.0)),
                 "tx_raw": list(raw_tx),
                 **provenance,

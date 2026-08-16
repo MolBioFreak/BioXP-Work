@@ -957,6 +957,85 @@ def test_post_maintenance_recovery_failure_preserves_block_and_fails_closed(monk
     assert api._maintenance_state_payload()["motion_blocked"] is True
 
 
+def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkeypatch):
+    api = load_api(monkeypatch)
+
+    class FakeTester:
+        pass
+
+    api._tester = FakeTester()
+    monkeypatch.setattr(
+        api.Serial206MotionAuthority,
+        "from_active_snapshot",
+        classmethod(lambda cls: object()),
+    )
+    monkeypatch.setattr(
+        api,
+        "prepare_motion_without_motion",
+        lambda tester, authority: {"ok": True, "physical_motion_commanded": False},
+    )
+    monkeypatch.setattr(
+        api,
+        "_execute_provider_z_intent",
+        lambda intent, inputs: {
+            "ok": True,
+            "receipt": {
+                "status": "completed",
+                "result": {"ok": True, "physical_motion": False},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        api.hardware_state,
+        "publish_can_ready_from_preparation",
+        lambda **kwargs: {
+            "published": True,
+            "already_ready": False,
+            "ownership_epoch": kwargs["expected_ownership_epoch"],
+        },
+    )
+    api._set_maintenance_state(
+        transition="test_recovery_complete",
+        motion_blocked=False,
+        recovery_required=False,
+        block_reason=None,
+        recovery_hint=None,
+        blocked_by=None,
+    )
+
+    result = asyncio.run(api.motion_oem_prepare_without_motion())
+
+    assert result["ok"] is True
+    assert result["maintenance_state"]["motion_blocked"] is False
+    assert result["maintenance_state"]["recovery_required"] is False
+
+
+def test_preparation_can_ready_publication_requires_same_owned_epoch():
+    from src.bioxp.hardware_status import HardwareStateOwner
+
+    owner = HardwareStateOwner()
+    epoch = owner.change_ownership(
+        reason="test_service_claim",
+        transport="owned",
+        usb="service",
+        router="running",
+    )
+
+    published = owner.publish_can_ready_from_preparation(
+        expected_ownership_epoch=epoch,
+        reason="test_preparation_completed",
+    )
+    assert published["published"] is True
+    assert owner.ownership_projection()["ownership"]["CAN_READY"] is True
+
+    owner.change_ownership(reason="new_owner", transport="owned", usb="service", router="running")
+    stale = owner.publish_can_ready_from_preparation(
+        expected_ownership_epoch=epoch,
+        reason="stale_preparation",
+    )
+    assert stale == {"published": False, "reason": "ownership_epoch_changed"}
+
+
 def test_service_start_defaults_to_pending_non_homing_recovery(monkeypatch):
     api = load_api(monkeypatch, startup_recovered=False)
 

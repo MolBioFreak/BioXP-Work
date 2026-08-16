@@ -16,6 +16,12 @@ from .oem_machine_bundle import OEM_MACHINE_SERIAL, get_active_oem_machine_snaps
 PREPARE_SCHEMA = "bioxp.oem_prepare_without_motion.v2"
 STOP_SCHEMA = "bioxp.physical_aggregate_stop.v1"
 
+# One immutable serial-206 machine adaptation contract.  The recovered X
+# initializer does not write either mask; recovery writes SAP12=1 separately
+# and preparation/motion/status only verify this effective tuple.
+SERIAL206_X_SWITCH_MASKS = {12: 1, 13: 0}
+SERIAL206_Z_SWITCH_MASKS = {12: 1, 13: 0}
+
 # ClassControlInterface construction for the accepted BioXP 3200 serial-206 machine.
 # Board 7 is the chiller/temperature controller.  Its status-2 reply to command 64 is
 # not a motor-board activation ACK and is therefore represented explicitly rather
@@ -300,39 +306,49 @@ def prepare_motion_without_motion(
         invalidate_profile("initialize_without_motion_evidence_failed")
         return _preparation_result(authority, ledger)
 
-    # The serial-206 Z source writes neither SAP12 nor SAP13 and relies on
-    # persistent machine configuration. GAP10/right is asserted at GAP9 top on
-    # this machine, so its inhibit must be disabled while GAP9/left stays enabled.
-    # Preparation verifies but never repairs that state implicitly.
-    mask_evidence: dict[str, Any] = {"board": 4, "motor": 1, "writes": {}}
-    mask_ok = True
-    if "z" in selected:
+    # The serial-206 X and Z source sequences write neither SAP12 nor SAP13.
+    # Their machine-bound mask policy is verified here and repaired only through
+    # the separately admitted recovery transaction.
+    mask_contracts = {
+        "x": SERIAL206_X_SWITCH_MASKS,
+        "z": SERIAL206_Z_SWITCH_MASKS,
+    }
+    for axis, board, motor in (("x", 5, 0), ("z", 4, 1)):
+        if axis not in selected:
+            continue
+        expected_masks = mask_contracts[axis]
         mask_rows: dict[str, Any] = {}
-        expected_masks = {12: 1, 13: 0}
+        mask_ok = True
         for parameter, label in ((12, "right_disable_param12"), (13, "left_disable_param13")):
             try:
-                row = driver.motor_get_axis_param(4, parameter, motor=1)
+                row = driver.motor_get_axis_param(board, parameter, motor=motor)
             except Exception as exc:
                 row = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
             mask_rows[label] = row
             if _ack_status(row) != 100 or row.get("value") != expected_masks[parameter]:
                 mask_ok = False
-        mask_evidence.update({
+        mask_evidence = {
+            "board": board,
+            "motor": motor,
+            "writes": {},
             "readbacks": mask_rows,
             "source_sequence_modified": False,
-            "blocker": None if mask_ok else "z_switch_mask_incompatible",
+            "blocker": None if mask_ok else f"{axis}_switch_mask_incompatible",
             "machine_bound_expected": expected_masks,
-            "source_anchor": "ClassMotor param12 right-disable; param13 left-disable; serial-206 Z source omits both writes",
-        })
-    ledger.append(_stage(
-        "z_switch_mask_precondition",
-        "passed" if mask_ok else "failed",
-        "effective serial-206 OEM Z switch-mask precondition",
-        mask_evidence,
-    ))
-    if not mask_ok:
-        invalidate_profile("switch_mask_precondition_failed")
-        return _preparation_result(authority, ledger)
+            "source_anchor": (
+                "ClassMotor param12 right-disable; param13 left-disable; "
+                f"serial-206 {axis.upper()} source omits both writes"
+            ),
+        }
+        ledger.append(_stage(
+            f"{axis}_switch_mask_precondition",
+            "passed" if mask_ok else "failed",
+            f"effective serial-206 OEM {axis.upper()} switch-mask precondition",
+            mask_evidence,
+        ))
+        if not mask_ok:
+            invalidate_profile(f"{axis}_switch_mask_precondition_failed")
+            return _preparation_result(authority, ledger)
 
     readbacks: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -443,7 +459,17 @@ def physical_aggregate_stop(
         speed = terminal.get("terminal_speed") if isinstance(terminal, Mapping) else None
         if speed is None and isinstance(terminal, Mapping):
             speed = terminal.get("speed")
-        zero_speed = bool(isinstance(terminal, Mapping) and terminal.get("ok") is True and type(speed) is int and speed == 0)
+        if speed is None and isinstance(terminal, Mapping):
+            speed = terminal.get("last_speed")
+        terminal_completion_verified = bool(
+            isinstance(terminal, Mapping)
+            and (
+                terminal.get("stopped") is True
+                if "stopped" in terminal
+                else terminal.get("ok") is True
+            )
+        )
+        zero_speed = bool(terminal_completion_verified and type(speed) is int and speed == 0)
         verified = row["stop_acknowledged"] is True and zero_speed
         row.update({
             "status": "stopped" if verified else "failed",
