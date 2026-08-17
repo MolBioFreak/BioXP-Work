@@ -211,9 +211,124 @@ _reference_state_store = ReferenceStateStore(
 )
 _pipette_transport = None
 _pipette_receipts = PipetteReceiptStore()
-_pipette_application = PipetteApplicationPlanner()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
+
+
+def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
+    provider = _serial206_oem_initialization_provider
+    pipette = _pipette_transport
+    ownership_epoch = int(getattr(hardware_state, "ownership_epoch", 0)) if "hardware_state" in globals() else 0
+
+    def snapshot_generation(payload: Mapping[str, Any] | None, fallback: int) -> int:
+        if isinstance(payload, Mapping):
+            for key in ("generation", "reference_generation", "ownership_epoch", "reader_generation"):
+                value = payload.get(key)
+                if isinstance(value, int):
+                    return value
+        return int(fallback)
+
+    def payload_blockers(payload: Mapping[str, Any] | None, unavailable: str) -> list[str]:
+        if not isinstance(payload, Mapping):
+            return [unavailable]
+        blockers = payload.get("blockers")
+        rows = [str(item) for item in blockers] if isinstance(blockers, list) else []
+        if payload.get("available") is False and unavailable not in rows:
+            rows.append(unavailable)
+        return rows
+
+    provider_status = serial206_oem_initialization_provider_status() if provider is not None else {}
+    x_state = provider_status.get("x_authority") if isinstance(provider_status.get("x_authority"), Mapping) else {}
+    z_state = provider_status.get("z_authority") if isinstance(provider_status.get("z_authority"), Mapping) else {}
+
+    try:
+        deck_layout = load_deck_layout()
+        deck_state: dict[str, Any] = {
+            "deck_identity": hashlib.sha256(
+                json.dumps(deck_layout, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest(),
+            "location_state": {"representation": str(deck_layout)},
+        }
+        deck_blockers: list[str] = []
+    except Exception as exc:
+        deck_state = {"deck_identity": None, "location_state": None, "error": str(exc)}
+        deck_blockers = ["deck_layout_unavailable"]
+
+    cached_channels: list[dict[str, Any]] = []
+    reader_generations: list[int] = []
+    if pipette is not None:
+        for channel, transport in enumerate(getattr(pipette, "_transports", [])):
+            cached_channels.append({
+                "channel": channel,
+                "tip": getattr(transport, "_last_tip_status", None),
+                "pressure": getattr(transport, "_last_pressure", None),
+            })
+            driver = getattr(transport, "_driver", None)
+            router = getattr(getattr(driver, "bus", None), "router", None)
+            generation = getattr(router, "reader_generation", None)
+            if isinstance(generation, int):
+                reader_generations.append(generation)
+    transport_generation = max(reader_generations) if reader_generations else ownership_epoch
+
+    plate_strip_state: dict[str, Any] = {}
+    if "hardware_state" in globals():
+        for domain in ("pipette", "plate", "strip"):
+            try:
+                plate_strip_state[domain] = hardware_state.project(domain)
+            except Exception as exc:
+                plate_strip_state[domain] = {"available": False, "error": str(exc)}
+
+    provider_bound = provider is not None
+    pipette_bound = pipette is not None
+    return {
+        "deck": {
+            "bound": callable(load_deck_layout) and not deck_blockers,
+            "authority": "domain.deck.load_deck_layout",
+            "generation": ownership_epoch,
+            "state": deck_state,
+            "blockers": deck_blockers,
+        },
+        "gantry": {
+            "bound": provider_bound,
+            "authority": "Serial206OemInitializationProvider.xy" if provider_bound else None,
+            "generation": snapshot_generation(x_state, ownership_epoch),
+            "state": dict(x_state),
+            "blockers": payload_blockers(x_state, "gantry_reference_unavailable") if provider_bound else ["serial206_provider_not_bound"],
+        },
+        "z": {
+            "bound": bool(provider_bound and callable(getattr(provider, "execute_z_intent", None))),
+            "authority": "Serial206OemInitializationProvider.z" if provider_bound else None,
+            "generation": snapshot_generation(z_state, ownership_epoch),
+            "state": dict(z_state),
+            "blockers": payload_blockers(z_state, "z_reference_unavailable") if provider_bound else ["serial206_provider_not_bound"],
+        },
+        "pressure": {
+            "bound": pipette_bound,
+            "authority": "FourPipetteTransport.pressure" if pipette_bound else None,
+            "generation": transport_generation,
+            "state": {"tip_waste_state": cached_channels},
+            "blockers": [] if pipette_bound else ["pipette_transport_not_bound"],
+        },
+        "pipette": {
+            "bound": pipette_bound,
+            "authority": "FourPipetteTransport" if pipette_bound else None,
+            "generation": transport_generation,
+            "state": {"transport_owner_generation": transport_generation, "channels": cached_channels},
+            "blockers": [] if pipette_bound else ["pipette_transport_not_bound"],
+        },
+        "machine_state": {
+            "bound": "hardware_state" in globals(),
+            "authority": "hardware_state" if "hardware_state" in globals() else None,
+            "generation": ownership_epoch,
+            "state": {"plate_strip_state": plate_strip_state},
+            "blockers": [] if "hardware_state" in globals() else ["hardware_state_not_bound"],
+        },
+    }
+
+
+_pipette_application = PipetteApplicationPlanner(
+    dependency_resolver=_pipette_application_dependencies,
+)
 
 
 def bind_serial206_oem_initialization_provider(
@@ -2102,6 +2217,10 @@ class PipetteDataRequest(BaseModel):
 
 class PipetteFluidDetectionRequest(BaseModel):
     dry_run: bool = True
+
+
+class PipetteReadbackRequest(BaseModel):
+    include_data: bool = False
 
 
 class PipetteApplicationPlanRequest(BaseModel):
@@ -8359,20 +8478,37 @@ async def liquid_application_plan(req: PipetteApplicationPlanRequest):
     if req.operation == "load_tip":
         if req.tip_tray is None or req.tip_well is None or req.tip_type is None or req.tip_location is None:
             raise HTTPException(status_code=422, detail="load_tip requires tip_tray, tip_well, tip_type, and tip_location")
-        return _pipette_application.plan_load_tip(
+        plan = _pipette_application.plan_load_tip(
             tip_tray=req.tip_tray,
             tip_well=req.tip_well,
             tip_type=req.tip_type,
             tip_location=req.tip_location,
             home_z_after=req.home_z_after,
         )
-    if req.operation == "move_to_waste":
-        return _pipette_application.plan_move_to_waste()
-    if req.operation == "detect_fluid":
+    elif req.operation == "move_to_waste":
+        plan = _pipette_application.plan_move_to_waste()
+    elif req.operation == "detect_fluid":
         if req.fluid_class is None:
             raise HTTPException(status_code=422, detail="detect_fluid requires fluid_class")
-        return _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
-    return _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
+        plan = _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
+    else:
+        plan = _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
+    requested = req.model_dump(exclude_none=True)
+    receipt = _pipette_receipts.record(
+        operation=f"application_plan:{req.operation}",
+        requested_inputs=requested,
+        result=plan,
+        runtime_binding={
+            "owner": "PipetteApplicationPlanner",
+            "mode": "plan_only",
+            "dependencies": plan.get("dependencies", {}),
+        },
+    )
+    return {
+        **plan,
+        "receipt_id": receipt["receipt_id"],
+        "receipt_truth": receipt["truth"],
+    }
 
 
 @app.get("/liquid/status")
@@ -8387,6 +8523,35 @@ async def liquid_status():
         "truth_source": "hardware_state_projection_only",
         "latest_receipt": _pipette_receipts.latest(),
         "application": _pipette_application.status(),
+    }
+
+
+@app.post("/liquid/readback")
+async def liquid_readback(req: PipetteReadbackRequest):
+    result = await _run_blocking(
+        "OEM four-pipette live readback",
+        lambda: _get_pipette_transport().readback_all(include_data=req.include_data),
+        timeout_s=180.0 if req.include_data else 60.0,
+    )
+    receipt = _pipette_receipts.record(
+        operation="live_readback",
+        requested_inputs=req.model_dump(),
+        effective_inputs={
+            "include_data": bool(req.include_data),
+            "channel_count": result.get("channel_count"),
+            "live_query_performed": result.get("live_query_performed"),
+        },
+        result=result,
+        runtime_binding={
+            "owner": "shared_bioxp_tester_pipette",
+            "transport_owner_bound": True,
+            "query_only": True,
+        },
+    )
+    return {
+        **result,
+        "receipt_id": receipt["receipt_id"],
+        "receipt_truth": receipt["truth"],
     }
 
 

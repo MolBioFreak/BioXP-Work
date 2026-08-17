@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from typing import Any, cast
+import time
+
+import pytest
 
 from src.bioxp.pipette.models import PipetteAspirateCommand, PipetteDiagnosticCommand
-from src.bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport
+from src.bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport, PipetteCommandError
 
 
 class FakeTransport:
     def __init__(self, channel: int, *, tip_loaded: bool = False, speed: float = 10.0):
         self.channel = channel
         self._tip_loaded = tip_loaded
+        self._last_tip_status = {
+            "ok": True,
+            "semantic_ok": True,
+            "hardware_truth_level": "hardware_query",
+            "tip_loaded": tip_loaded,
+            "observed_at": time.time(),
+            "reader_generation": 1,
+        }
         self._top_speed = speed
+        self._reader_generation = 1
         self._error_callback = None
         self.calls: list[tuple[str, object]] = []
 
@@ -21,7 +33,7 @@ class FakeTransport:
 
     def query_pressure(self):
         self.calls.append(("query_pressure", None))
-        return {"ok": True, "pressure": float(self.channel)}
+        return {"ok": True, "semantic_ok": True, "pressure": float(self.channel)}
 
     def execute_diagnoses(self, command, *, wait_for_completion: bool):
         self.calls.append(("execute_diagnoses", (command.number, wait_for_completion)))
@@ -33,7 +45,7 @@ class FakeTransport:
 
     def get_data(self, query: str):
         self.calls.append(("get_data", query))
-        return {"ok": True, "query": query, "value": f"{self.channel}:{query}"}
+        return {"ok": True, "semantic_ok": True, "query": query, "value": f"{self.channel}:{query}"}
 
 
 def collection(*, tips=(False, False, False, False), speeds=(10.0, 10.0, 10.0, 10.0)):
@@ -41,18 +53,23 @@ def collection(*, tips=(False, False, False, False), speeds=(10.0, 10.0, 10.0, 1
         FakeTransport(channel, tip_loaded=tips[channel], speed=speeds[channel])
         for channel in range(4)
     ]
-    return FourPipetteTransport(cast(Any, transports), sleep=lambda _seconds: None), transports
+    return FourPipetteTransport(
+        cast(Any, transports),
+        sleep=lambda _seconds: None,
+        liquid_mutation_enabled=True,
+    ), transports
 
 
 def test_default_liquid_channel_selection_uses_oem_tip_location():
     subject, _ = collection()
     subject.loadTip(200, 2)
 
-    assert subject._channels_from_metadata(None) == [2]
+    assert subject._channels_from_metadata({"selection_mode": "tip_location"}) == [2]
     assert subject._channels_from_metadata({"channels": [0, 3]}) == [0, 3]
 
     subject.loadTip(200, -1)
-    assert subject._channels_from_metadata(None) == [0, 1, 2, 3]
+    with pytest.raises(PipetteCommandError, match="unresolved"):
+        subject._channels_from_metadata({"selection_mode": "tip_location"})
 
 
 def test_set_top_speed_skips_channels_without_tips_and_honors_oem_early_return():
@@ -103,7 +120,7 @@ def test_group_host_accounting_waits_for_correlated_channel_completion():
 
         @staticmethod
         def query_tip_status():
-            return {"ok": True, "tip_loaded": True, "hardware_truth_level": "hardware_query"}
+            return {"ok": True, "semantic_ok": True, "tip_loaded": True, "hardware_truth_level": "hardware_query"}
 
         @staticmethod
         def aspirate(*args, **kwargs):
@@ -112,9 +129,9 @@ def test_group_host_accounting_waits_for_correlated_channel_completion():
                 "ok": True,
                 "tx_ok": True,
                 "delivery_verified": True,
-                "controller_acknowledged": False,
+                "controller_acknowledged": True,
                 "completion_verified": False,
-                "provenance": {"outcome": "tx_only"},
+                "provenance": {"outcome": "ack"},
             }
 
         @staticmethod
@@ -134,7 +151,9 @@ def test_group_host_accounting_waits_for_correlated_channel_completion():
         liquid_mutation_enabled=True,
     )
 
-    result = subject.aspirate(PipetteAspirateCommand(volume_ul=5.0))
+    result = subject.aspirate(
+        PipetteAspirateCommand(volume_ul=5.0, metadata={"channels": [0, 1, 2, 3]})
+    )
 
     assert result["ok"] is True
     assert result["delivery_verified"] is True

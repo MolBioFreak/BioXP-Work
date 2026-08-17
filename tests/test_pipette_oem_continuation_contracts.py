@@ -15,7 +15,8 @@ def test_driver_process_message_publishes_nonzero_oem_error_event():
 
     result = driver.process_pipette_message(
         3,
-        [0x20, 0x60, 0x07],
+        [0x07, 0x60, 0x00],
+        arbitration_id=0x519,
         command_name="dispense",
     )
 
@@ -41,7 +42,12 @@ def test_four_channel_collection_publishes_driver_errors_and_retains_last_error(
         )
     collection = FourPipetteTransport(transports, error_callback=lambda channel, code: callbacks.append((channel, code)))
     driver = collection._transports[2]._get_driver()
-    result = driver.process_pipette_message(3, [0x20, 0x60, 0x07], command_name="dispense")
+    result = driver.process_pipette_message(
+        3,
+        [0x07, 0x60, 0x00],
+        arbitration_id=0x511,
+        command_name="dispense",
+    )
 
     assert result["oem_error_code"] == 0x07
     assert callbacks == [(2, 0x07)]
@@ -129,7 +135,11 @@ def test_eject_all_tips_retries_remaining_tips_like_oem_verify_eject():
         for channel, driver in enumerate(drivers)
     ]
     sleeps = []
-    collection = FourPipetteTransport(transports, sleep=sleeps.append)
+    collection = FourPipetteTransport(
+        transports,
+        sleep=sleeps.append,
+        liquid_mutation_enabled=True,
+    )
     for transport in transports:
         transport._initialized = True
 
@@ -233,7 +243,9 @@ def test_group_mix_uses_per_command_completion_for_composite_oem_mix():
         transport._initialized = True
     collection = FourPipetteTransport(transports, sleep=lambda _seconds: None, liquid_mutation_enabled=True)
 
-    result = collection.mix(PipetteMixCommand(volume_ul=2.0, cycles=2))
+    result = collection.mix(
+        PipetteMixCommand(volume_ul=2.0, cycles=2, metadata={"channels": [0, 1, 2, 3]})
+    )
 
     assert result["ok"] is True
     assert result["wait_policy"] == "per_command_completion"

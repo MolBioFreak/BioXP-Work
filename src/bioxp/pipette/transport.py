@@ -330,6 +330,16 @@ class CanPipetteTransport:
                 ) from exc
             result = {"ok": False, "error": str(exc)}
         if isinstance(result, dict):
+            result = dict(result)
+            provenance = result.get("provenance")
+            reader_generation = (
+                provenance.get("reader_generation", provenance.get("owner_generation"))
+                if isinstance(provenance, Mapping)
+                else result.get("reader_generation")
+            )
+            result["observed_at"] = time.time()
+            result["reader_generation"] = reader_generation
+            self._reader_generation = reader_generation
             self._last_tip_status = result
             if result.get("ok") and "tip_loaded" in result:
                 self._tip_loaded = bool(result.get("tip_loaded"))
@@ -772,12 +782,22 @@ class CanPipetteTransport:
     def get_data(self, query: str) -> dict[str, Any]:
         result = self._get_driver().get_data(query)
         self._last_transaction = result
-        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "query": str(query), "result": result, "hardware_truth_level": "hardware_query"}
+        semantic_ok = bool(
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("semantic_ok") is True
+        )
+        return {"ok": semantic_ok, "semantic_ok": semantic_ok, "query": str(query), "result": result, "hardware_truth_level": "hardware_query"}
 
-    def get_all_data(self, queries: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    def get_all_data(
+        self,
+        queries: list[str] | tuple[str, ...],
+        *,
+        wake_if_needed: bool = True,
+    ) -> dict[str, Any]:
         driver = self._get_driver()
         wake = None
-        if not self._initialized:
+        if wake_if_needed and not self._initialized:
             wake_byte = 0x20 | int(self._pipette_id)
             wake = driver._send_packet(
                 0x080,
@@ -786,12 +806,24 @@ class CanPipetteTransport:
             )
         results = [driver.get_data(query, wake_if_needed=False) for query in queries]
         self._last_transaction = {"wake": wake, "results": results}
+        semantic_ok = bool(
+            len(results) == len(queries)
+            and all(
+                isinstance(result, dict)
+                and result.get("ok") is True
+                and result.get("semantic_ok") is True
+                and result.get("query") == str(query)
+                for query, result in zip(queries, results)
+            )
+        )
         return {
-            "ok": all(isinstance(result, dict) and result.get("ok") is True for result in results),
+            "ok": semantic_ok,
+            "semantic_ok": semantic_ok,
             "wake": wake,
             "queries": list(queries),
             "results": results,
             "wake_count": 1 if wake is not None else 0,
+            "wake_if_needed": bool(wake_if_needed),
             "oem_source_anchor": "ClassPipette.getData:211-261",
         }
 
@@ -823,6 +855,7 @@ class FourPipetteTransport:
     """Production ClassPipetteCollection-shaped owner for channels 0..3."""
 
     CHANNELS = (0, 1, 2, 3)
+    TIP_STATUS_FRESHNESS_S = 5.0
     OEM_DATA_QUERIES = (
         "?40", "?41", "?42", "?44", "?45", "?47",
         "?51", "?52", "?53", "?54", "?55", "?58", "?59",
@@ -904,7 +937,87 @@ class FourPipetteTransport:
             "physical_effect_verified": False,
         }
 
+    def readback_all(self, *, include_data: bool = False) -> dict[str, Any]:
+        """Actively query all four pipettes without sending a command-family mutation."""
+        rows: list[dict[str, Any]] = []
+        with self._transaction_lock:
+            for channel, transport in enumerate(self._transports):
+                driver = transport._get_driver()
+                firmware = driver.query_firmware(1)
+                status = driver.query_status()
+                tip = transport._safe_query_tip_status(driver, required=True)
+                pressure = None
+                if (
+                    isinstance(tip, Mapping)
+                    and tip.get("ok") is True
+                    and tip.get("semantic_ok") is True
+                    and tip.get("tip_loaded") is True
+                ):
+                    pressure = driver.query_pressure()
+                    if isinstance(pressure, Mapping):
+                        transport._last_pressure = dict(pressure)
+                data = transport.get_all_data(
+                    list(self.OEM_DATA_QUERIES),
+                    wake_if_needed=False,
+                ) if include_data else None
+                semantic_ok = bool(
+                    isinstance(firmware, Mapping)
+                    and firmware.get("ok") is True
+                    and firmware.get("semantic_ok") is True
+                    and isinstance(status, Mapping)
+                    and status.get("ok") is True
+                    and status.get("semantic_ok") is True
+                    and isinstance(tip, Mapping)
+                    and tip.get("ok") is True
+                    and tip.get("semantic_ok") is True
+                    and (
+                        pressure is None
+                        or (
+                            isinstance(pressure, Mapping)
+                            and pressure.get("ok") is True
+                            and pressure.get("semantic_ok") is True
+                        )
+                    )
+                    and (
+                        data is None
+                        or (
+                            isinstance(data, Mapping)
+                            and data.get("ok") is True
+                            and data.get("semantic_ok") is True
+                        )
+                    )
+                )
+                rows.append({
+                    "channel": channel,
+                    "semantic_ok": semantic_ok,
+                    "firmware": firmware,
+                    "status": status,
+                    "tip": tip,
+                    "pressure": pressure,
+                    "data": data,
+                })
+                self._sleep(0.030)
+        ok = bool(len(rows) == 4 and all(row["semantic_ok"] for row in rows))
+        return {
+            "ok": ok,
+            "semantic_ok": ok,
+            "available": ok,
+            "channel_count": 4,
+            "channels_constructed_unconditionally": [0, 1, 2, 3],
+            "channels": rows,
+            "include_data": bool(include_data),
+            "live_query_performed": True,
+            "truth_source": "live_hardware_queries",
+            "delivery_verified": False,
+            "controller_acknowledged": False,
+            "completion_verified": False,
+            "hardware_postcondition_verified": False,
+            "physical_effect_verified": False,
+            "oem_source_anchor": "ClassPipetteCollection constructor/readback; ClassPipette QueryFirmware/Q1/?31/?57/getData",
+        }
+
     def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
+        self._require_physical_command_admission(cycle)
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
             driver = transport._get_driver()
@@ -1115,15 +1228,64 @@ class FourPipetteTransport:
             raise ValueError("channels must not contain duplicates")
         return selected
 
+    def _tip_eligibility(
+        self,
+        channels: list[int] | tuple[int, ...] | None = None,
+    ) -> tuple[list[int], dict[int, dict[str, Any]]]:
+        selected = self._selected_channels(channels)
+        eligible: list[int] = []
+        ledger: dict[int, dict[str, Any]] = {}
+        now = time.time()
+        for channel in selected:
+            transport = self._transports[channel]
+            status = transport._last_tip_status
+            observed_at = status.get("observed_at") if isinstance(status, Mapping) else None
+            generation = status.get("reader_generation") if isinstance(status, Mapping) else None
+            driver = getattr(transport, "__dict__", {}).get("_driver")
+            router = getattr(getattr(driver, "bus", None), "router", None)
+            current_generation = getattr(router, "reader_generation", None)
+            if not isinstance(current_generation, int):
+                current_generation = getattr(transport, "_reader_generation", None)
+            if not isinstance(status, Mapping):
+                reason = "missing_tip_observation"
+            elif status.get("ok") is not True or status.get("semantic_ok") is not True:
+                reason = "invalid_tip_observation"
+            elif status.get("hardware_truth_level") != "hardware_query":
+                reason = "non_hardware_tip_observation"
+            elif not isinstance(observed_at, (int, float)) or now - float(observed_at) > self.TIP_STATUS_FRESHNESS_S:
+                reason = "stale_tip_observation"
+            elif not isinstance(generation, int):
+                reason = "missing_reader_generation"
+            elif not isinstance(current_generation, int):
+                reason = "missing_current_reader_generation"
+            elif generation != current_generation:
+                reason = "reader_generation_mismatch"
+            elif status.get("tip_loaded") is not True:
+                reason = "tip_not_loaded"
+            else:
+                reason = "eligible"
+                eligible.append(channel)
+            ledger[channel] = {
+                "channel": channel,
+                "eligible": reason == "eligible",
+                "reason": reason,
+                "observed_at": observed_at,
+                "reader_generation": generation,
+                "current_reader_generation": current_generation,
+                "freshness_limit_s": self.TIP_STATUS_FRESHNESS_S,
+            }
+        return eligible, ledger
+
     def _cached_tip_channels(
         self,
         channels: list[int] | tuple[int, ...] | None = None,
     ) -> list[int]:
-        selected = self._selected_channels(channels)
-        return [channel for channel in selected if self._transports[channel]._tip_loaded is True]
+        eligible, _ledger = self._tip_eligibility(channels)
+        return eligible
 
     def reinitialize_pipette(self) -> dict[str, Any]:
         """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait."""
+        self._require_physical_command_admission("reinitialize")
         with self._transaction_lock:
             sends: list[dict[str, Any]] = []
             for channel, transport in enumerate(self._transports):
@@ -1179,27 +1341,43 @@ class FourPipetteTransport:
         return self.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
 
     def read_pressure(self, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._cached_tip_channels(channels)
+        selected, eligibility = self._tip_eligibility(channels)
         rows = [{"channel": channel, "result": self._transports[channel].query_pressure()} for channel in selected]
         return {
-            "ok": all(row["result"].get("ok") is True for row in rows),
+            "ok": bool(selected) and all(
+                row["result"].get("ok") is True and row["result"].get("semantic_ok") is True
+                for row in rows
+            ),
             "channels": rows,
             "channel_count": len(rows),
+            "eligibility_source": "semantic_hardware_tip_readback",
+            "eligibility": eligibility,
             "hardware_truth_level": "hardware_query",
             "oem_source_anchor": "ClassPipetteCollection.readPressure:248-258; ClassPipette.QueryPressure:622-628",
         }
 
     def set_top_speed(self, velocity: float, channels: list[int] | None = None) -> dict[str, Any]:
+        self._require_physical_command_admission("set_top_speed")
         value = float(velocity)
+        selected, eligibility = self._tip_eligibility(channels)
+        if not selected:
+            return {
+                "ok": False,
+                "outcome": "no_eligible_channels",
+                "velocity": value,
+                "channels": [],
+                "eligibility": eligibility,
+                "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed",
+            }
         if float(self._transports[0]._top_speed) == value:
             return {
                 "ok": True,
                 "outcome": "unchanged_channel_zero_speed",
                 "velocity": value,
-                "channels": [],
+                "channels": selected,
+                "eligibility": eligibility,
                 "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed:756-758",
             }
-        selected = self._cached_tip_channels(channels)
         with self._transaction_lock:
             rows = []
             for channel in selected:
@@ -1207,9 +1385,10 @@ class FourPipetteTransport:
                 rows.append({"channel": channel, "result": result})
                 self._sleep(0.010)
             return {
-                "ok": all(row["result"].get("ok") for row in rows),
+                "ok": bool(rows) and all(row["result"].get("ok") for row in rows),
                 "velocity": value,
                 "channels": rows,
+                "eligibility": eligibility,
                 "oem_source_anchor": "ClassPipetteCollection.SetTopSpeed",
             }
 
@@ -1224,7 +1403,18 @@ class FourPipetteTransport:
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1"}
 
     def execute_diagnoses(self, command: PipetteDiagnosticCommand, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._cached_tip_channels(channels)
+        self._require_physical_command_admission("diagnoses")
+        selected, eligibility = self._tip_eligibility(channels)
+        if not selected:
+            return {
+                "ok": False,
+                "outcome": "no_eligible_channels",
+                "channels": [],
+                "diagnoses": [],
+                "eligibility": eligibility,
+                "requested": command.to_payload(),
+                "oem_source_anchor": "ClassPipetteCollection.diagnoses:261-283",
+            }
         with self._transaction_lock:
             rows: list[dict[str, Any]] = []
             for position, channel in enumerate(selected):
@@ -1240,7 +1430,7 @@ class FourPipetteTransport:
                 row["completion"] = completion
                 state = completion.get("pipette_message_state", {}) if isinstance(completion, dict) else {}
                 diagnoses.append({"channel": channel, "diagnosis": state.get("diagnosis"), "completion": completion})
-            ok = all(
+            ok = bool(rows) and all(
                 row["result"].get("ok") is True and row.get("completion", {}).get("ok") is True
                 for row in rows
             )
@@ -1248,6 +1438,7 @@ class FourPipetteTransport:
                 "ok": ok,
                 "channels": rows,
                 "diagnoses": diagnoses,
+                "eligibility": eligibility,
                 "requested": command.to_payload(),
                 "timeout_ms": 4_000,
                 "wait_policy": "shared_deadline_after_all_selected_diagnosis_sends",
@@ -1269,20 +1460,39 @@ class FourPipetteTransport:
             else:
                 results = [transport.get_data(item) for item in queries]
             rows.append({"channel": channel, "results": results, "aggregate": aggregate})
-        return {
-            "ok": all(
-                result.get("ok") is True
+        expected_query_count = len(queries)
+        semantic_ok = bool(
+            len(rows) == len(selected)
+            and len(rows) > 0
+            and all(
+                len(row["results"]) == expected_query_count
+                and all(
+                    result.get("ok") is True
+                    and result.get("semantic_ok") is True
+                    and result.get("query") == expected_query
+                    for expected_query, result in zip(queries, row["results"])
+                )
+                and (
+                    row["aggregate"] is None
+                    or row["aggregate"].get("semantic_ok") is True
+                )
                 for row in rows
-                for result in row["results"]
-            ),
+            )
+        )
+        return {
+            "ok": semantic_ok,
+            "semantic_ok": semantic_ok,
             "channels": rows,
             "query": None if query is None else str(query),
             "queries": queries,
+            "expected_channel_count": len(selected),
+            "expected_query_count": expected_query_count,
             "aggregate_oem_sweep": query is None,
             "oem_source_anchor": "ClassPipette.getData:211-261",
         }
 
     def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
+        self._require_physical_command_admission("terminate")
         with self._transaction_lock:
             rows = [{"channel": channel, "result": transport.terminate(command)} for channel, transport in enumerate(self._transports)]
             self._allow_to_stop = True
@@ -1296,6 +1506,7 @@ class FourPipetteTransport:
             }
 
     def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]:
+        self._require_physical_command_admission("heartbeat")
         rows = [{"channel": channel, "result": transport.heartbeat(command)} for channel, transport in enumerate(self._transports)]
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
 
@@ -1306,21 +1517,36 @@ class FourPipetteTransport:
         raw = metadata.get("channels") if isinstance(metadata, Mapping) else None
         if raw is not None:
             return self._selected_channels(list(raw))
+        if not isinstance(metadata, Mapping) or metadata.get("selection_mode") != "tip_location":
+            raise PipetteCommandError(
+                "Pipette channel selection requires explicit channels or selection_mode='tip_location'.",
+                details={
+                    "selection_required": True,
+                    "allowed_selection_modes": ["explicit_channels", "tip_location"],
+                },
+            )
         if self._tip_location == -1:
-            return list(self.CHANNELS)
+            raise PipetteCommandError(
+                "Pipette TipLocation is unresolved; explicit channels are required.",
+                details={"selection_mode": "tip_location", "tip_location": -1},
+            )
         return self._selected_channels([self._tip_location])
 
-    def _require_liquid_mutation(self, operation: str) -> None:
+    def _require_physical_command_admission(self, operation: str) -> None:
         if not self._liquid_mutation_enabled:
             raise PipetteCommandError(
                 f"Pipette {operation} remains blocked by the accepted production safety envelope.",
                 details={
                     "operation": operation,
                     "liquid_mutation_enabled": False,
+                    "physical_command_admitted": False,
                     "channel_count": 4,
                     "physical_effect_verified": False,
                 },
             )
+
+    def _require_liquid_mutation(self, operation: str) -> None:
+        self._require_physical_command_admission(operation)
 
     def _run_group_liquid_operation(
         self,
@@ -1357,7 +1583,6 @@ class FourPipetteTransport:
                     if isinstance(completion, Mapping) and completion.get("ok") is True:
                         state = self._transports[channel].apply_completed_effect(operation, row["result"])
                         row["result"].update(state)
-                        row["result"]["controller_acknowledged"] = True
                         row["result"]["completion_verified"] = True
                     else:
                         row["result"]["state_reconciled"] = False
@@ -1449,6 +1674,7 @@ class FourPipetteTransport:
         return {**result, "volume_ul": volume, "dispense_type": selected_type, "planned_command": f"D{volume},{selected_type}R"}
 
     def mix_all(self, count: int, vol: float, vigorous: int = 100) -> dict[str, Any]:
+        self._require_physical_command_admission("mix_all")
         cycles = int(count)
         if cycles < 1:
             raise ValueError("count must be at least one")
@@ -1509,7 +1735,8 @@ class FourPipetteTransport:
                 row.get("completion", {}).get("pipette_message_state", {})
                 or row["result"].get("driver_result", {}).get("pipette_message_state", {})
             )
-            self._fluid_detection_timestamps[int(row["channel"])] = state.get("fluid_timestamp") or now
+            if row.get("completion", {}).get("ok") is True and state.get("fluid_timestamp") is not None:
+                self._fluid_detection_timestamps[int(row["channel"])] = state["fluid_timestamp"]
         return {**result, "planned_command": "BR", "wait": True}
 
     def get_fluid_timestamp(self, channel: int) -> float | None:
@@ -1608,6 +1835,7 @@ class FourPipetteTransport:
         wait: bool = True,
         channels: list[int] | None = None,
     ) -> dict[str, Any]:
+        self._require_physical_command_admission("eject_all_tips")
         selected = self._selected_channels(channels)
         with self._transaction_lock:
             before = self.query_tip_status_all()
@@ -1672,6 +1900,7 @@ class FourPipetteTransport:
             }
 
     def KeepTip(self, tip: int) -> dict[str, Any]:  # noqa: N802
+        self._require_physical_command_admission("keep_tip")
         keep = self._selected_channels([int(tip)])[0]
         with self._transaction_lock:
             before = self.query_tip_status_all()
@@ -1722,7 +1951,8 @@ class FourPipetteTransport:
         with self._transaction_lock:
             channels: list[dict[str, Any]] = []
             for channel, transport in enumerate(self._transports):
-                result = transport._get_driver().query_tip_status()
+                driver = transport._get_driver()
+                result = transport._safe_query_tip_status(driver, required=True)
                 if (
                     not isinstance(result, dict)
                     or result.get("ok") is not True
@@ -1735,8 +1965,6 @@ class FourPipetteTransport:
                         details={"channel": channel, "result": result},
                     )
                 loaded = result["tip_loaded"]
-                transport._last_tip_status = dict(result)
-                transport._tip_loaded = loaded
                 channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
             loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
             return {

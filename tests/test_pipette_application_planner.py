@@ -6,10 +6,24 @@ from src.bioxp.pipette.application import (
     PipetteApplicationPlanner,
     PipettePhysicalMutationBlocked,
 )
+from src.bioxp.pipette.receipts import PipetteReceiptStore
+
+
+def _bound_dependencies():
+    return {
+        name: {
+            "bound": True,
+            "authority": f"test.{name}",
+            "generation": 7,
+            "state": {"ready": True, "identity": f"{name}-identity"},
+            "blockers": [],
+        }
+        for name in ("deck", "gantry", "z", "pressure", "pipette", "machine_state")
+    }
 
 
 def test_load_tip_plan_preserves_oem_control_lib_sequence_without_motion():
-    planner = PipetteApplicationPlanner()
+    planner = PipetteApplicationPlanner(dependency_resolver=_bound_dependencies)
 
     plan = planner.plan_load_tip(
         tip_tray="tray-1",
@@ -22,6 +36,8 @@ def test_load_tip_plan_preserves_oem_control_lib_sequence_without_motion():
     assert plan["ok"] is True
     assert plan["execution_admitted"] is False
     assert plan["motion_commanded"] is False
+    assert plan["dependencies_satisfied"] is True
+    assert all(step.get("owner") for step in plan["steps"])
     assert [step["action"] for step in plan["steps"]] == [
         "resolve_tip_tray_well",
         "move_gantry_to_tip",
@@ -44,7 +60,7 @@ def test_load_tip_plan_preserves_oem_control_lib_sequence_without_motion():
 
 
 def test_waste_fluid_and_plunger_plans_keep_oem_constants_and_dependencies():
-    planner = PipetteApplicationPlanner()
+    planner = PipetteApplicationPlanner(dependency_resolver=_bound_dependencies)
 
     waste = planner.plan_move_to_waste()
     fluid = planner.plan_detect_fluid(fluid_class="MS")
@@ -70,10 +86,49 @@ def test_waste_fluid_and_plunger_plans_keep_oem_constants_and_dependencies():
 
 
 def test_application_planner_rejects_execution_in_no_motion_tranche():
-    planner = PipetteApplicationPlanner()
+    planner = PipetteApplicationPlanner(dependency_resolver=_bound_dependencies)
 
     with pytest.raises(PipettePhysicalMutationBlocked):
         planner.execute("move_to_waste", {})
+
+
+def test_application_plan_fails_closed_when_required_provider_is_unbound():
+    dependencies = _bound_dependencies()
+    dependencies["gantry"] = {"bound": False, "authority": None, "error": "provider_unavailable"}
+    planner = PipetteApplicationPlanner(dependency_resolver=lambda: dependencies)
+
+    plan = planner.plan_move_to_waste()
+
+    assert plan["ok"] is False
+    assert plan["dependencies_satisfied"] is False
+    assert plan["blocker"] == "application_dependencies_unbound"
+    assert plan["missing_dependencies"] == ["gantry"]
+
+
+def test_application_plan_fails_closed_without_dependency_generation_and_state():
+    dependencies = _bound_dependencies()
+    dependencies["gantry"] = {"bound": True, "authority": "test.gantry", "blockers": []}
+    planner = PipetteApplicationPlanner(dependency_resolver=lambda: dependencies)
+
+    plan = planner.plan_move_to_waste()
+    status = planner.status()
+
+    assert plan["ok"] is False
+    assert plan["dependencies_satisfied"] is False
+    assert any("gantry" in blocker for blocker in plan["dependency_blockers"])
+    assert status["dependencies_satisfied"] is False
+    assert any("gantry" in blocker for blocker in status["dependency_blockers"])
+
+
+def test_receipt_store_uses_durable_oem_root_and_never_infers_completion(monkeypatch, tmp_path):
+    root = tmp_path / "oem-runtime"
+    monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(root))
+
+    store = PipetteReceiptStore()
+
+    assert store.root == root / "pipette"
+    assert store._truth({"ok": True, "outcome": "completion"})["completion_verified"] is False
 
 
 def test_application_plan_api_exposes_typed_no_motion_contract():
@@ -93,3 +148,5 @@ def test_application_plan_api_exposes_typed_no_motion_contract():
     assert plan.status_code == 200
     assert plan.json()["requested_inputs"] == {"fluid_class": "RC"}
     assert plan.json()["motion_commanded"] is False
+    assert isinstance(plan.json()["receipt_id"], str)
+    assert plan.json()["receipt_truth"]["physical_effect_verified"] is False

@@ -90,7 +90,17 @@ def test_fragmented_tx_uses_one_router_transaction_and_expected_id_families():
             return {
                 "ok": True,
                 "outcome": "completion",
-                "frames": [{"arbitration_id": 0x506, "dlc": 3, "data": [0x20, 0x60, 0x00], "raw": []}],
+                "frames": [{"arbitration_id": 0x511, "dlc": 0, "data": [], "raw": []}],
+                "immediate_ack_received": True,
+                "completion_received": True,
+                "completion": {
+                    "ok": True,
+                    "outcome": "completion",
+                    "observed_rx_id": 0x511,
+                    "observed_rx_dlc": 2,
+                    "data": [0x20, 0x00],
+                    "command_name": "long_command",
+                },
             }
 
     driver = BioXpCanDriver.__new__(BioXpCanDriver)
@@ -224,15 +234,16 @@ def test_transport_keeps_tip_precondition_separate_from_liquid_postcondition():
     assert result["physical_effect_verified"] is False
 
 
-def test_driver_deferred_send_reports_delivery_without_ack_or_completion():
+def test_driver_deferred_send_requires_ack_without_claiming_completion():
     class Bus:
         @staticmethod
         def transact_can(message, **kwargs):
             del message, kwargs
             return {
                 "ok": True,
-                "outcome": "tx_only",
-                "frames": [],
+                "outcome": "ack",
+                "frames": [{"arbitration_id": 0x501, "dlc": 0, "data": [], "raw": []}],
+                "immediate_ack_received": True,
                 "completion_received": False,
             }
 
@@ -250,7 +261,7 @@ def test_driver_deferred_send_reports_delivery_without_ack_or_completion():
 
     assert result["ok"] is True
     assert result["delivery_verified"] is True
-    assert result["controller_acknowledged"] is False
+    assert result["controller_acknowledged"] is True
     assert result["completion_verified"] is False
 
 
@@ -322,17 +333,36 @@ def test_multipart_matcher_requires_explicit_opt_in_and_rebind_fences_completion
 
 def test_generation_matched_pipette_completion_accepts_only_oem_initialized_byte():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    router.prepare_pipette_completion(1, 10.0)
-    frame = NovoFrame(
-        arbitration_id=0x509,
-        dlc=3,
-        data=bytes((0x20, 0x60, 0)),
-        raw=b"raw",
-        received_at=router._clock(),
-        classification="pipette_report",
+    token = router.prepare_pipette_completion(
+        1,
+        10.0,
+        command_family=1,
+        command_name="pipette_aspirate",
     )
-    router._dispatch(frame)
-    result = router.wait_pipette_completion(1, 0.0)
+    started = router._clock()
+    router.bind_pipette_completion(
+        1,
+        owner_token=token,
+        transaction_id="tx",
+        tx_started_at=started,
+    )
+    router._dispatch(NovoFrame(
+        arbitration_id=0x509,
+        dlc=0,
+        data=b"",
+        raw=b"raw",
+        received_at=started + 0.01,
+        classification="pipette_report",
+    ))
+    router._dispatch(NovoFrame(
+        arbitration_id=0x509,
+        dlc=2,
+        data=bytes((0x20, 0)),
+        raw=b"raw",
+        received_at=started + 0.02,
+        classification="pipette_report",
+    ))
+    result = router.wait_pipette_completion(1, 0.0, owner_token=token)
     assert result["ok"] is True
     assert result["generation_changed"] is False
 
@@ -359,8 +389,18 @@ def test_pipette_completion_requires_bound_command_owner_and_matching_token():
     router._dispatch(
         NovoFrame(
             arbitration_id=0x509,
-            dlc=3,
-            data=bytes((0x20, 0x60, 0)),
+            dlc=0,
+            data=b"",
+            raw=b"raw",
+            received_at=10.05,
+            classification="pipette_report",
+        )
+    )
+    router._dispatch(
+        NovoFrame(
+            arbitration_id=0x509,
+            dlc=2,
+            data=bytes((0x20, 0)),
             raw=b"raw",
             received_at=10.1,
             classification="pipette_report",

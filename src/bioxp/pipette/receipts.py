@@ -59,7 +59,14 @@ class PipetteReceiptStore:
     """Durable private journal for source-bound pipette operation receipts."""
 
     def __init__(self, root: str | Path | None = None) -> None:
-        self.root = Path(root or os.environ.get("BIOXP_PIPETTE_RECEIPT_ROOT") or "/tmp/bioxp-oem-runtime/pipette")
+        configured_root = os.environ.get("BIOXP_PIPETTE_RECEIPT_ROOT")
+        runtime_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
+        durable_default = Path.home() / ".local" / "state" / "bioxp-oem-runtime" / "pipette"
+        self.root = Path(
+            root
+            or configured_root
+            or (Path(runtime_root) / "pipette" if runtime_root else durable_default)
+        )
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         self.path = self.root / "receipts.jsonl"
@@ -119,11 +126,8 @@ class PipetteReceiptStore:
                 completion_explicit = True
             else:
                 completion = bool(provenance.get("completion_received", False))
-        if not completion_explicit and not completion:
-            completion = bool(
-                result.get("ok") is True
-                and result.get("outcome") in {"completion", "initialized"}
-            )
+        if not completion_explicit:
+            completion = False
 
         precondition = result.get("hardware_precondition_verified")
         if not isinstance(precondition, bool):

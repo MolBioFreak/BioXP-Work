@@ -81,10 +81,14 @@ class _PipetteCompletion:
     owner_token: str
     command_family: int | None
     command_name: str | None
+    expected_rx_id: int | None = None
     transaction_id: str | None = None
     tx_started_at: float | None = None
     event: threading.Event = field(default_factory=threading.Event)
+    ack_frame: NovoFrame | None = None
     frame: NovoFrame | None = None
+    duplicate_terminal_count: int = 0
+    rejected_reason: str | None = None
 
 
 class NovoRouterError(RuntimeError):
@@ -136,6 +140,10 @@ class NovoRouter:
     @property
     def running(self) -> bool:
         return bool(self._reader is not None and self._reader.is_alive())
+
+    @property
+    def reader_generation(self) -> int:
+        return int(self._reader_generation)
 
     def start(self) -> None:
         if self.running:
@@ -234,25 +242,60 @@ class NovoRouter:
 
     def _dispatch(self, frame: NovoFrame) -> None:
         completion_matched = False
-        if (
-            frame.arbitration_id in PIPETTE_RX_IDS
-            and (frame.arbitration_id & 0x7) == 1
-            and frame.dlc > 0
-        ):
+        if frame.arbitration_id in PIPETTE_RX_IDS:
             channel = (frame.arbitration_id & 0x78) >> 3
+            function = frame.arbitration_id & 0x7
             with self._completion_lock:
                 completion = self._pipette_completions.get(channel)
                 if (
                     completion is not None
                     and completion.owner_generation == self._reader_generation
+                    and completion.command_family == function
+                    and (
+                        completion.expected_rx_id is None
+                        or frame.arbitration_id == completion.expected_rx_id
+                    )
                     and completion.transaction_id is not None
                     and completion.tx_started_at is not None
                     and frame.received_at >= completion.tx_started_at
                     and self._clock() <= completion.deadline_at
                 ):
-                    completion.frame = frame
-                    completion.event.set()
-                    completion_matched = True
+                    if frame.dlc == 0:
+                        if completion.ack_frame is None:
+                            completion.ack_frame = frame
+                    elif frame.dlc == 2 and len(frame.data) == 2:
+                        if completion.ack_frame is None:
+                            completion.rejected_reason = "completion_before_ack"
+                            completion.frame = frame
+                            completion.event.set()
+                            self._pipette_completion_taints[channel] = {
+                                "channel": channel,
+                                "reason": "completion_before_ack",
+                                "owner_generation": completion.owner_generation,
+                                "owner_token": completion.owner_token,
+                                "transaction_id": completion.transaction_id,
+                                "command_family": completion.command_family,
+                                "command_name": completion.command_name,
+                                "tainted_at": self._clock(),
+                            }
+                            self._diagnostics.append({
+                                **frame.provenance(),
+                                "classification": "pipette_completion_before_ack",
+                                "owner_token": completion.owner_token,
+                            })
+                            completion_matched = True
+                        elif completion.frame is None:
+                            completion.frame = frame
+                            completion.event.set()
+                            completion_matched = True
+                        else:
+                            completion.duplicate_terminal_count += 1
+                            self._diagnostics.append({
+                                **frame.provenance(),
+                                "classification": "pipette_duplicate_terminal",
+                                "owner_token": completion.owner_token,
+                            })
+                            completion_matched = True
         matched = False
         with self._pending_lock:
             pending = self._pending
@@ -570,12 +613,23 @@ class NovoRouter:
         *,
         command_family: int | None = None,
         command_name: str | None = None,
+        expected_rx_id: int | None = None,
     ) -> str:
         channel = int(channel)
         if channel not in range(4):
             raise ValueError(f"invalid pipette channel: {channel}")
         if command_family is not None and int(command_family) not in PIPETTE_FUNCTIONS:
             raise ValueError(f"invalid pipette command family: {command_family}")
+        if expected_rx_id is not None:
+            expected_rx_id = int(expected_rx_id)
+            expected_channel = (expected_rx_id >> 3) & 0x3
+            expected_family = expected_rx_id & 0x7
+            if expected_rx_id not in PIPETTE_RX_IDS:
+                raise ValueError(f"invalid pipette expected RX ID: 0x{expected_rx_id:03x}")
+            if expected_channel != channel or (
+                command_family is not None and expected_family != int(command_family)
+            ):
+                raise ValueError("pipette expected RX ID does not match channel/family")
         with self._completion_lock:
             taint = self._pipette_completion_taints.get(channel)
             if taint is not None:
@@ -595,6 +649,7 @@ class NovoRouter:
                 owner_token=owner_token,
                 command_family=None if command_family is None else int(command_family),
                 command_name=None if command_name is None else str(command_name),
+                expected_rx_id=expected_rx_id,
                 transaction_id="legacy-unbound-owner" if legacy_owner else None,
                 tx_started_at=registered_at if legacy_owner else None,
             )
@@ -649,14 +704,22 @@ class NovoRouter:
         valid = bool(
             signaled
             and not generation_changed
+            and completion.rejected_reason is None
             and completion.transaction_id is not None
             and completion.tx_started_at is not None
+            and completion.ack_frame is not None
             and frame is not None
             and frame.received_at >= completion.tx_started_at
-            and frame.data
+            and (
+                completion.expected_rx_id is None
+                or frame.arbitration_id == completion.expected_rx_id
+            )
+            and (frame.arbitration_id & 0x7) == completion.command_family
+            and frame.dlc == 2
+            and len(frame.data) == 2
             and frame.data[0] == 0x20
         )
-        if not valid and not generation_changed:
+        if not valid and not generation_changed and completion.rejected_reason is None:
             with self._completion_lock:
                 self._pipette_completion_taints[channel] = {
                     "reason": "malformed_completion" if frame is not None else "completion_timeout",
@@ -671,6 +734,7 @@ class NovoRouter:
             "owner_token": completion.owner_token,
             "command_family": completion.command_family,
             "command_name": completion.command_name,
+            "expected_rx_id": completion.expected_rx_id,
             "transaction_id": completion.transaction_id,
             "tx_started_at": completion.tx_started_at,
             "owner_generation": completion.owner_generation,
@@ -678,7 +742,13 @@ class NovoRouter:
             "registration_timestamp": completion.registered_at,
             "deadline_timestamp": completion.deadline_at,
             "receive_timestamp": frame.received_at if frame is not None else None,
-            "outcome": "completion" if valid else ("malformed" if frame is not None else "timeout"),
+            "immediate_ack_received": completion.ack_frame is not None,
+            "immediate_ack": completion.ack_frame.provenance() if completion.ack_frame is not None else None,
+            "duplicate_terminal_count": completion.duplicate_terminal_count,
+            "outcome": "completion" if valid else (
+                completion.rejected_reason
+                or ("malformed" if frame is not None else "timeout")
+            ),
             "observed_rx_id": frame.arbitration_id if frame is not None else None,
             "observed_rx_dlc": frame.dlc if frame is not None else None,
             "observed_rx_raw": list(frame.raw) if frame is not None else None,
