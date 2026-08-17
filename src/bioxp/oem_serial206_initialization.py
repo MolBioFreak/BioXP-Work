@@ -4242,36 +4242,19 @@ class Serial206OemInitializationProvider:
                         lifecycle_generation = recovered_generation
                         prepared_board_generation = recovered_board_generation
                     else:
-                        recoverable_receipt = next(
-                            (
-                                row
-                                for row in reversed(list(source_lifecycle.get("receipts") or []))
-                                if isinstance(row, Mapping)
-                                and self._recoverable_pending_x_home_receipt(
-                                    source_lifecycle,
-                                    command_id=row.get("command_id") if isinstance(row.get("command_id"), str) else None,
-                                    generation=recovered_generation,
-                                    board_lifecycle_generation=recovered_board_generation,
-                                )
-                                is not None
-                            ),
-                            None,
-                        )
-                        if isinstance(recoverable_receipt, Mapping):
-                            recovered_receipt_id = recoverable_receipt.get("receipt_id")
-                            source_lifecycle.update({
-                                "state": "awaiting_operator_observation",
-                                "generation": recovered_generation,
-                                "board_lifecycle_generation": recovered_board_generation,
-                                "reference_state": "desynced",
-                                "active_receipt": None,
-                                "pending_ticket": None,
-                                "awaiting_observation_receipt_id": recovered_receipt_id,
-                                "last_failure": None,
-                            })
-                            self._save_state(state)
-                            lifecycle_generation = recovered_generation
-                            prepared_board_generation = recovered_board_generation
+                        source_lifecycle.update({
+                            "state": "unprepared",
+                            "generation": None,
+                            "board_lifecycle_generation": None,
+                            "prepared_receipt": None,
+                            "reference_state": "desynced",
+                            "active_receipt": None,
+                            "pending_ticket": None,
+                            "awaiting_observation_receipt_id": None,
+                        })
+                        self._save_state(state)
+                        lifecycle_generation = None
+                        prepared_board_generation = None
                 pending_home_receipt = self._recoverable_pending_x_home_receipt(
                     source_lifecycle,
                     command_id=(
