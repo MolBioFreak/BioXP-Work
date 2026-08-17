@@ -4954,11 +4954,20 @@ class Serial206OemInitializationProvider:
                     "current_generation": current_generation,
                     "primitive_result": _json_safe(result),
                 }
+            home_result_evidence = result.get("home")
             verified_x_home = bool(
                 selected in home_intents
                 and result.get("ok") is True
-                and result.get("home_predicate_confirmed") is True
                 and result.get("controller_terminal_state_verified") is True
+                and (
+                    result.get("home_predicate_confirmed") is True
+                    or result.get("reference_publication_required") is True
+                    or (
+                        isinstance(home_result_evidence, Mapping)
+                        and home_result_evidence.get("controller_home_proof_verified") is True
+                        and home_result_evidence.get("controller_terminal_state_verified") is True
+                    )
+                )
             )
             if verified_x_home:
                 if self.reference_store is None:
