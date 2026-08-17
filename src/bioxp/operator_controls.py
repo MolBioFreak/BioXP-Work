@@ -1772,6 +1772,7 @@ def install_operator_control_plane(
     reference_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     lifecycle_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     serial206_initialization_state_provider: Callable[[], Mapping[str, Any]] | None = None,
+    pipette_status_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -1796,6 +1797,15 @@ def install_operator_control_plane(
             freshness = projection.get("freshness")
             if isinstance(freshness, Mapping):
                 freshness_rows.append(dict(freshness))
+        if pipette_status_provider is not None:
+            pipette_status = pipette_status_provider()
+            if not isinstance(pipette_status, Mapping):
+                raise RuntimeError("pipette status provider returned a non-mapping payload")
+            domains["pipette"] = {
+                "status": "observed" if pipette_status.get("ok") is True else "unavailable",
+                "observation": dict(pipette_status),
+                "error": None if pipette_status.get("ok") is True else "passive pipette status unavailable",
+            }
         ownership_projection = hardware_state.ownership_projection()
         state_rank = {"fresh": 0, "stale": 1, "missing": 2}
         freshness = max(

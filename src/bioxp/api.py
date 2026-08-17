@@ -1237,6 +1237,76 @@ def _get_pipette_transport():
     return _pipette_transport
 
 
+def _operator_pipette_status() -> dict[str, Any]:
+    owner = _pipette_transport
+    if owner is not None:
+        status = owner.get_status()
+        if isinstance(status, Mapping):
+            return dict(status)
+    channels = []
+    for channel in range(4):
+        channels.append({
+            "ok": False,
+            "transport": "novo_usb_can",
+            "channel": channel,
+            "bitrate": 0,
+            "pipette_id": channel,
+            "transport_details": {
+                "source": "OEM Novo.Devices.CanInterfaceBoard over one shared NovoRouter",
+                "vid": "0x03eb",
+                "pid": "0x2423",
+                "alt": 1,
+                "shared_bioxp_usb_runtime": False,
+            },
+            "available": False,
+            "initialized": False,
+            "software_initialized": False,
+            "tip_loaded": False,
+            "software_tip_loaded": False,
+            "pressure_profile": "1R",
+            "top_speed": 1000.0,
+            "last_command": None,
+            "last_transaction": None,
+            "pipette_message_state": {},
+            "oem_initialization_counter": 0,
+            "oem_diagnosis": None,
+            "oem_error_queue": [],
+            "oem_process_error_code": None,
+            "hardware_tip_status": None,
+            "hardware_pressure": None,
+            "hardware_truth_level": "unavailable",
+            "ack_required": True,
+            "delivery_verified": False,
+            "controller_acknowledged": None,
+            "completion_verified": False,
+            "hardware_precondition_verified": False,
+            "hardware_postcondition_verified": False,
+            "state_reconciled": False,
+            "state_reconciliation_source": None,
+            "physical_effect_verified": False,
+            "response_timeout_s": 60.0,
+            "liquid_level_ul": 0.0,
+            "front_air_level_ul": 0.0,
+            "rear_air_level_ul": 0.0,
+        })
+    return {
+        "ok": False,
+        "transport": "novo_usb_can",
+        "channels": channels,
+        "channel_count": 4,
+        "group_status_spacing_ms": 30,
+        "live_query_performed": False,
+        "last_group_transaction": None,
+        "liquid_mutation_enabled": False,
+        "tip_type": 201,
+        "tip_location": -1,
+        "allow_to_stop": True,
+        "fluid_detection_timestamps": {str(channel): None for channel in range(4)},
+        "last_error": None,
+        "physical_effect_verified": False,
+    }
+
+
 def _oem_non_motion_startup_result(
     projection: dict[str, Any],
     *,
@@ -9079,4 +9149,5 @@ install_operator_control_plane(
     reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
     lifecycle_state_provider=lifecycle_state.projection,
     serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+    pipette_status_provider=_operator_pipette_status,
 )

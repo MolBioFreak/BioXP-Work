@@ -35,7 +35,7 @@ class OptionalNestedBody(BaseModel):
     stage_approval: StageApproval | None = None
 
 
-def make_app(tmp_path: Path, monkeypatch):
+def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     app = FastAPI()
     calls: list[tuple[str, object]] = []
@@ -132,12 +132,27 @@ def make_app(tmp_path: Path, monkeypatch):
         maintenance_state_provider=lambda: maintenance,
         reference_state_provider=lambda: {"rows": {axis: {"state": "referenced"} for axis in ("x", "y", "z", "g", "door")}},
         lifecycle_state_provider=lambda: lifecycle,
+        pipette_status_provider=pipette_status_provider,
     )
     return app, calls
 
 
 def action_for(catalog: dict, method: str, path: str) -> dict:
     return next(action for action in catalog["actions"] if action["informational_method"] == method and action["informational_path"] == path and action["kind"] == "primitive")
+
+
+def test_dashboard_uses_passive_four_channel_pipette_provider_when_projection_is_missing(tmp_path, monkeypatch):
+    passive = {
+        "ok": False,
+        "transport": "novo_usb_can",
+        "channels": [{"channel": channel, "available": False} for channel in range(4)],
+        "channel_count": 4,
+    }
+    app, _ = make_app(tmp_path, monkeypatch, pipette_status_provider=lambda: passive)
+
+    dashboard = TestClient(app).get("/operator/dashboard").json()
+
+    assert dashboard["pipettes"] == passive
 
 
 def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, monkeypatch):
