@@ -2189,8 +2189,12 @@ def install_operator_control_plane(
                 authority_receipt = None
                 observation_receipt = None
                 if isinstance(response, dict):
-                    authority_receipt = response.get("authority_receipt")
-                    observation_receipt = response.get("observation_receipt")
+                    receipt_source = response
+                    detail = response.get("detail")
+                    if isinstance(detail, Mapping):
+                        receipt_source = detail
+                    authority_receipt = receipt_source.get("authority_receipt")
+                    observation_receipt = receipt_source.get("observation_receipt")
                 authority_controller_acknowledged = (
                     authority_receipt.get("controller_command_acknowledged")
                     if (

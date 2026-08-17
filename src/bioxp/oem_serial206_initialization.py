@@ -292,7 +292,16 @@ def _json_safe(
                         if len(pairs) >= max_items:
                             pairs.append(("<omitted>", omitted("mapping_width_limit")))
                             break
-                    pairs.sort(key=lambda pair: pair[0])
+                    # Keep typed scalar authority ahead of bulky diagnostic evidence.
+                    # A deeply nested first key must not consume the shared budget and
+                    # replace fields such as ok, failure, status, or position with an
+                    # omission marker.
+                    pairs.sort(
+                        key=lambda pair: (
+                            isinstance(pair[1], (Mapping, list, tuple)),
+                            pair[0],
+                        )
+                    )
                     output: dict[str, Any] = {}
                     for selected_key, raw_value in pairs:
                         unique = selected_key
@@ -962,7 +971,13 @@ class Serial206ProductionPrimitiveAdapter:
         else:
             wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
             wait = wait_fn(5, motor=0, timeout_s=float(timeout_s), event_window=result.get("event_window"))
-            events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
+            wait_events = (
+                list(wait.get("events") or [])
+                if isinstance(wait, Mapping) and isinstance(wait.get("events"), list)
+                else []
+            )
+            trailing_events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
+            events = wait_events + list(trailing_events)
             after = self.tester.motor_get_position(5, motor=0)
             speed = self.tester.motor_get_speed(5, motor=0)
             after_value = self._x_value(after)
