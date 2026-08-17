@@ -3975,6 +3975,54 @@ class Serial206OemInitializationProvider:
                     "last_failure": None,
                 })
                 payload = self._save_state(payload)
+            awaiting_x_home_id = x_lifecycle.get("awaiting_observation_receipt_id")
+            completed_awaiting_x_home = next(
+                (
+                    receipt
+                    for receipt in reversed(list(x_lifecycle.get("receipts") or []))
+                    if isinstance(receipt, Mapping)
+                    and receipt.get("command_id") == awaiting_x_home_id
+                    and receipt.get("receipt_id") == awaiting_x_home_id
+                    and receipt.get("intent") in {
+                        "startup_home",
+                        "home_axis",
+                        "manual_panel_home",
+                        "move_to_origin_home",
+                        "caught_plate_recovery_home",
+                        "set_home",
+                    }
+                    and receipt.get("motion_kind") == "home"
+                    and receipt.get("status") == "completed"
+                    and receipt.get("generation") == x_lifecycle.get("generation")
+                    and receipt.get("board_lifecycle_generation") == x_lifecycle.get("board_lifecycle_generation")
+                ),
+                None,
+            )
+            if (
+                x_lifecycle.get("state") == "awaiting_operator_observation"
+                and completed_awaiting_x_home is not None
+                and self.reference_store is not None
+            ):
+                reference = self.reference_store.mark_referenced(
+                    MarkAxisReferencedCommand(
+                        axis="x",
+                        position_steps=0,
+                        source="serial206.x.controller_verified_home",
+                        motion_kind="home",
+                    )
+                )
+                reference_ok = bool(
+                    isinstance(reference, Mapping)
+                    and reference.get("ok") is True
+                    and reference.get("durable_clean") is True
+                )
+                x_lifecycle.update({
+                    "state": "referenced_ready" if reference_ok else "failed_latched",
+                    "reference_state": "referenced" if reference_ok else "desynced",
+                    "awaiting_observation_receipt_id": None,
+                    "last_failure": None if reference_ok else _json_safe(reference),
+                })
+                payload = self._save_state(payload)
             if x_lifecycle.get("state") == "executing":
                 if self.reference_store is not None:
                     desync = getattr(self.primitives, "_x_desync", None)
@@ -4923,6 +4971,38 @@ class Serial206OemInitializationProvider:
                     "current_generation": current_generation,
                     "primitive_result": _json_safe(result),
                 }
+            verified_x_home = bool(
+                selected in home_intents
+                and result.get("ok") is True
+                and result.get("home_predicate_confirmed") is True
+                and result.get("controller_terminal_state_verified") is True
+            )
+            if verified_x_home:
+                if self.reference_store is None:
+                    result.update({
+                        "ok": False,
+                        "failure": "x_home_reference_store_unavailable",
+                    })
+                else:
+                    reference = self.reference_store.mark_referenced(
+                        MarkAxisReferencedCommand(
+                            axis="x",
+                            position_steps=0,
+                            source="serial206.x.controller_verified_home",
+                            motion_kind="home",
+                        )
+                    )
+                    reference_ok = bool(
+                        isinstance(reference, Mapping)
+                        and reference.get("ok") is True
+                        and reference.get("durable_clean") is True
+                    )
+                    result["reference_publication"] = _json_safe(reference)
+                    if not reference_ok:
+                        result.update({
+                            "ok": False,
+                            "failure": "x_home_reference_publication_failed",
+                        })
             receipt: dict[str, Any] | None = None
             z_receipt: dict[str, Any] | None = None
             if selected != "wait_for_motor" and result.get("pending_motion") is True:
@@ -4930,7 +5010,7 @@ class Serial206OemInitializationProvider:
             elif result.get("ok") is True:
                 receipt_id = f"{command_id}:{time.time_ns()}" if interrupt else command_id
                 home_requires_observation = bool(
-                    (selected in home_intents or move_to_all_zero)
+                    move_to_all_zero
                     and (
                         result.get("reference_publication_required") is True
                         or (
