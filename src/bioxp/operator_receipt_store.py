@@ -861,6 +861,22 @@ class OperatorReceiptStore:
                     "summary": summary,
                     "evidence_unavailable": f"{type(exc).__name__}: {exc}"[:500],
                 }
+        response = receipt.get("response")
+        body = response.get("body") if isinstance(response, Mapping) else None
+        detail = body.get("detail") if isinstance(body, Mapping) else None
+        authority = None
+        if isinstance(body, Mapping):
+            authority = body.get("authority_receipt")
+        if not isinstance(authority, Mapping) and isinstance(detail, Mapping):
+            authority = detail.get("authority_receipt")
+        if (
+            isinstance(authority, Mapping)
+            and authority.get("command_id") == receipt.get("command_id")
+            and str(receipt.get("action_id") or "").startswith("oem.x.")
+        ):
+            receipt["authority_receipt_id"] = receipt.get("authority_receipt_id") or receipt["command_id"]
+            if not isinstance(receipt.get("authority_receipt_status"), str):
+                receipt["authority_receipt_status"] = receipt.get("status")
         return receipt
 
     def list(self, limit: int = 100, *, include_evidence: bool = False) -> list[dict[str, Any]]:
