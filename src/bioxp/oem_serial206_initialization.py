@@ -6716,30 +6716,20 @@ class Serial206OemInitializationProvider:
                     preparer = self.preparation_provider
                     if preparer is None:
                         raise RuntimeError("Z preparation provider is not bound")
-                    transition_scope = {
-                        "thread_id": threading.get_ident(),
-                        "command_id": command_id,
-                        "expected": [False, True],
-                        "violation": None,
-                    }
-                    self._board_transition_scope = transition_scope
-                    try:
-                        result = preparer.prepare_for_initialize_motors(
-                            expected_generation=observed_generation
-                        )
-                    finally:
-                        self._board_transition_scope = None
-                    if transition_scope.get("violation") is not None:
+                    result = preparer.prepare_for_initialize_motors(
+                        expected_generation=observed_generation,
+                        reuse_current_board_lifecycle=True,
+                    )
+                    if not (
+                        isinstance(result, Mapping)
+                        and result.get("ok") is True
+                        and result.get("board_lifecycle_reused") is True
+                    ):
                         result = {
+                            **(dict(result) if isinstance(result, Mapping) else {}),
                             "ok": False,
-                            "failure": "z_prepare_board_transition_scope_violation",
-                            "scope_violation": _json_safe(transition_scope.get("violation")),
-                        }
-                    elif transition_scope.get("expected"):
-                        result = {
-                            "ok": False,
-                            "failure": "z_prepare_board_transition_sequence_incomplete",
-                            "missing_transitions": list(transition_scope["expected"]),
+                            "failure": "z_prepare_requires_current_board_lifecycle_reuse",
+                            "physical_motion": False,
                         }
                 elif intent == "reconcile_switch_masks":
                     result = self.primitives.z_reconcile_switch_masks()
