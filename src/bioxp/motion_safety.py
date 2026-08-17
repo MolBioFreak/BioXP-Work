@@ -143,6 +143,7 @@ def prepare_motion_without_motion(
     authority: Serial206MotionAuthority,
     *,
     components: tuple[str, ...] | None = None,
+    reuse_current_board_lifecycle: bool = False,
 ) -> dict[str, Any]:
     """Run bounded OEM activation, literal no-motion parameterization, and queries."""
     ledger: list[dict[str, Any]] = []
@@ -217,50 +218,82 @@ def prepare_motion_without_motion(
         if not observed_ok:
             return _preparation_result(authority, ledger)
 
-    # Normal production initialCheck is a complete ESM(false) -> ESM(true)
-    # transition over all four constructed OEM boards. Activation-only recovery
-    # is not equivalent and must never preserve a stale motor profile.
+    # A component refresh inside an already established lifecycle must not run
+    # initialCheck's machine-wide cmd64 cycle. In particular, X is on board 5
+    # while the gravity-loaded Z head is on board 4. Cycling every board and
+    # then restoring only X removes Z holding current. OEM initialCheck avoids
+    # that incomplete state by following the cycle with full motor setup.
     cycle_boards = tuple(int(board) for board in authority.activation_boards)
-    try:
-        deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
-    except Exception as exc:
-        deactivation = {"error": f"{type(exc).__name__}: {exc}"}
-    deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
-    ledger.append(_stage(
-        "deactivateBoard",
-        "passed" if deactivation_ok else "failed",
-        "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
-        deactivation,
-    ))
-    if not deactivation_ok:
-        return _preparation_result(authority, ledger)
-
-    try:
-        activation = driver.activate_boards(expect_reply=True, fail_fast=True)
-    except Exception as exc:
-        activation = {"error": f"{type(exc).__name__}: {exc}"}
-    activation_ok = _board_cycle_ok(activation, cycle_boards)
-    ledger.append(_stage(
-        "activateBoard",
-        "passed" if activation_ok else "failed",
-        "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
-        activation,
-    ))
-    if not activation_ok:
-        return _preparation_result(authority, ledger)
-
-    try:
-        lifecycle = driver.oem_begin_board_lifecycle_generation(
-            deactivation=deactivation,
-            activation=activation,
+    if reuse_current_board_lifecycle:
+        generation_fn = getattr(driver, "oem_current_board_lifecycle_generation", None)
+        state_fn = getattr(driver, "_oem_board_state", None)
+        current_generation = generation_fn() if callable(generation_fn) else None
+        board_state = state_fn() if callable(state_fn) else None
+        lifecycle_ok = bool(
+            type(current_generation) is int
+            and isinstance(board_state, Mapping)
+            and all(board_state.get(board) is True for board in cycle_boards)
         )
-    except Exception as exc:
-        lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
+        lifecycle = {
+            "ok": lifecycle_ok,
+            "board_lifecycle_generation": current_generation if lifecycle_ok else None,
+            "reused": True,
+            "command64_emitted": False,
+            "required_initialized_boards": list(cycle_boards),
+            "initialized_boards": sorted(
+                int(board) for board in cycle_boards
+                if isinstance(board_state, Mapping) and board_state.get(board) is True
+            ),
+            "failure": None if lifecycle_ok else "current_board_lifecycle_unavailable_or_incomplete",
+        }
+    else:
+        # Normal production initialCheck is a complete ESM(false) -> ESM(true)
+        # transition over all four constructed OEM boards. Activation-only
+        # recovery is not equivalent and must not preserve a stale profile.
+        try:
+            deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
+        except Exception as exc:
+            deactivation = {"error": f"{type(exc).__name__}: {exc}"}
+        deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
+        ledger.append(_stage(
+            "deactivateBoard",
+            "passed" if deactivation_ok else "failed",
+            "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
+            deactivation,
+        ))
+        if not deactivation_ok:
+            return _preparation_result(authority, ledger)
+
+        try:
+            activation = driver.activate_boards(expect_reply=True, fail_fast=True)
+        except Exception as exc:
+            activation = {"error": f"{type(exc).__name__}: {exc}"}
+        activation_ok = _board_cycle_ok(activation, cycle_boards)
+        ledger.append(_stage(
+            "activateBoard",
+            "passed" if activation_ok else "failed",
+            "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
+            activation,
+        ))
+        if not activation_ok:
+            return _preparation_result(authority, ledger)
+
+        try:
+            lifecycle = driver.oem_begin_board_lifecycle_generation(
+                deactivation=deactivation,
+                activation=activation,
+            )
+        except Exception as exc:
+            lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
     ledger.append(_stage(
         "boardLifecycleGeneration",
         "passed" if lifecycle_ok else "failed",
-        "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1",
+        (
+            "Existing complete acknowledged OEM board lifecycle; component profile refresh emits no cmd64"
+            if reuse_current_board_lifecycle
+            else "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1"
+        ),
         lifecycle,
     ))
     if not lifecycle_ok:

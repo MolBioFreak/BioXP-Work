@@ -562,6 +562,7 @@ class Serial206ProductionPrimitiveAdapter:
         *,
         expected_generation: int,
         components: tuple[str, ...] = ("z",),
+        reuse_current_board_lifecycle: bool = False,
     ) -> dict[str, Any]:
         observed_generation = int(self.generation_provider())
         if expected_generation != observed_generation:
@@ -575,6 +576,7 @@ class Serial206ProductionPrimitiveAdapter:
             self.tester,
             self.authority_provider(),
             components=tuple(components),
+            reuse_current_board_lifecycle=bool(reuse_current_board_lifecycle),
         )
         ok = isinstance(raw, Mapping) and raw.get("ok") is True and raw.get("physical_motion") is False
         return {
@@ -583,6 +585,16 @@ class Serial206ProductionPrimitiveAdapter:
             "board_lifecycle_generation": raw.get("board_lifecycle_generation") if isinstance(raw, Mapping) else None,
             "board_preparation_verified": ok,
             "initialize_without_motion_verified": ok,
+            "board_lifecycle_reused": bool(
+                isinstance(raw, Mapping)
+                and any(
+                    isinstance(row, Mapping)
+                    and row.get("stage_id") == "boardLifecycleGeneration"
+                    and isinstance(row.get("controller_evidence"), Mapping)
+                    and row["controller_evidence"].get("reused") is True
+                    for row in raw.get("stage_ledger", [])
+                )
+            ),
             "physical_motion": False,
             "motor_output_state": "unknown",
             "motor_torque_verified": False,
@@ -1233,7 +1245,11 @@ class Serial206ProductionPrimitiveAdapter:
         return {"ok": ok, "axis_context": "x", "intent": "aggregate_oem_abort", "physical_scope": "aggregate_oem_all_present_boards", "x_only": False, "logical_abort": _json_safe(abort), "x_terminal_stop": _json_safe(stop), "reference_desync": _json_safe(desync), "controller_command_acknowledged": stop.get("controller_command_acknowledged") is True, "controller_terminal_state_verified": stop.get("controller_terminal_state_verified") is True, "physical_effect_verified": False, "failure": None if ok else "aggregate_oem_abort_not_verified"}
 
     def prepare_x(self, *, expected_generation: int) -> dict[str, Any]:
-        result = self.prepare_for_initialize_motors(expected_generation=int(expected_generation), components=("x",))
+        result = self.prepare_for_initialize_motors(
+            expected_generation=int(expected_generation),
+            components=("x",),
+            reuse_current_board_lifecycle=True,
+        )
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_prepare_result_not_mapping"}
         if result.get("ok") is True:
             self._x_profile_overrides.clear()
