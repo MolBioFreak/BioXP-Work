@@ -137,6 +137,11 @@ _MOTION_LEDGER_SCHEMA = "bioxp.serial206_initializeMotion_ledger.v2"
 _Z_LIFECYCLE_SCHEMA = "bioxp.serial206_z_lifecycle.v2"
 _X_LIFECYCLE_SCHEMA = "bioxp.serial206_x_lifecycle.v2"
 SERIAL206_Z_SELF_TEST_MAX_STEPS = 92049
+# OEM moveSteps completion is the TARGET_POSITION_REACHED event (event 128) plus the
+# 20 s wait; the terminal position readback is returned as evidence and never gates
+# completion (ClassMotor.atTarget's 300-step tolerance is goHome-only). This small
+# band is informational: it feeds the reported target_position_verified flag only.
+X_TARGET_TERMINAL_TOLERANCE_STEPS = 20
 _LEGACY_Z_LIFECYCLE_SCHEMAS = frozenset({"bioxp.serial206_z_lifecycle.v1"})
 _LEGACY_X_LIFECYCLE_SCHEMAS = frozenset({"bioxp.serial206_x_lifecycle.v1"})
 _INITIALIZE_MOTION_PARTIAL = (
@@ -996,7 +1001,15 @@ class Serial206ProductionPrimitiveAdapter:
             addressed_errors = [event for event in addressed_events if event.get("status") in {13, 14, 130}]
             target_events = [event for event in addressed_events if event.get("status") == 128]
             terminal_event = bool(target_events)
-            position_verified = self._x_readback_verified(after, int(result["target_position_steps"]))
+            target_value = int(result["target_position_steps"])
+            position_delta = (after_value - target_value) if type(after_value) is int else None
+            position_verified = bool(
+                isinstance(after, Mapping)
+                and after.get("ok") is True
+                and self._x_tmcl_success(after.get("ack"))
+                and type(position_delta) is int
+                and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
+            )
             speed_zero = bool(
                 isinstance(speed, Mapping)
                 and speed.get("ok") is True
@@ -1022,9 +1035,7 @@ class Serial206ProductionPrimitiveAdapter:
                 failure = "x_controller_error_event"
             elif not terminal_event:
                 failure = "x_target_event_128_missing_or_stale"
-            elif not position_verified:
-                failure = "x_target_position_not_verified"
-            result.update({"wait": _json_safe(wait), "wait_verified": wait_ok, "events": _json_safe(events), "after": _json_safe(after), "after_position_steps": after_value, "terminal_speed": _json_safe(speed), "controller_error_events": _json_safe(addressed_errors), "target_events": _json_safe(target_events), "target_event_128_verified": terminal_event, "target_event_128_observed": terminal_event, "target_position_verified": position_verified, "controller_terminal_state_verified": failure is None})
+            result.update({"wait": _json_safe(wait), "wait_verified": wait_ok, "events": _json_safe(events), "after": _json_safe(after), "after_position_steps": after_value, "target_position_delta_steps": position_delta, "terminal_speed": _json_safe(speed), "controller_error_events": _json_safe(addressed_errors), "target_events": _json_safe(target_events), "target_event_128_verified": terminal_event, "target_event_128_observed": terminal_event, "target_position_verified": position_verified, "controller_terminal_state_verified": failure is None})
             result["ok"] = bool(result.get("ok") is True and result["controller_terminal_state_verified"])
             if not result["ok"]:
                 result["failure"] = str(result.get("failure") or failure or "x_absolute_terminal_evidence_not_accepted")
@@ -1185,9 +1196,22 @@ class Serial206ProductionPrimitiveAdapter:
             )
             wait = waits.get(axis)
             wait_ok = bool(isinstance(wait, Mapping) and wait.get("ok") is True and wait.get("target_reached") is True)
-            position_ok = self._x_readback_verified(position, receipt["requested"][axis])
+            position_delta = (position_value - receipt["requested"][axis]) if type(position_value) is int else None
+            if axis == "x":
+                position_ok = bool(
+                    isinstance(position, Mapping)
+                    and position.get("ok") is True
+                    and self._x_tmcl_success(position.get("ack"))
+                    and type(position_delta) is int
+                    and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
+                )
+            else:
+                position_ok = self._x_readback_verified(position, receipt["requested"][axis])
             speed_ok = bool(isinstance(speed, Mapping) and speed.get("ok") is True and self._x_tmcl_success(speed.get("ack")) and type(speed_value) is int and speed_value == 0)
             event_ok = bool(not moved or (targets and not errors))
+            axis_ok = bool(command_ok and wait_ok and event_ok and speed_ok)
+            if axis != "x":
+                axis_ok = bool(axis_ok and position_ok)
             evidence[axis] = {
                 "command_acknowledged": command_ok,
                 "wait_accepted": wait_ok,
@@ -1195,15 +1219,16 @@ class Serial206ProductionPrimitiveAdapter:
                 "controller_error_events": _json_safe(errors),
                 "position": _json_safe(position),
                 "position_verified": position_ok,
+                "position_delta_steps": position_delta,
                 "terminal_speed": _json_safe(speed),
                 "terminal_speed_verified": speed_ok,
-                "ok": bool(command_ok and wait_ok and event_ok and position_ok and speed_ok),
+                "ok": axis_ok,
             }
         command_ok = all(evidence[axis]["command_acknowledged"] for axis in required_axes)
         terminal_ok = all(evidence[axis]["ok"] for axis in required_axes)
         target_ok = all(evidence[axis]["position_verified"] for axis in required_axes)
         restore_ok = all(isinstance(restore.get(axis), Mapping) and restore[axis].get("ok") is True and isinstance(restore[axis].get("readback"), Mapping) and restore[axis]["readback"].get("value") == (350 if axis == "x" else 400) for axis in ("x", "y"))
-        ok = bool(command_ok and terminal_ok and target_ok and restore_ok)
+        ok = bool(command_ok and terminal_ok and restore_ok)
         receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "controller_command_acknowledged": command_ok, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
         moved_axes = tuple(axis for axis in required_axes if isinstance(commands.get(axis), Mapping) and commands[axis].get("command_issued") is True)
         receipt["moved_axes"] = list(moved_axes)
