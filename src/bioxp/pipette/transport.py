@@ -1984,6 +1984,7 @@ class FourPipetteTransport:
         expected_channels_with_tips: list[int],
     ) -> dict[str, Any]:
         """Fixed startup-only E1R sequence with mandatory postcondition readback."""
+        self._require_physical_command_admission("eject_all_tips_for_oem_startup")
         with self._transaction_lock:
             return self._eject_all_tips_for_oem_startup_locked(
                 operator_ack=operator_ack,

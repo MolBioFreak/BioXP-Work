@@ -41,6 +41,10 @@ class _NoDriverCallsTransport:
         lambda owner: owner.terminate(PipetteTerminateCommand()),
         lambda owner: owner.heartbeat(PipetteHeartbeatCommand(enabled=True)),
         lambda owner: owner.eject_all_tips(check_missing_tip=False),
+        lambda owner: owner.eject_all_tips_for_oem_startup(
+            operator_ack="EJECT_STALE_STARTUP_TIPS",
+            expected_channels_with_tips=[0],
+        ),
         lambda owner: owner.KeepTip(0),
         lambda owner: owner.mix_all(1, 10.0),
     ],

@@ -687,7 +687,14 @@ class NovoRouter:
             completion = self._pipette_completions.get(channel)
         if completion is None:
             return {"ok": False, "channel": channel, "outcome": "completion_not_registered"}
-        if owner_token is not None and completion.owner_token != str(owner_token):
+        if owner_token is None or not str(owner_token):
+            return {
+                "ok": False,
+                "channel": channel,
+                "outcome": "completion_token_required",
+                "owner_token": None,
+            }
+        if completion.owner_token != str(owner_token):
             return {
                 "ok": False,
                 "channel": channel,

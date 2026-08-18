@@ -324,9 +324,9 @@ def test_multipart_matcher_requires_explicit_opt_in_and_rebind_fences_completion
     assert enabled(multipart).matched is True
 
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    router.prepare_pipette_completion(2, 10.0)
+    token = router.prepare_pipette_completion(2, 10.0)
     router._reader_generation += 1
-    result = router.wait_pipette_completion(2, 0.0)
+    result = router.wait_pipette_completion(2, 0.0, owner_token=token)
     assert result["ok"] is False
     assert result["generation_changed"] is True
 
@@ -441,6 +441,46 @@ def test_completion_timeout_taints_channel_until_router_rebind():
     router.shutdown()
     assert router.pipette_completion_taint(1) is None
     router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
+
+
+def test_wait_pipette_completion_rejects_missing_token_without_mutating_owner():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    token = router.prepare_pipette_completion(
+        0,
+        10.0,
+        command_family=0,
+        command_name="pipette_initialize",
+    )
+    router.bind_pipette_completion(
+        0,
+        owner_token=token,
+        transaction_id="tx-token-required",
+        tx_started_at=router._clock(),
+    )
+
+    rejected = router.wait_pipette_completion(0, 0.0)
+    assert rejected["ok"] is False
+    assert rejected["outcome"] == "completion_token_required"
+    with router._completion_lock:
+        assert 0 in router._pipette_completions
+
+    rejected_empty = router.wait_pipette_completion(0, 0.0, owner_token="")
+    assert rejected_empty["ok"] is False
+    assert rejected_empty["outcome"] == "completion_token_required"
+    with router._completion_lock:
+        assert 0 in router._pipette_completions
+
+    mismatch = router.wait_pipette_completion(0, 0.0, owner_token="wrong-token")
+    assert mismatch["ok"] is False
+    assert mismatch["outcome"] == "completion_owner_mismatch"
+    with router._completion_lock:
+        assert 0 in router._pipette_completions
+
+    owned = router.wait_pipette_completion(0, 0.0, owner_token=token)
+    assert owned["ok"] is False
+    assert owned["outcome"] == "timeout"
+    with router._completion_lock:
+        assert 0 not in router._pipette_completions
 
 
 def test_api_init_rejects_unmapped_pressure_profile_before_readiness_gate():
