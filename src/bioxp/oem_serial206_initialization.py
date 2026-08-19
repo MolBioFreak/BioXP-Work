@@ -5978,6 +5978,7 @@ class Serial206OemInitializationProvider:
             machine = dict(state.get("machine_status") or {})
         if z.get("state") != "referenced_ready" or z.get("reference_state") != "referenced":
             return {"ok": False, "blockers": ["z_reference_not_ready"]}
+        machine = self._establish_machine_status_baseline(machine)
         if type(machine.get("tip_loaded")) is not bool or type(machine.get("tip_dirty")) is not bool:
             return {"ok": False, "blockers": ["tip_state_not_authoritative"]}
         if type(machine.get("clean_path")) is not bool:
@@ -6029,6 +6030,65 @@ class Serial206OemInitializationProvider:
             "pseudo_z_home": pseudo,
             "source": "provider_controller_reference_store",
         }
+
+    def _establish_machine_status_baseline(self, machine: Mapping[str, Any]) -> dict[str, Any]:
+        """Resolve operator-plane machine status from controller truth.
+
+        The OEM full startup pipeline is the only OEM writer of
+        ``tip_loaded``/``tip_dirty``/``current_location``/``current_well``, and
+        that pipeline is gated behind physical pipette stages. The operator
+        activate/prepare flow never runs it, so the path authority could never
+        be satisfied. Mirror the OEM MachineStatus.updateLocation semantics:
+        derive the current location from live controller positions against the
+        immutable OEM position table, and query the pipette transport for tip
+        state. Fail-closed: unresolved or unqueryable fields stay unset and the
+        authority gate remains closed. Authoritative fields already present
+        (written by the startup pipeline or a prior path execution) are never
+        overwritten.
+        """
+        resolved = dict(machine)
+        # Tip state from the pipette transport (OEM queryTipStatus equivalent).
+        if type(resolved.get("tip_loaded")) is not bool or type(resolved.get("tip_dirty")) is not bool:
+            tip_query = getattr(self.primitives, "query_all_pipette_tip_states", None)
+            if callable(tip_query):
+                try:
+                    tip = tip_query()
+                except Exception:
+                    tip = None
+                if (
+                    isinstance(tip, Mapping)
+                    and tip.get("ok") is True
+                    and type(tip.get("tip_exists")) is bool
+                ):
+                    resolved["tip_loaded"] = bool(tip["tip_exists"])
+                    if not resolved["tip_loaded"]:
+                        # No tip loaded means the tip-dirty flag is meaningless.
+                        resolved["tip_dirty"] = False
+                    # A loaded tip with unknown dirty state stays unset and the
+                    # authority gate remains closed (fail-closed).
+        # Current location from live controller position + immutable table
+        # (OEM updateLocation-equivalent for the operator plane).
+        if resolved.get("current_location") is None or resolved.get("current_well") is None:
+            read_position = getattr(self.primitives, "_read_axis_position", None)
+            if callable(read_position):
+                try:
+                    x = read_position("x")
+                    y = read_position("y")
+                    if type(x) is int and type(y) is int:
+                        table = load_bound_oem_position_table()
+                        location_id, well_id = table.resolve_nearest(x=x, y=y)
+                        resolved["current_location"] = location_id
+                        resolved["current_well"] = well_id
+                except Exception:
+                    # Position readback or table resolution failure keeps the
+                    # location unset; the authority gate stays closed.
+                    pass
+        if resolved != dict(machine):
+            with self._lock:
+                state = self._load_state()
+                state["machine_status"].update(resolved)
+                self._save_state(state)
+        return resolved
 
     def _append_z_receipt(self, z: dict[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
         receipts = list(z.get("receipts") or [])
