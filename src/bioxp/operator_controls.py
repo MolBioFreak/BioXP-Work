@@ -171,6 +171,7 @@ _IMPLICIT_OPERATOR_ACK_BY_PATH = {
     "/oem/startup/initialize_environment": "INITIALIZE",
     "/oem/startup/request": "INITIALIZE",
     "/oem/runtime/movement-runs": "OEM_PATH_EXECUTE",
+    "/motion/oem/pathing/scriptmove_execute": "OEM_PATH_EXECUTE",
 }
 
 
@@ -1414,6 +1415,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         fixed_inputs={
             "mode": "live",
             "operator_ack": "OEM_PATH_EXECUTE",
+            "reason": "operator-invoked OEM scriptmoveTo via BioModStack operator plane",
             "current_loc": None,
             "current_well": None,
             "current_x": 0,

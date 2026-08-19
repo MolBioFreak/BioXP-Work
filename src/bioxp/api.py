@@ -166,6 +166,15 @@ except ModuleNotFoundError as exc:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError(f"BioXP USB runtime dependency unavailable: {_usb_driver_import_error}") from _usb_driver_import_error
 
+        def motion_arm_state(self):
+            return {"armed": False}
+
+        def motion_disarm(self, reason="manual", note=None):
+            return {"armed": False, "reason": str(reason), "note": note, "updated_ms": 0, "arm_seq": 0}
+
+        def motion_arm_confirm(self, reason="oem_activation_completed", note=None):
+            return {"armed": True, "reason": str(reason), "note": note, "updated_ms": 0, "arm_seq": 0}
+
 from .vision.barcode import BarcodeReadCommand
 from .vision.inspection import InspectionCommand
 
@@ -6253,11 +6262,17 @@ async def motion_oem_prepare_without_motion():
             reason="oem_prepare_without_motion_completed",
         )
         ready = bool(z_prepared and can_ready.get("published") is True)
+        arm_state = (
+            tester.motion_arm_confirm(reason="oem_prepare_without_motion_completed")
+            if ready
+            else tester.motion_arm_state()
+        )
         return {
             **dict(global_result),
             "ok": ready,
             "z_prepare_receipt": _json_safe(z_receipt),
             "can_ready_publication": _json_safe(can_ready),
+            "motion_arm_state": _json_safe(arm_state),
             "failure": None if ready else "operator_motion_state_publication_failed",
         }
 
@@ -6313,9 +6328,14 @@ async def motion_emergency_stop():
         timeout_s=30.0,
     )
     hardware_state.invalidate(reason="physical_aggregate_stop_attempted")
-    result["runtime_event"] = record_physical_emergency_stop(result=result)
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
+    try:
+        _get_tester().motion_disarm(reason="emergency_stop")
+    except Exception as exc:  # pragma: no cover - defensive
+        result["motion_arm_disarm_error"] = str(exc)
+    result["motion_arm_state"] = _json_safe(_get_tester().motion_arm_state())
+    result["runtime_event"] = record_physical_emergency_stop(result=result)
     return result
 
 

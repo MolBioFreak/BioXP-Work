@@ -3436,6 +3436,26 @@ class BioXpTester:
         }
         return dict(self._motion_arm)
 
+    def motion_arm_confirm(self, reason="oem_activation_completed", note=None):
+        """Publish the operator motion arm as confirmed.
+
+        Mirrors motion_disarm: increments the arm sequence so observers can
+        detect state changes.  The physical sensor gate remains authoritative
+        and motion_gate_assert_live auto-disarms when 24 V/door/latch sensors
+        fail.
+        """
+        prev_seq = 0
+        if isinstance(self._motion_arm, dict):
+            prev_seq = int(self._motion_arm.get("arm_seq", 0) or 0)
+        self._motion_arm = {
+            "armed": True,
+            "reason": str(reason),
+            "note": None if note is None else str(note),
+            "updated_ms": int(time.time() * 1000),
+            "arm_seq": prev_seq + 1,
+        }
+        return dict(self._motion_arm)
+
     def motion_gate_live_snapshot(self):
         io = self.io_snapshot(self.BOARD_DECK)
         rail = self.motor_query_24v_sensor()
