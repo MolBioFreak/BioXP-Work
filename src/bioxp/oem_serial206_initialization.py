@@ -651,6 +651,23 @@ class Serial206ProductionPrimitiveAdapter:
             and (expected is None or value == int(expected))
         )
 
+    def _x_oem_move_preflight(self) -> dict[str, Any]:
+        """OEM-aligned move-path pre-flight (R-A7).
+
+        ClassHeadBoard.moveSteps dispatches after inline checks only: init,
+        beyondLimit against a fresh position read, queryMotorStop, then
+        MovetoRelPosition. It never re-reads the motion profile or the switch
+        masks on the move path. The mask/profile validation lives in the
+        prepare and profile-write flows, where the OEM performs the mask work.
+        The move path keeps the diagnostic record without board reads.
+        """
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "oem_move_path_inline_checks",
+            "profile_overrides": dict(self._x_profile_overrides),
+        }
+
     def _x_require_motion_preflight(self) -> dict[str, Any]:
         profile = dict(self._x_profile())
         require_profile = getattr(self.tester, "motor_oem_require_no_motion_profile", None)
@@ -868,7 +885,7 @@ class Serial206ProductionPrimitiveAdapter:
         return {"ok": False, "desync": result, "recovery": self.reference_store.recover_untrusted_authority(f"X desynchronization failed: {reason}")}
 
     def _x_issue_absolute(self, requested: int, *, source_mode: str, clamp_low: int = 0, acceleration: int | None = None, event_window: Any = None) -> dict[str, Any]:
-        preflight = self._x_require_motion_preflight()
+        preflight = self._x_oem_move_preflight()
         before = self.tester.motor_get_position(5, motor=0)
         before_value = self._x_value(before)
         if not self._x_readback_verified(before):
@@ -1088,7 +1105,7 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
         reference = self._reference_snapshot(("x",), "ClassControlInterface.moveSteps(x)")
-        preflight = self._x_require_motion_preflight()
+        preflight = self._x_oem_move_preflight()
         before = self.tester.motor_get_position(5, motor=0)
         before_value = self._x_value(before)
         if not self._x_readback_verified(before):

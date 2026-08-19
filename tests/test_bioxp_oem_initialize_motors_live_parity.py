@@ -4,7 +4,7 @@ from typing import Callable
 
 import pytest
 
-from src.bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+from src.bioxp.oem_serial206_initialization import Serial206OemInitializationProvider, Serial206ProductionPrimitiveAdapter
 from src.bioxp.usb_driver import BioXpTester
 
 
@@ -133,6 +133,30 @@ class _ReferenceStore:
             "verified": True,
             "durable_clean": True,
         }
+
+
+def test_x_move_preflight_is_oem_trimmed_without_board_reads():
+    class _BusRecorder:
+        def __init__(self):
+            self.reads = []
+        def _motion_oem_axis_profile(self, *args, **kwargs):
+            self.reads.append("profile")
+            return {}
+    bus = _BusRecorder()
+    adapter = Serial206ProductionPrimitiveAdapter(
+        bus,
+        pipette_transport=None,
+        authority_provider=lambda: None,
+        generation_provider=lambda: 1,
+    )
+    receipt = adapter._x_oem_move_preflight()
+    assert receipt["ok"] is True
+    assert receipt["skipped"] is True
+    assert receipt["reason"] == "oem_move_path_inline_checks"
+    assert "profile_overrides" in receipt
+    assert "switch_masks" not in receipt
+    assert "profile_receipt" not in receipt
+    assert bus.reads == [], "oem move preflight must not read the board"
 
 
 def test_provider_owns_z_lifecycle_and_routes_only_source_positive_intents():
