@@ -54,6 +54,19 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
             return override
         return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
 
+    @app.post("/motion/oem/x/move_steps")
+    async def x_move_steps(steps: int, wait_timeout_s: float = 5.0):
+        base = getattr(app.state, "operator_test_x_position", 0)
+        app.state.operator_test_x_position = base + steps
+        calls.append(("x_move_steps", {"steps": steps, "base_position": base}))
+        blocker = getattr(app.state, "operator_test_x_move_steps_blocker", None)
+        if blocker is not None:
+            await blocker()
+        override = getattr(app.state, "operator_test_x_move_steps_response", None)
+        if override is not None:
+            return override
+        return {"ok": True, "controller_acknowledged": True, "status": "completed", "physical_effect_verified": False}
+
     @app.post("/motion/oem/home_xy")
     async def home_xy():
         calls.append(("home_xy", None))
@@ -127,11 +140,18 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     hardware = FakeHardwareState()
     app.state.operator_test_hardware = hardware
     monkeypatch.setattr(operator_controls, "hardware_state", hardware)
+    serial206_state = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "x_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
+        "z_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
+    }
     install_operator_control_plane(
         app,
         maintenance_state_provider=lambda: maintenance,
         reference_state_provider=lambda: {"rows": {axis: {"state": "referenced"} for axis in ("x", "y", "z", "g", "door")}},
         lifecycle_state_provider=lambda: lifecycle,
+        serial206_initialization_state_provider=lambda: serial206_state,
         pipette_status_provider=pipette_status_provider,
     )
     return app, calls
@@ -778,3 +798,140 @@ def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path
     })
     assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
     assert store.by_command("cmd-519")["operator_assessment"] == "fail"
+
+
+def test_successive_move_queue_mechanics_order_and_clear():
+    from bioxp.operator_controls import _SuccessiveMoveQueue
+
+    async def scenario():
+        queue = _SuccessiveMoveQueue(max_depth=2)
+        first = {"axis": "x", "command_id": "a", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        second = {"axis": "x", "command_id": "b", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        third = {"axis": "x", "command_id": "c", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        fourth = {"axis": "z", "command_id": "d", "event": asyncio.Event(), "action_id": "oem.z.move_steps", "cleared": False}
+        assert await queue.admit("x", first) == "dispatch_now"
+        assert await queue.admit("x", second) == "queued"
+        assert await queue.admit("x", third) == "queued"
+        overflow = {"axis": "x", "command_id": "c2", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        assert await queue.admit("x", overflow) == "full"
+        assert await queue.admit("z", fourth) == "dispatch_now"  # separate axis is independent
+        await queue.complete("x")  # first finishes; second is signalled
+        assert await queue.wait_dispatched(second) is True
+        assert queue.snapshot()["x"]["depth"] == 1  # third still queued
+        await queue.complete("x")  # second finishes; third is signalled
+        assert await queue.wait_dispatched(third) is True
+        # the cleared path
+        fifth = {"axis": "x", "command_id": "e", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        await queue.complete("x")  # third finishes; queue now empty
+        assert await queue.admit("x", fifth) == "dispatch_now"
+        sixth = {"axis": "x", "command_id": "f", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        assert await queue.admit("x", sixth) == "queued"
+        await queue.clear("x")
+        assert await queue.wait_dispatched(sixth) is False
+        assert sixth["cleared"] is True
+        assert queue.snapshot().get("x", {}).get("depth") == 0
+
+    asyncio.run(scenario())
+
+
+def test_successive_move_queues_and_dispatches_after_active_completes(tmp_path, monkeypatch):
+    import threading
+    import time as _time
+
+    app, calls = make_app(tmp_path, monkeypatch)
+    release_first = threading.Event()
+    first_entered = threading.Event()
+
+    async def blocker():
+        first_entered.set()
+        await asyncio.to_thread(release_first.wait, 5)
+
+    app.state.operator_test_x_move_steps_blocker = blocker
+    with TestClient(app) as client:
+        catalog = client.get("/operator/control-catalog").json()
+        generation = catalog["ownership_generation"]
+        responses: list = []
+
+        def invoke(key: str):
+            responses.append(
+                client.post(
+                    "/operator/actions/oem.x.move_steps",
+                    json={"expected_generation": generation, "idempotency_key": key, "inputs": {"steps": 100}},
+                )
+            )
+
+        first = threading.Thread(target=invoke, args=("queue-first",))
+        first.start()
+        assert first_entered.wait(5), "first move provider never entered"
+        second = threading.Thread(target=invoke, args=("queue-second",))
+        second.start()
+        _time.sleep(0.3)
+        mid = client.get("/operator/dashboard").json()
+        queue = mid["successive_move_queue"].get("x", {})
+        assert queue["depth"] == 1, mid
+        assert queue["state"] == "running"
+        release_first.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert responses[0].status_code == 200, responses[0].text
+        assert responses[1].status_code == 200, responses[1].text  # queued, never 409
+        history = client.get("/operator/actions/history?limit=10").json()
+    by_key = {row["idempotency_key"]: row for row in history["receipts"]}
+    second_receipt = by_key["queue-second"]
+    assert second_receipt["status"] == "completed", second_receipt
+    assert second_receipt.get("queued_at") is not None
+    assert second_receipt.get("dispatched_at") is not None
+    assert [name for name, _ in calls if name == "x_move_steps"] == ["x_move_steps", "x_move_steps"]
+    assert calls[0][1] != calls[1][1]  # distinct wire inputs (fresh position bases)
+
+
+def test_stop_clears_queued_successive_moves(tmp_path, monkeypatch):
+    import threading
+    import time as _time
+
+    app, calls = make_app(tmp_path, monkeypatch)
+    release_first = threading.Event()
+    first_entered = threading.Event()
+
+    async def blocker():
+        first_entered.set()
+        await asyncio.to_thread(release_first.wait, 5)
+
+    app.state.operator_test_x_move_steps_blocker = blocker
+    with TestClient(app) as client:
+        catalog = client.get("/operator/control-catalog").json()
+        generation = catalog["ownership_generation"]
+        responses: list = []
+
+        def invoke(key: str):
+            responses.append(
+                client.post(
+                    "/operator/actions/oem.x.move_steps",
+                    json={"expected_generation": generation, "idempotency_key": key, "inputs": {"steps": 100}},
+                )
+            )
+
+        first = threading.Thread(target=invoke, args=("clear-first",))
+        first.start()
+        assert first_entered.wait(5), f"first move provider never entered; responses={[(r.status_code, r.text[:120]) for r in responses]}"
+        second = threading.Thread(target=invoke, args=("clear-second",))
+        second.start()
+        _time.sleep(0.3)
+        stop = client.post(
+            "/operator/actions/meta.emergency_stop",
+            json={"expected_generation": generation, "idempotency_key": "clear-stop", "inputs": {}},
+        )
+        assert stop.status_code == 200, stop.text
+        release_first.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert responses[1].status_code == 200, responses[1].text
+        history = client.get("/operator/actions/history?limit=10").json()
+        by_key = {row["idempotency_key"]: row for row in history["receipts"]}
+        cleared = by_key["clear-second"]
+        assert cleared["status"] == "cleared", cleared
+        assert cleared.get("cleared_at") is not None
+        queue = client.get("/operator/dashboard").json()["successive_move_queue"]
+        assert "x" not in queue or queue["x"]["depth"] == 0

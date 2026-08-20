@@ -15,6 +15,7 @@ import math
 import re
 import time
 import uuid
+from collections import deque
 from contextvars import ContextVar
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
@@ -976,6 +977,7 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
         "schema_version": "bioxp.operator_dashboard.v1",
         "ownership_generation": int(machine_state.get("ownership_generation") or 0),
         "connection": {"live": connection_live, "ownership": dict(ownership)},
+        "successive_move_queue": _successive_move_queue.snapshot(),
         "motion": {"enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"]},
         "operation": {"state": lifecycle.get("operation_state"), "reason": lifecycle.get("operation_reason")},
         "enclosure": {
@@ -1767,6 +1769,95 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
         return status, {"body": raw.decode("utf-8", "replace")}
 
 
+class _SuccessiveMoveQueue:
+    """Per-axis bounded queue for successive single-axis moves (WP-B R-B1).
+
+    OEM parity: ClassNovoCommandQueue never rejects; successive moves dispatch
+    in order when the motor stops (queryMotorStop semantics). The queue admits
+    the second same-axis move as `queued` (HTTP 200, never 409), dispatches it
+    when the active move completes, and clears on stop/abort.
+    """
+
+    def __init__(self, max_depth: int = 8):
+        self._max_depth = max_depth
+        self._queues: dict[str, deque[dict[str, Any]]] = {}
+        self._active: dict[str, str] = {}
+        self._guard = asyncio.Lock()
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
+
+    async def admit(self, axis: str, entry: dict[str, Any]) -> str:
+        """Return `dispatch_now` when the axis is idle, `queued` when enqueued, `full` at depth."""
+        async with self._guard:
+            pending = self._queues.get(axis)
+            if axis not in self._active and not (pending and len(pending)):
+                self._active[axis] = str(entry["command_id"])
+                return "dispatch_now"
+            queue = pending if pending is not None else deque()
+            self._queues[axis] = queue
+            if len(queue) >= self._max_depth:
+                return "full"
+            queue.append(entry)
+            return "queued"
+
+    async def wait_dispatched(self, entry: dict[str, Any]) -> bool:
+        """Wait until this entry is signalled. Returns False when the queue was cleared."""
+        await entry["event"].wait()
+        async with self._guard:
+            queue = self._queues.get(str(entry["axis"]))
+            if queue and queue[0] is entry:
+                queue.popleft()
+                self._active[str(entry["axis"])] = str(entry["command_id"])
+            return not bool(entry.get("cleared"))
+
+    async def mark_active(self, axis: str, command_id: str) -> None:
+        async with self._guard:
+            self._active[axis] = command_id
+
+    async def complete(self, axis: str) -> None:
+        """Signal the next queued move after the active move's terminal."""
+        async with self._guard:
+            self._active.pop(str(axis), None)
+            queue = self._queues.get(str(axis))
+            if queue:
+                head = queue[0]
+                head["event"].set()
+
+    async def clear(self, axis: str | None = None) -> None:
+        """Clear queued moves (stop/abort). Waiter receipts finalize as `cleared`."""
+        async with self._guard:
+            for ax, queue in list(self._queues.items()):
+                if axis is not None and ax != axis:
+                    continue
+                for entry in queue:
+                    entry["cleared"] = True
+                    entry["event"].set()
+                queue.clear()
+                self._active.pop(ax, None)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            axis: {
+                "active_command_id": self._active.get(axis),
+                "depth": len(queue),
+                "head_action_id": queue[0].get("action_id") if queue else None,
+                "state": "running" if axis in self._active else ("queued" if queue else "idle"),
+            }
+            for axis, queue in sorted(self._queues.items())
+        }
+
+
+_successive_move_queue = _SuccessiveMoveQueue()
+_SINGLE_AXIS_MOVE_AXES = {
+    "oem.x.move_steps": "x",
+    "oem.x.move_absolute": "x",
+    "oem.z.move_steps": "z",
+    "oem.z.move_absolute": "z",
+}
+
+
 def install_operator_control_plane(
     app: FastAPI,
     *,
@@ -2046,6 +2137,80 @@ def install_operator_control_plane(
                         "required": "command_id, pass/fail verdict, four booleans, and a 3+ character note",
                     },
                 )
+        effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
+        queue_axis = _SINGLE_AXIS_MOVE_AXES.get(action_id) if not is_safety_interrupt else None
+        queued_entry = None
+        queue_queued_at = None
+        if queue_axis is not None:
+            queue_entry = {
+                "axis": queue_axis,
+                "command_id": f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}",
+                "action_id": action_id,
+                "event": asyncio.Event(),
+                "cleared": False,
+            }
+            admission = await _successive_move_queue.admit(queue_axis, queue_entry)
+            if admission == "full":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "queue_full",
+                        "axis": queue_axis,
+                        "max_depth": _successive_move_queue.max_depth,
+                    },
+                )
+            if admission == "queued":
+                queued_entry = queue_entry
+                queue_queued_at = time.time()
+                pre_state = machine_state()
+                if int(pre_state["ownership_generation"]) != payload.expected_generation:
+                    raise HTTPException(status_code=409, detail="ownership generation mismatch")
+                pre_assessment = _assess_action(action, pre_state, effective_inputs)
+                if not pre_assessment["enabled"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "action_unavailable",
+                            "reason": pre_assessment["disabled_reason"],
+                            "dependencies": pre_assessment["dependencies"],
+                        },
+                    )
+                if not await _successive_move_queue.wait_dispatched(queued_entry):
+                    cleared = time.time()
+                    cleared_receipt = {
+                        "schema_version": RECEIPT_SCHEMA,
+                        "command_id": queued_entry["command_id"],
+                        "action_id": action_id,
+                        "kind": action["kind"],
+                        "safety_class": action["safety_class"],
+                        "status": "cleared",
+                        "idempotency_key": payload.idempotency_key,
+                        "idempotency_replay_enabled": True,
+                        "ownership_generation": int(pre_state["ownership_generation"]),
+                        "authority_fingerprint": replay_authority_fingerprint(pre_state),
+                        "started_at": str(queue_queued_at),
+                        "request_received_at": request_received_at,
+                        "queued_at": str(queue_queued_at),
+                        "cleared_at": str(cleared),
+                        "finished_at": str(cleared),
+                        "duration_ms": (cleared - queue_queued_at) * 1000.0,
+                        "remote_acknowledged": True,
+                        "controller_acknowledged": False,
+                        "physical_effect_verified": False,
+                        "machine_assessment": "pass",
+                        "operator_assessment": None,
+                        "operator_note": None,
+                        "requested_inputs": _bounded_json(payload.inputs, _MAX_INPUT_BYTES),
+                        "inputs": _bounded_json(effective_inputs, _MAX_INPUT_BYTES),
+                        "response": _bounded_json(
+                            {"http_status": 200, "body": {"detail": {"error": "queue_cleared", "axis": queue_axis}}},
+                            _MAX_RESPONSE_BYTES,
+                        ),
+                        "error": None,
+                        "stage_receipts": [],
+                    }
+                    claimed, created = await asyncio.to_thread(store.claim, cleared_receipt)
+                    return claimed
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
         async with action_lock:
             lock_acquired_at = time.time()
@@ -2060,7 +2225,7 @@ def install_operator_control_plane(
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
             existing = None
-            if not is_safety_interrupt:
+            if not is_safety_interrupt and queued_entry is None:
                 existing = await asyncio.to_thread(
                     store.by_idempotency,
                     payload.idempotency_key,
@@ -2084,7 +2249,7 @@ def install_operator_control_plane(
                 if existing.get("authority_fingerprint") != current_authority_fingerprint:
                     raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
                 return existing
-            command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
+            command_id = queued_entry["command_id"] if queued_entry is not None else f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
             started = time.time()
             receipt = {
                 "schema_version": RECEIPT_SCHEMA,
@@ -2158,6 +2323,7 @@ def install_operator_control_plane(
                     return claimed
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
+            receipt["queued_at"] = queue_queued_at if queued_entry is not None else time.time()
             if not is_safety_interrupt:
                 claimed, created = await asyncio.to_thread(store.claim, receipt)
                 if not created:
@@ -2191,6 +2357,8 @@ def install_operator_control_plane(
             })
             try:
                 receipt["provider_entry_at"] = time.time()
+                receipt["status"] = "dispatched"
+                receipt["dispatched_at"] = receipt["provider_entry_at"]
                 status_code, response = await asyncio.wait_for(
                     _dispatch_asgi(app, target["method"], target["path"], wire_inputs, target["locations"]),
                     timeout=float(action["timeout_seconds"]),
@@ -2260,7 +2428,12 @@ def install_operator_control_plane(
             receipt["duration_ms"] = (finished - started) * 1000.0
             receipt["receipt_persist_started_at"] = time.time()
             persist_receipt = store.put_interrupt if is_safety_interrupt else store.put
-            return await asyncio.to_thread(persist_receipt, receipt)
+            persisted = await asyncio.to_thread(persist_receipt, receipt)
+            if is_safety_interrupt:
+                await _successive_move_queue.clear()
+            elif queue_axis is not None:
+                await _successive_move_queue.complete(queue_axis)
+            return persisted
 
     app.include_router(router)
     app.openapi_schema = None
