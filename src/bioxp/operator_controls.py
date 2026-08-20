@@ -1825,6 +1825,16 @@ class _SuccessiveMoveQueue:
                 head = queue[0]
                 head["event"].set()
 
+    async def remove(self, axis: str, entry: dict[str, Any]) -> None:
+        """Remove an admitted entry that will not wait (pre-check rejection paths)."""
+        async with self._guard:
+            queue = self._queues.get(str(axis))
+            if queue:
+                for i, item in enumerate(queue):
+                    if item is entry:
+                        del queue[i]
+                        break
+
     async def clear(self, axis: str | None = None) -> None:
         """Clear queued moves (stop/abort). Waiter receipts finalize as `cleared`."""
         async with self._guard:
@@ -2164,9 +2174,11 @@ def install_operator_control_plane(
                 queue_queued_at = time.time()
                 pre_state = machine_state()
                 if int(pre_state["ownership_generation"]) != payload.expected_generation:
+                    await _successive_move_queue.remove(queue_axis, queue_entry)
                     raise HTTPException(status_code=409, detail="ownership generation mismatch")
                 pre_assessment = _assess_action(action, pre_state, effective_inputs)
                 if not pre_assessment["enabled"]:
+                    await _successive_move_queue.remove(queue_axis, queue_entry)
                     raise HTTPException(
                         status_code=409,
                         detail={
