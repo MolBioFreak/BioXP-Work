@@ -585,7 +585,7 @@ Every row is required. “Partial” does not count as complete.
 | G-019 | P1 | Make `/liquid/status` and dashboard/UI visibly label cache, live query, controller ACK, completion, and physical-effect truth separately. | Contract snapshots and UI acceptance. |
 | G-020 | P1 | Make pipette ACKs set `controller_acknowledged` only from semantic pipette evidence; preserve requested versus effective inputs and stage receipts. | Robot/BMS schema round trip. |
 | G-021 | P1 | Add dedicated operator-safe pipette controls or formally accept generic catalog UX with channel/state/precondition clarity. | Browser acceptance and receipt linkage. |
-| G-022 | P1 | Persist immutable command, readback, timeout, error, pressure, callback, and lifecycle artifacts with ownership generation and source hashes; distinguish `ControlLib.errorEvent` from `pipetteError`. | Restart/recovery and artifact-integrity evidence. |
+| G-022 | P1 | Implement the complete robot-authoritative runtime audit, migration, retention, reporting, BMS relay, and cockpit contract in `docs/specs/2026-08-20-bioxp-runtime-audit-storage-reporting-spec.md`. This includes a durable claim before every transport-producing pipette entrypoint, one canonical `bioxp_runtime.db`, a generated closed-world OEM/robot/protocol/lifecycle/operator/BMS/UI denominator, typed command/pipette/channel/CAN/event/pressure identities, indefinite compact metadata, five-year full evidence, backup-first migration from JSONL, crash-safe evidence lifecycle, bounded snapshot-consistent reports, governed exports, and retirement of the unused workstation command database. | Every RA-0 through RA-14 gate and RAQ-001 through RAQ-017 in the runtime audit specification. Source-only implementation does not satisfy this row. |
 | G-023 | P2 | Execute staged read-only shadow, dry no-liquid, stale-tip, air, and separately authorized wet commissioning. | Signed acceptance packet for each stage. |
 | G-024 | P2 | Prove release branch, deployed SHA, managed service ownership, BMS/API/frontend compatibility, and rollback readiness. | Release evidence bundle and independent review. |
 
@@ -635,7 +635,7 @@ Exit: G-009–G-018 source-complete with fixtures; wet paths remain admission-bl
 - exact scriptmove/motion-wrapper dependency closure;
 - `initPipette` retry loop;
 - script/workflow call sites;
-- abort, cleanup, rehome, and persistent receipts.
+- abort, cleanup, rehome, and persistent receipts governed by the runtime audit storage specification.
 
 Exit: G-008, G-010, G-016, G-017, and G-022 integrated without parity overclaims.
 
@@ -645,9 +645,9 @@ Exit: G-008, G-010, G-016, G-017, and G-022 integrated without parity overclaims
 - cache/live/ACK/completion/physical truth;
 - pipette controller acknowledgement;
 - requested/effective inputs;
-- operator UI and immutable history.
+- robot-authoritative report APIs, strict BMS relay, cockpit filters/detail/export, and durable history governed by the runtime audit storage specification.
 
-Exit: G-019–G-021 complete in development runtime.
+Exit: G-019–G-021 complete in development runtime. G-022 remains open until every applicable RA gate passes.
 
 ### WP5 — Read-only shadow and dry commissioning
 
@@ -717,6 +717,7 @@ Implementation verification must include, at minimum:
 - pressure epoch isolation;
 - abort/terminate/restart ambiguity;
 - API/receipt/schema round trips;
+- durable claim before transport, failure and ambiguity persistence, exact operator-to-pipette-to-CAN correlation, versioned migration, five-year evidence lifecycle, backup/restore, one-snapshot reports, strict BMS models, cockpit drill-down, and governed export under the runtime audit storage specification;
 - cache/live/physical truth labels.
 
 ### Read-only live
@@ -758,8 +759,8 @@ Only under WP6 authorization:
 | A1 | Complete source/IL/method/call-site parity matrix; no unclassified row. |
 | A2 | Offline transport and parser fixtures pass, including observed multipart evidence. |
 | A3 | Complete per-channel and collection source surface with mutation still blocked. |
-| A4 | Exact constructor/`initializeMotion`/`initPipette` integration and durable failure semantics. |
-| A5 | API/BMS/receipt/UI contracts accepted in development. |
+| A4 | Exact constructor/`initializeMotion`/`initPipette` integration and durable failure semantics, including a durable claim before pipette side effects. |
+| A5 | API/BMS/receipt/UI contracts and all development-applicable RA gates accepted in development. |
 | A6 | Deployed runtime identity and single-owner proof. |
 | A7 | Read-only live shadow accepted on all four channels. |
 | A8 | Separately authorized dry physical acceptance completed. |
@@ -809,8 +810,8 @@ No row may skip levels or borrow evidence from a different subsystem, binary ver
 
 ## 16. Final specification verdict
 
-This document is **final as the source-vetted rectification specification and release contract**. Independent OEM review confirms that the recovered source is sufficiently bounded to specify the work, but rejects the artifact as an implementation-ready exact OEM contract until the open source/IL/runtime rows close.
+This document is **final as the source-vetted OEM rectification specification and release contract**. `docs/specs/2026-08-20-bioxp-runtime-audit-storage-reporting-spec.md` is the controlling companion for G-022 storage and reporting work. Independent review confirms that the recovered source is sufficiently bounded to specify the work, but rejects the artifact as an implementation-ready exact OEM contract until the open source, IL, runtime, and RA rows close.
 
-The current implementation is **not** declared full OEM parity, physically accepted, commissioned, or release-ready. Material blockers include the application-owner and constructor call-site closure, unresolved binary/runtime fragment semantics, unresolved Q1 synchronous/asynchronous error-vector correlation, incomplete command and collection surfaces, literal-versus-hardened lifecycle differences, the startup-ejection acknowledgement mismatch, incomplete controller-ack truth, no deployed-runtime proof, and no physical acceptance evidence.
+The current implementation is **not** declared full OEM parity, audit-complete, physically accepted, commissioned, or release-ready. Material blockers include the application-owner and constructor call-site closure, unresolved binary/runtime fragment semantics, unresolved Q1 synchronous/asynchronous error-vector correlation, incomplete command and collection surfaces, literal-versus-hardened lifecycle differences, the startup-ejection acknowledgement mismatch, incomplete controller-ack truth, unresolved runtime-audit RA gates, no deployed-runtime proof, and no physical acceptance evidence.
 
 The next permitted implementation tranche is WP0 unless Christian explicitly authorizes a different bounded work package. Finalization of this specification authorizes no code changes, tests, USB/CAN commands, pipette actions, robot motion, deployment, commit, promotion, or commissioning.

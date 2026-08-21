@@ -6,6 +6,8 @@
 
 **Architecture:** The robot remains the only command and state authority. `NovoRouter` remains the only USB endpoint reader and serialized CAN transaction owner. BioModStack remains a typed relay and operator surface. Physical pipette commands stay disabled for this tranche.
 
+**Status reconciliation, 2026-08-20:** This is a historical execution plan for the earlier pipette parity tranche. A `Closed` row below means that tranche recorded its source/read-only objective as closed. It does not close runtime audit storage, pre-dispatch durability, migration, retention, backup/restore, report, export, release, or physical acceptance. `docs/specs/2026-08-20-bioxp-runtime-audit-storage-reporting-spec.md` controls those requirements. Its RA and RAQ ledgers supersede any broader reading of `Closed` in this file. Current implementation status must be reported from the exact candidate and those ledgers.
+
 **Authorized repositories:**
 
 - BioXP: `/home/dalab/worktrees/bioxp-pipette-parity-full-20260816`
