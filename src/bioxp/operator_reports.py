@@ -448,7 +448,7 @@ def _pipette_page(connection: Any, filters: dict[str, Any], cursor: str | None) 
     where = " AND ".join(clauses)
     total = int(connection.execute(f"SELECT COUNT(*) FROM pipette_operations p WHERE {where}", params).fetchone()[0])
     rows = connection.execute(
-        f"SELECT p.* FROM pipette_operations p WHERE {where} ORDER BY p.rowid DESC LIMIT ?",
+        f"SELECT p.rowid AS rowid, p.* FROM pipette_operations p WHERE {where} ORDER BY p.rowid DESC LIMIT ?",
         [*params, int(filters["limit"]) + 1],
     ).fetchall()
     has_more = len(rows) > int(filters["limit"])

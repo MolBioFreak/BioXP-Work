@@ -110,6 +110,24 @@ def test_summary_totals_share_the_command_filter_scope(tmp_path):
         sample_period_ms=10,
         source_generation=4,
     )
+    claim3, _ = pipette.claim(
+        operation="mix",
+        requested_inputs={"channel": 2},
+        entrypoint_id="api.liquid.mix",
+        caller_class="direct_api",
+        control_class="physical_liquid_command",
+        idempotency_key="report-idem-3",
+        command_id="report-command-3",
+        ownership_generation=4,
+        runtime_binding={"bms_invocation_id": "bms-report-3"},
+    )
+    pipette.record_failure(
+        command_id=claim3["command_id"],
+        pipette_operation_id=claim3["pipette_operation_id"],
+        operation="mix",
+        failure_code="test_failure",
+        message="filtered fixture two",
+    )
 
     summary = TestClient(app).get("/operator/reports/summary?status=completed").json()
     assert summary["commands"]["total"] == 1
@@ -120,6 +138,11 @@ def test_summary_totals_share_the_command_filter_scope(tmp_path):
     assert events["returned_count"] == 0
     pressure = TestClient(app).get("/operator/reports/pressure-streams?status=completed").json()
     assert pressure["returned_count"] == 1
+    pipette_page = TestClient(app).get("/operator/reports/pipette?status=failed&limit=1")
+    assert pipette_page.status_code == 200
+    assert pipette_page.json()["returned_count"] == 1
+    assert pipette_page.json()["has_more"] is True
+    assert pipette_page.json()["next_cursor"]
 
 
 def test_report_detail_exposes_typed_pipette_children_without_paths(tmp_path):
