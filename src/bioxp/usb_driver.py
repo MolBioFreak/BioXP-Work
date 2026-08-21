@@ -4783,6 +4783,126 @@ class BioXpTester:
             "ok": self._tmcl_success(ack),
         }
 
+    def motor_y_move_relative_strict(self, steps, *, timeout_s=20.0):
+        """Serial-206 Y relative primitive with one delivery and event proof."""
+        board = 4
+        motor = 0
+        delta = int(steps)
+        before = self.motor_get_position(board, motor=motor)
+        current = before.get("position") if isinstance(before, dict) else None
+        if not isinstance(before, dict) or before.get("ok") is not True or type(current) is not int:
+            return {
+                "ok": False,
+                "failure": "y_current_position_unavailable",
+                "board": board,
+                "motor": motor,
+                "steps": delta,
+                "before": before,
+                "command_sent": False,
+            }
+        target = int(current) + delta
+        if target < 20 or target > 102936:
+            return {
+                "ok": False,
+                "failure": "y_relative_target_out_of_range",
+                "board": board,
+                "motor": motor,
+                "steps": delta,
+                "before": before,
+                "target_position": target,
+                "relative_min_target": 20,
+                "relative_max_target": 102936,
+                "command_sent": False,
+            }
+        pre_stop = self.motor_query_motor_stop(board, motor=motor)
+        if not isinstance(pre_stop, dict) or pre_stop.get("ok") is not True:
+            return {
+                "ok": False,
+                "failure": "oem_pre_move_stop_query_failed",
+                "board": board,
+                "motor": motor,
+                "steps": delta,
+                "before": before,
+                "pre_stop": pre_stop,
+                "command_sent": False,
+            }
+        event_window = self.begin_bus_event_window()
+        time.sleep(0.001)
+        ack = self._send_motor(
+            board,
+            4,
+            1,
+            motor,
+            delta,
+            attempts=1,
+            wait_reply=True,
+            write_timeout_ms=55,
+            read_timeout_ms=70,
+            max_reads=18,
+            strict_match=True,
+        )
+        result = {
+            "ok": False,
+            "board": board,
+            "motor": motor,
+            "steps": delta,
+            "before": before,
+            "target_position": target,
+            "pre_stop": pre_stop,
+            "event_window": event_window,
+            "ack": ack,
+            "command_sent": True,
+            "single_delivery": True,
+        }
+        if not self._tmcl_success(ack):
+            return {
+                **result,
+                "failure": "y_direct_movement_ack_required",
+                "uncertain_delivery": ack is None,
+            }
+        event_window = self._bind_event_dispatch_cursor(event_window, board, motor, ack)
+        result["event_window"] = event_window
+        wait = self.motor_oem_wait_target_reached(
+            board, motor=motor, timeout_s=float(timeout_s), event_window=event_window
+        )
+        terminal_position = self.motor_get_position(board, motor=motor)
+        terminal_speed = self.motor_get_speed(board, motor=motor)
+        result.update({"wait": wait, "terminal_position": terminal_position, "terminal_speed": terminal_speed})
+        event = wait.get("event") if isinstance(wait, dict) else None
+        event_ok = bool(
+            isinstance(wait, dict)
+            and wait.get("ok") is True
+            and wait.get("target_reached") is True
+            and isinstance(event, dict)
+            and event.get("status") == 128
+            and event.get("board") == board
+            and event.get("motor") == motor
+        )
+        position_ok = bool(
+            isinstance(terminal_position, dict)
+            and terminal_position.get("ok") is True
+            and terminal_position.get("position") == target
+        )
+        speed_ok = bool(
+            isinstance(terminal_speed, dict)
+            and terminal_speed.get("ok") is True
+            and terminal_speed.get("speed") == 0
+        )
+        proof = {
+            "direct_ack": True,
+            "addressed_event_128": event_ok,
+            "target_position": position_ok,
+            "speed_zero": speed_ok,
+        }
+        return {
+            **result,
+            "ok": all(proof.values()),
+            "failure": None if all(proof.values()) else "y_terminal_proof_failed",
+            "event": event,
+            "proof": proof,
+            "completion_class": "event_128" if event_ok else "unknown",
+        }
+
     def motor_x_move_relative_strict(self, steps, *, timeout_s=20.0):
         """Execute one provider-owned X relative move with complete terminal proof."""
         board = int(self.BOARD_DECK)
@@ -5741,7 +5861,15 @@ class BioXpTester:
             "readbacks": readbacks,
         }
 
-    def motor_oem_axis_search_home(self, axis_key, *, speed, timeout_s=30.0, max_search_abs_delta=None):
+    def motor_oem_axis_search_home(
+        self,
+        axis_key,
+        *,
+        speed,
+        timeout_s=30.0,
+        max_search_abs_delta=None,
+        require_switch_transition=True,
+    ):
         """Source-faithful Class*Board.axisSearchHome(axis, speed).
 
         OEM sequence:
@@ -5821,7 +5949,7 @@ class BioXpTester:
             speed=int(speed),
             rehome=False,
             timeout_s=timeout_s,
-            require_switch_transition=True,
+            require_switch_transition=bool(require_switch_transition),
             max_search_abs_delta=max_search_abs_delta,
         )
         return {
@@ -7086,6 +7214,7 @@ class BioXpTester:
         startup=False,
         restore_idle_current=True,
         oem_exact_current=False,
+        require_switch_transition=True,
     ):
         axis_key_norm = str(axis_key).strip().lower()
         preset_raw = self._motion_oem_axis_profile(axis_key, startup=bool(startup))
@@ -7116,6 +7245,7 @@ class BioXpTester:
                 speed=effective_speed,
                 timeout_s=timeout_s,
                 max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+                require_switch_transition=bool(require_switch_transition),
             )
             return {
                 "axis": axis_key_norm,
@@ -7148,9 +7278,16 @@ class BioXpTester:
                 speed=effective_speed,
                 timeout_s=timeout_s,
                 max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+                require_switch_transition=bool(require_switch_transition),
             )
         else:
-            home = self.motor_oem_go_home(axis_key_norm, speed=effective_speed, rehome=True, timeout_s=timeout_s)
+            home = self.motor_oem_go_home(
+                axis_key_norm,
+                speed=effective_speed,
+                rehome=True,
+                timeout_s=timeout_s,
+                require_switch_transition=bool(require_switch_transition),
+            )
         return {
             "axis": axis_key_norm,
             "startup": bool(startup),
@@ -7200,7 +7337,7 @@ class BioXpTester:
                 speed=200,
                 rehome=False,
                 timeout_s=timeout_s,
-                require_switch_transition=True,
+                require_switch_transition=(axis != "y"),
             )
 
         try:

@@ -8,6 +8,7 @@ authority-bearing ledgers are persisted as one atomic state document.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import math
 import threading
@@ -442,6 +443,10 @@ class Serial206ProductionPrimitiveAdapter:
         self._z_profile_overrides: dict[int, int] = {}
         self._x_profile_overrides: dict[int, int] = {}
         self._x_lifecycle_executor: Callable[[str, Mapping[str, Any]], dict[str, Any]] | None = None
+        self.y_provider: Any | None = None
+
+    def bind_y_provider(self, provider: Any) -> None:
+        self.y_provider = provider
 
     def bind_x_lifecycle_executor(
         self,
@@ -586,11 +591,17 @@ class Serial206ProductionPrimitiveAdapter:
                 "physical_motion": False,
                 "blocker": "ownership_generation_changed_before_preparation",
             }
+        prepare_kwargs: dict[str, Any] = {"components": tuple(components)}
+        try:
+            supports_reuse = "reuse_current_board_lifecycle" in inspect.signature(prepare_motion_without_motion).parameters
+        except (TypeError, ValueError):
+            supports_reuse = False
+        if supports_reuse:
+            prepare_kwargs["reuse_current_board_lifecycle"] = bool(reuse_current_board_lifecycle)
         raw = prepare_motion_without_motion(
             self.tester,
             self.authority_provider(),
-            components=tuple(components),
-            reuse_current_board_lifecycle=bool(reuse_current_board_lifecycle),
+            **prepare_kwargs,
         )
         ok = isinstance(raw, Mapping) and raw.get("ok") is True and raw.get("physical_motion") is False
         return {
@@ -1486,6 +1497,16 @@ class Serial206ProductionPrimitiveAdapter:
         home_ok = bool(setup_ok and not errors and all(isinstance(results.get(axis), Mapping) and results[axis].get("ok") is True and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y")) and all(self._x_value(positions[axis]) == 0 for axis in ("x", "y")) and restore_ok)
         source_return = {axis: results[axis].get("source_return_code") if isinstance(results.get(axis), Mapping) else None for axis in ("x", "y")}
         receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": bool(setup_ok), "setup": _json_safe(setup), "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "controller_command_acknowledged": home_ok, "controller_terminal_state_verified": home_ok, "reference_publication_required": home_ok, "physical_effect_verified": False, "failure": None if home_ok else "homexy_evidence_not_verified", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
+        if home_ok and self.y_provider is not None:
+            child_publication = self.y_provider.publish_home_xy_reference(
+                receipt,
+                command_id=f"homexy-{time.time_ns()}",
+            )
+            receipt["y_child_authority"] = _json_safe(child_publication)
+            if child_publication.get("ok") is not True:
+                home_ok = False
+                receipt["ok"] = False
+                receipt["failure"] = "homexy_y_child_authority_not_published"
         if not home_ok:
             receipt["safety_stop"] = _json_safe({
                 "x": self.tester.motor_oem_stop_exact(5, motor=0),
@@ -2610,7 +2631,16 @@ class Serial206ProductionPrimitiveAdapter:
         wait_timeout_s: float = 5.0,
     ) -> dict[str, Any]:
         """ClassControlInterface.moveXY source ordering and acceleration."""
-        return self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
+        result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
+        if self.y_provider is not None and isinstance(result, Mapping):
+            result = dict(result)
+            result["y_authority"] = _json_safe(
+                self.y_provider.record_move_xy_observation(
+                    result,
+                    command_id=f"move-xy-{time.time_ns()}",
+                )
+            )
+        return result
         px = self._axis_profile("x")
         py = self._axis_profile("y")
         present = getattr(self.tester, "_oem_board_present", None)
@@ -3634,6 +3664,7 @@ class Serial206OemInitializationProvider:
         self._z_interrupt_active = False
         self._memory_state: dict[str, Any] | None = None
         self._board_transition_scope: dict[str, Any] | None = None
+        self.y_provider: Any | None = None
 
     @contextmanager
     def z_command_lease(self):
@@ -5710,6 +5741,15 @@ class Serial206OemInitializationProvider:
             state = self._load_state()
             z = state["z_lifecycle"]
             active_receipt = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
+            existing_authority = bool(
+                str(z.get("state") or "unprepared") != "unprepared"
+                or z.get("generation") is not None
+                or z.get("board_lifecycle_generation") is not None
+                or z.get("prepared_receipt") is not None
+                or z.get("active_receipt") is not None
+                or z.get("awaiting_observation_receipt_id") is not None
+                or z.get("reference_state") == "referenced"
+            )
             scope = self._board_transition_scope
             expected_transition = None
             remaining_expected_transitions: list[Any] = []
@@ -5735,6 +5775,26 @@ class Serial206OemInitializationProvider:
                         "observed_transition": observed_transition,
                         "ack": _json_safe(ack),
                     }
+            authority_store_result: dict[str, Any] | None = None
+            authority_store = getattr(self.state_store, "record_board4_transition", None)
+            if callable(authority_store):
+                raw_authority_store_result = authority_store(
+                    active=active is not False,
+                    ack=ack,
+                    transition_id=str(active_receipt.get("command_id") or f"board4-{time.time_ns()}"),
+                    ownership_generation=int(self.generation_provider()),
+                    invalidate_axes=bool(existing_authority and not provider_owned),
+                    continuity_proven=bool(
+                        isinstance(ack, Mapping)
+                        and type(ack.get("status")) is int
+                        and ack.get("status") == 100
+                    ),
+                )
+                authority_store_result = (
+                    dict(raw_authority_store_result)
+                    if isinstance(raw_authority_store_result, Mapping)
+                    else {"ok": False, "failure": "board4_authority_result_not_mapping"}
+                )
             if provider_owned:
                 return {
                     "z_affected": False,
@@ -5742,6 +5802,7 @@ class Serial206OemInitializationProvider:
                     "provider_owned_preparation": True,
                     "transition": "activated" if active is not False else "deactivated",
                     "remaining_expected_transitions": remaining_expected_transitions,
+                    "authority_store": _json_safe(authority_store_result),
                 }
             previous = str(z.get("state") or "unprepared")
             transition = "activated" if active is not False else "deactivated"
@@ -5755,7 +5816,13 @@ class Serial206OemInitializationProvider:
                 or z.get("reference_state") == "referenced"
             )
             if not has_preparation_authority:
-                return {"z_affected": False, "board": 4, "already_unprepared": True, "transition": transition}
+                return {
+                    "z_affected": False,
+                    "board": 4,
+                    "already_unprepared": True,
+                    "transition": transition,
+                    "authority_store": _json_safe(authority_store_result),
+                }
             invalidation = {
                 "reason": "board4_command64_outside_provider_preparation",
                 "transition": transition,
@@ -5763,6 +5830,7 @@ class Serial206OemInitializationProvider:
                 "previous_state": previous,
                 "ack": _json_safe(ack),
                 "invalidated_at": time.time(),
+                "authority_store": _json_safe(authority_store_result),
             }
             z.update({
                 "state": "unprepared",
@@ -5875,6 +5943,27 @@ class Serial206OemInitializationProvider:
                     "blockers": ["durable_serial206_state_corrupt"],
                     "failure": f"{type(exc).__name__}: {exc}",
                 }
+
+    def board4_projection(self) -> dict[str, Any]:
+        projection = getattr(self.state_store, "board4_authority_projection", None)
+        if not callable(projection):
+            return {
+                "available": False,
+                "state": "unbound",
+                "blockers": ["serial206_board4_authority_store_unbound"],
+            }
+        try:
+            value = projection()
+            if not isinstance(value, Mapping):
+                raise TypeError("board4 authority projection is not a mapping")
+            return {"available": True, **_json_safe(dict(value))}
+        except Exception as exc:
+            return {
+                "available": False,
+                "state": "corrupt",
+                "blockers": ["serial206_board4_authority_projection_failed"],
+                "failure": f"{type(exc).__name__}: {exc}",
+            }
 
     @staticmethod
     def _sanitize_z_terminal_state(value: Any) -> dict[str, Any] | None:

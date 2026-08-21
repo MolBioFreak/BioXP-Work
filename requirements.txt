@@ -4,3 +4,4 @@ python-can
 pydantic
 pyusb
 pillow
+rfc8785

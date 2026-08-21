@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .oem_runtime_store import migrate_runtime_database_v2
+
 TERMINAL_STATES = frozenset({
     "completed",
     "failed",
@@ -30,6 +32,7 @@ TERMINAL_STATES = frozenset({
 NONREPLAYABLE_INTERRUPT_ACTIONS = frozenset({
     "meta.emergency_stop",
     "oem.z.stop",
+    "oem.y.stop",
     "oem.z.abort",
     "oem.x.stop",
     "oem.abort_all",
@@ -218,107 +221,7 @@ class OperatorReceiptStore:
         self.connection.execute("PRAGMA temp_store=MEMORY")
 
     def _create_schema(self) -> None:
-        try:
-            self.connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS runtime_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_commands (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    command_id TEXT NOT NULL UNIQUE,
-                    idempotency_key TEXT NOT NULL,
-                    idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
-                        CHECK(idempotency_replay_enabled IN (0,1)),
-                    action_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    safety_class TEXT,
-                    ownership_generation INTEGER NOT NULL,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    duration_ms REAL,
-                    controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
-                    physical_effect_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1)),
-                    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                    response_summary_json TEXT CHECK(response_summary_json IS NULL OR json_valid(response_summary_json)),
-                    evidence_relpath TEXT,
-                    evidence_sha256 TEXT,
-                    evidence_bytes INTEGER,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS operator_commands_history_idx
-                    ON operator_commands(sequence DESC);
-                CREATE INDEX IF NOT EXISTS operator_commands_updated_idx
-                    ON operator_commands(updated_at DESC, sequence DESC);
-                CREATE INDEX IF NOT EXISTS operator_commands_action_status_idx
-                    ON operator_commands(action_id, status, sequence DESC);
-                CREATE TABLE IF NOT EXISTS operator_transitions (
-                    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE CASCADE,
-                    state TEXT NOT NULL,
-                    observed_at REAL NOT NULL,
-                    detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json))
-                );
-                CREATE INDEX IF NOT EXISTS operator_transitions_command_idx
-                    ON operator_transitions(command_id, transition_id);
-                """
-            )
-            columns = {
-                str(row["name"])
-                for row in self.connection.execute("PRAGMA table_info(operator_commands)")
-            }
-            if "idempotency_replay_enabled" not in columns:
-                self.connection.execute(
-                    """
-                    ALTER TABLE operator_commands
-                    ADD COLUMN idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
-                        CHECK(idempotency_replay_enabled IN (0,1))
-                    """
-                )
-            placeholders = ",".join("?" for _ in NONREPLAYABLE_INTERRUPT_ACTIONS)
-            self.connection.execute(
-                f"""
-                UPDATE operator_commands
-                SET idempotency_replay_enabled=0
-                WHERE action_id IN ({placeholders})
-                """,
-                tuple(NONREPLAYABLE_INTERRUPT_ACTIONS),
-            )
-            for index in self.connection.execute("PRAGMA index_list(operator_commands)").fetchall():
-                if not index["unique"] or index["origin"] != "c" or index["partial"]:
-                    continue
-                name = str(index["name"])
-                indexed_columns = [
-                    str(row["name"])
-                    for row in self.connection.execute(
-                        "SELECT name FROM pragma_index_info(?)",
-                        (name,),
-                    )
-                ]
-                if indexed_columns == ["idempotency_key"]:
-                    drop_row = self.connection.execute(
-                        "SELECT printf('DROP INDEX \"%w\"', ?)",
-                        (name,),
-                    ).fetchone()
-                    if drop_row is None or not isinstance(drop_row[0], str):
-                        raise RuntimeError("operator_index_drop_statement_missing")
-                    self.connection.execute(drop_row[0])
-            self.connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS operator_commands_replay_key_idx
-                    ON operator_commands(idempotency_key)
-                    WHERE idempotency_replay_enabled=1
-                """
-            )
-            self.connection.execute("PRAGMA user_version=1")
-            self.connection.execute("COMMIT")
-        except Exception:
-            if self.connection.in_transaction:
-                self.connection.execute("ROLLBACK")
-            raise
+        migrate_runtime_database_v2(self.connection, self.root)
 
     def _evidence_path(self, command_id: str, started_at: Any, digest: str) -> tuple[Path, str]:
         try:

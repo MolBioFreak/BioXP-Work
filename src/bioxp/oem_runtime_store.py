@@ -18,6 +18,353 @@ from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
 MAX_SERIAL206_RECEIPTS_PER_STREAM = 128
 MAX_SERIAL206_INTERRUPT_FALLBACK_ARCHIVES = 8
 
+SERIAL206_SCHEMA_VERSION = 2
+SERIAL206_BOARD4_MEMBERS = {"y": 0, "z": 1, "gripper": 2}
+_NONREPLAYABLE_ACTIONS = frozenset({
+    "meta.emergency_stop",
+    "oem.x.stop",
+    "oem.y.stop",
+    "oem.z.stop",
+    "oem.z.abort",
+    "oem.abort_all",
+})
+
+
+def _schema_source_digests(root: Path) -> dict[str, str | None]:
+    digests: dict[str, str | None] = {}
+    for name in ("reference-state.json", "serial206_oem_initialization_state.json"):
+        path = root / name
+        digests[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return digests
+
+
+def _drop_unconditional_idempotency_indexes(connection: sqlite3.Connection) -> None:
+    for row in connection.execute("PRAGMA index_list(operator_commands)").fetchall():
+        if not row[1] or row[3] != "c" or row[4]:
+            continue
+        name = str(row[1])
+        columns = [
+            str(info[0])
+            for info in connection.execute(
+                "SELECT name FROM pragma_index_info(?)", (name,)
+            ).fetchall()
+        ]
+        if columns == ["idempotency_key"]:
+            connection.execute(f'DROP INDEX "{name.replace(chr(34), chr(34) * 2)}"')
+
+
+def _execute_schema_batch(connection: sqlite3.Connection, script: str) -> None:
+    for statement in script.split(";"):
+        statement = statement.strip()
+        if statement:
+            connection.execute(statement)
+
+
+def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_batch(connection,
+        """
+        CREATE TABLE IF NOT EXISTS runtime_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_receipts (
+            stream TEXT NOT NULL,
+            receipt_id TEXT NOT NULL,
+            command_id TEXT,
+            idempotency_key TEXT,
+            idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                CHECK(idempotency_replay_enabled IN (0, 1)),
+            status TEXT,
+            observed_at REAL NOT NULL,
+            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+            PRIMARY KEY(stream, receipt_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS serial206_receipts_command_idx
+            ON serial206_receipts(stream, command_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS serial206_receipts_idempotency_idx
+            ON serial206_receipts(stream, idempotency_key)
+            WHERE idempotency_key IS NOT NULL AND idempotency_replay_enabled = 1;
+        CREATE INDEX IF NOT EXISTS serial206_receipts_time_idx
+            ON serial206_receipts(stream, observed_at DESC);
+        CREATE TABLE IF NOT EXISTS operator_commands (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL,
+            idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                CHECK(idempotency_replay_enabled IN (0,1)),
+            action_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            safety_class TEXT,
+            ownership_generation INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_ms REAL,
+            controller_acknowledged INTEGER NOT NULL DEFAULT 0
+                CHECK(controller_acknowledged IN (0,1)),
+            physical_effect_verified INTEGER NOT NULL DEFAULT 0
+                CHECK(physical_effect_verified IN (0,1)),
+            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+            response_summary_json TEXT
+                CHECK(response_summary_json IS NULL OR json_valid(response_summary_json)),
+            evidence_relpath TEXT,
+            evidence_sha256 TEXT,
+            evidence_bytes INTEGER,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS operator_commands_history_idx
+            ON operator_commands(sequence DESC);
+        CREATE INDEX IF NOT EXISTS operator_commands_updated_idx
+            ON operator_commands(updated_at DESC, sequence DESC);
+        CREATE INDEX IF NOT EXISTS operator_commands_action_status_idx
+            ON operator_commands(action_id, status, sequence DESC);
+        CREATE TABLE IF NOT EXISTS operator_transitions (
+            transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            observed_at REAL NOT NULL,
+            detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json))
+        );
+        CREATE INDEX IF NOT EXISTS operator_transitions_command_idx
+            ON operator_transitions(command_id, transition_id);
+        """
+    )
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_commands)").fetchall()
+    }
+    if "idempotency_replay_enabled" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE operator_commands
+            ADD COLUMN idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                CHECK(idempotency_replay_enabled IN (0,1))
+            """
+        )
+    _drop_unconditional_idempotency_indexes(connection)
+    placeholders = ",".join("?" for _ in _NONREPLAYABLE_ACTIONS)
+    connection.execute(
+        f"UPDATE operator_commands SET idempotency_replay_enabled=0 WHERE action_id IN ({placeholders})",
+        tuple(sorted(_NONREPLAYABLE_ACTIONS)),
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS operator_commands_replay_key_idx
+            ON operator_commands(idempotency_key)
+            WHERE idempotency_replay_enabled=1
+        """
+    )
+
+
+def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_batch(connection,
+        """
+        CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
+            version INTEGER PRIMARY KEY CHECK(version=2),
+            backup_sha256 TEXT NOT NULL CHECK(length(backup_sha256)=64),
+            source_json_digests_json TEXT NOT NULL CHECK(json_valid(source_json_digests_json)),
+            started_at REAL NOT NULL,
+            finished_at REAL NOT NULL,
+            result TEXT NOT NULL CHECK(result='committed')
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_board_authority (
+            board_id INTEGER PRIMARY KEY CHECK(board_id=4),
+            state TEXT NOT NULL CHECK(state IN ('inactive','transitioning','active','faulted')),
+            prior_board_epoch INTEGER CHECK(prior_board_epoch IS NULL OR prior_board_epoch>=0),
+            active_board_epoch INTEGER CHECK(active_board_epoch IS NULL OR active_board_epoch>=0),
+            transition_id TEXT,
+            deactivation_attempt_id TEXT,
+            deactivation_delivery INTEGER CHECK(deactivation_delivery IS NULL OR deactivation_delivery IN (0,1)),
+            deactivation_reply_valid INTEGER CHECK(deactivation_reply_valid IS NULL OR deactivation_reply_valid IN (0,1)),
+            deactivation_status_code INTEGER,
+            activation_attempt_id TEXT,
+            activation_delivery INTEGER CHECK(activation_delivery IS NULL OR activation_delivery IN (0,1)),
+            activation_reply_valid INTEGER CHECK(activation_reply_valid IS NULL OR activation_reply_valid IN (0,1)),
+            activation_status_code INTEGER,
+            member_motors_json TEXT NOT NULL CHECK(json_valid(member_motors_json)),
+            state_version INTEGER NOT NULL CHECK(state_version>=1),
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS serial206_axis_authority (
+            axis TEXT PRIMARY KEY CHECK(axis IN ('y','z','gripper')),
+            board_id INTEGER NOT NULL REFERENCES serial206_board_authority(board_id),
+            motor_id INTEGER NOT NULL CHECK(motor_id BETWEEN 0 AND 2),
+            ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
+            prepared_board_epoch INTEGER CHECK(prepared_board_epoch IS NULL OR prepared_board_epoch>=0),
+            profile_fingerprint TEXT,
+            lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('unprepared','prepared_unreferenced','referenced_ready','generation_stale','reconciliation_required','faulted')),
+            reference_state TEXT NOT NULL CHECK(reference_state IN ('unreferenced','referenced','generation_stale','reconciliation_required')),
+            origin_position_steps INTEGER,
+            observed_position_steps INTEGER,
+            last_discrepancy_steps INTEGER,
+            last_command_id TEXT,
+            last_receipt_id TEXT,
+            interrupt_epoch INTEGER NOT NULL DEFAULT 0 CHECK(interrupt_epoch>=0),
+            state_version INTEGER NOT NULL CHECK(state_version>=1),
+            updated_at REAL NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_movement_methods (
+            method_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            action_id TEXT NOT NULL,
+            canonical_inputs_sha256 TEXT NOT NULL CHECK(length(canonical_inputs_sha256)=64),
+            state TEXT NOT NULL CHECK(state IN ('queued','active','completed','completed_partial','failed','cleared','interrupted','ambiguous')),
+            state_version INTEGER NOT NULL CHECK(state_version>=1),
+            failure_policy TEXT NOT NULL CHECK(failure_policy='require_completed'),
+            child_count INTEGER NOT NULL CHECK(child_count>=1),
+            accepted_at REAL NOT NULL,
+            started_at REAL,
+            finished_at REAL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_movement_commands (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            method_id TEXT REFERENCES serial206_movement_methods(method_id) ON DELETE CASCADE,
+            method_order INTEGER NOT NULL DEFAULT 0 CHECK(method_order>=0),
+            parallel_group INTEGER NOT NULL DEFAULT 0 CHECK(parallel_group>=0),
+            axis_scope TEXT,
+            board_scope_json TEXT NOT NULL CHECK(json_valid(board_scope_json)),
+            ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
+            expected_board_epochs_json TEXT NOT NULL CHECK(json_valid(expected_board_epochs_json)),
+            canonical_inputs_sha256 TEXT NOT NULL CHECK(length(canonical_inputs_sha256)=64),
+            state TEXT NOT NULL CHECK(state IN ('queued','dispatched','issued_pending','interrupting','completed','failed','cleared','interrupted','ambiguous','rejected')),
+            state_version INTEGER NOT NULL CHECK(state_version>=1),
+            admitted_interrupt_epochs_json TEXT NOT NULL CHECK(json_valid(admitted_interrupt_epochs_json)),
+            accepted_at REAL NOT NULL,
+            queued_at REAL NOT NULL,
+            dispatched_at REAL,
+            finished_at REAL,
+            terminal_receipt_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS serial206_command_resources (
+            command_id TEXT NOT NULL REFERENCES serial206_movement_commands(command_id) ON DELETE CASCADE,
+            resource_key TEXT NOT NULL,
+            PRIMARY KEY(command_id,resource_key)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_command_dependencies (
+            command_id TEXT NOT NULL REFERENCES serial206_movement_commands(command_id) ON DELETE CASCADE,
+            depends_on_command_id TEXT NOT NULL REFERENCES serial206_movement_commands(command_id) ON DELETE CASCADE,
+            required_terminal TEXT NOT NULL CHECK(required_terminal='completed'),
+            PRIMARY KEY(command_id,depends_on_command_id),
+            CHECK(command_id<>depends_on_command_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_interrupt_imports (
+            record_sha256 TEXT PRIMARY KEY CHECK(length(record_sha256)=64),
+            interrupt_attempt_id TEXT NOT NULL UNIQUE,
+            axis TEXT NOT NULL,
+            interrupt_epoch INTEGER NOT NULL CHECK(interrupt_epoch>=0),
+            imported_at REAL NOT NULL,
+            receipt_id TEXT NOT NULL
+        ) WITHOUT ROWID;
+        CREATE UNIQUE INDEX IF NOT EXISTS serial206_movement_commands_idempotency_idx
+            ON serial206_movement_commands(idempotency_key);
+        CREATE INDEX IF NOT EXISTS serial206_movement_commands_ready_idx
+            ON serial206_movement_commands(state,sequence);
+        CREATE INDEX IF NOT EXISTS serial206_movement_commands_method_idx
+            ON serial206_movement_commands(method_id,method_order,parallel_group,sequence);
+        CREATE INDEX IF NOT EXISTS serial206_command_resources_lookup_idx
+            ON serial206_command_resources(resource_key,command_id);
+        CREATE INDEX IF NOT EXISTS serial206_command_dependencies_reverse_idx
+            ON serial206_command_dependencies(depends_on_command_id,command_id);
+        """
+    )
+
+
+def _verify_v2_schema(connection: sqlite3.Connection) -> None:
+    required = {
+        "runtime_schema_migrations",
+        "serial206_board_authority",
+        "serial206_axis_authority",
+        "serial206_movement_methods",
+        "serial206_movement_commands",
+        "serial206_command_resources",
+        "serial206_command_dependencies",
+        "serial206_interrupt_imports",
+    }
+    found = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    missing = sorted(required - found)
+    if missing:
+        raise RuntimeError(f"serial-206 v2 schema missing tables: {','.join(missing)}")
+    required_indexes = {
+        "serial206_movement_commands_idempotency_idx",
+        "serial206_movement_commands_ready_idx",
+        "serial206_movement_commands_method_idx",
+        "serial206_command_resources_lookup_idx",
+        "serial206_command_dependencies_reverse_idx",
+    }
+    found_indexes = {
+        str(row[1])
+        for row in connection.execute(
+            "SELECT type,name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    missing_indexes = sorted(required_indexes - found_indexes)
+    if missing_indexes:
+        raise RuntimeError(f"serial-206 v2 schema missing indexes: {','.join(missing_indexes)}")
+
+
+def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
+    """Own the one-time v1-to-v2 runtime schema transition.
+
+    Both runtime stores call this function. It is idempotent and refuses a
+    future schema without creating or mutating application tables.
+    """
+    selected_root = Path(root)
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version > SERIAL206_SCHEMA_VERSION:
+        raise RuntimeError(f"unsupported runtime schema version {version}")
+    if version == SERIAL206_SCHEMA_VERSION:
+        _verify_v2_schema(connection)
+        return
+    backup_sha256 = "0" * 64
+    source_digests = _schema_source_digests(selected_root)
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _create_v1_runtime_schema(connection)
+        _create_v2_authority_schema(connection)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO serial206_board_authority(
+                board_id,state,member_motors_json,state_version,updated_at
+            ) VALUES(4,'inactive',?,1,?)
+            """,
+            (json.dumps(SERIAL206_BOARD4_MEMBERS, sort_keys=True, separators=(",", ":")), time.time()),
+        )
+        for axis, motor_id in SERIAL206_BOARD4_MEMBERS.items():
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO serial206_axis_authority(
+                    axis,board_id,motor_id,ownership_generation,lifecycle_state,
+                    reference_state,state_version,updated_at
+                ) VALUES(?,4,?,?, 'unprepared','unreferenced',1,?)
+                """,
+                (axis, motor_id, 0, time.time()),
+            )
+        finished_at = time.time()
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO runtime_schema_migrations(
+                version,backup_sha256,source_json_digests_json,started_at,finished_at,result
+            ) VALUES(2,?,?,?,?, 'committed')
+            """,
+            (backup_sha256, json.dumps(source_digests, sort_keys=True, separators=(",", ":")), started_at, finished_at),
+        )
+        connection.execute("PRAGMA user_version=2")
+        _verify_v2_schema(connection)
+        connection.execute("PRAGMA foreign_key_check")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     """Durably replace one private JSON authority file.
@@ -71,43 +418,266 @@ class OEMRuntimeStore:
             check_same_thread=False,
         )
         self._db.row_factory = sqlite3.Row
+        self._closed = False
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA busy_timeout=2000")
         self._db.execute("PRAGMA wal_autocheckpoint=256")
         self._db.execute("PRAGMA journal_size_limit=4194304")
-        self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS runtime_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            ) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS serial206_receipts (
-                stream TEXT NOT NULL,
-                receipt_id TEXT NOT NULL,
-                command_id TEXT,
-                idempotency_key TEXT,
-                idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
-                    CHECK(idempotency_replay_enabled IN (0, 1)),
-                status TEXT,
-                observed_at REAL NOT NULL,
-                receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                PRIMARY KEY(stream, receipt_id)
-            ) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS serial206_receipts_command_idx
-                ON serial206_receipts(stream, command_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS serial206_receipts_idempotency_idx
-                ON serial206_receipts(stream, idempotency_key)
-                WHERE idempotency_key IS NOT NULL AND idempotency_replay_enabled = 1;
-            CREATE INDEX IF NOT EXISTS serial206_receipts_time_idx
-                ON serial206_receipts(stream, observed_at DESC);
-            """
-        )
+        migrate_runtime_database_v2(self._db, self.root)
         self._seq = self._load_seq()
         self._import_embedded_serial206_receipts_once()
         self._import_serial206_interrupt_fallback()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._db.close()
+                self._closed = True
+
+    @staticmethod
+    def _authority_row(row: sqlite3.Row | None) -> dict[str, Any]:
+        return {} if row is None else {str(key): row[key] for key in row.keys()}
+
+    def _board4_row_locked(self) -> dict[str, Any]:
+        row = self._db.execute(
+            "SELECT * FROM serial206_board_authority WHERE board_id=4"
+        ).fetchone()
+        board = self._authority_row(row)
+        if board:
+            board["member_motors"] = json.loads(board.pop("member_motors_json"))
+        return board
+
+    def _axis_rows_locked(self) -> dict[str, dict[str, Any]]:
+        rows = self._db.execute(
+            "SELECT * FROM serial206_axis_authority ORDER BY axis"
+        ).fetchall()
+        output: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            axis = str(row["axis"])
+            output[axis] = self._authority_row(row)
+        return output
+
+    def board4_authority_projection(self) -> dict[str, Any]:
+        with self._lock:
+            return {"board": self._board4_row_locked(), "axes": self._axis_rows_locked()}
+
+    def record_board4_transition(
+        self,
+        *,
+        active: bool,
+        ack: Any,
+        transition_id: str,
+        ownership_generation: int,
+        invalidate_axes: bool = True,
+        continuity_proven: bool = True,
+    ) -> dict[str, Any]:
+        """Persist one board-4 command-64 boundary and its member-axis effect."""
+        if type(active) is not bool:
+            raise ValueError("board-4 active must be bool")
+        if not transition_id:
+            raise ValueError("board-4 transition_id is required")
+        status_code = int(ack.get("status", -1)) if isinstance(ack, Mapping) else -1
+        reply_valid = isinstance(ack, Mapping)
+        accepted = reply_valid and status_code == 100
+        now = time.time()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._db.execute(
+                    "SELECT * FROM serial206_board_authority WHERE board_id=4"
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError("serial-206 board-4 authority row is missing")
+                current_active_epoch = current["active_board_epoch"]
+                current_prior_epoch = current["prior_board_epoch"]
+                if active:
+                    board_epoch = (
+                        int(current_active_epoch)
+                        if accepted and current["state"] == "active" and current_active_epoch is not None
+                        else (int(current_active_epoch or current_prior_epoch or 0) + 1 if accepted else current_active_epoch)
+                    )
+                    state = "active" if accepted and continuity_proven else "faulted"
+                    prior_epoch = current_active_epoch if current_active_epoch is not None else current_prior_epoch
+                    active_epoch = board_epoch if accepted and continuity_proven else None
+                    attempt_column = "activation_attempt_id"
+                    delivery_column = "activation_delivery"
+                    reply_column = "activation_reply_valid"
+                    status_column = "activation_status_code"
+                else:
+                    prior_epoch = current_active_epoch if current_active_epoch is not None else current_prior_epoch
+                    active_epoch = None
+                    state = "inactive" if accepted and continuity_proven else "faulted"
+                    attempt_column = "deactivation_attempt_id"
+                    delivery_column = "deactivation_delivery"
+                    reply_column = "deactivation_reply_valid"
+                    status_column = "deactivation_status_code"
+                self._db.execute(
+                    f"""
+                    UPDATE serial206_board_authority
+                    SET state=?, prior_board_epoch=?, active_board_epoch=?, transition_id=?,
+                        {attempt_column}=?, {delivery_column}=?, {reply_column}=?,
+                        {status_column}=?, state_version=state_version+1, updated_at=?
+                    WHERE board_id=4
+                    """,
+                    (
+                        state,
+                        prior_epoch,
+                        active_epoch,
+                        transition_id,
+                        transition_id,
+                        1,
+                        int(reply_valid),
+                        status_code,
+                        now,
+                    ),
+                )
+                if invalidate_axes:
+                    for axis, row in self._axis_rows_locked().items():
+                        has_authority = bool(
+                            row.get("lifecycle_state") != "unprepared"
+                            or row.get("reference_state") != "unreferenced"
+                            or row.get("prepared_board_epoch") is not None
+                        )
+                        lifecycle = "generation_stale" if has_authority else "unprepared"
+                        reference = "generation_stale" if has_authority else "unreferenced"
+                        if state == "faulted" and has_authority:
+                            lifecycle = "generation_stale"
+                        self._db.execute(
+                            """
+                            UPDATE serial206_axis_authority
+                            SET prepared_board_epoch=NULL, lifecycle_state=?, reference_state=?,
+                                state_version=state_version+1, updated_at=?
+                            WHERE axis=?
+                            """,
+                            (lifecycle, reference, now, axis),
+                        )
+                self._db.execute("COMMIT")
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+            return self.board4_authority_projection() | {
+                "transition": {
+                    "transition_id": transition_id,
+                    "active": active,
+                    "accepted": accepted,
+                    "status_code": status_code,
+                    "delivery": True,
+                    "reply_valid": reply_valid,
+                    "continuity_proven": continuity_proven,
+                    "ownership_generation": int(ownership_generation),
+                }
+            }
+
+    def prepare_axis_authority(
+        self,
+        axis: str,
+        *,
+        ownership_generation: int,
+        profile_fingerprint: str,
+    ) -> dict[str, Any]:
+        axis = str(axis)
+        if axis not in SERIAL206_BOARD4_MEMBERS:
+            return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
+        with self._lock:
+            board = self._board4_row_locked()
+            if board.get("state") != "active" or board.get("active_board_epoch") is None:
+                return {"ok": False, "failure": "board4_not_active", "axis": axis, "board": board}
+            now = time.time()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute(
+                    """
+                    UPDATE serial206_axis_authority
+                    SET ownership_generation=?, prepared_board_epoch=?, profile_fingerprint=?,
+                        lifecycle_state='prepared_unreferenced', reference_state='unreferenced',
+                        state_version=state_version+1, updated_at=?
+                    WHERE axis=?
+                    """,
+                    (int(ownership_generation), int(board["active_board_epoch"]), str(profile_fingerprint), now, axis),
+                )
+                self._db.execute("COMMIT")
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+            return {"ok": True, "axis": self._axis_rows_locked()[axis], "board": self._board4_row_locked()}
+
+    def publish_axis_reference(
+        self,
+        axis: str,
+        *,
+        position_steps: int,
+        ownership_generation: int,
+        receipt_id: str | None = None,
+    ) -> dict[str, Any]:
+        axis = str(axis)
+        if axis not in SERIAL206_BOARD4_MEMBERS:
+            return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
+        with self._lock:
+            board = self._board4_row_locked()
+            row = self._axis_rows_locked().get(axis, {})
+            if board.get("state") != "active" or row.get("prepared_board_epoch") != board.get("active_board_epoch"):
+                return {"ok": False, "failure": "axis_board_epoch_not_current", "axis": axis, "board": board, "axis_state": row}
+            if int(row.get("ownership_generation", -1)) != int(ownership_generation):
+                return {"ok": False, "failure": "axis_generation_mismatch", "axis": axis, "axis_state": row}
+            now = time.time()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute(
+                    """
+                    UPDATE serial206_axis_authority
+                    SET lifecycle_state='referenced_ready', reference_state='referenced',
+                        origin_position_steps=?, observed_position_steps=?, last_receipt_id=?,
+                        state_version=state_version+1, updated_at=?
+                    WHERE axis=?
+                    """,
+                    (int(position_steps), int(position_steps), receipt_id, now, axis),
+                )
+                self._db.execute("COMMIT")
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+            return {"ok": True, "axis": self._axis_rows_locked()[axis], "board": self._board4_row_locked()}
+
+    def record_axis_observation(
+        self,
+        axis: str,
+        *,
+        requested_position_steps: int,
+        observed_position_steps: int,
+        receipt_id: str | None = None,
+    ) -> dict[str, Any]:
+        axis = str(axis)
+        if axis not in SERIAL206_BOARD4_MEMBERS:
+            return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
+        discrepancy = int(observed_position_steps) - int(requested_position_steps)
+        with self._lock:
+            now = time.time()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute(
+                    """
+                    UPDATE serial206_axis_authority
+                    SET observed_position_steps=?, last_discrepancy_steps=?, last_receipt_id=?, updated_at=?
+                    WHERE axis=?
+                    """,
+                    (int(observed_position_steps), discrepancy, receipt_id, now, axis),
+                )
+                self._db.execute("COMMIT")
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+            return {
+                "ok": True,
+                "axis": self._axis_rows_locked()[axis],
+                "discrepancy_steps": discrepancy,
+                "reconciled_to_observed": True,
+            }
 
     def _import_embedded_serial206_receipts_once(self) -> None:
         marker_key = "serial206_embedded_receipt_import_v1"
