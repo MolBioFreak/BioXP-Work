@@ -71,6 +71,7 @@ class PipetteReceiptStore:
         self.receipts_path = None
         self._legacy_path = self.root / "receipts.jsonl"
         self._lock = threading.RLock()
+        self.lock = self._lock
 
     def _source_identity(self) -> dict[str, Any]:
         repo = Path(__file__).resolve().parents[3]
