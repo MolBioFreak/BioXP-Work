@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import Response
 
 from .operator_receipt_store import OperatorReceiptStore, _fsync_directory
 
@@ -933,9 +933,13 @@ def create_operator_reports_router(store: Any) -> APIRouter:
                 raise HTTPException(status_code=409, detail={"error": "export_artifact_missing"})
             if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
                 raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+            headers = {
+                "X-Content-SHA256": str(row["sha256"]),
+                "Content-Disposition": f'attachment; filename="bioxp-report-{export_id}.{row["format"]}"',
+            }
             if row["format"] == "json":
-                return JSONResponse(content=json.loads(path.read_text(encoding="utf-8")))
-            return PlainTextResponse(path.read_text(encoding="utf-8"), media_type="text/csv")
+                return Response(content=path.read_bytes(), media_type="application/json", headers=headers)
+            return Response(content=path.read_bytes(), media_type="text/csv", headers=headers)
 
     @router.get("/audit-health")
     def audit_health() -> dict[str, Any]:
