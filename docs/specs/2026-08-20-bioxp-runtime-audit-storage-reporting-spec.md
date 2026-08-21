@@ -1,7 +1,7 @@
 # BioXP Runtime Audit Storage and Reporting Specification
 
-**Status:** Controlling implementation and acceptance specification
-**Date:** 2026-08-20
+**Status:** Controlling implementation and acceptance specification; implementation incomplete
+**Date:** 2026-08-20; reassessed 2026-08-21
 **Scope owner:** Christian
 **Systems:** BioXP serial 206 robot runtime and BioModStack
 **Primary authority:** Robot-local SQLite runtime audit store
@@ -735,7 +735,9 @@ Retirement steps:
 
 An empty database is not proof that deletion is safe. It remains preserved until this gate completes.
 
-## 18. Requirements and candidate ledger
+## 18. Original requirements and candidate ledger
+
+This ledger records the pre-implementation baseline. Section 24 is the binding current-candidate reassessment and supersedes the candidate-state and defect columns below. The approved requirements and closing gates remain controlling.
 
 Allowed candidate states are `absent`, `partial`, `implemented_unverified`, and `verified`. A source change without the required test, migration, deployment, and acceptance evidence cannot be `verified`.
 
@@ -819,7 +821,9 @@ Implementation work must add focused tests for:
 
 Repository tests that assert the old 512-record cap or old exact route count must be changed only after the new specification tests exist and fail for the intended reason.
 
-## 21. Ordered implementation packages
+## 21. Original ordered implementation packages
+
+These packages record the initial implementation sequence. Section 25 defines the binding remaining work after the 2026-08-21 exact-tree reassessment.
 
 ### RA-WP0: Specification and migration design
 
@@ -911,8 +915,236 @@ Known blocking prototype defects include:
 
 No prototype code may be committed, rebased into implementation, deployed, or used as acceptance evidence. A later implementation may reuse reviewed ideas only after RA-WP0 freezes the exact contract.
 
-## 23. Final verdict
+## 23. Initial pre-implementation verdict
 
-This specification makes the robot the sole runtime audit authority. It removes count-based command deletion, retains compact metadata indefinitely, retains full evidence for five calendar years, replaces active pipette JSONL writes with governed SQLite persistence, and requires practical runtime-wide and pipette reporting through BioModStack.
+The 2026-08-20 document review closed the original RA-0 documentation gate. Later implementation and deployment work did not close every acceptance gate. Sections 24 through 26 supersede any later claim that the complete storage and reporting assignment passed.
 
-Implementation readiness is **BLOCKED at RA-0** until this exact document is reviewed and approved. Finalization of the document does not authorize implementation or any physical action.
+## 24. Binding 2026-08-21 reassessment
+
+### 24.1 Reviewed identities and evidence boundary
+
+The reassessment used these immutable identities:
+
+- governing specification baseline commit `bed03aaeb76399ce5d994256d5abfef93fdc804b`;
+- governing specification baseline SHA-256 `00d6c6030708c7a2742f907452623ddb30a66c9af47ea67ce14db860eb0d42f8`;
+- robot candidate commit `23e717aa3809776341fc4339af9c79cbca27fea9`;
+- robot candidate tree `fbb12fd8a6669b829622b9e9248118946b9c37ca`;
+- focused robot acceptance result: 39 tests passed;
+- broad robot suite: not proven green because one run exited during collection and the isolated-state retry exceeded its time limit;
+- live BMS snapshot: API and frontend shared immutable release `5c519c34022f2725626c4f8580623ecb9dd7d34a`, whose BioXP bytes matched parent `61a04f1908b4a534ca39412f700f0339004298ca`;
+- BMS integration state at that snapshot: `origin/test` was `61a04f1908b4a534ca39412f700f0339004298ca`, the live child commit was not on the remote branch, and the canonical checkout had eight unrelated dirty BioXP files that were not present in the live immutable release.
+
+The robot source review and direct live read-only inspection support the findings below. No physical pipette command, CAN mutation, motion, 24 V activation, homing, or wet commissioning was part of this reassessment.
+
+### 24.2 Current gate ledger
+
+| Requirement | Current state | Decisive current evidence | Work required to close |
+|---|---|---|---|
+| RAQ-001 sole robot SQLite authority | `partial` | The canonical SQLite store is active, but `/var/lib/bioxp-oem-runtime/pipette/receipts.jsonl` remains an active receipt sink. | Remove every production JSONL write path after a backup-first, digest-bound, idempotent migration. Fail readiness if a runtime caller can select or append a second audit authority. |
+| RAQ-002 indefinite compact retention | `implemented_unverified` | Count-based truncation is absent and current command rows remain available. | Pass capacity, backup, restore, WAL, checkpoint, integrity, and disk-full gates. |
+| RAQ-003 typed correlation | `partial` | Typed columns exist, but the `pipette_operations` claim insert omits connection generation, protocol job/action, and lifecycle stage fields. Protocol and lifecycle writers do not populate the canonical typed chain. | Carry trusted identities through the claim API, database insert, terminal publication, reports, BMS models, and exports. Add foreign-key and exact-chain tests. |
+| RAQ-004 durable pre-side-effect claim | `partial` | The shared service claims before dispatch. `/liquid/readback`, `/liquid/init`, protocol handlers, constructor initialization, and Serial-206 lifecycle methods can reach transport outside that coordinator. | Route every generated denominator row through one coordinator before transport. Add denial fixtures that fail on the first early driver call. |
+| RAQ-005 durable success and failure | `partial` | Central service failures persist. Bypass paths can fail before a claim. Typed-normalization failure can leave `reserved`; startup reconciliation closes only the operator projection. | Persist all failure classes and reconcile both operator and pipette rows to `outcome_unknown` without retry. |
+| RAQ-006 JSONL migration | `partial` | A migration helper and unit fixture exist. Production startup does not invoke it. The live source contained nine legacy receipts, while `runtime_migration_receipts` contained zero rows at reassessment. | Implement one owner-elected migration with backup, source digest, count reconciliation, quarantine, rollback, restart idempotency, and a terminal migration receipt. Disable JSONL append after success. |
+| RAQ-007 five-year evidence lifecycle | `partial` | Evidence tables and report projections exist. Full retention, legal hold, two-phase expiry, and recovery remain unaccepted. | Complete Section 8 and pass RA-7. |
+| RAQ-008 evidence integrity | `partial` | Existing export bytes matched recorded digest and byte count. Broader evidence publication and periodic integrity closure remain open. | Add exact evidence-link receipts, confinement, corruption handling, orphan recovery, and periodic verification. |
+| RAQ-009 backup and restore | `absent` | No accepted database-plus-evidence restore drill exists for this candidate. | Run both restore paths against the exact migration/schema candidate after separate test authorization. |
+| RAQ-010 WAL, capacity, and disk behavior | `partial` | WAL and quick-check evidence exist. Five-year capacity and fail-closed disk behavior remain open. | Pass RA-12 with measured representative data and explicit thresholds. |
+| RAQ-011 robot reports | `partial` | Live summary, lists, details, pagination, events, pressure, health, and exports render. Pipette/event/pressure summary totals are global while command metrics honor filters. | Apply one filter contract to every summary numerator and denominator. Add concurrent-write snapshot tests and exact filtered-summary fixtures. |
+| RAQ-012 BMS read-only relay | `partial` | The live relay is read-only and mutation access was disabled. Exact integration and current-branch provenance did not pass. | Seal strict models against the final robot contract, integrate the exact candidate into `test`, and prove live source identity. |
+| RAQ-013 cockpit reports | `partial` | The mounted report panel settled and displayed command rows, zero typed pipette rows, details, filters, and export controls. It did not reveal the nine unmigrated legacy receipts as typed pipette operations. | Render reconciled robot-authoritative data after migration and filtered-summary repair. Re-run mounted browser acceptance against the integrated release. |
+| RAQ-014 workstation command database retirement | `verified` | Active `commands.sqlite3`, WAL, and SHM paths were absent. A hash-bound archived database and retirement receipts remained. No active writer, handle, source fallback, or BMS fallback was found. | Preserve receipts and recheck non-use during final release acceptance. |
+| RAQ-015 physical boundary | `verified` for software acceptance | Effective BMS mutations were disabled. No reassessment action produced physical effects. | Keep this gate unchanged. Physical and wet acceptance remain separate and require Christian's named authorization. |
+| RAQ-016 complete release evidence | `partial` | Focused tests and live read-only behavior passed. Broad robot tests, restore, capacity, exact BMS integration, and all earlier acceptance gates did not pass. | Complete Section 25 in order against one exact candidate and one immutable deployed release. |
+| RAQ-017 closed entrypoint denominator | `partial` | The direct route snapshot contained 29 `/liquid/*` routes: 24 used the typed coordinator, two dispatched before claim, one plan route used legacy receipt recording, and two were projections. Five hardware/query routes remained effect-producing GETs. Protocol and lifecycle bypasses also remained. | Generate the final route, protocol, lifecycle, operator, callback, transport, BMS, and cockpit inventory from mounted source. Require zero missing and zero bypass rows. |
+
+### 24.3 Binding defect list
+
+The remaining implementation must close all defects below. One passing example does not close a caller family.
+
+1. **Direct route bypasses:** `/liquid/readback` and `/liquid/init` dispatch before a typed claim.
+2. **Protocol bypass:** the protocol pipette handler dispatches direct transport and records afterward.
+3. **Lifecycle bypasses:** constructor initialization and Serial-206 query, eject, and initialize methods reach transport outside the durable coordinator.
+4. **Effect-producing GET routes:** data, fluid timestamp, pressure, condition, and status readback require typed POST replacements and explicit retired-route responses.
+5. **Legacy authority:** no-ID receipt calls append active JSONL. Application-plan, direct bypass, and protocol paths must stop using that fallback.
+6. **Migration not wired:** production startup has no owner-elected call to the existing JSONL migration.
+7. **Incomplete typed identities:** connection generation, protocol job/action, lifecycle stage, and callback session must be inserted as typed columns rather than buried in untyped source JSON.
+8. **Idempotent replay hole:** replay of an existing operator command must reject or repair a missing pipette child. It must never synthesize a nonexistent `pipette_operation_id`.
+9. **Misleading terminal status:** `acknowledged` requires `controller_acknowledged=true`. A non-completed, non-ACK result uses an exact state such as `dispatched`, `outcome_unknown`, or `failed` according to evidence.
+10. **Partial reconciliation:** normalization or terminal-publication failure must not leave a pipette row indefinitely `reserved`; restart reconciliation must update both linked projections.
+11. **Missing live event writers:** receive-thread callbacks, source-distinct errors, completion taints, and pressure sessions must enter typed runtime tables with generation and transaction identity.
+12. **Filtered summary mismatch:** every summary count and rate must use the same normalized filter set and read snapshot as the displayed resources.
+13. **Export hardening:** download must validate stored byte count, regular-file and no-symlink status, canonical root confinement, and digest over the exact bytes returned. It must read once or use a race-safe file handle. Terminal export receipts must link to governed evidence objects.
+14. **BMS provenance:** the accepted release must be reachable from the approved `test` branch, use one API/frontend release identity, and contain no unreviewed dirty overlay.
+15. **Broad acceptance gaps:** the exact candidate still needs the specified broad regression, restore, capacity, corruption, migration, and mounted-browser gates.
+
+### 24.4 Historical pipette truth
+
+The live evidence at reassessment contained nine legacy pipette receipts: seven `live_readback` rows and two `tip` rows whose requested action was `load`. Four corresponding operator attempts were visible in the command projection. The two tip rows had operator-layer success but no verified delivery, controller ACK, completion, hardware postcondition, or physical effect.
+
+The only accepted historical claim is:
+
+> Zero typed pipette operations and zero verified physical effects were present at the reassessment snapshot.
+
+The evidence does not prove zero historical attempts, zero transport activity, or zero physical effects. Migration must preserve these rows as historical, tainted evidence without upgrading their truth level.
+
+## 25. Binding remaining work packages
+
+No package below authorizes tests, migration, deployment, service restart, hardware queries, CAN traffic, physical pipette action, or wet commissioning. Those actions require separate authority. Source implementation, verification, integration, deployment, live read-only acceptance, controller evidence, and physical acceptance remain separate gates.
+
+### RA-RW0: Freeze the final denominator and RED contract
+
+**Objective:** Produce the machine-generated current-runtime denominator before further implementation.
+
+**Primary files:**
+
+- create `docs/specs/evidence/bioxp-runtime-audit-entrypoint-denominator.json`;
+- create or update a deterministic inventory generator under `scripts/`;
+- update `tests/test_pipette_wp0_wp4_contracts.py`;
+- add focused route/protocol/lifecycle denominator tests under `tests/`.
+
+**Required result:**
+
+- inventory mounted `/liquid/*` routes, protocol handlers, operator aliases, application planners, constructor and Serial-206 lifecycle callers, callbacks, transport public methods, BMS relay routes, and cockpit actions;
+- classify control effect and durable-claim requirement for every row;
+- bind each row to its coordinator and verification ID;
+- fail on an unclassified, removed, duplicate, stale, or direct-transport row;
+- record the exact denominator SHA-256.
+
+**Exit gate:** RA-2 denominator portion passes with zero missing and zero bypass rows in the intended final design. RED tests demonstrate every currently known bypass.
+
+### RA-RW1: Close universal claim and failure persistence
+
+**Objective:** Ensure every transport-producing path owns a durable claim before its first external side effect.
+
+**Primary files:**
+
+- `src/bioxp/api.py`;
+- `src/bioxp/services/pipette_service.py`;
+- `src/bioxp/oem_serial206_initialization.py`;
+- `src/bioxp/pipette/receipts.py`;
+- `src/bioxp/runtime_audit_store.py`;
+- `src/bioxp/operator_receipt_store.py`;
+- affected protocol and lifecycle tests under `tests/`.
+
+**Required result:**
+
+- route readback, initialization, protocol, constructor, diagnostic, startup, reconnect, recovery, query, eject, and initialize paths through one durable coordinator;
+- replace hardware-query GET routes with typed idempotent POST operations and fail-closed compatibility responses;
+- prevent transport acquisition and driver calls when claim persistence fails;
+- define exact states for admitted, dispatched, ACK, completion, failure, timeout, and ambiguity;
+- update operator and pipette projections together during restart reconciliation;
+- require controller ACK before publishing `acknowledged`;
+- prove zero driver calls for every denied or preclaim-failure row.
+
+**Exit gate:** RA-4 and RA-5 pass against the complete RA-RW0 denominator without hardware use.
+
+### RA-RW2: Establish sole-SQLite authority and migrate legacy receipts
+
+**Objective:** Preserve all legacy evidence while removing JSONL as an active authority.
+
+**Primary files:**
+
+- `src/bioxp/pipette/receipts.py`;
+- `src/bioxp/runtime_audit_store.py`;
+- managed startup/readiness owner;
+- migration tests in `tests/test_ra_wp3_evidence_migration.py` and new production-wiring tests.
+
+**Required result:**
+
+- elect one migration owner across processes;
+- create and verify a backup before import;
+- bind source path, source SHA-256, source byte count, row count, imported count, duplicate count, and quarantine count;
+- import all valid rows idempotently while preserving false and unknown evidence phases;
+- quarantine invalid rows with source line and digest evidence;
+- publish a terminal migration receipt and exact reconciliation result;
+- make repeat startup a no-op after the same source digest;
+- disable every production JSONL append after migration;
+- fail readiness if a no-ID receipt would otherwise fall back to JSONL.
+
+**Exit gate:** RA-1 and RA-3 pass. The canonical robot store contains the migrated nine-row historical set at minimum, subject to a fresh pre-migration inventory. No active JSONL writer remains.
+
+### RA-RW3: Complete typed correlation and asynchronous evidence
+
+**Objective:** Close the canonical identity chain from caller through report and export.
+
+**Primary files:**
+
+- `src/bioxp/runtime_audit_store.py`;
+- `src/bioxp/pipette/receipts.py`;
+- `src/bioxp/pipette/audit.py`;
+- `src/bioxp/operator_controls.py`;
+- protocol and lifecycle dispatch owners;
+- Novo receive, callback, completion, and pressure owners;
+- `tests/test_ra_wp2_pipette_audit.py` plus end-to-end correlation fixtures.
+
+**Required result:**
+
+- write connection generation, robot ownership generation, protocol job ID, protocol action ID, lifecycle stage ID, callback session ID, action ID, command ID, and pipette operation ID as typed fields;
+- reject identity conflicts and missing required parent rows;
+- repair or reject idempotent replay when the pipette child is absent;
+- bind channel observations, CAN/Novo exchanges, ACK, delayed completion, taints, callbacks, errors, pressure streams, and evidence links;
+- preserve the evidence ladder without promoting TX, generic `ok`, cached state, or controller facts to physical truth.
+
+**Exit gate:** RA-6 passes with direct, operator, protocol, lifecycle, callback, and pressure fixtures.
+
+### RA-RW4: Repair reports and harden governed exports
+
+**Objective:** Make every report and export truthful, filtered, snapshot-consistent, and byte-bound.
+
+**Primary files:**
+
+- `src/bioxp/operator_reports.py`;
+- `tests/test_ra_wp4_reports.py`;
+- BMS strict models and relay tests;
+- `platform/frontend/src/components/BioXpOperatorReports.tsx` and mounted frontend tests.
+
+**Required result:**
+
+- apply one normalized filter set to commands, pipette rows, events, pressure, rates, and every summary denominator;
+- keep all related resources on one declared read snapshot or one stable high-water contract;
+- include migrated legacy rows with explicit historical/tainted labels;
+- validate export confinement, regular-file status, no symlink traversal, stored byte count, and digest;
+- hash and return the same immutable byte buffer or a race-safe opened file;
+- link terminal export receipts to governed evidence objects;
+- add corruption, false-byte-count, symlink, path escape, and replacement-race tests;
+- preserve exact robot bytes through the BMS relay and browser download.
+
+**Exit gate:** RA-8 through RA-10 pass against one exact robot and BMS candidate.
+
+### RA-RW5: Close storage operations, integration, and release acceptance
+
+**Objective:** Seal the complete software assignment without physical pipette execution.
+
+**Primary surfaces:**
+
+- schema migration and readiness attestation;
+- database-plus-evidence backup and restore artifacts;
+- capacity and disk-pressure evidence;
+- robot and BMS `test` branches;
+- immutable robot and BMS releases;
+- live robot report API and mounted Development cockpit.
+
+**Required result:**
+
+- pass exact schema, append-only trigger, WAL, checkpoint, disk-full, corruption, and five-year capacity gates;
+- pass backup and restore drills with database-to-evidence reconciliation;
+- run the focused suites and the complete required regression suite with isolated managed state;
+- obtain independent exact-tree review after the final byte change;
+- commit and push robot and BMS candidates to their approved `test` branches;
+- deploy one immutable API/frontend BMS release reachable from `origin/test`;
+- prove source SHA, tree, process owner, listener, database identity, connection generation, mutation-disabled state, and report authority;
+- perform live read-only API and mounted-browser acceptance;
+- recheck retired workstation database non-use and archive receipts.
+
+**Exit gate:** RA-0 through RA-14 pass on one final candidate. Physical commissioning remains outside this exit gate.
+
+## 26. Current verdict and completion rule
+
+The software storage and reporting assignment is **INCOMPLETE**.
+
+The current implementation provides a functional robot SQLite foundation, read-only report API, BMS relay, cockpit report panel, and a happy-path exact-byte export. Those parts do not compensate for the universal-claim bypasses, active legacy JSONL authority, incomplete migration, missing typed correlations, partial reconciliation, filtered-summary defects, export race and confinement gaps, unsealed BMS integration, and unpassed restore and capacity gates.
+
+Completion may be claimed only when RA-RW0 through RA-RW5 have passed against one exact candidate and every RA-0 through RA-14 gate is green. The completion statement must remain limited to software audit, storage, migration, reporting, relay, and read-only cockpit acceptance.
+
+Physical pipette commissioning, controller postcondition campaigns, wet verification, and OEM physical parity remain unperformed and separately gated. No historical row, HTTP success, typed receipt, controller ACK, report rendering, or export can substitute for Christian's separately authorized physical acceptance.

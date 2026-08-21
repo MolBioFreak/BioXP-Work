@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal, Mapping, Optional, Protocol, cast
+from typing import Any, Callable, Literal, Mapping, Optional, Protocol, cast
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -466,6 +466,38 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
     return dict(result)
 
 
+def _run_serial206_pipette_audit(
+    operation_name: str,
+    operation: Callable[[Any], Any],
+    *,
+    requested_inputs: Mapping[str, Any],
+    lifecycle_stage_id: str,
+) -> dict[str, Any]:
+    async def inline_run(_label: str, callback, *, timeout_s: float):
+        del _label, timeout_s
+        return callback()
+
+    return asyncio.run(
+        run_pipette_operation(
+            operation_name,
+            operation,
+            get_transport=_get_pipette_transport,
+            run_blocking=inline_run,
+            timeout_s=1800.0,
+            receipt_store=_pipette_receipts,
+            requested_inputs=dict(requested_inputs),
+            runtime_binding={
+                "owner": "shared_bioxp_tester_pipette",
+                "transport_owner_bound": True,
+                "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
+                "caller_class": "lifecycle",
+                "control_class": "pipette_state_command",
+                "lifecycle_stage_id": lifecycle_stage_id,
+            },
+        )
+    )
+
+
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
     if _tester is None or _pipette_transport is None:
         raise RuntimeError("owned BioXpTester and FourPipetteTransport are required")
@@ -475,6 +507,7 @@ def _build_serial206_oem_initialization_provider() -> Serial206OemInitialization
         authority_provider=Serial206MotionAuthority.from_active_snapshot,
         generation_provider=lambda: hardware_state.ownership_epoch,
         reference_store=_reference_state_store,
+        pipette_audit_runner=_run_serial206_pipette_audit,
     )
     store_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
     state_store = OEMRuntimeStore(store_root)
@@ -1259,7 +1292,13 @@ def _constructor_pipette_action() -> dict[str, Any]:
     owner = _get_pipette_transport()
     if owner.__class__.__name__ != "FourPipetteTransport":
         return {"ok": False, "error": "exact_four_pipette_owner_required"}
-    result = owner.initialize(PipetteInitCommand())
+    command = PipetteInitCommand()
+    result = _run_serial206_pipette_audit(
+        "initialize",
+        lambda transport: transport.initialize(command),
+        requested_inputs=command.to_payload(),
+        lifecycle_stage_id="constructor_pipette_stage",
+    )
     return {
         **result,
         "ok": bool(result.get("ok")),
@@ -8874,31 +8913,23 @@ async def liquid_status():
 
 @app.post("/liquid/readback")
 async def liquid_readback(req: PipetteReadbackRequest):
-    result = await _run_blocking(
-        "OEM four-pipette live readback",
-        lambda: _get_pipette_transport().readback_all(include_data=req.include_data),
+    return await run_pipette_operation(
+        "live_readback",
+        lambda transport: transport.readback_all(include_data=req.include_data),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
         timeout_s=180.0 if req.include_data else 60.0,
-    )
-    receipt = _pipette_receipts.record(
-        operation="live_readback",
+        receipt_store=_pipette_receipts,
         requested_inputs=req.model_dump(),
-        effective_inputs={
-            "include_data": bool(req.include_data),
-            "channel_count": result.get("channel_count"),
-            "live_query_performed": result.get("live_query_performed"),
-        },
-        result=result,
         runtime_binding={
             "owner": "shared_bioxp_tester_pipette",
             "transport_owner_bound": True,
             "query_only": True,
+            "entrypoint_id": "direct.liquid.readback",
+            "caller_class": "direct_api",
+            "control_class": "hardware_query",
         },
     )
-    return {
-        **result,
-        "receipt_id": receipt["receipt_id"],
-        "receipt_truth": receipt["truth"],
-    }
 
 
 @app.post("/liquid/init")
@@ -8913,21 +8944,42 @@ async def liquid_init(req: PipetteInitRequest):
                 "physical_motion_commanded": False,
             },
         )
-    if command.prime_volume_ul is not None:
-        raise HTTPException(status_code=409, detail="constructor initialization cannot prime or mutate liquid")
-    if _can_ready_observation() is not True:
-        raise HTTPException(status_code=409, detail="constructor pipette stage requires explicit CAN_READY=true evidence")
+
+    def init_preflight(_operation: str, _command: Any) -> dict[str, Any]:
+        if command.prime_volume_ul is not None:
+            raise ValueError("constructor initialization cannot prime or mutate liquid")
+        if _can_ready_observation() is not True:
+            raise ValueError("constructor pipette stage requires explicit CAN_READY=true evidence")
+        return {"can_ready": True, "motion_commanded": False}
+
+    async def inline_run(_label: str, operation, *, timeout_s: float):
+        del _label, timeout_s
+        return operation()
 
     def action() -> dict[str, Any]:
-        result = _get_pipette_transport().initialize(command)
-        result = {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
-        receipt = _pipette_receipts.record(
-            operation="init",
-            requested_inputs=command.to_payload(),
-            result=result,
-            runtime_binding={"owner": "shared_bioxp_tester_pipette", "transport_owner_bound": True},
+        result = asyncio.run(
+            run_pipette_init_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=init_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding={
+                    "owner": "shared_bioxp_tester_pipette",
+                    "transport_owner_bound": True,
+                    "entrypoint_id": "lifecycle.constructor_pipette_stage",
+                    "caller_class": "lifecycle",
+                    "control_class": "pipette_state_command",
+                    "lifecycle_stage_id": "constructor_pipette_stage",
+                },
+            )
         )
-        return {**result, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
+        return {
+            **result,
+            "channel_count": 4,
+            "channels_constructed_unconditionally": [0, 1, 2, 3],
+            "motion_commanded": False,
+        }
 
     try:
         projection = await _run_blocking(
@@ -9322,41 +9374,102 @@ def _protocol_live_move_handler(action, state):
 
 
 def _protocol_live_pipette_handler(action, state):
-    del state
     params = dict(action.params or {})
-    transport = _get_pipette_transport()
     kind = action.kind
+    job_id = getattr(state, "job_id", None) or getattr(state, "protocol_id", None)
+    runtime_binding = {
+        "owner": "shared_bioxp_tester_pipette",
+        "transport_owner_bound": True,
+        "entrypoint_id": f"protocol.{kind.value}",
+        "caller_class": "protocol",
+        "control_class": "physical_liquid_command",
+        "protocol_job_id": job_id,
+        "protocol_action_id": action.action_id,
+        "lifecycle_stage_id": action.stage_id,
+    }
+
+    async def inline_run(_label: str, operation, *, timeout_s: float):
+        del _label, timeout_s
+        return operation()
+
     if kind is ProtocolActionKind.PIPETTE_INIT:
         command = PipetteInitCommand.from_request(params)
-        result = transport.initialize(command)
+        result = asyncio.run(
+            run_pipette_init_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_TIP:
         command = PipetteTipCommand.from_request(params)
-        result = transport.set_tip(command)
+        result = asyncio.run(
+            run_pipette_tip_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.TIP_EJECT:
         command = PipetteTipCommand(action=PipetteTipAction.EJECT, metadata=params)
-        result = transport.set_tip(command)
+        result = asyncio.run(
+            run_pipette_tip_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_ASPIRATE:
         command = PipetteAspirateCommand.from_request(params)
-        _liquid_reference_preflight("pipette_aspirate", command)
-        result = transport.aspirate(command)
+        result = asyncio.run(
+            run_pipette_aspirate_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_DISPENSE:
         command = PipetteDispenseCommand.from_request(params)
-        _liquid_reference_preflight("pipette_dispense", command)
-        result = transport.dispense(command)
+        result = asyncio.run(
+            run_pipette_dispense_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_MIX:
         command = PipetteMixCommand.from_request(params)
-        _liquid_reference_preflight("pipette_mix", command)
-        result = transport.mix(command)
+        result = asyncio.run(
+            run_pipette_mix_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     else:  # pragma: no cover - handler map is explicit
         raise ValueError(f"Unsupported live pipette action kind: {kind.value}")
-    payload = {**dict(result), "protocol_action_id": action.action_id, "physical_effect_verified": False}
-    receipt = _pipette_receipts.record(
-        operation=f"protocol:{kind.value}",
-        requested_inputs=command.to_payload(),
-        result=payload,
-        runtime_binding={"owner": "shared_bioxp_tester_pipette", "protocol_action_id": action.action_id},
-    )
-    return {**payload, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
+    return {
+        **dict(result),
+        "protocol_job_id": job_id,
+        "protocol_action_id": action.action_id,
+        "lifecycle_stage_id": action.stage_id,
+        "physical_effect_verified": False,
+    }
 
 
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:

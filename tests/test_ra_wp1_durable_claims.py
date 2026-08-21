@@ -9,7 +9,7 @@ import pytest
 import bioxp.runtime_audit_store as runtime_store_module
 from bioxp.operator_receipt_store import OperatorReceiptStore, runtime_state_root
 from bioxp.oem_runtime_store import OEMRuntimeStore
-from bioxp.pipette.receipts import PipetteReceiptStore
+from bioxp.pipette.receipts import PipetteReceiptError, PipetteReceiptStore
 from bioxp.services.pipette_service import _run_transport_call
 
 
@@ -150,13 +150,17 @@ def test_oem_runtime_store_uses_the_same_schema_authority(tmp_path):
 
 def test_service_claims_before_get_transport_and_operation():
     events: list[str] = []
+    claim_kwargs: dict[str, object] = {}
+    record_kwargs: dict[str, object] = {}
 
     class TrackingStore:
         def claim(self, **kwargs):
+            claim_kwargs.update(kwargs)
             events.append("claim")
             return {"command_id": "cmd-service", "status": "reserved"}, True
 
         def record(self, **kwargs):
+            record_kwargs.update(kwargs)
             events.append("record")
             return {"receipt_id": "receipt-service", "truth": {}, "source_identity": {}}
 
@@ -174,11 +178,226 @@ def test_service_claims_before_get_transport_and_operation():
             timeout_s=1,
             get_transport=get_transport,
             run_blocking=run_blocking,
-            operation=lambda _transport: (events.append("operation") or {"ok": True}),
+            operation=lambda _transport: (
+                events.append("operation")
+                or {"ok": True, "provenance": {"transaction_id": "txn-service"}}
+            ),
             operation_name="status",
             receipt_store=TrackingStore(),
         )
     )
 
     assert result["receipt_id"] == "receipt-service"
+    assert isinstance(claim_kwargs.get("callback_session_id"), str)
+    assert claim_kwargs["callback_session_id"].startswith("pipette-callback:")
+    assert record_kwargs["runtime_binding"]["callback_session_id"] == claim_kwargs["callback_session_id"]
+    assert record_kwargs["result"]["callback_session_id"] == claim_kwargs["callback_session_id"]
+    assert record_kwargs["result"]["provenance"]["callback_session_id"] == claim_kwargs["callback_session_id"]
     assert events == ["claim", "get_transport", "operation", "record"]
+
+
+def test_pipette_claim_persists_all_typed_correlation_fields(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+    claim, created = store.claim(
+        operation="aspirate",
+        requested_inputs={"volume_ul": 10.0},
+        entrypoint_id="protocol.pipette.aspirate",
+        caller_class="protocol",
+        control_class="physical_liquid_command",
+        idempotency_key="typed-correlation",
+        connection_generation=8,
+        protocol_job_id="protocol-job-1",
+        protocol_action_id="action-1",
+        lifecycle_stage_id="stage-1",
+        callback_session_id="callback-1",
+        runtime_binding={"owner": "test"},
+    )
+
+    assert created is True
+    row = store.connection.execute(
+        """
+        SELECT connection_generation, protocol_job_id, protocol_action_id,
+               lifecycle_stage_id, callback_session_id
+        FROM pipette_operations WHERE pipette_operation_id=?
+        """,
+        (claim["pipette_operation_id"],),
+    ).fetchone()
+    assert tuple(row) == (8, "protocol-job-1", "action-1", "stage-1", "callback-1")
+
+
+def test_pipette_replay_repairs_missing_typed_child(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+    payload = _claim_payload(key="missing-child")
+    first, created = store._audit_database.claim(payload, pipette=False)
+    assert created is True
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM pipette_operations WHERE command_id=?",
+        (first["command_id"],),
+    ).fetchone()[0] == 0
+
+    replay, replay_created = store.claim(
+        operation="aspirate",
+        requested_inputs=payload["requested_inputs"],
+        entrypoint_id=payload["entrypoint_id"],
+        caller_class=payload["caller_class"],
+        control_class=payload["control_class"],
+        idempotency_key=payload["idempotency_key"],
+        command_id=payload["command_id"],
+        ownership_generation=payload["ownership_generation"],
+        runtime_binding=payload["source_identity"],
+    )
+
+    assert replay_created is False
+    assert replay["pipette_operation_id"]
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM pipette_operations WHERE command_id=?",
+        (first["command_id"],),
+    ).fetchone()[0] == 1
+
+
+def test_receipt_without_controller_ack_is_not_acknowledged(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+    claim, _ = store.claim(
+        operation="aspirate",
+        requested_inputs={"volume_ul": 10.0},
+        entrypoint_id="direct.liquid.aspirate",
+        caller_class="operator",
+        control_class="physical_liquid_command",
+        idempotency_key="tx-only-status",
+    )
+    store.record(
+        operation="aspirate",
+        requested_inputs={"volume_ul": 10.0},
+        result={
+            "ok": True,
+            "delivery_verified": True,
+            "controller_acknowledged": False,
+            "completion_verified": False,
+            "outcome": "tx_only",
+        },
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+    )
+
+    row = store.connection.execute(
+        "SELECT status, controller_acknowledged FROM pipette_operations WHERE pipette_operation_id=?",
+        (claim["pipette_operation_id"],),
+    ).fetchone()
+    assert row["status"] == "dispatched"
+    assert row["controller_acknowledged"] == 0
+
+
+def test_transport_exception_closes_claim_with_failure_receipt(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+
+    def get_transport():
+        raise RuntimeError("transport unavailable")
+
+    async def run_blocking(_label, operation, *, timeout_s):
+        del timeout_s
+        return operation()
+
+    with pytest.raises(Exception):
+        asyncio.run(
+            _run_transport_call(
+                "Pipette status",
+                timeout_s=1,
+                get_transport=get_transport,
+                run_blocking=run_blocking,
+                operation=lambda _transport: {"ok": True},
+                operation_name="status",
+                receipt_store=store,
+            )
+        )
+
+    row = store.connection.execute(
+        "SELECT status, failure_code FROM pipette_operations ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["failure_code"] == "transport_exception"
+
+
+def test_normalization_failure_closes_reserved_claim(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+    claim, _ = store.claim(
+        operation="readback",
+        requested_inputs={},
+        entrypoint_id="direct.liquid.readback",
+        caller_class="direct_api",
+        control_class="hardware_query",
+        idempotency_key="normalize-failure",
+    )
+
+    with pytest.raises(PipetteReceiptError, match="not-an-int"):
+        store.record(
+            operation="readback",
+            requested_inputs={},
+            result={"ok": True, "channels": [{"channel": "not-an-int"}]},
+            command_id=claim["command_id"],
+            pipette_operation_id=claim["pipette_operation_id"],
+        )
+
+    row = store.connection.execute(
+        "SELECT status,failure_code,outcome FROM pipette_operations WHERE pipette_operation_id=?",
+        (claim["pipette_operation_id"],),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["failure_code"] == "pipette_result_normalization_failed"
+    assert row["outcome"] == "normalization_failed"
+
+
+def test_serial206_pipette_lifecycle_calls_audit_runner_before_transport():
+    from src.bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
+
+    class Transport:
+        def initialize(self, _command):
+            return {"ok": True}
+
+    adapter = Serial206ProductionPrimitiveAdapter(
+        object(),
+        Transport(),
+        authority_provider=lambda: {},
+        generation_provider=lambda: 0,
+    )
+    calls = []
+
+    def runner(operation_name, operation, *, requested_inputs, lifecycle_stage_id):
+        calls.append((operation_name, requested_inputs, lifecycle_stage_id))
+        assert operation(adapter.pipette_transport)["ok"] is True
+        return {"ok": True, "receipt_id": "receipt-lifecycle"}
+
+    adapter.pipette_audit_runner = runner
+    result = adapter.initiate_pipette_group()
+
+    assert result["receipt_id"] == "receipt-lifecycle"
+    assert calls == [
+        ("initialize", {"pressure_profile": "1R", "prime_volume_ul": None}, "serial206.initiate_pipette_group")
+    ]
+
+
+def test_coordinator_persists_explicit_connection_generation_fallback(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+
+    def get_transport():
+        return object()
+
+    async def run_blocking(_label, operation, *, timeout_s):
+        del timeout_s
+        return operation()
+
+    asyncio.run(
+        _run_transport_call(
+            "Pipette status",
+            timeout_s=1,
+            get_transport=get_transport,
+            run_blocking=run_blocking,
+            operation=lambda _transport: {"ok": True, "delivery_verified": True},
+            operation_name="status",
+            receipt_store=store,
+        )
+    )
+
+    row = store.connection.execute(
+        "SELECT connection_generation FROM pipette_operations ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert row["connection_generation"] == 0

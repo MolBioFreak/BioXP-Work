@@ -4,8 +4,10 @@ import hashlib
 import json
 import time
 
+import pytest
+
 from bioxp.operator_receipt_store import OperatorReceiptStore
-from bioxp.pipette.receipts import PipetteReceiptStore
+from bioxp.pipette.receipts import PipetteReceiptError, PipetteReceiptStore
 
 
 def test_evidence_expiry_is_two_phase_and_retains_digest_metadata(tmp_path):
@@ -91,11 +93,48 @@ def test_pipette_jsonl_migration_is_digest_bound_and_idempotent(tmp_path):
     assert first["status"] == "completed"
     assert first["imported_count"] == 2
     assert first["source_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert store._legacy_path.read_bytes() == raw
+    archive_path = store.root / first["archive_relpath"]
+    assert archive_path.read_bytes() == raw
+    assert not store._legacy_path.exists()
     assert store.connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0] == 2
 
     second = store.migrate_legacy_jsonl()
     assert second["status"] == "already_imported"
     assert second["imported_count"] == 0
     assert store.connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0] == 2
-    assert store.connection.execute("SELECT COUNT(*) FROM runtime_migration_receipts").fetchone()[0] == 1
+    migration = store.connection.execute(
+        "SELECT archive_relpath FROM runtime_migration_receipts"
+    ).fetchone()
+    assert migration["archive_relpath"] == first["archive_relpath"]
+    retirement = store.connection.execute(
+        "SELECT retired_at,retirement_sha256 FROM runtime_migration_retirements"
+    ).fetchone()
+    assert retirement["retired_at"] is not None
+    assert retirement["retirement_sha256"] == first["source_sha256"]
+
+
+def test_record_without_typed_ids_uses_sqlite_and_does_not_append_jsonl(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+
+    receipt = store.record(
+        operation="status",
+        requested_inputs={"channel": 0},
+        result={"ok": True, "outcome": "completion", "channel": 0},
+        runtime_binding={"owner": "legacy_callsite"},
+    )
+
+    assert receipt["receipt_id"]
+    assert not store._legacy_path.exists()
+    callback = store.connection.execute(
+        "SELECT callback_session_id FROM pipette_operations"
+    ).fetchone()["callback_session_id"]
+    assert isinstance(callback, str) and callback.startswith("pipette-callback:")
+    assert store.connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0] == 1
+
+
+def test_active_jsonl_is_not_a_read_authority(tmp_path):
+    store = PipetteReceiptStore(tmp_path)
+    store._legacy_path.write_text('{"receipt_id":"legacy"}\n', encoding="utf-8")
+
+    with pytest.raises(PipetteReceiptError, match="requires JSONL migration"):
+        store.read()

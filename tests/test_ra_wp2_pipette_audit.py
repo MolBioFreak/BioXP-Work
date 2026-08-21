@@ -276,7 +276,13 @@ def test_invalid_typed_result_keeps_claim_nonterminal(tmp_path):
     status = store.connection.execute(
         "SELECT status FROM operator_commands WHERE command_id=?", (claim["command_id"],)
     ).fetchone()[0]
-    assert status == "reserved"
+    assert status == "failed"
+    pipette_status = store.connection.execute(
+        "SELECT status,failure_code FROM pipette_operations WHERE pipette_operation_id=?",
+        (claim["pipette_operation_id"],),
+    ).fetchone()
+    assert pipette_status["status"] == "failed"
+    assert pipette_status["failure_code"] == "pipette_result_normalization_failed"
 def test_service_finalizes_admission_failure_after_claim(tmp_path):
     store = PipetteReceiptStore(tmp_path)
     command = PipetteAspirateCommand(volume_ul=10.0, air_gap_ul=1.0)

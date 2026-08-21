@@ -432,9 +432,9 @@ def create_protocol_job(
     live_contract = None
     if not dry_run:
         live_contract = _build_live_execution_contract(payload=payload, compiled=compiled, handlers=handlers)
-    state = ProtocolExecutor(dry_run=dry_run, handlers=handlers).execute(compiled.document)
     created_at = _utc_now_iso()
     job_id = f"protocol-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    state = ProtocolExecutor(dry_run=dry_run, job_id=job_id, handlers=handlers).execute(compiled.document)
     bundle = _build_operator_bundle(
         job_id=job_id,
         compiled=compiled,

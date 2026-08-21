@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS pipette_operations (
     protocol_job_id TEXT,
     protocol_action_id TEXT,
     lifecycle_stage_id TEXT,
+    callback_session_id TEXT,
     requested_inputs_json TEXT NOT NULL CHECK(json_valid(requested_inputs_json)),
     effective_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(effective_inputs_json)),
     source_identity_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(source_identity_json)),
@@ -338,7 +339,17 @@ CREATE TABLE IF NOT EXISTS runtime_migration_receipts (
     imported_count INTEGER NOT NULL,
     quarantined_count INTEGER NOT NULL,
     status TEXT NOT NULL,
+    archive_relpath TEXT,
+    retired_at REAL,
+    retirement_sha256 TEXT,
     created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_migration_retirements (
+    migration_id TEXT PRIMARY KEY,
+    source_digest TEXT NOT NULL,
+    archive_relpath TEXT NOT NULL,
+    retired_at REAL NOT NULL,
+    retirement_sha256 TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS report_exports (
     export_id TEXT PRIMARY KEY,
@@ -411,6 +422,7 @@ _APPEND_ONLY_TABLES = (
     "runtime_evidence_links",
     "runtime_evidence_events",
     "runtime_migration_receipts",
+    "runtime_migration_retirements",
     "report_exports",
     "pipette_channel_observations",
     "pipette_transport_exchanges",
@@ -449,6 +461,7 @@ def _add_missing_columns(connection: sqlite3.Connection) -> None:
             "protocol_job_id": "TEXT",
             "protocol_action_id": "TEXT",
             "lifecycle_stage_id": "TEXT",
+            "callback_session_id": "TEXT",
             "source_identity_json": "TEXT NOT NULL DEFAULT '{}'",
             "delivery_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1))",
             "controller_acknowledged": "INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1))",
@@ -474,6 +487,11 @@ def _add_missing_columns(connection: sqlite3.Connection) -> None:
         },
         "pipette_transport_exchanges": {
             "transaction_id": "TEXT",
+        },
+        "runtime_migration_receipts": {
+            "archive_relpath": "TEXT",
+            "retired_at": "REAL",
+            "retirement_sha256": "TEXT",
         },
     }
     for table, additions in additions_by_table.items():
@@ -607,18 +625,51 @@ class RuntimeAuditDatabase:
         action_id = str(payload["action_id"])
         connection = self.connection
 
+        def ensure_pipette_child(row: sqlite3.Row | Mapping[str, Any]) -> str:
+            existing_operation = connection.execute(
+                "SELECT pipette_operation_id FROM pipette_operations WHERE command_id=?",
+                (str(row["command_id"]),),
+            ).fetchone()
+            if existing_operation is not None:
+                return str(existing_operation["pipette_operation_id"])
+            operation_id = str(payload.get("pipette_operation_id") or f"pipette.{row['command_id']}")
+            connection.execute(
+                """
+                INSERT INTO pipette_operations(
+                    pipette_operation_id,command_id,operation,entrypoint_id,caller_class,
+                    control_class,action_id,operation_class,status,ownership_generation,
+                    connection_generation,protocol_job_id,protocol_action_id,lifecycle_stage_id,
+                    callback_session_id,requested_inputs_json,source_identity_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    operation_id,
+                    str(row["command_id"]),
+                    str(payload.get("operation") or row["operation"]),
+                    str(payload.get("entrypoint_id") or row["entrypoint_id"]),
+                    str(payload.get("caller_class") or row["caller_class"]),
+                    str(payload.get("control_class") or row["control_class"]),
+                    str(payload.get("action_id") or row["action_id"]),
+                    str(payload.get("operation_class") or "pipette"),
+                    str(row["status"]),
+                    int(payload.get("ownership_generation") or row["ownership_generation"] or 0),
+                    payload.get("connection_generation"),
+                    payload.get("protocol_job_id"),
+                    payload.get("protocol_action_id"),
+                    payload.get("lifecycle_stage_id"),
+                    payload.get("callback_session_id"),
+                    canonical_json(payload.get("requested_inputs") or {}),
+                    canonical_json(payload.get("source_identity") or {}),
+                    now,
+                    now,
+                ),
+            )
+            return operation_id
+
         def claim_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
             result = dict(row)
             if pipette:
-                operation_row = connection.execute(
-                    "SELECT pipette_operation_id FROM pipette_operations WHERE command_id=?",
-                    (str(result["command_id"]),),
-                ).fetchone()
-                result["pipette_operation_id"] = (
-                    str(operation_row["pipette_operation_id"])
-                    if operation_row is not None
-                    else str(result["command_id"])
-                )
+                result["pipette_operation_id"] = ensure_pipette_child(row)
             return result
 
         try:
@@ -654,6 +705,11 @@ class RuntimeAuditDatabase:
                     "caller_class": str(payload["caller_class"]),
                     "control_class": str(payload["control_class"]),
                     "ownership_generation": int(payload["ownership_generation"]),
+                    "connection_generation": payload.get("connection_generation"),
+                    "protocol_job_id": payload.get("protocol_job_id"),
+                    "protocol_action_id": payload.get("protocol_action_id"),
+                    "lifecycle_stage_id": payload.get("lifecycle_stage_id"),
+                    "callback_session_id": payload.get("callback_session_id"),
                     "requested_inputs": requested_inputs,
                     "status": "reserved",
                 }
@@ -663,9 +719,9 @@ class RuntimeAuditDatabase:
                 INSERT INTO operator_commands(
                     command_id,idempotency_key,canonical_request_sha256,operation,command_kind,entrypoint_id,
                     caller_class,control_class,idempotency_replay_enabled,action_id,status,
-                    safety_class,ownership_generation,source_identity_json,requested_inputs_json,
+                    safety_class,ownership_generation,connection_generation,source_identity_json,requested_inputs_json,
                     effective_inputs_json,started_at,receipt_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     command_id,
@@ -681,6 +737,7 @@ class RuntimeAuditDatabase:
                     "reserved",
                     payload.get("safety_class"),
                     int(payload["ownership_generation"]),
+                    payload.get("connection_generation"),
                     canonical_json(source_identity),
                     canonical_json(requested_inputs),
                     canonical_json(payload.get("effective_inputs") or {}),
@@ -699,9 +756,10 @@ class RuntimeAuditDatabase:
                     """
                     INSERT INTO pipette_operations(
                         pipette_operation_id,command_id,operation,entrypoint_id,caller_class,
-                        control_class,action_id,operation_class,status,ownership_generation,
-                        requested_inputs_json,source_identity_json,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    control_class,action_id,operation_class,status,ownership_generation,
+                    connection_generation,protocol_job_id,protocol_action_id,lifecycle_stage_id,
+                    callback_session_id,requested_inputs_json,source_identity_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         operation_id,
@@ -712,9 +770,14 @@ class RuntimeAuditDatabase:
                         str(payload["control_class"]),
                         action_id,
                         str(payload.get("operation_class") or "pipette"),
-                        "reserved",
-                        int(payload["ownership_generation"]),
-                        canonical_json(requested_inputs),
+ "reserved",
+ int(payload["ownership_generation"]),
+ payload.get("connection_generation"),
+ payload.get("protocol_job_id"),
+ payload.get("protocol_action_id"),
+ payload.get("lifecycle_stage_id"),
+ payload.get("callback_session_id"),
+ canonical_json(requested_inputs),
                         canonical_json(source_identity),
                         now,
                         now,

@@ -69,7 +69,57 @@ def test_report_gets_use_one_read_snapshot_and_do_not_write(tmp_path):
     assert summary.status_code == 200
     assert summary.json()["scope"] == "filtered"
     assert summary.json()["commands"]["total"] == 1
+    assert summary.json()["pipette_operations"]["total"] == 1
+    assert summary.json()["runtime_events"]["total"] == 0
+    assert summary.json()["pressure"]["streams"] == 1
     assert store.connection.total_changes == before
+
+
+def test_summary_totals_share_the_command_filter_scope(tmp_path):
+    app, _store = _app(tmp_path)
+    pipette = PipetteReceiptStore(tmp_path)
+    claim, _ = pipette.claim(
+        operation="dispense",
+        requested_inputs={"channel": 0, "volume_ul": 5},
+        entrypoint_id="api.liquid.dispense",
+        caller_class="direct_api",
+        control_class="physical_liquid_command",
+        idempotency_key="report-idem-2",
+        command_id="report-command-2",
+        ownership_generation=4,
+        runtime_binding={"bms_invocation_id": "bms-report-2"},
+    )
+    pipette.record_failure(
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+        operation="dispense",
+        failure_code="test_failure",
+        message="filtered fixture",
+    )
+    pipette.record_event(
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+        event_source="fixture",
+        event_kind="fixture_failure",
+        event_payload={"ok": False},
+    )
+    pipette.record_pressure_stream(
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+        channels=[0],
+        sample_period_ms=10,
+        source_generation=4,
+    )
+
+    summary = TestClient(app).get("/operator/reports/summary?status=completed").json()
+    assert summary["commands"]["total"] == 1
+    assert summary["pipette_operations"]["total"] == 1
+    assert summary["runtime_events"]["total"] == 0
+    assert summary["pressure"]["streams"] == 1
+    events = TestClient(app).get("/operator/reports/events?status=completed").json()
+    assert events["returned_count"] == 0
+    pressure = TestClient(app).get("/operator/reports/pressure-streams?status=completed").json()
+    assert pressure["returned_count"] == 1
 
 
 def test_report_detail_exposes_typed_pipette_children_without_paths(tmp_path):
@@ -105,6 +155,26 @@ def test_report_export_is_post_then_read_only_download(tmp_path):
     assert len(downloaded.content) == metadata.json()["byte_count"]
     payload = downloaded.json()
     assert payload["commands"][0]["command_id"] == "report-command-1"
+
+
+def test_export_download_rejects_symlink_artifact(tmp_path):
+    app, store = _app(tmp_path)
+    client = TestClient(app)
+    created = client.post("/operator/reports/exports", json={"format": "json", "limit": 100})
+    assert created.status_code == 200
+    export_id = created.json()["export_id"]
+    row = store.connection.execute(
+        "SELECT artifact_relpath FROM report_exports WHERE export_id=?", (export_id,)
+    ).fetchone()
+    artifact = store.root / row["artifact_relpath"]
+    outside = tmp_path.parent / f"outside-{export_id}.json"
+    outside.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    artifact.symlink_to(outside)
+
+    downloaded = client.get(f"/operator/reports/exports/{export_id}/download")
+    assert downloaded.status_code == 409
+    assert downloaded.json()["detail"]["error"] == "export_integrity_failure"
 
 
 def test_real_bioxp_app_exposes_report_routes(monkeypatch, tmp_path):

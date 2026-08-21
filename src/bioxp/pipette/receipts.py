@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -160,6 +161,39 @@ class PipetteReceiptStore:
     ) -> dict[str, Any]:
         if not isinstance(result, Mapping):
             raise PipetteReceiptError("receipt result must be a mapping")
+        if (command_id is None) != (pipette_operation_id is None):
+            raise PipetteReceiptError("typed receipt persistence requires command_id and pipette_operation_id together")
+        if command_id is None and pipette_operation_id is None:
+            binding = dict(runtime_binding or {})
+            idempotency_key = str(binding.get("idempotency_key") or f"record:{operation}:{uuid.uuid4().hex}")
+            binding.setdefault(
+                "callback_session_id",
+                f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
+            )
+            claim, _ = self.claim(
+                operation=str(operation),
+                requested_inputs=requested_inputs,
+                entrypoint_id=str(binding.get("entrypoint_id") or "legacy.record"),
+                caller_class=str(binding.get("caller_class") or "legacy"),
+                control_class=str(binding.get("control_class") or "pipette_state_command"),
+                idempotency_key=idempotency_key,
+                ownership_generation=int(binding.get("ownership_generation") or getattr(hardware_state, "ownership_epoch", 0)),
+                connection_generation=binding.get("connection_generation", 0),
+                protocol_job_id=binding.get("protocol_job_id"),
+                protocol_action_id=binding.get("protocol_action_id"),
+                lifecycle_stage_id=binding.get("lifecycle_stage_id"),
+                callback_session_id=binding.get("callback_session_id"),
+                runtime_binding=binding,
+            )
+            return self.record(
+                operation=operation,
+                requested_inputs=requested_inputs,
+                result=result,
+                effective_inputs=effective_inputs,
+                runtime_binding=binding,
+                command_id=claim["command_id"],
+                pipette_operation_id=claim["pipette_operation_id"],
+            )
         source_identity = self._source_identity()
         receipt = {
             "schema": "bioxp.pipette.receipt.v1",
@@ -180,16 +214,6 @@ class PipetteReceiptStore:
                 "status": "source_bound_not_deployed_proof",
             },
         }
-        encoded = (json.dumps(receipt, sort_keys=True) + "\n").encode("utf-8")
-        if command_id is None or pipette_operation_id is None:
-            with self._lock:
-                fd = os.open(self._legacy_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                try:
-                    os.write(fd, encoded)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.chmod(self._legacy_path, 0o600)
         if command_id is not None and pipette_operation_id is not None:
             try:
                 self._persist_normalized_result(
@@ -200,14 +224,45 @@ class PipetteReceiptStore:
                 self._audit_database.finalize_claim(
                     command_id=str(command_id),
                     pipette_operation_id=str(pipette_operation_id),
-                    status="completed" if receipt["truth"]["completion_verified"] else "acknowledged",
+                    status="completed"
+                    if receipt["truth"]["completion_verified"]
+                    else "acknowledged"
+                    if receipt["truth"]["controller_acknowledged"]
+                    else "dispatched"
+                    if receipt["truth"]["delivery_verified"]
+                    else "failed",
                     outcome=str(result.get("outcome") or ("completed" if result.get("ok") is True else "failed")),
                     failure_code=None if result.get("ok") is True else str(result.get("error") or result.get("code") or "pipette_operation_failed"),
                     result=result,
                     effective_inputs=effective_inputs,
                     receipt_json=json.dumps(receipt, sort_keys=True),
                 )
-            except PipetteAuditIntegrityError as exc:
+            except (PipetteAuditIntegrityError, TypeError, ValueError, KeyError) as exc:
+                failure_result = {
+                    "ok": False,
+                    "outcome": "normalization_failed",
+                    "error": str(exc),
+                    "failure_code": "pipette_result_normalization_failed",
+                    "physical_effect_verified": False,
+                }
+                receipt["result"] = failure_result
+                receipt["failure_code"] = "pipette_result_normalization_failed"
+                receipt["normalization_error"] = str(exc)
+                try:
+                    self._audit_database.finalize_claim(
+                        command_id=str(command_id),
+                        pipette_operation_id=str(pipette_operation_id),
+                        status="failed",
+                        outcome="normalization_failed",
+                        failure_code="pipette_result_normalization_failed",
+                        result=failure_result,
+                        effective_inputs=effective_inputs,
+                        receipt_json=json.dumps(receipt, sort_keys=True),
+                    )
+                except Exception as finalize_exc:
+                    raise PipetteReceiptError(
+                        f"typed pipette normalization failure could not be finalized: {finalize_exc}"
+                    ) from finalize_exc
                 raise PipetteReceiptError(str(exc)) from exc
             except Exception as exc:
                 raise PipetteReceiptError(f"typed pipette audit persistence failed: {exc}") from exc
@@ -363,6 +418,11 @@ class PipetteReceiptStore:
         idempotency_key: str,
         command_id: str | None = None,
         ownership_generation: int = 0,
+        connection_generation: int | None = None,
+        protocol_job_id: str | None = None,
+        protocol_action_id: str | None = None,
+        lifecycle_stage_id: str | None = None,
+        callback_session_id: str | None = None,
         runtime_binding: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         command = str(command_id or f"pipette_{uuid.uuid4().hex}")
@@ -375,101 +435,188 @@ class PipetteReceiptStore:
             "caller_class": str(caller_class),
             "control_class": str(control_class),
             "ownership_generation": int(ownership_generation),
+            "connection_generation": connection_generation,
+            "protocol_job_id": protocol_job_id,
+            "protocol_action_id": protocol_action_id,
+            "lifecycle_stage_id": lifecycle_stage_id,
+            "callback_session_id": callback_session_id,
             "source_identity": dict(runtime_binding or {"authority": "robot_runtime"}),
             "requested_inputs": dict(requested_inputs or {}),
         }
         return self._audit_database.claim(payload, pipette=True)
 
     def migrate_legacy_jsonl(self) -> dict[str, Any]:
-        if not self._legacy_path.exists():
-            return {"status": "no_source", "source_path": str(self._legacy_path), "imported_count": 0}
-        raw = self._legacy_path.read_bytes()
-        source_sha256 = hashlib.sha256(raw).hexdigest()
-        migration_id = f"pipette-jsonl:{source_sha256}"
-        existing = self.connection.execute(
-            "SELECT status,imported_count FROM runtime_migration_receipts WHERE migration_id=?",
-            (migration_id,),
-        ).fetchone()
-        if existing is not None:
+        with self._lock:
+            existing = self.connection.execute(
+                "SELECT migration_id,source_digest,source_count,imported_count,quarantined_count,status,archive_relpath FROM runtime_migration_receipts WHERE source_kind=? ORDER BY created_at DESC LIMIT 1",
+                ("pipette_receipts_jsonl",),
+            ).fetchone()
+            if not self._legacy_path.exists():
+                if existing is None:
+                    return {"status": "no_source", "source_path": str(self._legacy_path), "imported_count": 0}
+                retirement = self.connection.execute(
+                    "SELECT archive_relpath FROM runtime_migration_retirements WHERE migration_id=?",
+                    (existing["migration_id"],),
+                ).fetchone()
+                return {
+                    "status": "already_imported" if retirement is not None else "retirement_pending",
+                    "source_path": str(self._legacy_path),
+                    "source_sha256": str(existing["source_digest"]),
+                    "source_count": int(existing["source_count"]),
+                    "imported_count": 0,
+                    "quarantined_count": int(existing["quarantined_count"]),
+                    "archive_relpath": str(
+                        retirement["archive_relpath"] if retirement is not None else existing["archive_relpath"]
+                    ),
+                }
+
+            raw = self._legacy_path.read_bytes()
+            source_sha256 = hashlib.sha256(raw).hexdigest()
+            migration_id = f"pipette-jsonl:{source_sha256}"
+            archive_relpath = str(
+                existing["archive_relpath"]
+                if existing is not None and existing["archive_relpath"]
+                else f"archive/receipts.jsonl.{source_sha256}"
+            )
+            archive_path = self.root / archive_relpath
+            archive_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+            def ensure_archive() -> None:
+                if archive_path.exists():
+                    if hashlib.sha256(archive_path.read_bytes()).hexdigest() != source_sha256:
+                        raise PipetteReceiptError("legacy JSONL archive digest mismatch")
+                    return
+                temp_path = archive_path.with_name(f".{archive_path.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    temp_path.write_bytes(raw)
+                    with temp_path.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                    if hashlib.sha256(temp_path.read_bytes()).hexdigest() != source_sha256:
+                        raise PipetteReceiptError("legacy JSONL archive verification failed")
+                    os.replace(temp_path, archive_path)
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+            def retire() -> None:
+                ensure_archive()
+                if self._legacy_path.exists():
+                    current = self._legacy_path.read_bytes()
+                    if hashlib.sha256(current).hexdigest() != source_sha256:
+                        raise PipetteReceiptError("legacy JSONL changed during migration")
+                    self._legacy_path.unlink()
+                self.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self.connection.execute(
+                        """
+                        INSERT INTO runtime_migration_retirements(
+                            migration_id,source_digest,archive_relpath,retired_at,retirement_sha256
+                        ) VALUES(?,?,?,?,?)
+                        """,
+                        (migration_id, source_sha256, archive_relpath, time.time(), source_sha256),
+                    )
+                    self.connection.execute("COMMIT")
+                except sqlite3.IntegrityError:
+                    if self.connection.in_transaction:
+                        self.connection.execute("ROLLBACK")
+                except Exception:
+                    if self.connection.in_transaction:
+                        self.connection.execute("ROLLBACK")
+                    raise
+
+            if existing is not None:
+                if str(existing["source_digest"]) != source_sha256:
+                    raise PipetteReceiptError("legacy JSONL digest conflicts with prior migration receipt")
+                retire()
+                return {
+                    "status": "already_imported",
+                    "source_path": str(self._legacy_path),
+                    "source_sha256": source_sha256,
+                    "source_count": int(existing["source_count"]),
+                    "imported_count": 0,
+                    "quarantined_count": int(existing["quarantined_count"]),
+                    "archive_relpath": archive_relpath,
+                }
+
+            imported = 0
+            quarantined = 0
+            source_count = 0
+            for line_number, line in enumerate(raw.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                source_count += 1
+                try:
+                    legacy = json.loads(line.decode("utf-8"))
+                    if not isinstance(legacy, Mapping):
+                        raise ValueError("legacy receipt is not an object")
+                    receipt_id = str(legacy.get("receipt_id") or f"line-{line_number}")
+                    operation = str(legacy.get("operation") or "legacy_pipette")
+                    command_id = f"legacy.pipette.{receipt_id}"
+                    claim, created = self.claim(
+                        operation=operation,
+                        requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
+                        entrypoint_id="migration.pipette_jsonl.v1",
+                        caller_class="legacy_migration",
+                        control_class="historical_import",
+                        idempotency_key=f"legacy-pipette:{receipt_id}",
+                        command_id=command_id,
+                        ownership_generation=0,
+                        connection_generation=0,
+                        runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
+                    )
+                    if not created:
+                        continue
+                    result = legacy.get("result") if isinstance(legacy.get("result"), Mapping) else {"ok": False, "outcome": "legacy_result_missing"}
+                    self.record(
+                        operation=operation,
+                        requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
+                        effective_inputs=legacy.get("effective_inputs") if isinstance(legacy.get("effective_inputs"), Mapping) else {},
+                        result={**dict(result), "legacy_receipt_id": receipt_id, "legacy_source_sha256": source_sha256},
+                        runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
+                        command_id=claim["command_id"],
+                        pipette_operation_id=claim["pipette_operation_id"],
+                    )
+                    imported += 1
+                except Exception:
+                    quarantined += 1
+
+            ensure_archive()
+            status = "completed_with_quarantine" if quarantined else "completed"
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    """
+                    INSERT INTO runtime_migration_receipts(
+                        migration_id,source_kind,source_digest,source_count,imported_count,quarantined_count,status,archive_relpath,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        migration_id,
+                        "pipette_receipts_jsonl",
+                        source_sha256,
+                        source_count,
+                        imported,
+                        quarantined,
+                        status,
+                        archive_relpath,
+                        time.time(),
+                    ),
+                )
+                self.connection.execute("COMMIT")
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+                raise
+            retire()
             return {
-                "status": "already_imported",
+                "status": status,
                 "source_path": str(self._legacy_path),
                 "source_sha256": source_sha256,
-                "imported_count": 0,
+                "source_count": source_count,
+                "imported_count": imported,
+                "quarantined_count": quarantined,
+                "archive_relpath": archive_relpath,
             }
-        imported = 0
-        quarantined = 0
-        source_count = 0
-        for line_number, line in enumerate(raw.splitlines(), start=1):
-            if not line.strip():
-                continue
-            source_count += 1
-            try:
-                legacy = json.loads(line.decode("utf-8"))
-                if not isinstance(legacy, Mapping):
-                    raise ValueError("legacy receipt is not an object")
-                receipt_id = str(legacy.get("receipt_id") or f"line-{line_number}")
-                operation = str(legacy.get("operation") or "legacy_pipette")
-                command_id = f"legacy.pipette.{receipt_id}"
-                claim, created = self.claim(
-                    operation=operation,
-                    requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
-                    entrypoint_id="migration.pipette_jsonl.v1",
-                    caller_class="legacy_migration",
-                    control_class="historical_import",
-                    idempotency_key=f"legacy-pipette:{receipt_id}",
-                    command_id=command_id,
-                    ownership_generation=0,
-                    runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
-                )
-                if not created:
-                    continue
-                result = legacy.get("result") if isinstance(legacy.get("result"), Mapping) else {"ok": False, "outcome": "legacy_result_missing"}
-                self.record(
-                    operation=operation,
-                    requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
-                    effective_inputs=legacy.get("effective_inputs") if isinstance(legacy.get("effective_inputs"), Mapping) else {},
-                    result={**dict(result), "legacy_receipt_id": receipt_id, "legacy_source_sha256": source_sha256},
-                    runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
-                    command_id=claim["command_id"],
-                    pipette_operation_id=claim["pipette_operation_id"],
-                )
-                imported += 1
-            except Exception:
-                quarantined += 1
-        status = "completed_with_quarantine" if quarantined else "completed"
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.connection.execute(
-                """
-                INSERT INTO runtime_migration_receipts(
-                    migration_id,source_kind,source_digest,source_count,imported_count,quarantined_count,status,created_at
-                ) VALUES(?,?,?,?,?,?,?,?)
-                """,
-                (
-                    migration_id,
-                    "pipette_receipts_jsonl",
-                    source_sha256,
-                    source_count,
-                    imported,
-                    quarantined,
-                    status,
-                    time.time(),
-                ),
-            )
-            self.connection.execute("COMMIT")
-        except Exception:
-            if self.connection.in_transaction:
-                self.connection.execute("ROLLBACK")
-            raise
-        return {
-            "status": status,
-            "source_path": str(self._legacy_path),
-            "source_sha256": source_sha256,
-            "source_count": source_count,
-            "imported_count": imported,
-            "quarantined_count": quarantined,
-        }
 
     def read(self, limit: int = 50) -> list[dict[str, Any]]:
         selected_limit = max(1, min(int(limit), 200))
@@ -479,10 +626,9 @@ class PipetteReceiptStore:
         ).fetchall()
         if rows:
             return [json.loads(row["receipt_json"]) for row in rows]
-        if not self._legacy_path.exists():
-            return []
-        legacy_rows = [json.loads(line) for line in self._legacy_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        return legacy_rows[-selected_limit:]
+        if self._legacy_path.exists():
+            raise PipetteReceiptError("active pipette JSONL requires JSONL migration")
+        return []
 
     def latest(self) -> dict[str, Any] | None:
         rows = self.read(1)

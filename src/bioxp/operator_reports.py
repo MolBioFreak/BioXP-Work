@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import time
 import uuid
@@ -438,6 +439,12 @@ def _pipette_page(connection: Any, filters: dict[str, Any], cursor: str | None) 
         last_rowid = int(state["last_rowid"])
         clauses.append("p.rowid < ?")
         params.append(last_rowid)
+    if filters.get("start") is not None:
+        clauses.append("p.updated_at >= ?")
+        params.append(float(filters["start"]))
+    if filters.get("end") is not None:
+        clauses.append("p.updated_at < ?")
+        params.append(float(filters["end"]))
     where = " AND ".join(clauses)
     total = int(connection.execute(f"SELECT COUNT(*) FROM pipette_operations p WHERE {where}", params).fetchone()[0])
     rows = connection.execute(
@@ -496,14 +503,32 @@ def _summary(connection: Any, filters: dict[str, Any]) -> dict[str, Any]:
         params,
     ).fetchall()
     errors = {str(row["code"]): int(row["count"]) for row in error_rows}
+    scope_keys = tuple(key for key in filters if key != "limit")
+    scope = "filtered" if any(filters.get(key) is not None for key in scope_keys) else "window"
+    pipette_total = int(connection.execute(
+        f"SELECT COUNT(*) FROM pipette_operations p WHERE EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=p.command_id AND {where})",
+        params,
+    ).fetchone()[0])
+    event_total = int(connection.execute(
+        f"SELECT COUNT(*) FROM runtime_events e WHERE EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=e.command_id AND {where})",
+        params,
+    ).fetchone()[0])
+    pressure_stream_total = int(connection.execute(
+        f"SELECT COUNT(*) FROM pipette_pressure_streams s WHERE EXISTS (SELECT 1 FROM pipette_operations p WHERE p.pipette_operation_id=s.pipette_operation_id AND EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=p.command_id AND {where}))",
+        params,
+    ).fetchone()[0])
+    pressure_chunk_total = int(connection.execute(
+        f"SELECT COUNT(*) FROM pipette_pressure_chunks pc WHERE EXISTS (SELECT 1 FROM pipette_pressure_streams s WHERE s.stream_session_id=pc.stream_session_id AND EXISTS (SELECT 1 FROM pipette_operations p WHERE p.pipette_operation_id=s.pipette_operation_id AND EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=p.command_id AND {where})))",
+        params,
+    ).fetchone()[0])
     return {
-        "scope": "filtered" if any(filters.get(key) is not None for key in ("start", "end", "status", "operation", "action", "channel")) else "window",
+        "scope": scope,
         "filters": filters,
         "snapshot": {"high_water_sequence": high_water, **_store_identity(connection)},
         "commands": {"total": total, "by_status": statuses},
-        "pipette_operations": {"total": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0])},
-        "runtime_events": {"total": int(connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0])},
-        "pressure": {"streams": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_streams").fetchone()[0]), "chunks": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_chunks").fetchone()[0])},
+        "pipette_operations": {"total": pipette_total},
+        "runtime_events": {"total": event_total},
+        "pressure": {"streams": pressure_stream_total, "chunks": pressure_chunk_total},
         "rates": {
             "delivery_rate": float(aggregate["delivered"]) / total_for_rates,
             "ack_rate": float(aggregate["acknowledged"]) / total_for_rates,
@@ -541,6 +566,10 @@ def _pressure_stream_page(connection: Any, filters: dict[str, Any], cursor: str 
     if filters.get("channel") is not None:
         clauses.append("EXISTS (SELECT 1 FROM json_each(s.channels_json) WHERE CAST(json_each.value AS INTEGER)=?)")
         params.append(int(filters["channel"]))
+    command_high_water = int(connection.execute("SELECT COALESCE(MAX(sequence),0) FROM operator_commands").fetchone()[0])
+    command_where, command_params = _command_where(filters, high_water=command_high_water)
+    clauses.append(f"EXISTS (SELECT 1 FROM pipette_operations p WHERE p.pipette_operation_id=s.pipette_operation_id AND EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=p.command_id AND {command_where}))")
+    params.extend(command_params)
     where = " AND ".join(clauses)
     rows = connection.execute(
         f"SELECT s.* FROM pipette_pressure_streams s WHERE {where} ORDER BY s.rowid DESC LIMIT ?",
@@ -597,6 +626,10 @@ def _pressure_samples_page(connection: Any, stream_session_id: str, filters: dic
     if filters.get("channel") is not None:
         clauses.append("c.channel=?")
         params.append(int(filters["channel"]))
+    command_high_water = int(connection.execute("SELECT COALESCE(MAX(sequence),0) FROM operator_commands").fetchone()[0])
+    command_where, command_params = _command_where(filters, high_water=command_high_water)
+    clauses.append(f"EXISTS (SELECT 1 FROM pipette_pressure_streams s WHERE s.stream_session_id=c.stream_session_id AND EXISTS (SELECT 1 FROM pipette_operations p WHERE p.pipette_operation_id=s.pipette_operation_id AND EXISTS (SELECT 1 FROM operator_commands oc WHERE oc.command_id=p.command_id AND {command_where})))")
+    params.extend(command_params)
     rows = connection.execute(
         f"SELECT c.* FROM pipette_pressure_chunks c WHERE {' AND '.join(clauses)} ORDER BY c.rowid DESC LIMIT ?",
         [*params, int(filters["limit"]) + 1],
@@ -664,6 +697,10 @@ def _event_page(connection: Any, filters: dict[str, Any], cursor: str | None) ->
     if filters.get("channel") is not None:
         clauses.append("json_extract(e.event_json, '$.channel') = ?")
         params.append(int(filters["channel"]))
+    command_high_water = int(connection.execute("SELECT COALESCE(MAX(sequence),0) FROM operator_commands").fetchone()[0])
+    command_where, command_params = _command_where(filters, high_water=command_high_water)
+    clauses.append(f"EXISTS (SELECT 1 FROM operator_commands c WHERE c.command_id=e.command_id AND {command_where})")
+    params.extend(command_params)
     where = " AND ".join(clauses)
     rows = connection.execute(
         f"SELECT * FROM runtime_events e WHERE {where} ORDER BY e.event_id DESC LIMIT ?",
@@ -732,6 +769,54 @@ def _write_export(store: OperatorReceiptStore, *, export_id: str, fmt: str, payl
         except FileNotFoundError:
             pass
     return relpath.as_posix(), len(raw), digest
+
+
+def _read_export_artifact(store: OperatorReceiptStore, row: Any) -> bytes:
+    relative = Path(str(row["artifact_relpath"]))
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    root_fd = None
+    current_fd = None
+    try:
+        root_fd = os.open(str(store.root), root_flags)
+        current_fd = root_fd
+        for index, component in enumerate(relative.parts):
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+            if index < len(relative.parts) - 1:
+                flags |= getattr(os, "O_DIRECTORY", 0)
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        before = os.fstat(current_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(current_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(current_fd)
+        if before.st_size != after.st_size or len(content) != int(row["byte_count"]):
+            raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+        if hashlib.sha256(content).hexdigest() != str(row["sha256"]):
+            raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+        return content
+    except HTTPException:
+        raise
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail={"error": "export_artifact_missing"}) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"}) from exc
+    finally:
+        if current_fd is not None and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def create_operator_reports_router(store: Any) -> APIRouter:
@@ -928,18 +1013,13 @@ def create_operator_reports_router(store: Any) -> APIRouter:
             row = connection.execute("SELECT * FROM report_exports WHERE export_id=?", (export_id,)).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail={"error": "export_not_found"})
-            path = store.root / str(row["artifact_relpath"])
-            if not path.is_file():
-                raise HTTPException(status_code=409, detail={"error": "export_artifact_missing"})
-            if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
-                raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+            content = _read_export_artifact(store, row)
             headers = {
                 "X-Content-SHA256": str(row["sha256"]),
                 "Content-Disposition": f'attachment; filename="bioxp-report-{export_id}.{row["format"]}"',
             }
-            if row["format"] == "json":
-                return Response(content=path.read_bytes(), media_type="application/json", headers=headers)
-            return Response(content=path.read_bytes(), media_type="text/csv", headers=headers)
+            media_type = "application/json" if row["format"] == "json" else "text/csv"
+            return Response(content=content, media_type=media_type, headers=headers)
 
     @router.get("/audit-health")
     def audit_health() -> dict[str, Any]:

@@ -429,9 +429,11 @@ class Serial206ProductionPrimitiveAdapter:
         authority_provider: Callable[[], Any],
         generation_provider: Callable[[], int],
         reference_store: Any | None = None,
+        pipette_audit_runner: Callable[..., Any] | None = None,
     ) -> None:
         self.tester = tester
         self.pipette_transport = pipette_transport
+        self.pipette_audit_runner = pipette_audit_runner
         self.authority_provider = authority_provider
         self.generation_provider = generation_provider
         self.reference_store = reference_store
@@ -2437,8 +2439,30 @@ class Serial206ProductionPrimitiveAdapter:
     def motor_oem_open_thermal_door(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_oem_open_thermal_door(*args, **kwargs)
 
+    def _run_audited_pipette(
+        self,
+        operation_name: str,
+        operation: Callable[[Any], Any],
+        *,
+        requested_inputs: Mapping[str, Any] | None = None,
+        lifecycle_stage_id: str,
+    ) -> Any:
+        runner = self.pipette_audit_runner
+        if not callable(runner):
+            raise RuntimeError("pipette_audit_runner_not_bound")
+        return runner(
+            operation_name,
+            operation,
+            requested_inputs=dict(requested_inputs or {}),
+            lifecycle_stage_id=lifecycle_stage_id,
+        )
+
     def query_tip_status(self) -> dict[str, Any]:
-        raw = self.pipette_transport.query_tip_status_all()
+        raw = self._run_audited_pipette(
+            "query_tip_status",
+            lambda transport: transport.query_tip_status_all(),
+            lifecycle_stage_id="serial206.query_tip_status",
+        )
         rows = raw.get("channels") if isinstance(raw, Mapping) else None
         if not isinstance(rows, list) or len(rows) != 4:
             return {"ok": False, "channels": None, "raw": _json_safe(raw)}
@@ -2463,9 +2487,17 @@ class Serial206ProductionPrimitiveAdapter:
     def eject_all_tips(self) -> Any:
         if self._last_tip_channels is None:
             return {"ok": False, "failure": "exact_tip_query_required_before_eject"}
-        return self.pipette_transport.eject_all_tips_for_oem_startup(
-            operator_ack="EJECT_STALE_STARTUP_TIPS",
-            expected_channels_with_tips=list(self._last_tip_channels),
+        return self._run_audited_pipette(
+            "eject_all_tips",
+            lambda transport: transport.eject_all_tips_for_oem_startup(
+                operator_ack="EJECT_STALE_STARTUP_TIPS",
+                expected_channels_with_tips=list(self._last_tip_channels),
+            ),
+            requested_inputs={
+                "operator_ack": "EJECT_STALE_STARTUP_TIPS",
+                "expected_channels_with_tips": list(self._last_tip_channels),
+            },
+            lifecycle_stage_id="serial206.eject_all_tips",
         )
 
     def eject_all_pipette_tips_for_oem_startup(
@@ -2474,19 +2506,42 @@ class Serial206ProductionPrimitiveAdapter:
         operator_ack: str,
         expected_channels_with_tips: list[int],
     ) -> Any:
-        return self.pipette_transport.eject_all_tips_for_oem_startup(
-            operator_ack=operator_ack,
-            expected_channels_with_tips=list(expected_channels_with_tips),
+        return self._run_audited_pipette(
+            "eject_all_pipette_tips_for_oem_startup",
+            lambda transport: transport.eject_all_tips_for_oem_startup(
+                operator_ack=operator_ack,
+                expected_channels_with_tips=list(expected_channels_with_tips),
+            ),
+            requested_inputs={
+                "operator_ack": operator_ack,
+                "expected_channels_with_tips": list(expected_channels_with_tips),
+            },
+            lifecycle_stage_id="serial206.eject_all_pipette_tips_for_oem_startup",
         )
 
     def initiate_pipette_group(self) -> Any:
-        return self.pipette_transport.initialize(PipetteInitCommand())
+        return self._run_audited_pipette(
+            "initialize",
+            lambda transport: transport.initialize(PipetteInitCommand()),
+            requested_inputs=PipetteInitCommand().to_payload(),
+            lifecycle_stage_id="serial206.initiate_pipette_group",
+        )
 
     def initiate_pipette_group_for_oem_initialize_motion(self, *, cycle: str) -> Any:
-        return self.pipette_transport.initiate_group_once_for_oem_initialize_motion(cycle=cycle)
+        return self._run_audited_pipette(
+            "initialize_group",
+            lambda transport: transport.initiate_group_once_for_oem_initialize_motion(cycle=cycle),
+            requested_inputs={"cycle": cycle},
+            lifecycle_stage_id="serial206.initiate_pipette_group_for_oem_initialize_motion",
+        )
 
     def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> Any:
-        return self.pipette_transport.checked_pipette_status_for_oem_initialize_motion(attempt=attempt)
+        return self._run_audited_pipette(
+            "checked_status",
+            lambda transport: transport.checked_pipette_status_for_oem_initialize_motion(attempt=attempt),
+            requested_inputs={"attempt": attempt},
+            lifecycle_stage_id="serial206.checked_pipette_status_for_oem_initialize_motion",
+        )
 
     @staticmethod
     def _position_value(result: Any) -> int:

@@ -242,6 +242,24 @@ def test_transport_keeps_tip_precondition_separate_from_liquid_postcondition():
     assert result["physical_effect_verified"] is False
 
 
+def test_generated_runtime_entrypoint_denominator_is_closed_world(tmp_path):
+    from scripts.generate_bioxp_runtime_audit_entrypoint_denominator import generate_denominator
+
+    output = tmp_path / "denominator.json"
+    bms_root = Path("/home/dalab/worktrees/bms-runtime-audit-complete-20260821")
+    payload = generate_denominator(ROOT, bms_root=bms_root if bms_root.is_dir() else None, output_path=output)
+
+    assert payload["schema"] == "bioxp.runtime_audit.entrypoint_denominator.v1"
+    assert payload["rows"]
+    families = {row["family"] for row in payload["rows"]}
+    assert {"robot_route", "protocol_handler", "lifecycle_caller", "transport_method"} <= families
+    assert {"bms_relay", "cockpit_action"} <= families
+    assert payload["invariants"]["unclassified_count"] == 0
+    assert payload["invariants"]["direct_transport_bypass_count"] == 0
+    assert payload["invariants"]["duplicate_identity_count"] == 0
+    assert output.read_bytes() == json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+
+
 def test_driver_deferred_send_requires_ack_without_claiming_completion():
     class Bus:
         @staticmethod
