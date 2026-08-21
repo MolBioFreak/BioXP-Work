@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import io
+import json
+import os
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator, Mapping
+
+from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+
+from .operator_receipt_store import OperatorReceiptStore, _fsync_directory
+
+
+_SCHEMA_VERSION = 2
+_MAX_EXPORT_ROWS = 100_000
+_CURSOR_TTL_S = 15 * 60
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _decode_json(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def _encode_cursor(value: Mapping[str, Any]) -> str:
+    return base64.urlsafe_b64encode(_canonical(value).encode()).decode().rstrip("=")
+
+
+def _decode_cursor(value: str) -> dict[str, Any]:
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode((value + padding).encode()).decode()
+        result = json.loads(decoded)
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeError) as exc:
+        raise HTTPException(status_code=409, detail={"error": "invalid_report_cursor"}) from exc
+    if not isinstance(result, dict) or float(result.get("expires_at", 0)) < time.time():
+        raise HTTPException(status_code=409, detail={"error": "expired_report_cursor"})
+    return result
+
+
+@contextmanager
+def _read_snapshot(store: OperatorReceiptStore) -> Iterator[Any]:
+    with store.lock:
+        store.connection.execute("BEGIN")
+        try:
+            yield store.connection
+        finally:
+            if store.connection.in_transaction:
+                store.connection.execute("ROLLBACK")
+
+
+def _store_identity(connection: Any) -> dict[str, Any]:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    identity = connection.execute(
+        "SELECT database_path,schema_version FROM runtime_store_identity WHERE identity_id=1"
+    ).fetchone()
+    return {
+        "database_identity": "robot_authoritative_sqlite",
+        "schema_version": version,
+        "database_path_exposed": False,
+        "identity_version": None if identity is None else int(identity["schema_version"]),
+    }
+
+
+def _base_filters(
+    *,
+    start: float | None,
+    end: float | None,
+    status: str | None,
+    operation: str | None,
+    action: str | None,
+    channel: int | None,
+    limit: int,
+) -> dict[str, Any]:
+    if start is not None and end is not None and start >= end:
+        raise HTTPException(status_code=422, detail={"error": "invalid_time_window"})
+    if channel is not None and channel not in range(4):
+        raise HTTPException(status_code=422, detail={"error": "invalid_channel"})
+    return {
+        "start": start,
+        "end": end,
+        "status": status,
+        "operation": operation,
+        "action": action,
+        "channel": channel,
+        "limit": limit,
+    }
+
+
+def _command_where(filters: Mapping[str, Any], *, high_water: int, last_sequence: int | None = None) -> tuple[str, list[Any]]:
+    clauses = ["c.sequence <= ?"]
+    params: list[Any] = [high_water]
+    if last_sequence is not None:
+        clauses.append("c.sequence < ?")
+        params.append(last_sequence)
+    if filters.get("start") is not None:
+        clauses.append("c.updated_at >= ?")
+        params.append(float(filters["start"]))
+    if filters.get("end") is not None:
+        clauses.append("c.updated_at < ?")
+        params.append(float(filters["end"]))
+    for key, column in (("status", "c.status"), ("operation", "c.operation"), ("action", "c.action_id")):
+        if filters.get(key) is not None:
+            clauses.append(f"{column} = ?")
+            params.append(str(filters[key]))
+    if filters.get("channel") is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM pipette_channel_observations o WHERE o.command_id=c.command_id AND o.channel=?)"
+        )
+        params.append(int(filters["channel"]))
+    return " AND ".join(clauses), params
+
+
+def _evidence_rows(connection: Any, command_id: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT evidence_artifact_id,sha256,byte_count,created_at,retention_deadline,
+               legal_hold,expiry_state,expiry_receipt_id
+        FROM runtime_evidence_objects WHERE command_id=? ORDER BY created_at,evidence_artifact_id
+        """,
+        (command_id,),
+    ).fetchall()
+    return [
+        {
+            "evidence_artifact_id": str(row["evidence_artifact_id"]),
+            "sha256": str(row["sha256"]),
+            "byte_count": int(row["byte_count"]),
+            "created_at": row["created_at"],
+            "retention_deadline": row["retention_deadline"],
+            "legal_hold": bool(row["legal_hold"]),
+            "expiry_state": row["expiry_state"],
+            "expiry_receipt_id": row["expiry_receipt_id"],
+        }
+        for row in rows
+    ]
+
+
+def _command_projection(connection: Any, row: Any, *, detail: bool = False) -> dict[str, Any]:
+    result = {
+        "sequence": int(row["sequence"]),
+        "command_id": str(row["command_id"]),
+        "idempotency_key": str(row["idempotency_key"]),
+        "operation": row["operation"],
+        "command_kind": row["command_kind"],
+        "entrypoint_id": row["entrypoint_id"],
+        "caller_class": row["caller_class"],
+        "control_class": row["control_class"],
+        "action_id": row["action_id"],
+        "status": row["status"],
+        "outcome": row["outcome"],
+        "failure_code": row["failure_code"],
+        "ownership_generation": row["ownership_generation"],
+        "connection_generation": row["connection_generation"],
+        "started_at": row["started_at"],
+        "admitted_at": row["admitted_at"],
+        "dispatched_at": row["dispatched_at"],
+        "finished_at": row["finished_at"],
+        "duration_ms": row["duration_ms"],
+        "delivery_verified": bool(row["delivery_verified"]),
+        "controller_acknowledged": bool(row["controller_acknowledged"]),
+        "completion_verified": bool(row["completion_verified"]),
+        "hardware_precondition_verified": bool(row["hardware_precondition_verified"]),
+        "hardware_postcondition_verified": bool(row["hardware_postcondition_verified"]),
+        "physical_effect_verified": bool(row["physical_effect_verified"]),
+        "evidence_state": row["evidence_state"],
+    }
+    if detail:
+        result["requested_inputs"] = _decode_json(row["requested_inputs_json"], {})
+        result["effective_inputs"] = _decode_json(row["effective_inputs_json"], {})
+        result["source_identity"] = _decode_json(row["source_identity_json"], {})
+        result["transitions"] = [
+            {
+                "transition_id": int(item["transition_id"]),
+                "state": item["state"],
+                "observed_at": item["observed_at"],
+                "detail": _decode_json(item["detail_json"], {}),
+            }
+            for item in connection.execute(
+                "SELECT transition_id,state,observed_at,detail_json FROM operator_transitions WHERE command_id=? ORDER BY transition_id",
+                (row["command_id"],),
+            ).fetchall()
+        ]
+        result["evidence"] = _evidence_rows(connection, str(row["command_id"]))
+        pipette = connection.execute(
+            "SELECT * FROM pipette_operations WHERE command_id=?",
+            (row["command_id"],),
+        ).fetchone()
+        result["pipette"] = None if pipette is None else _pipette_projection(connection, pipette, detail=True)
+    return result
+
+
+def _pipette_projection(connection: Any, row: Any, *, detail: bool = False) -> dict[str, Any]:
+    result = {
+        "pipette_operation_id": str(row["pipette_operation_id"]),
+        "command_id": str(row["command_id"]),
+        "operation": row["operation"],
+        "entrypoint_id": row["entrypoint_id"],
+        "caller_class": row["caller_class"],
+        "control_class": row["control_class"],
+        "action_id": row["action_id"],
+        "status": row["status"],
+        "outcome": row["outcome"],
+        "failure_code": row["failure_code"],
+        "delivery_verified": bool(row["delivery_verified"]),
+        "controller_acknowledged": bool(row["controller_acknowledged"]),
+        "completion_verified": bool(row["completion_verified"]),
+        "hardware_postcondition_verified": bool(row["hardware_postcondition_verified"]),
+        "physical_effect_verified": bool(row["physical_effect_verified"]),
+        "evidence_state": row["evidence_state"],
+    }
+    if detail:
+        op_id = str(row["pipette_operation_id"])
+        result["channels"] = [
+            {
+                "observation_id": str(item["observation_id"]),
+                "command_id": str(item["command_id"]),
+                "pipette_operation_id": op_id,
+                "channel": int(item["channel"]),
+                "phase": item["phase"],
+                "observed_at": item["observed_at"],
+                "semantic_validity": item["semantic_validity"],
+                "truth_source": item["truth_source"],
+                "tip_loaded": None if item["tip_loaded"] is None else bool(item["tip_loaded"]),
+                "pressure": item["pressure"],
+                "pressure_units": item["pressure_units"],
+                "status": item["status"],
+                "error_code": item["error_code"],
+                "firmware_class": item["firmware_class"],
+                "detail": _decode_json(item["detail_json"], {}),
+            }
+            for item in connection.execute(
+                "SELECT * FROM pipette_channel_observations WHERE pipette_operation_id=? ORDER BY observed_at,observation_id",
+                (op_id,),
+            ).fetchall()
+        ]
+        result["exchanges"] = [
+            {
+                "exchange_id": str(item["exchange_id"]),
+                "transaction_id": item["transaction_id"],
+                "channel": item["channel"],
+                "transaction_phase": item["transaction_phase"],
+                "command_family": item["command_family"],
+                "matcher_name": item["matcher_name"],
+                "tx_id": item["tx_id"],
+                "expected_rx_id": item["expected_rx_id"],
+                "observed_rx_id": item["observed_rx_id"],
+                "tx_bytes": _decode_json(item["tx_bytes_json"], []),
+                "rx_bytes": _decode_json(item["rx_bytes_json"], []),
+                "delivery_verified": bool(item["delivery_verified"]),
+                "semantic_match": bool(item["semantic_match"]),
+                "controller_acknowledged": bool(item["controller_acknowledged"]),
+                "completion_verified": bool(item["completion_verified"]),
+                "completion_before_ack": bool(item["completion_before_ack"]),
+                "sent_at": item["sent_at"],
+                "received_at": item["received_at"],
+                "ack_at": item["ack_at"],
+                "completion_at": item["completion_at"],
+            }
+            for item in connection.execute(
+                "SELECT * FROM pipette_transport_exchanges WHERE pipette_operation_id=? ORDER BY sent_at,exchange_id",
+                (op_id,),
+            ).fetchall()
+        ]
+        result["events"] = [
+            {
+                "event_id": int(item["event_id"]),
+                "event_source": item["event_source"],
+                "event_kind": item["event_kind"],
+                "observed_at": item["observed_at"],
+                "event": _decode_json(item["event_json"], {}),
+            }
+            for item in connection.execute(
+                "SELECT * FROM runtime_events WHERE pipette_operation_id=? ORDER BY event_id",
+                (op_id,),
+            ).fetchall()
+        ]
+        result["pressure_streams"] = [
+            {
+                "stream_session_id": item["stream_session_id"],
+                "channels": _decode_json(item["channels_json"], []),
+                "sample_period_ms": item["sample_period_ms"],
+                "started_at": item["started_at"],
+                "stopped_at": item["stopped_at"],
+                "source_generation": item["source_generation"],
+                "reader_generation": item["reader_generation"],
+                "offset_identity": item["offset_identity"],
+                "terminal_state": item["terminal_state"],
+                "loss_count": item["loss_count"],
+            }
+            for item in connection.execute(
+                "SELECT * FROM pipette_pressure_streams WHERE pipette_operation_id=? ORDER BY started_at,stream_session_id",
+                (op_id,),
+            ).fetchall()
+        ]
+    return result
+
+
+def _command_page(connection: Any, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+    high_water = int(connection.execute("SELECT COALESCE(MAX(sequence),0) FROM operator_commands").fetchone()[0])
+    filter_digest = hashlib.sha256(_canonical(filters).encode()).hexdigest()
+    last_sequence = None
+    if cursor:
+        state = _decode_cursor(cursor)
+        if state.get("resource") != "commands" or state.get("filter_sha256") != filter_digest:
+            raise HTTPException(status_code=409, detail={"error": "cursor_filter_mismatch"})
+        high_water = int(state["high_water"])
+        last_sequence = int(state["last_sequence"])
+    where, params = _command_where(filters, high_water=high_water, last_sequence=last_sequence)
+    total = int(connection.execute(f"SELECT COUNT(*) FROM operator_commands c WHERE {where}", params).fetchone()[0])
+    rows = connection.execute(
+        f"SELECT c.* FROM operator_commands c WHERE {where} ORDER BY c.sequence DESC LIMIT ?",
+        [*params, int(filters["limit"]) + 1],
+    ).fetchall()
+    has_more = len(rows) > int(filters["limit"])
+    rows = rows[: int(filters["limit"])]
+    body = {
+        "filters": filters,
+        "snapshot": {"high_water_sequence": high_water, **_store_identity(connection)},
+        "returned_count": len(rows),
+        "filtered_total": total,
+        "has_more": has_more,
+        "next_cursor": None,
+        "commands": [_command_projection(connection, row) for row in rows],
+    }
+    if has_more and rows:
+        body["next_cursor"] = _encode_cursor({
+            "resource": "commands",
+            "filter_sha256": filter_digest,
+            "high_water": high_water,
+            "last_sequence": int(rows[-1]["sequence"]),
+            "expires_at": time.time() + _CURSOR_TTL_S,
+        })
+    return body
+
+
+def _pipette_page(connection: Any, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+    clauses = ["p.rowid <= (SELECT COALESCE(MAX(rowid),0) FROM pipette_operations)"]
+    params: list[Any] = []
+    if filters.get("status") is not None:
+        clauses.append("p.status=?")
+        params.append(filters["status"])
+    if filters.get("operation") is not None:
+        clauses.append("p.operation=?")
+        params.append(filters["operation"])
+    if filters.get("channel") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM pipette_channel_observations o WHERE o.pipette_operation_id=p.pipette_operation_id AND o.channel=?)")
+        params.append(filters["channel"])
+    last_rowid = None
+    filter_digest = hashlib.sha256(_canonical(filters).encode()).hexdigest()
+    high_water = int(connection.execute("SELECT COALESCE(MAX(rowid),0) FROM pipette_operations").fetchone()[0])
+    if cursor:
+        state = _decode_cursor(cursor)
+        if state.get("resource") != "pipette" or state.get("filter_sha256") != filter_digest:
+            raise HTTPException(status_code=409, detail={"error": "cursor_filter_mismatch"})
+        high_water = int(state["high_water"])
+        last_rowid = int(state["last_rowid"])
+        clauses.append("p.rowid < ?")
+        params.append(last_rowid)
+    where = " AND ".join(clauses)
+    total = int(connection.execute(f"SELECT COUNT(*) FROM pipette_operations p WHERE {where}", params).fetchone()[0])
+    rows = connection.execute(
+        f"SELECT p.* FROM pipette_operations p WHERE {where} ORDER BY p.rowid DESC LIMIT ?",
+        [*params, int(filters["limit"]) + 1],
+    ).fetchall()
+    has_more = len(rows) > int(filters["limit"])
+    rows = rows[: int(filters["limit"])]
+    body = {
+        "filters": filters,
+        "snapshot": {"high_water_rowid": high_water, **_store_identity(connection)},
+        "returned_count": len(rows),
+        "filtered_total": total,
+        "has_more": has_more,
+        "next_cursor": None,
+        "pipette": [_pipette_projection(connection, row) for row in rows],
+    }
+    if has_more and rows:
+        body["next_cursor"] = _encode_cursor({
+            "resource": "pipette",
+            "filter_sha256": filter_digest,
+            "high_water": high_water,
+            "last_rowid": int(rows[-1]["rowid"]),
+            "expires_at": time.time() + _CURSOR_TTL_S,
+        })
+    return body
+
+
+def _summary(connection: Any, filters: dict[str, Any]) -> dict[str, Any]:
+    high_water = int(connection.execute("SELECT COALESCE(MAX(sequence),0) FROM operator_commands").fetchone()[0])
+    where, params = _command_where(filters, high_water=high_water)
+    total = int(connection.execute(f"SELECT COUNT(*) FROM operator_commands c WHERE {where}", params).fetchone()[0])
+    statuses = {
+        str(row["status"]): int(row["count"])
+        for row in connection.execute(f"SELECT c.status,COUNT(*) AS count FROM operator_commands c WHERE {where} GROUP BY c.status", params).fetchall()
+    }
+    return {
+        "scope": "filtered" if any(filters.get(key) is not None for key in ("start", "end", "status", "operation", "action")) else "window",
+        "filters": filters,
+        "snapshot": {"high_water_sequence": high_water, **_store_identity(connection)},
+        "commands": {"total": total, "by_status": statuses},
+        "pipette": {"total": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0])},
+        "events": {"total": int(connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0])},
+        "pressure": {"streams": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_streams").fetchone()[0]), "chunks": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_chunks").fetchone()[0])},
+    }
+
+
+def _write_export(store: OperatorReceiptStore, *, export_id: str, fmt: str, payload: Mapping[str, Any]) -> tuple[str, int, str]:
+    export_root = store.root / "report_exports"
+    export_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    relpath = Path("report_exports") / f"{export_id}.{fmt}"
+    final_path = store.root / relpath
+    if fmt == "json":
+        raw = (_canonical(payload) + "\n").encode()
+    else:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=["command_id", "operation", "status", "outcome", "failure_code"])
+        writer.writeheader()
+        for row in payload.get("commands", []):
+            writer.writerow({key: row.get(key) for key in writer.fieldnames})
+        raw = output.getvalue().encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{export_id}.", suffix=".tmp", dir=export_root)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, final_path)
+        _fsync_directory(export_root)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return relpath.as_posix(), len(raw), digest
+
+
+def create_operator_reports_router(store: Any) -> APIRouter:
+    router = APIRouter(prefix="/operator", tags=["operator-reports"])
+
+    def filters(
+        start: float | None = None,
+        end: float | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        action: str | None = None,
+        channel: int | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        return _base_filters(start=start, end=end, status=status, operation=operation, action=action, channel=channel, limit=limit)
+
+    @router.get("/reports/summary")
+    def report_summary(
+        start: float | None = None,
+        end: float | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        action: str | None = None,
+        channel: int | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        selected = filters(start, end, status, operation, action, channel, limit)
+        with _read_snapshot(store) as connection:
+            return _summary(connection, selected)
+
+    @router.get("/reports/commands")
+    def report_commands(
+        start: float | None = None,
+        end: float | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        action: str | None = None,
+        channel: int | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        selected = filters(start, end, status, operation, action, channel, limit)
+        with _read_snapshot(store) as connection:
+            return _command_page(connection, selected, cursor)
+
+    @router.get("/reports/commands/{command_id}")
+    def report_command_detail(command_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "command_not_found", "command_id": command_id})
+            return _command_projection(connection, row, detail=True)
+
+    @router.get("/reports/commands/{command_id}/transitions")
+    def report_command_transitions(command_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            rows = connection.execute("SELECT transition_id,state,observed_at,detail_json FROM operator_transitions WHERE command_id=? ORDER BY transition_id", (command_id,)).fetchall()
+            return {"command_id": command_id, "transitions": [{"transition_id": int(row["transition_id"]), "state": row["state"], "observed_at": row["observed_at"], "detail": _decode_json(row["detail_json"], {})} for row in rows]}
+
+    @router.get("/reports/pipette")
+    def report_pipette(
+        start: float | None = None,
+        end: float | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        action: str | None = None,
+        channel: int | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        selected = filters(start, end, status, operation, action, channel, limit)
+        with _read_snapshot(store) as connection:
+            return _pipette_page(connection, selected, cursor)
+
+    @router.get("/reports/pipette/{pipette_operation_id}")
+    def report_pipette_detail(pipette_operation_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM pipette_operations WHERE pipette_operation_id=?", (pipette_operation_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "pipette_operation_not_found", "pipette_operation_id": pipette_operation_id})
+            return _pipette_projection(connection, row, detail=True)
+
+    @router.get("/reports/pipette/{pipette_operation_id}/channels")
+    def report_pipette_channels(pipette_operation_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM pipette_operations WHERE pipette_operation_id=?", (pipette_operation_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "pipette_operation_not_found"})
+            return {"pipette_operation_id": pipette_operation_id, "channels": _pipette_projection(connection, row, detail=True)["channels"]}
+
+    @router.get("/reports/pipette/{pipette_operation_id}/exchanges")
+    def report_pipette_exchanges(pipette_operation_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM pipette_operations WHERE pipette_operation_id=?", (pipette_operation_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "pipette_operation_not_found"})
+            return {"pipette_operation_id": pipette_operation_id, "exchanges": _pipette_projection(connection, row, detail=True)["exchanges"]}
+
+    @router.get("/reports/events")
+    def report_events(limit: int = Query(100, ge=1, le=1000), event_kind: str | None = None) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            if event_kind is None:
+                rows = connection.execute("SELECT * FROM runtime_events ORDER BY event_id DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM runtime_events WHERE event_kind=? ORDER BY event_id DESC LIMIT ?", (event_kind, limit)).fetchall()
+            return {"event_kind": event_kind, "returned_count": len(rows), "events": [{"event_id": int(row["event_id"]), "command_id": row["command_id"], "pipette_operation_id": row["pipette_operation_id"], "event_source": row["event_source"], "event_kind": row["event_kind"], "observed_at": row["observed_at"], "event": _decode_json(row["event_json"], {})} for row in rows]}
+
+    @router.get("/reports/events/{event_id}")
+    def report_event_detail(event_id: int) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM runtime_events WHERE event_id=?", (event_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "event_not_found"})
+            return {"event_id": int(row["event_id"]), "command_id": row["command_id"], "pipette_operation_id": row["pipette_operation_id"], "event_source": row["event_source"], "event_kind": row["event_kind"], "observed_at": row["observed_at"], "event": _decode_json(row["event_json"], {})}
+
+    @router.get("/reports/pressure-streams")
+    def report_pressure_streams(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            rows = connection.execute("SELECT * FROM pipette_pressure_streams ORDER BY started_at DESC,stream_session_id DESC LIMIT ?", (limit,)).fetchall()
+            return {"returned_count": len(rows), "pressure_streams": [{"stream_session_id": row["stream_session_id"], "pipette_operation_id": row["pipette_operation_id"], "channels": _decode_json(row["channels_json"], []), "sample_period_ms": row["sample_period_ms"], "started_at": row["started_at"], "stopped_at": row["stopped_at"], "terminal_state": row["terminal_state"], "loss_count": row["loss_count"]} for row in rows]}
+
+    @router.get("/reports/pressure-streams/{stream_session_id}")
+    def report_pressure_stream_detail(stream_session_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM pipette_pressure_streams WHERE stream_session_id=?", (stream_session_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "pressure_stream_not_found"})
+            chunks = connection.execute("SELECT * FROM pipette_pressure_chunks WHERE stream_session_id=? ORDER BY channel,chunk_sequence", (stream_session_id,)).fetchall()
+            return {"stream_session_id": row["stream_session_id"], "pipette_operation_id": row["pipette_operation_id"], "channels": _decode_json(row["channels_json"], []), "sample_period_ms": row["sample_period_ms"], "started_at": row["started_at"], "stopped_at": row["stopped_at"], "terminal_state": row["terminal_state"], "loss_count": row["loss_count"], "chunks": [{"chunk_id": c["chunk_id"], "channel": c["channel"], "chunk_sequence": c["chunk_sequence"], "sample_count": c["sample_count"], "lost_sample_count": c["lost_sample_count"], "units": c["units"], "sha256": c["sha256"], "byte_count": c["byte_count"], "evidence_artifact_id": c["evidence_artifact_id"]} for c in chunks]}
+
+    @router.get("/reports/pressure-streams/{stream_session_id}/samples")
+    def report_pressure_stream_samples(stream_session_id: str, limit: int = Query(1000, ge=1, le=10000)) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            rows = connection.execute("SELECT * FROM pipette_pressure_chunks WHERE stream_session_id=? ORDER BY channel,chunk_sequence LIMIT ?", (stream_session_id, limit)).fetchall()
+            return {"stream_session_id": stream_session_id, "returned_count": len(rows), "samples": [{"chunk_id": row["chunk_id"], "channel": row["channel"], "chunk_sequence": row["chunk_sequence"], "sample_count": row["sample_count"], "lost_sample_count": row["lost_sample_count"], "units": row["units"], "sha256": row["sha256"], "byte_count": row["byte_count"], "summary": _decode_json(row["sample_summary_json"], {})} for row in rows]}
+
+    @router.post("/reports/exports")
+    def create_export(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        fmt = str(payload.get("format") or "json").lower()
+        if fmt not in {"json", "csv"}:
+            raise HTTPException(status_code=422, detail={"error": "unsupported_export_format"})
+        limit = int(payload.get("limit", 1000))
+        if limit < 1 or limit > _MAX_EXPORT_ROWS:
+            raise HTTPException(status_code=422, detail={"error": "export_limit_exceeded", "max_rows": _MAX_EXPORT_ROWS})
+        selected = _base_filters(
+            start=payload.get("start"),
+            end=payload.get("end"),
+            status=payload.get("status"),
+            operation=payload.get("operation"),
+            action=payload.get("action"),
+            channel=payload.get("channel"),
+            limit=limit,
+        )
+        with _read_snapshot(store) as connection:
+            page = _command_page(connection, selected, None)
+            snapshot = page["snapshot"]
+            export_payload = {"schema_version": "bioxp.operator_report_export.v1", "filters": selected, "snapshot": snapshot, "commands": page["commands"]}
+        export_id = uuid.uuid4().hex
+        try:
+            relpath, byte_count, digest = _write_export(store, export_id=export_id, fmt=fmt, payload=export_payload)
+            created_at = time.time()
+            with store.lock:
+                store.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    store.connection.execute(
+                        "INSERT INTO report_exports(export_id,format,filter_json,filter_sha256,snapshot_json,row_count,sha256,byte_count,status,artifact_relpath,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (export_id, fmt, _canonical(selected), hashlib.sha256(_canonical(selected).encode()).hexdigest(), _canonical(snapshot), len(page["commands"]), digest, byte_count, "completed", relpath, created_at, created_at),
+                    )
+                    store.connection.execute("COMMIT")
+                except Exception:
+                    if store.connection.in_transaction:
+                        store.connection.execute("ROLLBACK")
+                    raise
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"error": "export_generation_failed", "reason": str(exc)[:500]}) from exc
+        return {"export_id": export_id, "status": "completed", "format": fmt, "row_count": len(page["commands"]), "sha256": digest, "byte_count": byte_count, "download": f"/operator/reports/exports/{export_id}/download"}
+
+    @router.get("/reports/exports/{export_id}")
+    def export_metadata(export_id: str) -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM report_exports WHERE export_id=?", (export_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "export_not_found"})
+            return {"export_id": row["export_id"], "format": row["format"], "filter": _decode_json(row["filter_json"], {}), "filter_sha256": row["filter_sha256"], "snapshot": _decode_json(row["snapshot_json"], {}), "row_count": row["row_count"], "sha256": row["sha256"], "byte_count": row["byte_count"], "status": row["status"], "created_at": row["created_at"], "completed_at": row["completed_at"], "download": f"/operator/reports/exports/{export_id}/download"}
+
+    @router.get("/reports/exports/{export_id}/download")
+    def export_download(export_id: str):
+        with _read_snapshot(store) as connection:
+            row = connection.execute("SELECT * FROM report_exports WHERE export_id=?", (export_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"error": "export_not_found"})
+            path = store.root / str(row["artifact_relpath"])
+            if not path.is_file():
+                raise HTTPException(status_code=409, detail={"error": "export_artifact_missing"})
+            if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
+                raise HTTPException(status_code=409, detail={"error": "export_integrity_failure"})
+            if row["format"] == "json":
+                return JSONResponse(content=json.loads(path.read_text(encoding="utf-8")))
+            return PlainTextResponse(path.read_text(encoding="utf-8"), media_type="text/csv")
+
+    @router.get("/audit-health")
+    def audit_health() -> dict[str, Any]:
+        with _read_snapshot(store) as connection:
+            page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            return {
+                "status": "ok",
+                "store": _store_identity(connection),
+                "database_bytes": page_count * page_size,
+                "wal_bytes": (store.path.with_name(store.path.name + "-wal").stat().st_size if store.path.with_name(store.path.name + "-wal").exists() else 0),
+                "commands": int(connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0]),
+                "pipette_operations": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0]),
+                "retained_evidence": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects WHERE expiry_state='active'").fetchone()[0]),
+                "pending_expiry_evidence": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects WHERE expiry_state='expiry_pending'").fetchone()[0]),
+                "integrity_failures": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_events WHERE event_kind='integrity_failure'").fetchone()[0]),
+                "migration_receipts": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_receipts").fetchone()[0]),
+                "exports": int(connection.execute("SELECT COUNT(*) FROM report_exports").fetchone()[0]),
+            }
+
+    return router

@@ -49,6 +49,7 @@ from .oem_serial206_initialization import (
 from .oem_runtime_store import OEMRuntimeStore
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .operator_reports import create_operator_reports_router
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
 # must neither activate a camera nor present an unqueried cache as observation.
@@ -890,6 +891,7 @@ app = FastAPI(
 app.include_router(oem_compat_router)
 app.include_router(oem_runtime_router)
 app.include_router(oem_homing_router)
+app.include_router(create_operator_reports_router(_pipette_receipts))
 
 
 def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:

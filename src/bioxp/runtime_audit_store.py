@@ -340,6 +340,20 @@ CREATE TABLE IF NOT EXISTS runtime_migration_receipts (
     status TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS report_exports (
+    export_id TEXT PRIMARY KEY,
+    format TEXT NOT NULL CHECK(format IN ('json','csv')),
+    filter_json TEXT NOT NULL CHECK(json_valid(filter_json)),
+    filter_sha256 TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+    row_count INTEGER NOT NULL CHECK(row_count >= 0),
+    sha256 TEXT NOT NULL,
+    byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+    status TEXT NOT NULL,
+    artifact_relpath TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    completed_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS serial206_receipts (
     stream TEXT NOT NULL,
     receipt_id TEXT NOT NULL,
@@ -375,6 +389,8 @@ CREATE INDEX IF NOT EXISTS runtime_evidence_objects_command_idx
     ON runtime_evidence_objects(command_id, created_at, evidence_artifact_id);
 CREATE INDEX IF NOT EXISTS runtime_evidence_events_artifact_idx
     ON runtime_evidence_events(evidence_artifact_id, event_id);
+CREATE INDEX IF NOT EXISTS report_exports_time_idx
+    ON report_exports(created_at DESC, export_id);
 CREATE INDEX IF NOT EXISTS serial206_receipts_command_idx
     ON serial206_receipts(stream, command_id);
 CREATE UNIQUE INDEX IF NOT EXISTS serial206_receipts_idempotency_idx
@@ -395,6 +411,7 @@ _APPEND_ONLY_TABLES = (
     "runtime_evidence_links",
     "runtime_evidence_events",
     "runtime_migration_receipts",
+    "report_exports",
     "pipette_channel_observations",
     "pipette_transport_exchanges",
     "pipette_pressure_chunks",
