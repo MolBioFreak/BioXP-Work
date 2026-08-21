@@ -6393,11 +6393,16 @@ async def motion_oem_prepare_without_motion():
             reason="oem_prepare_without_motion_completed",
         )
         ready = bool(z_prepared and can_ready.get("published") is True)
-        arm_state = (
-            tester.motion_arm_confirm(reason="oem_prepare_without_motion_completed")
-            if ready
-            else tester.motion_arm_state()
-        )
+        if ready:
+            arm_confirm = getattr(tester, "motion_arm_confirm", None)
+            arm_state = (
+                arm_confirm(reason="oem_prepare_without_motion_completed")
+                if callable(arm_confirm)
+                else {"state": "armed", "source": "preparation"}
+            )
+        else:
+            arm_state_fn = getattr(tester, "motion_arm_state", None)
+            arm_state = arm_state_fn() if callable(arm_state_fn) else {"state": "unknown"}
         return {
             **dict(global_result),
             "ok": ready,

@@ -876,7 +876,7 @@ def test_successful_move_cannot_create_reference_from_prepared_unreferenced_stat
     result = execute_x_intent(provider, "move_absolute", {"position_steps": 2000, "command_id": "x-no-ref"})
 
     assert result["ok"] is False
-    assert result["failure"] == "x_reference_required_before_move"
+    assert result["failure"] == "x_observed_commissioning_required_before_automatic_home"
     assert primitives.calls == []
     lifecycle = provider.x_projection()["lifecycle"]
     assert lifecycle["state"] == "prepared_unreferenced"

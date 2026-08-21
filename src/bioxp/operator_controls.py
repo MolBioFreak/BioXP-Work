@@ -1226,7 +1226,14 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             None,
         )
         if route is None:
-            return
+            if provider.get("provider_available") is not True:
+                return
+            route = {
+                "method": str(provider.get("informational_method") or "POST"),
+                "path": path,
+                "locations": {},
+                "inputs": {row["name"] for row in provider.get("inputs", []) if isinstance(row, Mapping) and row.get("name")},
+            }
         fixed = dict(fixed_inputs or {})
         visible_inputs = [dict(row) for row in provider.get("inputs", []) if row.get("name") not in fixed]
         action_bounds = {
@@ -1784,7 +1791,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     if initialize_motion_route:
         dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
-    actions = [row for row in actions if not str(row.get("action_id", "")).startswith(("oem.xy.", "oem.xyz.", "oem.y.internal."))]
+    actions = [row for row in actions if not str(row.get("action_id", "")).startswith("oem.y.internal.")]
     # Composite routes are private command-plane method targets. They are not
     # direct operator actions, but strict admitted methods must still dispatch.
     dispatch = {key: value for key, value in dispatch.items() if not key.startswith("oem.xyz.")}

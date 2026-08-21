@@ -32,8 +32,10 @@ class FakeMotionDriver:
         self.parameter_readbacks = {
             (5, 0, 4): 1700,
             (4, 0, 4): 1800,
-            (4, 1, 12): 1,
+            (4, 1, 12): 0,
             (4, 1, 13): 0,
+            (5, 0, 12): 0,
+            (5, 0, 13): 0,
         }
         self.rail = {"ack": {"status": 100}, "reply_valid": True, "sample_valid": True, "safety_valid": True, "oem_scalar": 0}
         self.io: dict[int, object] = {
@@ -212,6 +214,7 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
         "boardLifecycleGeneration",
         "waitForBoard",
         "initializeMotorsWithoutMotion",
+        "x_switch_mask_precondition",
         "z_switch_mask_precondition",
         "parameter_readback",
     ]
@@ -275,7 +278,7 @@ def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switc
     assert stage["controller_evidence"]["writes"] == {}
     assert ("write_param", 4, 1, 13, 0) not in driver.calls
     assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
-    assert driver.invalidations == ["switch_mask_precondition_failed"]
+    assert driver.invalidations == ["z_switch_mask_precondition_failed"]
 
 
 def test_prepare_without_motion_requires_reconciled_z_right_mask():

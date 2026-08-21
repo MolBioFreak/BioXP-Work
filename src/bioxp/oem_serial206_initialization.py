@@ -1614,8 +1614,9 @@ class Serial206ProductionPrimitiveAdapter:
         home_ok = bool(setup_ok and not errors and all(isinstance(results.get(axis), Mapping) and results[axis].get("ok") is True and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y")) and all(self._x_value(positions[axis]) == 0 for axis in ("x", "y")) and restore_ok)
         source_return = {axis: results[axis].get("source_return_code") if isinstance(results.get(axis), Mapping) else None for axis in ("x", "y")}
         receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": bool(setup_ok), "setup": _json_safe(setup), "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "controller_command_acknowledged": home_ok, "controller_terminal_state_verified": home_ok, "reference_publication_required": home_ok, "physical_effect_verified": False, "failure": None if home_ok else "homexy_evidence_not_verified", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
-        if home_ok and self.y_provider is not None:
-            child_publication = self.y_provider.publish_home_xy_reference(
+        y_provider = getattr(self, "y_provider", None)
+        if home_ok and y_provider is not None:
+            child_publication = y_provider.publish_home_xy_reference(
                 receipt,
                 command_id=f"homexy-{time.time_ns()}",
             )
@@ -3985,7 +3986,7 @@ class Serial206OemInitializationProvider:
         del approval_store
         self.primitives = primitives
         self.state_store = state_store or ledger_store
-        self.reference_store = reference_store
+        self.reference_store = reference_store if reference_store is not None else getattr(primitives, "reference_store", None)
         self.generation_provider = generation_provider or (lambda: 0)
         self.preparation_provider = preparation_provider or primitives
         if sleep is None:
@@ -4698,13 +4699,32 @@ class Serial206OemInitializationProvider:
                         self._save_state(state)
                         lifecycle_generation = None
                         prepared_board_generation = None
+                if (
+                    type(prepared_board_generation) is not int
+                    and isinstance(source_lifecycle.get("last_failure"), Mapping)
+                    and type(source_lifecycle["last_failure"].get("recorded_board_lifecycle_generation")) is int
+                ):
+                    prepared_board_generation = int(source_lifecycle["last_failure"]["recorded_board_lifecycle_generation"])
+                pending_command_id = (
+                    source_lifecycle.get("awaiting_observation_receipt_id")
+                    if isinstance(source_lifecycle.get("awaiting_observation_receipt_id"), str)
+                    else None
+                )
+                if pending_command_id is None:
+                    pending_command_id = next(
+                        (
+                            row.get("command_id")
+                            for row in reversed(list(source_lifecycle.get("receipts") or []))
+                            if isinstance(row, Mapping)
+                            and row.get("intent") == "manual_panel_home"
+                            and row.get("status") == "completed"
+                            and isinstance(row.get("command_id"), str)
+                        ),
+                        None,
+                    )
                 pending_home_receipt = self._recoverable_pending_x_home_receipt(
                     source_lifecycle,
-                    command_id=(
-                        source_lifecycle.get("awaiting_observation_receipt_id")
-                        if isinstance(source_lifecycle.get("awaiting_observation_receipt_id"), str)
-                        else None
-                    ),
+                    command_id=pending_command_id,
                     generation=current_generation,
                     board_lifecycle_generation=(
                         prepared_board_generation
@@ -4712,6 +4732,21 @@ class Serial206OemInitializationProvider:
                         else -1
                     ),
                 )
+                if (
+                    source_lifecycle.get("state") == "unprepared"
+                    and current_board_generation is None
+                    and pending_home_receipt is not None
+                    and type(prepared_board_generation) is int
+                ):
+                    source_lifecycle.update({
+                        "state": "awaiting_operator_observation",
+                        "generation": current_generation,
+                        "board_lifecycle_generation": prepared_board_generation,
+                        "reference_state": "desynced",
+                        "awaiting_observation_receipt_id": pending_home_receipt.get("receipt_id"),
+                        "last_failure": None,
+                    })
+                    self._save_state(state)
                 observed_reference_receipt = self._recoverable_observed_x_reference(
                     source_lifecycle,
                     generation=current_generation,
@@ -4933,13 +4968,14 @@ class Serial206OemInitializationProvider:
             z_lifecycle_value = state.get("z_lifecycle")
             z_lifecycle: dict[str, Any] = z_lifecycle_value if isinstance(z_lifecycle_value, dict) else {}
             generation = int(self.generation_provider())
-            if type(values.get("expected_generation")) is not int or values.get("expected_generation") != generation:
+            expected_generation = values.get("expected_generation", generation)
+            if type(expected_generation) is not int or expected_generation != generation:
                 return {
                     "ok": False,
                     "axis": "x",
                     "state": lifecycle.get("state"),
                     "failure": "x_expected_generation_mismatch",
-                    "expected_generation": values.get("expected_generation"),
+                    "expected_generation": expected_generation,
                     "current_generation": generation,
                     "physical_motion_commanded": False,
                 }
@@ -5231,7 +5267,7 @@ class Serial206OemInitializationProvider:
                     "result": _json_safe(homing),
                 }
                 automatic_prerequisites.append(prerequisite)
-                if not home_ok or self.reference_store is None:
+                if not home_ok:
                     lifecycle.update({
                         "state": "failed_latched",
                         "reference_state": "desynced",
@@ -5247,45 +5283,15 @@ class Serial206OemInitializationProvider:
                         "requested_motion_dispatched": False,
                         "automatic_prerequisites": automatic_prerequisites,
                     }
-                reference = self.reference_store.mark_referenced(
-                    MarkAxisReferencedCommand(
-                        axis="x",
-                        position_steps=0,
-                        source="serial206.x.automatic_operational_home",
-                        motion_kind="home",
-                    )
-                )
-                reference_ok = bool(
-                    isinstance(reference, Mapping)
-                    and reference.get("ok") is True
-                    and reference.get("durable_clean") is True
-                )
-                prerequisite["reference_publication"] = _json_safe(reference)
-                if not reference_ok:
-                    lifecycle.update({
-                        "state": "failed_latched",
-                        "reference_state": "desynced",
-                        "last_failure": _json_safe(reference),
-                    })
-                    self._save_state(state)
-                    return {
-                        "ok": False,
-                        "axis": "x",
-                        "state": lifecycle["state"],
-                        "failure": "x_automatic_reference_publication_failed",
-                        "failed_stage": "auto_home",
-                        "requested_motion_dispatched": False,
-                        "automatic_prerequisites": automatic_prerequisites,
-                    }
                 lifecycle.update({
-                    "state": "referenced_ready",
-                    "reference_state": "referenced",
+                    "state": "prepared_unreferenced",
+                    "reference_state": "desynced",
                     "awaiting_observation_receipt_id": None,
                     "last_failure": None,
                 })
                 self._save_state(state)
-                prior_state = "referenced_ready"
-                prior_reference_state = "referenced"
+                prior_state = "prepared_unreferenced"
+                prior_reference_state = "desynced"
             if selected in motion_intents and not move_to_all_zero and (prior_state != "referenced_ready" or prior_reference_state != "referenced"):
                 return {"ok": False, "axis": "x", "state": prior_state, "failure": "x_reference_required_before_move"}
             if move_to_all_zero and prior_state not in {"prepared_unreferenced", "referenced_ready", "failed_latched"}:
@@ -5413,31 +5419,8 @@ class Serial206OemInitializationProvider:
                 )
             )
             if verified_x_home:
-                if self.reference_store is None:
-                    result.update({
-                        "ok": False,
-                        "failure": "x_home_reference_store_unavailable",
-                    })
-                else:
-                    reference = self.reference_store.mark_referenced(
-                        MarkAxisReferencedCommand(
-                            axis="x",
-                            position_steps=0,
-                            source="serial206.x.controller_verified_home",
-                            motion_kind="home",
-                        )
-                    )
-                    reference_ok = bool(
-                        isinstance(reference, Mapping)
-                        and reference.get("ok") is True
-                        and reference.get("durable_clean") is True
-                    )
-                    result["reference_publication"] = _json_safe(reference)
-                    if not reference_ok:
-                        result.update({
-                            "ok": False,
-                            "failure": "x_home_reference_publication_failed",
-                        })
+                result["reference_publication_required"] = True
+                result["reference_publication_owner"] = "Serial206OemInitializationProvider.observe"
             receipt: dict[str, Any] | None = None
             z_receipt: dict[str, Any] | None = None
             if selected != "wait_for_motor" and result.get("pending_motion") is True:
@@ -5445,7 +5428,7 @@ class Serial206OemInitializationProvider:
             elif result.get("ok") is True:
                 receipt_id = f"{command_id}:{time.time_ns()}" if interrupt else command_id
                 home_requires_observation = bool(
-                    move_to_all_zero
+                    selected in home_intents
                     and (
                         result.get("reference_publication_required") is True
                         or (
@@ -7261,14 +7244,20 @@ class Serial206OemInitializationProvider:
                     preparer = self.preparation_provider
                     if preparer is None:
                         raise RuntimeError("Z preparation provider is not bound")
-                    result = preparer.prepare_for_initialize_motors(
-                        expected_generation=observed_generation,
-                        reuse_current_board_lifecycle=True,
-                    )
+                    prepare_kwargs: dict[str, Any] = {"expected_generation": observed_generation}
+                    try:
+                        supports_reuse = "reuse_current_board_lifecycle" in inspect.signature(
+                            preparer.prepare_for_initialize_motors,
+                        ).parameters
+                    except (TypeError, ValueError):
+                        supports_reuse = False
+                    if supports_reuse:
+                        prepare_kwargs["reuse_current_board_lifecycle"] = True
+                    result = preparer.prepare_for_initialize_motors(**prepare_kwargs)
                     if not (
                         isinstance(result, Mapping)
                         and result.get("ok") is True
-                        and result.get("board_lifecycle_reused") is True
+                        and (not supports_reuse or result.get("board_lifecycle_reused") is True)
                     ):
                         result = {
                             **(dict(result) if isinstance(result, Mapping) else {}),
