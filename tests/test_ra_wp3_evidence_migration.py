@@ -132,6 +132,16 @@ def test_record_without_typed_ids_uses_sqlite_and_does_not_append_jsonl(tmp_path
     assert store.connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0] == 1
 
 
+def test_pipette_store_selects_existing_legacy_pipette_layout(tmp_path):
+    legacy = tmp_path / "pipette" / "receipts.jsonl"
+    legacy.parent.mkdir()
+    legacy.write_text("{\"receipt_id\":\"legacy\"}\n", encoding="utf-8")
+
+    store = PipetteReceiptStore(tmp_path)
+
+    assert store._legacy_path == legacy
+
+
 def test_active_jsonl_is_not_a_read_authority(tmp_path):
     store = PipetteReceiptStore(tmp_path)
     store._legacy_path.write_text('{"receipt_id":"legacy"}\n', encoding="utf-8")

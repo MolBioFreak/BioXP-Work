@@ -70,7 +70,14 @@ class PipetteReceiptStore:
         os.chmod(self.root, 0o700)
         self.path = self._audit_database.path
         self.receipts_path = None
-        self._legacy_path = self.root / "receipts.jsonl"
+        root_legacy = self.root / "receipts.jsonl"
+        pipette_legacy = self.root / "pipette" / "receipts.jsonl"
+        existing_legacy = [path for path in (root_legacy, pipette_legacy) if path.is_file()]
+        if len(existing_legacy) > 1:
+            raise PipetteReceiptError("multiple active pipette JSONL sources require explicit cleanup")
+        self._legacy_path = existing_legacy[0] if existing_legacy else pipette_legacy
+        self._legacy_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._legacy_path.parent, 0o700)
         self._lock = threading.RLock()
         self.lock = self._lock
 
