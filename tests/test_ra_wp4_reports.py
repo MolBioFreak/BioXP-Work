@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from fastapi import FastAPI
@@ -98,6 +99,10 @@ def test_report_export_is_post_then_read_only_download(tmp_path):
     assert "path" not in metadata.json()
     downloaded = client.get(f"/operator/reports/exports/{export_id}/download")
     assert downloaded.status_code == 200
+    expected_sha = metadata.json()["sha256"]
+    assert downloaded.headers["x-content-sha256"] == expected_sha
+    assert hashlib.sha256(downloaded.content).hexdigest() == expected_sha
+    assert len(downloaded.content) == metadata.json()["byte_count"]
     payload = downloaded.json()
     assert payload["commands"][0]["command_id"] == "report-command-1"
 
