@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -378,11 +379,109 @@ class PipetteReceiptStore:
         }
         return self._audit_database.claim(payload, pipette=True)
 
+    def migrate_legacy_jsonl(self) -> dict[str, Any]:
+        if not self._legacy_path.exists():
+            return {"status": "no_source", "source_path": str(self._legacy_path), "imported_count": 0}
+        raw = self._legacy_path.read_bytes()
+        source_sha256 = hashlib.sha256(raw).hexdigest()
+        migration_id = f"pipette-jsonl:{source_sha256}"
+        existing = self.connection.execute(
+            "SELECT status,imported_count FROM runtime_migration_receipts WHERE migration_id=?",
+            (migration_id,),
+        ).fetchone()
+        if existing is not None:
+            return {
+                "status": "already_imported",
+                "source_path": str(self._legacy_path),
+                "source_sha256": source_sha256,
+                "imported_count": 0,
+            }
+        imported = 0
+        quarantined = 0
+        source_count = 0
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            source_count += 1
+            try:
+                legacy = json.loads(line.decode("utf-8"))
+                if not isinstance(legacy, Mapping):
+                    raise ValueError("legacy receipt is not an object")
+                receipt_id = str(legacy.get("receipt_id") or f"line-{line_number}")
+                operation = str(legacy.get("operation") or "legacy_pipette")
+                command_id = f"legacy.pipette.{receipt_id}"
+                claim, created = self.claim(
+                    operation=operation,
+                    requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
+                    entrypoint_id="migration.pipette_jsonl.v1",
+                    caller_class="legacy_migration",
+                    control_class="historical_import",
+                    idempotency_key=f"legacy-pipette:{receipt_id}",
+                    command_id=command_id,
+                    ownership_generation=0,
+                    runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
+                )
+                if not created:
+                    continue
+                result = legacy.get("result") if isinstance(legacy.get("result"), Mapping) else {"ok": False, "outcome": "legacy_result_missing"}
+                self.record(
+                    operation=operation,
+                    requested_inputs=legacy.get("requested_inputs") if isinstance(legacy.get("requested_inputs"), Mapping) else {},
+                    effective_inputs=legacy.get("effective_inputs") if isinstance(legacy.get("effective_inputs"), Mapping) else {},
+                    result={**dict(result), "legacy_receipt_id": receipt_id, "legacy_source_sha256": source_sha256},
+                    runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
+                    command_id=claim["command_id"],
+                    pipette_operation_id=claim["pipette_operation_id"],
+                )
+                imported += 1
+            except Exception:
+                quarantined += 1
+        status = "completed_with_quarantine" if quarantined else "completed"
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO runtime_migration_receipts(
+                    migration_id,source_kind,source_digest,source_count,imported_count,quarantined_count,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    migration_id,
+                    "pipette_receipts_jsonl",
+                    source_sha256,
+                    source_count,
+                    imported,
+                    quarantined,
+                    status,
+                    time.time(),
+                ),
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+        return {
+            "status": status,
+            "source_path": str(self._legacy_path),
+            "source_sha256": source_sha256,
+            "source_count": source_count,
+            "imported_count": imported,
+            "quarantined_count": quarantined,
+        }
+
     def read(self, limit: int = 50) -> list[dict[str, Any]]:
+        selected_limit = max(1, min(int(limit), 200))
+        rows = self.connection.execute(
+            "SELECT receipt_json FROM pipette_operations WHERE receipt_json IS NOT NULL AND receipt_json <> '{}' ORDER BY updated_at DESC LIMIT ?",
+            (selected_limit,),
+        ).fetchall()
+        if rows:
+            return [json.loads(row["receipt_json"]) for row in rows]
         if not self._legacy_path.exists():
             return []
-        rows = [json.loads(line) for line in self._legacy_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        return rows[-max(1, int(limit)):]
+        legacy_rows = [json.loads(line) for line in self._legacy_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return legacy_rows[-selected_limit:]
 
     def latest(self) -> dict[str, Any] | None:
         rows = self.read(1)

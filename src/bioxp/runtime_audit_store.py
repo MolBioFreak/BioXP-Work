@@ -308,6 +308,28 @@ CREATE TABLE IF NOT EXISTS runtime_evidence_links (
     link_kind TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runtime_evidence_objects (
+    evidence_artifact_id TEXT PRIMARY KEY,
+    command_id TEXT REFERENCES operator_commands(command_id) ON DELETE RESTRICT,
+    pipette_operation_id TEXT REFERENCES pipette_operations(pipette_operation_id) ON DELETE RESTRICT,
+    original_relpath TEXT NOT NULL,
+    active_relpath TEXT,
+    sha256 TEXT NOT NULL,
+    byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+    created_at REAL NOT NULL,
+    retention_deadline REAL,
+    legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0,1)),
+    expiry_state TEXT NOT NULL,
+    expiry_receipt_id TEXT,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_evidence_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_artifact_id TEXT NOT NULL REFERENCES runtime_evidence_objects(evidence_artifact_id) ON DELETE RESTRICT,
+    event_kind TEXT NOT NULL,
+    observed_at REAL NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(detail_json))
+);
 CREATE TABLE IF NOT EXISTS runtime_migration_receipts (
     migration_id TEXT PRIMARY KEY,
     source_kind TEXT NOT NULL,
@@ -349,6 +371,10 @@ CREATE INDEX IF NOT EXISTS runtime_events_kind_idx
     ON runtime_events(event_kind, observed_at DESC, event_id DESC);
 CREATE INDEX IF NOT EXISTS runtime_evidence_links_command_idx
     ON runtime_evidence_links(command_id, evidence_link_id);
+CREATE INDEX IF NOT EXISTS runtime_evidence_objects_command_idx
+    ON runtime_evidence_objects(command_id, created_at, evidence_artifact_id);
+CREATE INDEX IF NOT EXISTS runtime_evidence_events_artifact_idx
+    ON runtime_evidence_events(evidence_artifact_id, event_id);
 CREATE INDEX IF NOT EXISTS serial206_receipts_command_idx
     ON serial206_receipts(stream, command_id);
 CREATE UNIQUE INDEX IF NOT EXISTS serial206_receipts_idempotency_idx
@@ -367,6 +393,7 @@ _APPEND_ONLY_TABLES = (
     "operator_transitions",
     "runtime_events",
     "runtime_evidence_links",
+    "runtime_evidence_events",
     "runtime_migration_receipts",
     "pipette_channel_observations",
     "pipette_transport_exchanges",

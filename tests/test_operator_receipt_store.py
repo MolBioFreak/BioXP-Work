@@ -73,6 +73,7 @@ def test_legacy_import_is_transactional_compact_and_keeps_source(tmp_path):
     assert compact is not None
     assert compact["response"] == {"http_status": 200, "body": {}}
     assert compact["stage_receipts"] == []
+    assert store.connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects").fetchone()[0] == 2
     detailed = store.by_command("legacy-1", include_evidence=True)
     assert detailed is not None
     assert detailed["response"]["body"] == large_body

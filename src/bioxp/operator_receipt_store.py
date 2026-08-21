@@ -15,7 +15,9 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -356,6 +358,160 @@ class OperatorReceiptStore:
         return relpath, digest, len(raw)
 
     @staticmethod
+    def _five_calendar_year_deadline(now: float) -> float:
+        current = datetime.fromtimestamp(float(now), tz=timezone.utc)
+        try:
+            future = current.replace(year=current.year + 5)
+        except ValueError:
+            future = current.replace(year=current.year + 5, day=28)
+        return future.timestamp()
+
+    def _register_evidence(
+        self,
+        receipt: Mapping[str, Any],
+        evidence: tuple[str, str, int] | tuple[None, None, None],
+    ) -> str | None:
+        relpath, digest, size = evidence
+        if relpath is None or digest is None or size is None:
+            return None
+        artifact_id = f"evidence:{digest}"
+        now = time.time()
+        deadline = receipt.get("evidence_retention_deadline")
+        if deadline is None:
+            deadline = self._five_calendar_year_deadline(now)
+        existing = self.connection.execute(
+            "SELECT original_relpath,sha256,byte_count FROM runtime_evidence_objects WHERE evidence_artifact_id=?",
+            (artifact_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["original_relpath"]) != str(relpath)
+                or str(existing["sha256"]) != str(digest)
+                or int(existing["byte_count"]) != int(size)
+            ):
+                raise RuntimeError("evidence artifact identity collision")
+        else:
+            self.connection.execute(
+                """
+                INSERT INTO runtime_evidence_objects(
+                    evidence_artifact_id,command_id,pipette_operation_id,original_relpath,active_relpath,
+                    sha256,byte_count,created_at,retention_deadline,legal_hold,expiry_state,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    artifact_id,
+                    receipt.get("command_id"),
+                    receipt.get("pipette_operation_id"),
+                    str(relpath),
+                    str(relpath),
+                    str(digest),
+                    int(size),
+                    now,
+                    float(deadline),
+                    int(bool(receipt.get("legal_hold", False))),
+                    "active",
+                    now,
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
+                (artifact_id, "published", now, _json_text({"relpath": relpath, "sha256": digest, "byte_count": size})),
+            )
+        command_id = receipt.get("command_id")
+        if command_id:
+            self.connection.execute(
+                "INSERT INTO runtime_evidence_links(evidence_artifact_id,command_id,link_kind,created_at) VALUES(?,?,?,?)",
+                (artifact_id, str(command_id), "command_evidence", now),
+            )
+        return artifact_id
+
+    def expire_evidence(
+        self,
+        command_id: str,
+        *,
+        retention_deadline: float | None = None,
+        now: float | None = None,
+        legal_hold: bool | None = None,
+    ) -> dict[str, Any]:
+        current_time = time.time() if now is None else float(now)
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT o.* FROM runtime_evidence_objects o
+                WHERE o.command_id=? ORDER BY o.created_at DESC LIMIT 1
+                """,
+                (str(command_id),),
+            ).fetchone()
+            if row is None:
+                return {"state": "no_evidence", "command_id": str(command_id)}
+            deadline = float(row["retention_deadline"] if retention_deadline is None else retention_deadline)
+            held = bool(row["legal_hold"] if legal_hold is None else legal_hold)
+            if held:
+                return {"state": "legal_hold", "command_id": str(command_id), "evidence_artifact_id": row["evidence_artifact_id"]}
+            if current_time < deadline:
+                return {"state": "retained", "command_id": str(command_id), "evidence_artifact_id": row["evidence_artifact_id"]}
+            artifact_id = str(row["evidence_artifact_id"])
+            relpath = row["active_relpath"]
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    "UPDATE runtime_evidence_objects SET expiry_state='expiry_pending',updated_at=? WHERE evidence_artifact_id=?",
+                    (current_time, artifact_id),
+                )
+                self.connection.execute(
+                    "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
+                    (artifact_id, "expiry_pending", current_time, _json_text({"command_id": command_id})),
+                )
+                self.connection.execute("COMMIT")
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+                raise
+        if relpath:
+            path = self.root / str(relpath)
+            try:
+                path.unlink()
+                _fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                with self.lock:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        self.connection.execute(
+                            "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
+                            (artifact_id, "integrity_failure", current_time, _json_text({"error": str(exc)[:500]})),
+                        )
+                        self.connection.execute("COMMIT")
+                    except Exception:
+                        if self.connection.in_transaction:
+                            self.connection.execute("ROLLBACK")
+                    raise
+        expiry_receipt_id = uuid.uuid4().hex
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    "UPDATE runtime_evidence_objects SET active_relpath=NULL,expiry_state='expired',expiry_receipt_id=?,updated_at=? WHERE evidence_artifact_id=?",
+                    (expiry_receipt_id, current_time, artifact_id),
+                )
+                self.connection.execute(
+                    "UPDATE operator_commands SET evidence_relpath=NULL,evidence_state='expired',updated_at=? WHERE command_id=?",
+                    (current_time, str(command_id)),
+                )
+                for event_kind in ("deleted", "expired"):
+                    self.connection.execute(
+                        "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
+                        (artifact_id, event_kind, current_time, _json_text({"expiry_receipt_id": expiry_receipt_id})),
+                    )
+                self.connection.execute("COMMIT")
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+                raise
+        return {"state": "expired", "command_id": str(command_id), "evidence_artifact_id": artifact_id, "expiry_receipt_id": expiry_receipt_id}
+
+    @staticmethod
     def _compact_receipt(receipt: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
         compact = dict(receipt)
         response = compact.pop("response", None)
@@ -569,6 +725,7 @@ class OperatorReceiptStore:
                     row = dict(raw_row)
                     evidence = self._persist_evidence(row)
                     self._upsert(row, evidence=evidence)
+                    self._register_evidence(row, evidence)
                     imported += 1
                 pruned = self._prune_locked()
             self.connection.execute(
@@ -665,6 +822,7 @@ class OperatorReceiptStore:
                 prepared = [(dict(row), self._persist_evidence(row)) for row in receipts]
                 for row, evidence in prepared:
                     self._upsert(row, evidence=evidence)
+                    self._register_evidence(row, evidence)
                 pruned.extend(self._prune_locked())
                 self.connection.execute("COMMIT")
             except Exception:
@@ -720,7 +878,9 @@ class OperatorReceiptStore:
                             },
                         },
                     })
-                    self._upsert(receipt, evidence=(None, None, None))
+                    evidence = self._persist_evidence(receipt)
+                    self._upsert(receipt, evidence=evidence)
+                    self._register_evidence(receipt, evidence)
                 self.connection.execute("COMMIT")
             except Exception:
                 self.connection.execute("ROLLBACK")
@@ -763,6 +923,7 @@ class OperatorReceiptStore:
             return self.append_interrupt_fallback(receipt, reason="sqlite_connection_busy")
         try:
             self.connection.execute("PRAGMA busy_timeout=0")
+            artifact_id = None
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
                 evidence = self._persist_evidence(receipt)
@@ -771,6 +932,9 @@ class OperatorReceiptStore:
                     (str(receipt.get("command_id") or ""),),
                 ).fetchone()
                 compact = self._upsert(receipt, evidence=evidence)
+                artifact_id = self._register_evidence(receipt, evidence)
+                if artifact_id is not None:
+                    compact.update({"evidence_artifact_id": artifact_id, "evidence_relpath": evidence[0], "evidence_sha256": evidence[1], "evidence_bytes": evidence[2]})
                 pruned = self._prune_locked()
                 self.connection.execute("COMMIT")
                 if (
@@ -800,11 +964,15 @@ class OperatorReceiptStore:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 evidence = self._persist_evidence(row) if row.get("status") in TERMINAL_STATES else (None, None, None)
+                artifact_id = None
                 previous = self.connection.execute(
                     "SELECT evidence_relpath FROM operator_commands WHERE command_id=?",
                     (str(row.get("command_id") or ""),),
                 ).fetchone()
                 compact = self._upsert(row, evidence=evidence)
+                artifact_id = self._register_evidence(row, evidence)
+                if artifact_id is not None:
+                    compact.update({"evidence_artifact_id": artifact_id, "evidence_relpath": evidence[0], "evidence_sha256": evidence[1], "evidence_bytes": evidence[2]})
                 pruned = self._prune_locked()
                 self.connection.execute("COMMIT")
                 if (
