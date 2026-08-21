@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
+from functools import wraps
 import json
 import os
 import sqlite3
@@ -14,11 +16,27 @@ from typing import Any, Mapping
 from ..hardware_status import hardware_state
 from ..oem_full_lifecycle import current_authority_identity, current_registry_sha256
 from ..runtime_audit_store import RuntimeAuditDatabase, runtime_state_root
+from ..storage_operations import create_backup_unit
 from .audit import PipetteAuditIntegrityError, normalize_pipette_result
 
 
 class PipetteReceiptError(RuntimeError):
     """A pipette operation cannot be durably represented."""
+
+
+def _migration_file_lock(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        lock_path = self.root / "pipette-migration.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    return wrapped
 
 
 _SECRET_KEYS = frozenset(
@@ -452,6 +470,7 @@ class PipetteReceiptStore:
         }
         return self._audit_database.claim(payload, pipette=True)
 
+    @_migration_file_lock
     def migrate_legacy_jsonl(self) -> dict[str, Any]:
         with self._lock:
             existing = self.connection.execute(
@@ -480,6 +499,13 @@ class PipetteReceiptStore:
             raw = self._legacy_path.read_bytes()
             source_sha256 = hashlib.sha256(raw).hexdigest()
             migration_id = f"pipette-jsonl:{source_sha256}"
+            pre_migration_backup = create_backup_unit(
+                self.root,
+                label=f"pipette-audit-pre-migration-{source_sha256[:16]}",
+                phase="pre_migration",
+                source_kind="pipette_receipts_jsonl",
+                source_digest=source_sha256,
+            )
             archive_relpath = str(
                 existing["archive_relpath"]
                 if existing is not None and existing["archive_relpath"]
@@ -543,6 +569,7 @@ class PipetteReceiptStore:
                     "imported_count": 0,
                     "quarantined_count": int(existing["quarantined_count"]),
                     "archive_relpath": archive_relpath,
+                    "pre_migration_backup": pre_migration_backup["unit"],
                 }
 
             imported = 0
@@ -623,6 +650,7 @@ class PipetteReceiptStore:
                 "imported_count": imported,
                 "quarantined_count": quarantined,
                 "archive_relpath": archive_relpath,
+                "pre_migration_backup": pre_migration_backup["unit"],
             }
 
     def read(self, limit: int = 50) -> list[dict[str, Any]]:

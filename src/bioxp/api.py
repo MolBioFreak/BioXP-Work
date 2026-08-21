@@ -49,6 +49,7 @@ from .oem_serial206_initialization import (
     Serial206StageApproval,
 )
 from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
+from .runtime_audit_store import runtime_state_root
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
 from .operator_reports import create_operator_reports_router
@@ -807,17 +808,19 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _tester, _tester_quarantine, _startup_error, _pipette_transport, _operator_control_plane_installed
-    runtime_root = Path(
-        os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
-        or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
-        or "/tmp/bioxp-oem-runtime"
-    )
+    runtime_root = runtime_state_root()
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
     try:
         migrate_runtime_database_v2(migration_connection, runtime_root)
     finally:
         migration_connection.close()
+    try:
+        app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
+    except Exception as exc:
+        _startup_error = f"Pipette JSONL migration/readiness failed: {exc}"
+        app.state.pipette_migration = {"status": "failed", "error": str(exc)}
+        raise RuntimeError(_startup_error) from exc
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)

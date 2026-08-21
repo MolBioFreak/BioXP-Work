@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import time
@@ -76,6 +77,16 @@ def _store_identity(connection: Any) -> dict[str, Any]:
         "database_path_exposed": False,
         "identity_version": None if identity is None else int(identity["schema_version"]),
     }
+
+
+def _tree_bytes(root: Path) -> int:
+    total = 0
+    if not root.exists():
+        return 0
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            total += path.stat().st_size
+    return total
 
 
 def _base_filters(
@@ -1026,17 +1037,29 @@ def create_operator_reports_router(store: Any) -> APIRouter:
         with _read_snapshot(store) as connection:
             page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            database_path = store.path
+            backup_root = store.root / "backups"
+            backup_units = sorted(path.name for path in backup_root.iterdir() if path.is_dir()) if backup_root.exists() else []
+            disk = shutil.disk_usage(store.root)
             return {
                 "status": "ok",
                 "store": _store_identity(connection),
                 "database_bytes": page_count * page_size,
+                "database_file_bytes": database_path.stat().st_size if database_path.exists() else 0,
                 "wal_bytes": (store.path.with_name(store.path.name + "-wal").stat().st_size if store.path.with_name(store.path.name + "-wal").exists() else 0),
+                "shm_bytes": (store.path.with_name(store.path.name + "-shm").stat().st_size if store.path.with_name(store.path.name + "-shm").exists() else 0),
+                "backup_units": backup_units,
+                "backup_bytes": _tree_bytes(backup_root),
+                "evidence_bytes": sum(_tree_bytes(store.root / relative) for relative in ("operator_evidence", "pipette/evidence", "report_exports", "artifacts", "archive")),
+                "free_bytes": disk.free,
+                "storage_capacity_status": "ok" if disk.free > 0 else "fail",
                 "commands": int(connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0]),
                 "pipette_operations": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0]),
                 "retained_evidence": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects WHERE expiry_state='active'").fetchone()[0]),
                 "pending_expiry_evidence": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects WHERE expiry_state='expiry_pending'").fetchone()[0]),
                 "integrity_failures": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_events WHERE event_kind='integrity_failure'").fetchone()[0]),
                 "migration_receipts": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_receipts").fetchone()[0]),
+                "migration_retirements": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_retirements").fetchone()[0]),
                 "exports": int(connection.execute("SELECT COUNT(*) FROM report_exports").fetchone()[0]),
             }
 
