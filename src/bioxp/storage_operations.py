@@ -95,6 +95,7 @@ def inspect_database(path: Path) -> dict[str, Any]:
             "runtime_evidence_objects",
             "runtime_migration_receipts",
             "runtime_migration_retirements",
+            "runtime_migration_evidence",
             "report_exports",
         ):
             if table in tables:
@@ -368,6 +369,29 @@ def restore_drill(unit: str | Path) -> dict[str, Any]:
         shutil.rmtree(temporary, ignore_errors=True)
 
 
+def checkpoint_database(path: str | Path, mode: str = "PASSIVE") -> dict[str, Any]:
+    database = Path(path).resolve()
+    if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+        raise StorageEvidenceError(f"unsupported SQLite checkpoint mode: {mode}")
+    connection = sqlite3.connect(database, timeout=10.0)
+    try:
+        connection.execute("PRAGMA busy_timeout=5000")
+        result = tuple(int(value) for value in connection.execute(f"PRAGMA wal_checkpoint({mode})").fetchone())
+    finally:
+        connection.close()
+    health = inspect_database(database)
+    status = "verified" if result[0] == 0 and health["quick_check"] == ["ok"] and not health["foreign_key_check"] else "failed"
+    return {
+        "schema": "bioxp.runtime.checkpoint.receipt.v1",
+        "status": status,
+        "database": health,
+        "mode": mode,
+        "busy": result[0],
+        "wal_pages": result[1],
+        "checkpointed_pages": result[2],
+    }
+
+
 def _parse_epoch(value: Any) -> float | None:
     if value is None:
         return None
@@ -462,7 +486,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Verify BioXP runtime storage and recovery evidence")
-    parser.add_argument("operation", choices=("backup", "restore", "capacity"))
+    parser.add_argument("operation", choices=("backup", "restore", "capacity", "checkpoint"))
     parser.add_argument("--root", default=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT", "/var/lib/bioxp-oem-runtime"))
     parser.add_argument("--unit")
     parser.add_argument("--label", default=f"runtime-backup-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
@@ -475,6 +499,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             if not args.unit:
                 parser.error("restore requires --unit")
             result = restore_drill(args.unit)
+        elif args.operation == "checkpoint":
+            result = checkpoint_database(Path(args.root) / "bioxp_runtime.db")
         else:
             result = capacity_report(args.root, args.allocation_bytes)
         print(json.dumps(result, sort_keys=True, indent=2))

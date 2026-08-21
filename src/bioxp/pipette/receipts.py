@@ -470,6 +470,64 @@ class PipetteReceiptStore:
         }
         return self._audit_database.claim(payload, pipette=True)
 
+    def _migration_backup_relpath(self, unit: str | None) -> str | None:
+        if not unit:
+            return None
+        try:
+            return Path(unit).resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            raise PipetteReceiptError("migration backup escaped the runtime root")
+
+    def _latest_migration_backup_relpath(self) -> str | None:
+        backup_root = self.root / "backups"
+        candidates = sorted(backup_root.glob("pipette-audit-pre-migration-*")) if backup_root.exists() else []
+        if not candidates:
+            return None
+        return candidates[-1].relative_to(self.root).as_posix()
+
+    def _ensure_migration_evidence(
+        self,
+        *,
+        migration_id: str,
+        source_path: str,
+        source_digest: str,
+        source_bytes: int,
+        source_count: int,
+        imported_count: int,
+        duplicate_count: int,
+        quarantined_count: int,
+        backup_relpath: str | None,
+        archive_relpath: str | None,
+    ) -> None:
+        existing = self.connection.execute(
+            "SELECT migration_id FROM runtime_migration_evidence WHERE migration_id=?",
+            (migration_id,),
+        ).fetchone()
+        if existing is not None:
+            return
+        self.connection.execute(
+            """
+            INSERT INTO runtime_migration_evidence(
+                migration_id,source_path,source_digest,source_bytes,source_count,
+                imported_count,duplicate_count,quarantined_count,backup_relpath,
+                archive_relpath,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                migration_id,
+                source_path,
+                source_digest,
+                int(source_bytes),
+                int(source_count),
+                int(imported_count),
+                int(duplicate_count),
+                int(quarantined_count),
+                backup_relpath,
+                archive_relpath,
+                time.time(),
+            ),
+        )
+
     @_migration_file_lock
     def migrate_legacy_jsonl(self) -> dict[str, Any]:
         with self._lock:
@@ -484,16 +542,47 @@ class PipetteReceiptStore:
                     "SELECT archive_relpath FROM runtime_migration_retirements WHERE migration_id=?",
                     (existing["migration_id"],),
                 ).fetchone()
+                archive_relpath = str(
+                    retirement["archive_relpath"] if retirement is not None else existing["archive_relpath"]
+                )
+                archive_path = self.root / archive_relpath
+                if not archive_path.is_file() or archive_path.is_symlink():
+                    raise PipetteReceiptError("retired migration archive is missing")
+                backup_relpath = self._latest_migration_backup_relpath()
+                self.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._ensure_migration_evidence(
+                        migration_id=str(existing["migration_id"]),
+                        source_path=str(self._legacy_path),
+                        source_digest=str(existing["source_digest"]),
+                        source_bytes=archive_path.stat().st_size,
+                        source_count=int(existing["source_count"]),
+                        imported_count=int(existing["imported_count"]),
+                        duplicate_count=0,
+                        quarantined_count=int(existing["quarantined_count"]),
+                        backup_relpath=backup_relpath,
+                        archive_relpath=archive_relpath,
+                    )
+                    self.connection.execute("COMMIT")
+                except Exception:
+                    if self.connection.in_transaction:
+                        self.connection.execute("ROLLBACK")
+                    raise
+                evidence = self.connection.execute(
+                    "SELECT source_bytes,duplicate_count,backup_relpath FROM runtime_migration_evidence WHERE migration_id=?",
+                    (existing["migration_id"],),
+                ).fetchone()
                 return {
                     "status": "already_imported" if retirement is not None else "retirement_pending",
                     "source_path": str(self._legacy_path),
                     "source_sha256": str(existing["source_digest"]),
+                    "source_bytes": int(evidence["source_bytes"]) if evidence is not None else archive_path.stat().st_size,
                     "source_count": int(existing["source_count"]),
                     "imported_count": 0,
+                    "duplicate_count": int(evidence["duplicate_count"]) if evidence is not None else 0,
                     "quarantined_count": int(existing["quarantined_count"]),
-                    "archive_relpath": str(
-                        retirement["archive_relpath"] if retirement is not None else existing["archive_relpath"]
-                    ),
+                    "archive_relpath": archive_relpath,
+                    "pre_migration_backup": None if evidence is None else evidence["backup_relpath"],
                 }
 
             raw = self._legacy_path.read_bytes()
@@ -561,12 +650,33 @@ class PipetteReceiptStore:
                 if str(existing["source_digest"]) != source_sha256:
                     raise PipetteReceiptError("legacy JSONL digest conflicts with prior migration receipt")
                 retire()
+                self.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._ensure_migration_evidence(
+                        migration_id=migration_id,
+                        source_path=str(self._legacy_path),
+                        source_digest=source_sha256,
+                        source_bytes=len(raw),
+                        source_count=int(existing["source_count"]),
+                        imported_count=int(existing["imported_count"]),
+                        duplicate_count=0,
+                        quarantined_count=int(existing["quarantined_count"]),
+                        backup_relpath=self._migration_backup_relpath(pre_migration_backup["unit"]),
+                        archive_relpath=archive_relpath,
+                    )
+                    self.connection.execute("COMMIT")
+                except Exception:
+                    if self.connection.in_transaction:
+                        self.connection.execute("ROLLBACK")
+                    raise
                 return {
                     "status": "already_imported",
                     "source_path": str(self._legacy_path),
                     "source_sha256": source_sha256,
+                    "source_bytes": len(raw),
                     "source_count": int(existing["source_count"]),
                     "imported_count": 0,
+                    "duplicate_count": 0,
                     "quarantined_count": int(existing["quarantined_count"]),
                     "archive_relpath": archive_relpath,
                     "pre_migration_backup": pre_migration_backup["unit"],
@@ -574,6 +684,7 @@ class PipetteReceiptStore:
 
             imported = 0
             quarantined = 0
+            duplicate_count = 0
             source_count = 0
             for line_number, line in enumerate(raw.splitlines(), start=1):
                 if not line.strip():
@@ -599,6 +710,7 @@ class PipetteReceiptStore:
                         runtime_binding={"legacy_receipt_id": receipt_id, "source_sha256": source_sha256},
                     )
                     if not created:
+                        duplicate_count += 1
                         continue
                     result = legacy.get("result") if isinstance(legacy.get("result"), Mapping) else {"ok": False, "outcome": "legacy_result_missing"}
                     self.record(
@@ -636,6 +748,18 @@ class PipetteReceiptStore:
                         time.time(),
                     ),
                 )
+                self._ensure_migration_evidence(
+                    migration_id=migration_id,
+                    source_path=str(self._legacy_path),
+                    source_digest=source_sha256,
+                    source_bytes=len(raw),
+                    source_count=source_count,
+                    imported_count=imported,
+                    duplicate_count=duplicate_count,
+                    quarantined_count=quarantined,
+                    backup_relpath=self._migration_backup_relpath(pre_migration_backup["unit"]),
+                    archive_relpath=archive_relpath,
+                )
                 self.connection.execute("COMMIT")
             except Exception:
                 if self.connection.in_transaction:
@@ -646,8 +770,10 @@ class PipetteReceiptStore:
                 "status": status,
                 "source_path": str(self._legacy_path),
                 "source_sha256": source_sha256,
+                "source_bytes": len(raw),
                 "source_count": source_count,
                 "imported_count": imported,
+                "duplicate_count": duplicate_count,
                 "quarantined_count": quarantined,
                 "archive_relpath": archive_relpath,
                 "pre_migration_backup": pre_migration_backup["unit"],

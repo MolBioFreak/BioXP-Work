@@ -351,6 +351,19 @@ CREATE TABLE IF NOT EXISTS runtime_migration_retirements (
     retired_at REAL NOT NULL,
     retirement_sha256 TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runtime_migration_evidence (
+    migration_id TEXT PRIMARY KEY,
+    source_path TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+    imported_count INTEGER NOT NULL CHECK(imported_count >= 0),
+    duplicate_count INTEGER NOT NULL CHECK(duplicate_count >= 0),
+    quarantined_count INTEGER NOT NULL CHECK(quarantined_count >= 0),
+    backup_relpath TEXT,
+    archive_relpath TEXT,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS report_exports (
     export_id TEXT PRIMARY KEY,
     format TEXT NOT NULL CHECK(format IN ('json','csv')),
@@ -423,6 +436,7 @@ _APPEND_ONLY_TABLES = (
     "runtime_evidence_events",
     "runtime_migration_receipts",
     "runtime_migration_retirements",
+    "runtime_migration_evidence",
     "report_exports",
     "pipette_channel_observations",
     "pipette_transport_exchanges",

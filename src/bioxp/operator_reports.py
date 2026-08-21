@@ -1060,6 +1060,7 @@ def create_operator_reports_router(store: Any) -> APIRouter:
                 "integrity_failures": int(connection.execute("SELECT COUNT(*) FROM runtime_evidence_events WHERE event_kind='integrity_failure'").fetchone()[0]),
                 "migration_receipts": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_receipts").fetchone()[0]),
                 "migration_retirements": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_retirements").fetchone()[0]),
+                "migration_evidence": int(connection.execute("SELECT COUNT(*) FROM runtime_migration_evidence").fetchone()[0]),
                 "exports": int(connection.execute("SELECT COUNT(*) FROM report_exports").fetchone()[0]),
             }
 

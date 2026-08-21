@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 
+import pytest
 from bioxp.pipette.receipts import PipetteReceiptStore
 from bioxp.storage_operations import (
     capacity_report,
+    checkpoint_database,
     create_backup_unit,
     restore_drill,
+    StorageEvidenceError,
     verify_backup_unit,
 )
 
@@ -38,11 +42,21 @@ def test_backup_restore_and_capacity_evidence_are_database_and_evidence_bound(tm
     restored = restore_drill(unit)
     assert restored["status"] == "verified"
     assert restored["restored_file_count"] == 1
+    checkpoint = checkpoint_database(tmp_path / "bioxp_runtime.db")
+    assert checkpoint["status"] == "verified"
 
     capacity = capacity_report(tmp_path, allocation_bytes=1024 * 1024 * 1024)
     assert capacity["status"] == "pass"
     assert capacity["observed"]["command_count"] == 1
     assert capacity["five_year_projection"]["total_bytes"] <= capacity["threshold_bytes"]
+    assert capacity_report(tmp_path, allocation_bytes=1)["status"] == "fail"
+
+    corrupt = tmp_path / "backups" / "rw5-corrupt"
+    shutil.copytree(unit, corrupt)
+    corrupt_db = corrupt / "bioxp_runtime.db"
+    corrupt_db.write_bytes(corrupt_db.read_bytes() + b"corrupt")
+    with pytest.raises(StorageEvidenceError):
+        verify_backup_unit(corrupt)
 
     store.connection.close()
 
