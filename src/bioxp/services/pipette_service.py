@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from fastapi import HTTPException
 from ..pipette.models import (
@@ -57,6 +58,72 @@ async def _run_transport_call(
     runtime_binding: dict[str, Any] | None = None,
     requested_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    requested_for_receipt = (
+        dict(requested_inputs)
+        if requested_inputs is not None
+        else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
+    )
+    claim_record: dict[str, Any] | None = None
+    if receipt_store is not None and hasattr(receipt_store, "claim"):
+        try:
+            from ..operator_controls import current_operator_dispatch_context
+
+            dispatch_context = current_operator_dispatch_context() or {}
+        except Exception:
+            dispatch_context = {}
+        binding = dict(runtime_binding or {})
+        control_class = (
+            "hardware_query"
+            if str(operation_name or label).lower() in {
+                "status",
+                "readback",
+                "query_status",
+                "query_pressure",
+                "read_pressure",
+                "query_tip_status",
+                "query_error_log",
+                "get_data",
+                "get_all_data",
+            }
+            else "physical_liquid_command"
+        )
+        try:
+            claim_record, _ = receipt_store.claim(
+                operation=str(operation_name or label),
+                requested_inputs=requested_for_receipt,
+                entrypoint_id=str(
+                    binding.get("entrypoint_id")
+                    or dispatch_context.get("entrypoint_id")
+                    or f"service.pipette.{operation_name or label}"
+                ),
+                caller_class=str(
+                    binding.get("caller_class")
+                    or dispatch_context.get("caller_class")
+                    or "direct_api"
+                ),
+                control_class=str(binding.get("control_class") or control_class),
+                idempotency_key=str(
+                    binding.get("idempotency_key")
+                    or dispatch_context.get("idempotency_key")
+                    or f"pipette-attempt:{uuid4().hex}"
+                ),
+                command_id=(
+                    str(binding.get("command_id") or dispatch_context.get("operator_command_id"))
+                    if (binding.get("command_id") or dispatch_context.get("operator_command_id"))
+                    else None
+                ),
+                ownership_generation=int(
+                    binding.get("ownership_generation")
+                    or dispatch_context.get("expected_ownership_generation")
+                    or 0
+                ),
+                runtime_binding=binding,
+            )
+        except (PipetteReceiptError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "pipette_claim_persistence_failed", "message": str(exc)},
+            ) from exc
     preflight_payload: dict[str, Any] | None = None
     try:
         _validate_oem_admission(operation_name, command)
@@ -80,11 +147,6 @@ async def _run_transport_call(
         result.setdefault("preflight", preflight_payload)
     if receipt_store is not None and isinstance(result, dict):
         try:
-            requested_for_receipt = (
-                dict(requested_inputs)
-                if requested_inputs is not None
-                else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
-            )
             effective_candidate = result.get("effective")
             effective_inputs = dict(effective_candidate) if isinstance(effective_candidate, dict) else dict(requested_for_receipt)
             if "effective_volume_ul" in result:
@@ -106,6 +168,8 @@ async def _run_transport_call(
         result["receipt_id"] = receipt["receipt_id"]
         result["receipt_truth"] = receipt["truth"]
         result["source_identity"] = receipt["source_identity"]
+        if claim_record is not None and claim_record.get("command_id"):
+            result["command_id"] = claim_record["command_id"]
     return result
 
 

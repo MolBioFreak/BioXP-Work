@@ -127,13 +127,16 @@ def test_receipt_store_uses_durable_oem_root_and_never_infers_completion(monkeyp
 
     store = PipetteReceiptStore()
 
-    assert store.root == root / "pipette"
+    assert store.root == root
     assert store._truth({"ok": True, "outcome": "completion"})["completion_verified"] is False
 
 
-def test_application_plan_api_exposes_typed_no_motion_contract():
+def test_application_plan_api_exposes_typed_no_motion_contract(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
+    monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path / "api-runtime"))
     from src.bioxp.api import app
 
     client = TestClient(app)

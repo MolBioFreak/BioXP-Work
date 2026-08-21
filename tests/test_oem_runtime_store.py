@@ -143,7 +143,7 @@ def test_serial206_multi_stream_receipts_roll_back_if_second_stream_fails(tmp_pa
     assert store.read_serial206_receipt("z", "xyz-rollback") is None
 
 
-def test_serial206_receipt_retention_keeps_128_newest_per_stream(tmp_path: Path) -> None:
+def test_serial206_receipt_metadata_is_retained_indefinitely_per_stream(tmp_path: Path) -> None:
     store = OEMRuntimeStore(tmp_path)
     for index in range(129):
         store.append_serial206_receipt("z", {
@@ -156,12 +156,12 @@ def test_serial206_receipt_retention_keeps_128_newest_per_stream(tmp_path: Path)
     count = store._db.execute(
         "SELECT COUNT(*) FROM serial206_receipts WHERE stream='z'"
     ).fetchone()[0]
-    assert count == 128
-    assert store.read_serial206_receipt("z", "z-0") is None
+    assert count == 129
+    assert store.read_serial206_receipt("z", "z-0") is not None
     assert store.read_serial206_receipt("z", "z-128") is not None
 
 
-def test_serial206_insert_and_retention_prune_roll_back_together(tmp_path: Path) -> None:
+def test_serial206_insert_does_not_prune_metadata(tmp_path: Path) -> None:
     store = OEMRuntimeStore(tmp_path)
     for index in range(128):
         store.append_serial206_receipt("z", {
@@ -180,18 +180,17 @@ def test_serial206_insert_and_retention_prune_roll_back_together(tmp_path: Path)
         """
     )
 
-    with pytest.raises(sqlite3.DatabaseError, match="injected prune failure"):
-        store.append_serial206_receipt("z", {
-            "command_id": "atomic-128",
-            "idempotency_key": "atomic-key-128",
-            "status": "completed",
-            "finished_at": 129.0,
-        })
+    store.append_serial206_receipt("z", {
+        "command_id": "atomic-128",
+        "idempotency_key": "atomic-key-128",
+        "status": "completed",
+        "finished_at": 129.0,
+    })
 
     assert store._db.execute(
         "SELECT COUNT(*) FROM serial206_receipts WHERE stream='z'"
-    ).fetchone()[0] == 128
-    assert store.read_serial206_receipt("z", "atomic-128") is None
+    ).fetchone()[0] == 129
+    assert store.read_serial206_receipt("z", "atomic-128") is not None
 
 
 def test_serial206_nonreplayable_interrupt_keys_are_not_unique_or_queryable(tmp_path: Path) -> None:

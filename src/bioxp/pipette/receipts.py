@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from ..hardware_status import hardware_state
 from ..oem_full_lifecycle import current_authority_identity, current_registry_sha256
+from ..runtime_audit_store import RuntimeAuditDatabase, runtime_state_root
 
 
 class PipetteReceiptError(RuntimeError):
@@ -59,17 +60,14 @@ class PipetteReceiptStore:
     """Durable private journal for source-bound pipette operation receipts."""
 
     def __init__(self, root: str | Path | None = None) -> None:
-        configured_root = os.environ.get("BIOXP_PIPETTE_RECEIPT_ROOT")
-        runtime_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
-        durable_default = Path.home() / ".local" / "state" / "bioxp-oem-runtime" / "pipette"
-        self.root = Path(
-            root
-            or configured_root
-            or (Path(runtime_root) / "pipette" if runtime_root else durable_default)
-        )
+        self._audit_database = RuntimeAuditDatabase(root=root)
+        self.connection = self._audit_database.connection
+        self.root = self._audit_database.root
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
-        self.path = self.root / "receipts.jsonl"
+        self.path = self._audit_database.path
+        self.receipts_path = None
+        self._legacy_path = self.root / "receipts.jsonl"
         self._lock = threading.RLock()
 
     def _source_identity(self) -> dict[str, Any]:
@@ -179,19 +177,47 @@ class PipetteReceiptStore:
         }
         encoded = (json.dumps(receipt, sort_keys=True) + "\n").encode("utf-8")
         with self._lock:
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(self._legacy_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             try:
                 os.write(fd, encoded)
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.chmod(self.path, 0o600)
+            os.chmod(self._legacy_path, 0o600)
         return receipt
 
+    def claim(
+        self,
+        *,
+        operation: str,
+        requested_inputs: Mapping[str, Any] | None,
+        entrypoint_id: str,
+        caller_class: str,
+        control_class: str,
+        idempotency_key: str,
+        command_id: str | None = None,
+        ownership_generation: int = 0,
+        runtime_binding: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        command = str(command_id or f"pipette_{uuid.uuid4().hex}")
+        payload = {
+            "command_id": command,
+            "idempotency_key": str(idempotency_key),
+            "action_id": f"pipette.{operation}",
+            "operation": str(operation),
+            "entrypoint_id": str(entrypoint_id),
+            "caller_class": str(caller_class),
+            "control_class": str(control_class),
+            "ownership_generation": int(ownership_generation),
+            "source_identity": dict(runtime_binding or {"authority": "robot_runtime"}),
+            "requested_inputs": dict(requested_inputs or {}),
+        }
+        return self._audit_database.claim(payload, pipette=True)
+
     def read(self, limit: int = 50) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if not self._legacy_path.exists():
             return []
-        rows = [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        rows = [json.loads(line) for line in self._legacy_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         return rows[-max(1, int(limit)):]
 
     def latest(self) -> dict[str, Any] | None:

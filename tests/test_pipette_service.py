@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+import tempfile
 import types
 
 import pytest
@@ -106,6 +107,9 @@ async def _fake_run_blocking(label, func, timeout_s=30.0):
 
 
 def load_api(monkeypatch):
+    monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", tempfile.mkdtemp(prefix="bioxp-api-test-"))
     usb_pkg = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
     usb_util = types.ModuleType("usb.util")

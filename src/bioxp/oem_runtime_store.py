@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
+from .runtime_audit_store import RuntimeAuditDatabase
 
 
-MAX_SERIAL206_RECEIPTS_PER_STREAM = 128
 MAX_SERIAL206_INTERRUPT_FALLBACK_ARCHIVES = 8
 
 SERIAL206_SCHEMA_VERSION = 2
@@ -158,14 +158,6 @@ def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
 def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
     _execute_schema_batch(connection,
         """
-        CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
-            version INTEGER PRIMARY KEY CHECK(version=2),
-            backup_sha256 TEXT NOT NULL CHECK(length(backup_sha256)=64),
-            source_json_digests_json TEXT NOT NULL CHECK(json_valid(source_json_digests_json)),
-            started_at REAL NOT NULL,
-            finished_at REAL NOT NULL,
-            result TEXT NOT NULL CHECK(result='committed')
-        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS serial206_board_authority (
             board_id INTEGER PRIMARY KEY CHECK(board_id=4),
             state TEXT NOT NULL CHECK(state IN ('inactive','transitioning','active','faulted')),
@@ -309,6 +301,60 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"serial-206 v2 schema missing indexes: {','.join(missing_indexes)}")
 
 
+
+
+def _ensure_runtime_migration_ledger(connection: sqlite3.Connection) -> None:
+    """Extend the shared migration ledger without replacing its authority."""
+    existing = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(runtime_schema_migrations)").fetchall()
+    }
+    additions = {
+        "backup_sha256": "TEXT",
+        "source_json_digests_json": "TEXT",
+        "started_at": "REAL",
+        "finished_at": "REAL",
+        "result": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE runtime_schema_migrations ADD COLUMN {name} {definition}"
+            )
+
+
+def _record_runtime_migration(
+    connection: sqlite3.Connection,
+    *,
+    backup_sha256: str,
+    source_digests: dict[str, str | None],
+    started_at: float,
+    finished_at: float,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(runtime_schema_migrations)").fetchall()
+    }
+    values: dict[str, Any] = {
+        "version": SERIAL206_SCHEMA_VERSION,
+        "backup_sha256": backup_sha256,
+        "source_json_digests_json": json.dumps(source_digests, sort_keys=True, separators=(",", ":")),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "result": "committed",
+        "name": "serial206_runtime_authority",
+        "ddl_sha256": hashlib.sha256(b"serial206_runtime_authority_v2").hexdigest(),
+        "applied_at": finished_at,
+    }
+    selected = [(name, values[name]) for name in values if name in columns]
+    names = ",".join(name for name, _ in selected)
+    placeholders = ",".join("?" for _ in selected)
+    connection.execute(
+        f"INSERT OR REPLACE INTO runtime_schema_migrations({names}) VALUES({placeholders})",
+        tuple(value for _, value in selected),
+    )
+
+
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Own the one-time v1-to-v2 runtime schema transition.
 
@@ -319,14 +365,22 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version > SERIAL206_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported runtime schema version {version}")
-    if version == SERIAL206_SCHEMA_VERSION:
-        _verify_v2_schema(connection)
-        return
     backup_sha256 = "0" * 64
     source_digests = _schema_source_digests(selected_root)
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT,
+                ddl_sha256 TEXT,
+                applied_at REAL
+            ) WITHOUT ROWID
+            """
+        )
+        _ensure_runtime_migration_ledger(connection)
         _create_v1_runtime_schema(connection)
         _create_v2_authority_schema(connection)
         connection.execute(
@@ -348,17 +402,18 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
                 (axis, motor_id, 0, time.time()),
             )
         finished_at = time.time()
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO runtime_schema_migrations(
-                version,backup_sha256,source_json_digests_json,started_at,finished_at,result
-            ) VALUES(2,?,?,?,?, 'committed')
-            """,
-            (backup_sha256, json.dumps(source_digests, sort_keys=True, separators=(",", ":")), started_at, finished_at),
+        _record_runtime_migration(
+            connection,
+            backup_sha256=backup_sha256,
+            source_digests=source_digests,
+            started_at=started_at,
+            finished_at=finished_at,
         )
         connection.execute("PRAGMA user_version=2")
         _verify_v2_schema(connection)
-        connection.execute("PRAGMA foreign_key_check")
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            raise RuntimeError(f"runtime foreign key check failed: {foreign_keys}")
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
@@ -400,31 +455,13 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 class OEMRuntimeStore:
     def __init__(self, root: str | Path | None = None):
-        self.root = Path(
-            root
-            or os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
-            or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
-            or "/tmp/bioxp-oem-runtime"
-        )
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        self._audit_database = RuntimeAuditDatabase(root=root)
+        self.root = self._audit_database.root
         self.serial206_interrupt_fallback_path = self.root / "serial206_interrupt_fallback.jsonl"
         self.serial206_interrupt_fallback_lock_path = self.root / "serial206_interrupt_fallback.lock"
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(
-            self.root / "bioxp_runtime.db",
-            timeout=2.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        self._db.row_factory = sqlite3.Row
+        self._db = self._audit_database.connection
         self._closed = False
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.execute("PRAGMA busy_timeout=2000")
-        self._db.execute("PRAGMA wal_autocheckpoint=256")
-        self._db.execute("PRAGMA journal_size_limit=4194304")
         migrate_runtime_database_v2(self._db, self.root)
         self._seq = self._load_seq()
         self._import_embedded_serial206_receipts_once()
@@ -1025,17 +1062,6 @@ class OEMRuntimeStore:
                         """,
                         row,
                     )
-                    self._db.execute(
-                        """
-                        DELETE FROM serial206_receipts
-                        WHERE stream=? AND receipt_id IN (
-                            SELECT receipt_id FROM serial206_receipts
-                            WHERE stream=? ORDER BY observed_at DESC, receipt_id DESC
-                            LIMIT -1 OFFSET ?
-                        )
-                        """,
-                        (selected_stream, selected_stream, MAX_SERIAL206_RECEIPTS_PER_STREAM),
-                    )
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -1105,23 +1131,6 @@ class OEMRuntimeStore:
                         status_text,
                         observed_at,
                         encoded,
-                    ),
-                )
-                self._db.execute(
-                    """
-                    DELETE FROM serial206_receipts
-                    WHERE stream=? AND receipt_id IN (
-                        SELECT receipt_id
-                        FROM serial206_receipts
-                        WHERE stream=?
-                        ORDER BY observed_at DESC, receipt_id DESC
-                        LIMIT -1 OFFSET ?
-                    )
-                    """,
-                    (
-                        selected_stream,
-                        selected_stream,
-                        MAX_SERIAL206_RECEIPTS_PER_STREAM,
                     ),
                 )
                 self._db.execute("COMMIT")

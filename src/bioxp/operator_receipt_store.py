@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .oem_runtime_store import migrate_runtime_database_v2
+from .runtime_audit_store import RuntimeAuditDatabase, runtime_state_root as _canonical_runtime_state_root
 
 TERMINAL_STATES = frozenset({
     "completed",
@@ -31,13 +31,12 @@ TERMINAL_STATES = frozenset({
 })
 NONREPLAYABLE_INTERRUPT_ACTIONS = frozenset({
     "meta.emergency_stop",
-    "oem.z.stop",
     "oem.y.stop",
+    "oem.z.stop",
     "oem.z.abort",
     "oem.x.stop",
     "oem.abort_all",
 })
-MAX_OPERATOR_COMMANDS = 512
 MAX_INTERRUPT_FALLBACK_ARCHIVES = 8
 _SUMMARY_FIELDS = frozenset({
     "ok",
@@ -95,16 +94,7 @@ def _ensure_durable_directory(path: Path) -> None:
 
 
 def runtime_state_root(root: str | Path | None = None) -> Path:
-    selected = (
-        root
-        or os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
-        or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
-        or "/tmp/bioxp-oem-runtime"
-    )
-    path = Path(selected)
-    _ensure_durable_directory(path)
-    os.chmod(path, 0o700)
-    return path
+    return _canonical_runtime_state_root(root)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -196,13 +186,8 @@ class OperatorReceiptStore:
         if not self.legacy_path.exists() and fallback_legacy.exists():
             self.legacy_path = fallback_legacy
         self.lock = threading.RLock()
-        self.connection = sqlite3.connect(
-            self.path,
-            timeout=2.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        self.connection.row_factory = sqlite3.Row
+        self._audit_database = RuntimeAuditDatabase(root=self.root)
+        self.connection = self._audit_database.connection
         with self.lock:
             self._configure()
             self._create_schema()
@@ -221,7 +206,107 @@ class OperatorReceiptStore:
         self.connection.execute("PRAGMA temp_store=MEMORY")
 
     def _create_schema(self) -> None:
-        migrate_runtime_database_v2(self.connection, self.root)
+        try:
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS operator_commands (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command_id TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL,
+                    idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK(idempotency_replay_enabled IN (0,1)),
+                    action_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    safety_class TEXT,
+                    ownership_generation INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    duration_ms REAL,
+                    controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
+                    physical_effect_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1)),
+                    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+                    response_summary_json TEXT CHECK(response_summary_json IS NULL OR json_valid(response_summary_json)),
+                    evidence_relpath TEXT,
+                    evidence_sha256 TEXT,
+                    evidence_bytes INTEGER,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS operator_commands_history_idx
+                    ON operator_commands(sequence DESC);
+                CREATE INDEX IF NOT EXISTS operator_commands_updated_idx
+                    ON operator_commands(updated_at DESC, sequence DESC);
+                CREATE INDEX IF NOT EXISTS operator_commands_action_status_idx
+                    ON operator_commands(action_id, status, sequence DESC);
+                CREATE TABLE IF NOT EXISTS operator_transitions (
+                    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE CASCADE,
+                    state TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json))
+                );
+                CREATE INDEX IF NOT EXISTS operator_transitions_command_idx
+                    ON operator_transitions(command_id, transition_id);
+                """
+            )
+            columns = {
+                str(row["name"])
+                for row in self.connection.execute("PRAGMA table_info(operator_commands)")
+            }
+            if "idempotency_replay_enabled" not in columns:
+                self.connection.execute(
+                    """
+                    ALTER TABLE operator_commands
+                    ADD COLUMN idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK(idempotency_replay_enabled IN (0,1))
+                    """
+                )
+            placeholders = ",".join("?" for _ in NONREPLAYABLE_INTERRUPT_ACTIONS)
+            self.connection.execute(
+                f"""
+                UPDATE operator_commands
+                SET idempotency_replay_enabled=0
+                WHERE action_id IN ({placeholders})
+                """,
+                tuple(NONREPLAYABLE_INTERRUPT_ACTIONS),
+            )
+            for index in self.connection.execute("PRAGMA index_list(operator_commands)").fetchall():
+                if not index["unique"] or index["origin"] != "c" or index["partial"]:
+                    continue
+                name = str(index["name"])
+                indexed_columns = [
+                    str(row["name"])
+                    for row in self.connection.execute(
+                        "SELECT name FROM pragma_index_info(?)",
+                        (name,),
+                    )
+                ]
+                if indexed_columns == ["idempotency_key"]:
+                    drop_row = self.connection.execute(
+                        "SELECT printf('DROP INDEX \"%w\"', ?)",
+                        (name,),
+                    ).fetchone()
+                    if drop_row is None or not isinstance(drop_row[0], str):
+                        raise RuntimeError("operator_index_drop_statement_missing")
+                    self.connection.execute(drop_row[0])
+            self.connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS operator_commands_replay_key_idx
+                    ON operator_commands(idempotency_key)
+                    WHERE idempotency_replay_enabled=1
+                """
+            )
+            self.connection.execute("PRAGMA user_version=2")
+            self.connection.execute("COMMIT")
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def _evidence_path(self, command_id: str, started_at: Any, digest: str) -> tuple[Path, str]:
         try:
@@ -369,27 +454,9 @@ class OperatorReceiptStore:
         return compact
 
     def _prune_locked(self) -> list[str]:
-        total = int(self.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0])
-        excess = max(0, total - MAX_OPERATOR_COMMANDS)
-        if excess == 0:
-            return []
-        stale = self.connection.execute(
-            """
-            SELECT sequence,evidence_relpath
-            FROM operator_commands
-            WHERE status NOT IN ('queued','executing')
-            ORDER BY updated_at ASC, sequence ASC
-            LIMIT ?
-            """,
-            (excess,),
-        ).fetchall()
-        if not stale:
-            return []
-        self.connection.executemany(
-            "DELETE FROM operator_commands WHERE sequence=?",
-            [(int(row["sequence"]),) for row in stale],
-        )
-        return [str(row["evidence_relpath"]) for row in stale if row["evidence_relpath"]]
+        # Compact command metadata is retained indefinitely. Evidence lifecycle
+        # owns byte expiry and never deletes the command projection here.
+        return []
 
     def _remove_evidence_files_locked(self, relpaths: list[str]) -> None:
         changed_directories: set[Path] = set()
@@ -626,7 +693,7 @@ class OperatorReceiptStore:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 rows = self.connection.execute(
-                    "SELECT receipt_json FROM operator_commands WHERE status IN ('queued','executing')"
+                    "SELECT receipt_json FROM operator_commands WHERE status IN ('reserved','queued','executing')"
                 ).fetchall()
                 if not rows:
                     self.connection.execute("COMMIT")
@@ -663,24 +730,32 @@ class OperatorReceiptStore:
     def claim(self, receipt: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """Atomically claim an idempotency key before normal dispatch."""
         row = dict(receipt)
+        action_id = str(row.get("action_id") or "operator.action")
+        payload = {
+            "command_id": str(row.get("command_id") or ""),
+            "idempotency_key": str(row.get("idempotency_key") or ""),
+            "action_id": action_id,
+            "operation": str(row.get("operation") or action_id),
+            "entrypoint_id": str(row.get("entrypoint_id") or f"operator.{action_id}"),
+            "caller_class": str(row.get("caller_class") or "operator"),
+            "control_class": str(row.get("control_class") or row.get("safety_class") or "service"),
+            "ownership_generation": int(row.get("ownership_generation") or 0),
+            "source_identity": row.get("source_identity") or {"authority": "robot_runtime"},
+            "requested_inputs": row.get("requested_inputs", row.get("inputs", {})) or {},
+            "effective_inputs": row.get("effective_inputs", {}) or {},
+            "safety_class": row.get("safety_class"),
+            "idempotency_replay_enabled": row.get("idempotency_replay_enabled", True),
+            "started_at": row.get("started_at"),
+        }
         with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self.connection.execute(
-                    "SELECT * FROM operator_commands WHERE idempotency_key=?",
-                    (str(row.get("idempotency_key") or ""),),
-                ).fetchone()
-                if existing is not None:
-                    self.connection.execute("COMMIT")
-                    return self._row_receipt(existing, include_evidence=False), False
-                compact = self._upsert(row, evidence=(None, None, None))
-                pruned = self._prune_locked()
-                self.connection.execute("COMMIT")
-            except Exception:
-                self.connection.execute("ROLLBACK")
-                raise
-        self._remove_pruned_evidence(pruned)
-        return compact, True
+            claimed, created = self._audit_database.claim(payload)
+            stored = self.connection.execute(
+                "SELECT * FROM operator_commands WHERE command_id=?",
+                (claimed["command_id"],),
+            ).fetchone()
+            if stored is None:
+                raise RuntimeError("operator claim missing after durable commit")
+            return self._row_receipt(stored, include_evidence=False), created
 
     def put_interrupt(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Persist a delivered safety interrupt without waiting on normal DB work."""
