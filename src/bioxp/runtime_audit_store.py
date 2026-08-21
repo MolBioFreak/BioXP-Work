@@ -506,6 +506,9 @@ def _install_append_only_triggers(connection: sqlite3.Connection) -> None:
 
 
 def ensure_schema(connection: sqlite3.Connection, root: Path | None = None) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version > SCHEMA_VERSION:
+        raise RuntimeAuditStoreError(f"unsupported runtime schema version {version}")
     configure_connection(connection)
     try:
         connection.executescript(_SCHEMA_DDL)

@@ -8177,14 +8177,34 @@ class BioXpTester:
             max_reads=18,
             strict_match=True,
         )
+        terminal_speed = self.motor_wait_stopped(
+            int(board_id),
+            motor=int(motor),
+            timeout_s=3.0,
+            require_seen_nonzero=False,
+        )
+        first_ok = self._tmcl_success(first)
+        second_ok = self._tmcl_success(second)
+        zero_speed = bool(
+            isinstance(terminal_speed, Mapping)
+            and terminal_speed.get("stopped") is True
+            and type(terminal_speed.get("last_speed")) is int
+            and terminal_speed.get("last_speed") == 0
+            and isinstance(terminal_speed.get("last_ack"), Mapping)
+            and type(terminal_speed["last_ack"].get("status")) is int
+            and terminal_speed["last_ack"].get("status") == 100
+        )
         return {
             "board": int(board_id),
             "motor": int(motor),
             "ack": second,
             "first_delivery": first,
             "second_delivery": second,
+            "terminal_speed": terminal_speed,
+            "double_stop_acknowledged": bool(first_ok and second_ok),
+            "terminal_speed_zero": zero_speed,
             "oem_double_stop": True,
-            "ok": self._tmcl_success(second),
+            "ok": bool(first_ok and second_ok and zero_speed),
         }
 
     def motor_stop(self, board_id, motor=0):

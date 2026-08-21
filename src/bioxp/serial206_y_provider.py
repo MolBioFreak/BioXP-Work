@@ -169,6 +169,17 @@ class Serial206YProvider:
             return int(value["position"])
         return None
 
+    def _speed(self) -> dict[str, Any]:
+        reader = getattr(self.tester, "motor_get_speed", None)
+        if not callable(reader):
+            return {"ok": False, "failure": "y_speed_primitive_not_bound"}
+        value = reader(self.board, motor=self.motor)
+        return dict(value) if isinstance(value, Mapping) else {"ok": False, "failure": "y_speed_result_not_mapping", "raw": value}
+
+    @staticmethod
+    def _reply_valid(value: Any, field: str) -> bool:
+        return isinstance(value, Mapping) and value.get("ok") is True and type(value.get(field)) is int
+
     def _record_observation(
         self,
         *,
@@ -339,6 +350,151 @@ class Serial206YProvider:
             "discrepancy": observation,
             "result": result,
             "profile": profile,
+        }
+
+    def move_absolute_internal(
+        self,
+        intent: str,
+        target_steps: int,
+        *,
+        wait_for_stop: bool = True,
+        acceleration_override: int | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Typed internal source overload; routine operator inputs cannot reach it."""
+        allowed = {
+            "manual_panel": (False, None),
+            "wrapper_default": (True, None),
+            "acceleration_overload": (bool(wait_for_stop), acceleration_override),
+            "board_test_my": (False, 400),
+        }
+        if intent not in allowed:
+            return {"ok": False, "failure": "unsupported_y_absolute_intent", "intent": intent}
+        selected_wait, selected_acc = allowed[intent]
+        if intent == "acceleration_overload" and type(selected_acc) is not int:
+            return {"ok": False, "failure": "acceleration_override_required", "intent": intent}
+        if selected_acc is None:
+            return self.move_absolute(target_steps, wait_for_stop=selected_wait, command_id=command_id)
+        setter = getattr(self.tester, "motor_set_axis_param", None)
+        getter = getattr(self.tester, "motor_get_axis_param", None)
+        receipt: dict[str, Any] = {
+            "intent": intent,
+            "requested_acceleration": int(selected_acc),
+            "restoration_class": "LINUX_EVIDENCE_HARDENING",
+        }
+        absolute_result: dict[str, Any] | None = None
+        source_exception: Exception | None = None
+        try:
+            receipt["requested_acceleration_write"] = setter(self.board, 5, int(selected_acc), motor=self.motor) if callable(setter) else {"ok": False, "failure": "acceleration_setter_not_bound"}
+            receipt["requested_acceleration_readback"] = getter(self.board, 5, motor=self.motor) if callable(getter) else {"ok": False, "failure": "acceleration_reader_not_bound"}
+            receipt["requested_acceleration_applied"] = bool(
+                isinstance(receipt["requested_acceleration_readback"], Mapping)
+                and receipt["requested_acceleration_readback"].get("ok") is True
+                and receipt["requested_acceleration_readback"].get("value") == int(selected_acc)
+            )
+            if receipt["requested_acceleration_applied"]:
+                absolute_result = self.move_absolute(target_steps, wait_for_stop=selected_wait, command_id=command_id)
+            else:
+                absolute_result = {"ok": False, "failure": "requested_acceleration_write_or_readback_unverified", "command_id": command_id, "physical_effect_verified": False}
+            receipt["absolute_result"] = absolute_result
+        except Exception as exc:
+            source_exception = exc
+            receipt["source_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
+        finally:
+            try:
+                receipt["restoration_write"] = setter(self.board, 5, self.normal_acc, motor=self.motor) if callable(setter) else {"ok": False, "failure": "acceleration_setter_not_bound"}
+            except Exception as exc:
+                receipt["restoration_write"] = {"ok": False, "failure": "normal_acceleration_restoration_write_failed"}
+                receipt["restoration_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
+            try:
+                receipt["restoration_readback"] = getter(self.board, 5, motor=self.motor) if callable(getter) else {"ok": False, "failure": "acceleration_reader_not_bound"}
+            except Exception as exc:
+                receipt["restoration_readback"] = {"ok": False, "failure": "normal_acceleration_restoration_readback_failed"}
+                receipt.setdefault("restoration_exception", {"type": type(exc).__name__, "message": str(exc)[:500]})
+            receipt["restoration_complete"] = bool(
+                isinstance(receipt["restoration_readback"], Mapping)
+                and receipt["restoration_readback"].get("ok") is True
+                and receipt["restoration_readback"].get("value") == self.normal_acc
+            )
+        if source_exception is not None:
+            return {"ok": False, "failure": "y_absolute_source_exception", "acceleration_overload": receipt}
+        result_with_receipt = {**dict(absolute_result or {}), "acceleration_overload": receipt}
+        if not receipt["restoration_complete"]:
+            result_with_receipt["ok"] = False
+            result_with_receipt["failure"] = "normal_acceleration_restoration_unverified"
+        return result_with_receipt
+
+    def terminalize_absolute(self, issued_receipt: Mapping[str, Any], *, timeout_s: float = 20.0) -> dict[str, Any]:
+        result = issued_receipt.get("result") if isinstance(issued_receipt.get("result"), Mapping) else issued_receipt
+        event_window = result.get("event_window") if isinstance(result, Mapping) else None
+        command_id = str(issued_receipt.get("command_id") or "")
+        target = issued_receipt.get("motor_effective_target")
+        waiter = getattr(self.tester, "motor_oem_wait_target_reached", None)
+        wait = waiter(self.board, motor=self.motor, timeout_s=float(timeout_s), event_window=event_window) if callable(waiter) else {"ok": False, "failure": "y_event_waiter_not_bound"}
+        event = wait.get("event") if isinstance(wait, Mapping) and isinstance(wait.get("event"), Mapping) else None
+        position = self._position()
+        speed = self._speed()
+        position_valid = self._reply_valid(position, "position")
+        speed_valid = self._reply_valid(speed, "speed")
+        event_code = event.get("status") if isinstance(event, Mapping) else None
+        wait_window = wait.get("event_window") if isinstance(wait, Mapping) else None
+        addressed = bool(
+            command_id
+            and isinstance(event_window, Mapping)
+            and isinstance(wait_window, Mapping)
+            and dict(wait_window) == dict(event_window)
+            and isinstance(event, Mapping)
+            and event.get("board") == self.board
+            and event.get("motor") == self.motor
+        )
+        timeout_equal = bool(
+            (event is None or event_code is None)
+            and position_valid
+            and speed_valid
+            and type(target) is int
+            and position.get("position") == int(target)
+            and speed.get("speed") == 0
+        )
+        exact_target = bool(position_valid and type(target) is int and position.get("position") == int(target))
+        if addressed and event_code == 128 and exact_target:
+            completion_class = "event_128"
+        elif addressed and event_code == 128:
+            completion_class = "target_mismatch"
+        elif addressed and event_code == 130:
+            completion_class = "stall_event_130"
+        elif addressed and event_code in {13, 14}:
+            completion_class = f"controller_error_{event_code}"
+        elif timeout_equal:
+            completion_class = "oem_timeout_target_equal"
+        else:
+            completion_class = "timeout"
+        controller_completed = bool(completion_class == "event_128" and exact_target and speed_valid and speed.get("speed") == 0)
+        # A target-equal readback after timeout is ambiguous evidence, not
+        # command-bound terminal proof. Every non-event-128 outcome takes the
+        # independent stop lane and returns non-success.
+        source_completed = controller_completed
+        observation = self._record_observation(command_id=command_id, target=int(target), observed=self._position_value(position)) if source_completed and type(target) is int else None
+        failure_stop = None if source_completed else self.stop(command_id=f"{command_id}:failure-stop", timeout_s=min(float(timeout_s), 3.0))
+        return {
+            "ok": source_completed,
+            "receipt_id": f"y-terminal-{command_id}",
+            "axis": self.axis,
+            "board": self.board,
+            "motor": self.motor,
+            "command_id": command_id,
+            "event_window": event_window,
+            "event": event,
+            "wait": wait,
+            "terminal_position": position,
+            "terminal_speed": speed,
+            "completion_class": completion_class,
+            "controller_completion_verified": controller_completed,
+            "target_position_verified": exact_target,
+            "terminal_speed_zero": bool(speed_valid and speed.get("speed") == 0),
+            "source_returned_normally": source_completed,
+            "physical_effect_verified": False,
+            "discrepancy": observation,
+            "failure_stop": failure_stop,
         }
 
     @staticmethod
@@ -543,14 +699,43 @@ class Serial206YProvider:
         primitive = getattr(self.tester, "motor_oem_stop_exact", None) or getattr(self.tester, "motor_stop", None)
         result = primitive(self.board, motor=self.motor) if callable(primitive) else {"ok": False, "failure": "y_stop_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_stop_result_not_mapping", "raw": result}
+        first = result.get("first_delivery")
+        second = result.get("second_delivery")
+        first_ok = isinstance(first, Mapping) and type(first.get("status")) is int and first.get("status") == 100
+        second_ok = isinstance(second, Mapping) and type(second.get("status")) is int and second.get("status") == 100
+        embedded_speed = result.get("terminal_speed")
+        waiter = getattr(self.tester, "motor_wait_stopped", None)
+        terminal_speed = embedded_speed if isinstance(embedded_speed, Mapping) else waiter(
+            self.board,
+            motor=self.motor,
+            timeout_s=float(timeout_s),
+            require_seen_nonzero=False,
+        ) if callable(waiter) else {"stopped": False, "failure": "y_stop_speed_waiter_not_bound"}
+        terminal_speed = dict(terminal_speed) if isinstance(terminal_speed, Mapping) else {"stopped": False, "raw": terminal_speed}
+        zero = bool(
+            terminal_speed.get("stopped") is True
+            and type(terminal_speed.get("last_speed")) is int
+            and terminal_speed.get("last_speed") == 0
+            and isinstance(terminal_speed.get("last_ack"), Mapping)
+            and type(terminal_speed["last_ack"].get("status")) is int
+            and terminal_speed["last_ack"].get("status") == 100
+        )
+        reconciliation = None
+        reconciler = getattr(self.state_store, "require_axis_reconciliation", None)
+        if callable(reconciler) and callable(primitive):
+            reconciliation = reconciler(self.axis, receipt_id=command_id)
         return {
-            "ok": bool(result.get("ok") is True),
+            "ok": bool(first_ok and second_ok and zero),
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
             "motor": self.motor,
             "command_id": command_id,
             "stop": result,
+            "double_stop_acknowledged": bool(first_ok and second_ok),
+            "terminal_speed": terminal_speed,
+            "terminal_speed_zero": zero,
+            "reconciliation": reconciliation,
             "timeout_s": float(timeout_s),
             "physical_effect_verified": False,
         }

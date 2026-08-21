@@ -34,8 +34,73 @@ def _schema_source_digests(root: Path) -> dict[str, str | None]:
     digests: dict[str, str | None] = {}
     for name in ("reference-state.json", "serial206_oem_initialization_state.json"):
         path = root / name
-        digests[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        if not path.is_file():
+            digests[name] = None
+            continue
+        raw = path.read_bytes()
+        json.loads(raw)
+        digests[name] = hashlib.sha256(raw).hexdigest()
     return digests
+
+
+def _load_schema_sources(root: Path) -> dict[str, dict[str, Any] | None]:
+    payloads: dict[str, dict[str, Any] | None] = {}
+    for name in ("reference-state.json", "serial206_oem_initialization_state.json"):
+        path = root / name
+        if not path.is_file():
+            payloads[name] = None
+            continue
+        value = json.loads(path.read_bytes())
+        if not isinstance(value, dict):
+            raise RuntimeError(f"runtime migration source {name} must contain a JSON object")
+        payloads[name] = value
+    return payloads
+
+
+def _legacy_axis_reference(payload: Mapping[str, Any] | None, axis: str) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    rows = payload.get("rows")
+    row = rows.get(axis) if isinstance(rows, Mapping) else None
+    return row if isinstance(row, Mapping) else {}
+
+
+def _find_nonnegative_int(payload: Any, *keys: str) -> int | None:
+    pending = [payload]
+    visited = 0
+    wanted = set(keys)
+    while pending and visited < 500:
+        current = pending.pop(0)
+        visited += 1
+        if isinstance(current, Mapping):
+            for key, value in current.items():
+                if str(key) in wanted and type(value) is int and value >= 0:
+                    return value
+                if isinstance(value, (Mapping, list, tuple)):
+                    pending.append(value)
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+    return None
+
+
+def _legacy_table_identity(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, ...], int, str] | None:
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is None:
+        return None
+    info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    selected_columns = columns or tuple(str(row[1]) for row in info)
+    available = {str(row[1]) for row in info}
+    if any(column not in available for column in selected_columns):
+        raise RuntimeError(f"runtime v2 migration removed frozen legacy columns: {table}")
+    primary = [str(row[1]) for row in sorted((row for row in info if int(row[5]) > 0), key=lambda row: int(row[5]))]
+    order = ",".join(f'"{column.replace(chr(34), chr(34) * 2)}"' for column in primary) or "rowid"
+    projection = ",".join(f'"{column.replace(chr(34), chr(34) * 2)}"' for column in selected_columns)
+    rows = connection.execute(f"SELECT {projection} FROM {table} ORDER BY {order}").fetchall()
+    encoded = json.dumps([list(row) for row in rows], sort_keys=False, separators=(",", ":"), default=str).encode("utf-8")
+    return selected_columns, len(rows), hashlib.sha256(encoded).hexdigest()
 
 
 def _drop_unconditional_idempotency_indexes(connection: sqlite3.Connection) -> None:
@@ -44,9 +109,9 @@ def _drop_unconditional_idempotency_indexes(connection: sqlite3.Connection) -> N
             continue
         name = str(row[1])
         columns = [
-            str(info[0])
+            str(info[2])
             for info in connection.execute(
-                "SELECT name FROM pragma_index_info(?)", (name,)
+                "SELECT * FROM pragma_index_info(?)", (name,)
             ).fetchall()
         ]
         if columns == ["idempotency_key"]:
@@ -299,6 +364,96 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
     missing_indexes = sorted(required_indexes - found_indexes)
     if missing_indexes:
         raise RuntimeError(f"serial-206 v2 schema missing indexes: {','.join(missing_indexes)}")
+    expected_columns = {
+        "runtime_schema_migrations": (("version", "INTEGER", 1, 1), ("backup_sha256", "TEXT", 1, 0), ("source_json_digests_json", "TEXT", 1, 0), ("started_at", "REAL", 1, 0), ("finished_at", "REAL", 1, 0), ("result", "TEXT", 1, 0)),
+        "serial206_board_authority": (("board_id", "INTEGER", 0, 1), ("state", "TEXT", 1, 0), ("prior_board_epoch", "INTEGER", 0, 0), ("active_board_epoch", "INTEGER", 0, 0), ("transition_id", "TEXT", 0, 0), ("deactivation_attempt_id", "TEXT", 0, 0), ("deactivation_delivery", "INTEGER", 0, 0), ("deactivation_reply_valid", "INTEGER", 0, 0), ("deactivation_status_code", "INTEGER", 0, 0), ("activation_attempt_id", "TEXT", 0, 0), ("activation_delivery", "INTEGER", 0, 0), ("activation_reply_valid", "INTEGER", 0, 0), ("activation_status_code", "INTEGER", 0, 0), ("member_motors_json", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("updated_at", "REAL", 1, 0)),
+        "serial206_axis_authority": (("axis", "TEXT", 1, 1), ("board_id", "INTEGER", 1, 0), ("motor_id", "INTEGER", 1, 0), ("ownership_generation", "INTEGER", 1, 0), ("prepared_board_epoch", "INTEGER", 0, 0), ("profile_fingerprint", "TEXT", 0, 0), ("lifecycle_state", "TEXT", 1, 0), ("reference_state", "TEXT", 1, 0), ("origin_position_steps", "INTEGER", 0, 0), ("observed_position_steps", "INTEGER", 0, 0), ("last_discrepancy_steps", "INTEGER", 0, 0), ("last_command_id", "TEXT", 0, 0), ("last_receipt_id", "TEXT", 0, 0), ("interrupt_epoch", "INTEGER", 1, 0), ("state_version", "INTEGER", 1, 0), ("updated_at", "REAL", 1, 0)),
+        "serial206_movement_methods": (("method_id", "TEXT", 1, 1), ("idempotency_key", "TEXT", 1, 0), ("action_id", "TEXT", 1, 0), ("canonical_inputs_sha256", "TEXT", 1, 0), ("state", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("failure_policy", "TEXT", 1, 0), ("child_count", "INTEGER", 1, 0), ("accepted_at", "REAL", 1, 0), ("started_at", "REAL", 0, 0), ("finished_at", "REAL", 0, 0)),
+        "serial206_movement_commands": (("sequence", "INTEGER", 0, 1), ("command_id", "TEXT", 1, 0), ("idempotency_key", "TEXT", 1, 0), ("action_id", "TEXT", 1, 0), ("method_id", "TEXT", 0, 0), ("method_order", "INTEGER", 1, 0), ("parallel_group", "INTEGER", 1, 0), ("axis_scope", "TEXT", 0, 0), ("board_scope_json", "TEXT", 1, 0), ("ownership_generation", "INTEGER", 1, 0), ("expected_board_epochs_json", "TEXT", 1, 0), ("canonical_inputs_sha256", "TEXT", 1, 0), ("state", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("admitted_interrupt_epochs_json", "TEXT", 1, 0), ("accepted_at", "REAL", 1, 0), ("queued_at", "REAL", 1, 0), ("dispatched_at", "REAL", 0, 0), ("finished_at", "REAL", 0, 0), ("terminal_receipt_id", "TEXT", 0, 0)),
+        "serial206_command_resources": (("command_id", "TEXT", 1, 1), ("resource_key", "TEXT", 1, 2)),
+        "serial206_command_dependencies": (("command_id", "TEXT", 1, 1), ("depends_on_command_id", "TEXT", 1, 2), ("required_terminal", "TEXT", 1, 0)),
+        "serial206_interrupt_imports": (("record_sha256", "TEXT", 1, 1), ("interrupt_attempt_id", "TEXT", 1, 0), ("axis", "TEXT", 1, 0), ("interrupt_epoch", "INTEGER", 1, 0), ("imported_at", "REAL", 1, 0), ("receipt_id", "TEXT", 1, 0)),
+    }
+    for table, expected in expected_columns.items():
+        actual = tuple((str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5])) for row in connection.execute(f"PRAGMA table_info({table})"))
+        if table == "runtime_schema_migrations":
+            actual_by_name = {row[0]: (row[1], row[3]) for row in actual}
+            if any(actual_by_name.get(row[0]) != (row[1], row[3]) for row in expected):
+                raise RuntimeError(f"serial-206 v2 schema shape mismatch: {table}")
+        elif actual != expected:
+            raise RuntimeError(f"serial-206 v2 schema shape mismatch: {table}")
+    index_shapes = {
+        "serial206_movement_commands_idempotency_idx": (True, ("idempotency_key",)),
+        "serial206_movement_commands_ready_idx": (False, ("state", "sequence")),
+        "serial206_movement_commands_method_idx": (False, ("method_id", "method_order", "parallel_group", "sequence")),
+        "serial206_command_resources_lookup_idx": (False, ("resource_key", "command_id")),
+        "serial206_command_dependencies_reverse_idx": (False, ("depends_on_command_id", "command_id")),
+    }
+    for name, (unique, columns) in index_shapes.items():
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+        actual_columns = tuple(str(item[2]) for item in connection.execute(f"PRAGMA index_info({name})"))
+        actual_unique = "CREATE UNIQUE INDEX" in str(row[0]).upper() if row else False
+        if row is None or actual_columns != columns or actual_unique != unique:
+            raise RuntimeError(f"serial-206 v2 schema index shape mismatch: {name}")
+    fk = connection.execute("PRAGMA foreign_key_list(serial206_axis_authority)").fetchall()
+    if len(fk) != 1 or str(fk[0][2]) != "serial206_board_authority" or str(fk[0][3]) != "board_id" or str(fk[0][4]) != "board_id":
+        raise RuntimeError("serial-206 v2 schema foreign-key shape mismatch")
+    expected_fk_counts = {
+        "serial206_movement_commands": 1,
+        "serial206_command_resources": 1,
+        "serial206_command_dependencies": 2,
+    }
+    for table, count in expected_fk_counts.items():
+        rows = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        if len(rows) != count or any(str(row[6]).upper() != "CASCADE" for row in rows):
+            raise RuntimeError(f"serial-206 v2 schema foreign-key shape mismatch: {table}")
+    constraint_fragments = {
+        "serial206_board_authority": ("CHECK(BOARD_ID=4)", "JSON_VALID(MEMBER_MOTORS_JSON)"),
+        "serial206_axis_authority": ("AXIS IN ('Y','Z','GRIPPER')", "WITHOUT ROWID"),
+        "serial206_movement_methods": ("FAILURE_POLICY='REQUIRE_COMPLETED'", "WITHOUT ROWID"),
+        "serial206_movement_commands": ("JSON_VALID(EXPECTED_BOARD_EPOCHS_JSON)", "STATE IN ('QUEUED','DISPATCHED','ISSUED_PENDING','INTERRUPTING','COMPLETED','FAILED','CLEARED','INTERRUPTED','AMBIGUOUS','REJECTED')"),
+        "serial206_command_dependencies": ("CHECK(COMMAND_ID<>DEPENDS_ON_COMMAND_ID)", "WITHOUT ROWID"),
+        "serial206_interrupt_imports": ("CHECK(LENGTH(RECORD_SHA256)=64)", "WITHOUT ROWID"),
+    }
+    for table, fragments in constraint_fragments.items():
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        normalized = "".join(str(row[0]).upper().split()) if row else ""
+        if any("".join(fragment.upper().split()) not in normalized for fragment in fragments):
+            raise RuntimeError(f"serial-206 v2 schema constraint shape mismatch: {table}")
+
+
+def verify_runtime_database_v2(connection: sqlite3.Connection) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version != SERIAL206_SCHEMA_VERSION:
+        raise RuntimeError(f"runtime schema v2 is not prepared (found {version})")
+    _verify_v2_schema(connection)
+
+
+def _verified_sqlite_backup(connection: sqlite3.Connection, root: Path) -> str:
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup_path = root / f"bioxp_runtime.db.pre-v2.{time.time_ns()}.sqlite3"
+    backup = sqlite3.connect(backup_path)
+    try:
+        connection.backup(backup)
+        integrity = backup.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("runtime SQLite backup integrity verification failed")
+    finally:
+        backup.close()
+    fd = os.open(backup_path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    if len(digest) != 64:
+        raise RuntimeError("runtime SQLite backup digest verification failed")
+    return digest
 
 
 
@@ -358,15 +513,51 @@ def _record_runtime_migration(
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Own the one-time v1-to-v2 runtime schema transition.
 
-    Both runtime stores call this function. It is idempotent and refuses a
-    future schema without creating or mutating application tables.
+    API lifespan calls this before route installation. Direct store construction
+    also calls it so isolated tools and tests cannot open an unprepared schema.
     """
     selected_root = Path(root)
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version > SERIAL206_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported runtime schema version {version}")
-    backup_sha256 = "0" * 64
+    if version == SERIAL206_SCHEMA_VERSION:
+        strict_tables = {
+            "serial206_board_authority",
+            "serial206_axis_authority",
+            "serial206_movement_methods",
+            "serial206_movement_commands",
+            "serial206_command_resources",
+            "serial206_command_dependencies",
+            "serial206_interrupt_imports",
+        }
+        found_tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        found_strict_tables = strict_tables & found_tables
+        if found_strict_tables:
+            _verify_v2_schema(connection)
+            journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+            if journal_mode != "wal" or synchronous != 2:
+                raise RuntimeError("runtime schema v2 durability settings are not WAL/synchronous FULL")
+            return
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    source_payloads = _load_schema_sources(selected_root)
     source_digests = _schema_source_digests(selected_root)
+    preserved_identities = {}
+    for table in ("runtime_metadata", "operator_commands", "operator_transitions", "serial206_receipts"):
+        columns = None
+        if table == "operator_commands" and connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None:
+            columns = tuple(
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+                if str(row[1]) != "idempotency_replay_enabled"
+            )
+        preserved_identities[table] = _legacy_table_identity(connection, table, columns)
+    backup_sha256 = _verified_sqlite_backup(connection, selected_root)
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -381,26 +572,62 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
             """
         )
         _ensure_runtime_migration_ledger(connection)
+        if version in {1, SERIAL206_SCHEMA_VERSION}:
+            table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_commands'").fetchone()
+            if table is not None and connection.execute("SELECT 1 FROM operator_commands WHERE status='executing' LIMIT 1").fetchone() is not None:
+                raise RuntimeError("runtime v2 migration requires quiesced operator mutation admission")
         _create_v1_runtime_schema(connection)
         _create_v2_authority_schema(connection)
+        reference_payload = source_payloads.get("reference-state.json")
+        initialization_payload = source_payloads.get("serial206_oem_initialization_state.json")
+        z_board_epoch = _find_nonnegative_int(initialization_payload, "board_lifecycle_generation")
         connection.execute(
             """
-            INSERT OR IGNORE INTO serial206_board_authority(
-                board_id,state,member_motors_json,state_version,updated_at
-            ) VALUES(4,'inactive',?,1,?)
+            INSERT OR REPLACE INTO serial206_board_authority(
+                board_id,state,prior_board_epoch,active_board_epoch,transition_id,
+                member_motors_json,state_version,updated_at
+            ) VALUES(4,'faulted',?,NULL,'migration-v2-continuity-unproved',?,1,?)
             """,
-            (json.dumps(SERIAL206_BOARD4_MEMBERS, sort_keys=True, separators=(",", ":")), time.time()),
+            (z_board_epoch, json.dumps(SERIAL206_BOARD4_MEMBERS, sort_keys=True, separators=(",", ":")), time.time()),
         )
         for axis, motor_id in SERIAL206_BOARD4_MEMBERS.items():
+            legacy = _legacy_axis_reference(reference_payload, axis)
+            legacy_state = str(legacy.get("state") or "unreferenced").lower()
+            origin = legacy.get("origin_position_steps")
+            if type(origin) is not int:
+                origin = legacy.get("origin") if type(legacy.get("origin")) is int else None
+            if axis == "gripper":
+                lifecycle_state = "unprepared"
+                reference_state = "unreferenced"
+                origin = None
+                prepared_epoch = None
+            elif axis == "y":
+                lifecycle_state = "generation_stale" if legacy else "unprepared"
+                reference_state = "generation_stale" if legacy_state in {"referenced", "home", "homed"} else "reconciliation_required" if legacy_state in {"desynced", "reconciliation_required"} else "unreferenced"
+                prepared_epoch = None
+            else:
+                lifecycle_state = "unprepared" if legacy_state == "unprepared" or not legacy else "generation_stale"
+                reference_state = "generation_stale" if legacy_state in {"referenced", "home", "homed"} else "reconciliation_required" if legacy_state in {"desynced", "failed_latched", "reconciliation_required"} else "unreferenced"
+                prepared_epoch = z_board_epoch
             connection.execute(
                 """
-                INSERT OR IGNORE INTO serial206_axis_authority(
-                    axis,board_id,motor_id,ownership_generation,lifecycle_state,
-                    reference_state,state_version,updated_at
-                ) VALUES(?,4,?,?, 'unprepared','unreferenced',1,?)
+                INSERT OR REPLACE INTO serial206_axis_authority(
+                    axis,board_id,motor_id,ownership_generation,prepared_board_epoch,
+                    lifecycle_state,reference_state,origin_position_steps,
+                    interrupt_epoch,state_version,updated_at
+                ) VALUES(?,4,?,0,?,?,?,?,0,1,?)
                 """,
-                (axis, motor_id, 0, time.time()),
+                (axis, motor_id, prepared_epoch, lifecycle_state, reference_state, origin, time.time()),
             )
+        for table in (
+            "serial206_movement_methods",
+            "serial206_movement_commands",
+            "serial206_command_resources",
+            "serial206_command_dependencies",
+            "serial206_interrupt_imports",
+        ):
+            if int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) != 0:
+                raise RuntimeError(f"runtime v2 migration found unexpected preexisting rows: {table}")
         finished_at = time.time()
         _record_runtime_migration(
             connection,
@@ -411,9 +638,12 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         )
         connection.execute("PRAGMA user_version=2")
         _verify_v2_schema(connection)
-        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
-        if foreign_keys:
-            raise RuntimeError(f"runtime foreign key check failed: {foreign_keys}")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"runtime v2 migration foreign-key verification failed: {violations}")
+        for table, before in preserved_identities.items():
+            if before is not None and _legacy_table_identity(connection, table, before[0]) != before:
+                raise RuntimeError(f"runtime v2 migration changed frozen legacy rows: {table}")
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
@@ -499,6 +729,23 @@ class OEMRuntimeStore:
     def board4_authority_projection(self) -> dict[str, Any]:
         with self._lock:
             return {"board": self._board4_row_locked(), "axes": self._axis_rows_locked()}
+
+    def require_axis_reconciliation(self, axis: str, *, receipt_id: str) -> dict[str, Any]:
+        selected = str(axis).strip().lower()
+        if selected not in SERIAL206_BOARD4_MEMBERS:
+            raise ValueError("unsupported board-4 axis")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self._db.execute(
+                    "UPDATE serial206_axis_authority SET lifecycle_state='reconciliation_required',reference_state='reconciliation_required',prepared_board_epoch=NULL,last_receipt_id=?,interrupt_epoch=interrupt_epoch+1,state_version=state_version+1,updated_at=? WHERE axis=?",
+                    (str(receipt_id), time.time(), selected),
+                ).rowcount
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        return {"ok": changed == 1, "axis": selected, "receipt_id": str(receipt_id), "reconciliation_required": changed == 1}
 
     def record_board4_transition(
         self,
@@ -908,7 +1155,14 @@ class OEMRuntimeStore:
             fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
             os.close(lock_descriptor)
 
-        pending_paths = sorted(self.root.glob("serial206_interrupt_fallback.pending.*.jsonl"))
+        pending_paths = sorted({
+            *self.root.glob("serial206_interrupt_fallback.pending.*.jsonl"),
+            *self.root.glob("serial206_interrupt_fallback.operator.pending.*.jsonl"),
+            # Older command-plane code archived Y rows after importing only
+            # idempotency projections. Re-read those archives into canonical
+            # per-stream receipt history; receipt upserts make this repeatable.
+            *self.root.glob("serial206_interrupt_fallback.operator.imported.*.jsonl"),
+        })
         for pending in pending_paths:
             try:
                 rows = [
@@ -922,13 +1176,14 @@ class OEMRuntimeStore:
                 if not isinstance(wrapper, Mapping) or not isinstance(wrapper.get("receipt"), Mapping):
                     raise RuntimeError("serial-206 interrupt fallback contains an invalid row")
                 self.append_serial206_receipt(str(wrapper.get("stream") or ""), wrapper["receipt"])
-            archive = self.root / pending.name.replace(".pending.", ".imported.")
-            os.replace(pending, archive)
-            directory_descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            if ".pending." in pending.name:
+                archive = self.root / pending.name.replace(".pending.", ".imported.")
+                os.replace(pending, archive)
+                directory_descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
 
         archives = sorted(
             self.root.glob("serial206_interrupt_fallback.imported.*.jsonl"),
@@ -1018,7 +1273,7 @@ class OEMRuntimeStore:
         normalized: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = []
         for stream, receipt in receipts:
             selected_stream = str(stream).strip().lower()
-            if selected_stream not in {"x", "z", "initialize_motion"}:
+            if selected_stream not in {"x", "y", "z", "initialize_motion"}:
                 raise ValueError("unsupported serial-206 receipt stream")
             payload = dict(receipt)
             replay_enabled = payload.get("idempotency_replay_enabled")
@@ -1071,7 +1326,7 @@ class OEMRuntimeStore:
     def append_serial206_receipt(self, stream: str, receipt: dict[str, Any]) -> dict[str, Any]:
         """Persist one provider receipt without expanding the current-state file."""
         selected_stream = str(stream).strip().lower()
-        if selected_stream not in {"x", "z", "initialize_motion"}:
+        if selected_stream not in {"x", "y", "z", "initialize_motion"}:
             raise ValueError("unsupported serial-206 receipt stream")
         payload = dict(receipt)
         replay_enabled = payload.get("idempotency_replay_enabled")

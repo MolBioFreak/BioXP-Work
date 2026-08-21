@@ -28,7 +28,7 @@ def test_fresh_runtime_database_has_serial206_v2_authority(tmp_path):
     } <= tables
     assert store._db.execute(
         "SELECT state FROM serial206_board_authority WHERE board_id=4"
-    ).fetchone()[0] == "inactive"
+    ).fetchone()[0] == "faulted"
     assert store._db.execute(
         "SELECT COUNT(*) FROM serial206_axis_authority"
     ).fetchone()[0] == 3
@@ -133,3 +133,19 @@ def test_v2_migration_is_idempotent(tmp_path):
     assert second._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
     ).fetchone()[0] == 1
+
+
+def test_shared_interrupt_fallback_import_preserves_x_y_z_history(tmp_path):
+    rows = [
+        {"stream": axis, "receipt": {"receipt_id": f"{axis}-stop-1", "interrupt_attempt_id": f"{axis}-attempt-1", "intent": "stop", "status": "stopped"}}
+        for axis in ("x", "y", "z")
+    ]
+    (tmp_path / "serial206_interrupt_fallback.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    store = OEMRuntimeStore(tmp_path)
+    for axis in ("x", "y", "z"):
+        receipts = store.list_serial206_receipts(axis)
+        assert [row["interrupt_attempt_id"] for row in receipts] == [f"{axis}-attempt-1"]
+    assert not (tmp_path / "serial206_interrupt_fallback.jsonl").exists()
+    assert len(list(tmp_path.glob("serial206_interrupt_fallback.imported.*.jsonl"))) == 1

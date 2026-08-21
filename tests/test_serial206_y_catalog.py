@@ -15,3 +15,10 @@ def test_operator_catalog_contains_canonical_y_actions_and_exact_bounds():
     assert absolute["target_steps"]["maximum"] == 102956
     assert by_id["oem.y.manual_panel_home"]["inputs"] == []
     assert dispatch["oem.y.manual_panel_home"]["fixed_inputs"]["source_mode"] == "manual_panel"
+    assert "oem.xy.move_absolute" not in by_id
+    assert "oem.xy.home" not in by_id
+    assert "oem.xy.move_absolute" in dispatch
+    assert "oem.xy.home" in dispatch
+    for action_id in ("oem.y.internal.acceleration_overload", "oem.y.internal.board_test_my"):
+        assert action_id not in by_id
+        assert action_id in dispatch
