@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .operator_receipt_store import OperatorReceiptStore, _fsync_directory
@@ -85,10 +85,32 @@ def _base_filters(
     operation: str | None,
     action: str | None,
     channel: int | None,
-    limit: int,
+    entrypoint: str | None = None,
+    caller_class: str | None = None,
+    control_class: str | None = None,
+    protocol_job_id: str | None = None,
+    protocol_action_id: str | None = None,
+    lifecycle_stage_id: str | None = None,
+    outcome: str | None = None,
+    event_source: str | None = None,
+    event_kind: str | None = None,
+    pressure_stream_id: str | None = None,
+    delivery_verified: bool | None = None,
+    controller_acknowledged: bool | None = None,
+    completion_verified: bool | None = None,
+    hardware_postcondition_verified: bool | None = None,
+    physical_effect_verified: bool | None = None,
+    evidence_state: str | None = None,
+    command_id: str | None = None,
+    pipette_operation_id: str | None = None,
+    connection_generation: int | None = None,
+    ownership_generation: int | None = None,
+    limit: int = 100,
 ) -> dict[str, Any]:
     if start is not None and end is not None and start >= end:
         raise HTTPException(status_code=422, detail={"error": "invalid_time_window"})
+    if start is not None and end is not None and end - start > 31 * 24 * 60 * 60:
+        raise HTTPException(status_code=422, detail={"error": "time_window_exceeds_31_days"})
     if channel is not None and channel not in range(4):
         raise HTTPException(status_code=422, detail={"error": "invalid_channel"})
     return {
@@ -98,6 +120,26 @@ def _base_filters(
         "operation": operation,
         "action": action,
         "channel": channel,
+        "entrypoint": entrypoint,
+        "caller_class": caller_class,
+        "control_class": control_class,
+        "protocol_job_id": protocol_job_id,
+        "protocol_action_id": protocol_action_id,
+        "lifecycle_stage_id": lifecycle_stage_id,
+        "outcome": outcome,
+        "event_source": event_source,
+        "event_kind": event_kind,
+        "pressure_stream_id": pressure_stream_id,
+        "delivery_verified": delivery_verified,
+        "controller_acknowledged": controller_acknowledged,
+        "completion_verified": completion_verified,
+        "hardware_postcondition_verified": hardware_postcondition_verified,
+        "physical_effect_verified": physical_effect_verified,
+        "evidence_state": evidence_state,
+        "command_id": command_id,
+        "pipette_operation_id": pipette_operation_id,
+        "connection_generation": connection_generation,
+        "ownership_generation": ownership_generation,
         "limit": limit,
     }
 
@@ -114,15 +156,29 @@ def _command_where(filters: Mapping[str, Any], *, high_water: int, last_sequence
     if filters.get("end") is not None:
         clauses.append("c.updated_at < ?")
         params.append(float(filters["end"]))
-    for key, column in (("status", "c.status"), ("operation", "c.operation"), ("action", "c.action_id")):
+    for key, column in (("status", "c.status"), ("operation", "c.operation"), ("action", "c.action_id"), ("entrypoint", "c.entrypoint_id"), ("caller_class", "c.caller_class"), ("control_class", "c.control_class"), ("outcome", "c.outcome"), ("evidence_state", "c.evidence_state"), ("command_id", "c.command_id"), ("connection_generation", "c.connection_generation"), ("ownership_generation", "c.ownership_generation")):
         if filters.get(key) is not None:
             clauses.append(f"{column} = ?")
-            params.append(str(filters[key]))
+            params.append(filters[key] if key in {"connection_generation", "ownership_generation"} else str(filters[key]))
+    for key, column in (("delivery_verified", "c.delivery_verified"), ("controller_acknowledged", "c.controller_acknowledged"), ("completion_verified", "c.completion_verified"), ("hardware_postcondition_verified", "c.hardware_postcondition_verified"), ("physical_effect_verified", "c.physical_effect_verified")):
+        if filters.get(key) is not None:
+            clauses.append(f"{column} = ?")
+            params.append(int(bool(filters[key])))
     if filters.get("channel") is not None:
         clauses.append(
             "EXISTS (SELECT 1 FROM pipette_channel_observations o WHERE o.command_id=c.command_id AND o.channel=?)"
         )
         params.append(int(filters["channel"]))
+    for key, column in (("protocol_job_id", "p.protocol_job_id"), ("protocol_action_id", "p.protocol_action_id"), ("lifecycle_stage_id", "p.lifecycle_stage_id"), ("pipette_operation_id", "p.pipette_operation_id")):
+        if filters.get(key) is not None:
+            clauses.append(f"EXISTS (SELECT 1 FROM pipette_operations p WHERE p.command_id=c.command_id AND {column} = ?)")
+            params.append(str(filters[key]))
+    if filters.get("event_source") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM runtime_events e WHERE e.command_id=c.command_id AND e.event_source=?)")
+        params.append(str(filters["event_source"]))
+    if filters.get("pressure_stream_id") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM pipette_pressure_streams s WHERE s.pipette_operation_id=(SELECT p.pipette_operation_id FROM pipette_operations p WHERE p.command_id=c.command_id) AND s.stream_session_id=?)")
+        params.append(str(filters["pressure_stream_id"]))
     return " AND ".join(clauses), params
 
 
@@ -351,15 +407,26 @@ def _command_page(connection: Any, filters: dict[str, Any], cursor: str | None) 
 def _pipette_page(connection: Any, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
     clauses = ["p.rowid <= (SELECT COALESCE(MAX(rowid),0) FROM pipette_operations)"]
     params: list[Any] = []
-    if filters.get("status") is not None:
-        clauses.append("p.status=?")
-        params.append(filters["status"])
-    if filters.get("operation") is not None:
-        clauses.append("p.operation=?")
-        params.append(filters["operation"])
+    for key, column in (("status", "p.status"), ("operation", "p.operation"), ("action", "p.action_id"), ("entrypoint", "p.entrypoint_id"), ("caller_class", "p.caller_class"), ("control_class", "p.control_class"), ("protocol_job_id", "p.protocol_job_id"), ("protocol_action_id", "p.protocol_action_id"), ("lifecycle_stage_id", "p.lifecycle_stage_id"), ("outcome", "p.outcome"), ("evidence_state", "p.evidence_state"), ("pipette_operation_id", "p.pipette_operation_id"), ("connection_generation", "p.connection_generation"), ("ownership_generation", "p.ownership_generation")):
+        if filters.get(key) is not None:
+            clauses.append(f"{column}=?")
+            params.append(filters[key] if key in {"connection_generation", "ownership_generation"} else str(filters[key]))
+    if filters.get("command_id") is not None:
+        clauses.append("p.command_id=?")
+        params.append(str(filters["command_id"]))
+    for key, column in (("delivery_verified", "p.delivery_verified"), ("controller_acknowledged", "p.controller_acknowledged"), ("completion_verified", "p.completion_verified"), ("hardware_postcondition_verified", "p.hardware_postcondition_verified"), ("physical_effect_verified", "p.physical_effect_verified")):
+        if filters.get(key) is not None:
+            clauses.append(f"{column}=?")
+            params.append(int(bool(filters[key])))
+    if filters.get("event_source") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM runtime_events e WHERE e.pipette_operation_id=p.pipette_operation_id AND e.event_source=?)")
+        params.append(str(filters["event_source"]))
     if filters.get("channel") is not None:
         clauses.append("EXISTS (SELECT 1 FROM pipette_channel_observations o WHERE o.pipette_operation_id=p.pipette_operation_id AND o.channel=?)")
         params.append(filters["channel"])
+    if filters.get("pressure_stream_id") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM pipette_pressure_streams s WHERE s.pipette_operation_id=p.pipette_operation_id AND s.stream_session_id=?)")
+        params.append(str(filters["pressure_stream_id"]))
     last_rowid = None
     filter_digest = hashlib.sha256(_canonical(filters).encode()).hexdigest()
     high_water = int(connection.execute("SELECT COALESCE(MAX(rowid),0) FROM pipette_operations").fetchone()[0])
@@ -407,15 +474,232 @@ def _summary(connection: Any, filters: dict[str, Any]) -> dict[str, Any]:
         str(row["status"]): int(row["count"])
         for row in connection.execute(f"SELECT c.status,COUNT(*) AS count FROM operator_commands c WHERE {where} GROUP BY c.status", params).fetchall()
     }
+    aggregate = connection.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(c.delivery_verified), 0) AS delivered,
+            COALESCE(SUM(c.controller_acknowledged), 0) AS acknowledged,
+            COALESCE(SUM(c.completion_verified), 0) AS completed,
+            COALESCE(SUM(c.hardware_postcondition_verified), 0) AS postcondition,
+            COALESCE(SUM(c.physical_effect_verified), 0) AS physical_effect,
+            COALESCE(SUM(CASE WHEN c.failure_code IS NOT NULL OR c.status IN ('failed','blocked','rejected') THEN 1 ELSE 0 END), 0) AS failures,
+            COALESCE(AVG(CASE WHEN c.duration_ms IS NOT NULL THEN c.duration_ms END), 0.0) AS average_ms,
+            COALESCE(MAX(CASE WHEN c.duration_ms IS NOT NULL THEN c.duration_ms ELSE 0 END), 0.0) AS maximum_ms
+        FROM operator_commands c WHERE {where}
+        """,
+        params,
+    ).fetchone()
+    total_for_rates = max(1, int(aggregate["total"]))
+    error_rows = connection.execute(
+        f"SELECT COALESCE(c.failure_code, c.outcome, 'unknown') AS code, COUNT(*) AS count FROM operator_commands c WHERE {where} AND (c.failure_code IS NOT NULL OR c.status IN ('failed','blocked','rejected')) GROUP BY code ORDER BY code",
+        params,
+    ).fetchall()
+    errors = {str(row["code"]): int(row["count"]) for row in error_rows}
     return {
-        "scope": "filtered" if any(filters.get(key) is not None for key in ("start", "end", "status", "operation", "action")) else "window",
+        "scope": "filtered" if any(filters.get(key) is not None for key in ("start", "end", "status", "operation", "action", "channel")) else "window",
         "filters": filters,
         "snapshot": {"high_water_sequence": high_water, **_store_identity(connection)},
         "commands": {"total": total, "by_status": statuses},
-        "pipette": {"total": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0])},
-        "events": {"total": int(connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0])},
+        "pipette_operations": {"total": int(connection.execute("SELECT COUNT(*) FROM pipette_operations").fetchone()[0])},
+        "runtime_events": {"total": int(connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0])},
         "pressure": {"streams": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_streams").fetchone()[0]), "chunks": int(connection.execute("SELECT COUNT(*) FROM pipette_pressure_chunks").fetchone()[0])},
+        "rates": {
+            "delivery_rate": float(aggregate["delivered"]) / total_for_rates,
+            "ack_rate": float(aggregate["acknowledged"]) / total_for_rates,
+            "completion_rate": float(aggregate["completed"]) / total_for_rates,
+            "postcondition_rate": float(aggregate["postcondition"]) / total_for_rates,
+            "physical_effect_rate": float(aggregate["physical_effect"]) / total_for_rates,
+            "failure_rate": float(aggregate["failures"]) / total_for_rates,
+        },
+        "latency": {"average_ms": float(aggregate["average_ms"]), "maximum_ms": float(aggregate["maximum_ms"])},
+        "errors": {"by_code": errors},
     }
+
+
+def _pressure_stream_page(connection: Any, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+    high_water = int(connection.execute("SELECT COALESCE(MAX(rowid),0) FROM pipette_pressure_streams").fetchone()[0])
+    filter_digest = hashlib.sha256(_canonical(filters).encode()).hexdigest()
+    clauses = ["s.rowid <= ?"]
+    params: list[Any] = [high_water]
+    if cursor:
+        state = _decode_cursor(cursor)
+        if state.get("resource") != "pressure_streams" or state.get("filter_sha256") != filter_digest:
+            raise HTTPException(status_code=409, detail={"error": "cursor_filter_mismatch"})
+        high_water = int(state["high_water"])
+        clauses.append("s.rowid < ?")
+        params.append(int(state["last_rowid"]))
+    if filters.get("start") is not None:
+        clauses.append("s.started_at >= ?")
+        params.append(float(filters["start"]))
+    if filters.get("end") is not None:
+        clauses.append("s.started_at < ?")
+        params.append(float(filters["end"]))
+    if filters.get("pressure_stream_id") is not None:
+        clauses.append("s.stream_session_id = ?")
+        params.append(str(filters["pressure_stream_id"]))
+    if filters.get("channel") is not None:
+        clauses.append("EXISTS (SELECT 1 FROM json_each(s.channels_json) WHERE CAST(json_each.value AS INTEGER)=?)")
+        params.append(int(filters["channel"]))
+    where = " AND ".join(clauses)
+    rows = connection.execute(
+        f"SELECT s.* FROM pipette_pressure_streams s WHERE {where} ORDER BY s.rowid DESC LIMIT ?",
+        [*params, int(filters["limit"]) + 1],
+    ).fetchall()
+    has_more = len(rows) > int(filters["limit"])
+    rows = rows[: int(filters["limit"])]
+    body = {
+        "filters": filters,
+        "snapshot": {"high_water_rowid": high_water, **_store_identity(connection)},
+        "returned_count": len(rows),
+        "has_more": has_more,
+        "next_cursor": None,
+        "pressure_streams": [
+            {
+                "stream_session_id": row["stream_session_id"],
+                "pipette_operation_id": row["pipette_operation_id"],
+                "channels": _decode_json(row["channels_json"], []),
+                "sample_period_ms": row["sample_period_ms"],
+                "started_at": row["started_at"],
+                "stopped_at": row["stopped_at"],
+                "source_generation": row["source_generation"],
+                "reader_generation": row["reader_generation"],
+                "offset_identity": row["offset_identity"],
+                "terminal_state": row["terminal_state"],
+                "loss_count": row["loss_count"],
+            }
+            for row in rows
+        ],
+    }
+    if has_more and rows:
+        body["next_cursor"] = _encode_cursor({
+            "resource": "pressure_streams",
+            "filter_sha256": filter_digest,
+            "high_water": high_water,
+            "last_rowid": int(rows[-1]["rowid"]),
+            "expires_at": time.time() + _CURSOR_TTL_S,
+        })
+    return body
+
+
+def _pressure_samples_page(connection: Any, stream_session_id: str, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+    high_water = int(connection.execute("SELECT COALESCE(MAX(rowid),0) FROM pipette_pressure_chunks WHERE stream_session_id=?", (stream_session_id,)).fetchone()[0])
+    filter_digest = hashlib.sha256(_canonical({"stream_session_id": stream_session_id, **filters}).encode()).hexdigest()
+    clauses = ["c.stream_session_id=?", "c.rowid <= ?"]
+    params: list[Any] = [stream_session_id, high_water]
+    if cursor:
+        state = _decode_cursor(cursor)
+        if state.get("resource") != "pressure_samples" or state.get("filter_sha256") != filter_digest:
+            raise HTTPException(status_code=409, detail={"error": "cursor_filter_mismatch"})
+        high_water = int(state["high_water"])
+        clauses.append("c.rowid < ?")
+        params.append(int(state["last_rowid"]))
+    if filters.get("channel") is not None:
+        clauses.append("c.channel=?")
+        params.append(int(filters["channel"]))
+    rows = connection.execute(
+        f"SELECT c.* FROM pipette_pressure_chunks c WHERE {' AND '.join(clauses)} ORDER BY c.rowid DESC LIMIT ?",
+        [*params, int(filters["limit"]) + 1],
+    ).fetchall()
+    has_more = len(rows) > int(filters["limit"])
+    rows = rows[: int(filters["limit"])]
+    body = {
+        "stream_session_id": stream_session_id,
+        "filters": filters,
+        "snapshot": {"high_water_rowid": high_water, **_store_identity(connection)},
+        "returned_count": len(rows),
+        "has_more": has_more,
+        "next_cursor": None,
+        "samples": [
+            {
+                "chunk_id": row["chunk_id"],
+                "channel": row["channel"],
+                "chunk_sequence": row["chunk_sequence"],
+                "sample_count": row["sample_count"],
+                "lost_sample_count": row["lost_sample_count"],
+                "units": row["units"],
+                "sha256": row["sha256"],
+                "byte_count": row["byte_count"],
+                "evidence_artifact_id": row["evidence_artifact_id"],
+                "summary": _decode_json(row["sample_summary_json"], {}),
+            }
+            for row in rows
+        ],
+    }
+    if has_more and rows:
+        body["next_cursor"] = _encode_cursor({
+            "resource": "pressure_samples",
+            "filter_sha256": filter_digest,
+            "high_water": high_water,
+            "last_rowid": int(rows[-1]["rowid"]),
+            "expires_at": time.time() + _CURSOR_TTL_S,
+        })
+    return body
+
+
+def _event_page(connection: Any, filters: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+    high_water = int(connection.execute("SELECT COALESCE(MAX(event_id),0) FROM runtime_events").fetchone()[0])
+    filter_digest = hashlib.sha256(_canonical(filters).encode()).hexdigest()
+    clauses = ["e.event_id <= ?"]
+    params: list[Any] = [high_water]
+    last_event_id = None
+    if cursor:
+        state = _decode_cursor(cursor)
+        if state.get("resource") != "events" or state.get("filter_sha256") != filter_digest:
+            raise HTTPException(status_code=409, detail={"error": "cursor_filter_mismatch"})
+        high_water = int(state["high_water"])
+        last_event_id = int(state["last_event_id"])
+        clauses[0] = "e.event_id <= ? AND e.event_id < ?"
+        params = [high_water, last_event_id]
+    if filters.get("start") is not None:
+        clauses.append("e.observed_at >= ?")
+        params.append(float(filters["start"]))
+    if filters.get("end") is not None:
+        clauses.append("e.observed_at < ?")
+        params.append(float(filters["end"]))
+    for key, column in (("event_kind", "e.event_kind"), ("event_source", "e.event_source"), ("command_id", "e.command_id"), ("pipette_operation_id", "e.pipette_operation_id")):
+        if filters.get(key) is not None:
+            clauses.append(f"{column}=?")
+            params.append(str(filters[key]))
+    if filters.get("channel") is not None:
+        clauses.append("json_extract(e.event_json, '$.channel') = ?")
+        params.append(int(filters["channel"]))
+    where = " AND ".join(clauses)
+    rows = connection.execute(
+        f"SELECT * FROM runtime_events e WHERE {where} ORDER BY e.event_id DESC LIMIT ?",
+        [*params, int(filters["limit"]) + 1],
+    ).fetchall()
+    has_more = len(rows) > int(filters["limit"])
+    rows = rows[: int(filters["limit"])]
+    body = {
+        "event_kind": filters.get("event_kind"),
+        "filters": filters,
+        "snapshot": {"high_water_event_id": high_water, **_store_identity(connection)},
+        "returned_count": len(rows),
+        "has_more": has_more,
+        "next_cursor": None,
+        "events": [
+            {
+                "event_id": int(row["event_id"]),
+                "command_id": row["command_id"],
+                "pipette_operation_id": row["pipette_operation_id"],
+                "event_source": row["event_source"],
+                "event_kind": row["event_kind"],
+                "observed_at": row["observed_at"],
+                "event": _decode_json(row["event_json"], {}),
+            }
+            for row in rows
+        ],
+    }
+    if has_more and rows:
+        body["next_cursor"] = _encode_cursor({
+            "resource": "events",
+            "filter_sha256": filter_digest,
+            "high_water": high_water,
+            "last_event_id": int(rows[-1]["event_id"]),
+            "expires_at": time.time() + _CURSOR_TTL_S,
+        })
+    return body
 
 
 def _write_export(store: OperatorReceiptStore, *, export_id: str, fmt: str, payload: Mapping[str, Any]) -> tuple[str, int, str]:
@@ -459,37 +743,55 @@ def create_operator_reports_router(store: Any) -> APIRouter:
         status: str | None = None,
         operation: str | None = None,
         action: str | None = None,
-        channel: int | None = None,
+        channel: int | None = Query(default=None, ge=0, le=3),
+        entrypoint: str | None = None,
+        caller_class: str | None = None,
+        control_class: str | None = None,
+        protocol_job_id: str | None = None,
+        protocol_action_id: str | None = None,
+        lifecycle_stage_id: str | None = None,
+        outcome: str | None = None,
+        event_source: str | None = None,
+        event_kind: str | None = None,
+        pressure_stream_id: str | None = None,
+        delivery_verified: bool | None = None,
+        controller_acknowledged: bool | None = None,
+        completion_verified: bool | None = None,
+        hardware_postcondition_verified: bool | None = None,
+        physical_effect_verified: bool | None = None,
+        evidence_state: str | None = None,
+        command_id: str | None = None,
+        pipette_operation_id: str | None = None,
+        connection_generation: int | None = Query(default=None, ge=0),
+        ownership_generation: int | None = Query(default=None, ge=0),
         limit: int = Query(100, ge=1, le=1000),
     ) -> dict[str, Any]:
-        return _base_filters(start=start, end=end, status=status, operation=operation, action=action, channel=channel, limit=limit)
+        return _base_filters(
+            start=start, end=end, status=status, operation=operation, action=action, channel=channel,
+            entrypoint=entrypoint, caller_class=caller_class, control_class=control_class,
+            protocol_job_id=protocol_job_id, protocol_action_id=protocol_action_id,
+            lifecycle_stage_id=lifecycle_stage_id, outcome=outcome, event_source=event_source,
+            event_kind=event_kind, pressure_stream_id=pressure_stream_id, delivery_verified=delivery_verified,
+            controller_acknowledged=controller_acknowledged, completion_verified=completion_verified,
+            hardware_postcondition_verified=hardware_postcondition_verified,
+            physical_effect_verified=physical_effect_verified, evidence_state=evidence_state,
+            command_id=command_id, pipette_operation_id=pipette_operation_id,
+            connection_generation=connection_generation, ownership_generation=ownership_generation,
+            limit=limit,
+        )
 
     @router.get("/reports/summary")
     def report_summary(
-        start: float | None = None,
-        end: float | None = None,
-        status: str | None = None,
-        operation: str | None = None,
-        action: str | None = None,
-        channel: int | None = None,
-        limit: int = Query(100, ge=1, le=1000),
+        selected: dict[str, Any] = Depends(filters),
     ) -> dict[str, Any]:
-        selected = filters(start, end, status, operation, action, channel, limit)
         with _read_snapshot(store) as connection:
             return _summary(connection, selected)
 
     @router.get("/reports/commands")
     def report_commands(
-        start: float | None = None,
-        end: float | None = None,
-        status: str | None = None,
-        operation: str | None = None,
-        action: str | None = None,
-        channel: int | None = None,
-        limit: int = Query(100, ge=1, le=1000),
+        selected: dict[str, Any] = Depends(filters),
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        selected = filters(start, end, status, operation, action, channel, limit)
         with _read_snapshot(store) as connection:
             return _command_page(connection, selected, cursor)
 
@@ -509,16 +811,9 @@ def create_operator_reports_router(store: Any) -> APIRouter:
 
     @router.get("/reports/pipette")
     def report_pipette(
-        start: float | None = None,
-        end: float | None = None,
-        status: str | None = None,
-        operation: str | None = None,
-        action: str | None = None,
-        channel: int | None = None,
-        limit: int = Query(100, ge=1, le=1000),
+        selected: dict[str, Any] = Depends(filters),
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        selected = filters(start, end, status, operation, action, channel, limit)
         with _read_snapshot(store) as connection:
             return _pipette_page(connection, selected, cursor)
 
@@ -547,13 +842,9 @@ def create_operator_reports_router(store: Any) -> APIRouter:
             return {"pipette_operation_id": pipette_operation_id, "exchanges": _pipette_projection(connection, row, detail=True)["exchanges"]}
 
     @router.get("/reports/events")
-    def report_events(limit: int = Query(100, ge=1, le=1000), event_kind: str | None = None) -> dict[str, Any]:
+    def report_events(selected: dict[str, Any] = Depends(filters), cursor: str | None = None) -> dict[str, Any]:
         with _read_snapshot(store) as connection:
-            if event_kind is None:
-                rows = connection.execute("SELECT * FROM runtime_events ORDER BY event_id DESC LIMIT ?", (limit,)).fetchall()
-            else:
-                rows = connection.execute("SELECT * FROM runtime_events WHERE event_kind=? ORDER BY event_id DESC LIMIT ?", (event_kind, limit)).fetchall()
-            return {"event_kind": event_kind, "returned_count": len(rows), "events": [{"event_id": int(row["event_id"]), "command_id": row["command_id"], "pipette_operation_id": row["pipette_operation_id"], "event_source": row["event_source"], "event_kind": row["event_kind"], "observed_at": row["observed_at"], "event": _decode_json(row["event_json"], {})} for row in rows]}
+            return _event_page(connection, selected, cursor)
 
     @router.get("/reports/events/{event_id}")
     def report_event_detail(event_id: int) -> dict[str, Any]:
@@ -564,10 +855,9 @@ def create_operator_reports_router(store: Any) -> APIRouter:
             return {"event_id": int(row["event_id"]), "command_id": row["command_id"], "pipette_operation_id": row["pipette_operation_id"], "event_source": row["event_source"], "event_kind": row["event_kind"], "observed_at": row["observed_at"], "event": _decode_json(row["event_json"], {})}
 
     @router.get("/reports/pressure-streams")
-    def report_pressure_streams(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+    def report_pressure_streams(selected: dict[str, Any] = Depends(filters), cursor: str | None = None) -> dict[str, Any]:
         with _read_snapshot(store) as connection:
-            rows = connection.execute("SELECT * FROM pipette_pressure_streams ORDER BY started_at DESC,stream_session_id DESC LIMIT ?", (limit,)).fetchall()
-            return {"returned_count": len(rows), "pressure_streams": [{"stream_session_id": row["stream_session_id"], "pipette_operation_id": row["pipette_operation_id"], "channels": _decode_json(row["channels_json"], []), "sample_period_ms": row["sample_period_ms"], "started_at": row["started_at"], "stopped_at": row["stopped_at"], "terminal_state": row["terminal_state"], "loss_count": row["loss_count"]} for row in rows]}
+            return _pressure_stream_page(connection, selected, cursor)
 
     @router.get("/reports/pressure-streams/{stream_session_id}")
     def report_pressure_stream_detail(stream_session_id: str) -> dict[str, Any]:
@@ -579,10 +869,9 @@ def create_operator_reports_router(store: Any) -> APIRouter:
             return {"stream_session_id": row["stream_session_id"], "pipette_operation_id": row["pipette_operation_id"], "channels": _decode_json(row["channels_json"], []), "sample_period_ms": row["sample_period_ms"], "started_at": row["started_at"], "stopped_at": row["stopped_at"], "terminal_state": row["terminal_state"], "loss_count": row["loss_count"], "chunks": [{"chunk_id": c["chunk_id"], "channel": c["channel"], "chunk_sequence": c["chunk_sequence"], "sample_count": c["sample_count"], "lost_sample_count": c["lost_sample_count"], "units": c["units"], "sha256": c["sha256"], "byte_count": c["byte_count"], "evidence_artifact_id": c["evidence_artifact_id"]} for c in chunks]}
 
     @router.get("/reports/pressure-streams/{stream_session_id}/samples")
-    def report_pressure_stream_samples(stream_session_id: str, limit: int = Query(1000, ge=1, le=10000)) -> dict[str, Any]:
+    def report_pressure_stream_samples(stream_session_id: str, selected: dict[str, Any] = Depends(filters), cursor: str | None = None) -> dict[str, Any]:
         with _read_snapshot(store) as connection:
-            rows = connection.execute("SELECT * FROM pipette_pressure_chunks WHERE stream_session_id=? ORDER BY channel,chunk_sequence LIMIT ?", (stream_session_id, limit)).fetchall()
-            return {"stream_session_id": stream_session_id, "returned_count": len(rows), "samples": [{"chunk_id": row["chunk_id"], "channel": row["channel"], "chunk_sequence": row["chunk_sequence"], "sample_count": row["sample_count"], "lost_sample_count": row["lost_sample_count"], "units": row["units"], "sha256": row["sha256"], "byte_count": row["byte_count"], "summary": _decode_json(row["sample_summary_json"], {})} for row in rows]}
+            return _pressure_samples_page(connection, stream_session_id, selected, cursor)
 
     @router.post("/reports/exports")
     def create_export(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
