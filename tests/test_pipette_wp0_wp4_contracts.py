@@ -3,11 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+
+os.environ.setdefault("BIOXP_OEM_RUNTIME_STATE_ROOT", tempfile.mkdtemp(prefix="bioxp-wp0-contracts-"))
+os.environ.pop("BIOXP_OEM_RUNTIME_ROOT", None)
+os.environ.pop("BIOXP_PIPETTE_RECEIPT_ROOT", None)
 
 from src.bioxp.can_driver import BioXpCanDriver
 from src.bioxp import api
@@ -17,6 +23,8 @@ from src.bioxp.pipette.models import PipetteAspirateCommand, PipetteDispenseComm
 from src.bioxp.pipette.receipts import PipetteReceiptStore
 from src.bioxp.pipette.transport import CanPipetteTransport
 from src.bioxp.services.pipette_service import run_pipette_dispense_command, run_pipette_status
+
+os.environ.pop("BIOXP_OEM_RUNTIME_STATE_ROOT", None)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -292,7 +300,12 @@ def test_service_status_can_persist_a_source_bound_receipt(tmp_path):
             receipt_store=store,
         )
     )
-    assert result["receipt_id"] == store.latest()["receipt_id"]
+    row = store.connection.execute(
+        "SELECT receipt_json FROM operator_commands ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert result["receipt_id"] == json.loads(row[0])["receipt_id"]
+    assert not store._legacy_path.exists()
     assert result["receipt_truth"]["physical_effect_verified"] is False
 
 

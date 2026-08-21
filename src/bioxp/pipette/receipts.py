@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from ..hardware_status import hardware_state
 from ..oem_full_lifecycle import current_authority_identity, current_registry_sha256
 from ..runtime_audit_store import RuntimeAuditDatabase, runtime_state_root
+from .audit import PipetteAuditIntegrityError, normalize_pipette_result
 
 
 class PipetteReceiptError(RuntimeError):
@@ -152,6 +153,8 @@ class PipetteReceiptStore:
         result: Mapping[str, Any],
         effective_inputs: Mapping[str, Any] | None = None,
         runtime_binding: Mapping[str, Any] | None = None,
+        command_id: str | None = None,
+        pipette_operation_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(result, Mapping):
             raise PipetteReceiptError("receipt result must be a mapping")
@@ -176,15 +179,176 @@ class PipetteReceiptStore:
             },
         }
         encoded = (json.dumps(receipt, sort_keys=True) + "\n").encode("utf-8")
-        with self._lock:
-            fd = os.open(self._legacy_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        if command_id is None or pipette_operation_id is None:
+            with self._lock:
+                fd = os.open(self._legacy_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.write(fd, encoded)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.chmod(self._legacy_path, 0o600)
+        if command_id is not None and pipette_operation_id is not None:
             try:
-                os.write(fd, encoded)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(self._legacy_path, 0o600)
+                self._persist_normalized_result(
+                    command_id=str(command_id),
+                    pipette_operation_id=str(pipette_operation_id),
+                    result=result,
+                )
+                self._audit_database.finalize_claim(
+                    command_id=str(command_id),
+                    pipette_operation_id=str(pipette_operation_id),
+                    status="completed" if receipt["truth"]["completion_verified"] else "acknowledged",
+                    outcome=str(result.get("outcome") or ("completed" if result.get("ok") is True else "failed")),
+                    failure_code=None if result.get("ok") is True else str(result.get("error") or result.get("code") or "pipette_operation_failed"),
+                    result=result,
+                    effective_inputs=effective_inputs,
+                    receipt_json=json.dumps(receipt, sort_keys=True),
+                )
+            except PipetteAuditIntegrityError as exc:
+                raise PipetteReceiptError(str(exc)) from exc
+            except Exception as exc:
+                raise PipetteReceiptError(f"typed pipette audit persistence failed: {exc}") from exc
         return receipt
+
+    def _persist_normalized_result(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str,
+        result: Mapping[str, Any],
+    ) -> dict[str, list[str]]:
+        normalized = normalize_pipette_result(result)
+        observation_ids: list[str] = []
+        exchange_ids: list[str] = []
+        event_ids: list[str] = []
+        for row in normalized["channels"]:
+            observation_ids.append(
+                self.record_channel_observation(
+                    command_id=command_id,
+                    pipette_operation_id=pipette_operation_id,
+                    **row,
+                )
+            )
+        for row in normalized["exchanges"]:
+            exchange_ids.append(
+                self.record_transport_exchange(
+                    command_id=command_id,
+                    pipette_operation_id=pipette_operation_id,
+                    **row,
+                )
+            )
+        for row in normalized["events"]:
+            event_ids.append(
+                self.record_event(
+                    command_id=command_id,
+                    pipette_operation_id=pipette_operation_id,
+                    **row,
+                )
+            )
+        pressure_samples = list(normalized.get("pressure_samples") or [])
+        pressure_stream_ids: list[str] = []
+        pressure_chunk_ids: list[str] = []
+        if pressure_samples:
+            channels = sorted({int(sample.get("channel", result.get("channel", 0))) for sample in pressure_samples})
+            stream_id = self.record_pressure_stream(
+                command_id=command_id,
+                pipette_operation_id=pipette_operation_id,
+                channels=channels,
+                sample_period_ms=result.get("sample_period_ms"),
+                source_generation=result.get("source_generation", result.get("reader_generation", 0)),
+                reader_generation=result.get("reader_generation"),
+                offset_identity=result.get("offset_identity"),
+            )
+            pressure_stream_ids.append(stream_id)
+            for channel in channels:
+                chunk_samples = []
+                for sample in pressure_samples:
+                    if int(sample.get("channel", result.get("channel", 0))) != channel:
+                        continue
+                    chunk_samples.append(
+                        {
+                            **dict(sample),
+                            "raw_pressure": sample.get("raw_pressure", sample.get("value")),
+                            "corrected_pressure": sample.get("corrected_pressure", sample.get("value")),
+                            "controller_timestamp": sample.get("controller_timestamp", sample.get("controller_time")),
+                        }
+                    )
+                pressure_chunk_ids.append(
+                    self.record_pressure_chunk(
+                        stream_session_id=stream_id,
+                        channel=channel,
+                        chunk_sequence=0,
+                        samples=chunk_samples,
+                        units=str(result.get("pressure_units") or "unknown"),
+                        offset_identity=result.get("offset_identity"),
+                        chunk_schema="bioxp.pipette.pressure.chunk.v1",
+                    )
+                )
+        return {
+            "observation_ids": observation_ids,
+            "exchange_ids": exchange_ids,
+            "event_ids": event_ids,
+            "pressure_stream_ids": pressure_stream_ids,
+            "pressure_chunk_ids": pressure_chunk_ids,
+        }
+
+    def record_failure(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str,
+        operation: str,
+        failure_code: str,
+        message: str,
+        status: str = "failed",
+        requested_inputs: Mapping[str, Any] | None = None,
+        runtime_binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "ok": False,
+            "outcome": "rejected" if status == "rejected" else "failed",
+            "error": str(message),
+            "failure_code": str(failure_code),
+            "runtime_binding": dict(runtime_binding or {}),
+        }
+        try:
+            self._audit_database.finalize_claim(
+                command_id=str(command_id),
+                pipette_operation_id=str(pipette_operation_id),
+                status=str(status),
+                outcome=str(result["outcome"]),
+                failure_code=str(failure_code),
+                result=result,
+                effective_inputs={},
+                receipt_json=json.dumps(result, sort_keys=True),
+            )
+            self._persist_normalized_result(
+                command_id=str(command_id),
+                pipette_operation_id=str(pipette_operation_id),
+                result=result,
+            )
+        except Exception as exc:
+            raise PipetteReceiptError(f"pipette failure persistence failed: {exc}") from exc
+        return result
+
+    def record_channel_observation(self, **kwargs: Any) -> str:
+        return self._audit_database.record_channel_observation(**kwargs)
+
+    def record_transport_exchange(self, **kwargs: Any) -> str:
+        try:
+            return self._audit_database.record_transport_exchange(**kwargs)
+        except ValueError as exc:
+            raise PipetteAuditIntegrityError(str(exc)) from exc
+
+    def record_event(self, **kwargs: Any) -> str:
+        return self._audit_database.record_event(**kwargs)
+
+    def record_pressure_stream(self, **kwargs: Any) -> str:
+        return self._audit_database.record_pressure_stream(**kwargs)
+
+    def record_pressure_chunk(self, **kwargs: Any) -> str:
+        return self._audit_database.record_pressure_chunk(**kwargs)
 
     def claim(
         self,

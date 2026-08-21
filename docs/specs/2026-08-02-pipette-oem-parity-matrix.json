@@ -3,7 +3,7 @@
   "machine_serial": 206,
   "specification": {
     "path": "docs/specs/2026-08-02-pipette-oem-gap-rectification-spec.md",
-    "sha256": "01f244277deb8415e12e83970c2809367d1c420045d1c45921423b72db9f54d9"
+    "sha256": "35742fe762cb7d7052253594961e2b2c47c8a7d599510492619d7897906e704e"
   },
   "authority": {
     "source": "src/bioxp/oem_full_lifecycle.py::current_authority_identity",

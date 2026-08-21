@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS operator_commands (
     idempotency_key TEXT NOT NULL,
     canonical_request_sha256 TEXT NOT NULL DEFAULT '',
     operation TEXT NOT NULL DEFAULT 'operator_action',
+    command_kind TEXT NOT NULL DEFAULT 'pipette',
     entrypoint_id TEXT NOT NULL DEFAULT 'unknown',
     caller_class TEXT NOT NULL DEFAULT 'operator',
     control_class TEXT NOT NULL DEFAULT 'service',
@@ -130,14 +132,24 @@ CREATE TABLE IF NOT EXISTS operator_commands (
     status TEXT NOT NULL,
     safety_class TEXT,
     ownership_generation INTEGER NOT NULL DEFAULT 0,
+    connection_generation INTEGER,
     source_identity_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(source_identity_json)),
     requested_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(requested_inputs_json)),
     effective_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(effective_inputs_json)),
     started_at TEXT NOT NULL,
+    admitted_at TEXT,
+    dispatched_at TEXT,
     finished_at TEXT,
     duration_ms REAL,
+    delivery_verified INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1)),
     controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
+    completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1)),
+    hardware_precondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_precondition_verified IN (0,1)),
+    hardware_postcondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1)),
     physical_effect_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1)),
+    outcome TEXT,
+    failure_code TEXT,
+    evidence_state TEXT,
     receipt_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(receipt_json)),
     response_summary_json TEXT CHECK(response_summary_json IS NULL OR json_valid(response_summary_json)),
     evidence_relpath TEXT,
@@ -159,12 +171,78 @@ CREATE TABLE IF NOT EXISTS pipette_operations (
     entrypoint_id TEXT NOT NULL,
     caller_class TEXT NOT NULL,
     control_class TEXT NOT NULL,
+    action_id TEXT NOT NULL DEFAULT '',
+    operation_class TEXT NOT NULL DEFAULT 'pipette',
     status TEXT NOT NULL,
     ownership_generation INTEGER NOT NULL,
+    connection_generation INTEGER,
+    protocol_job_id TEXT,
+    protocol_action_id TEXT,
+    lifecycle_stage_id TEXT,
     requested_inputs_json TEXT NOT NULL CHECK(json_valid(requested_inputs_json)),
     effective_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(effective_inputs_json)),
+    source_identity_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(source_identity_json)),
+    delivery_verified INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1)),
+    controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
+    completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1)),
+    hardware_precondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_precondition_verified IN (0,1)),
+    hardware_postcondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1)),
+    physical_effect_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1)),
+    outcome TEXT,
+    failure_code TEXT,
+    evidence_state TEXT,
+    receipt_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(receipt_json)),
     created_at REAL NOT NULL,
+    dispatched_at REAL,
+    finished_at REAL,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pipette_channel_observations (
+    observation_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE RESTRICT,
+    pipette_operation_id TEXT NOT NULL REFERENCES pipette_operations(pipette_operation_id) ON DELETE RESTRICT,
+    channel INTEGER NOT NULL CHECK(channel BETWEEN 0 AND 3),
+    phase TEXT NOT NULL CHECK(phase IN ('precondition','query','ack','completion','postcondition','error','callback')),
+    observed_at REAL NOT NULL,
+    semantic_validity TEXT NOT NULL,
+    truth_source TEXT NOT NULL,
+    tip_loaded INTEGER CHECK(tip_loaded IS NULL OR tip_loaded IN (0,1)),
+    pressure REAL,
+    pressure_units TEXT,
+    status TEXT,
+    error_code INTEGER,
+    firmware_class TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(detail_json))
+);
+CREATE TABLE IF NOT EXISTS pipette_transport_exchanges (
+    exchange_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE RESTRICT,
+    pipette_operation_id TEXT NOT NULL REFERENCES pipette_operations(pipette_operation_id) ON DELETE RESTRICT,
+    transaction_id TEXT,
+    channel INTEGER CHECK(channel IS NULL OR channel BETWEEN 0 AND 3),
+    transaction_phase TEXT NOT NULL,
+    command_family INTEGER,
+    matcher_name TEXT,
+    tx_id INTEGER,
+    tx_dlc INTEGER,
+    tx_bytes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(tx_bytes_json)),
+    expected_rx_id INTEGER,
+    observed_rx_id INTEGER,
+    rx_dlc INTEGER,
+    rx_bytes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(rx_bytes_json)),
+    router_generation INTEGER,
+    sent_at REAL,
+    received_at REAL,
+    ack_at REAL,
+    completion_at REAL,
+    delivery_verified INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1)),
+    semantic_match INTEGER NOT NULL DEFAULT 0 CHECK(semantic_match IN (0,1)),
+    controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
+    completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1)),
+    completion_before_ack INTEGER NOT NULL DEFAULT 0 CHECK(completion_before_ack IN (0,1)),
+    multipart_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(multipart_json)),
+    raw_exchange_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(raw_exchange_json)),
+    CHECK(tx_id IS NULL OR expected_rx_id = (tx_id | 1024))
 );
 CREATE TABLE IF NOT EXISTS runtime_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,7 +251,54 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     event_source TEXT NOT NULL,
     event_kind TEXT NOT NULL,
     event_json TEXT NOT NULL CHECK(json_valid(event_json)),
+    channel INTEGER CHECK(channel IS NULL OR channel BETWEEN 0 AND 3),
+    stream_session_id TEXT,
+    transaction_id TEXT,
+    reader_generation INTEGER,
+    ownership_generation INTEGER,
+    source_sequence INTEGER,
+    semantic_validity TEXT,
     observed_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pipette_pressure_streams (
+    stream_session_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE RESTRICT,
+    pipette_operation_id TEXT NOT NULL REFERENCES pipette_operations(pipette_operation_id) ON DELETE RESTRICT,
+    channels_json TEXT NOT NULL CHECK(json_valid(channels_json)),
+    sample_period_ms REAL,
+    started_at REAL NOT NULL,
+    stopped_at REAL,
+    source_generation INTEGER,
+    reader_generation INTEGER,
+    offset_identity TEXT,
+    terminal_state TEXT NOT NULL,
+    loss_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pipette_pressure_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    stream_session_id TEXT NOT NULL REFERENCES pipette_pressure_streams(stream_session_id) ON DELETE RESTRICT,
+    channel INTEGER NOT NULL CHECK(channel BETWEEN 0 AND 3),
+    chunk_sequence INTEGER NOT NULL CHECK(chunk_sequence >= 0),
+    first_sample_sequence INTEGER,
+    last_sample_sequence INTEGER,
+    first_time REAL,
+    last_time REAL,
+    sample_count INTEGER NOT NULL CHECK(sample_count >= 0),
+    lost_sample_count INTEGER NOT NULL DEFAULT 0 CHECK(lost_sample_count >= 0),
+    units TEXT NOT NULL,
+    raw_min REAL,
+    raw_max REAL,
+    raw_mean REAL,
+    corrected_min REAL,
+    corrected_max REAL,
+    corrected_mean REAL,
+    offset_identity TEXT,
+    chunk_schema TEXT NOT NULL,
+    byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+    sha256 TEXT NOT NULL,
+    evidence_artifact_id TEXT,
+    sample_summary_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(sample_summary_json)),
+    UNIQUE(stream_session_id, channel, chunk_sequence)
 );
 CREATE TABLE IF NOT EXISTS runtime_evidence_links (
     evidence_link_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +339,10 @@ CREATE INDEX IF NOT EXISTS operator_transitions_command_idx
     ON operator_transitions(command_id, transition_id);
 CREATE INDEX IF NOT EXISTS pipette_operations_command_idx
     ON pipette_operations(command_id);
+CREATE INDEX IF NOT EXISTS pipette_channel_observations_operation_idx
+    ON pipette_channel_observations(pipette_operation_id, observed_at, observation_id);
+CREATE INDEX IF NOT EXISTS pipette_transport_exchanges_operation_idx
+    ON pipette_transport_exchanges(pipette_operation_id, sent_at, exchange_id);
 CREATE INDEX IF NOT EXISTS runtime_events_command_idx
     ON runtime_events(command_id, event_id);
 CREATE INDEX IF NOT EXISTS runtime_events_kind_idx
@@ -227,6 +356,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS serial206_receipts_idempotency_idx
     WHERE idempotency_key IS NOT NULL AND idempotency_replay_enabled=1;
 CREATE INDEX IF NOT EXISTS serial206_receipts_time_idx
     ON serial206_receipts(stream, observed_at DESC);
+CREATE INDEX IF NOT EXISTS pipette_pressure_streams_operation_idx
+    ON pipette_pressure_streams(pipette_operation_id, started_at, stream_session_id);
+CREATE INDEX IF NOT EXISTS pipette_pressure_chunks_stream_idx
+    ON pipette_pressure_chunks(stream_session_id, channel, chunk_sequence);
 """
 
 _APPEND_ONLY_TABLES = (
@@ -235,28 +368,75 @@ _APPEND_ONLY_TABLES = (
     "runtime_events",
     "runtime_evidence_links",
     "runtime_migration_receipts",
+    "pipette_channel_observations",
+    "pipette_transport_exchanges",
+    "pipette_pressure_chunks",
 )
 
 
 def _add_missing_columns(connection: sqlite3.Connection) -> None:
-    columns = {
-        str(row["name"])
-        for row in connection.execute("PRAGMA table_info(operator_commands)")
+    additions_by_table = {
+        "operator_commands": {
+            "idempotency_replay_enabled": "INTEGER NOT NULL DEFAULT 1 CHECK(idempotency_replay_enabled IN (0,1))",
+            "canonical_request_sha256": "TEXT NOT NULL DEFAULT ''",
+            "operation": "TEXT NOT NULL DEFAULT 'operator_action'",
+            "command_kind": "TEXT NOT NULL DEFAULT 'pipette'",
+            "entrypoint_id": "TEXT NOT NULL DEFAULT 'unknown'",
+            "caller_class": "TEXT NOT NULL DEFAULT 'operator'",
+            "control_class": "TEXT NOT NULL DEFAULT 'service'",
+            "source_identity_json": "TEXT NOT NULL DEFAULT '{}'",
+            "requested_inputs_json": "TEXT NOT NULL DEFAULT '{}'",
+            "effective_inputs_json": "TEXT NOT NULL DEFAULT '{}'",
+            "connection_generation": "INTEGER",
+            "admitted_at": "TEXT",
+            "dispatched_at": "TEXT",
+            "delivery_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1))",
+            "completion_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1))",
+            "hardware_precondition_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(hardware_precondition_verified IN (0,1))",
+            "hardware_postcondition_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1))",
+            "outcome": "TEXT",
+            "failure_code": "TEXT",
+            "evidence_state": "TEXT",
+        },
+        "pipette_operations": {
+            "action_id": "TEXT NOT NULL DEFAULT ''",
+            "operation_class": "TEXT NOT NULL DEFAULT 'pipette'",
+            "connection_generation": "INTEGER",
+            "protocol_job_id": "TEXT",
+            "protocol_action_id": "TEXT",
+            "lifecycle_stage_id": "TEXT",
+            "source_identity_json": "TEXT NOT NULL DEFAULT '{}'",
+            "delivery_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1))",
+            "controller_acknowledged": "INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1))",
+            "completion_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1))",
+            "hardware_precondition_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(hardware_precondition_verified IN (0,1))",
+            "hardware_postcondition_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1))",
+            "physical_effect_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1))",
+            "outcome": "TEXT",
+            "failure_code": "TEXT",
+            "evidence_state": "TEXT",
+            "receipt_json": "TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(receipt_json))",
+            "dispatched_at": "REAL",
+            "finished_at": "REAL",
+        },
+        "runtime_events": {
+            "channel": "INTEGER CHECK(channel IS NULL OR channel BETWEEN 0 AND 3)",
+            "stream_session_id": "TEXT",
+            "transaction_id": "TEXT",
+            "reader_generation": "INTEGER",
+            "ownership_generation": "INTEGER",
+            "source_sequence": "INTEGER",
+            "semantic_validity": "TEXT",
+        },
+        "pipette_transport_exchanges": {
+            "transaction_id": "TEXT",
+        },
     }
-    additions = {
-        "idempotency_replay_enabled": "INTEGER NOT NULL DEFAULT 1 CHECK(idempotency_replay_enabled IN (0,1))",
-        "canonical_request_sha256": "TEXT NOT NULL DEFAULT ''",
-        "operation": "TEXT NOT NULL DEFAULT 'operator_action'",
-        "entrypoint_id": "TEXT NOT NULL DEFAULT 'unknown'",
-        "caller_class": "TEXT NOT NULL DEFAULT 'operator'",
-        "control_class": "TEXT NOT NULL DEFAULT 'service'",
-        "source_identity_json": "TEXT NOT NULL DEFAULT '{}'",
-        "requested_inputs_json": "TEXT NOT NULL DEFAULT '{}'",
-        "effective_inputs_json": "TEXT NOT NULL DEFAULT '{}'",
-    }
-    for name, definition in additions.items():
-        if name not in columns:
-            connection.execute(f"ALTER TABLE operator_commands ADD COLUMN {name} {definition}")
+    for table, additions in additions_by_table.items():
+        columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _install_append_only_triggers(connection: sqlite3.Connection) -> None:
@@ -379,6 +559,21 @@ class RuntimeAuditDatabase:
         requested_inputs = payload.get("requested_inputs") or {}
         action_id = str(payload["action_id"])
         connection = self.connection
+
+        def claim_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+            result = dict(row)
+            if pipette:
+                operation_row = connection.execute(
+                    "SELECT pipette_operation_id FROM pipette_operations WHERE command_id=?",
+                    (str(result["command_id"]),),
+                ).fetchone()
+                result["pipette_operation_id"] = (
+                    str(operation_row["pipette_operation_id"])
+                    if operation_row is not None
+                    else str(result["command_id"])
+                )
+            return result
+
         try:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -390,7 +585,7 @@ class RuntimeAuditDatabase:
                 if existing_digest and existing_digest != digest:
                     raise ValueError("idempotency key conflict")
                 connection.execute("COMMIT")
-                return dict(existing), False
+                return claim_projection(existing), False
 
             existing_command = connection.execute(
                 "SELECT * FROM operator_commands WHERE command_id=?",
@@ -400,7 +595,7 @@ class RuntimeAuditDatabase:
                 if str(existing_command["canonical_request_sha256"] or "") != digest:
                     raise ValueError("command identity conflict")
                 connection.execute("COMMIT")
-                return dict(existing_command), False
+                return claim_projection(existing_command), False
 
             receipt_json = canonical_json(
                 {
@@ -419,17 +614,18 @@ class RuntimeAuditDatabase:
             connection.execute(
                 """
                 INSERT INTO operator_commands(
-                    command_id,idempotency_key,canonical_request_sha256,operation,entrypoint_id,
+                    command_id,idempotency_key,canonical_request_sha256,operation,command_kind,entrypoint_id,
                     caller_class,control_class,idempotency_replay_enabled,action_id,status,
                     safety_class,ownership_generation,source_identity_json,requested_inputs_json,
                     effective_inputs_json,started_at,receipt_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     command_id,
                     idempotency_key,
                     digest,
                     str(payload["operation"]),
+                    str(payload.get("command_kind") or ("pipette" if pipette else "operator")),
                     str(payload["entrypoint_id"]),
                     str(payload["caller_class"]),
                     str(payload["control_class"]),
@@ -456,8 +652,9 @@ class RuntimeAuditDatabase:
                     """
                     INSERT INTO pipette_operations(
                         pipette_operation_id,command_id,operation,entrypoint_id,caller_class,
-                        control_class,status,ownership_generation,requested_inputs_json,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                        control_class,action_id,operation_class,status,ownership_generation,
+                        requested_inputs_json,source_identity_json,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         operation_id,
@@ -466,9 +663,12 @@ class RuntimeAuditDatabase:
                         str(payload["entrypoint_id"]),
                         str(payload["caller_class"]),
                         str(payload["control_class"]),
+                        action_id,
+                        str(payload.get("operation_class") or "pipette"),
                         "reserved",
                         int(payload["ownership_generation"]),
                         canonical_json(requested_inputs),
+                        canonical_json(source_identity),
                         now,
                         now,
                     ),
@@ -480,10 +680,437 @@ class RuntimeAuditDatabase:
             connection.execute("COMMIT")
             if row is None:
                 raise RuntimeAuditStoreError("durable claim disappeared before commit")
-            return dict(row), True
+            return claim_projection(row), True
         except Exception:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _truth_flag(result: Mapping[str, Any], name: str) -> int:
+        value = result.get(name)
+        return int(value) if isinstance(value, bool) else 0
+
+    def finalize_claim(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str | None,
+        status: str,
+        outcome: str | None,
+        failure_code: str | None,
+        result: Mapping[str, Any],
+        effective_inputs: Mapping[str, Any] | None = None,
+        receipt_json: str | None = None,
+    ) -> None:
+        now = time.time()
+        bounded_result = canonical_json(dict(result))
+        effective_json = canonical_json(dict(effective_inputs or {}))
+        flags = {
+            "delivery_verified": self._truth_flag(result, "delivery_verified"),
+            "controller_acknowledged": self._truth_flag(result, "controller_acknowledged"),
+            "completion_verified": self._truth_flag(result, "completion_verified"),
+            "hardware_precondition_verified": self._truth_flag(result, "hardware_precondition_verified"),
+            "hardware_postcondition_verified": self._truth_flag(result, "hardware_postcondition_verified"),
+            "physical_effect_verified": 0,
+        }
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            command = connection.execute(
+                "SELECT command_id FROM operator_commands WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+            if command is None:
+                raise RuntimeAuditStoreError(f"unknown pipette claim: {command_id}")
+            connection.execute(
+                """
+                UPDATE operator_commands
+                SET status=?, finished_at=?, response_summary_json=?, receipt_json=COALESCE(?, receipt_json), effective_inputs_json=?,
+                    delivery_verified=?, controller_acknowledged=?, completion_verified=?,
+                    hardware_precondition_verified=?, hardware_postcondition_verified=?,
+                    physical_effect_verified=?, outcome=?, failure_code=?, updated_at=?
+                WHERE command_id=?
+                """,
+                (
+                    str(status),
+                    str(now),
+                    bounded_result,
+                    receipt_json,
+                    effective_json,
+                    flags["delivery_verified"],
+                    flags["controller_acknowledged"],
+                    flags["completion_verified"],
+                    flags["hardware_precondition_verified"],
+                    flags["hardware_postcondition_verified"],
+                    flags["physical_effect_verified"],
+                    outcome,
+                    failure_code,
+                    now,
+                    str(command_id),
+                ),
+            )
+            if pipette_operation_id is not None:
+                connection.execute(
+                    """
+                    UPDATE pipette_operations
+                    SET status=?, effective_inputs_json=?, delivery_verified=?,
+                        controller_acknowledged=?, completion_verified=?,
+                        hardware_precondition_verified=?, hardware_postcondition_verified=?,
+                        physical_effect_verified=?, outcome=?, failure_code=?,
+                        receipt_json=COALESCE(?, receipt_json), finished_at=?, updated_at=?
+                    WHERE pipette_operation_id=? AND command_id=?
+                    """,
+                    (
+                        str(status),
+                        effective_json,
+                        flags["delivery_verified"],
+                        flags["controller_acknowledged"],
+                        flags["completion_verified"],
+                        flags["hardware_precondition_verified"],
+                        flags["hardware_postcondition_verified"],
+                        flags["physical_effect_verified"],
+                        outcome,
+                        failure_code,
+                        receipt_json,
+                        now,
+                        now,
+                        str(pipette_operation_id),
+                        str(command_id),
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO operator_transitions(command_id,state,observed_at,detail_json) VALUES(?,?,?,?)",
+                (
+                    str(command_id),
+                    str(status),
+                    now,
+                    canonical_json({"outcome": outcome, "failure_code": failure_code}),
+                ),
+            )
+            if result.get("completion_received") is True and result.get("controller_acknowledged") is not True:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_events(
+                        command_id,pipette_operation_id,event_source,event_kind,event_json,
+                        channel,transaction_id,semantic_validity,observed_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(command_id),
+                        str(pipette_operation_id) if pipette_operation_id is not None else None,
+                        "pipette_service",
+                        "completion_before_ack",
+                        canonical_json({"result": dict(result)}),
+                        result.get("channel"),
+                        result.get("transaction_id"),
+                        "tainted",
+                        now,
+                    ),
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    def record_channel_observation(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str,
+        channel: int,
+        phase: str,
+        semantic_validity: str,
+        truth_source: str,
+        tip_loaded: bool | None,
+        pressure: float | None,
+        pressure_units: str | None,
+        status: str | None,
+        error_code: int | None,
+        firmware_class: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        observation_id = uuid.uuid4().hex
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO pipette_channel_observations(
+                    observation_id,command_id,pipette_operation_id,channel,phase,observed_at,
+                    semantic_validity,truth_source,tip_loaded,pressure,pressure_units,status,
+                    error_code,firmware_class,detail_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    observation_id,
+                    str(command_id),
+                    str(pipette_operation_id),
+                    int(channel),
+                    str(phase),
+                    time.time(),
+                    str(semantic_validity),
+                    str(truth_source),
+                    None if tip_loaded is None else int(bool(tip_loaded)),
+                    pressure,
+                    pressure_units,
+                    status,
+                    error_code,
+                    firmware_class,
+                    canonical_json(dict(detail or {})),
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return observation_id
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def record_transport_exchange(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str,
+        channel: int | None,
+        transaction_phase: str,
+        command_family: int | None,
+        matcher_name: str | None,
+        tx_id: int | None,
+        tx_dlc: int | None,
+        tx_bytes: list[int] | tuple[int, ...],
+        expected_rx_id: int | None,
+        observed_rx_id: int | None,
+        rx_dlc: int | None,
+        rx_bytes: list[int] | tuple[int, ...],
+        router_generation: int | None = None,
+        sent_at: float | None = None,
+        received_at: float | None = None,
+        ack_at: float | None = None,
+        completion_at: float | None = None,
+        delivery_verified: bool = False,
+        semantic_match: bool = False,
+        controller_acknowledged: bool = False,
+        completion_verified: bool = False,
+        completion_before_ack: bool = False,
+        multipart: Mapping[str, Any] | None = None,
+        raw_exchange: Mapping[str, Any] | None = None,
+        transaction_id: str | None = None,
+    ) -> str:
+        exchange_id = uuid.uuid4().hex
+        derived_expected = None if tx_id is None else int(tx_id) | 0x400
+        if derived_expected is not None and expected_rx_id != derived_expected:
+            raise ValueError("expected_rx_id must equal tx_id | 0x400")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO pipette_transport_exchanges(
+                    exchange_id,command_id,pipette_operation_id,transaction_id,channel,transaction_phase,
+                    command_family,matcher_name,tx_id,tx_dlc,tx_bytes_json,expected_rx_id,
+                    observed_rx_id,rx_dlc,rx_bytes_json,router_generation,sent_at,received_at,
+                    ack_at,completion_at,delivery_verified,semantic_match,controller_acknowledged,
+                    completion_verified,completion_before_ack,multipart_json,raw_exchange_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    exchange_id,
+                    str(command_id),
+                    str(pipette_operation_id),
+                    transaction_id,
+                    channel,
+                    str(transaction_phase),
+                    command_family,
+                    matcher_name,
+                    tx_id,
+                    tx_dlc,
+                    canonical_json(list(tx_bytes)[:64]),
+                    expected_rx_id,
+                    observed_rx_id,
+                    rx_dlc,
+                    canonical_json(list(rx_bytes)[:64]),
+                    router_generation,
+                    sent_at,
+                    received_at,
+                    ack_at,
+                    completion_at,
+                    int(bool(delivery_verified)),
+                    int(bool(semantic_match)),
+                    int(bool(controller_acknowledged)),
+                    int(bool(completion_verified)),
+                    int(bool(completion_before_ack)),
+                    canonical_json(dict(multipart or {})),
+                    canonical_json(dict(raw_exchange or {})),
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return exchange_id
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def record_event(
+        self,
+        *,
+        command_id: str | None,
+        pipette_operation_id: str | None,
+        event_source: str,
+        event_kind: str,
+        event_payload: Mapping[str, Any],
+        channel: int | None = None,
+        stream_session_id: str | None = None,
+        transaction_id: str | None = None,
+        reader_generation: int | None = None,
+        ownership_generation: int | None = None,
+        source_sequence: int | None = None,
+        semantic_validity: str | None = None,
+    ) -> str:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            cursor = self.connection.execute(
+                """
+                INSERT INTO runtime_events(
+                    command_id,pipette_operation_id,event_source,event_kind,event_json,channel,
+                    stream_session_id,transaction_id,reader_generation,ownership_generation,
+                    source_sequence,semantic_validity,observed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    command_id,
+                    pipette_operation_id,
+                    str(event_source),
+                    str(event_kind),
+                    canonical_json(dict(event_payload)),
+                    channel,
+                    stream_session_id,
+                    transaction_id,
+                    reader_generation,
+                    ownership_generation,
+                    source_sequence,
+                    semantic_validity,
+                    time.time(),
+                ),
+            )
+            event_id = str(cursor.lastrowid)
+            self.connection.execute("COMMIT")
+            return event_id
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def record_pressure_stream(
+        self,
+        *,
+        command_id: str,
+        pipette_operation_id: str,
+        channels: list[int] | tuple[int, ...],
+        sample_period_ms: float | None,
+        source_generation: int | None,
+        reader_generation: int | None = None,
+        offset_identity: str | None = None,
+    ) -> str:
+        stream_id = uuid.uuid4().hex
+        selected = sorted({int(channel) for channel in channels})
+        if not selected or any(channel < 0 or channel > 3 for channel in selected):
+            raise ValueError("pressure stream channels must be within 0..3")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO pipette_pressure_streams(
+                    stream_session_id,command_id,pipette_operation_id,channels_json,sample_period_ms,
+                    started_at,source_generation,reader_generation,offset_identity,terminal_state,loss_count
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    stream_id,
+                    command_id,
+                    pipette_operation_id,
+                    canonical_json(selected),
+                    sample_period_ms,
+                    time.time(),
+                    source_generation,
+                    reader_generation,
+                    offset_identity,
+                    "running",
+                    0,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return stream_id
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def record_pressure_chunk(
+        self,
+        *,
+        stream_session_id: str,
+        channel: int,
+        chunk_sequence: int,
+        samples: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+        units: str,
+        offset_identity: str | None,
+        chunk_schema: str,
+        lost_sample_count: int = 0,
+        evidence_artifact_id: str | None = None,
+    ) -> str:
+        normalized = [dict(sample) for sample in samples]
+        raw_bytes = canonical_json(normalized).encode("utf-8")
+        raw_values = [float(sample["raw_pressure"]) for sample in normalized if sample.get("raw_pressure") is not None]
+        corrected_values = [float(sample["corrected_pressure"]) for sample in normalized if sample.get("corrected_pressure") is not None]
+        sequences = [int(sample["sample_sequence"]) for sample in normalized if sample.get("sample_sequence") is not None]
+        times = [float(sample[key]) for sample in normalized for key in ("controller_timestamp", "robot_receive_time") if sample.get(key) is not None]
+        chunk_id = uuid.uuid4().hex
+
+        def mean(values: list[float]) -> float | None:
+            return sum(values) / len(values) if values else None
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO pipette_pressure_chunks(
+                    chunk_id,stream_session_id,channel,chunk_sequence,first_sample_sequence,
+                    last_sample_sequence,first_time,last_time,sample_count,lost_sample_count,units,
+                    raw_min,raw_max,raw_mean,corrected_min,corrected_max,corrected_mean,
+                    offset_identity,chunk_schema,byte_count,sha256,evidence_artifact_id,sample_summary_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    chunk_id,
+                    stream_session_id,
+                    int(channel),
+                    int(chunk_sequence),
+                    min(sequences) if sequences else None,
+                    max(sequences) if sequences else None,
+                    min(times) if times else None,
+                    max(times) if times else None,
+                    len(normalized),
+                    int(lost_sample_count),
+                    str(units),
+                    min(raw_values) if raw_values else None,
+                    max(raw_values) if raw_values else None,
+                    mean(raw_values),
+                    min(corrected_values) if corrected_values else None,
+                    max(corrected_values) if corrected_values else None,
+                    mean(corrected_values),
+                    offset_identity,
+                    str(chunk_schema),
+                    len(raw_bytes),
+                    hashlib.sha256(raw_bytes).hexdigest(),
+                    evidence_artifact_id,
+                    canonical_json({"first_sequence": min(sequences) if sequences else None, "last_sequence": max(sequences) if sequences else None}),
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return chunk_id
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
             raise
 
     def close(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -42,6 +43,41 @@ def _validate_oem_admission(operation_name: str | None, command: Any | None) -> 
             raise PipetteValidationError(
                 "blow_out is not an OEM ClassPipette operation; use an explicit A0R workflow after physical acceptance."
             )
+
+
+def _persist_failure(
+    *,
+    receipt_store: Any,
+    claim_record: dict[str, Any] | None,
+    operation_name: str | None,
+    failure_code: str,
+    message: str,
+    status: str,
+    requested_inputs: dict[str, Any],
+    runtime_binding: dict[str, Any] | None,
+) -> None:
+    if receipt_store is None or claim_record is None or not hasattr(receipt_store, "record_failure"):
+        return
+    command_id = claim_record.get("command_id")
+    operation_id = claim_record.get("pipette_operation_id") or command_id
+    if not command_id or not operation_id:
+        return
+    try:
+        receipt_store.record_failure(
+            command_id=str(command_id),
+            pipette_operation_id=str(operation_id),
+            operation=str(operation_name or "pipette"),
+            failure_code=str(failure_code),
+            message=str(message),
+            status=str(status),
+            requested_inputs=requested_inputs,
+            runtime_binding=runtime_binding,
+        )
+    except PipetteReceiptError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "pipette_failure_receipt_persistence_failed", "message": str(exc)},
+        ) from exc
 
 
 async def _run_transport_call(
@@ -125,24 +161,71 @@ async def _run_transport_call(
                 detail={"error": "pipette_claim_persistence_failed", "message": str(exc)},
             ) from exc
     preflight_payload: dict[str, Any] | None = None
+    stage = "admission"
     try:
         _validate_oem_admission(operation_name, command)
-    except PipetteError as exc:
-        raise _pipette_error_to_http_exception(exc) from exc
-    if preflight is not None:
-        try:
+        if preflight is not None:
             preflight_payload = preflight(operation_name or label, command)
-        except PipetteError as exc:
-            raise _pipette_error_to_http_exception(exc) from exc
-        except ValueError as exc:
-            raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
-    transport = get_transport()
-    try:
+        stage = "transport"
+        transport = get_transport()
+        stage = "dispatch"
         result = await run_blocking(label, lambda: operation(transport), timeout_s=timeout_s)
     except PipetteError as exc:
+        status = "rejected" if stage == "admission" else "failed"
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code=exc.code,
+            message=exc.message,
+            status=status,
+            requested_inputs=requested_for_receipt,
+            runtime_binding=runtime_binding,
+        )
         raise _pipette_error_to_http_exception(exc) from exc
     except ValueError as exc:
-        raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
+        failure_code = "validation_error" if stage == "admission" else "malformed_response"
+        status = "rejected" if stage == "admission" else "failed"
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code=failure_code,
+            message=str(exc),
+            status=status,
+            requested_inputs=requested_for_receipt,
+            runtime_binding=runtime_binding,
+        )
+        if stage == "admission":
+            raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
+        raise HTTPException(status_code=502, detail={"error": failure_code, "message": str(exc)}) from exc
+    except asyncio.TimeoutError as exc:
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code="timeout",
+            message="pipette operation timed out",
+            status="failed",
+            requested_inputs=requested_for_receipt,
+            runtime_binding=runtime_binding,
+        )
+        raise HTTPException(status_code=504, detail={"error": "timeout", "message": str(exc)}) from exc
+    except Exception as exc:
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code="transport_exception" if stage != "admission" else "admission_exception",
+            message=str(exc),
+            status="failed" if stage != "admission" else "rejected",
+            requested_inputs=requested_for_receipt,
+            runtime_binding=runtime_binding,
+        )
+        raise HTTPException(
+            status_code=503 if stage != "admission" else 400,
+            detail={"error": "pipette_operation_failed", "message": str(exc)},
+        ) from exc
     if preflight_payload is not None and isinstance(result, dict):
         result.setdefault("preflight", preflight_payload)
     if receipt_store is not None and isinstance(result, dict):
@@ -159,6 +242,8 @@ async def _run_transport_call(
                 effective_inputs=effective_inputs,
                 result=result,
                 runtime_binding=runtime_binding,
+                command_id=claim_record.get("command_id") if claim_record is not None else None,
+                pipette_operation_id=claim_record.get("pipette_operation_id") if claim_record is not None else None,
             )
         except PipetteReceiptError as exc:
             raise HTTPException(
