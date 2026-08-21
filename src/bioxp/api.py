@@ -630,7 +630,7 @@ def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]
 
 def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
     """Invalidate every hardware and camera projection on ownership changes."""
-    global _camera_projection_epoch, _camera_probe_cache
+    global _camera_projection_epoch, _camera_probe_cache, _camera_session
     epoch = hardware_state.change_ownership(
         reason=reason,
         transport=transport,
@@ -638,6 +638,8 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
         router=router,
     )
     with _camera_projection_lock:
+        session = _camera_session
+        _camera_session = None
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         _camera_stream_state.update(
@@ -647,6 +649,23 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
                 "last_frame_at": None,
             }
         )
+    if session is not None:
+        process = session.get("process")
+        if process is not None and process.returncode is None:
+            process.terminate()
+        queue = session.get("queue")
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+        task = session.get("reader_task")
+        if task is not None and not task.done():
+            task.cancel()
     _sync_serial206_oem_initialization_provider(transport=transport, usb=usb, router=router)
     return epoch
 
@@ -2461,6 +2480,18 @@ class ChillerRequest(BaseModel):
 
 class CameraSnapshotRequest(BaseModel):
     """Finite snapshot command: the provider owns all camera identity and settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CameraStreamStartRequest(BaseModel):
+    """Start the fixed serial-206 stream profile without caller tuning."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CameraStreamStopRequest(BaseModel):
+    """Stop the currently owned camera stream."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -5837,7 +5868,6 @@ async def _camera_mjpeg_response(
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
-        "X-BioXp-Camera-Device": device,
     }
     return StreamingResponse(
         iterator(),
@@ -5884,23 +5914,81 @@ async def _stop_owned_camera_session(*, reason: str) -> dict[str, Any]:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
+        queue = session.get("queue")
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+        viewer_shutdown = session.get("viewer_shutdown_task")
+        if viewer_shutdown is not None and viewer_shutdown is not asyncio.current_task() and not viewer_shutdown.done():
+            viewer_shutdown.cancel()
         task = session.get("reader_task")
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
     _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
-    return {"ok": True, "stopped_session_id": None if session is None else session.get("session_id"), "replacement": reason == "replacement", "camera_ownership_epoch": epoch}
+    return {
+        **_camera_stream_control_payload(session, state="off", error=reason),
+        "ok": True,
+        "stopped_session_id": None if session is None else session.get("session_id"),
+        "replacement": reason == "replacement",
+    }
+
+
+def _camera_stream_control_payload(
+    session: dict[str, Any] | None,
+    *,
+    state: str,
+    idempotent: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
+    latest_frame_at = _camera_stream_state.get("last_frame_at")
+    if latest_frame_at is not None:
+        latest_frame_at = datetime.fromtimestamp(float(latest_frame_at), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "schema_version": "bioxp.camera_stream.v1",
+        "state": state,
+        "active": state in {"starting", "live"},
+        "stream_id": None if session is None else session.get("session_id"),
+        "camera_ownership_epoch": _camera_projection_epoch,
+        "device": None if session is None else session.get("device"),
+        "fps": None if session is None else session.get("fps"),
+        "quality": None if session is None else session.get("quality"),
+        "width": None if session is None else session.get("width"),
+        "height": None if session is None else session.get("height"),
+        "frames_emitted": int(_camera_stream_state.get("frames_emitted") or 0),
+        "dropped_frames": int(_camera_stream_state.get("dropped_frames") or 0),
+        "latest_frame_at": latest_frame_at,
+        "last_error": error if error is not None else _camera_stream_state.get("last_error"),
+        "idempotent": idempotent,
+    }
 
 
 async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]:
+    del payload
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
-    replacement = _camera_session is not None
+    with _camera_projection_lock:
+        existing = _camera_session
+        existing_active = bool(
+            existing is not None
+            and _camera_stream_state.get("active")
+            and existing.get("process") is not None
+            and existing["process"].returncode is None
+        )
+        if existing_active:
+            return _camera_stream_control_payload(existing, state="live", idempotent=True)
+    replacement = existing is not None
     if replacement:
         await _stop_owned_camera_session(reason="replacement")
-    device = str(payload.get("device") or "/dev/video0")
-    fps = max(1, min(int(payload.get("fps") or 8), 30))
-    quality = max(2, min(int(payload.get("quality") or 7), 15))
-    width = max(160, min(int(payload.get("width") or 640), 1920))
-    height = max(120, min(int(payload.get("height") or 480), 1080))
+    device = "/dev/video0"
+    fps = 8
+    quality = 7
+    width = 640
+    height = 480
     pick = _pick_stream_device(device)
     if not pick.get("ok"):
         raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
@@ -5912,13 +6000,13 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
     if proc.stdout is None:
         proc.terminate()
         raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=8)
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
     session_id = uuid.uuid4().hex
     with _camera_projection_lock:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         epoch = _camera_projection_epoch
-        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
         _camera_session = session
     hardware_state.invalidate(reason="camera ownership changed: stream started")
     _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
@@ -5948,6 +6036,7 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
                     if queue.full():
                         try:
                             queue.get_nowait()
+                            _camera_stream_state["dropped_frames"] = int(_camera_stream_state.get("dropped_frames") or 0) + 1
                         except asyncio.QueueEmpty:
                             pass
                     queue.put_nowait(part)
@@ -5972,7 +6061,12 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
 
     task = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
     session["reader_task"] = task
-    return {"ok": True, "session_id": session_id, "camera_ownership_epoch": epoch, "replacement": replacement, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue_max_frames": queue.maxsize, "mjpeg_url": "/camera/mjpeg"}
+    return {
+        **_camera_stream_control_payload(session, state="starting"),
+        "replacement": replacement,
+        "queue_max_frames": queue.maxsize,
+        "mjpeg_url": "/camera/mjpeg",
+    }
 
 
 def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -8702,9 +8796,16 @@ async def camera_probe(payload: dict[str, Any] | None = None):
         return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
 
 
-async def camera_stream_start(payload: dict[str, Any] | None = None):
-    result = await _start_owned_camera_session(payload or {})
-    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("ok")), "provenance": "POST /camera/stream/start"})
+@app.post("/camera/stream/start")
+async def camera_stream_start(
+    request: Request,
+    req: CameraStreamStartRequest = CameraStreamStartRequest(),
+):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
+    del req
+    result = await _start_owned_camera_session({})
+    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("active")), "provenance": "POST /camera/stream/start"})
     return result
 
 
@@ -8821,35 +8922,73 @@ async def camera_reset(req: CameraSnapshotRequest):
     return {**reset, "owned_session": stopped}
 
 
-async def camera_stop(req: CameraSnapshotRequest):
+@app.post("/camera/stream/stop")
+async def camera_stop(
+    request: Request,
+    req: CameraStreamStopRequest = CameraStreamStopRequest(),
+):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     del req
     return await _stop_owned_camera_session(reason="explicit stop")
 
 
-async def camera_stream_state():
-    _, projection = _camera_session_projection()
-    return {**projection, **_camera_stream_state_payload()}
+@app.get("/camera/stream/state")
+async def camera_stream_state(request: Request):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
+    session, projection = _camera_session_projection()
+    state = "live" if projection.get("available") and _camera_stream_state.get("last_frame_at") else "starting" if projection.get("available") else "off"
+    return {
+        **_camera_stream_control_payload(session, state=state),
+        "session": projection.get("session"),
+        "freshness": projection.get("freshness"),
+        "provenance": projection.get("provenance"),
+    }
 
 
-async def camera_mjpeg(
-    device: str = "/dev/video0",
-    fps: int = Query(8, ge=1, le=30),
-    quality: int = Query(7, ge=2, le=15),
-    width: int = Query(640, ge=160, le=1920),
-    height: int = Query(480, ge=120, le=1080),
-):
-    del device, fps, quality, width, height
+@app.get("/camera/mjpeg")
+async def camera_mjpeg(request: Request):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     session, projection = _camera_session_projection()
     if session is None or not projection.get("available"):
         raise HTTPException(status_code=503, detail={**projection, "error": "no active POST-started camera session"})
     queue = session["queue"]
+    with _camera_projection_lock:
+        session["viewers"] = int(session.get("viewers") or 0) + 1
+        pending_shutdown = session.get("viewer_shutdown_task")
+        if pending_shutdown is not None and not pending_shutdown.done():
+            pending_shutdown.cancel()
+        session["viewer_shutdown_task"] = None
+
+    async def stop_after_viewer_grace(session_id: str) -> None:
+        try:
+            await asyncio.sleep(5.0)
+            with _camera_projection_lock:
+                current = _camera_session
+                viewers = 0 if current is None else int(current.get("viewers") or 0)
+                should_stop = current is not None and current.get("session_id") == session_id and viewers == 0
+            if should_stop:
+                await _stop_owned_camera_session(reason="viewer grace expired")
+        except asyncio.CancelledError:
+            return
 
     async def iterator():
-        while True:
-            part = await queue.get()
-            if part is None:
-                break
-            yield part
+        try:
+            while True:
+                part = await queue.get()
+                if part is None:
+                    break
+                yield part
+        finally:
+            with _camera_projection_lock:
+                current = _camera_session
+                if current is not None and current.get("session_id") == session["session_id"]:
+                    current["viewers"] = max(0, int(current.get("viewers") or 0) - 1)
+                    if current["viewers"] == 0:
+                        task = asyncio.create_task(stop_after_viewer_grace(session["session_id"]), name=f"bioxp-camera-grace-{session['session_id']}")
+                        current["viewer_shutdown_task"] = task
 
     return StreamingResponse(
         iterator(),
