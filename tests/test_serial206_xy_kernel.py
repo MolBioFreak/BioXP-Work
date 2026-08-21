@@ -55,7 +55,7 @@ class FakeTester:
         return {"ok": True, "ack": {"status": 100}, "speed": 0}
 
     def motor_get_axis_param(self, board, param, motor=0):
-        values = {(5, 12): 1, (5, 13): 0}
+        values = {(5, 9): 0, (5, 10): 0, (5, 12): 0, (5, 13): 0}
         return {"ok": True, "ack": {"status": 100}, "value": values[(int(board), int(param))]}
 
     def motor_set_axis_param(self, board, param, value, motor=0):
@@ -108,6 +108,7 @@ def adapter(*, fail_acceleration=False, reference=True):
     primitive = Serial206ProductionPrimitiveAdapter.__new__(Serial206ProductionPrimitiveAdapter)
     primitive.tester = FakeTester(fail_acceleration=fail_acceleration)
     primitive.reference_store = FakeReferenceStore() if reference else None
+    primitive._x_profile_overrides = {}
     return primitive
 
 
@@ -183,7 +184,7 @@ class ImmediateXPrimitives:
 
     @staticmethod
     def _x_require_motion_preflight():
-        return {"profile": {"axis": "x"}, "switch_masks": {12: 1, 13: 0}}
+        return {"profile": {"axis": "x"}, "switch_masks": {12: 0, 13: 0}}
 
     def x_move_absolute(self, **_kwargs):
         self.dispatches += 1

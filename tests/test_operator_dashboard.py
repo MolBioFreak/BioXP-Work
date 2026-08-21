@@ -545,7 +545,7 @@ def test_dashboard_uses_provider_owned_x_authority_and_never_claims_physical_pos
 def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state():
     from bioxp import api
 
-    values = {1: 123, 3: 0, 6: 31, 7: 8, 9: 0, 10: 1, 12: 1, 13: 0}
+    values = {1: 123, 3: 0, 6: 31, 7: 8, 9: 0, 10: 1, 12: 0, 13: 0}
 
     class Tester:
         MOTOR_SWITCH_ACTIVE_VALUE = 1
@@ -572,16 +572,16 @@ def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state
         "left_raw_active": False,
         "right_raw_active": True,
         "left_disabled": False,
-        "right_disabled": True,
+        "right_disabled": False,
         "left_effective_active": False,
-        "right_effective_active": False,
+        "right_effective_active": True,
     }
     state = machine_state(motion_enabled=True, z="referenced")
     state["domains"]["axes"]["observation"]["rows"] = {"z": row}
     z = _dashboard_payload(state)["axes"][0]
     assert z["right_switch_state"] == 1
     assert z["right_switch_raw_active"] is True
-    assert z["right_switch_active"] is False
+    assert z["right_switch_active"] is True
 
 
 def test_dashboard_reports_active_motion_independently_from_homing_and_uses_live_latch_evidence():

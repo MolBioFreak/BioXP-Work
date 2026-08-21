@@ -1036,15 +1036,19 @@ def test_preparation_can_ready_publication_requires_same_owned_epoch():
     assert stale == {"published": False, "reason": "ownership_epoch_changed"}
 
 
-def test_service_start_defaults_to_pending_non_homing_recovery(monkeypatch):
+def test_service_start_is_clean_without_non_homing_recovery_gate(monkeypatch):
     api = load_api(monkeypatch, startup_recovered=False)
 
     state = api._maintenance_state_payload()
 
-    assert state["motion_blocked"] is True
-    assert state["recovery_required"] is True
-    assert state["blocked_by"] == "service_start"
-    assert api._require_non_homing_motion_recovery_pending() == 1
+    assert state["motion_blocked"] is False
+    assert state["recovery_required"] is False
+    assert state["block_reason"] is None
+    assert state["blocked_by"] is None
+    with pytest.raises(HTTPException) as exc_info:
+        api._require_non_homing_motion_recovery_pending()
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "motion_recovery_not_required"
 
 
 def test_remote_strict_startup_requires_recover_motion_ack_before_hardware(monkeypatch):

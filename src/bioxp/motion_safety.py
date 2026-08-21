@@ -16,11 +16,11 @@ from .oem_machine_bundle import OEM_MACHINE_SERIAL, get_active_oem_machine_snaps
 PREPARE_SCHEMA = "bioxp.oem_prepare_without_motion.v2"
 STOP_SCHEMA = "bioxp.physical_aggregate_stop.v1"
 
-# One immutable serial-206 machine adaptation contract.  The recovered X
-# initializer does not write either mask; recovery writes SAP12=1 separately
-# and preparation/motion/status only verify this effective tuple.
-SERIAL206_X_SWITCH_MASKS = {12: 1, 13: 0}
-SERIAL206_Z_SWITCH_MASKS = {12: 1, 13: 0}
+# One immutable literal-OEM effective switch-mask contract.  The recovered
+# initializer omits X/Z mask writes.  An explicit no-motion repair converges
+# controller-persistent state to this effective tuple before preparation.
+SERIAL206_X_SWITCH_MASKS = {12: 0, 13: 0}
+SERIAL206_Z_SWITCH_MASKS = {12: 0, 13: 0}
 
 # ClassControlInterface construction for the accepted BioXP 3200 serial-206 machine.
 # Board 7 is the chiller/temperature controller.  Its status-2 reply to command 64 is

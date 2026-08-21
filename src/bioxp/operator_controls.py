@@ -732,7 +732,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             z_switches = z_row.get("switch_activity") if isinstance(z_row, Mapping) else None
             z_preset = z_row.get("preset") if isinstance(z_row, Mapping) else None
             left_home_enabled = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
-            right_inhibit_disabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is True
+            right_switch_enabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is False
             # OEM no-motion preparation establishes the motor profile without
             # a prior Z GAP12/GAP13 snapshot. Keep this replacement check only
             # on ordinary generic Z operations, never on state-establishing
@@ -741,8 +741,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                 dependencies.append(_dependency(
                     "z_switch_masks_machine_bound",
                     "Z machine-bound GAP12/GAP13 state",
-                    left_home_enabled and right_inhibit_disabled,
-                    "Expected GAP12/right disabled and GAP13/GAP9-left enabled; run Z mask reconciliation.",
+                    left_home_enabled and right_switch_enabled,
+                    "Expected GAP12/right enabled and GAP13/left enabled; run Z mask reconciliation.",
                 ))
             # Preparation and mask reconciliation do not move Z and therefore
             # must not require an already-valid OEM coordinate.  Movement and
@@ -1283,7 +1283,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     x_semantic_actions = (
         ("oem.x.status", "/motion/oem/x/status", "X axis authority status", "Provider-owned X lifecycle, terminal telemetry, reconciliation state, and durable receipt projection.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
         ("oem.x.prepare", "/motion/oem/x/prepare", "Prepare OEM X profile", "Run the exact X no-motion profile and verify the Serial-206 machine tuple without movement.", "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195"),
-        ("oem.x.reconcile_switch_masks", "/motion/oem/x/reconcile_switch_masks", "Reconcile Serial-206 X switch masks", "Apply the explicit Serial-206 machine adaptation SAP12=1 and verify GAP12=1/GAP13=0; invalidates X preparation/reference.", "Serial-206 D1 machine safety adaptation"),
+        ("oem.x.reconcile_switch_masks", "/motion/oem/x/reconcile_switch_masks", "Reconcile Serial-206 X switch masks", "Repair persistent X masks to SAP12=0/SAP13=0 and verify both readbacks; invalidates X preparation/reference.", "Literal-OEM controller-state repair"),
         ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Source-shaped relative X movement with the provider-owned 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
         ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Source-shaped absolute X movement in 0..90263 with effective minimum 60 and optional temporary acceleration.", "ClassControlInterface.moveX:4206-4243"),
         ("oem.x.manual_panel_home", "/motion/oem/x/manual_home", "OEM X manual panel Home", "Exact manual-panel goHome(rehome=true, speed=500) identity.", "ClassControlInterface manual panel Home:2270-2278"),
@@ -1388,7 +1388,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         action_id="oem.z.reconcile_switch_masks",
         path="/motion/oem/z/reconcile_switch_masks",
         label="Reconcile OEM Z switch masks",
-        description="Restore the serial-206 persistent Z wiring state: disable mirrored GAP10/right inhibit while keeping GAP9/left home protection enabled; requires fresh Z preparation afterward.",
+        description="Repair persistent Z masks to the literal-OEM enabled baseline SAP12=0/SAP13=0; requires fresh Z preparation afterward.",
         source_anchor="ClassMotor param12 right-disable; param13 left-disable",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",

@@ -17,6 +17,17 @@ def test_axis_profiles_expose_source_anchored_testing_matrix():
     assert matrix["x"]["startup_home_speed"] == 250
     assert matrix["x"]["manual_home_speed"] == 500
     assert matrix["z"]["manual_home_speed"] == 1791
+    assert matrix["x"]["speed"] == 1700
+    assert matrix["x"]["acc"] == 350
+    assert matrix["x"]["stall_guard"] == 16
+    assert matrix["y"]["speed"] == 1800
+    assert matrix["y"]["acc"] == 400
+    assert matrix["y"]["stall_guard"] == 16
+    assert matrix["y"]["disable_right"] is True
+    assert matrix["y"]["disable_left"] is False
+    assert matrix["z"]["speed"] == 1791
+    assert matrix["z"]["acc"] == 576
+    assert matrix["z"]["stall_guard"] == 3
     assert matrix["g"]["gripper_version_1_home_speed"] == 200
     assert matrix["door"]["home_method"] == "doorSearchHome"
     assert all(row["source_anchor"] for row in matrix.values())

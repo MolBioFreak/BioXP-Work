@@ -113,7 +113,7 @@ class BioXpTester:
             "stall_guard": 3,
             # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
             # The explicit provider reconciliation action establishes the
-            # serial-206 persistent state; source preparation must preserve it.
+            # literal-OEM enabled-mask baseline; source preparation verifies it.
             "warm_enable": True,
         },
         "g": {
@@ -2904,36 +2904,40 @@ class BioXpTester:
         }
 
     def motor_x_reconcile_switch_masks(self):
-        """Apply the approved serial-206 X SAP12 adaptation and verify both masks."""
+        """Repair persistent X masks to the literal-OEM enabled baseline."""
         board = int(self.BOARD_DECK)
         motor = 0
         before_12 = self.motor_get_axis_param(board, 12, motor=motor)
         before_13 = self.motor_get_axis_param(board, 13, motor=motor)
         before_12_ok = self._tmcl_success(before_12.get("ack")) and type(before_12.get("value")) is int
         before_13_ok = self._tmcl_success(before_13.get("ack")) and type(before_13.get("value")) is int
-        write_12 = None
-        if before_12_ok and before_13_ok and before_13.get("value") == 0 and before_12.get("value") != 1:
-            write_12 = self.motor_set_axis_param(board, 12, 1, motor=motor)
+        writes = []
+        if before_12_ok and before_13_ok:
+            for parameter in (12, 13):
+                result = self.motor_set_axis_param(board, parameter, 0, motor=motor)
+                writes.append({"parameter": parameter, "value": 0, "result": result})
+                if not isinstance(result, dict) or result.get("ok") is not True or not self._tmcl_success(result.get("ack")):
+                    break
         after_12 = self.motor_get_axis_param(board, 12, motor=motor)
         after_13 = self.motor_get_axis_param(board, 13, motor=motor)
         ok = bool(
             before_12_ok
             and before_13_ok
-            and after_12.get("value") == 1
+            and after_12.get("value") == 0
             and after_13.get("value") == 0
             and self._tmcl_success(after_12.get("ack"))
             and self._tmcl_success(after_13.get("ack"))
-            and (write_12 is None or write_12.get("ok") is True)
+            and len(writes) == 2
+            and all(row["result"].get("ok") is True for row in writes)
         )
         return {
             "schema_version": "bioxp.serial206_x_switch_mask_reconciliation.v1",
             "board": board,
             "motor": motor,
-            "machine_adaptation": "SAP12=1",
+            "classification": "controller_state_repair_for_literal_oem_baseline",
             "source_sequence_modified": False,
             "before": {"12": before_12, "13": before_13},
-            "write_12": write_12,
-            "writes": [] if write_12 is None else [{"parameter": 12, "value": 1, "result": write_12}],
+            "writes": writes,
             "after": {"12": after_12, "13": after_13},
             "switch_masks": {
                 12: after_12.get("value"),
@@ -5829,10 +5833,13 @@ class BioXpTester:
             expected[12] = int(bool(preset["disable_right"]))
         if preset.get("disable_left") is not None:
             expected[13] = int(bool(preset["disable_left"]))
-        if str(axis_key).strip().lower() == "z":
+        if str(axis_key).strip().lower() == "x":
+            expected[12] = 0
+            expected[13] = 0
+        elif str(axis_key).strip().lower() == "z":
             # Source preparation leaves Z SAP12/SAP13 untouched.  Verify the
-            # separately reconciled serial-206 persistent wiring state.
-            expected[12] = 1
+            # separately repaired literal-OEM persistent baseline.
+            expected[12] = 0
             expected[13] = 0
         readbacks = {}
         mismatches = []
@@ -5840,7 +5847,13 @@ class BioXpTester:
             row = self.motor_get_axis_param(board, param, motor=motor)
             readbacks[param] = row
             observed = row.get("value") if isinstance(row, dict) else None
-            if observed is None or int(observed) != int(wanted):
+            if (
+                not isinstance(row, dict)
+                or row.get("ok", True) is not True
+                or not self._tmcl_success(row.get("ack"))
+                or type(observed) is not int
+                or observed != int(wanted)
+            ):
                 mismatches.append({"param": param, "expected": wanted, "observed": observed})
         if mismatches:
             self._invalidate_oem_no_motion_profiles(reason=f"{key}_profile_readback_mismatch")

@@ -1,3 +1,5 @@
+import pytest
+
 from src.bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
 from src.bioxp.usb_driver import BioXpTester
 
@@ -10,6 +12,9 @@ class _ProfileTester:
         self.values = {}
         self.calls = []
         self.mismatch = mismatch
+        self.position = 2500
+        self.speed = 0
+        self.profile_verifier_result = {"ok": True}
 
     def _motion_oem_axis_profile(self, axis):
         assert axis == "z"
@@ -17,7 +22,7 @@ class _ProfileTester:
 
     def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides):
         self.calls.append(("verify-profile", axis, dict(expected_overrides)))
-        return {"ok": True}
+        return dict(self.profile_verifier_result)
 
     def motor_oem_verify_motion_interlock(self):
         return {"ok": True}
@@ -30,6 +35,14 @@ class _ProfileTester:
     def motor_get_axis_param(self, board, param, *, motor):
         value = self.values[param] + 1 if self.mismatch else self.values[param]
         return {"ok": True, "ack": dict(ACK), "value": value}
+
+    def motor_get_position(self, board, *, motor):
+        self.calls.append(("gap", board, motor, 1))
+        return {"ok": True, "ack": dict(ACK), "position": self.position}
+
+    def motor_get_speed(self, board, *, motor):
+        self.calls.append(("gap", board, motor, 3))
+        return {"ok": True, "ack": dict(ACK), "speed": self.speed}
 
 
 def _adapter(tester):
@@ -69,18 +82,54 @@ def test_z_profile_control_rejects_readback_mismatch_without_recording_override(
     assert adapter._z_profile_overrides == {}
 
 
-def test_z_mask_reconciliation_restores_machine_bound_right_disabled_left_enabled():
+def test_z_mask_reconciliation_restores_literal_oem_enabled_masks():
     tester = _ProfileTester()
-    tester.values[12] = 0
-    tester.values[13] = 1
+    tester.values.update({9: 0, 10: 0, 12: 1, 13: 1})
     adapter = _adapter(tester)
 
     result = adapter.z_reconcile_switch_masks()
 
     assert result["ok"] is True
-    assert result["machine_bound_expected"] == {12: 1, 13: 0}
-    assert tester.values[12] == 1
+    assert result["machine_bound_expected"] == {12: 0, 13: 0}
+    assert result["classification"] == "controller_state_repair_for_literal_oem_baseline"
+    assert tester.values[12] == 0
     assert tester.values[13] == 0
+
+
+def test_z_mask_repair_fails_when_raw_limit_remains_active_after_enablement():
+    tester = _ProfileTester()
+    tester.values.update({9: 0, 10: 1, 12: 1, 13: 1})
+    adapter = _adapter(tester)
+
+    result = adapter.z_reconcile_switch_masks()
+
+    assert result["ok"] is False
+    assert result["failure"] == "raw_active_z_limit_after_mask_convergence"
+    assert result["raw_active_limits"] == [10]
+
+
+def test_z_move_preflight_blocks_an_active_enabled_limit():
+    tester = _ProfileTester()
+    tester.values.update({9: 0, 10: 1, 12: 0, 13: 0})
+    adapter = _adapter(tester)
+
+    result = adapter._z_oem_move_preflight()
+
+    assert result["ok"] is False
+    assert result["failure"] == "raw_active_z_limit_after_mask_convergence"
+    assert result["raw_active_limits"] == [10]
+
+
+def test_z_absolute_move_does_not_dispatch_with_active_enabled_limit():
+    tester = _ProfileTester()
+    tester.values.update({9: 0, 10: 1, 12: 0, 13: 0})
+    adapter = _adapter(tester)
+
+    result = adapter.z_move_absolute(requested_position_steps=4000, pseudo_home_steps=0)
+
+    assert result["ok"] is False
+    assert result["failure"] == "raw_active_z_limit_after_mask_convergence"
+    assert result["command_issued"] is False
 
 
 def test_z_profile_verifier_accepts_only_reconciled_persistent_masks():
@@ -97,7 +146,7 @@ def test_z_profile_verifier_accepts_only_reconciled_persistent_masks():
         "run_current": 31,
         "stall_guard": 3,
     }
-    values = {4: 1791, 5: 576, 6: 31, 205: 3, 12: 1, 13: 0}
+    values = {4: 1791, 5: 576, 6: 31, 205: 3, 12: 0, 13: 0}
     driver.motor_get_axis_param = lambda board, param, *, motor: {  # type: ignore[method-assign]
         "ok": True,
         "ack": {"status": 100},
@@ -107,8 +156,17 @@ def test_z_profile_verifier_accepts_only_reconciled_persistent_masks():
     result = driver.motor_oem_require_no_motion_profile("z")
 
     assert result["ok"] is True
-    assert result["readbacks"][12]["value"] == 1
+    assert result["readbacks"][12]["value"] == 0
     assert result["readbacks"][13]["value"] == 0
+
+
+def test_z_profile_path_stops_when_exact_profile_verification_fails():
+    tester = _ProfileTester()
+    tester.profile_verifier_result = {"ok": False, "failure": "z_profile_readback_mismatch"}
+    adapter = _adapter(tester)
+
+    with pytest.raises(RuntimeError, match="Z profile verification failed"):
+        adapter._z_profile()
 
 
 def test_z_current_max_oem_sentinel_100_selects_machine_down_current():
@@ -118,3 +176,16 @@ def test_z_current_max_oem_sentinel_100_selects_machine_down_current():
 
     assert result["ok"] is True
     assert (result["param"], result["value"]) == (6, 31)
+
+
+def test_z_terminal_status_rejects_typed_but_non_oem_switch_mask():
+    tester = _ProfileTester()
+    tester.values.update({1: 2500, 3: 0, 4: 1791, 5: 576, 6: 31, 9: 0, 10: 0, 12: 1, 13: 0, 205: 3})
+    adapter = _adapter(tester)
+
+    result = adapter.z_terminal_status()
+
+    assert result["ok"] is False
+    assert result["profile_verified"] is True
+    assert result["switch_mask_verified"] is False
+    assert result["failure"] == "z_oem_profile_or_switch_mask_mismatch"

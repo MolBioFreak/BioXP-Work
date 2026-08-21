@@ -174,7 +174,7 @@ def test_x_wait_accepts_only_fresh_correctly_addressed_128(monkeypatch):
     assert result["event"]["event_sequence"] == 11
 
 
-def test_x_switch_mask_recovery_writes_only_sap12_and_verifies_both(monkeypatch):
+def test_x_switch_mask_recovery_writes_both_masks_and_verifies_both(monkeypatch):
     driver = _driver()
     writes = []
     values = {12: 0, 13: 0}
@@ -193,8 +193,8 @@ def test_x_switch_mask_recovery_writes_only_sap12_and_verifies_both(monkeypatch)
     result = driver.motor_x_reconcile_switch_masks()
 
     assert result["ok"] is True
-    assert writes == [(5, 0, 12, 1)]
-    assert result["switch_masks"] == {12: 1, 13: 0}
+    assert writes == [(5, 0, 12, 0), (5, 0, 13, 0)]
+    assert result["switch_masks"] == {12: 0, 13: 0}
 
 
 def _current_driver(monkeypatch):

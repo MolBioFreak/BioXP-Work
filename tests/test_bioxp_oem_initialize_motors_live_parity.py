@@ -135,13 +135,16 @@ class _ReferenceStore:
         }
 
 
-def test_x_move_preflight_is_oem_trimmed_without_board_reads():
+def test_x_move_preflight_requires_literal_masks_and_inactive_raw_limits():
     class _BusRecorder:
         def __init__(self):
             self.reads = []
-        def _motion_oem_axis_profile(self, *args, **kwargs):
-            self.reads.append("profile")
-            return {}
+            self.values = {9: 0, 10: 0, 12: 0, 13: 0}
+            self.MOTOR_SWITCH_ACTIVE_VALUE = 1
+
+        def motor_get_axis_param(self, board, param, *, motor):
+            self.reads.append((board, motor, param))
+            return {"ok": True, "ack": {"status": 100}, "value": self.values[param]}
     bus = _BusRecorder()
     adapter = Serial206ProductionPrimitiveAdapter(
         bus,
@@ -151,12 +154,57 @@ def test_x_move_preflight_is_oem_trimmed_without_board_reads():
     )
     receipt = adapter._x_oem_move_preflight()
     assert receipt["ok"] is True
-    assert receipt["skipped"] is True
-    assert receipt["reason"] == "oem_move_path_inline_checks"
-    assert "profile_overrides" in receipt
-    assert "switch_masks" not in receipt
-    assert "profile_receipt" not in receipt
-    assert bus.reads == [], "oem move preflight must not read the board"
+    assert receipt["skipped"] is False
+    assert receipt["reason"] == "literal_oem_mask_and_raw_switch_preflight"
+    assert receipt["switch_masks"] == {12: 0, 13: 0}
+    assert receipt["raw_active_limits"] == []
+    assert bus.reads == [(5, 0, 12), (5, 0, 13), (5, 0, 9), (5, 0, 10)]
+
+
+def test_x_move_preflight_blocks_an_active_enabled_limit():
+    class _BusRecorder:
+        MOTOR_SWITCH_ACTIVE_VALUE = 1
+
+        def motor_get_axis_param(self, board, param, *, motor):
+            values = {12: 0, 13: 0, 9: 0, 10: 1}
+            return {"ok": True, "ack": {"status": 100}, "value": values[param]}
+
+    adapter = Serial206ProductionPrimitiveAdapter(
+        _BusRecorder(),
+        pipette_transport=None,
+        authority_provider=lambda: None,
+        generation_provider=lambda: 1,
+    )
+
+    receipt = adapter._x_oem_move_preflight()
+
+    assert receipt["ok"] is False
+    assert receipt["failure"] == "raw_active_x_limit_after_mask_convergence"
+    assert receipt["raw_active_limits"] == [10]
+
+
+def test_x_profile_path_stops_when_exact_profile_verification_fails():
+    class _BusRecorder:
+        def _motion_oem_axis_profile(self, axis, *, startup=False):
+            assert axis == "x"
+            assert startup is True
+            return {"board": 5, "motor": 0, "axis_min_steps": 0, "axis_max_steps": 90263}
+
+        def motor_oem_require_no_motion_profile(self, axis, *, expected_overrides):
+            return {"ok": False, "failure": "x_profile_readback_mismatch"}
+
+        def motor_get_axis_param(self, board, param, *, motor):
+            return {"ok": True, "ack": {"status": 100}, "value": 0}
+
+    adapter = Serial206ProductionPrimitiveAdapter(
+        _BusRecorder(),
+        pipette_transport=None,
+        authority_provider=lambda: None,
+        generation_provider=lambda: 1,
+    )
+
+    with pytest.raises(RuntimeError, match="X profile verification failed"):
+        adapter._x_require_motion_preflight()
 
 
 def test_provider_owns_z_lifecycle_and_routes_only_source_positive_intents():

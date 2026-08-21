@@ -34,7 +34,7 @@ X_PROFILE = {
     "run_current": 31,
     "stall_guard": 16,
 }
-X_MASK_TUPLE = {12: 1, 13: 0}
+X_MASK_TUPLE = {12: 0, 13: 0}
 TERMINAL_GAPS = (1, 3, 4, 5, 6, 9, 10, 12, 13, 205)
 ERROR_EVENTS = (13, 14, 130)
 
@@ -129,7 +129,7 @@ class InMemoryXTester:
     def __init__(self, *, position: int = 1000) -> None:
         self.positions = {5: int(position), 4: 2000}
         self.params = {
-            5: {1: int(position), 3: 0, 4: 1700, 5: 350, 6: 31, 9: 1, 10: 1, 12: 1, 13: 0, 205: 16},
+            5: {1: int(position), 3: 0, 4: 1700, 5: 350, 6: 31, 9: 0, 10: 0, 12: 0, 13: 0, 205: 16},
             4: {1: 2000, 3: 0, 4: 1800, 5: 400, 6: 31, 9: 1, 10: 1, 12: 0, 13: 0, 205: 16},
         }
         self.calls: list[tuple[Any, ...]] = []
@@ -373,23 +373,55 @@ def test_x_prepare_selects_x_component_and_exact_oem_profile_without_mask_writes
     assert not any(call[:4] in {("sap", 5, 0, 12), ("sap", 5, 0, 13)} for call in tester.calls)
 
 
-def test_d1_recovery_writes_only_sap12_and_verifies_shared_12_13_tuple_then_invalidates():
+def test_d1_recovery_writes_both_x_masks_and_verifies_literal_oem_tuple_then_invalidates():
     tester = InMemoryXTester()
-    tester.params[5][12] = 0
+    tester.params[5][12] = 1
+    tester.params[5][9] = 0
+    tester.params[5][10] = 0
     adapter = make_adapter(tester=tester)
 
     result = adapter.x_reconcile_switch_masks()
 
     assert result["ok"] is True
-    assert result["classification"] == "serial206_machine_safety_adaptation"
+    assert result["classification"] == "controller_state_repair_for_literal_oem_baseline"
     assert result["switch_mask_tuple"] == X_MASK_TUPLE
-    assert [call for call in tester.calls if call[0] == "sap"] == [("sap", 5, 0, 12, 1)]
+    assert [call for call in tester.calls if call[0] == "sap"] == [
+        ("sap", 5, 0, 12, 0),
+        ("sap", 5, 0, 13, 0),
+    ]
     assert {call for call in tester.calls if call[0] == "gap" and call[-1] in (12, 13)} == {
         ("gap", 5, 0, 12),
         ("gap", 5, 0, 13),
     }
     assert result["preparation_invalidated"] is True
     assert result["reference_invalidated"] is True
+
+
+def test_x_mask_repair_fails_when_raw_limit_remains_active_after_enablement():
+    tester = InMemoryXTester()
+    tester.params[5][9] = 0
+    tester.params[5][10] = 1
+    adapter = make_adapter(tester=tester)
+
+    result = adapter.x_reconcile_switch_masks()
+
+    assert result["ok"] is False
+    assert result["failure"] == "raw_active_x_limit_after_mask_convergence"
+    assert result["raw_active_limits"] == [10]
+    assert result["preparation_invalidated"] is True
+
+
+def test_x_absolute_move_does_not_dispatch_with_active_enabled_limit():
+    tester = InMemoryXTester(position=1000)
+    tester.params[5][10] = 1
+    adapter = make_adapter(tester=tester)
+
+    result = adapter.x_move_absolute(position_steps=2000)
+
+    assert result["ok"] is False
+    assert result["failure"] == "raw_active_x_limit_after_mask_convergence"
+    assert result["command_issued"] is False
+    assert not any(call[0] == "move_abs" for call in tester.calls)
 
 
 def test_x_terminal_status_uses_ack_backed_typed_gap_reads_for_complete_contract():
@@ -404,6 +436,19 @@ def test_x_terminal_status_uses_ack_backed_typed_gap_reads_for_complete_contract
     assert result["switch_mask_tuple"] == X_MASK_TUPLE
     assert set(result["readbacks"]) == set(TERMINAL_GAPS)
     assert all(row["ack"]["status"] == 100 for row in result["readbacks"].values())
+
+
+def test_x_terminal_status_rejects_typed_but_non_oem_switch_mask():
+    tester = InMemoryXTester(position=4321)
+    tester.params[5][12] = 1
+    adapter = make_adapter(tester=tester)
+
+    result = adapter.x_terminal_status()
+
+    assert result["ok"] is False
+    assert result["profile_verified"] is True
+    assert result["switch_mask_verified"] is False
+    assert result["failure"] == "x_oem_profile_or_switch_mask_mismatch"
 
 
 def test_x_terminal_status_rejects_boolean_speed_even_though_false_equals_zero():
@@ -629,7 +674,7 @@ class ProviderPrimitives:
 
     def _x_require_motion_preflight(self):
         self.calls.append(("x_live_preflight", {}))
-        return {"profile": {"axis": "x"}, "switch_masks": {12: 1, 13: 0}}
+        return {"profile": {"axis": "x"}, "switch_masks": {12: 0, 13: 0}}
 
     def home_xy(self, **kwargs):
         self.calls.append(("home_xy", dict(kwargs)))
@@ -797,14 +842,14 @@ def test_x_projection_preserves_complete_typed_terminal_status_without_omission_
                 "max_current": 31,
                 "left_switch_state": 0,
                 "right_switch_state": 0,
-                "right_switch_disabled": True,
+                "right_switch_disabled": False,
                 "left_switch_disabled": False,
                 "stall_guard": 16,
                 "profile_verified": True,
                 "expected_profile": {4: 1700, 5: 350, 6: 31, 205: 16},
                 "switch_mask_verified": True,
-                "switch_mask_tuple": {12: 1, 13: 0},
-                "expected_switch_masks": {12: 1, 13: 0},
+                "switch_mask_tuple": {12: 0, 13: 0},
+                "expected_switch_masks": {12: 0, 13: 0},
                 "readbacks": readbacks,
                 "authority": "serial206_x_terminal_register_readback",
                 "failure": None,

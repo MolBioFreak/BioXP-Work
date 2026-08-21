@@ -280,15 +280,15 @@ def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switc
 
 def test_prepare_without_motion_requires_reconciled_z_right_mask():
     driver = FakeMotionDriver()
-    driver.parameter_readbacks[(4, 1, 12)] = 0
+    driver.parameter_readbacks[(4, 1, 12)] = 1
 
-    result = prepare_motion_without_motion(driver, authority())
+    result = prepare_motion_without_motion(driver, authority(), components=("z",))
 
     assert result["ok"] is False
     stage = next(row for row in result["stage_ledger"] if row["stage_id"] == "z_switch_mask_precondition")
     assert stage["status"] == "failed"
-    assert stage["controller_evidence"]["machine_bound_expected"] == {12: 1, 13: 0}
-    assert stage["controller_evidence"]["readbacks"]["right_disable_param12"]["value"] == 0
+    assert stage["controller_evidence"]["machine_bound_expected"] == {12: 0, 13: 0}
+    assert stage["controller_evidence"]["readbacks"]["right_disable_param12"]["value"] == 1
     assert stage["controller_evidence"]["writes"] == {}
     assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
 

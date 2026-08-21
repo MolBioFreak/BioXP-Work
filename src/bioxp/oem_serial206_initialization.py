@@ -17,7 +17,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from .motion_safety import SERIAL206_X_SWITCH_MASKS, prepare_motion_without_motion
+from .motion_safety import (
+    SERIAL206_X_SWITCH_MASKS,
+    SERIAL206_Z_SWITCH_MASKS,
+    prepare_motion_without_motion,
+)
 from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
@@ -665,26 +669,69 @@ class Serial206ProductionPrimitiveAdapter:
         )
 
     def _x_oem_move_preflight(self) -> dict[str, Any]:
-        """OEM-aligned move-path pre-flight (R-A7).
-
-        ClassHeadBoard.moveSteps dispatches after inline checks only: init,
-        beyondLimit against a fresh position read, queryMotorStop, then
-        MovetoRelPosition. It never re-reads the motion profile or the switch
-        masks on the move path. The mask/profile validation lives in the
-        prepare and profile-write flows, where the OEM performs the mask work.
-        The move path keeps the diagnostic record without board reads.
-        """
+        """Require fresh literal-OEM masks and raw limit readbacks before X motion."""
+        try:
+            mask_rows = {
+                param: self.tester.motor_get_axis_param(5, param, motor=0)
+                for param in (12, 13)
+            }
+            raw_rows = {
+                param: self.tester.motor_get_axis_param(5, param, motor=0)
+                for param in (9, 10)
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "skipped": False,
+                "reason": "literal_oem_mask_and_raw_switch_preflight",
+                "failure": "x_switch_mask_preflight_read_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "physical_motion": False,
+            }
+        active_value = int(getattr(self.tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))
+        mask_values = {param: self._x_value(row) for param, row in mask_rows.items()}
+        raw_values = {param: self._x_value(row) for param, row in raw_rows.items()}
+        mask_verified = all(
+            self._x_readback_verified(mask_rows[param], expected)
+            for param, expected in SERIAL206_X_SWITCH_MASKS.items()
+        )
+        raw_switches_verified = all(self._x_readback_verified(row) for row in raw_rows.values())
+        raw_active_limits = [
+            param for param, value in raw_values.items() if value == active_value
+        ]
+        failure = None
+        if not mask_verified:
+            failure = "x_switch_mask_preflight_readback_failed"
+        elif not raw_switches_verified:
+            failure = "x_raw_switch_preflight_readback_failed"
+        elif raw_active_limits:
+            failure = "raw_active_x_limit_after_mask_convergence"
         return {
-            "ok": True,
-            "skipped": True,
-            "reason": "oem_move_path_inline_checks",
-            "profile_overrides": dict(self._x_profile_overrides),
+            "ok": failure is None,
+            "skipped": False,
+            "reason": "literal_oem_mask_and_raw_switch_preflight",
+            "profile_overrides": dict(getattr(self, "_x_profile_overrides", {})),
+            "switch_masks": mask_values,
+            "expected_switch_masks": dict(SERIAL206_X_SWITCH_MASKS),
+            "raw_switches": raw_values,
+            "raw_active_limits": raw_active_limits,
+            "mask_readbacks": _json_safe(mask_rows),
+            "raw_readbacks": _json_safe(raw_rows),
+            "mask_verified": mask_verified,
+            "raw_switches_verified": raw_switches_verified,
+            "source_exact": False,
+            "physical_motion": False,
+            "failure": failure,
         }
 
     def _x_require_motion_preflight(self) -> dict[str, Any]:
         profile = dict(self._x_profile())
         require_profile = getattr(self.tester, "motor_oem_require_no_motion_profile", None)
         profile_receipt = require_profile("x", expected_overrides=dict(self._x_profile_overrides)) if callable(require_profile) else None
+        if profile_receipt is not None and (
+            not isinstance(profile_receipt, Mapping) or profile_receipt.get("ok") is not True
+        ):
+            raise RuntimeError(f"serial-206 X profile verification failed: {profile_receipt}")
         masks = {
             param: self.tester.motor_get_axis_param(5, param, motor=0)
             for param in (12, 13)
@@ -793,8 +840,10 @@ class Serial206ProductionPrimitiveAdapter:
             failure = "x_terminal_speed_not_typed_integer_zero"
         elif not verified:
             failure = "x_terminal_readback_not_verified"
+        elif not profile_verified or not mask_verified:
+            failure = "x_oem_profile_or_switch_mask_mismatch"
         return {
-            "ok": verified and typed_speed_zero,
+            "ok": verified and typed_speed_zero and profile_verified and mask_verified,
             "axis": "x",
             "board": 5,
             "motor": 0,
@@ -820,17 +869,54 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_reconcile_switch_masks(self) -> dict[str, Any]:
         before = {param: self.tester.motor_get_axis_param(5, param, motor=0) for param in (12, 13)}
-        write = self.tester.motor_set_axis_param(5, 12, SERIAL206_X_SWITCH_MASKS[12], motor=0)
+        position_before = self.tester.motor_get_position(5, motor=0)
+        speed_before = self.tester.motor_get_speed(5, motor=0)
+        writes: dict[int, Any] = {}
+        acknowledged = True
+        for param in (12, 13):
+            write = self.tester.motor_set_axis_param(
+                5, param, SERIAL206_X_SWITCH_MASKS[param], motor=0
+            )
+            writes[param] = write
+            if not (
+                isinstance(write, Mapping)
+                and write.get("ok") is True
+                and self._x_tmcl_success(write.get("ack"))
+            ):
+                acknowledged = False
+                break
         after = {param: self.tester.motor_get_axis_param(5, param, motor=0) for param in (12, 13)}
-        acknowledged = bool(
-            isinstance(write, Mapping)
-            and write.get("ok") is True
-            and self._x_tmcl_success(write.get("ack"))
+        position_after = self.tester.motor_get_position(5, motor=0)
+        speed_after = self.tester.motor_get_speed(5, motor=0)
+        raw_switches_after = {
+            param: self.tester.motor_get_axis_param(5, param, motor=0) for param in (9, 10)
+        }
+        active_value = int(getattr(self.tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))
+        raw_active_limits = [
+            param
+            for param, row in raw_switches_after.items()
+            if self._x_readback_verified(row) and self._x_value(row) == active_value
+        ]
+        raw_switches_verified = all(
+            self._x_readback_verified(row) for row in raw_switches_after.values()
+        )
+        position_before_value = self._x_value(position_before)
+        position_after_value = self._x_value(position_after)
+        speed_after_value = speed_after.get("speed") if isinstance(speed_after, Mapping) else None
+        no_motion_verified = bool(
+            self._x_readback_verified(position_before)
+            and self._x_readback_verified(position_after)
+            and position_before_value == position_after_value
+            and isinstance(speed_after, Mapping)
+            and speed_after.get("ok", True) is True
+            and self._x_tmcl_success(speed_after.get("ack"))
+            and type(speed_after_value) is int
+            and speed_after_value == 0
         )
         verified = acknowledged and all(
             self._x_readback_verified(after[param], expected)
             for param, expected in SERIAL206_X_SWITCH_MASKS.items()
-        )
+        ) and no_motion_verified and raw_switches_verified and not raw_active_limits
         if verified:
             self._x_profile_overrides.clear()
         invalidation = self._x_desync(
@@ -842,13 +928,21 @@ class Serial206ProductionPrimitiveAdapter:
             "axis": "x",
             "intent": "reconcile_switch_masks",
             "source_exact": False,
-            "adaptation": "serial206_machine_safety_adaptation",
-            "classification": "serial206_machine_safety_adaptation",
-            "writes": {"12": _json_safe(write)},
+            "adaptation": "controller_state_repair_for_literal_oem_baseline",
+            "classification": "controller_state_repair_for_literal_oem_baseline",
+            "writes": {str(param): _json_safe(row) for param, row in writes.items()},
             "before": _json_safe(before),
             "after": _json_safe(after),
             "machine_bound_expected": dict(SERIAL206_X_SWITCH_MASKS),
             "switch_mask_tuple": {param: self._x_value(after[param]) for param in (12, 13)},
+            "position_before": _json_safe(position_before),
+            "position_after": _json_safe(position_after),
+            "speed_before": _json_safe(speed_before),
+            "speed_after": _json_safe(speed_after),
+            "no_motion_verified": no_motion_verified,
+            "raw_switches_after": _json_safe(raw_switches_after),
+            "raw_active_limits": raw_active_limits,
+            "raw_switches_verified": raw_switches_verified,
             "preparation_invalidated": True,
             "reference_invalidated": bool(
                 self.reference_store is None
@@ -859,7 +953,11 @@ class Serial206ProductionPrimitiveAdapter:
             "controller_terminal_state_verified": verified,
             "physical_motion_commanded": False,
             "physical_effect_verified": False,
-            "failure": None if verified else "x_switch_mask_reconciliation_failed",
+            "failure": None if verified else (
+                "raw_active_x_limit_after_mask_convergence"
+                if raw_active_limits
+                else "x_switch_mask_reconciliation_failed"
+            ),
         }
 
     def _x_event_fresh(self, event: Any, event_window: Any) -> bool:
@@ -899,6 +997,14 @@ class Serial206ProductionPrimitiveAdapter:
 
     def _x_issue_absolute(self, requested: int, *, source_mode: str, clamp_low: int = 0, acceleration: int | None = None, event_window: Any = None) -> dict[str, Any]:
         preflight = self._x_oem_move_preflight()
+        if preflight.get("ok") is not True:
+            return {
+                "ok": False,
+                "failure": preflight.get("failure") or "x_move_preflight_failed",
+                "preflight": _json_safe(preflight),
+                "command_issued": False,
+                "physical_motion_commanded": False,
+            }
         before = self.tester.motor_get_position(5, motor=0)
         before_value = self._x_value(before)
         if not self._x_readback_verified(before):
@@ -1119,6 +1225,15 @@ class Serial206ProductionPrimitiveAdapter:
     def x_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
         reference = self._reference_snapshot(("x",), "ClassControlInterface.moveSteps(x)")
         preflight = self._x_oem_move_preflight()
+        if preflight.get("ok") is not True:
+            return {
+                "ok": False,
+                "failure": preflight.get("failure") or "x_move_preflight_failed",
+                "preflight": _json_safe(preflight),
+                "command_issued": False,
+                "physical_motion_commanded": False,
+                "reference_before": _json_safe(reference),
+            }
         before = self.tester.motor_get_position(5, motor=0)
         before_value = self._x_value(before)
         if not self._x_readback_verified(before):
@@ -1528,13 +1643,78 @@ class Serial206ProductionPrimitiveAdapter:
                 ))
         return receipt
 
+    def _z_oem_move_preflight(self) -> dict[str, Any]:
+        """Require fresh literal-OEM masks and raw limit readbacks before Z motion."""
+        try:
+            mask_rows = {
+                param: self.tester.motor_get_axis_param(4, param, motor=1)
+                for param in (12, 13)
+            }
+            raw_rows = {
+                param: self.tester.motor_get_axis_param(4, param, motor=1)
+                for param in (9, 10)
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "skipped": False,
+                "reason": "literal_oem_mask_and_raw_switch_preflight",
+                "failure": "z_switch_mask_preflight_read_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "physical_motion": False,
+            }
+        active_value = int(getattr(self.tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))
+        mask_values = {param: self._z_value(row) for param, row in mask_rows.items()}
+        raw_values = {param: self._z_value(row) for param, row in raw_rows.items()}
+        mask_verified = all(
+            isinstance(mask_rows[param], Mapping)
+            and self._z_tmcl_success(mask_rows[param].get("ack"))
+            and type(self._z_value(mask_rows[param])) is int
+            and self._z_value(mask_rows[param]) == expected
+            for param, expected in SERIAL206_Z_SWITCH_MASKS.items()
+        )
+        raw_switches_verified = all(
+            isinstance(row, Mapping)
+            and self._z_tmcl_success(row.get("ack"))
+            and type(self._z_value(row)) is int
+            for row in raw_rows.values()
+        )
+        raw_active_limits = [
+            param for param, value in raw_values.items() if value == active_value
+        ]
+        failure = None
+        if not mask_verified:
+            failure = "z_switch_mask_preflight_readback_failed"
+        elif not raw_switches_verified:
+            failure = "z_raw_switch_preflight_readback_failed"
+        elif raw_active_limits:
+            failure = "raw_active_z_limit_after_mask_convergence"
+        return {
+            "ok": failure is None,
+            "skipped": False,
+            "reason": "literal_oem_mask_and_raw_switch_preflight",
+            "switch_masks": mask_values,
+            "expected_switch_masks": dict(SERIAL206_Z_SWITCH_MASKS),
+            "raw_switches": raw_values,
+            "raw_active_limits": raw_active_limits,
+            "mask_readbacks": _json_safe(mask_rows),
+            "raw_readbacks": _json_safe(raw_rows),
+            "mask_verified": mask_verified,
+            "raw_switches_verified": raw_switches_verified,
+            "source_exact": False,
+            "physical_motion": False,
+            "failure": failure,
+        }
+
     def _z_profile(self) -> dict[str, Any]:
         profile = dict(self.tester._motion_oem_axis_profile("z"))
         if int(profile.get("board", -1)) != 4 or int(profile.get("motor", -1)) != 1:
             raise RuntimeError("serial-206 Z authority must resolve to board 4 motor 1")
-        self.tester.motor_oem_require_no_motion_profile(
+        verification = self.tester.motor_oem_require_no_motion_profile(
             "z", expected_overrides=dict(self._z_profile_overrides)
         )
+        if not isinstance(verification, Mapping) or verification.get("ok") is not True:
+            raise RuntimeError(f"serial-206 Z profile verification failed: {verification}")
         interlock = self.tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, Mapping) or interlock.get("ok") is not True:
             raise RuntimeError(f"serial-206 Z interlock failed: {interlock}")
@@ -1649,23 +1829,47 @@ class Serial206ProductionPrimitiveAdapter:
         motor = int(profile["motor"])
         rows = {
             param: self.tester.motor_get_axis_param(board, param, motor=motor)
-            for param in (1, 3, 9, 10, 12, 13)
+            for param in (1, 3, 4, 5, 6, 9, 10, 12, 13, 205)
         }
         values = {param: self._z_value(row) for param, row in rows.items()}
         verified = all(
             isinstance(row, Mapping) and self._z_tmcl_success(row.get("ack"))
             for row in rows.values()
         )
+        expected_profile = {4: 1791, 5: 576, 6: 31, 205: 3}
+        profile_verified = verified and all(
+            values[param] == expected for param, expected in expected_profile.items()
+        )
+        mask_verified = verified and all(
+            values[param] == expected for param, expected in SERIAL206_Z_SWITCH_MASKS.items()
+        )
+        failure = None
+        if type(values[3]) is not int or values[3] != 0:
+            failure = "z_terminal_speed_not_typed_integer_zero"
+        elif not verified:
+            failure = "z_terminal_readback_not_verified"
+        elif not profile_verified or not mask_verified:
+            failure = "z_oem_profile_or_switch_mask_mismatch"
         return {
-            "ok": verified,
+            "ok": verified and profile_verified and mask_verified and values[3] == 0,
             "position_steps": values[1],
             "speed_steps_s": values[3],
+            "max_speed": values[4],
+            "max_acceleration": values[5],
+            "max_current": values[6],
             "left_switch_state": values[9],
             "right_switch_state": values[10],
             "right_switch_disabled": None if values[12] is None else values[12] != 0,
             "left_switch_disabled": None if values[13] is None else values[13] != 0,
+            "stall_guard": values[205],
+            "expected_profile": expected_profile,
+            "profile_verified": profile_verified,
+            "switch_mask_tuple": {param: values[param] for param in (12, 13)},
+            "expected_switch_masks": dict(SERIAL206_Z_SWITCH_MASKS),
+            "switch_mask_verified": mask_verified,
             "readbacks": _json_safe(rows),
             "authority": "serial206_terminal_register_readback",
+            "failure": failure,
         }
 
     def _z_tmcl_success(self, ack: Any) -> bool:
@@ -1772,6 +1976,15 @@ class Serial206ProductionPrimitiveAdapter:
 
     def z_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
         profile = self._z_profile()
+        preflight = self._z_oem_move_preflight()
+        if preflight.get("ok") is not True:
+            return {
+                "ok": False,
+                "failure": preflight.get("failure") or "z_move_preflight_failed",
+                "preflight": _json_safe(preflight),
+                "command_issued": False,
+                "physical_motion_commanded": False,
+            }
         before = self.tester.motor_get_position(4, motor=1)
         before_value = self._z_value(before)
         if not (
@@ -1826,6 +2039,7 @@ class Serial206ProductionPrimitiveAdapter:
         result.update({
             "intent": "move_steps",
             "requested_steps": int(steps),
+            "preflight": _json_safe(preflight),
             "source_anchor": "ClassControlInterface.moveSteps:4165-4204",
         })
         return result
@@ -1838,6 +2052,15 @@ class Serial206ProductionPrimitiveAdapter:
         wait_timeout_s: float = 20.0,
     ) -> dict[str, Any]:
         profile = self._z_profile()
+        preflight = self._z_oem_move_preflight()
+        if preflight.get("ok") is not True:
+            return {
+                "ok": False,
+                "failure": preflight.get("failure") or "z_move_preflight_failed",
+                "preflight": _json_safe(preflight),
+                "command_issued": False,
+                "physical_motion_commanded": False,
+            }
         requested = int(requested_position_steps)
         effective = max(int(pseudo_home_steps), requested)
         if requested < 0 or requested > 160000 or effective < 0 or effective > 160000:
@@ -1916,6 +2139,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "controller_command_acknowledged": False,
                 "controller_terminal_state_verified": terminal_verified,
                 "physical_effect_verified": False,
+                "preflight": _json_safe(preflight),
             }
         current_write = self.tester.motor_set_axis_param(4, 6, int(profile["run_current"]), motor=1)
         current_readback = self.tester.motor_get_axis_param(4, 6, motor=1)
@@ -1949,6 +2173,7 @@ class Serial206ProductionPrimitiveAdapter:
             "effective_position_steps": effective,
             "pseudo_home_steps": int(pseudo_home_steps),
             "source_anchor": "ClassControlInterface.moveZ:4254-4265",
+            "preflight": _json_safe(preflight),
         })
         return result
 
@@ -2312,18 +2537,62 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_reconcile_switch_masks(self) -> dict[str, Any]:
-        expected = {12: 1, 13: 0}
+        expected = dict(SERIAL206_Z_SWITCH_MASKS)
         before = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
-        writes = {
-            param: self.tester.motor_set_axis_param(4, param, expected[param], motor=1)
-            for param in (12, 13)
-        }
+        position_before = self.tester.motor_get_position(4, motor=1)
+        speed_before = self.tester.motor_get_speed(4, motor=1)
+        writes: dict[int, Any] = {}
+        acknowledged = True
+        for param in (12, 13):
+            write = self.tester.motor_set_axis_param(4, param, expected[param], motor=1)
+            writes[param] = write
+            if not (
+                isinstance(write, Mapping)
+                and write.get("ok") is True
+                and self._z_tmcl_success(write.get("ack"))
+            ):
+                acknowledged = False
+                break
         after = {param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (12, 13)}
-        ok = all(
-            isinstance(writes[param], Mapping) and writes[param].get("ok") is True
+        position_after = self.tester.motor_get_position(4, motor=1)
+        speed_after = self.tester.motor_get_speed(4, motor=1)
+        raw_switches_after = {
+            param: self.tester.motor_get_axis_param(4, param, motor=1) for param in (9, 10)
+        }
+        active_value = int(getattr(self.tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))
+        raw_active_limits = [
+            param
+            for param, row in raw_switches_after.items()
+            if isinstance(row, Mapping)
+            and self._z_tmcl_success(row.get("ack"))
+            and type(self._z_value(row)) is int
+            and self._z_value(row) == active_value
+        ]
+        raw_switches_verified = all(
+            isinstance(row, Mapping) and self._z_tmcl_success(row.get("ack"))
+            and type(self._z_value(row)) is int
+            for row in raw_switches_after.values()
+        )
+        position_before_value = self._z_value(position_before)
+        position_after_value = self._z_value(position_after)
+        speed_after_value = speed_after.get("speed") if isinstance(speed_after, Mapping) else None
+        no_motion_verified = bool(
+            isinstance(position_before, Mapping)
+            and self._z_tmcl_success(position_before.get("ack"))
+            and isinstance(position_after, Mapping)
+            and self._z_tmcl_success(position_after.get("ack"))
+            and position_before_value == position_after_value
+            and isinstance(speed_after, Mapping)
+            and speed_after.get("ok", True) is True
+            and self._z_tmcl_success(speed_after.get("ack"))
+            and type(speed_after_value) is int
+            and speed_after_value == 0
+        )
+        ok = acknowledged and all(
+            self._z_tmcl_success(after[param].get("ack"))
             and self._z_value(after[param]) == expected[param]
             for param in (12, 13)
-        )
+        ) and no_motion_verified and raw_switches_verified and not raw_active_limits
         return {
             "ok": ok,
             "intent": "reconcile_switch_masks",
@@ -2332,11 +2601,26 @@ class Serial206ProductionPrimitiveAdapter:
             "before": _json_safe(before),
             "writes": _json_safe(writes),
             "after": _json_safe(after),
+            "position_before": _json_safe(position_before),
+            "position_after": _json_safe(position_after),
+            "speed_before": _json_safe(speed_before),
+            "speed_after": _json_safe(speed_after),
+            "no_motion_verified": no_motion_verified,
+            "raw_switches_after": _json_safe(raw_switches_after),
+            "raw_active_limits": raw_active_limits,
+            "raw_switches_verified": raw_switches_verified,
             "source_exact": False,
+            "adaptation": "controller_state_repair_for_literal_oem_baseline",
+            "classification": "controller_state_repair_for_literal_oem_baseline",
             "machine_bound_expected": expected,
+            "failure": None if ok else (
+                "raw_active_z_limit_after_mask_convergence"
+                if raw_active_limits
+                else "z_switch_mask_reconciliation_failed"
+            ),
             "recovery_reason": (
-                "restore serial-206 persistent Z wiring contract: "
-                "GAP12/right disabled, GAP13/GAP9-left enabled"
+                "restore literal OEM Z switch-mask baseline: "
+                "GAP12/right enabled, GAP13/left enabled"
             ),
         }
 

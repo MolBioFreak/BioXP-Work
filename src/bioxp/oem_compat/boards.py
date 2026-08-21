@@ -38,7 +38,7 @@ class AxisProfile:
 AXIS_PROFILES: dict[str, AxisProfile] = {
     "x": AxisProfile("x", "X", BOARD_DECK, 0, 1700, 350, 31, 10, 16, False, False),
     "y": AxisProfile("y", "Y", BOARD_HEAD, 0, 1800, 400, 31, 10, 16, True, False),
-    "z": AxisProfile("z", "Z", BOARD_HEAD, 1, 1791, 576, 31, 10, 16, False, False),
+    "z": AxisProfile("z", "Z", BOARD_HEAD, 1, 1791, 576, 31, 10, 3, False, False),
     "g": AxisProfile("g", "GRIPPER", BOARD_HEAD, 2, 1500, 20, 10, 10, 20, None, None, 6, 2),
     "door": AxisProfile("door", "THERMAL_DOOR", BOARD_THERMAL, 0, 600, 200, 20, 10, 6, True, True),
 }
