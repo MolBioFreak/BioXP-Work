@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import shutil
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -19,6 +20,7 @@ from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Mapping, Optional, Protocol, cast
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -46,7 +48,7 @@ from .oem_serial206_initialization import (
     Serial206ProductionPrimitiveAdapter,
     Serial206StageApproval,
 )
-from .oem_runtime_store import OEMRuntimeStore
+from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
 
@@ -224,6 +226,7 @@ _pipette_receipts = PipetteReceiptStore()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_y_provider: Serial206YProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
+_operator_control_plane_installed = False
 
 
 def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
@@ -769,8 +772,18 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    del app
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _operator_control_plane_installed
+    runtime_root = Path(
+        os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
+        or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
+        or "/tmp/bioxp-oem-runtime"
+    )
+    runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
+    try:
+        migrate_runtime_database_v2(migration_connection, runtime_root)
+    finally:
+        migration_connection.close()
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)
@@ -817,6 +830,16 @@ async def lifespan(app: FastAPI):
         z_resume_provider=_runtime_z_resume_provider,
         autostart=True,
     )
+    if not _operator_control_plane_installed:
+        install_operator_control_plane(
+            app,
+            maintenance_state_provider=_maintenance_state_payload,
+            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
+            lifecycle_state_provider=lifecycle_state.projection,
+            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+            pipette_status_provider=_operator_pipette_status,
+        )
+        _operator_control_plane_installed = True
     try:
         yield
     finally:
@@ -834,6 +857,12 @@ async def lifespan(app: FastAPI):
                     shutdown_oem_runtime()
                 except Exception as exc:
                     shutdown_errors.append(f"OEM runtime shutdown: {exc}")
+                command_plane = getattr(app.state, "operator_command_plane", None)
+                if command_plane is not None:
+                    try:
+                        command_plane.stop()
+                    except Exception as exc:
+                        shutdown_errors.append(f"operator command plane shutdown: {exc}")
                 cleanup_errors = list(shutdown_errors)
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
@@ -1630,6 +1659,19 @@ class OemYMoveStepsRequest(BaseModel):
 
 
 class OemYMoveAbsoluteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_steps: StrictInt
+
+
+class OemYAccelerationOverloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_steps: StrictInt
+    acceleration_override: StrictInt = Field(ge=1, le=2047)
+
+
+class OemYBoardTestMyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     target_steps: StrictInt
@@ -6855,6 +6897,15 @@ async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
 
 @app.post("/motion/diagnostics/stop")
 async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
+    if req.axis == "y":
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "direct_y_diagnostic_stop_retired",
+                "replacement_action_id": None,
+                "physical_motion_commanded": False,
+            },
+        )
     try:
         action = resolve_axis_diagnostic(req.axis, "stop")
     except AxisDiagnosticContractError as exc:  # pragma: no cover - literal axis restricts this
@@ -7160,11 +7211,12 @@ def _require_serial206_y_provider() -> Serial206YProvider:
 
 
 def _execute_serial206_y_call(method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
-    if method_name in {"prepare", "move_steps", "move_absolute", "home", "set_home", "stop"}:
+    if method_name in {"prepare", "move_steps", "move_absolute", "move_absolute_internal", "terminalize_absolute", "home", "set_home", "stop"}:
         context = current_operator_dispatch_context()
         if not isinstance(context, Mapping):
             raise HTTPException(status_code=410, detail={"error": "direct_serial206_y_mutation_retired", "replacement": "/operator/actions/{semantic_y_action_id}", "physical_motion_commanded": False})
-        kwargs.setdefault("command_id", str(context["operator_command_id"]))
+        if method_name != "terminalize_absolute":
+            kwargs.setdefault("command_id", str(context["operator_command_id"]))
     provider = _require_serial206_y_provider()
     method = getattr(provider, method_name)
     try:
@@ -7212,6 +7264,44 @@ async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
         lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
         timeout_s=30.0,
     )
+
+
+@app.post("/motion/oem/y/internal/acceleration_overload")
+async def motion_oem_y_acceleration_overload(req: OemYAccelerationOverloadRequest):
+    return await _run_blocking(
+        "serial-206 Y acceleration overload",
+        lambda: _execute_serial206_y_call(
+            "move_absolute_internal",
+            "acceleration_overload",
+            int(req.target_steps),
+            acceleration_override=int(req.acceleration_override),
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/y/internal/board_test_my")
+async def motion_oem_y_board_test_my(req: OemYBoardTestMyRequest):
+    return await _run_blocking(
+        "serial-206 Y board_test_my",
+        lambda: _execute_serial206_y_call(
+            "move_absolute_internal",
+            "board_test_my",
+            int(req.target_steps),
+        ),
+        timeout_s=30.0,
+    )
+
+
+def _terminalize_serial206_y_internal(issued_receipt: Mapping[str, Any], timeout_s: float) -> dict[str, Any]:
+    return _execute_serial206_y_call(
+        "terminalize_absolute",
+        dict(issued_receipt),
+        timeout_s=float(timeout_s),
+    )
+
+
+app.state.serial206_y_terminalizer = _terminalize_serial206_y_internal
 
 
 @app.post("/motion/oem/y/home")
@@ -9322,16 +9412,3 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-# Install after every primitive/lifecycle route has been declared.  The
-# catalog is therefore an exact snapshot of the final production route table,
-# and the operator router cannot accidentally enumerate/dispatch itself.
-install_operator_control_plane(
-    app,
-    maintenance_state_provider=_maintenance_state_payload,
-    reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
-    lifecycle_state_provider=lifecycle_state.projection,
-    serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
-    pipette_status_provider=_operator_pipette_status,
-)

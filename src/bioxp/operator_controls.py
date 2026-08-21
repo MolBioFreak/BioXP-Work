@@ -20,7 +20,7 @@ from contextvars import ContextVar
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.types import Message, Scope
 
@@ -619,7 +619,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                 y_state in allowed,
                 f"Current Y lifecycle state {y_state!r}; expected one of {sorted(allowed)}.",
             ))
-
     method = str(action.get("informational_method") or "GET")
     safety = str(action.get("safety_class") or "read_only")
     path = str(action.get("informational_path") or "").lower()
@@ -1235,8 +1234,8 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "oem.z.move_absolute": ("position_steps", 0, 160000),
             "oem.x.move_steps": ("steps", -90243, 90243),
             "oem.x.move_absolute": ("position_steps", 0, 90263),
-            "oem.y.move_steps": ("steps", -102936, 102936),
-            "oem.y.move_absolute": ("target_steps", 0, 102956),
+            "oem.y.move_steps": ("steps", -102_936, 102_936),
+            "oem.y.move_absolute": ("target_steps", 0, 102_956),
         }.get(action_id)
         if action_bounds is not None:
             input_name, minimum, maximum = action_bounds
@@ -1261,7 +1260,6 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "oem.z.set_home",
                 "oem.x.reconcile_switch_masks",
                 "oem.x.set_home",
-                "oem.y.manual_panel_home",
             },
             "category": (
                 "x-axis"
@@ -1316,6 +1314,58 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             source_anchor=source_anchor,
             required_provider_capability="initialize_motors",
         )
+    y_semantic_actions = (
+        ("oem.y.status", "/motion/oem/y/status", "OEM Y status", "Passive Serial-206 Y authority and controller-status projection.", "ClassControlInterface Y status", {}),
+        ("oem.y.prepare", "/motion/oem/y/prepare", "OEM Y prepare", "No-motion Serial-206 Y profile preparation and readback.", "ClassControlInterface initializeMotors", {}),
+        ("oem.y.manual_panel_home", "/motion/oem/y/home", "OEM Y manual-panel Home", "Exact manual-panel Y home identity.", "ClassControlInterface.btnYHome_Click:1847-1856", {"source_mode": "manual_panel"}),
+        ("oem.y.move_steps", "/motion/oem/y/move_steps", "OEM Y moveSteps", "Source-shaped relative Y movement with strict effective-target bounds.", "ClassControlInterface.moveSteps:4165-4204", {}),
+        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM Y moveY absolute", "Source-shaped nonblocking absolute issue with durable terminalization.", "ClassControlInterface.moveY overloads:4206-4252", {}),
+        ("oem.y.stop", "/motion/oem/y/stop", "OEM Y Stop", "Independent priority-lane Y stop.", "ClassMotor.stopMotor", {}),
+    )
+    for action_id, path, label, description, source_anchor, fixed_inputs in y_semantic_actions:
+        add_semantic_alias(
+            action_id=action_id,
+            path=path,
+            label=label,
+            description=description,
+            source_anchor=source_anchor,
+            fixed_inputs=fixed_inputs,
+            required_provider_capability="initialize_motors",
+        )
+    add_semantic_alias(
+        action_id="oem.y.internal.acceleration_overload",
+        path="/motion/oem/y/internal/acceleration_overload",
+        label="Internal Y acceleration overload",
+        description="Typed source-only M04 acceleration overload with mandatory restoration.",
+        source_anchor="ClassControlInterface.moveY acceleration overload",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.y.internal.board_test_my",
+        path="/motion/oem/y/internal/board_test_my",
+        label="Internal board_test_my Y move",
+        description="Typed board-test moveY source identity with fixed source acceleration.",
+        source_anchor="board_test_my",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.move_absolute",
+        path="/motion/oem/move_xy",
+        label="OEM moveXY absolute",
+        description="Exact OEM parallel X/Y absolute composite.",
+        source_anchor="ClassControlInterface.moveXY",
+        fixed_inputs={"timeout_s": 120.0},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.home",
+        path="/motion/oem/home_xy",
+        label="OEM HomeXY",
+        description="Exact OEM parallel HomeXY composite.",
+        source_anchor="ClassControlInterface.HomeXY",
+        fixed_inputs={"operator_ack": "HOMEXY", "timeout_s": 120.0, "allow_implementation_mapped_predicate": False},
+        required_provider_capability="initialize_motors",
+    )
     x_abort_action = next((row for row in actions if row.get("action_id") == "oem.abort_all"), None)
     if x_abort_action is not None:
         x_abort_action.update({
@@ -1324,61 +1374,6 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "x_only": False,
             "category": "x-axis",
         })
-
-    add_semantic_alias(
-        action_id="oem.y.status",
-        path="/motion/oem/y/status",
-        label="Y axis authority status",
-        description="Robot-owned Y lifecycle, board epoch, position, switches, profile, and receipt projection.",
-        source_anchor="ClassMotor GAP1/GAP3/GAP9/GAP10/GAP12/GAP13",
-        fixed_inputs={},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.y.prepare",
-        path="/motion/oem/y/prepare",
-        label="Prepare OEM Y profile",
-        description="Verify the exact Serial-206 Y profile and current board authority without movement.",
-        source_anchor="ClassControlInterface.initializeMotorsWithoutMotion:3196-3205",
-        fixed_inputs={},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.y.move_steps",
-        path="/motion/oem/y/move_steps",
-        label="OEM Y moveSteps",
-        description="Source-shaped relative Y movement on board 4 motor 0 with the 20-step inner envelope.",
-        source_anchor="ClassControlInterface.moveSteps:4165-4204; selected Y profile",
-        fixed_inputs={},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.y.move_absolute",
-        path="/motion/oem/y/move_absolute",
-        label="OEM Y moveY",
-        description="Source-shaped absolute Y movement in the selected 0..102956 controller range; the operator action is nonblocking.",
-        source_anchor="ClassControlInterface.moveY:4206-4243; selected Y profile",
-        fixed_inputs={},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.y.manual_panel_home",
-        path="/motion/oem/y/home",
-        label="OEM Y manual panel Home",
-        description="Exact Y manual panel Home mode: goHome(rehome=true, speed=500) with final home predicate and set-home proof.",
-        source_anchor="ClassControlInterface manual panel Home:2270-2278; selected Y profile",
-        fixed_inputs={"source_mode": "manual_panel"},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.y.stop",
-        path="/motion/oem/y/stop",
-        label="OEM Y double-stop",
-        description="Interrupt-safe Y StopMotor sequence with terminal speed and position evidence; does not clear Z or gripper authority.",
-        source_anchor="ClassMotor.StopMotor:161-183",
-        fixed_inputs={},
-        required_provider_capability="initialize_motors",
-    )
 
     add_semantic_alias(
         action_id="oem.z.prepare",
@@ -1789,6 +1784,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     if initialize_motion_route:
         dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
+    actions = [row for row in actions if not str(row.get("action_id", "")).startswith(("oem.xy.", "oem.xyz.", "oem.y.internal."))]
+    # Composite routes are private command-plane method targets. They are not
+    # direct operator actions, but strict admitted methods must still dispatch.
+    dispatch = {key: value for key, value in dispatch.items() if not key.startswith("oem.xyz.")}
     return actions, dispatch
 
 
@@ -2045,7 +2044,15 @@ def install_operator_control_plane(
     # closure exists. It owns canonical X/Z admission and execution while the
     # compatibility router below continues to expose non-motion maintenance
     # actions.
-    from .operator_command_plane import OperatorCommandPlane
+    from .operator_command_plane import (
+        OperatorActionRequestV2,
+        OperatorCommandPlane,
+        OperatorInterruptRequestV1,
+        OperatorMethodRequestV1,
+    )
+    globals()["OperatorActionRequestV2"] = OperatorActionRequestV2
+    globals()["OperatorInterruptRequestV1"] = OperatorInterruptRequestV1
+    globals()["OperatorMethodRequestV1"] = OperatorMethodRequestV1
 
     command_plane = OperatorCommandPlane(
         app,
@@ -2053,6 +2060,8 @@ def install_operator_control_plane(
         actions=actions,
         dispatch=dispatch,
     )
+    app.state.operator_command_plane = command_plane
+    app.state.operator_receipt_store = store
     app.include_router(command_plane.router)
 
     def replay_authority_fingerprint(state: Mapping[str, Any]) -> str:
@@ -2166,7 +2175,7 @@ def install_operator_control_plane(
             "active_command": None, "interrupt_epoch": int(raw.get("interrupt_epoch") or 0), "latest_compact_receipt": None, "last_discrepancy_steps": raw.get("last_discrepancy_steps"), "state_version": max(1, int(raw.get("state_version") or 1)), "updated_at": float(raw.get("updated_at") or now), "physical_position_verified": bool(raw.get("physical_position_verified", False)),
         }
 
-    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         queue_projection = queue_projection or {}
         rows = rows or []
         compact = [_v2_compact_receipt(row) for row in rows]
@@ -2178,48 +2187,129 @@ def install_operator_control_plane(
         provider = state.get("serial206_initialization_provider")
         provider_map = dict(provider) if isinstance(provider, Mapping) else {}
         board = provider_map.get("board4_authority") if isinstance(provider_map.get("board4_authority"), Mapping) else {}
+        if not board and isinstance(provider_map.get("y_authority"), Mapping):
+            candidate = provider_map["y_authority"].get("board_authority")
+            board = candidate if isinstance(candidate, Mapping) else {}
         now = time.time()
-        board4 = {"state": str(board.get("state") or "unknown"), "prior_board_epoch": board.get("prior_board_epoch"), "active_board_epoch": board.get("active_board_epoch"), "transition_phase": str(board.get("transition_phase") or "unknown"), "transition_evidence": dict(board.get("transition_evidence") or {}), "member_motors": {str(key): int(value) for key, value in dict(board.get("member_motors") or {"y": 0}).items()}, "state_version": max(1, int(board.get("state_version") or 1)), "updated_at": float(board.get("updated_at") or now)}
-        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": _v2_y_axis(state), "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
+        board4 = {"state": str(board.get("state") or "unknown"), "prior_board_epoch": board.get("prior_board_epoch"), "active_board_epoch": board.get("active_board_epoch"), "transition_phase": str(board.get("transition_phase") or "unknown"), "transition_evidence": dict(board.get("transition_evidence") or {}), "member_motors": {str(key): int(value) for key, value in dict(board.get("member_motors") or {"y": 0, "z": 1, "gripper": 2}).items()}, "state_version": max(1, int(board.get("state_version") or 1)), "updated_at": float(board.get("updated_at") or now)}
+        y_axis = _v2_y_axis(state)
+        y_rows = [row for row in compact if str(row.get("action_id", "")).startswith("oem.y.")]
+        y_axis["active_command"] = next((row for row in y_rows if not row["terminal"]), None)
+        y_axis["latest_compact_receipt"] = y_rows[0] if y_rows else None
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
     @router.get("/v2/dashboard")
     async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
-        rows = await asyncio.to_thread(store.list, 100)
+        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=100)
         return _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), rows)
 
     @router.get("/v2/control-catalog")
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
-        dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(store.list, 100))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions]}
+        dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=100))
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"])) and (str(action["safety_class"]) != "stop" or str(action["action_id"]) == "oem.y.stop")]}
 
     @router.post("/v2/actions/{action_id}")
-    async def invoke_action_v2(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
+    async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
         if not command_plane.is_canonical(action_id):
             raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
+        if action_id in {"oem.x.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
+            raise HTTPException(status_code=404, detail="interrupt identity is not part of the strict Serial-206 Y v2 lane")
+        if action_id == "oem.y.stop":
+            if not isinstance(payload, OperatorInterruptRequestV1):
+                raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
+            return await command_plane.invoke_y_interrupt(payload.model_dump())
+        if isinstance(payload, OperatorInterruptRequestV1):
+            raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
+        if not isinstance(payload, OperatorActionRequestV2):
+            raise HTTPException(status_code=422, detail={"error": "action_request_schema_required"})
         state = machine_state()
-        result = await asyncio.to_thread(command_plane.store.admit_command, {"action_id": action_id, "inputs": payload.inputs, "expected_ownership_generation": payload.expected_generation, "idempotency_key": payload.idempotency_key}, state=state)
-        return _v2_compact_receipt(result)
+        result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=state)
+        admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
+        return _v2_compact_receipt(admitted or result)
 
     @router.get("/v2/actions/history")
-    async def action_history_v2(limit: int = 100) -> dict[str, Any]:
-        rows = await asyncio.to_thread(store.list, min(limit, 200))
-        return {"schema_version": "bioxp.operator_action_history.v2", "items": [_v2_compact_receipt(row) for row in rows], "next_cursor": None, "limit": min(limit, 200)}
+    async def action_history_v2(limit: int = Query(default=100, ge=1, le=200), cursor: str | None = None) -> dict[str, Any]:
+        before = None
+        if cursor is not None:
+            if not cursor.isdecimal() or int(cursor) < 1:
+                raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
+            before = int(cursor)
+        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=limit, before_sequence=before)
+        items = [_v2_compact_receipt(row) for row in rows]
+        next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+        return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
 
     @router.get("/v2/actions/receipts/{command_id}")
     async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
-        row = await asyncio.to_thread(store.by_command, command_id, include_evidence=detail)
+        row = await asyncio.to_thread(command_plane.store.command_detail_v2 if detail else command_plane.store.get_command, command_id)
         if row is None:
             raise HTTPException(status_code=404, detail="operator action receipt not found")
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
-        return {**compact, "canonical_inputs": dict(row.get("inputs") or {}), "requested_values": dict(row.get("inputs") or {}), "effective_values": dict(row.get("effective_inputs") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("response_payload") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": [], "child_receipts": [], "transitions": []}
+        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("raw_return_layers") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
+
+    async def _v2_method_receipt(method: Mapping[str, Any]) -> dict[str, Any]:
+        raw_status = str(method.get("status") or "queued")
+        status = {"running": "active", "cancelled": "cleared", "stopped": "interrupted", "aborted": "interrupted", "recovery_required": "ambiguous"}.get(raw_status, raw_status)
+        children = await asyncio.to_thread(command_plane.store.list_method_commands, str(method["method_id"]))
+        terminal = status in {"completed", "completed_partial", "failed", "cleared", "interrupted", "ambiguous"}
+        accepted_at = float(method.get("queued_at") or time.time())
+        return {
+            "schema_version": "bioxp.operator_method.v1",
+            "method_id": str(method["method_id"]),
+            "action_id": str(method.get("name") or ""),
+            "status": status,
+            "state_version": max(1, int(method.get("version") or 1)),
+            "child_receipts": [_v2_compact_receipt(row) for row in children],
+            "accepted_at": accepted_at,
+            "finished_at": float(method.get("updated_at") or accepted_at) if terminal else None,
+        }
+
+    @router.post("/v2/methods")
+    async def submit_method_v2(payload: OperatorMethodRequestV1) -> dict[str, Any]:
+        method = await command_plane.admit_strict_method(payload.model_dump())
+        return await _v2_method_receipt(method)
+
+    @router.get("/v2/methods/{method_id}")
+    async def method_status_v2(method_id: str) -> dict[str, Any]:
+        method = await asyncio.to_thread(command_plane.store.get_method, method_id)
+        if method is None:
+            raise HTTPException(status_code=404, detail="operator method not found")
+        return await _v2_method_receipt(method)
+
+    @router.get("/v2/commands/{command_id}")
+    async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
+        return await action_receipt_v2(command_id, detail=detail)
 
     @router.get("/control-catalog")
-    async def control_catalog() -> dict[str, Any]:
+    async def control_catalog(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
         state = machine_state()
+        if schema_version == "bioxp.operator_control_catalog.v2":
+            dashboard = _v2_dashboard(
+                state,
+                await asyncio.to_thread(command_plane.store.queue),
+                await asyncio.to_thread(command_plane.store.list_commands, limit=100),
+            )
+            return {
+                "schema_version": "bioxp.operator_control_catalog.v2",
+                "dashboard": dashboard,
+                "actions": [
+                    {
+                        "action_id": str(action["action_id"]),
+                        "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                        "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2",
+                        "interrupt": str(action["safety_class"]) == "stop",
+                        "enabled": bool(assessed_action(action, state).get("enabled")),
+                        "disabled_reason": assessed_action(action, state).get("disabled_reason"),
+                    }
+                    for action in actions
+                    if str(action["action_id"]) in command_plane.by_id
+                    and (str(action["safety_class"]) != "stop" or str(action["action_id"]) == "oem.y.stop")
+                ],
+            }
         return {
             "schema_name": "bioxp.operator_control_catalog",
             "schema_version": CATALOG_SCHEMA,
@@ -2231,7 +2321,11 @@ def install_operator_control_plane(
         }
 
     @router.get("/dashboard")
-    async def operator_dashboard() -> dict[str, Any]:
+    async def operator_dashboard(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
+        if schema_version == "bioxp.operator_dashboard.v2":
+            state = machine_state()
+            rows = await asyncio.to_thread(command_plane.store.list_commands, limit=100)
+            return _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), rows)
         dashboard = _dashboard_payload(machine_state())
         queue_projection = await asyncio.to_thread(command_plane.store.queue)
         active = queue_projection.get("active_command")
@@ -2264,12 +2358,35 @@ def install_operator_control_plane(
         return {"action_id": action_id, "ownership_generation": state["ownership_generation"], **_assess_action(by_id[action_id], state, effective_inputs)}
 
     @router.get("/actions/history")
-    async def action_history(limit: int = 100) -> dict[str, Any]:
+    async def action_history(
+        limit: int = Query(default=100, ge=1, le=200),
+        schema_version: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        if schema_version == "bioxp.operator_action_history.v2":
+            before = None
+            if cursor is not None:
+                if not cursor.isdecimal() or int(cursor) < 1:
+                    raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
+                before = int(cursor)
+            command_rows = await asyncio.to_thread(command_plane.store.list_commands, limit=limit, before_sequence=before)
+            items = [_v2_compact_receipt(row) for row in command_rows]
+            next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+            return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
         rows = await asyncio.to_thread(store.list, limit)
         return {"schema_version": HISTORY_SCHEMA, "receipts": rows}
 
     @router.get("/actions/receipts/{command_id}")
     async def action_receipt(command_id: str, detail: bool = False) -> dict[str, Any]:
+        command_row = await asyncio.to_thread(
+            command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
+            command_id,
+        )
+        if command_row is not None:
+            compact = _v2_compact_receipt(command_row)
+            if not detail:
+                return compact
+            return {**compact, "canonical_inputs": dict(command_row.get("canonical_inputs") or {}), "requested_values": dict(command_row.get("requested_values") or {}), "effective_values": dict(command_row.get("effective_values") or {}), "observed_values": dict(command_row.get("observed_values") or {}), "raw_return_layers": dict(command_row.get("raw_return_layers") or {}), "controller_evidence": dict(command_row.get("controller_evidence") or {}), "transport_artifacts": list(command_row.get("transport_artifacts") or []), "child_receipts": list(command_row.get("child_receipts") or []), "transitions": list(command_row.get("transitions") or [])}
         row = await asyncio.to_thread(
             store.by_command,
             command_id,
@@ -2311,8 +2428,22 @@ def install_operator_control_plane(
         return await asyncio.to_thread(store.put, row)
 
     @router.post("/actions/{action_id}")
-    async def invoke_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
+    async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        if isinstance(payload, OperatorInterruptRequestV1):
+            if action_id == "oem.y.stop":
+                return await command_plane.invoke_y_interrupt(payload.model_dump())
+            if action_id not in {"oem.x.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
+                raise HTTPException(status_code=404, detail="unknown X/Z interrupt action_id")
+            return await command_plane.compat_invoke(action_id, payload.model_dump())
+        if isinstance(payload, OperatorActionRequestV2):
+            if not command_plane.is_canonical(action_id):
+                raise HTTPException(status_code=404, detail="unknown normal v2 operator action_id")
+            result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=machine_state())
+            admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
+            return _v2_compact_receipt(admitted or result)
         if command_plane.is_canonical(action_id):
+            if action_id.startswith("oem.y."):
+                raise HTTPException(status_code=410, detail={"error": "legacy_y_action_mutation_retired", "required_schema": "bioxp.operator_action_request.v2"})
             return await command_plane.compat_invoke(
                 action_id,
                 {
