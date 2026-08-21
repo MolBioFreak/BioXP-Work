@@ -71,6 +71,7 @@ if [[ -n "$(listener_pids)" ]]; then
 fi
 
 exec "$UDOCKER_BIN" run \
+  --pull=never \
   --user=root \
   --volume="$APP_DIR:/app" \
   --volume="$LOCK_DIR:/app/.oem_lock" \
