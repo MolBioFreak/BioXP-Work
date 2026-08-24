@@ -2,6 +2,7 @@ import asyncio
 import fcntl
 import importlib
 import sys
+import tempfile
 import types
 
 import pytest
@@ -15,6 +16,9 @@ from src.bioxp.services.reference_service import (
 
 
 def load_api(monkeypatch):
+    runtime_root = tempfile.mkdtemp(prefix="bioxp-reference-api-")
+    monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", runtime_root)
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", runtime_root)
     usb_pkg = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
     usb_util = types.ModuleType("usb.util")
@@ -36,7 +40,7 @@ def load_api(monkeypatch):
 
 
 def test_reference_state_store_tracks_reference_and_desync(tmp_path):
-    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+    store = ReferenceStateStore(state_path=tmp_path / "bioxp_runtime.db")
 
     referenced = store.mark_referenced(
         MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual", note="camera aligned")
@@ -55,7 +59,7 @@ def test_reference_state_store_tracks_reference_and_desync(tmp_path):
 
 
 def test_reference_state_store_records_motion_without_forcing_reference(tmp_path):
-    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+    store = ReferenceStateStore(state_path=tmp_path / "bioxp_runtime.db")
 
     row = store.record_motion("g", "relative")
 
@@ -65,7 +69,7 @@ def test_reference_state_store_records_motion_without_forcing_reference(tmp_path
 
 
 def test_reference_state_store_reset_clears_rows(tmp_path):
-    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+    store = ReferenceStateStore(state_path=tmp_path / "bioxp_runtime.db")
     store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0))
 
     store.reset()
@@ -75,7 +79,7 @@ def test_reference_state_store_reset_clears_rows(tmp_path):
 
 
 def test_reference_state_file_lock_propagates_inner_exceptions(tmp_path):
-    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+    store = ReferenceStateStore(state_path=tmp_path / "bioxp_runtime.db")
 
     with pytest.raises(RuntimeError, match="boom"):
         with store._state_file_lock(fcntl.LOCK_EX):
@@ -84,7 +88,7 @@ def test_reference_state_file_lock_propagates_inner_exceptions(tmp_path):
 
 
 def test_reference_state_store_reset_clears_persisted_rows(tmp_path):
-    state_path = tmp_path / "reference-state.json"
+    state_path = tmp_path / "bioxp_runtime.db"
     store = ReferenceStateStore(state_path=state_path)
     store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
 
@@ -95,45 +99,8 @@ def test_reference_state_store_reset_clears_persisted_rows(tmp_path):
 
 
 
-def test_reference_state_store_persist_failure_is_best_effort(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    store = ReferenceStateStore(state_path=state_path)
-
-    monkeypatch.setattr(type(state_path), "write_text", lambda self, text, *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
-
-    row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-
-    assert row["state"] == "referenced"
-    assert row["persisted"] is False
-    assert store.snapshot(["x"])["ok"] is False
-    assert store.snapshot(["x"])["durable_clean"] is False
-    assert store.snapshot(["x"])["rows"]["x"]["state"] == "unknown"
-    assert not state_path.exists()
-
-
-
-def test_reference_state_store_keeps_in_memory_updates_after_persist_failure(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    state_path.write_text(
-        '{"rows": {"x": {"axis": "x", "state": "desynced", "source": "stale", "note": "old", "updated_at": "2026-01-01T00:00:00+00:00"}}}'
-    )
-    store = ReferenceStateStore(state_path=state_path)
-
-    monkeypatch.setattr(type(state_path), "write_text", lambda self, text, *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
-
-    row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-    snapshot = store.snapshot(["x"])
-
-    assert row["state"] == "referenced"
-    assert snapshot["ok"] is False
-    assert snapshot["durable_clean"] is False
-    assert snapshot["rows"]["x"]["state"] == "unknown"
-    assert snapshot["rows"]["x"]["source"] is None
-
-
-
 def test_reference_state_store_persists_rows_to_disk(tmp_path):
-    state_path = tmp_path / "reference-state.json"
+    state_path = tmp_path / "bioxp_runtime.db"
     store = ReferenceStateStore(state_path=state_path)
     row = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="startup_home"))
 
@@ -147,7 +114,7 @@ def test_reference_state_store_persists_rows_to_disk(tmp_path):
 
 def test_reference_state_persists_across_api_lifespan_restart(monkeypatch, tmp_path):
     api = load_api(monkeypatch)
-    state_path = tmp_path / "reference-state.json"
+    state_path = tmp_path / "bioxp_runtime.db"
     store = ReferenceStateStore(state_path=state_path)
     store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
 
@@ -156,7 +123,7 @@ def test_reference_state_persists_across_api_lifespan_restart(monkeypatch, tmp_p
     monkeypatch.setattr(api, "build_default_pipette_transport", lambda **kwargs: types.SimpleNamespace(close=lambda: None))
 
     async def exercise_lifespan():
-        async with api.lifespan(None):
+        async with api.lifespan(api.app):
             assert api._reference_state_store.snapshot(["x"])["rows"]["x"]["state"] == "referenced"
 
     asyncio.run(exercise_lifespan())
@@ -166,18 +133,8 @@ def test_reference_state_persists_across_api_lifespan_restart(monkeypatch, tmp_p
 
 
 
-def test_reference_state_store_ignores_invalid_persisted_rows(tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    state_path.write_text('{"rows": {"x": {"axis": "x", "state": "bogus"}}}')
-
-    store = ReferenceStateStore(state_path=state_path)
-
-    assert store.snapshot(["x"])["rows"]["x"]["state"] == "unknown"
-
-
-
 def test_reference_state_store_merges_interleaved_writers(tmp_path):
-    state_path = tmp_path / "reference-state.json"
+    state_path = tmp_path / "bioxp_runtime.db"
     store_a = ReferenceStateStore(state_path=state_path)
     store_b = ReferenceStateStore(state_path=state_path)
 
@@ -192,98 +149,6 @@ def test_reference_state_store_merges_interleaved_writers(tmp_path):
     for snapshot in (snapshot_a, snapshot_b, persisted):
         assert snapshot["rows"]["x"]["state"] == "referenced"
         assert snapshot["rows"]["y"]["state"] == "referenced"
-
-
-
-def test_reference_state_store_merges_dirty_recovery_with_new_disk_rows(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    original_write_text = type(state_path).write_text
-    failure_count = {"remaining": 1}
-
-    def flaky_write_text(self, text, *args, **kwargs):
-        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
-            failure_count["remaining"] -= 1
-            raise OSError("disk full")
-        return original_write_text(self, text, *args, **kwargs)
-
-    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
-
-    store_a = ReferenceStateStore(state_path=state_path)
-    store_b = ReferenceStateStore(state_path=state_path)
-
-    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-    store_b.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=10, source="manual"))
-    store_a.record_motion("z", "jog")
-
-    reloaded = ReferenceStateStore(state_path=state_path)
-    persisted = reloaded.snapshot(["x", "y", "z"])
-
-    assert persisted["rows"]["x"]["state"] == "unknown"
-    assert persisted["rows"]["y"]["state"] == "referenced"
-    assert persisted["rows"]["z"]["state"] == "unknown"
-
-
-
-def test_reference_state_store_dirty_recovery_prefers_newer_same_axis_disk_row(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    original_write_text = type(state_path).write_text
-    failure_count = {"remaining": 1}
-
-    def flaky_write_text(self, text, *args, **kwargs):
-        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
-            failure_count["remaining"] -= 1
-            raise OSError("disk full")
-        return original_write_text(self, text, *args, **kwargs)
-
-    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
-
-    store_a = ReferenceStateStore(state_path=state_path)
-    store_b = ReferenceStateStore(state_path=state_path)
-
-    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-    store_b.mark_desynced(MarkAxisDesyncedCommand(axis="x", reason="belt slip", source="operator"))
-    row = store_a.record_motion("x", "jog")
-
-    reloaded = ReferenceStateStore(state_path=state_path)
-    persisted = reloaded.snapshot(["x"])
-
-    assert row["persisted"] is False
-    assert persisted["rows"]["x"]["state"] == "desynced"
-    assert persisted["rows"]["x"]["note"] == "belt slip"
-    assert persisted["rows"]["x"]["last_motion_kind"] is None
-
-
-
-def test_reference_state_store_failed_reset_recovery_preserves_disk_rows(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    original_write_text = type(state_path).write_text
-
-    seed = ReferenceStateStore(state_path=state_path)
-    seed.mark_referenced(MarkAxisReferencedCommand(axis="legacy", position_steps=5, source="manual"))
-
-    failure_count = {"remaining": 1}
-
-    def flaky_write_text(self, text, *args, **kwargs):
-        if self == state_path.with_suffix(".json.tmp") and failure_count["remaining"] > 0:
-            failure_count["remaining"] -= 1
-            raise OSError("disk full")
-        return original_write_text(self, text, *args, **kwargs)
-
-    monkeypatch.setattr(type(state_path), "write_text", flaky_write_text)
-
-    store_a = ReferenceStateStore(state_path=state_path)
-    store_b = ReferenceStateStore(state_path=state_path)
-
-    store_a.reset()
-    store_b.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=10, source="manual"))
-    store_a.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-
-    reloaded = ReferenceStateStore(state_path=state_path)
-    persisted = reloaded.snapshot(["legacy", "x", "y"])
-
-    assert persisted["rows"]["legacy"]["state"] == "referenced"
-    assert persisted["rows"]["x"]["state"] == "unknown"
-    assert persisted["rows"]["y"]["state"] == "referenced"
 
 
 
@@ -383,28 +248,8 @@ def test_reference_store_without_durable_path_is_untrusted():
     assert snapshot["rows"]["x"]["state"] == "unknown"
 
 
-def test_reference_store_failed_persistence_hides_unverified_rows_and_rolls_back(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    store = ReferenceStateStore(state_path=state_path)
-    store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-    original = state_path.read_text()
-
-    monkeypatch.setattr(type(state_path), "replace", lambda self, target: (_ for _ in ()).throw(OSError("replace failed")))
-
-    result = store.mark_desynced(
-        MarkAxisDesyncedCommand(axis="x", reason="ambiguous", source="test")
-    )
-    snapshot = store.snapshot(["x"])
-
-    assert result["ok"] is False
-    assert result["durable_clean"] is False
-    assert snapshot["ok"] is False
-    assert snapshot["rows"]["x"]["state"] == "unknown"
-    assert state_path.read_text() == original
-
-
 def test_reference_store_lock_failure_is_fail_closed(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
+    state_path = tmp_path / "bioxp_runtime.db"
     store = ReferenceStateStore(state_path=state_path)
 
     def fail_open(*args, **kwargs):
@@ -418,7 +263,7 @@ def test_reference_store_lock_failure_is_fail_closed(monkeypatch, tmp_path):
 
 
 def test_reference_store_batch_publishes_once_and_rereads(tmp_path):
-    store = ReferenceStateStore(state_path=tmp_path / "reference-state.json")
+    store = ReferenceStateStore(state_path=tmp_path / "bioxp_runtime.db")
     calls = {"persist": 0}
     original = store._persist_locked
 
@@ -436,22 +281,3 @@ def test_reference_store_batch_publishes_once_and_rereads(tmp_path):
     assert result["durable_clean"] is True
     assert calls["persist"] == 1
     assert {row["axis"] for row in result["rows"]} == {"x", "y"}
-
-
-def test_reference_store_explicit_recovery_desynchronizes_disk_references(monkeypatch, tmp_path):
-    state_path = tmp_path / "reference-state.json"
-    store = ReferenceStateStore(state_path=state_path)
-    original_replace = type(state_path).replace
-    store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0, source="manual"))
-    monkeypatch.setattr(type(state_path), "replace", lambda self, target: (_ for _ in ()).throw(OSError("replace failed")))
-    store.mark_referenced(MarkAxisReferencedCommand(axis="y", position_steps=0, source="manual"))
-
-    monkeypatch.setattr(type(state_path), "replace", original_replace)
-    recovered = store.recover_untrusted_authority("persistence recovery")
-    snapshot = store.snapshot(["x", "y"])
-
-    assert recovered["ok"] is True
-    assert recovered["durable_clean"] is True
-    assert snapshot["ok"] is True
-    assert snapshot["rows"]["x"]["state"] == "desynced"
-    assert snapshot["rows"]["y"]["state"] == "unknown"

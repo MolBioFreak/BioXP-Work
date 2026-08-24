@@ -9,6 +9,7 @@ import threading
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,14 @@ MAX_SERIAL206_INTERRUPT_FALLBACK_ARCHIVES = 8
 
 SERIAL206_SCHEMA_VERSION = 2
 SERIAL206_BOARD4_MEMBERS = {"y": 0, "z": 1, "gripper": 2}
+_RUNTIME_PHYSICAL_SCHEMA_SHA256 = "1a6937590cbf8b12ec96faf2f8f62bb8d5560d1c3d1e24d1ff2f3599cc8a4075"
+_RUNTIME_PHYSICAL_TABLES = {
+    "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
+    "runtime_state_snapshots", "runtime_journal", "runtime_movement_runs", "serial206_receipts",
+    "operator_commands", "operator_transitions", "serial206_board_authority",
+    "serial206_board_transitions", "serial206_axis_authority",
+    "serial206_interrupt_imports",
+}
 _NONREPLAYABLE_ACTIONS = frozenset({
     "meta.emergency_stop",
     "oem.x.stop",
@@ -125,12 +134,90 @@ def _execute_schema_batch(connection: sqlite3.Connection, script: str) -> None:
             connection.execute(statement)
 
 
+def _runtime_physical_schema_sha256(connection: sqlite3.Connection) -> str:
+    def normalize_sql(value: Any) -> str:
+        return "".join(str(value or "").upper().split())
+
+    manifest: dict[str, Any] = {}
+    for table in sorted(_RUNTIME_PHYSICAL_TABLES):
+        table_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if table_row is None:
+            return "missing:" + table
+        indexes = []
+        for index_row in connection.execute(f'PRAGMA index_list("{table}")').fetchall():
+            index_name = str(index_row[1])
+            index_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
+            ).fetchone()
+            indexes.append((
+                index_name,
+                int(index_row[2]),
+                str(index_row[3]),
+                int(index_row[4]),
+                normalize_sql(index_sql_row[0] if index_sql_row else ""),
+                [tuple(row) for row in connection.execute(f'PRAGMA index_xinfo("{index_name}")').fetchall()],
+            ))
+        manifest[table] = {
+            "sql": normalize_sql(table_row[0]),
+            "columns": [tuple(row) for row in connection.execute(f'PRAGMA table_xinfo("{table}")').fetchall()],
+            "indexes": sorted(indexes),
+            "foreign_keys": [tuple(row) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()],
+            "triggers": [
+                (str(row[0]), normalize_sql(row[1]))
+                for row in connection.execute(
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name",
+                    (table,),
+                ).fetchall()
+            ],
+        }
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
     _execute_schema_batch(connection,
         """
         CREATE TABLE IF NOT EXISTS runtime_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS runtime_retired_json_artifacts (
+            source_name TEXT PRIMARY KEY,
+            content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
+            content_blob BLOB NOT NULL,
+            imported_at REAL NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS serial206_authority_snapshots (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+            state_sha256 TEXT NOT NULL CHECK(length(state_sha256)=64),
+            receipt_set_json TEXT NOT NULL CHECK(json_valid(receipt_set_json)),
+            receipt_set_sha256 TEXT NOT NULL CHECK(length(receipt_set_sha256)=64),
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_state_snapshots (
+            sequence INTEGER PRIMARY KEY,
+            state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+            state_sha256 TEXT NOT NULL CHECK(length(state_sha256)=64),
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_journal (
+            sequence INTEGER PRIMARY KEY,
+            stream TEXT NOT NULL,
+            payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+            payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS runtime_journal_stream_idx
+            ON runtime_journal(stream,sequence DESC);
+        CREATE TABLE IF NOT EXISTS runtime_movement_runs (
+            run_id TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL,
+            run_json TEXT NOT NULL CHECK(json_valid(run_json)),
+            run_sha256 TEXT NOT NULL CHECK(length(run_sha256)=64),
             updated_at REAL NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS serial206_receipts (
@@ -218,6 +305,274 @@ def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
             WHERE idempotency_replay_enabled=1
         """
     )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_authority_snapshots_coherence_v1
+        BEFORE INSERT ON serial206_authority_snapshots
+        WHEN NEW.state_json<>canonical_json(NEW.state_json)
+          OR NEW.state_sha256<>sha256_utf8(NEW.state_json)
+          OR NEW.receipt_set_json<>canonical_json(NEW.receipt_set_json)
+          OR NEW.receipt_set_sha256<>sha256_utf8(NEW.receipt_set_json)
+        BEGIN SELECT RAISE(ABORT, 'serial-206 authority snapshot is incoherent'); END
+        """
+    )
+    for table in ("serial206_authority_snapshots", "runtime_state_snapshots", "runtime_journal", "runtime_retired_json_artifacts"):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_no_update_v1 BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'{table} is append-only'); END"
+        )
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_no_delete_v1 BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'{table} is append-only'); END"
+        )
+    for table in ("serial206_authority_snapshots", "runtime_state_snapshots", "runtime_journal"):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_authorized_insert_v2 BEFORE INSERT ON {table} "
+            f"WHEN authority_write_allowed()<>1 BEGIN SELECT RAISE(ABORT, '{table} insert requires authoritative writer'); END"
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_state_snapshots_coherence_v1
+        BEFORE INSERT ON runtime_state_snapshots
+        WHEN NEW.state_json<>canonical_json(NEW.state_json)
+          OR NEW.state_sha256<>sha256_utf8(NEW.state_json)
+        BEGIN SELECT RAISE(ABORT, 'runtime state snapshot is incoherent'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_journal_coherence_v1
+        BEFORE INSERT ON runtime_journal
+        WHEN NEW.payload_json<>canonical_json(NEW.payload_json)
+          OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
+        BEGIN SELECT RAISE(ABORT, 'runtime journal row is incoherent'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_retired_json_artifacts_coherence_v1
+        BEFORE INSERT ON runtime_retired_json_artifacts
+        WHEN NEW.content_sha256<>sha256_blob(NEW.content_blob)
+          OR authority_write_allowed()<>1
+        BEGIN SELECT RAISE(ABORT, 'retired runtime JSON evidence is incoherent'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_movement_runs_coherence_insert_v1
+        BEFORE INSERT ON runtime_movement_runs
+        WHEN NEW.run_json<>canonical_json(NEW.run_json)
+          OR NEW.run_sha256<>sha256_utf8(NEW.run_json)
+          OR json_extract(NEW.run_json,'$.run_id') IS NOT NEW.run_id
+          OR json_extract(NEW.run_json,'$.sequence') IS NOT NEW.sequence
+        BEGIN SELECT RAISE(ABORT, 'runtime movement run is incoherent'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_movement_runs_coherence_update_v1
+        BEFORE UPDATE ON runtime_movement_runs
+        WHEN NEW.run_id IS NOT OLD.run_id
+          OR NEW.run_json<>canonical_json(NEW.run_json)
+          OR NEW.run_sha256<>sha256_utf8(NEW.run_json)
+          OR json_extract(NEW.run_json,'$.run_id') IS NOT NEW.run_id
+          OR json_extract(NEW.run_json,'$.sequence') IS NOT NEW.sequence
+        BEGIN SELECT RAISE(ABORT, 'runtime movement run is incoherent'); END
+        """
+    )
+    for trigger_name, operation in (
+        ("runtime_movement_runs_authorized_insert_v2", "INSERT"),
+        ("runtime_movement_runs_authorized_update_v2", "UPDATE"),
+        ("runtime_movement_runs_authorized_delete_v2", "DELETE"),
+    ):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {trigger_name} BEFORE {operation} ON runtime_movement_runs "
+            "WHEN authority_write_allowed()<>1 "
+            "BEGIN SELECT RAISE(ABORT,'runtime movement-run writer is not authoritative'); END"
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_metadata_serial206_authority_no_insert_v1
+        BEFORE INSERT ON runtime_metadata
+        WHEN NEW.key='serial206_oem_initialization_state'
+        BEGIN SELECT RAISE(ABORT, 'mutable serial-206 metadata authority is retired'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_metadata_serial206_authority_no_update_v1
+        BEFORE UPDATE ON runtime_metadata
+        WHEN OLD.key='serial206_oem_initialization_state' OR NEW.key='serial206_oem_initialization_state'
+        BEGIN SELECT RAISE(ABORT, 'mutable serial-206 metadata authority is retired'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS runtime_metadata_serial206_authority_no_delete_v1
+        BEFORE DELETE ON runtime_metadata
+        WHEN OLD.key='serial206_oem_initialization_state'
+        BEGIN SELECT RAISE(ABORT, 'mutable serial-206 metadata authority is retired'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_xyz_receipts_no_update_v1
+        BEFORE UPDATE ON serial206_receipts
+        WHEN OLD.stream IN ('x','y','z')
+        BEGIN SELECT RAISE(ABORT, 'serial-206 provider receipts are append-only'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_xyz_receipts_no_delete_v1
+        BEFORE DELETE ON serial206_receipts
+        WHEN OLD.stream IN ('x','y','z')
+        BEGIN SELECT RAISE(ABORT, 'serial-206 provider receipts are append-only'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_xyz_receipts_authorized_insert_v2
+        BEFORE INSERT ON serial206_receipts
+        WHEN NEW.stream IN ('x','y','z') AND authority_write_allowed()<>1
+        BEGIN SELECT RAISE(ABORT, 'serial-206 provider receipt writer is not authoritative'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_initialization_runs_no_delete
+        BEFORE DELETE ON serial206_receipts
+        WHEN OLD.stream IN ('initialize_motors','initialize_motion')
+        BEGIN SELECT RAISE(ABORT, 'serial-206 initialization runs are immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_initialization_runs_terminal_immutable
+        BEFORE UPDATE ON serial206_receipts
+        WHEN OLD.stream IN ('initialize_motors','initialize_motion') AND (
+            OLD.status <> 'running'
+            OR NEW.stream <> OLD.stream
+            OR NEW.receipt_id <> OLD.receipt_id
+            OR NEW.command_id IS NOT OLD.command_id
+            OR NEW.idempotency_key IS NOT OLD.idempotency_key
+            OR NEW.idempotency_replay_enabled <> OLD.idempotency_replay_enabled
+            OR NEW.status NOT IN ('completed','failed','ambiguous')
+        )
+        BEGIN SELECT RAISE(ABORT, 'serial-206 initialization run identity or terminal receipt is immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_initialization_request_identity_immutable_v2
+        BEFORE UPDATE ON serial206_receipts
+        WHEN OLD.stream IN ('initialize_motors','initialize_motion') AND (
+            json_extract(NEW.receipt_json,'$.schema_version') IS NOT json_extract(OLD.receipt_json,'$.schema_version')
+            OR json_extract(NEW.receipt_json,'$.receipt_id') IS NOT json_extract(OLD.receipt_json,'$.receipt_id')
+            OR json_extract(NEW.receipt_json,'$.command_id') IS NOT json_extract(OLD.receipt_json,'$.command_id')
+            OR json_extract(NEW.receipt_json,'$.run_id') IS NOT json_extract(OLD.receipt_json,'$.run_id')
+            OR json_extract(NEW.receipt_json,'$.idempotency_key') IS NOT json_extract(OLD.receipt_json,'$.idempotency_key')
+            OR json_extract(NEW.receipt_json,'$.intent') IS NOT json_extract(OLD.receipt_json,'$.intent')
+            OR json_extract(NEW.receipt_json,'$.started_at') IS NOT json_extract(OLD.receipt_json,'$.started_at')
+            OR json_extract(NEW.receipt_json,'$.request_sha256') IS NOT json_extract(OLD.receipt_json,'$.request_sha256')
+            OR json(json_extract(NEW.receipt_json,'$.request')) IS NOT json(json_extract(OLD.receipt_json,'$.request'))
+        )
+        BEGIN SELECT RAISE(ABORT, 'serial-206 initialization request identity is immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_initialization_receipt_coherence_insert_v3
+        BEFORE INSERT ON serial206_receipts
+        WHEN NEW.stream IN ('initialize_motors','initialize_motion') AND (
+            NEW.status NOT IN ('running','completed','failed','ambiguous')
+            OR json_type(NEW.receipt_json,'$.status') IS NOT 'text'
+            OR json_extract(NEW.receipt_json,'$.status') IS NOT NEW.status
+            OR json_extract(NEW.receipt_json,'$.receipt_id') IS NOT NEW.receipt_id
+            OR json_extract(NEW.receipt_json,'$.command_id') IS NOT NEW.command_id
+            OR json_extract(NEW.receipt_json,'$.run_id') IS NOT NEW.command_id
+            OR json_extract(NEW.receipt_json,'$.idempotency_key') IS NOT NEW.idempotency_key
+            OR json_extract(NEW.receipt_json,'$.idempotency_replay_enabled') IS NOT NEW.idempotency_replay_enabled
+            OR json_extract(NEW.receipt_json,'$.intent') IS NOT NEW.stream
+            OR json_type(NEW.receipt_json,'$.request_sha256') IS NOT 'text'
+            OR length(json_extract(NEW.receipt_json,'$.request_sha256')) <> 64
+            OR (NEW.status='running' AND json_type(NEW.receipt_json,'$.response') IS NOT 'null')
+            OR (NEW.status IN ('completed','failed','ambiguous') AND json_type(NEW.receipt_json,'$.response') IS NOT 'object')
+        )
+        BEGIN SELECT RAISE(ABORT, 'serial-206 initialization receipt is incoherent'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS serial206_initialization_receipt_coherence_update_v3
+        BEFORE UPDATE ON serial206_receipts
+        WHEN NEW.stream IN ('initialize_motors','initialize_motion') AND (
+            NEW.status NOT IN ('running','completed','failed','ambiguous')
+            OR json_type(NEW.receipt_json,'$.status') IS NOT 'text'
+            OR json_extract(NEW.receipt_json,'$.status') IS NOT NEW.status
+            OR json_extract(NEW.receipt_json,'$.receipt_id') IS NOT NEW.receipt_id
+            OR json_extract(NEW.receipt_json,'$.command_id') IS NOT NEW.command_id
+            OR json_extract(NEW.receipt_json,'$.run_id') IS NOT NEW.command_id
+            OR json_extract(NEW.receipt_json,'$.idempotency_key') IS NOT NEW.idempotency_key
+            OR json_extract(NEW.receipt_json,'$.idempotency_replay_enabled') IS NOT NEW.idempotency_replay_enabled
+            OR json_extract(NEW.receipt_json,'$.intent') IS NOT NEW.stream
+            OR json_type(NEW.receipt_json,'$.request_sha256') IS NOT 'text'
+            OR length(json_extract(NEW.receipt_json,'$.request_sha256')) <> 64
+            OR (NEW.status='running' AND json_type(NEW.receipt_json,'$.response') IS NOT 'null')
+            OR (NEW.status IN ('completed','failed','ambiguous') AND json_type(NEW.receipt_json,'$.response') IS NOT 'object')
+        )
+        BEGIN SELECT RAISE(ABORT, 'serial-206 initialization receipt is incoherent'); END
+        """
+    )
+
+
+_RUNTIME_AUTHORITY_TRIGGER_NAMES = (
+    "serial206_authority_snapshots_coherence_v1",
+    "serial206_authority_snapshots_no_update_v1",
+    "serial206_authority_snapshots_no_delete_v1",
+    "runtime_state_snapshots_no_update_v1",
+    "runtime_state_snapshots_no_delete_v1",
+    "runtime_journal_no_update_v1",
+    "runtime_journal_no_delete_v1",
+    "serial206_authority_snapshots_authorized_insert_v2",
+    "runtime_state_snapshots_authorized_insert_v2",
+    "runtime_journal_authorized_insert_v2",
+    "runtime_retired_json_artifacts_no_update_v1",
+    "runtime_retired_json_artifacts_no_delete_v1",
+    "runtime_retired_json_artifacts_coherence_v1",
+    "runtime_state_snapshots_coherence_v1",
+    "runtime_journal_coherence_v1",
+    "runtime_movement_runs_coherence_insert_v1",
+    "runtime_movement_runs_coherence_update_v1",
+    "runtime_movement_runs_authorized_insert_v2",
+    "runtime_movement_runs_authorized_update_v2",
+    "runtime_movement_runs_authorized_delete_v2",
+    "runtime_metadata_serial206_authority_no_insert_v1",
+    "runtime_metadata_serial206_authority_no_update_v1",
+    "runtime_metadata_serial206_authority_no_delete_v1",
+    "serial206_xyz_receipts_no_update_v1",
+    "serial206_xyz_receipts_no_delete_v1",
+    "serial206_xyz_receipts_authorized_insert_v2",
+    "serial206_initialization_runs_no_delete",
+    "serial206_initialization_runs_terminal_immutable",
+    "serial206_initialization_request_identity_immutable_v2",
+    "serial206_initialization_receipt_coherence_insert_v3",
+    "serial206_initialization_receipt_coherence_update_v3",
+    "serial206_board_transitions_no_update",
+    "serial206_board_transitions_no_delete",
+    "serial206_board_authority_authorized_insert_v3",
+    "serial206_board_authority_authorized_update_v3",
+    "serial206_board_authority_authorized_delete_v3",
+    "serial206_axis_authority_authorized_insert_v3",
+    "serial206_axis_authority_authorized_update_v3",
+    "serial206_axis_authority_authorized_delete_v3",
+    "serial206_board_transitions_authorized_insert_v3",
+)
+
+
+def _reinstall_runtime_authority_triggers(connection: sqlite3.Connection) -> None:
+    for name in _RUNTIME_AUTHORITY_TRIGGER_NAMES:
+        connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+    _create_v1_runtime_schema(connection)
+    _create_v2_authority_schema(connection)
 
 
 def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
@@ -240,6 +595,22 @@ def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
             member_motors_json TEXT NOT NULL CHECK(json_valid(member_motors_json)),
             state_version INTEGER NOT NULL CHECK(state_version>=1),
             updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS serial206_board_transitions (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            transition_id TEXT NOT NULL UNIQUE,
+            requested_active INTEGER NOT NULL CHECK(requested_active IN (0,1)),
+            ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
+            delivery_attempted INTEGER NOT NULL CHECK(delivery_attempted IN (0,1)),
+            reply_valid INTEGER NOT NULL CHECK(reply_valid IN (0,1)),
+            status_code INTEGER NOT NULL,
+            continuity_proven INTEGER NOT NULL CHECK(continuity_proven IN (0,1)),
+            accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+            state_before TEXT NOT NULL,
+            state_after TEXT NOT NULL,
+            prior_board_epoch INTEGER,
+            active_board_epoch INTEGER,
+            created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS serial206_axis_authority (
             axis TEXT PRIMARY KEY CHECK(axis IN ('y','z','gripper')),
@@ -326,12 +697,38 @@ def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
             ON serial206_command_dependencies(depends_on_command_id,command_id);
         """
     )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS serial206_board_transitions_no_update "
+        "BEFORE UPDATE ON serial206_board_transitions "
+        "BEGIN SELECT RAISE(ABORT,'serial206 board transition history is immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS serial206_board_transitions_no_delete "
+        "BEFORE DELETE ON serial206_board_transitions "
+        "BEGIN SELECT RAISE(ABORT,'serial206 board transition history is immutable'); END"
+    )
+    for trigger_name, table_name, operation in (
+        ("serial206_board_authority_authorized_insert_v3", "serial206_board_authority", "INSERT"),
+        ("serial206_board_authority_authorized_update_v3", "serial206_board_authority", "UPDATE"),
+        ("serial206_board_authority_authorized_delete_v3", "serial206_board_authority", "DELETE"),
+        ("serial206_axis_authority_authorized_insert_v3", "serial206_axis_authority", "INSERT"),
+        ("serial206_axis_authority_authorized_update_v3", "serial206_axis_authority", "UPDATE"),
+        ("serial206_axis_authority_authorized_delete_v3", "serial206_axis_authority", "DELETE"),
+        ("serial206_board_transitions_authorized_insert_v3", "serial206_board_transitions", "INSERT"),
+    ):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {trigger_name} BEFORE {operation} ON {table_name} "
+            "WHEN authority_write_allowed()<>1 "
+            "BEGIN SELECT RAISE(ABORT,'serial206 authority writer is not authoritative'); END"
+        )
 
 
 def _verify_v2_schema(connection: sqlite3.Connection) -> None:
     required = {
         "runtime_schema_migrations",
+        "runtime_retired_json_artifacts",
         "serial206_board_authority",
+        "serial206_board_transitions",
         "serial206_axis_authority",
         "serial206_movement_methods",
         "serial206_movement_commands",
@@ -364,9 +761,59 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
     missing_indexes = sorted(required_indexes - found_indexes)
     if missing_indexes:
         raise RuntimeError(f"serial-206 v2 schema missing indexes: {','.join(missing_indexes)}")
+    trigger_rows = {
+        str(row[0]): str(row[1] or "")
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger'"
+        ).fetchall()
+    }
+    missing_triggers = sorted(set(_RUNTIME_AUTHORITY_TRIGGER_NAMES) - set(trigger_rows))
+    if missing_triggers:
+        raise RuntimeError(f"runtime authority triggers missing: {','.join(missing_triggers)}")
+    exclusively_runtime_owned_tables = {
+        "serial206_authority_snapshots",
+        "runtime_state_snapshots",
+        "runtime_journal",
+        "runtime_movement_runs",
+        "runtime_retired_json_artifacts",
+        "serial206_board_authority",
+        "serial206_axis_authority",
+        "serial206_board_transitions",
+    }
+    expected_owned_triggers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (%s) AND tbl_name IN (%s)"
+            % (
+                ",".join("?" for _ in _RUNTIME_AUTHORITY_TRIGGER_NAMES),
+                ",".join("?" for _ in exclusively_runtime_owned_tables),
+            ),
+            tuple(_RUNTIME_AUTHORITY_TRIGGER_NAMES) + tuple(sorted(exclusively_runtime_owned_tables)),
+        ).fetchall()
+    }
+    actual_owned_triggers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (%s)"
+            % ",".join("?" for _ in exclusively_runtime_owned_tables),
+            tuple(sorted(exclusively_runtime_owned_tables)),
+        ).fetchall()
+    }
+    if actual_owned_triggers != expected_owned_triggers:
+        raise RuntimeError("runtime authority trigger set is not exact")
+    coherence_sql = trigger_rows["serial206_authority_snapshots_coherence_v1"]
+    if "canonical_json" not in coherence_sql or "sha256_utf8" not in coherence_sql:
+        raise RuntimeError("runtime authority trigger definition mismatch")
     expected_columns = {
         "runtime_schema_migrations": (("version", "INTEGER", 1, 1), ("backup_sha256", "TEXT", 1, 0), ("source_json_digests_json", "TEXT", 1, 0), ("started_at", "REAL", 1, 0), ("finished_at", "REAL", 1, 0), ("result", "TEXT", 1, 0)),
+        "runtime_retired_json_artifacts": (("source_name", "TEXT", 1, 1), ("content_sha256", "TEXT", 1, 0), ("content_blob", "BLOB", 1, 0), ("imported_at", "REAL", 1, 0)),
+        "serial206_authority_snapshots": (("sequence", "INTEGER", 0, 1), ("state_json", "TEXT", 1, 0), ("state_sha256", "TEXT", 1, 0), ("receipt_set_json", "TEXT", 1, 0), ("receipt_set_sha256", "TEXT", 1, 0), ("created_at", "REAL", 1, 0)),
+        "runtime_state_snapshots": (("sequence", "INTEGER", 0, 1), ("state_json", "TEXT", 1, 0), ("state_sha256", "TEXT", 1, 0), ("created_at", "REAL", 1, 0)),
+        "runtime_journal": (("sequence", "INTEGER", 0, 1), ("stream", "TEXT", 1, 0), ("payload_json", "TEXT", 1, 0), ("payload_sha256", "TEXT", 1, 0), ("created_at", "REAL", 1, 0)),
+        "runtime_movement_runs": (("run_id", "TEXT", 1, 1), ("sequence", "INTEGER", 1, 0), ("run_json", "TEXT", 1, 0), ("run_sha256", "TEXT", 1, 0), ("updated_at", "REAL", 1, 0)),
+        "serial206_receipts": (("stream", "TEXT", 1, 1), ("receipt_id", "TEXT", 1, 2), ("command_id", "TEXT", 0, 0), ("idempotency_key", "TEXT", 0, 0), ("idempotency_replay_enabled", "INTEGER", 1, 0), ("status", "TEXT", 0, 0), ("observed_at", "REAL", 1, 0), ("receipt_json", "TEXT", 1, 0)),
         "serial206_board_authority": (("board_id", "INTEGER", 0, 1), ("state", "TEXT", 1, 0), ("prior_board_epoch", "INTEGER", 0, 0), ("active_board_epoch", "INTEGER", 0, 0), ("transition_id", "TEXT", 0, 0), ("deactivation_attempt_id", "TEXT", 0, 0), ("deactivation_delivery", "INTEGER", 0, 0), ("deactivation_reply_valid", "INTEGER", 0, 0), ("deactivation_status_code", "INTEGER", 0, 0), ("activation_attempt_id", "TEXT", 0, 0), ("activation_delivery", "INTEGER", 0, 0), ("activation_reply_valid", "INTEGER", 0, 0), ("activation_status_code", "INTEGER", 0, 0), ("member_motors_json", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("updated_at", "REAL", 1, 0)),
+        "serial206_board_transitions": (("sequence", "INTEGER", 0, 1), ("transition_id", "TEXT", 1, 0), ("requested_active", "INTEGER", 1, 0), ("ownership_generation", "INTEGER", 1, 0), ("delivery_attempted", "INTEGER", 1, 0), ("reply_valid", "INTEGER", 1, 0), ("status_code", "INTEGER", 1, 0), ("continuity_proven", "INTEGER", 1, 0), ("accepted", "INTEGER", 1, 0), ("state_before", "TEXT", 1, 0), ("state_after", "TEXT", 1, 0), ("prior_board_epoch", "INTEGER", 0, 0), ("active_board_epoch", "INTEGER", 0, 0), ("created_at", "REAL", 1, 0)),
         "serial206_axis_authority": (("axis", "TEXT", 1, 1), ("board_id", "INTEGER", 1, 0), ("motor_id", "INTEGER", 1, 0), ("ownership_generation", "INTEGER", 1, 0), ("prepared_board_epoch", "INTEGER", 0, 0), ("profile_fingerprint", "TEXT", 0, 0), ("lifecycle_state", "TEXT", 1, 0), ("reference_state", "TEXT", 1, 0), ("origin_position_steps", "INTEGER", 0, 0), ("observed_position_steps", "INTEGER", 0, 0), ("last_discrepancy_steps", "INTEGER", 0, 0), ("last_command_id", "TEXT", 0, 0), ("last_receipt_id", "TEXT", 0, 0), ("interrupt_epoch", "INTEGER", 1, 0), ("state_version", "INTEGER", 1, 0), ("updated_at", "REAL", 1, 0)),
         "serial206_movement_methods": (("method_id", "TEXT", 1, 1), ("idempotency_key", "TEXT", 1, 0), ("action_id", "TEXT", 1, 0), ("canonical_inputs_sha256", "TEXT", 1, 0), ("state", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("failure_policy", "TEXT", 1, 0), ("child_count", "INTEGER", 1, 0), ("accepted_at", "REAL", 1, 0), ("started_at", "REAL", 0, 0), ("finished_at", "REAL", 0, 0)),
         "serial206_movement_commands": (("sequence", "INTEGER", 0, 1), ("command_id", "TEXT", 1, 0), ("idempotency_key", "TEXT", 1, 0), ("action_id", "TEXT", 1, 0), ("method_id", "TEXT", 0, 0), ("method_order", "INTEGER", 1, 0), ("parallel_group", "INTEGER", 1, 0), ("axis_scope", "TEXT", 0, 0), ("board_scope_json", "TEXT", 1, 0), ("ownership_generation", "INTEGER", 1, 0), ("expected_board_epochs_json", "TEXT", 1, 0), ("canonical_inputs_sha256", "TEXT", 1, 0), ("state", "TEXT", 1, 0), ("state_version", "INTEGER", 1, 0), ("admitted_interrupt_epochs_json", "TEXT", 1, 0), ("accepted_at", "REAL", 1, 0), ("queued_at", "REAL", 1, 0), ("dispatched_at", "REAL", 0, 0), ("finished_at", "REAL", 0, 0), ("terminal_receipt_id", "TEXT", 0, 0)),
@@ -396,19 +843,35 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         if row is None or actual_columns != columns or actual_unique != unique:
             raise RuntimeError(f"serial-206 v2 schema index shape mismatch: {name}")
     fk = connection.execute("PRAGMA foreign_key_list(serial206_axis_authority)").fetchall()
-    if len(fk) != 1 or str(fk[0][2]) != "serial206_board_authority" or str(fk[0][3]) != "board_id" or str(fk[0][4]) != "board_id":
-        raise RuntimeError("serial-206 v2 schema foreign-key shape mismatch")
-    expected_fk_counts = {
-        "serial206_movement_commands": 1,
-        "serial206_command_resources": 1,
-        "serial206_command_dependencies": 2,
+    axis_fk = {
+        (str(row[3]), str(row[2]), str(row[4]), str(row[5]).upper(), str(row[6]).upper(), str(row[7]).upper())
+        for row in fk
     }
-    for table, count in expected_fk_counts.items():
+    if axis_fk != {("board_id", "serial206_board_authority", "board_id", "NO ACTION", "NO ACTION", "NONE")}:
+        raise RuntimeError("serial-206 v2 schema foreign-key shape mismatch")
+    expected_fks = {
+        "serial206_movement_commands": {
+            ("method_id", "serial206_movement_methods", "method_id", "NO ACTION", "CASCADE", "NONE"),
+        },
+        "serial206_command_resources": {
+            ("command_id", "serial206_movement_commands", "command_id", "NO ACTION", "CASCADE", "NONE"),
+        },
+        "serial206_command_dependencies": {
+            ("command_id", "serial206_movement_commands", "command_id", "NO ACTION", "CASCADE", "NONE"),
+            ("depends_on_command_id", "serial206_movement_commands", "command_id", "NO ACTION", "CASCADE", "NONE"),
+        },
+    }
+    for table, expected in expected_fks.items():
         rows = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
-        if len(rows) != count or any(str(row[6]).upper() != "CASCADE" for row in rows):
+        actual = {
+            (str(row[3]), str(row[2]), str(row[4]), str(row[5]).upper(), str(row[6]).upper(), str(row[7]).upper())
+            for row in rows
+        }
+        if actual != expected:
             raise RuntimeError(f"serial-206 v2 schema foreign-key shape mismatch: {table}")
     constraint_fragments = {
         "serial206_board_authority": ("CHECK(BOARD_ID=4)", "JSON_VALID(MEMBER_MOTORS_JSON)"),
+        "serial206_board_transitions": ("REQUESTED_ACTIVE IN (0,1)", "ACCEPTED IN (0,1)"),
         "serial206_axis_authority": ("AXIS IN ('Y','Z','GRIPPER')", "WITHOUT ROWID"),
         "serial206_movement_methods": ("FAILURE_POLICY='REQUIRE_COMPLETED'", "WITHOUT ROWID"),
         "serial206_movement_commands": ("JSON_VALID(EXPECTED_BOARD_EPOCHS_JSON)", "STATE IN ('QUEUED','DISPATCHED','ISSUED_PENDING','INTERRUPTING','COMPLETED','FAILED','CLEARED','INTERRUPTED','AMBIGUOUS','REJECTED')"),
@@ -420,6 +883,9 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         normalized = "".join(str(row[0]).upper().split()) if row else ""
         if any("".join(fragment.upper().split()) not in normalized for fragment in fragments):
             raise RuntimeError(f"serial-206 v2 schema constraint shape mismatch: {table}")
+    physical_schema_sha256 = _runtime_physical_schema_sha256(connection)
+    if physical_schema_sha256 != _RUNTIME_PHYSICAL_SCHEMA_SHA256:
+        raise RuntimeError(f"runtime physical schema fingerprint mismatch: {physical_schema_sha256}")
 
 
 def verify_runtime_database_v2(connection: sqlite3.Connection) -> None:
@@ -536,6 +1002,7 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         }
         found_strict_tables = strict_tables & found_tables
         if found_strict_tables:
+            _reinstall_runtime_authority_triggers(connection)
             _verify_v2_schema(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -651,6 +1118,69 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         raise
 
 
+def _compact_controller_state(
+    value: Any,
+    *,
+    key: str | None = None,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> Any:
+    if budget is None:
+        budget = [2048]
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
+    digest_summary: dict[str, Any] = {
+        "value_omitted_from_current_state": True,
+        "content_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "encoded_bytes": len(encoded.encode("utf-8")),
+    }
+    if budget[0] <= 0 or depth >= 12:
+        return digest_summary
+    budget[0] -= 1
+    raw_keys = {
+        "wait", "events", "raw_packet", "raw_packets", "packets",
+        "event_snapshot", "last_ack", "ack", "attempt_diagnostics",
+        "controller_response",
+    }
+    if key in raw_keys:
+        if isinstance(value, (list, tuple)):
+            digest_summary["item_count"] = len(value)
+        if isinstance(value, Mapping):
+            for scalar_key in (
+                "ok", "stopped", "target_reached", "timed_out", "last_speed",
+                "failure", "source_return_code", "status", "value", "return_status",
+            ):
+                scalar = value.get(scalar_key)
+                if scalar is None or isinstance(scalar, (str, int, float, bool)):
+                    if scalar_key in value:
+                        digest_summary[scalar_key] = scalar
+        digest_summary["controller_payload_omitted_to_provider_receipt"] = True
+        return digest_summary
+    if isinstance(value, str) and len(value.encode("utf-8")) > 512:
+        return digest_summary
+    if isinstance(value, Mapping):
+        items = []
+        for original_key, child in value.items():
+            child_key = str(original_key)
+            if len(child_key.encode("utf-8")) > 128:
+                child_key = "_oversized_key_" + hashlib.sha256(child_key.encode("utf-8")).hexdigest()
+            items.append((child_key, child))
+        items.sort(key=lambda row: row[0])
+        selected = items[:64]
+        result = {
+            child_key: _compact_controller_state(child, key=child_key, depth=depth + 1, budget=budget)
+            for child_key, child in selected
+        }
+        if len(items) > len(selected):
+            result["_omitted_current_state_items"] = {**digest_summary, "item_count": len(items) - len(selected)}
+        return result
+    if isinstance(value, (list, tuple)):
+        selected = list(value[:64])
+        result = [_compact_controller_state(child, depth=depth + 1, budget=budget) for child in selected]
+        if len(value) > len(selected):
+            result.append({"_omitted_current_state_items": {**digest_summary, "item_count": len(value) - len(selected)}})
+        return result
+    return value
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     """Durably replace one private JSON authority file.
 
@@ -691,11 +1221,86 @@ class OEMRuntimeStore:
         self.serial206_interrupt_fallback_lock_path = self.root / "serial206_interrupt_fallback.lock"
         self._lock = threading.RLock()
         self._db = self._audit_database.connection
+        self._authority_write_depth = 0
+        self._db.create_function(
+            "sha256_utf8",
+            1,
+            lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest(),
+            deterministic=True,
+        )
+        self._db.create_function(
+            "canonical_json",
+            1,
+            lambda value: json.dumps(json.loads(str(value)), sort_keys=True, separators=(",", ":"), allow_nan=False),
+            deterministic=True,
+        )
+        self._db.create_function(
+            "authority_write_allowed",
+            0,
+            lambda: 1 if self._authority_write_depth > 0 else 0,
+        )
+        self._db.create_function(
+            "sha256_blob",
+            1,
+            lambda value: hashlib.sha256(bytes(value)).hexdigest(),
+            deterministic=True,
+        )
         self._closed = False
-        migrate_runtime_database_v2(self._db, self.root)
+        with self._authority_write():
+            migrate_runtime_database_v2(self._db, self.root)
+        self._authority_schema_version = int(self._db.execute("PRAGMA schema_version").fetchone()[0])
         self._seq = self._load_seq()
-        self._import_embedded_serial206_receipts_once()
+        with self._authority_write():
+            self._import_retired_runtime_json_files()
         self._import_serial206_interrupt_fallback()
+
+    @contextmanager
+    def _authority_write(self):
+        if self._authority_write_depth == 0 and hasattr(self, "_authority_schema_version"):
+            schema_version = int(self._db.execute("PRAGMA schema_version").fetchone()[0])
+            if schema_version != self._authority_schema_version:
+                _verify_v2_schema(self._db)
+                self._authority_schema_version = schema_version
+        self._authority_write_depth += 1
+        try:
+            yield
+        finally:
+            self._authority_write_depth -= 1
+
+    def _import_retired_runtime_json_files(self) -> None:
+        names = (
+            "operator_command_store.json",
+            "sequence_state.json",
+            "oem_runtime_state.json",
+            "oem_full_lifecycle_runs.json",
+            "oem_serial206_interrupt_journal.json",
+            "oem_initialization_state.json",
+            "reference-state.json",
+            "serial206_oem_initialization_state.json",
+        )
+        for name in names:
+            source = self.root / name
+            if not source.is_file():
+                continue
+            content = source.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            self._db.execute(
+                "INSERT OR IGNORE INTO runtime_retired_json_artifacts(source_name,content_sha256,content_blob,imported_at) VALUES(?,?,?,?)",
+                (name, digest, content, time.time()),
+            )
+            existing = self._db.execute(
+                "SELECT content_sha256,content_blob FROM runtime_retired_json_artifacts WHERE source_name=?",
+                (name,),
+            ).fetchone()
+            if existing is None or str(existing["content_sha256"]) != digest or bytes(existing["content_blob"]) != content:
+                raise RuntimeError(f"retired runtime JSON identity conflicts: {name}")
+            archive = self.root / f"{name}.retired.{digest}"
+            os.replace(source, archive)
+            directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
     def close(self) -> None:
         with self._lock:
@@ -817,6 +1422,31 @@ class OEMRuntimeStore:
                         now,
                     ),
                 )
+                self._db.execute(
+                    """
+                    INSERT INTO serial206_board_transitions(
+                        transition_id,requested_active,ownership_generation,
+                        delivery_attempted,reply_valid,status_code,continuity_proven,
+                        accepted,state_before,state_after,prior_board_epoch,
+                        active_board_epoch,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        transition_id,
+                        int(active),
+                        int(ownership_generation),
+                        1,
+                        int(reply_valid),
+                        status_code,
+                        int(bool(continuity_proven)),
+                        int(accepted),
+                        str(current["state"]),
+                        state,
+                        prior_epoch,
+                        active_epoch,
+                        now,
+                    ),
+                )
                 if invalidate_axes:
                     for axis, row in self._axis_rows_locked().items():
                         has_authority = bool(
@@ -831,11 +1461,11 @@ class OEMRuntimeStore:
                         self._db.execute(
                             """
                             UPDATE serial206_axis_authority
-                            SET prepared_board_epoch=NULL, lifecycle_state=?, reference_state=?,
+                            SET ownership_generation=?, prepared_board_epoch=NULL, lifecycle_state=?, reference_state=?,
                                 state_version=state_version+1, updated_at=?
                             WHERE axis=?
                             """,
-                            (lifecycle, reference, now, axis),
+                            (int(ownership_generation), lifecycle, reference, now, axis),
                         )
                 self._db.execute("COMMIT")
             except Exception:
@@ -905,8 +1535,6 @@ class OEMRuntimeStore:
             row = self._axis_rows_locked().get(axis, {})
             if board.get("state") != "active" or row.get("prepared_board_epoch") != board.get("active_board_epoch"):
                 return {"ok": False, "failure": "axis_board_epoch_not_current", "axis": axis, "board": board, "axis_state": row}
-            if int(row.get("ownership_generation", -1)) != int(ownership_generation):
-                return {"ok": False, "failure": "axis_generation_mismatch", "axis": axis, "axis_state": row}
             now = time.time()
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -962,177 +1590,6 @@ class OEMRuntimeStore:
                 "discrepancy_steps": discrepancy,
                 "reconciled_to_observed": True,
             }
-
-    def _import_embedded_serial206_receipts_once(self) -> None:
-        marker_key = "serial206_embedded_receipt_import_v1"
-        if self._db.execute(
-            "SELECT 1 FROM runtime_metadata WHERE key=?",
-            (marker_key,),
-        ).fetchone() is not None:
-            return
-        path = self.root / "serial206_oem_initialization_state.json"
-        imported = 0
-        payload: Any = None
-        if path.exists():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"embedded serial-206 receipt import failed for {path}"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise RuntimeError(
-                    f"embedded serial-206 receipt import failed for {path}: state is not an object"
-                )
-        self._db.execute("BEGIN IMMEDIATE")
-        try:
-            if isinstance(payload, dict):
-                for stream, lifecycle_key in (("z", "z_lifecycle"), ("x", "x_lifecycle")):
-                    lifecycle = payload.get(lifecycle_key)
-                    receipts = lifecycle.get("receipts") if isinstance(lifecycle, dict) else None
-                    if receipts is None:
-                        continue
-                    if not isinstance(receipts, list):
-                        raise ValueError(f"{lifecycle_key}.receipts must be a list")
-                    for receipt_index, raw_receipt in enumerate(receipts):
-                        if not isinstance(raw_receipt, dict):
-                            raise ValueError(f"{lifecycle_key}.receipts contains a non-object row")
-                        imported_receipt = dict(raw_receipt)
-                        replay_enabled = imported_receipt.get("idempotency_replay_enabled")
-                        if replay_enabled is None:
-                            replay_enabled = imported_receipt.get("intent") not in {"stop", "abort"}
-                        replay_enabled = bool(replay_enabled)
-                        imported_receipt["idempotency_replay_enabled"] = replay_enabled
-                        command_id = imported_receipt.get("command_id")
-                        command_text = str(command_id) if isinstance(command_id, str) and command_id else None
-                        idempotency_key = imported_receipt.get("idempotency_key")
-                        idempotency_text = (
-                            idempotency_key
-                            if isinstance(idempotency_key, str) and idempotency_key
-                            else None
-                        )
-                        status = imported_receipt.get("status")
-                        status_text = status if isinstance(status, str) and status else None
-                        identity_payload = json.dumps(
-                            imported_receipt,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        )
-                        supplied_receipt_id = imported_receipt.get("receipt_id")
-                        if isinstance(supplied_receipt_id, str) and supplied_receipt_id:
-                            receipt_id = supplied_receipt_id
-                        elif replay_enabled:
-                            receipt_id = command_text or hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
-                        else:
-                            receipt_id = hashlib.sha256(
-                                f"{stream}:{receipt_index}:{identity_payload}".encode("utf-8")
-                            ).hexdigest()
-                        imported_receipt["receipt_id"] = receipt_id
-                        encoded = json.dumps(
-                            imported_receipt,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        )
-                        try:
-                            observed_at = float(
-                                imported_receipt.get("finished_at")
-                                or imported_receipt.get("started_at")
-                                or imported_receipt.get("observed_at")
-                                or utc_ts()
-                            )
-                        except (TypeError, ValueError, OverflowError):
-                            observed_at = float(utc_ts())
-                        self._db.execute(
-                            """
-                            INSERT INTO serial206_receipts(
-                                stream,receipt_id,command_id,idempotency_key,
-                                idempotency_replay_enabled,status,observed_at,receipt_json
-                            ) VALUES(?,?,?,?,?,?,?,?)
-                            ON CONFLICT(stream,receipt_id) DO UPDATE SET
-                                command_id=excluded.command_id,
-                                idempotency_key=excluded.idempotency_key,
-                                idempotency_replay_enabled=excluded.idempotency_replay_enabled,
-                                status=excluded.status,
-                                observed_at=excluded.observed_at,
-                                receipt_json=excluded.receipt_json
-                            """,
-                            (
-                                stream,
-                                receipt_id,
-                                command_text,
-                                idempotency_text,
-                                int(replay_enabled),
-                                status_text,
-                                observed_at,
-                                encoded,
-                            ),
-                        )
-                        imported += 1
-            self._db.execute(
-                "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?)",
-                (
-                    marker_key,
-                    json.dumps({"source": str(path), "source_retained": True, "imported": imported}),
-                    time.time(),
-                ),
-            )
-            self._db.execute("COMMIT")
-        except Exception:
-            self._db.execute("ROLLBACK")
-            raise
-
-    def append_serial206_interrupt_fallback(
-        self,
-        stream: str,
-        receipt: Mapping[str, Any],
-        *,
-        reason: str,
-    ) -> dict[str, Any]:
-        row = dict(receipt)
-        row["persistence_fallback"] = {
-            "kind": "serial206_interrupt_jsonl",
-            "reason": str(reason)[:500],
-            "recorded_at": time.time(),
-        }
-        wrapper = {"stream": str(stream).strip().lower(), "receipt": row}
-        raw = json.dumps(
-            wrapper,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8") + b"\n"
-        lock_descriptor = os.open(
-            self.serial206_interrupt_fallback_lock_path,
-            os.O_CREAT | os.O_RDWR,
-            0o600,
-        )
-        try:
-            os.fchmod(lock_descriptor, 0o600)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-            descriptor = os.open(
-                self.serial206_interrupt_fallback_path,
-                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                0o600,
-            )
-            try:
-                os.fchmod(descriptor, 0o600)
-                written = os.write(descriptor, raw)
-                if written != len(raw):
-                    raise OSError(f"short serial-206 interrupt fallback write: {written}/{len(raw)} bytes")
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            directory_descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        finally:
-            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-            os.close(lock_descriptor)
-        return row
 
     def _import_serial206_interrupt_fallback(self) -> None:
         lock_descriptor = os.open(
@@ -1207,51 +1664,123 @@ class OEMRuntimeStore:
         receipt: Mapping[str, Any],
     ) -> dict[str, Any]:
         if not self._lock.acquire(blocking=False):
-            return self.append_serial206_interrupt_fallback(
-                stream,
-                receipt,
-                reason="sqlite_connection_busy",
-            )
+            return {
+                "ok": False,
+                "failure": "sqlite_connection_busy",
+                "persistence_state": "recovery_required",
+            }
         try:
             self._db.execute("PRAGMA busy_timeout=0")
             try:
                 return self.append_serial206_receipt(stream, dict(receipt))
             except sqlite3.Error as exc:
-                return self.append_serial206_interrupt_fallback(
-                    stream,
-                    receipt,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
+                return {
+                    "ok": False,
+                    "failure": f"{type(exc).__name__}: {exc}",
+                    "persistence_state": "recovery_required",
+                }
             finally:
                 self._db.execute("PRAGMA busy_timeout=2000")
         finally:
             self._lock.release()
 
-    @property
-    def serial206_initialization_state_path(self) -> Path:
-        return self.root / "serial206_oem_initialization_state.json"
+    def _serial206_receipt_set_locked(self) -> tuple[str, str]:
+        rows = self._db.execute(
+            "SELECT stream,receipt_id,receipt_json FROM serial206_receipts ORDER BY stream,receipt_id"
+        ).fetchall()
+        receipt_set = [
+            [str(row["stream"]), str(row["receipt_id"]), hashlib.sha256(str(row["receipt_json"]).encode("utf-8")).hexdigest()]
+            for row in rows
+        ]
+        encoded = json.dumps(receipt_set, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _append_serial206_authority_snapshot_locked(self, state: Mapping[str, Any]) -> None:
+        state_json = json.dumps(dict(state), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        receipt_set_json, receipt_set_sha256 = self._serial206_receipt_set_locked()
+        self._db.execute(
+            "INSERT INTO serial206_authority_snapshots(state_json,state_sha256,receipt_set_json,receipt_set_sha256,created_at) VALUES(?,?,?,?,?)",
+            (
+                state_json,
+                hashlib.sha256(state_json.encode("utf-8")).hexdigest(),
+                receipt_set_json,
+                receipt_set_sha256,
+                time.time(),
+            ),
+        )
+
+    def _rebind_latest_serial206_authority_snapshot_locked(self) -> None:
+        latest = self._db.execute(
+            "SELECT state_json FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if latest is not None:
+            self._append_serial206_authority_snapshot_locked(json.loads(str(latest["state_json"])))
 
     def read_oem_serial206_initialization_state(self) -> dict[str, Any] | None:
-        """Read the single atomic serial-206 lifecycle authority.
-
-        JSON/schema errors intentionally propagate.  Callers must fail closed;
-        treating corruption as a fresh state could replay acknowledged motion.
-        """
-        path = self.serial206_initialization_state_path
-        if not path.exists():
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        """Read append-only serial-206 authority bound to the immutable receipt set."""
+        with self._lock:
+            selected = self._db.execute(
+                "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            if selected is None:
+                legacy = self._db.execute(
+                    "SELECT value FROM runtime_metadata WHERE key='serial206_oem_initialization_state'"
+                ).fetchone()
+                if legacy is None:
+                    return None
+                payload = json.loads(str(legacy[0]))
+                if not isinstance(payload, dict):
+                    raise ValueError("serial-206 initialization state must be an object")
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_serial206_authority_snapshot_locked(payload)
+                    self._db.execute("COMMIT")
+                except Exception:
+                    self._db.execute("ROLLBACK")
+                    raise
+                selected = self._db.execute(
+                    "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()
+            state_json = str(selected["state_json"])
+            canonical_state_json = json.dumps(
+                json.loads(state_json), sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            if (
+                state_json != canonical_state_json
+                or str(selected["state_sha256"])
+                != hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+            ):
+                raise RuntimeError("serial-206 authority snapshot state bytes or hash are incoherent")
+            stored_receipt_set_json = str(selected["receipt_set_json"])
+            canonical_receipt_set_json = json.dumps(
+                json.loads(stored_receipt_set_json),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if (
+                stored_receipt_set_json != canonical_receipt_set_json
+                or str(selected["receipt_set_sha256"])
+                != hashlib.sha256(stored_receipt_set_json.encode("utf-8")).hexdigest()
+            ):
+                raise RuntimeError("serial-206 authority snapshot receipt-set bytes or hash are incoherent")
+            receipt_set_json, receipt_set_sha256 = self._serial206_receipt_set_locked()
+            if stored_receipt_set_json != receipt_set_json or str(selected["receipt_set_sha256"]) != receipt_set_sha256:
+                raise RuntimeError("serial-206 authority snapshot is not bound to the current immutable receipt set")
+            payload = json.loads(state_json)
         if not isinstance(payload, dict):
             raise ValueError("serial-206 initialization state must be an object")
         return payload
 
     def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Persist compact current authority; detailed receipts remain in SQLite."""
+        """Append compact current authority with an exact immutable receipt-set binding."""
         payload = dict(state)
         required = {"movement_ledger", "used_approvals", "initialize_motion_ledger"}
         if not required.issubset(payload):
             raise ValueError("serial-206 state must contain all lifecycle ledgers")
-        stored_payload = dict(payload)
+        stored_payload = _compact_controller_state(payload)
+        if not isinstance(stored_payload, dict):
+            raise ValueError("serial-206 state compaction must preserve object shape")
         for lifecycle_key in ("z_lifecycle", "x_lifecycle"):
             lifecycle = stored_payload.get(lifecycle_key)
             if isinstance(lifecycle, dict):
@@ -1261,8 +1790,23 @@ class OEMRuntimeStore:
                     compact_lifecycle["receipts"] = receipts[-1:]
                     compact_lifecycle["receipts_omitted_to_sqlite"] = max(0, len(receipts) - 1)
                 stored_payload[lifecycle_key] = compact_lifecycle
+        encoded_current = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(encoded_current.encode("utf-8")) > 262_144:
+            stored_payload = _compact_controller_state(payload, budget=[256])
+            if not isinstance(stored_payload, dict):
+                raise ValueError("serial-206 bounded state compaction must preserve object shape")
+            encoded_current = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(encoded_current.encode("utf-8")) > 262_144:
+            raise ValueError("serial-206 compact current state exceeds encoded-byte ceiling")
         with self._lock:
-            _atomic_json(self.serial206_initialization_state_path, stored_payload)
+            with self._authority_write():
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_serial206_authority_snapshot_locked(stored_payload)
+                    self._db.execute("COMMIT")
+                except Exception:
+                    self._db.execute("ROLLBACK")
+                    raise
         return payload
 
     def append_serial206_receipts_atomic(
@@ -1273,7 +1817,7 @@ class OEMRuntimeStore:
         normalized: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = []
         for stream, receipt in receipts:
             selected_stream = str(stream).strip().lower()
-            if selected_stream not in {"x", "y", "z", "initialize_motion"}:
+            if selected_stream not in {"x", "y", "z", "initialize_motors", "initialize_motion"}:
                 raise ValueError("unsupported serial-206 receipt stream")
             payload = dict(receipt)
             replay_enabled = payload.get("idempotency_replay_enabled")
@@ -1298,102 +1842,55 @@ class OEMRuntimeStore:
         if not normalized:
             raise ValueError("at least one serial-206 receipt required")
         with self._lock:
+            self._authority_write_depth += 1
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 for selected_stream, _payload, row in normalized:
-                    self._db.execute(
-                        """
-                        INSERT INTO serial206_receipts(
-                            stream,receipt_id,command_id,idempotency_key,
-                            idempotency_replay_enabled,status,observed_at,receipt_json
-                        ) VALUES(?,?,?,?,?,?,?,?)
-                        ON CONFLICT(stream,receipt_id) DO UPDATE SET
-                            command_id=excluded.command_id,
-                            idempotency_key=excluded.idempotency_key,
-                            idempotency_replay_enabled=excluded.idempotency_replay_enabled,
-                            status=excluded.status,
-                            observed_at=excluded.observed_at,
-                            receipt_json=excluded.receipt_json
-                        """,
-                        row,
-                    )
+                    if selected_stream in {"x", "y", "z"}:
+                        self._db.execute(
+                            """
+                            INSERT OR IGNORE INTO serial206_receipts(
+                                stream,receipt_id,command_id,idempotency_key,
+                                idempotency_replay_enabled,status,observed_at,receipt_json
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            """,
+                            row,
+                        )
+                        existing = self._db.execute(
+                            "SELECT receipt_json FROM serial206_receipts WHERE stream=? AND receipt_id=?",
+                            (row[0], row[1]),
+                        ).fetchone()
+                        if existing is None or str(existing[0]) != str(row[7]):
+                            raise ValueError("serial-206 provider receipt identity conflicts with immutable receipt")
+                    else:
+                        self._db.execute(
+                            """
+                            INSERT INTO serial206_receipts(
+                                stream,receipt_id,command_id,idempotency_key,
+                                idempotency_replay_enabled,status,observed_at,receipt_json
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            ON CONFLICT(stream,receipt_id) DO UPDATE SET
+                                command_id=excluded.command_id,
+                                idempotency_key=excluded.idempotency_key,
+                                idempotency_replay_enabled=excluded.idempotency_replay_enabled,
+                                status=excluded.status,
+                                observed_at=excluded.observed_at,
+                                receipt_json=excluded.receipt_json
+                            """,
+                            row,
+                        )
+                self._rebind_latest_serial206_authority_snapshot_locked()
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
+                self._authority_write_depth -= 1
                 raise
+            self._authority_write_depth -= 1
         return [payload for _stream, payload, _row in normalized]
 
     def append_serial206_receipt(self, stream: str, receipt: dict[str, Any]) -> dict[str, Any]:
         """Persist one provider receipt without expanding the current-state file."""
-        selected_stream = str(stream).strip().lower()
-        if selected_stream not in {"x", "y", "z", "initialize_motion"}:
-            raise ValueError("unsupported serial-206 receipt stream")
-        payload = dict(receipt)
-        replay_enabled = payload.get("idempotency_replay_enabled")
-        if replay_enabled is None:
-            replay_enabled = payload.get("intent") not in {"stop", "abort"}
-        replay_enabled = bool(replay_enabled)
-        payload["idempotency_replay_enabled"] = replay_enabled
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        command_id = payload.get("command_id")
-        command_text = str(command_id) if isinstance(command_id, str) and command_id else None
-        idempotency_key = payload.get("idempotency_key")
-        idempotency_text = (
-            idempotency_key
-            if isinstance(idempotency_key, str) and idempotency_key
-            else None
-        )
-        status = payload.get("status")
-        status_text = status if isinstance(status, str) and status else None
-        supplied_receipt_id = payload.get("receipt_id")
-        receipt_id = (
-            str(supplied_receipt_id)
-            if isinstance(supplied_receipt_id, str) and supplied_receipt_id
-            else command_text or hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        )
-        try:
-            observed_at = float(
-                payload.get("finished_at")
-                or payload.get("started_at")
-                or payload.get("observed_at")
-                or utc_ts()
-            )
-        except (TypeError, ValueError, OverflowError):
-            observed_at = float(utc_ts())
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                self._db.execute(
-                    """
-                    INSERT INTO serial206_receipts(
-                        stream,receipt_id,command_id,idempotency_key,
-                        idempotency_replay_enabled,status,observed_at,receipt_json
-                    ) VALUES(?,?,?,?,?,?,?,?)
-                    ON CONFLICT(stream,receipt_id) DO UPDATE SET
-                        command_id=excluded.command_id,
-                        idempotency_key=excluded.idempotency_key,
-                        idempotency_replay_enabled=excluded.idempotency_replay_enabled,
-                        status=excluded.status,
-                        observed_at=excluded.observed_at,
-                        receipt_json=excluded.receipt_json
-                    """,
-                    (
-                        selected_stream,
-                        receipt_id,
-                        command_text,
-                        idempotency_text,
-                        int(replay_enabled),
-                        status_text,
-                        observed_at,
-                        encoded,
-                    ),
-                )
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
-        return payload
-
+        return self.append_serial206_receipts_atomic([(stream, receipt)])[0]
     def read_serial206_receipt(self, stream: str, command_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._db.execute(
@@ -1428,20 +1925,35 @@ class OEMRuntimeStore:
         return [json.loads(row["receipt_json"]) for row in reversed(rows)]
 
     def _load_seq(self) -> int:
-        p = self.root / "sequence.txt"
-        try:
-            return int(p.read_text().strip())
-        except Exception:
-            return 0
+        row = self._db.execute(
+            "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def next_seq(self) -> int:
         with self._lock:
-            self._seq += 1
-            (self.root / "sequence.txt").write_text(str(self._seq))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
+                ).fetchone()
+                current = int(row[0]) if row is not None else 0
+                self._seq = max(int(self._seq), current) + 1
+                self._db.execute(
+                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('runtime_sequence',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (str(self._seq), time.time()),
+                )
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
             return self._seq
 
     def write_state(self, snapshot: OEMRuntimeSnapshot | dict[str, Any]) -> dict[str, Any]:
-        payload = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        if isinstance(snapshot, OEMRuntimeSnapshot):
+            payload: dict[str, Any] = snapshot.to_dict()
+        else:
+            payload = dict(snapshot)
         from .hardware_status import hardware_state
         from .lifecycle_state import lifecycle_state
 
@@ -1457,16 +1969,36 @@ class OEMRuntimeStore:
         payload["operation_state"] = lifecycle["operation_state"]
         payload["startup"] = lifecycle["startup"]
         payload["lifecycle_revision"] = lifecycle["revision"]
-        payload["sequence"] = self.next_seq()
+        sequence = self.next_seq()
+        payload["sequence"] = sequence
         payload["updated_at"] = utc_ts()
-        _atomic_json(self.root / "runtime_state.json", payload)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._lock:
+            with self._authority_write():
+                self._db.execute(
+                    "INSERT INTO runtime_state_snapshots(sequence,state_json,state_sha256,created_at) VALUES(?,?,?,?)",
+                    (
+                        sequence,
+                        encoded,
+                        hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                        time.time(),
+                    ),
+                )
         return payload
 
     def read_state(self) -> dict[str, Any] | None:
-        p = self.root / "runtime_state.json"
-        if not p.exists():
+        with self._lock:
+            row = self._db.execute(
+                "SELECT state_json,state_sha256 FROM runtime_state_snapshots ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
             return None
-        return json.loads(p.read_text())
+        encoded = str(row["state_json"])
+        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
+            raise RuntimeError("runtime state snapshot JSON is not canonical")
+        if str(row["state_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
+            raise RuntimeError("runtime state snapshot digest mismatch")
+        return json.loads(encoded)
 
 
     def create_oem_full_lifecycle_run_once(
@@ -1499,19 +2031,27 @@ class OEMRuntimeStore:
             return self.write_oem_full_lifecycle_run(payload)
 
     def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Persist one full OEM movement-lifecycle run atomically.
-
-        Run files are immutable by identity but replaceable by monotonic state
-        updates.  The robot owns the directory and run identifier; callers do
-        not supply paths.
-        """
+        """Persist one full OEM movement-lifecycle run in SQLite."""
         payload = dict(run)
         run_id = str(payload.get("run_id") or "").strip()
         if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
             raise ValueError("valid robot-owned run_id required")
         with self._lock:
-            payload["sequence"] = self.next_seq()
-            _atomic_json(self.root / "movement_runs" / f"{run_id}.json", payload)
+            sequence = self.next_seq()
+            payload["sequence"] = sequence
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            self._db.execute(
+                """
+                INSERT INTO runtime_movement_runs(run_id,sequence,run_json,run_sha256,updated_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    sequence=excluded.sequence,
+                    run_json=excluded.run_json,
+                    run_sha256=excluded.run_sha256,
+                    updated_at=excluded.updated_at
+                """,
+                (run_id, sequence, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
+            )
         return payload
 
     def mutate_oem_full_lifecycle_run(
@@ -1530,29 +2070,46 @@ class OEMRuntimeStore:
         selected = str(run_id).strip()
         if not selected or "/" in selected or "\\" in selected or selected in {".", ".."}:
             raise ValueError("valid robot-owned run_id required")
-        path = self.root / "movement_runs" / f"{selected}.json"
-        if not path.exists():
+        with self._lock:
+            row = self._db.execute(
+                "SELECT run_json,run_sha256 FROM runtime_movement_runs WHERE run_id=?", (selected,)
+            ).fetchone()
+        if row is None:
             return None
-        return json.loads(path.read_text())
+        encoded = str(row["run_json"])
+        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
+            raise RuntimeError("runtime movement run JSON is not canonical")
+        if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
+            raise RuntimeError("runtime movement run digest mismatch")
+        return json.loads(encoded)
 
     def list_oem_full_lifecycle_runs(self) -> list[dict[str, Any]]:
-        root = self.root / "movement_runs"
-        if not root.exists():
-            return []
-        rows: list[dict[str, Any]] = []
-        for path in sorted(root.glob("*.json")):
-            rows.append(json.loads(path.read_text()))
-        return rows
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT run_json,run_sha256 FROM runtime_movement_runs ORDER BY sequence,run_id"
+            ).fetchall()
+        result = []
+        for row in rows:
+            encoded = str(row["run_json"])
+            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
+                raise RuntimeError("runtime movement run JSON is not canonical")
+            if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
+                raise RuntimeError("runtime movement run digest mismatch")
+            result.append(json.loads(encoded))
+        return result
 
     def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = dict(payload)
         row.setdefault("created_at", utc_ts())
-        row["sequence"] = self.next_seq()
-        path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        sequence = self.next_seq()
+        row["sequence"] = sequence
+        encoded = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
         with self._lock:
-            with path.open("a") as fh:
-                fh.write(json.dumps(row, sort_keys=True) + "\n")
+            with self._authority_write():
+                self._db.execute(
+                    "INSERT INTO runtime_journal(sequence,stream,payload_json,payload_sha256,created_at) VALUES(?,?,?,?,?)",
+                    (sequence, str(name), encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
+                )
         return row
 
     def append_command_queue(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -1568,14 +2125,21 @@ class OEMRuntimeStore:
         return self.append_journal("runtime_errors.jsonl", error)
 
     def read_journal(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
-        path = self.root / name
-        if not path.exists():
-            return []
-        rows = []
-        for line in path.read_text().splitlines():
-            if line.strip():
-                rows.append(json.loads(line))
-        return rows[-limit:]
+        bounded = max(1, min(int(limit), 500))
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT payload_json,payload_sha256 FROM runtime_journal WHERE stream=? ORDER BY sequence DESC LIMIT ?",
+                (str(name), bounded),
+            ).fetchall()
+        result = []
+        for row in reversed(rows):
+            encoded = str(row["payload_json"])
+            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
+                raise RuntimeError("runtime journal JSON is not canonical")
+            if str(row["payload_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
+                raise RuntimeError("runtime journal digest mismatch")
+            result.append(json.loads(encoded))
+        return result
 
     def recover_state(self) -> dict[str, Any]:
         state = self.read_state()

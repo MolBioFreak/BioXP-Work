@@ -195,8 +195,7 @@ _NO_MOTION_PREPARATION_PATHS = {
     # movement/homing action.  It must remain available to repair a stale Z
     # coordinate while the physical-motion arm is deliberately disarmed.
     "/motion/oem/z/set_home",
-    "/motion/oem/x/prepare",
-    "/motion/oem/x/reconcile_switch_masks",
+
     "/motion/oem/x/set_home",
     "/motion/oem/x/set_max_speed",
     "/motion/oem/x/set_max_acc",
@@ -265,16 +264,12 @@ def _home_action(action: Mapping[str, Any]) -> bool:
 
 
 _Z_NO_MOTION_STATE_ACTIONS = frozenset({
-    "oem.z.prepare",
-    "oem.z.reconcile_switch_masks",
     "oem.z.set_home",
 })
 
-_Y_NO_MOTION_STATE_ACTIONS = frozenset({"oem.y.prepare"})
+_Y_NO_MOTION_STATE_ACTIONS = frozenset()
 
 _X_NO_MOTION_STATE_ACTIONS = frozenset({
-    "oem.x.prepare",
-    "oem.x.reconcile_switch_masks",
     "oem.x.set_home",
     "oem.x.set_max_speed",
     "oem.x.set_max_acc",
@@ -535,90 +530,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     action_id = str(action.get("action_id") or "")
     x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     y_provider_action = action_id.startswith("oem.y.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
-    if x_provider_action and action_id != "oem.x.status":
-        provider_state_value = machine_state.get("serial206_initialization_provider")
-        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
-        x_authority_value = provider_state.get("x_authority")
-        x_authority = x_authority_value if isinstance(x_authority_value, Mapping) else {}
-        x_lifecycle_value = x_authority.get("lifecycle")
-        x_lifecycle = x_lifecycle_value if isinstance(x_lifecycle_value, Mapping) else x_authority
-        x_state = str(x_lifecycle.get("state") or "unbound")
-        allowed_by_action = {
-            "oem.x.prepare": {"unprepared", "failed_latched", "reconciliation_required"},
-            "oem.x.reconcile_switch_masks": {"unprepared", "failed_latched", "reconciliation_required"},
-            "oem.x.manual_panel_home": {"unprepared", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.startup_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_to_origin_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.caught_plate_recovery_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_steps": {"unprepared", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_absolute": {"unprepared", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_max_speed": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_max_acc": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.restore_original_speed": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_stall_guard": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.observe": {"awaiting_operator_observation"},
-            "oem.x.stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
-            "oem.abort_all": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
-            "oem.xy.home_xy": {"prepared_unreferenced", "referenced_ready"},
-            "oem.xy.move_xy": {"referenced_ready"},
-            "oem.xyz.move_to": {"prepared_unreferenced", "referenced_ready", "failed_latched"},
-        }
-        allowed = allowed_by_action.get(action_id)
-        if allowed is not None:
-            dependencies.append(_dependency(
-                "serial206_x_lifecycle",
-                "Serial-206 X lifecycle",
-                x_state in allowed,
-                f"Current X lifecycle state {x_state!r}; expected one of {sorted(allowed)}.",
-            ))
-    if action_id.startswith("oem.z.") and action_id != "oem.z.status":
-        provider_state_value = machine_state.get("serial206_initialization_provider")
-        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
-        z_authority_value = provider_state.get("z_authority")
-        z_authority = z_authority_value if isinstance(z_authority_value, Mapping) else {}
-        z_state = str(z_authority.get("state") or "unbound")
-        allowed_by_action = {
-            "oem.z.prepare": {"unprepared", "failed_latched"},
-            "oem.z.reconcile_switch_masks": {"unprepared", "failed_latched"},
-            "oem.z.manual_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.diagnostic_home_axis": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.resume_after_abort": {"failed_latched"},
-            "oem.z.move_steps": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.move_absolute": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.clear": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.observe": {"awaiting_operator_observation"},
-        }
-        allowed = allowed_by_action.get(action_id)
-        if allowed is not None:
-            dependencies.append(_dependency(
-                "serial206_z_lifecycle",
-                "Serial-206 Z lifecycle",
-                z_state in allowed,
-                f"Current Z lifecycle state {z_state!r}; expected one of {sorted(allowed)}.",
-            ))
-    if action_id.startswith("oem.y.") and action_id != "oem.y.status":
-        provider_state_value = machine_state.get("serial206_initialization_provider")
-        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
-        y_authority_value = provider_state.get("y_authority")
-        y_authority = y_authority_value.get("authority") if isinstance(y_authority_value, Mapping) and isinstance(y_authority_value.get("authority"), Mapping) else y_authority_value
-        y_state = str(y_authority.get("lifecycle_state") or y_authority.get("state") or "unbound") if isinstance(y_authority, Mapping) else "unbound"
-        allowed_by_action = {
-            "oem.y.prepare": {"unprepared", "generation_stale", "failed_latched"},
-            "oem.y.manual_panel_home": {"unprepared", "prepared_unreferenced", "referenced_ready", "generation_stale"},
-            "oem.y.move_steps": {"prepared_unreferenced", "referenced_ready"},
-            "oem.y.move_absolute": {"prepared_unreferenced", "referenced_ready"},
-        }
-        allowed = allowed_by_action.get(action_id)
-        if allowed is not None:
-            dependencies.append(_dependency(
-                "serial206_y_lifecycle",
-                "Serial-206 Y lifecycle",
-                y_state in allowed,
-                f"Current Y lifecycle state {y_state!r}; expected one of {sorted(allowed)}.",
-            ))
     method = str(action.get("informational_method") or "GET")
     safety = str(action.get("safety_class") or "read_only")
     path = str(action.get("informational_path") or "").lower()
@@ -678,7 +589,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     )
     motion_action = source_initializer or safety == "motion" or _motor_motion_action(action)
     if motion_action:
-        dependencies.append(_operation_motion_dependency(machine_state))
+        if not (provider_owned_x_motion or provider_owned_y_motion or provider_owned_z_motion):
+            dependencies.append(_operation_motion_dependency(machine_state))
         x_state_establishing = action_id in _X_NO_MOTION_STATE_ACTIONS
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
         y_state_establishing = action_id in _Y_NO_MOTION_STATE_ACTIONS
@@ -688,39 +600,22 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             if source_initializer or z_state_establishing or x_state_establishing or y_state_establishing or observation_action
             else _required_reference_axes(action, values)
         )
-        if x_state_establishing or observation_action:
-            readiness = {"dependencies": []}
-        elif action_id in _X_AUTO_PREREQUISITE_ACTIONS:
-            # Normal X controls compose missing preparation and operational
-            # homing inside the provider transaction. Cached lifecycle and
-            # board freshness must not pre-disable the requested action.
-            readiness = {"dependencies": []}
-        elif provider_owned_x_motion:
-            readiness = _provider_x_motion_readiness(machine_state)
-        elif y_state_establishing or provider_owned_y_motion:
-            readiness = {"dependencies": []}
-        elif z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
-            # OEM state-establishing operations create readiness. Normal Z
-            # controls also compose missing preparation/reference work inside
-            # the provider transaction, so cached readiness must not pre-disable
-            # the operator's requested action.
+        if (
+            x_state_establishing
+            or y_state_establishing
+            or z_state_establishing
+            or observation_action
+            or provider_owned_x_motion
+            or provider_owned_y_motion
+            or provider_owned_z_motion
+        ):
             readiness = {"dependencies": []}
         else:
-            readiness = (
-                _provider_z_motion_readiness(machine_state)
-                if provider_owned_z_motion
-                else _motion_readiness(machine_state, required_axes)
-            )
+            readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
         )
-        if action_id == "oem.xy.move_xy":
-            existing_keys = {str(row.get("key")) for row in dependencies}
-            y_readiness = _motion_readiness(machine_state, ["y"])
-            dependencies.extend(
-                row for row in y_readiness["dependencies"] if str(row.get("key")) not in existing_keys
-            )
         effective_axis = str(values.get("axis") or "").lower()
         if effective_axis == "z" and not provider_owned_z_motion:
             domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
@@ -776,30 +671,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                         target_ok,
                         "Requested Z target is outside the OEM nonnegative envelope.",
                     ))
-        elif provider_owned_z_motion and action_id == "oem.z.move_absolute":
-            target = values.get("position_steps")
-            dependencies.append(_dependency(
-                "z_target_oem_envelope",
-                "Z target in OEM 0..160000 envelope",
-                type(target) is int and 0 <= target <= 160000,
-                "Requested Z target is outside the OEM nonnegative envelope.",
-            ))
-        elif provider_owned_x_motion and action_id == "oem.x.move_absolute":
-            target = values.get("position_steps")
-            dependencies.append(_dependency(
-                "x_target_oem_envelope",
-                "X target in OEM 0..90263 envelope (effective minimum 60)",
-                type(target) is int and 0 <= target <= 90263,
-                "Requested X target is outside the OEM 0..90263 envelope.",
-            ))
-        elif provider_owned_x_motion and action_id == "oem.x.move_steps":
-            steps = values.get("steps")
-            dependencies.append(_dependency(
-                "x_relative_oem_envelope",
-                "X relative request respects the source 20-step inner margin",
-                type(steps) is int and -90243 <= steps <= 90243,
-                "Requested X relative delta exceeds the maximum source-margin span; live target preflight remains provider-owned.",
-            ))
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
@@ -997,11 +868,15 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
         if provider_z_available
         else _motion_readiness(machine_state, [])
     )
+    z_terminal_value = z_authority.get("terminal_state")
+    z_terminal_state: Mapping[str, Any] = z_terminal_value if isinstance(z_terminal_value, Mapping) else {}
     z_provider = {
         **z_authority,
         "bound": provider_state.get("bound") if isinstance(provider_state, Mapping) else False,
         "expected_startup_stage": initialize_motors.get("expected_next_stage") if isinstance(initialize_motors, Mapping) else None,
         "startup_terminal_state": initialize_motors.get("terminal_state") if isinstance(initialize_motors, Mapping) else None,
+        "switch_mask_policy": "observed_only_oem_source_omits_z_writes",
+        "switch_mask_tuple": z_terminal_state.get("switch_mask_tuple"),
     }
     return {
         "schema_version": "bioxp.operator_dashboard.v1",
@@ -1109,7 +984,7 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/manual/home": "initialize_motors",
     "/motion/oem/x/status": "initialize_motors",
     "/motion/oem/x/prepare": "initialize_motors",
-    "/motion/oem/x/reconcile_switch_masks": "initialize_motors",
+
     "/motion/oem/x/move_steps": "initialize_motors",
     "/motion/oem/x/move_absolute": "initialize_motors",
     "/motion/oem/x/manual_home": "initialize_motors",
@@ -1139,7 +1014,7 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/z/lower_pipette": "initialize_motors",
     "/motion/oem/z/lift_pipette": "initialize_motors",
     "/motion/oem/z/self_test": "initialize_motors",
-    "/motion/oem/z/reconcile_switch_masks": "initialize_motors",
+
     "/motion/oem/z/set_home": "initialize_motors",
     "/motion/oem/z/diagnostic_home_axis": "initialize_motors",
     "/motion/oem/z/stop": "initialize_motors",
@@ -1237,12 +1112,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         fixed = dict(fixed_inputs or {})
         visible_inputs = [dict(row) for row in provider.get("inputs", []) if row.get("name") not in fixed]
         action_bounds = {
-            "oem.z.move_steps": ("steps", -160000, 160000),
-            "oem.z.move_absolute": ("position_steps", 0, 160000),
-            "oem.x.move_steps": ("steps", -90243, 90243),
-            "oem.x.move_absolute": ("position_steps", 0, 90263),
-            "oem.y.move_steps": ("steps", -102_936, 102_936),
-            "oem.y.move_absolute": ("target_steps", 0, 102_956),
+            "oem.z.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.z.move_absolute": ("position_steps", -(2**31), 2**31 - 1),
+            "oem.x.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.x.move_absolute": ("position_steps", -(2**31), 2**31 - 1),
+            "oem.y.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.y.move_absolute": ("target_steps", -(2**31), 2**31 - 1),
         }.get(action_id)
         if action_bounds is not None:
             input_name, minimum, maximum = action_bounds
@@ -1263,9 +1138,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "description": description,
             "source_anchor": source_anchor,
             "requires_confirmation": action_id in {
-                "oem.z.reconcile_switch_masks",
                 "oem.z.set_home",
-                "oem.x.reconcile_switch_masks",
                 "oem.x.set_home",
             },
             "category": (
@@ -1288,11 +1161,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         }
 
     x_semantic_actions = (
-        ("oem.x.status", "/motion/oem/x/status", "X axis authority status", "Provider-owned X lifecycle, terminal telemetry, reconciliation state, and durable receipt projection.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
-        ("oem.x.prepare", "/motion/oem/x/prepare", "Prepare OEM X profile", "Run the exact X no-motion profile and verify the Serial-206 machine tuple without movement.", "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195"),
-        ("oem.x.reconcile_switch_masks", "/motion/oem/x/reconcile_switch_masks", "Reconcile Serial-206 X switch masks", "Repair persistent X masks to SAP12=0/SAP13=0 and verify both readbacks; invalidates X preparation/reference.", "Literal-OEM controller-state repair"),
-        ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Source-shaped relative X movement with the provider-owned 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
-        ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Source-shaped absolute X movement in 0..90263 with effective minimum 60 and optional temporary acceleration.", "ClassControlInterface.moveX:4206-4243"),
+        ("oem.x.status", "/motion/oem/x/status", "X axis controller status", "Provider-owned X terminal telemetry and durable receipt projection. SAP12/SAP13 are observed because recovered OEM X initialization writes neither register.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
+
+        ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Signed-int32 relative request; ClassMotor returns -1 without movement when the resulting target crosses its 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
+        ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Signed-int32 absolute request; the public wrapper clamps values below 60 and ClassHeadBoard returns the current position without movement at or above the high guard.", "ClassControlInterface.moveX:4206-4243"),
         ("oem.x.manual_panel_home", "/motion/oem/x/manual_home", "OEM X manual panel Home", "Exact manual-panel goHome(rehome=true, speed=500) identity.", "ClassControlInterface manual panel Home:2270-2278"),
         ("oem.x.diagnostic_home_axis", "/motion/oem/x/diagnostic_home_axis", "Diagnostic X HomeAxis", "Exact diagnostic axisSearchHome(X,250) identity; not the manual Home action.", "ClassControlInterface.HomeAxis:4997-5008"),
         ("oem.x.startup_home", "/motion/oem/x/startup_home", "OEM X startup home", "Exact startup axisSearchHome(X,250), setHome, profile restore, and park sequence.", "ClassControlInterface.initializeMotors:3203-3220"),
@@ -1323,10 +1195,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         )
     y_semantic_actions = (
         ("oem.y.status", "/motion/oem/y/status", "OEM Y status", "Passive Serial-206 Y authority and controller-status projection.", "ClassControlInterface Y status", {}),
-        ("oem.y.prepare", "/motion/oem/y/prepare", "OEM Y prepare", "No-motion Serial-206 Y profile preparation and readback.", "ClassControlInterface initializeMotors", {}),
         ("oem.y.manual_panel_home", "/motion/oem/y/home", "OEM Y manual-panel Home", "Exact manual-panel Y home identity.", "ClassControlInterface.btnYHome_Click:1847-1856", {"source_mode": "manual_panel"}),
-        ("oem.y.move_steps", "/motion/oem/y/move_steps", "OEM Y moveSteps", "Source-shaped relative Y movement with strict effective-target bounds.", "ClassControlInterface.moveSteps:4165-4204", {}),
-        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM Y moveY absolute", "Source-shaped nonblocking absolute issue with durable terminalization.", "ClassControlInterface.moveY overloads:4206-4252", {}),
+        ("oem.y.move_steps", "/motion/oem/y/move_steps", "OEM Y moveSteps", "Signed-int32 relative request; ClassMotor returns -1 without movement when the resulting target crosses its 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204", {}),
+        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM Y moveY absolute", "Signed-int32 nonblocking absolute request; ClassHeadBoard clamps negative values to zero and returns the current position without movement at or above the high guard.", "ClassControlInterface.moveY overloads:4206-4252", {}),
         ("oem.y.stop", "/motion/oem/y/stop", "OEM Y Stop", "Independent priority-lane Y stop.", "ClassMotor.stopMotor", {}),
     )
     for action_id, path, label, description, source_anchor, fixed_inputs in y_semantic_actions:
@@ -1370,7 +1241,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="OEM HomeXY",
         description="Exact OEM parallel HomeXY composite.",
         source_anchor="ClassControlInterface.HomeXY",
-        fixed_inputs={"operator_ack": "HOMEXY", "timeout_s": 120.0, "allow_implementation_mapped_predicate": False},
+        fixed_inputs={"operator_ack": "HOMEXY"},
         required_provider_capability="initialize_motors",
     )
     x_abort_action = next((row for row in actions if row.get("action_id") == "oem.abort_all"), None)
@@ -1382,24 +1253,6 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "x-axis",
         })
 
-    add_semantic_alias(
-        action_id="oem.z.prepare",
-        path="/motion/oem/z/prepare",
-        label="Prepare OEM Z profile",
-        description="Run the OEM safety check and cmd64=0→1 board cycle, then execute the source Z no-motion segment and verify exact readbacks without moving.",
-        source_anchor="ClassControlInterface.initializeMotorsWithoutMotion:3225-3232",
-        fixed_inputs={"axis": "z"},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.z.reconcile_switch_masks",
-        path="/motion/oem/z/reconcile_switch_masks",
-        label="Reconcile OEM Z switch masks",
-        description="Repair persistent Z masks to the literal-OEM enabled baseline SAP12=0/SAP13=0; requires fresh Z preparation afterward.",
-        source_anchor="ClassMotor param12 right-disable; param13 left-disable",
-        fixed_inputs={"axis": "z"},
-        required_provider_capability="initialize_motors",
-    )
     add_semantic_alias(
         action_id="oem.z.set_home",
         path="/motion/oem/z/set_home",
@@ -2118,6 +1971,8 @@ def install_operator_control_plane(
             "admission_pending": "queued",
             "blocked": "rejected",
             "reconciliation_required": "failed",
+            "stop_requested": "interrupting",
+            "abort_requested": "interrupting",
             "stopped": "interrupted",
             "aborted": "interrupted",
             "cancelled": "cleared",
@@ -2215,18 +2070,19 @@ def install_operator_control_plane(
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
         dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=100))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"])) and (str(action["safety_class"]) != "stop" or str(action["action_id"]) == "oem.y.stop")]}
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"]))]}
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
         if not command_plane.is_canonical(action_id):
             raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
-        if action_id in {"oem.x.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
-            raise HTTPException(status_code=404, detail="interrupt identity is not part of the strict Serial-206 Y v2 lane")
-        if action_id == "oem.y.stop":
+        if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
             if not isinstance(payload, OperatorInterruptRequestV1):
                 raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
-            return await command_plane.invoke_y_interrupt(payload.model_dump())
+            request_body = payload.model_dump()
+            if action_id == "oem.y.stop":
+                return await command_plane.invoke_y_interrupt(request_body)
+            return await command_plane.compat_invoke(action_id, request_body)
         if isinstance(payload, OperatorInterruptRequestV1):
             raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
         if not isinstance(payload, OperatorActionRequestV2):
@@ -2314,7 +2170,6 @@ def install_operator_control_plane(
                     }
                     for action in actions
                     if str(action["action_id"]) in command_plane.by_id
-                    and (str(action["safety_class"]) != "stop" or str(action["action_id"]) == "oem.y.stop")
                 ],
             }
         return {
@@ -2473,6 +2328,8 @@ def install_operator_control_plane(
         action = by_id[action_id]
         is_safety_interrupt = action_id in {
             "meta.emergency_stop",
+            "oem.x.stop",
+            "oem.y.stop",
             "oem.z.stop",
             "oem.z.abort",
         }
@@ -2487,10 +2344,16 @@ def install_operator_control_plane(
                 "/motion/diagnostics/stop",
                 "/motion/oem/x/stop",
                 "/motion/oem/x/abort",
+                "/motion/oem/y/stop",
                 "/motion/oem/z/stop",
                 "/motion/oem/z/abort",
             }
         )
+        interrupt_axis = {
+            "/motion/oem/x/stop": "x",
+            "/motion/oem/y/stop": "y",
+            "/motion/oem/z/stop": "z",
+        }.get(str(target.get("path"))) if is_safety_interrupt else None
         unknown_inputs = set(payload.inputs) - set(target["inputs"])
         if unknown_inputs:
             raise HTTPException(
@@ -2622,6 +2485,8 @@ def install_operator_control_plane(
                     }
                     claimed, created = await asyncio.to_thread(store.claim, cleared_receipt)
                     return claimed
+        if is_safety_interrupt:
+            await _successive_move_queue.clear(interrupt_axis)
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
         async with action_lock:
             lock_acquired_at = time.time()
@@ -2631,7 +2496,7 @@ def install_operator_control_plane(
                 if locked_state is None
                 else int(locked_state["ownership_generation"])
             )
-            if payload.expected_generation != locked_expected:
+            if not is_safety_interrupt and payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
@@ -2840,9 +2705,7 @@ def install_operator_control_plane(
             receipt["receipt_persist_started_at"] = time.time()
             persist_receipt = store.put_interrupt if is_safety_interrupt else store.put
             persisted = await asyncio.to_thread(persist_receipt, receipt)
-            if is_safety_interrupt:
-                await _successive_move_queue.clear()
-            elif queue_axis is not None:
+            if queue_axis is not None:
                 await _successive_move_queue.complete(queue_axis)
             return persisted
 

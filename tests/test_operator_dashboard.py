@@ -388,7 +388,8 @@ def test_provider_gate_precedes_runtime_dependencies():
     assert assessed["disabled_reason"] == "provider not bound"
 
 
-def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
+def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp import api
 
     actions, dispatch = _build_catalog(api.app)
@@ -400,8 +401,6 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         "oem.z.set_clean_path": ["enabled"],
         "oem.z.move_steps": ["steps"],
         "oem.z.move_absolute": ["position_steps"],
-        "oem.z.prepare": [],
-        "oem.z.reconcile_switch_masks": ["confirm"],
         "oem.z.set_home": [],
         "oem.z.diagnostic_home_axis": [],
         "oem.z.stop": [],
@@ -419,7 +418,7 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         assert action_id in by_id
         assert [row["name"] for row in by_id[action_id]["inputs"]] == input_names
         assert by_id[action_id]["requires_confirmation"] is (
-            action_id in {"oem.z.reconcile_switch_masks", "oem.z.set_home"}
+            action_id == "oem.z.set_home"
         )
         assert by_id[action_id]["required_provider_capability"] == "initialize_motors"
         if action_id == "oem.z.move_z_home":
@@ -427,6 +426,8 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         else:
             assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
+    assert "oem.z.prepare" not in by_id
+    assert "oem.z.reconcile_switch_masks" not in by_id
     assert any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
     assert not any(row["informational_path"] == "/motion/oem/z/live_right_reference" for row in actions)
     assert {

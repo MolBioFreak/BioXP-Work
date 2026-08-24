@@ -209,38 +209,27 @@ class Serial206YProvider:
     ) -> dict[str, Any]:
         command_id = command_id or f"y-relative-{uuid.uuid4().hex}"
         profile = self.profile()
-        authority = self._current_authority()
-        if not authority.get("ok"):
-            return {"ok": False, "axis": self.axis, "command_id": command_id, **authority}
-        before = self._position()
-        before_value = self._position_value(before)
-        if before_value is None:
-            return {"ok": False, "axis": self.axis, "command_id": command_id, "failure": "y_position_readback_invalid", "position_before": before}
+        authority = self._current_authority(allow_unprepared=True)
         requested_steps = int(steps)
-        target = before_value + requested_steps
-        if target < self.relative_min_target or target > self.relative_max_target:
-            return {
-                "ok": False,
-                "axis": self.axis,
-                "command_id": command_id,
-                "failure": "y_relative_target_out_of_range",
-                "requested_steps": requested_steps,
-                "position_before": before_value,
-                "requested_target": target,
-                "relative_min_target": self.relative_min_target,
-                "relative_max_target": self.relative_max_target,
-                "command_sent": False,
-            }
         primitive = getattr(self.tester, "motor_y_move_relative_strict", None)
         if callable(primitive):
             result = primitive(requested_steps, timeout_s=float(wait_timeout_s))
+            result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_relative_result_not_mapping", "raw": result}
+            before_value = result.get("position_before")
+            target = result.get("requested_target")
+            before = {"position": before_value} if type(before_value) is int else None
         else:
+            before = self._position()
+            before_value = self._position_value(before)
+            if before_value is None:
+                return {"ok": False, "axis": self.axis, "command_id": command_id, "failure": "y_position_readback_invalid", "position_before": before}
+            target = before_value + requested_steps
             primitive = getattr(self.tester, "motor_move_relative", None)
             result = primitive(self.board, requested_steps, motor=self.motor) if callable(primitive) else {"ok": False, "failure": "y_relative_primitive_not_bound"}
-        result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_relative_result_not_mapping", "raw": result}
+            result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_relative_result_not_mapping", "raw": result}
         after = result.get("terminal_position") if isinstance(result.get("terminal_position"), Mapping) else self._position()
         after_value = self._position_value(after)
-        observation = self._record_observation(command_id=command_id, target=target, observed=after_value)
+        observation = self._record_observation(command_id=command_id, target=int(target), observed=after_value) if type(target) is int else None
         proof = result.get("proof") if isinstance(result.get("proof"), Mapping) else {}
         completion_class = str(result.get("completion_class") or ("event_128" if proof.get("addressed_event_128") else "unknown"))
         return {
@@ -268,6 +257,7 @@ class Serial206YProvider:
             "discrepancy": observation,
             "result": result,
             "profile": profile,
+            "authority_observation": authority,
         }
 
     def move_absolute(
@@ -280,35 +270,13 @@ class Serial206YProvider:
     ) -> dict[str, Any]:
         command_id = command_id or f"y-absolute-{uuid.uuid4().hex}"
         profile = self.profile()
-        authority = self._current_authority()
-        if not authority.get("ok"):
-            return {"ok": False, "axis": self.axis, "command_id": command_id, **authority}
+        authority = self._current_authority(allow_unprepared=True)
         before = self._position()
         before_value = self._position_value(before)
         if before_value is None:
             return {"ok": False, "axis": self.axis, "command_id": command_id, "failure": "y_position_readback_invalid", "position_before": before}
         caller_target = int(target_steps)
-        effective_target = max(self.min_steps, min(self.max_steps, caller_target))
-        near_high_noop = bool(
-            before_value <= self.max_steps
-            and abs(self.max_steps - before_value) < 10
-            and caller_target > before_value
-        )
-        if near_high_noop:
-            return {
-                "ok": True,
-                "schema": self.schema,
-                "axis": self.axis,
-                "command_id": command_id,
-                "state": "completed",
-                "caller_requested_target": caller_target,
-                "board_effective_target": before_value,
-                "motor_effective_target": before_value,
-                "near_high_noop": True,
-                "command_sent": False,
-                "completion_class": "oem_near_high_noop",
-                "physical_effect_verified": False,
-            }
+        effective_target = max(self.min_steps, caller_target)
         primitive = getattr(self.tester, "motor_oem_move_absolute", None)
         result = primitive(
             self.board,
@@ -318,6 +286,28 @@ class Serial206YProvider:
             max_position=self.max_steps,
         ) if callable(primitive) else {"ok": False, "failure": "y_absolute_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_absolute_result_not_mapping", "raw": result}
+        if result.get("source_noop") is True:
+            observed = result.get("effective_position", before_value)
+            return {
+                "ok": bool(result.get("ok") is True),
+                "schema": self.schema,
+                "axis": self.axis,
+                "board": self.board,
+                "motor": self.motor,
+                "command_id": command_id,
+                "state": "completed",
+                "caller_requested_target": caller_target,
+                "board_effective_target": observed,
+                "motor_effective_target": observed,
+                "near_high_noop": result.get("short_circuit") == "high_limit_guard",
+                "command_sent": False,
+                "completion_class": "oem_source_noop",
+                "controller_completion_verified": True,
+                "physical_effect_verified": False,
+                "result": result,
+                "profile": profile,
+                "authority_observation": authority,
+            }
         state = "completed" if wait_for_stop else "issued_pending"
         after = result.get("terminal_position") if wait_for_stop and isinstance(result.get("terminal_position"), Mapping) else None
         after_value = self._position_value(after)
@@ -350,6 +340,7 @@ class Serial206YProvider:
             "discrepancy": observation,
             "result": result,
             "profile": profile,
+            "authority_observation": authority,
         }
 
     def move_absolute_internal(
@@ -361,7 +352,6 @@ class Serial206YProvider:
         acceleration_override: int | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Typed internal source overload; routine operator inputs cannot reach it."""
         allowed = {
             "manual_panel": (False, None),
             "wrapper_default": (True, None),
@@ -380,49 +370,27 @@ class Serial206YProvider:
         receipt: dict[str, Any] = {
             "intent": intent,
             "requested_acceleration": int(selected_acc),
-            "restoration_class": "LINUX_EVIDENCE_HARDENING",
+            "source_sequence": ["SAP5=requested", "moveY", f"SAP5={self.normal_acc}"],
         }
-        absolute_result: dict[str, Any] | None = None
-        source_exception: Exception | None = None
         try:
             receipt["requested_acceleration_write"] = setter(self.board, 5, int(selected_acc), motor=self.motor) if callable(setter) else {"ok": False, "failure": "acceleration_setter_not_bound"}
             receipt["requested_acceleration_readback"] = getter(self.board, 5, motor=self.motor) if callable(getter) else {"ok": False, "failure": "acceleration_reader_not_bound"}
             receipt["requested_acceleration_applied"] = bool(
                 isinstance(receipt["requested_acceleration_readback"], Mapping)
-                and receipt["requested_acceleration_readback"].get("ok") is True
                 and receipt["requested_acceleration_readback"].get("value") == int(selected_acc)
             )
-            if receipt["requested_acceleration_applied"]:
-                absolute_result = self.move_absolute(target_steps, wait_for_stop=selected_wait, command_id=command_id)
-            else:
-                absolute_result = {"ok": False, "failure": "requested_acceleration_write_or_readback_unverified", "command_id": command_id, "physical_effect_verified": False}
+            absolute_result = self.move_absolute(target_steps, wait_for_stop=selected_wait, command_id=command_id)
             receipt["absolute_result"] = absolute_result
-        except Exception as exc:
-            source_exception = exc
-            receipt["source_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
-        finally:
-            try:
-                receipt["restoration_write"] = setter(self.board, 5, self.normal_acc, motor=self.motor) if callable(setter) else {"ok": False, "failure": "acceleration_setter_not_bound"}
-            except Exception as exc:
-                receipt["restoration_write"] = {"ok": False, "failure": "normal_acceleration_restoration_write_failed"}
-                receipt["restoration_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
-            try:
-                receipt["restoration_readback"] = getter(self.board, 5, motor=self.motor) if callable(getter) else {"ok": False, "failure": "acceleration_reader_not_bound"}
-            except Exception as exc:
-                receipt["restoration_readback"] = {"ok": False, "failure": "normal_acceleration_restoration_readback_failed"}
-                receipt.setdefault("restoration_exception", {"type": type(exc).__name__, "message": str(exc)[:500]})
+            receipt["restoration_write"] = setter(self.board, 5, self.normal_acc, motor=self.motor) if callable(setter) else {"ok": False, "failure": "acceleration_setter_not_bound"}
+            receipt["restoration_readback"] = getter(self.board, 5, motor=self.motor) if callable(getter) else {"ok": False, "failure": "acceleration_reader_not_bound"}
             receipt["restoration_complete"] = bool(
                 isinstance(receipt["restoration_readback"], Mapping)
-                and receipt["restoration_readback"].get("ok") is True
                 and receipt["restoration_readback"].get("value") == self.normal_acc
             )
-        if source_exception is not None:
+        except Exception as exc:
+            receipt["source_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
             return {"ok": False, "failure": "y_absolute_source_exception", "acceleration_overload": receipt}
-        result_with_receipt = {**dict(absolute_result or {}), "acceleration_overload": receipt}
-        if not receipt["restoration_complete"]:
-            result_with_receipt["ok"] = False
-            result_with_receipt["failure"] = "normal_acceleration_restoration_unverified"
-        return result_with_receipt
+        return {**dict(absolute_result), "acceleration_overload": receipt}
 
     def terminalize_absolute(self, issued_receipt: Mapping[str, Any], *, timeout_s: float = 20.0) -> dict[str, Any]:
         result = issued_receipt.get("result") if isinstance(issued_receipt.get("result"), Mapping) else issued_receipt
@@ -436,6 +404,8 @@ class Serial206YProvider:
         speed = self._speed()
         position_valid = self._reply_valid(position, "position")
         speed_valid = self._reply_valid(speed, "speed")
+        position_source_valid = isinstance(position, Mapping) and type(position.get("position")) is int
+        speed_source_valid = isinstance(speed, Mapping) and type(speed.get("speed")) is int
         event_code = event.get("status") if isinstance(event, Mapping) else None
         wait_window = wait.get("event_window") if isinstance(wait, Mapping) else None
         addressed = bool(
@@ -449,13 +419,11 @@ class Serial206YProvider:
         )
         timeout_equal = bool(
             (event is None or event_code is None)
-            and position_valid
-            and speed_valid
+            and position_source_valid
             and type(target) is int
             and position.get("position") == int(target)
-            and speed.get("speed") == 0
         )
-        exact_target = bool(position_valid and type(target) is int and position.get("position") == int(target))
+        exact_target = bool(position_source_valid and type(target) is int and position.get("position") == int(target))
         if addressed and event_code == 128 and exact_target:
             completion_class = "event_128"
         elif addressed and event_code == 128:
@@ -468,13 +436,12 @@ class Serial206YProvider:
             completion_class = "oem_timeout_target_equal"
         else:
             completion_class = "timeout"
-        controller_completed = bool(completion_class == "event_128" and exact_target and speed_valid and speed.get("speed") == 0)
-        # A target-equal readback after timeout is ambiguous evidence, not
-        # command-bound terminal proof. Every non-event-128 outcome takes the
-        # independent stop lane and returns non-success.
-        source_completed = controller_completed
+        controller_completed = bool(addressed and event_code == 128)
+        # ClassHeadBoard.moveToAbs breaks out normally when its 20-second wait
+        # expires and queryActualPosition equals the requested target.
+        source_completed = controller_completed or timeout_equal
         observation = self._record_observation(command_id=command_id, target=int(target), observed=self._position_value(position)) if source_completed and type(target) is int else None
-        failure_stop = None if source_completed else self.stop(command_id=f"{command_id}:failure-stop", timeout_s=min(float(timeout_s), 3.0))
+        failure_stop = None
         return {
             "ok": source_completed,
             "receipt_id": f"y-terminal-{command_id}",
@@ -490,7 +457,11 @@ class Serial206YProvider:
             "completion_class": completion_class,
             "controller_completion_verified": controller_completed,
             "target_position_verified": exact_target,
-            "terminal_speed_zero": bool(speed_valid and speed.get("speed") == 0),
+            "terminal_position_reply_valid": position_valid,
+            "terminal_speed_reply_valid": speed_valid,
+            "terminal_position_source_valid": position_source_valid,
+            "terminal_speed_source_valid": speed_source_valid,
+            "terminal_speed_zero": bool(speed_source_valid and speed.get("speed") == 0),
             "source_returned_normally": source_completed,
             "physical_effect_verified": False,
             "discrepancy": observation,
@@ -533,12 +504,6 @@ class Serial206YProvider:
         speed, startup = self._HOME_MODES[mode]
         profile = self.profile(startup=startup)
         authority = self._current_authority(allow_unprepared=True)
-        if not authority.get("ok"):
-            return {"ok": False, "axis": self.axis, "command_id": command_id, "source_mode": mode, **authority}
-        if authority.get("authority") and not authority.get("axis", {}).get("prepared_board_epoch"):
-            prepared = self.prepare(command_id=f"{command_id}:prepare")
-            if not prepared.get("ok"):
-                return {"ok": False, "axis": self.axis, "command_id": command_id, "source_mode": mode, "failure": "y_home_prepare_failed", "prepare": prepared}
         primitive = getattr(self.tester, "motor_oem_home_axis", None)
         result = primitive(
             self.axis,
@@ -551,6 +516,7 @@ class Serial206YProvider:
         proof = self._home_proof(result)
         proof_ok = all(proof.values())
         reference = None
+        reference_published = False
         if proof_ok:
             publisher = getattr(self.state_store, "publish_axis_reference", None)
             if callable(publisher):
@@ -560,9 +526,9 @@ class Serial206YProvider:
                     ownership_generation=int(self.generation_provider()),
                     receipt_id=command_id,
                 )
-                proof_ok = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
+                reference_published = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
         return {
-            "ok": bool(result.get("ok") is True and proof_ok),
+            "ok": bool(result.get("ok") is True),
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -572,11 +538,12 @@ class Serial206YProvider:
             "source_speed": int(speed),
             "startup": bool(startup),
             "home_proof": proof,
-            "reference_published": bool(proof_ok),
+            "reference_published": reference_published,
             "physical_effect_verified": False,
             "result": result,
             "reference": reference,
             "profile": profile,
+            "authority_observation": authority,
         }
 
     def record_move_xy_observation(self, result: Mapping[str, Any], *, command_id: str) -> dict[str, Any]:
@@ -629,21 +596,6 @@ class Serial206YProvider:
                 "failure": "homexy_y_child_proof_incomplete",
                 "reference_published": False,
             }
-        authority = self._current_authority(allow_unprepared=True)
-        if not authority.get("ok"):
-            return {"ok": False, "axis": self.axis, "command_id": command_id, **authority, "reference_published": False}
-        axis_state = authority.get("axis") if isinstance(authority.get("axis"), Mapping) else {}
-        board = authority.get("board") if isinstance(authority.get("board"), Mapping) else {}
-        if axis_state.get("prepared_board_epoch") != board.get("active_board_epoch"):
-            prepared = getattr(self.state_store, "prepare_axis_authority", None)
-            if callable(prepared):
-                prepared_result = prepared(
-                    self.axis,
-                    ownership_generation=int(self.generation_provider()),
-                    profile_fingerprint=self._profile_fingerprint(self.profile()),
-                )
-                if not isinstance(prepared_result, Mapping) or prepared_result.get("ok") is not True:
-                    return {"ok": False, "axis": self.axis, "command_id": command_id, "failure": "homexy_y_prepare_persist_failed", "prepare": prepared_result, "reference_published": False}
         publisher = getattr(self.state_store, "publish_axis_reference", None)
         reference = publisher(
             self.axis,
@@ -663,23 +615,15 @@ class Serial206YProvider:
 
     def set_home(self, operator_ack: str, *, command_id: str | None = None) -> dict[str, Any]:
         command_id = command_id or f"y-set-home-{uuid.uuid4().hex}"
-        if operator_ack != "SET_HOME_CURRENT_POSITION":
-            return {
-                "ok": False,
-                "axis": self.axis,
-                "command_id": command_id,
-                "failure": "y_set_home_ack_required",
-                "physical_motion": False,
-                "reference_published": False,
-            }
         primitive = getattr(self.tester, "motor_set_home", None)
-        result = primitive(self.board, motor=self.motor) if callable(primitive) else {"ok": False, "failure": "y_set_home_primitive_not_bound"}
+        source_call_completed = callable(primitive)
+        result = primitive(self.board, motor=self.motor) if source_call_completed else {"ok": False, "failure": "y_set_home_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_set_home_result_not_mapping", "raw": result}
         readback = self._position()
         readback_value = self._position_value(readback)
         readback_ok = bool(readback_value == 0)
         return {
-            "ok": bool(result.get("ok") is True and readback_ok),
+            "ok": source_call_completed,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -687,57 +631,44 @@ class Serial206YProvider:
             "command_id": command_id,
             "operator_ack": operator_ack,
             "physical_motion": False,
+            "source_call_completed": source_call_completed,
             "controller_set_home_acknowledged": bool(result.get("ok") is True),
             "zero_readback": readback_ok,
             "reference_published": False,
             "position_after": readback,
             "result": result,
+            "failure": None if source_call_completed else "y_set_home_primitive_not_bound",
         }
 
     def stop(self, *, command_id: str | None = None, timeout_s: float = 3.0) -> dict[str, Any]:
         command_id = command_id or f"y-stop-{uuid.uuid4().hex}"
-        primitive = getattr(self.tester, "motor_oem_stop_exact", None) or getattr(self.tester, "motor_stop", None)
-        result = primitive(self.board, motor=self.motor) if callable(primitive) else {"ok": False, "failure": "y_stop_primitive_not_bound"}
+        primitive = getattr(self.tester, "motor_oem_board_stop", None)
+        result = primitive(self.board, motor=self.motor, axis_name="y") if callable(primitive) else {"ok": False, "failure": "y_stop_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_stop_result_not_mapping", "raw": result}
+        source_call_completed = bool(result.get("source_call_completed") is True)
+        source_return_ok = bool(source_call_completed and result.get("source_return_code") == 0)
         first = result.get("first_delivery")
         second = result.get("second_delivery")
         first_ok = isinstance(first, Mapping) and type(first.get("status")) is int and first.get("status") == 100
         second_ok = isinstance(second, Mapping) and type(second.get("status")) is int and second.get("status") == 100
-        embedded_speed = result.get("terminal_speed")
-        waiter = getattr(self.tester, "motor_wait_stopped", None)
-        terminal_speed = embedded_speed if isinstance(embedded_speed, Mapping) else waiter(
-            self.board,
-            motor=self.motor,
-            timeout_s=float(timeout_s),
-            require_seen_nonzero=False,
-        ) if callable(waiter) else {"stopped": False, "failure": "y_stop_speed_waiter_not_bound"}
-        terminal_speed = dict(terminal_speed) if isinstance(terminal_speed, Mapping) else {"stopped": False, "raw": terminal_speed}
-        zero = bool(
-            terminal_speed.get("stopped") is True
-            and type(terminal_speed.get("last_speed")) is int
-            and terminal_speed.get("last_speed") == 0
-            and isinstance(terminal_speed.get("last_ack"), Mapping)
-            and type(terminal_speed["last_ack"].get("status")) is int
-            and terminal_speed["last_ack"].get("status") == 100
-        )
-        reconciliation = None
-        reconciler = getattr(self.state_store, "require_axis_reconciliation", None)
-        if callable(reconciler) and callable(primitive):
-            reconciliation = reconciler(self.axis, receipt_id=command_id)
         return {
-            "ok": bool(first_ok and second_ok and zero),
+            "ok": source_return_ok,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
             "motor": self.motor,
             "command_id": command_id,
             "stop": result,
+            "source_call_completed": source_call_completed,
+            "source_return_code": result.get("source_return_code"),
             "double_stop_acknowledged": bool(first_ok and second_ok),
-            "terminal_speed": terminal_speed,
-            "terminal_speed_zero": zero,
-            "reconciliation": reconciliation,
-            "timeout_s": float(timeout_s),
+            "controller_command_acknowledged": second_ok,
+            "terminal_speed": None,
+            "terminal_speed_zero": None,
+            "reconciliation": None,
+            "timeout_s_omitted_by_source": float(timeout_s),
             "physical_effect_verified": False,
+            "failure": None if source_return_ok else "y_stop_source_return_failure" if source_call_completed else "y_stop_primitive_not_bound",
         }
 
     def status(self) -> dict[str, Any]:

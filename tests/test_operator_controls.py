@@ -4,6 +4,7 @@ import asyncio
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
@@ -650,12 +651,17 @@ def test_catalog_preserves_inclusive_and_exclusive_numeric_bounds(tmp_path, monk
     assert inputs["number_lt"]["exclusive_maximum"] == 2.5
 
 
-def test_generic_motion_request_models_do_not_claim_z_specific_step_envelopes():
+def test_public_motion_request_models_use_signed_int32_at_robot_boundaries(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp.api import (
         MoveAbsoluteRequest,
         MoveRelativeRequest,
         OemManualAbsoluteRequest,
         OemManualRelativeRequest,
+        OemHomeXYRequest,
+        OemMoveXYRequest,
+        OemYMoveAbsoluteRequest,
+        OemYMoveStepsRequest,
         ReferenceMarkRequest,
     )
 
@@ -664,12 +670,36 @@ def test_generic_motion_request_models_do_not_claim_z_specific_step_envelopes():
     manual_relative = OemManualRelativeRequest.model_json_schema()["properties"]["steps"]
     manual_absolute = OemManualAbsoluteRequest.model_json_schema()["properties"]["position_steps"]
     reference = ReferenceMarkRequest.model_json_schema()["properties"]["position_steps"]
-    for schema in (relative, absolute, manual_relative, manual_absolute, reference):
+    for schema in (relative, absolute, reference):
         assert "minimum" not in schema
         assert "maximum" not in schema
+    for schema in (manual_relative, manual_absolute):
+        assert (schema["minimum"], schema["maximum"]) == (-(2**31), 2**31 - 1)
+    for model, field in (
+        (OemManualRelativeRequest, "steps"),
+        (OemManualAbsoluteRequest, "position_steps"),
+        (OemYMoveStepsRequest, "steps"),
+        (OemYMoveAbsoluteRequest, "target_steps"),
+    ):
+        payload = {"axis": "x", field: 1} if model in {OemManualRelativeRequest, OemManualAbsoluteRequest} else {field: 1}
+        model.model_validate(payload)
+        with pytest.raises(Exception):
+            model.model_validate({**payload, field: str(payload[field])})
+        with pytest.raises(Exception):
+            model.model_validate({**payload, field: 2**31})
+    OemMoveXYRequest.model_validate({"operator_ack": "MOVEXY", "x": 0, "y": 0})
+    with pytest.raises(Exception):
+        OemMoveXYRequest.model_validate({"operator_ack": "MOVEXY", "x": -(2**31) - 1, "y": 0})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "unexpected": True})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "timeout_s": 120.0})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "allow_implementation_mapped_predicate": True})
 
 
-def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
+def test_z_semantic_and_manual_moves_expose_signed_int32_bounds(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp.api import app
 
     actions, _ = operator_controls._build_catalog(app)
@@ -677,8 +707,8 @@ def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
 
     relative = next(row for row in by_id["oem.z.move_steps"]["inputs"] if row["name"] == "steps")
     absolute = next(row for row in by_id["oem.z.move_absolute"]["inputs"] if row["name"] == "position_steps")
-    assert (relative["minimum"], relative["maximum"]) == (-160000, 160000)
-    assert (absolute["minimum"], absolute["maximum"]) == (0, 160000)
+    assert (relative["minimum"], relative["maximum"]) == (-(2**31), 2**31 - 1)
+    assert (absolute["minimum"], absolute["maximum"]) == (-(2**31), 2**31 - 1)
 
     generic_relative = next(
         action for action in actions
@@ -690,8 +720,8 @@ def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
     )
     generic_steps = next(row for row in generic_relative["inputs"] if row["name"] == "steps")
     generic_position = next(row for row in generic_absolute["inputs"] if row["name"] == "position_steps")
-    assert generic_steps["minimum"] is None and generic_steps["maximum"] is None
-    assert generic_position["minimum"] is None and generic_position["maximum"] is None
+    assert (generic_steps["minimum"], generic_steps["maximum"]) == (-(2**31), 2**31 - 1)
+    assert (generic_position["minimum"], generic_position["maximum"]) == (-(2**31), 2**31 - 1)
 
 
 def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispatch(tmp_path, monkeypatch):
