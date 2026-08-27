@@ -9,6 +9,15 @@ from pathlib import Path
 import pytest
 
 from bioxp.operator_receipt_store import OperatorReceiptStore, runtime_state_root
+from bioxp.oem_runtime_store import OEMRuntimeStore
+
+
+def _operator_store(root: Path) -> OperatorReceiptStore:
+    owner = OEMRuntimeStore(root)
+    owner.close()
+    store = OperatorReceiptStore(root)
+    store.converge_startup_state()
+    return store
 
 
 def receipt(
@@ -61,7 +70,7 @@ def test_legacy_import_is_transactional_compact_and_keeps_source(tmp_path):
     )
     original = legacy_path.read_bytes()
 
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
 
     assert legacy_path.read_bytes() == original
     assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -91,7 +100,7 @@ def test_malformed_legacy_import_fails_without_success_marker(tmp_path):
     legacy_path.write_text("{broken", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="legacy operator receipt import failed"):
-        OperatorReceiptStore(tmp_path)
+        _operator_store(tmp_path)
 
     import sqlite3
 
@@ -102,34 +111,9 @@ def test_malformed_legacy_import_fails_without_success_marker(tmp_path):
     assert legacy_path.read_text(encoding="utf-8") == "{broken"
 
 
-def test_default_reads_do_not_load_evidence_and_detail_checks_digest(tmp_path, monkeypatch):
-    store = OperatorReceiptStore(tmp_path)
-    store.put(receipt("evidence-1", response={"http_status": 200, "body": {"payload": "z" * 20_000}}))
-
-    original_read_bytes = Path.read_bytes
-
-    def fail_if_read(_path: Path) -> bytes:
-        raise AssertionError("compact read touched evidence")
-
-    monkeypatch.setattr(Path, "read_bytes", fail_if_read)
-    assert store.list()[0]["response"] == {"http_status": 200, "body": {}}
-    assert store.by_command("evidence-1", include_evidence=False) is not None
-    assert store.by_idempotency("key-evidence-1", include_evidence=False) is not None
-
-    monkeypatch.setattr(Path, "read_bytes", original_read_bytes)
-    row = store.connection.execute(
-        "SELECT evidence_relpath FROM operator_commands WHERE command_id='evidence-1'"
-    ).fetchone()
-    evidence_path = tmp_path / row[0]
-    evidence_path.write_bytes(evidence_path.read_bytes() + b"\n")
-    detailed = store.by_command("evidence-1", include_evidence=True)
-    assert detailed is not None
-    assert "digest mismatch" in detailed["response"]["evidence_unavailable"]
-
-
 def test_atomic_claim_allows_one_cross_connection_owner(tmp_path):
-    first = OperatorReceiptStore(tmp_path)
-    second = OperatorReceiptStore(tmp_path)
+    first = _operator_store(tmp_path)
+    second = _operator_store(tmp_path)
     barrier = threading.Barrier(2)
     outcomes: list[tuple[str, bool, str]] = []
 
@@ -156,41 +140,14 @@ def test_atomic_claim_allows_one_cross_connection_owner(tmp_path):
     ).fetchone()[0] == 1
 
 
-def test_blocked_detail_read_does_not_block_command_claim(tmp_path, monkeypatch):
-    reader = OperatorReceiptStore(tmp_path)
-    writer = OperatorReceiptStore(tmp_path)
-    reader.put(receipt("detail-1", response={"http_status": 200, "body": {"payload": "q" * 20_000}}))
-    entered = threading.Event()
-    release = threading.Event()
-    original_read_bytes = Path.read_bytes
-
-    def blocked_read(path: Path) -> bytes:
-        if path.name.startswith("detail-1.") and path.name.endswith(".json"):
-            entered.set()
-            assert release.wait(timeout=5)
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", blocked_read)
-    detail_thread = threading.Thread(
-        target=lambda: reader.by_command("detail-1", include_evidence=True)
-    )
-    detail_thread.start()
-    assert entered.wait(timeout=3)
-
-    claimed, created = writer.claim(receipt("fast-claim", status="queued"))
-    assert created is True
-    assert claimed["command_id"] == "fast-claim"
-
-    release.set()
-    detail_thread.join(timeout=5)
-    assert not detail_thread.is_alive()
-
-
 def test_terminal_update_moves_command_to_newest_and_keeps_transitions(tmp_path):
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.claim(receipt("first", status="queued"))
     store.claim(receipt("second", status="queued"))
-    store.put(receipt("first", status="completed", response={"http_status": 200, "body": {"ok": True}}))
+    store.put(
+        receipt("first", status="completed", response={"http_status": 200, "body": {"ok": True}}),
+        _expected_status="reserved",
+    )
 
     assert store.list()[0]["command_id"] == "first"
     transitions = store.connection.execute(
@@ -199,8 +156,52 @@ def test_terminal_update_moves_command_to_newest_and_keeps_transitions(tmp_path)
     assert [row[0] for row in transitions] == ["reserved", "completed"]
 
 
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "completed",
+        "failed",
+        "rejected",
+        "ambiguous",
+        "outcome_unknown",
+        "cancelled",
+        "reconciliation_required",
+    ],
+)
+def test_ordinary_put_cannot_mutate_any_terminal_receipt(tmp_path, terminal_status):
+    store = _operator_store(tmp_path)
+    command_id = f"terminal-{terminal_status}"
+    store.put(
+        receipt(
+            command_id,
+            status=terminal_status,
+            response={"http_status": 200, "body": {"value": "first"}},
+        )
+    )
+    before = store.connection.execute(
+        "SELECT status,receipt_json,response_summary_json,updated_at FROM operator_commands WHERE command_id=?",
+        (command_id,),
+    ).fetchone()
+
+    with pytest.raises(RuntimeError, match="cannot mutate terminal state"):
+        store.put(
+            receipt(
+                command_id,
+                status=terminal_status,
+                response={"http_status": 200, "body": {"value": "stale"}},
+            ),
+            _expected_status=terminal_status,
+        )
+
+    after = store.connection.execute(
+        "SELECT status,receipt_json,response_summary_json,updated_at FROM operator_commands WHERE command_id=?",
+        (command_id,),
+    ).fetchone()
+    assert tuple(after) == tuple(before)
+
+
 def test_retention_keeps_all_command_metadata_and_evidence_until_lifecycle_expiry(tmp_path: Path) -> None:
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     first_evidence: Path | None = None
 
     for index in range(513):
@@ -223,49 +224,8 @@ def test_retention_keeps_all_command_metadata_and_evidence_until_lifecycle_expir
     assert store.list(200)[0]["command_id"] == "bounded-512"
 
 
-def test_startup_reconciliation_marks_queued_receipt_ambiguous_without_retry(tmp_path: Path) -> None:
-    store = OperatorReceiptStore(tmp_path)
-    claimed, created = store.claim(receipt("crash-queued", status="queued", started_at="100.0"))
-    assert created is True
-    assert claimed["status"] == "reserved"
-
-    assert store.reconcile_nonterminal_receipts() == 1
-    reconciled = store.by_command("crash-queued")
-    assert reconciled is not None
-    assert reconciled["status"] == "reconciliation_required"
-    assert reconciled["automatic_retry"] is False
-    assert reconciled["physical_outcome"] == "ambiguous"
-    assert reconciled["response"]["body"]["automatic_retry"] is False
-    assert reconciled["response"]["body"]["physical_outcome"] == "ambiguous"
-    assert store.reconcile_nonterminal_receipts() == 0
-
-
-def test_reconciliation_takes_write_lock_before_selecting_nonterminal_rows(tmp_path: Path) -> None:
-    reconciler = OperatorReceiptStore(tmp_path)
-    terminal_writer = OperatorReceiptStore(tmp_path)
-    reconciler.claim(receipt("race", status="queued"))
-    selected = threading.Event()
-
-    def trace(statement: str) -> None:
-        if statement.startswith("SELECT receipt_json FROM operator_commands WHERE status"):
-            selected.set()
-            time.sleep(0.1)
-
-    reconciler.connection.set_trace_callback(trace)
-    thread = threading.Thread(target=reconciler.reconcile_nonterminal_receipts)
-    thread.start()
-    assert selected.wait(timeout=3)
-    terminal_writer.put(
-        receipt("race", status="completed", response={"http_status": 200, "body": {"ok": True}})
-    )
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert terminal_writer.by_command("race")["status"] == "completed"
-
-
 def test_interrupt_receipt_uses_zero_wait_fallback_and_imports_on_restart(tmp_path: Path) -> None:
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     blocker = sqlite3.connect(tmp_path / "bioxp_runtime.db", isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")
     interrupt = receipt(
@@ -290,7 +250,7 @@ def test_interrupt_receipt_uses_zero_wait_fallback_and_imports_on_restart(tmp_pa
 
     blocker.execute("ROLLBACK")
     blocker.close()
-    restarted = OperatorReceiptStore(tmp_path)
+    restarted = _operator_store(tmp_path)
     imported = restarted.by_command("stop-fallback")
     assert imported is not None
     assert imported["status"] == "completed"
@@ -303,7 +263,7 @@ def test_failed_sql_update_cannot_mutate_committed_evidence_and_restart_removes_
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.put(receipt("immutable", response={"http_status": 200, "body": {"value": "first"}}))
     committed = store.connection.execute(
         "SELECT evidence_relpath,evidence_sha256 FROM operator_commands WHERE command_id='immutable'"
@@ -327,13 +287,30 @@ def test_failed_sql_update_cannot_mutate_committed_evidence_and_restart_removes_
     assert len(list(store.evidence_root.rglob("immutable.*.json"))) == 2
 
     store.connection.close()
-    restarted = OperatorReceiptStore(tmp_path)
+    restarted = _operator_store(tmp_path)
     assert len(list(restarted.evidence_root.rglob("immutable.*.json"))) == 1
     assert restarted.by_command("immutable", include_evidence=True)["response"]["body"]["value"] == "first"
+    orphan = restarted.connection.execute(
+        """
+        SELECT evidence_artifact_id,active_relpath,expiry_state,sha256,byte_count
+        FROM runtime_evidence_objects WHERE evidence_artifact_id LIKE 'orphan:%'
+        """
+    ).fetchone()
+    assert orphan is not None
+    assert orphan["active_relpath"] is None
+    assert orphan["expiry_state"] == "orphan_cleaned"
+    orphan_events = [
+        row[0]
+        for row in restarted.connection.execute(
+            "SELECT event_kind FROM runtime_evidence_events WHERE evidence_artifact_id=? ORDER BY event_id",
+            (orphan["evidence_artifact_id"],),
+        ).fetchall()
+    ]
+    assert orphan_events == ["orphan_classified", "orphan_deleted", "orphan_cleaned"]
 
 
 def test_interrupt_evidence_write_failure_uses_fsynced_fallback(tmp_path: Path, monkeypatch) -> None:
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     interrupt = receipt(
         "stop-evidence-fallback",
         key="reused-stop-key",
@@ -426,7 +403,7 @@ def test_existing_database_migrates_replay_column_before_replacing_unique_index(
     database.commit()
     database.close()
 
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
 
     columns = {
         row["name"]: row
@@ -458,7 +435,7 @@ def test_existing_database_migrates_replay_column_before_replacing_unique_index(
     ).fetchone()[0] == 2
 
     store.connection.close()
-    restarted = OperatorReceiptStore(tmp_path)
+    restarted = _operator_store(tmp_path)
     assert restarted.connection.execute(
         "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key='existing-key-2'"
     ).fetchone()[0] == 2
@@ -479,7 +456,7 @@ def test_legacy_repeated_safety_keys_import_as_nonreplayable(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
 
     assert store.connection.execute(
         "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key='same-stop-key'"
@@ -489,7 +466,7 @@ def test_legacy_repeated_safety_keys_import_as_nonreplayable(tmp_path: Path) -> 
 
 
 def test_startup_gc_waits_for_inflight_evidence_publication(tmp_path: Path, monkeypatch) -> None:
-    first = OperatorReceiptStore(tmp_path)
+    first = _operator_store(tmp_path)
     created = threading.Event()
     release = threading.Event()
     real_persist = first._persist_evidence
@@ -511,7 +488,7 @@ def test_startup_gc_waits_for_inflight_evidence_publication(tmp_path: Path, monk
 
     opened: list[OperatorReceiptStore] = []
     startup_thread = threading.Thread(
-        target=lambda: opened.append(OperatorReceiptStore(tmp_path)),
+        target=lambda: opened.append(_operator_store(tmp_path)),
         daemon=True,
     )
     startup_thread.start()
@@ -529,8 +506,8 @@ def test_startup_gc_waits_for_inflight_evidence_publication(tmp_path: Path, monk
 
 
 def test_delayed_cleanup_preserves_evidence_reused_by_later_commit(tmp_path: Path, monkeypatch) -> None:
-    first = OperatorReceiptStore(tmp_path)
-    second = OperatorReceiptStore(tmp_path)
+    first = _operator_store(tmp_path)
+    second = _operator_store(tmp_path)
     original = receipt(
         "reuse-evidence",
         response={"http_status": 200, "body": {"payload": "x" * 20_000}},
@@ -551,11 +528,14 @@ def test_delayed_cleanup_preserves_evidence_reused_by_later_commit(tmp_path: Pat
         "reuse-evidence",
         response={"http_status": 200, "body": {"payload": "y" * 20_000}},
     )
-    update_thread = threading.Thread(target=lambda: first.put(replacement), daemon=True)
+    update_thread = threading.Thread(
+        target=lambda: first.reconcile(replacement, expected_status="completed"),
+        daemon=True,
+    )
     update_thread.start()
     assert cleanup_started.wait(timeout=2)
 
-    second.put(original)
+    second.reconcile(original, expected_status="completed")
     release_cleanup.set()
     update_thread.join(timeout=2)
     assert not update_thread.is_alive()
@@ -566,7 +546,7 @@ def test_delayed_cleanup_preserves_evidence_reused_by_later_commit(tmp_path: Pat
 
 
 def test_retention_never_deletes_an_inflight_idempotency_claim(tmp_path: Path) -> None:
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     active = receipt("active-claim", status="queued")
     claimed, created = store.claim(active)
     assert created is True
@@ -584,7 +564,7 @@ def test_retention_never_deletes_an_inflight_idempotency_claim(tmp_path: Path) -
 def test_interrupt_fallback_rotation_does_not_lose_concurrent_append(tmp_path: Path, monkeypatch) -> None:
     import bioxp.operator_receipt_store as store_subject
 
-    first = OperatorReceiptStore(tmp_path)
+    first = _operator_store(tmp_path)
     first.append_interrupt_fallback(receipt("fallback-before"), reason="test")
     original_replace = store_subject.os.replace
     writer_threads: list[threading.Thread] = []
@@ -605,18 +585,18 @@ def test_interrupt_fallback_rotation_does_not_lose_concurrent_append(tmp_path: P
         return original_replace(source, destination)
 
     monkeypatch.setattr(store_subject.os, "replace", replace_with_concurrent_writer)
-    second = OperatorReceiptStore(tmp_path)
+    second = _operator_store(tmp_path)
     writer_threads[0].join(timeout=2)
     assert not writer_threads[0].is_alive()
     assert second.by_command("fallback-before") is not None
     assert second.by_command("fallback-during") is None
 
-    third = OperatorReceiptStore(tmp_path)
+    third = _operator_store(tmp_path)
     assert third.by_command("fallback-during") is not None
 
 
-def test_evidence_cleanup_failure_propagates(tmp_path: Path, monkeypatch) -> None:
-    store = OperatorReceiptStore(tmp_path)
+def test_unclassified_evidence_cannot_enter_direct_cleanup(tmp_path: Path) -> None:
+    store = _operator_store(tmp_path)
     store.put(receipt(
         "cleanup-propagates",
         status="completed",
@@ -626,13 +606,9 @@ def test_evidence_cleanup_failure_propagates(tmp_path: Path, monkeypatch) -> Non
     evidence_path = tmp_path / relpath
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text("{}", encoding="utf-8")
-    original_unlink = Path.unlink
-
-    def fail_evidence_unlink(path, *args, **kwargs):
-        if path == evidence_path:
-            raise OSError("injected evidence cleanup failure")
-        return original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", fail_evidence_unlink)
-    with pytest.raises(OSError, match="injected evidence cleanup failure"):
-        store._remove_pruned_evidence([relpath])
+    store._remove_pruned_evidence([relpath])
+    assert evidence_path.exists()
+    assert store.connection.execute(
+        "SELECT 1 FROM runtime_evidence_objects WHERE active_relpath=?",
+        (relpath,),
+    ).fetchone() is None

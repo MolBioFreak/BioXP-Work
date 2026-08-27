@@ -186,6 +186,8 @@ Terminal publication must preserve:
 
 If terminal publication fails after dispatch, the durable claim remains nonterminal. Restart reconciliation must publish `outcome_unknown`. The API must never return a retry-safe failure shape for that condition.
 
+Terminal publication of a linked pipette command is one transaction over both `operator_commands` and `pipette_operations`. Each projection update includes its observed pre-update status in the `WHERE` clause and requires exactly one affected row. A zero-row expected-state CAS result rolls back both projections and the transition event; it never overwrites a terminal winner. Startup reconciliation scans the complete nonterminal set—`reserved`, `queued`, `admitted`, `dispatched`, `acknowledged`, `executing`, `running`, `blocked`, and `reconciliation_required`—across both projections. When both remain nonterminal it terminalizes both as `outcome_unknown` with automatic retry disabled. When only one projection remains nonterminal, it converges that projection to the already-terminal counterpart without rewriting the terminal winner.
+
 ## 5. Correlation contract
 
 ### 5.1 Canonical identity chain
@@ -230,6 +232,10 @@ Required schema-control tables:
 - `runtime_migration_receipts`.
 
 Each migration row contains its ordered version, name, source revision, applied time, canonical DDL digest, pre-migration backup receipt, and post-migration integrity receipt.
+
+The canonical registry is shared by `runtime_audit_store` and `oem_runtime_store` and has exactly these ordered owners: version 1 `runtime_audit_foundation`, version 2 `serial206_runtime_authority`, version 3 `report_identity_metadata_v1`, version 4 `canonical_runtime_release_start`, then version 5 `operator_command_plane_schema_v1`. Version numbers are unique and strictly increasing. A ledger row is accepted only when version, name, and canonical DDL digest all match the registry. An occupied version with a different name or digest blocks startup without replacement; migration code must not use `INSERT OR REPLACE` or conflict replacement for migration identity. `PRAGMA user_version` cannot advance past a missing or mismatched registry row.
+
+The API lifespan is the production migration owner. Module import and construction of the deferred pipette report/receipt dependency may configure a connection but must not execute substantive DDL. Before each unapplied registry entry, the owner creates and verifies the SQLite backup, then executes that entry's DDL and data conversion under the process-wide coordinator. Direct isolated store construction may invoke this same canonical owner for fixtures and offline tools; it may not carry an independent schema runner.
 
 Readiness must attest exact tables, columns, indexes, foreign keys, CHECK constraints, triggers, migration order, and DDL digests.
 
@@ -409,6 +415,7 @@ Direct routes, protocol handlers, operator relays, constructor stages, initializ
 - A legal hold suspends expiry for the linked evidence object. Creating and releasing a hold requires an append-only assessment and a named operator identity. Hold release restores the original `retention_until`; it does not start a new five-year period.
 - Count-based deletion is prohibited.
 - Disk pressure must not shorten retention.
+- Receipt payloads and expiry callers cannot supply, shorten, extend, or bypass the persisted retention deadline or legal-hold state. Expiry reads only the immutable database authority. Hold changes use the separately governed append-only operator assessment path; they are not expiry-call parameters.
 
 ### 8.2 Publication
 
@@ -420,6 +427,8 @@ Direct routes, protocol handlers, operator relays, constructor stages, initializ
 6. Commit the evidence transition to `retained`.
 
 A crash between filesystem publication and database binding leaves a discoverable orphan. Startup reconciliation must hash and classify it before any deletion.
+
+Evidence reads, expiry, and cleanup traverse from the governed root with no-follow directory and file opens. They require a confined root-relative path, a regular file, exact stored byte count, and exact stored SHA-256. Cleanup first publishes a durable orphan identity, digest, size, path, state, and event; only that classified object may enter confined deletion. Symlinks and special files are retained as integrity failures, not followed or silently removed.
 
 ### 8.3 Expiry
 
@@ -437,7 +446,8 @@ A missing file, digest mismatch, size mismatch, symlink, non-regular file, path 
 
 ## 9. SQLite operation and concurrency
 
-- All writers use one process-wide runtime audit coordinator.
+- All writers use one process-wide runtime audit coordinator. Every `RuntimeAuditDatabase`, `OperatorReceiptStore`, `PipetteReceiptStore`, `OEMRuntimeStore`, and operator command-plane instance resolving the same canonical root reuses the same re-entrant writer lock; a separately constructed per-store lock is not a valid serialization boundary.
+- Migration ownership, migration-ledger publication, command claims, linked terminal publication, startup reconciliation, Serial-206 authority updates, and receipt/event writes enter that same boundary before opening a write transaction.
 - SQLite uses WAL, `synchronous=FULL`, foreign keys, a bounded busy timeout, and deliberate checkpoints.
 - A passive WAL checkpoint runs at least every 60 seconds or 1,000 pages. A successful backup, migration, or clean service stop performs a truncate checkpoint after command admission is quiesced.
 - A failed checkpoint raises audit health. New physical commands are blocked when the last successful checkpoint is older than 24 hours or WAL size exceeds the lower of 1 GiB and 10 percent of the audit volume.
@@ -475,14 +485,16 @@ Migration stops if any input cannot be inventoried or backed up.
 
 ### 10.3 Import contract
 
-- Parse and validate the complete JSONL before database mutation.
-- Validate receipt schema, required identity, timestamps, truth types, and source identity.
-- Invalid records go to a governed quarantine artifact. They are not silently defaulted to false or unknown.
-- Recheck the migration marker inside the same `BEGIN IMMEDIATE` transaction that claims the import.
-- Use exact receipt IDs for idempotent replay.
-- Import command links, observations, exchanges, and evidence bindings transactionally.
-- Keep the source JSONL byte-identical and read-only until migration acceptance and restore proof complete.
-- New runtime writes must target SQLite only after the migration transaction commits.
+- Read the source as bytes and parse every nonblank physical line before the first database write. Re-read and require byte equality immediately before opening the writer transaction.
+- Validate the exact `bioxp.pipette.receipt.v1` schema, non-empty receipt and operation identity, timezone-aware timestamp, object-valued request/effective/result/truth/runtime/source fields, boolean truth fields, result truth/outcome, source SHA-256 map, registry SHA-256, evidence authority, and the normalized child-record contract.
+- Bind every invalid line into deterministic immutable quarantine JSONL bytes. Each quarantine row contains the physical line number, SHA-256 and byte count of the exact line bytes including its terminator, base64 exact bytes, source digest, migration ID, and a typed reason code/detail. The content-addressed quarantine file is fsynced before any database mutation; publication failure leaves all import tables untouched.
+- Recheck the exact digest-derived migration marker only after the same `BEGIN IMMEDIATE` transaction has started. Claims, pipette child links, normalized observations/exchanges/events/pressure rows, finalization, migration receipt, and migration evidence all reconcile or roll back together through the shared runtime database primitives.
+- Use the exact legacy receipt ID in deterministic command, pipette-operation, and idempotency identities. A replay must have the same canonical request and source/line binding; a conflicting identity fails closed.
+- Count every nonblank source line exactly once as either imported/reconciled or quarantined. Do not silently default malformed fields to false, empty, unknown, or generated identity.
+- Publish the byte-identical content-addressed archive with file fsync, atomic replacement, digest verification, read-only mode, and parent-directory fsync before retirement is authorized.
+- Persist an append-only, digest- and archive-bound retirement authority only after the atomic import commits. The active source may be unlinked only after that authority commits; recheck exact source bytes immediately before unlink and fsync the source directory afterward.
+- Treat the retirement authority as an idempotent crash journal: source present means resume the authorized unlink; source absent means require and revalidate the authority, archive, source counts, and deterministic quarantine bytes. A missing source without prior durable retirement authority is an integrity failure.
+- Retain the archive and quarantine byte-identically through migration acceptance and restore proof. New runtime writes target SQLite only after the migration transaction commits.
 
 ### 10.4 Post-migration gate
 
@@ -510,6 +522,12 @@ The backup unit contains:
 - store identity and schema ledger;
 - SHA-256 for every manifest and database object;
 - backup time and source deployment identity.
+
+Every backup acquires the exclusive side of the runtime lifecycle lock shared by application-owned SQLite transactions and evidence/export publication. Under that lock it completes a non-busy checkpoint, creates an online SQLite backup, and computes one exact bidirectional closure: every active database evidence receipt has one matching confined regular file with the same digest and size, and every governed evidence file has a matching database receipt. Missing, unbound, mismatched, symlinked, or special files fail before publication.
+
+Backup publication always uses a fresh restrictive staging directory and a never-reused opaque backup identity. It verifies the complete listed-file set, database integrity, foreign keys, exact schema object identity, ordered migration ledger identity, and append-only trigger identity before atomic publication. A separately published external receipt binds the immutable package, manifest, checksums, database, schema, migration ledger, triggers, and evidence closure. Retrying a human label creates a new identity and never overwrites an accepted unit.
+
+Restore verification materializes only into a new child of the isolated restore root. It verifies the sealed source package before target creation, then reconstructs and compares the exact database/evidence closure and source identities. Source-only restore receipts state `execution_performed:false`, `service_started:false`, `hardware_touched:false`, and `production_database_modified:false`. They must not claim API, service, controller, or physical acceptance.
 
 The runtime backup policy must preserve the five-year evidence contract. Backup pruning cannot remove the only retained copy of an evidence object before `retention_until`.
 
@@ -558,6 +576,8 @@ Before deployment, capacity planning must use measured values from representativ
 - five-year evidence projection;
 - WAL and backup overhead.
 
+A sample that lacks a representative observation window, command population, pipette operations, channel observations, transport exchanges, runtime events, pressure chunks, or full evidence returns `status=insufficient_evidence`. It cannot pass merely because a one-row or otherwise nonrepresentative linear projection fits below the threshold.
+
 The projected five-year retained footprint must fit below 60 percent of the allocated audit volume. The remaining capacity covers WAL, backup, migration, and abnormal growth. If this gate fails, storage is expanded. Retention is not shortened.
 
 Status and reports expose:
@@ -571,6 +591,8 @@ Status and reports expose:
 - free-space state.
 
 New physical pipette commands fail closed when audit storage cannot guarantee a durable claim and terminal receipt.
+
+`GET /operator/audit-health` performs no checkpoint, backup, restore, cleanup, service, or hardware action. It attests exact schema objects, ordered migrations, append-only triggers, full SQLite integrity, foreign keys, WAL durability, persisted checkpoint freshness, externally receipted backup freshness and integrity, writer status and queue depth, WAL threshold, and free-space threshold. Any absent, stale, mismatched, corrupt, unreadable, or over-threshold item returns `status=degraded` with typed reasons. This storage packet adds no new non-OEM physical-command admission predicate; health reporting and any separately approved admission policy remain distinct authorities.
 
 ## 13. Robot reporting APIs
 

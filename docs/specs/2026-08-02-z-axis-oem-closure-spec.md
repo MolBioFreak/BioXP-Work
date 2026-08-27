@@ -167,7 +167,7 @@ Success requires:
 | 5 | Current semantics | Z source current `31`; no invented standby write in manual/diagnostic paths | Closed |
 | 6 | GAP9 exact home predicate | Raw active value `1`; ACKed readback and transition evidence | Closed |
 | 7 | GAP10 diagnostic only | Live-right-reference route retired; its simultaneous assertion at GAP9 top is not opposite-end travel authority | Closed |
-| 8 | Switch-mask truth | Machine-bound `GAP12/right-disable=1`; `GAP13/GAP9-left-disable=0`; explicit recovery requires re-prepare | Closed |
+| 8 | Switch-mask truth | Machine-bound `GAP12/right-disable=1`; `GAP13/GAP9-left-disable=0`; retained OEM path is read-only and performs no SAP12/SAP13 repair or lifecycle invalidation | Closed |
 | 9 | Relative `moveSteps` | Production keyword binding, live current-position bounds, ACK/terminal/event/final-position proof | Closed |
 | 10 | Absolute `moveZ` | Dynamic pseudo-home clamp, current write/readback, guarded production primitive | Closed |
 | 11 | Coordinate bounds | `0..160000`; unreferenced/pre-home values are never motion authority | Closed |

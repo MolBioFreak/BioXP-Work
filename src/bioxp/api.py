@@ -4,9 +4,11 @@ import copy
 import hashlib
 import json
 import os
+import re
 import signal
 import shutil
 import sqlite3
+
 import subprocess
 import tarfile
 import tempfile
@@ -49,10 +51,22 @@ from .oem_serial206_initialization import (
     Serial206StageApproval,
 )
 from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
-from .runtime_audit_store import runtime_state_root
+from .runtime_audit_store import (
+    open_runtime_connection,
+    record_runtime_release_start,
+    runtime_state_root,
+    runtime_write_coordinator,
+)
+from .release_identity import (
+    ReleaseIdentityError,
+    configure_release_identity,
+    current_release_identity,
+    public_release_identity,
+    publish_runtime_release_receipt,
+)
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
-from .operator_reports import create_operator_reports_router
+from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
 # must neither activate a camera nor present an unqueried cache as observation.
@@ -78,7 +92,7 @@ from pydantic import (
 )
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
@@ -109,6 +123,7 @@ from .services.motion_service import (
     run_relative_motion_command,
 )
 from .services.pipette_service import (
+    READ_ONLY_PIPETTE_OPERATIONS,
     run_pipette_aspirate_command,
     run_pipette_dispense_command,
     run_pipette_init_command,
@@ -116,6 +131,8 @@ from .services.pipette_service import (
     run_pipette_operation,
     run_pipette_status,
     run_pipette_tip_command,
+    reset_direct_pipette_idempotency_key,
+    set_direct_pipette_idempotency_key,
 )
 from .services.protocol_service import (
     ProtocolLiveContractError,
@@ -218,12 +235,22 @@ def _default_reference_state_path() -> str:
 _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
+# Release authority is established before the first runtime audit store opens.
+# Canonical release mode fails closed; local source use remains explicitly unverified.
+_process_release_identity = configure_release_identity()
 _pipette_transport = None
-_pipette_receipts = PipetteReceiptStore()
+_pipette_receipts: PipetteReceiptStore = None  # type: ignore[assignment]
+_operator_reports_installed = False
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_y_provider: Serial206YProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 _operator_control_plane_installed = False
+
+
+def _persist_pipette_runtime_error(channel: int, error_code: int) -> None:
+    if _pipette_receipts is None:
+        raise RuntimeError("pipette runtime event store is unavailable")
+    _pipette_receipts.record_runtime_error_event(int(channel), int(error_code))
 
 
 def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
@@ -432,19 +459,35 @@ def _require_serial206_oem_initialization_provider(
 
 
 def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    provider = _serial206_oem_initialization_provider
-    if provider is None:
-        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
     context = current_operator_dispatch_context()
     if context is None:
+        canonical_replacements = {
+            "move_xy": "oem.xy.move_absolute",
+            "home_xy": "oem.xy.home",
+            "move_to": "oem.xyz.move_to",
+        }
+        canonical_method_id = canonical_replacements.get(intent)
+        if canonical_method_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical_xz_method_requires_v2_route",
+                    "replacement_method_action_id": canonical_method_id,
+                    "replacement_route": "/operator/v2/methods",
+                    "required_schema": "bioxp.operator_method_request.v1",
+                    "physical_motion_commanded": False,
+                },
+            )
         raise HTTPException(
             status_code=410,
             detail={
                 "error": "direct_serial206_composite_mutation_retired",
-                "replacement": "/operator/actions/{semantic_action_id}",
                 "physical_motion_commanded": False,
             },
         )
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
     payload = dict(inputs or {})
     payload.update({
         "command_id": str(context["operator_command_id"]),
@@ -468,6 +511,8 @@ def _run_serial206_pipette_audit(
     *,
     requested_inputs: Mapping[str, Any],
     lifecycle_stage_id: str,
+    lifecycle_attempt_id: str,
+    lifecycle_idempotency_key: str,
 ) -> dict[str, Any]:
     async def inline_run(_label: str, callback, *, timeout_s: float):
         del _label, timeout_s
@@ -487,8 +532,14 @@ def _run_serial206_pipette_audit(
                 "transport_owner_bound": True,
                 "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
                 "caller_class": "lifecycle",
-                "control_class": "pipette_state_command",
+                "control_class": (
+                    "hardware_query"
+                    if str(operation_name).lower() in READ_ONLY_PIPETTE_OPERATIONS
+                    else "pipette_state_command"
+                ),
                 "lifecycle_stage_id": lifecycle_stage_id,
+                "lifecycle_attempt_id": lifecycle_attempt_id,
+                "idempotency_key": lifecycle_idempotency_key,
             },
         )
     )
@@ -818,7 +869,16 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _operator_control_plane_installed
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _pipette_receipts
+    global _operator_control_plane_installed, _operator_reports_installed
+    try:
+        app.state.release_identity = configure_release_identity()
+    except ReleaseIdentityError as exc:
+        _startup_error = f"Canonical release identity unavailable: {exc}"
+        raise RuntimeError(_startup_error) from exc
+    app.state.release_start_receipt = None
+    app.state.release_start_error = None
+    app.state.release_start_ready = asyncio.Event()
     runtime_root = runtime_state_root()
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
@@ -839,10 +899,25 @@ async def lifespan(app: FastAPI):
     finally:
         migration_authorized = False
         migration_connection.close()
+    if _pipette_receipts is None:
+        _pipette_receipts = PipetteReceiptStore(root=runtime_root)
+    elif _pipette_receipts.root != runtime_root:
+        raise RuntimeError("pipette receipt store is already bound to a different canonical runtime root")
+    if not _operator_reports_installed:
+        app.include_router(
+            create_operator_reports_router(
+                _pipette_receipts,
+                writer_health_provider=runtime_write_coordinator(_pipette_receipts.root).snapshot,
+            )
+        )
+        _operator_reports_installed = True
+    app.state.report_export_reconciliation = reconcile_operator_report_exports(_pipette_receipts)
     try:
+        _pipette_receipts.attest_first_install_absence()
         app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
+        app.state.runtime_reconciliation = _pipette_receipts.reconcile_nonterminal_claims()
     except Exception as exc:
-        _startup_error = f"Pipette JSONL migration/readiness failed: {exc}"
+        _startup_error = f"Pipette migration/runtime reconciliation readiness failed: {exc}"
         app.state.pipette_migration = {"status": "failed", "error": str(exc)}
         raise RuntimeError(_startup_error) from exc
     try:
@@ -891,10 +966,42 @@ async def lifespan(app: FastAPI):
             serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
             pipette_status_provider=_operator_pipette_status,
         )
+        operator_store = app.state.operator_receipt_store
+        command_plane = app.state.operator_command_plane
+        operator_store.converge_startup_state()
+        command_plane.start()
         _operator_control_plane_installed = True
+    release_start_task = None
+    if app.state.release_identity.get("verified") is True:
+        async def commit_release_start_receipt() -> None:
+            global _startup_error
+            try:
+                receipt = await asyncio.to_thread(
+                    record_runtime_release_start,
+                    runtime_root,
+                    app.state.release_identity,
+                    timeout_s=45.0,
+                )
+                app.state.release_start_receipt = receipt
+                app.state.release_identity = publish_runtime_release_receipt(receipt)
+            except Exception as exc:
+                app.state.release_start_error = f"{type(exc).__name__}: {exc}"
+                _startup_error = f"Canonical runtime release-start receipt failed: {app.state.release_start_error}"
+            finally:
+                app.state.release_start_ready.set()
+
+        release_start_task = asyncio.create_task(
+            commit_release_start_receipt(),
+            name="bioxp-runtime-release-start-receipt",
+        )
+    else:
+        app.state.release_start_ready.set()
     try:
         yield
     finally:
+        if release_start_task is not None and not release_start_task.done():
+            release_start_task.cancel()
+            await asyncio.gather(release_start_task, return_exceptions=True)
         # Close admission immediately, then drain the same ownership leases used
         # by reconnect. A shielded constructor may outlive its cancelled HTTP
         # waiter, but it cannot publish an owner after this shutdown completes.
@@ -966,18 +1073,66 @@ app = FastAPI(
 )
 app.include_router(oem_compat_router)
 app.include_router(oem_homing_router)
-app.include_router(create_operator_reports_router(_pipette_receipts))
+
+
+
+@app.middleware("http")
+async def bind_direct_pipette_idempotency(request: Request, call_next):
+    if request.method == "POST" and request.url.path.startswith("/liquid/"):
+        dispatch_context = current_operator_dispatch_context() or {}
+        trusted_key = dispatch_context.get("idempotency_key")
+        key = str(trusted_key or request.headers.get("idempotency-key", "")).strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,199}", key) is None:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "valid Idempotency-Key header is required"},
+            )
+        token = set_direct_pipette_idempotency_key(key)
+        try:
+            return await call_next(request)
+        finally:
+            reset_direct_pipette_idempotency_key(token)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def require_durable_release_start_before_readiness(request: Request, call_next):
+    identity = getattr(request.app.state, "release_identity", {})
+    if isinstance(identity, Mapping) and identity.get("verified") is True:
+        ready = getattr(request.app.state, "release_start_ready", None)
+        if isinstance(ready, asyncio.Event):
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=46.0)
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "not_ready", "error": "runtime_release_start_receipt_timeout"},
+                )
+        error = getattr(request.app.state, "release_start_error", None)
+        receipt = getattr(request.app.state, "release_start_receipt", None)
+        if error is not None or not isinstance(receipt, Mapping):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "error": "runtime_release_start_receipt_unavailable",
+                    "reason_code": "release_start_failed" if error is not None else "release_start_receipt_missing",
+                },
+            )
+    return await call_next(request)
 
 
 def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
-            status_code=410,
+            status_code=409,
             detail={
                 "error": "direct_z_mutation_retired",
                 "authority": "Serial206OemInitializationProvider",
-                "replacement": "/operator/actions/{semantic_z_action_id}",
+                "replacement": "/operator/v2/actions/{canonical_action_id}",
+                "required_schema": "bioxp.operator_action_request.v2",
+                "physical_motion_commanded": False,
             },
         )
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
@@ -1073,11 +1228,12 @@ def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = N
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
-            status_code=410,
+            status_code=409,
             detail={
                 "error": "direct_x_mutation_retired",
                 "authority": "Serial206OemInitializationProvider",
-                "replacement": "/operator/actions/{semantic_x_action_id}",
+                "replacement": "/operator/v2/actions/{canonical_action_id}",
+                "required_schema": "bioxp.operator_action_request.v2",
                 "physical_motion_commanded": False,
             },
         )
@@ -1301,16 +1457,32 @@ def _can_ready_observation() -> bool | None:
     return (hardware_state.ownership_projection().get("ownership") or {}).get("CAN_READY")
 
 
+def _active_lifecycle_attempt_id(stage_id: str) -> str:
+    stage = (
+        lifecycle_state.projection()
+        .get("startup", {})
+        .get("stages", {})
+        .get(str(stage_id), {})
+    )
+    attempt_id = stage.get("attempt_id") if isinstance(stage, Mapping) else None
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise LifecycleStateError(f"{stage_id} has no active lifecycle attempt identity")
+    return attempt_id
+
+
 def _constructor_pipette_action() -> dict[str, Any]:
     owner = _get_pipette_transport()
     if owner.__class__.__name__ != "FourPipetteTransport":
         return {"ok": False, "error": "exact_four_pipette_owner_required"}
     command = PipetteInitCommand()
+    attempt_id = _active_lifecycle_attempt_id("constructor_pipette_stage")
     result = _run_serial206_pipette_audit(
         "initialize",
         lambda transport: transport.initialize(command),
         requested_inputs=command.to_payload(),
         lifecycle_stage_id="constructor_pipette_stage",
+        lifecycle_attempt_id=attempt_id,
+        lifecycle_idempotency_key=f"constructor_pipette_stage:{attempt_id}",
     )
     return {
         **result,
@@ -4503,21 +4675,14 @@ def _status_payload() -> dict:
     serial206_initialization = serial206_oem_initialization_provider_status()
     return {
         **projection,
-        "runtime_identity": {
-            "release_sha": os.environ.get("BIOXP_RELEASE_SHA"),
-            "release_tree": os.environ.get("BIOXP_RELEASE_TREE"),
-            "source_mount": os.environ.get("BIOXP_RELEASE_SOURCE_MOUNT"),
-            "runtime_owner": os.environ.get("BIOXP_RUNTIME_OWNER"),
-            "service_unit": "bioxp-api.service",
-            "listener_port": 8123,
-        },
+        "runtime_identity": public_release_identity(current_release_identity()),
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
         "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
         "runtime_available": runtime_available,
         "hardware_connected": can_ready,
         "hardware_connected_deprecated": "maps only to OEM CAN_READY",
-        "startup_error": _startup_error,
+        "startup_error": None if _startup_error is None else "startup_failed",
         "status_error": None if projection.get("available") else "canonical hardware snapshot unavailable",
         "board_status": boards,
         "chiller_status": chiller,
@@ -5297,6 +5462,9 @@ async def _run_blocking(label: str, func, timeout_s: float = 30.0):
                 "error": "tester_operation_completion_ambiguous",
                 "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
                 "completion_ambiguous": True,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
                 "connection_transition_blocked_until_worker_exit": True,
             },
         ) from exc
@@ -5429,7 +5597,7 @@ def _camera_missing_dependency_payload(dependency: str, device: str | None = Non
         "output": "",
         "error": f"missing required camera runtime dependency: {dependency}",
         "missing_dependency": dependency,
-        "runtime_owner": os.getenv("BIOXP_RUNTIME_OWNER"),
+        "runtime_identity": current_release_identity(),
         "failure_class": "camera_runtime_contract_failed",
         **extra,
     }
@@ -6152,7 +6320,10 @@ async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) 
     try:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
         candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
-        transport = build_default_pipette_transport(shared_usb=candidate)
+        transport = build_default_pipette_transport(
+            shared_usb=candidate,
+            error_callback=_persist_pipette_runtime_error,
+        )
         _tester = candidate
         _pipette_transport = transport
         _startup_error = None
@@ -6228,7 +6399,10 @@ async def reconnect_runtime():
                 close_fn()
             reconnect_fn = getattr(tester, "reconnect")
             reconnect_fn()
-            return build_default_pipette_transport(shared_usb=tester)
+            return build_default_pipette_transport(
+                shared_usb=tester,
+                error_callback=_persist_pipette_runtime_error,
+            )
 
         try:
             _pipette_transport = await run_in_threadpool(reconnect_and_rebuild)
@@ -7619,6 +7793,11 @@ async def motion_oem_x_abort():
 
 @app.post("/motion/oem/x/observation")
 async def motion_oem_x_observation(req: OemXObservationRequest):
+    if current_operator_dispatch_context() is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "legacy_x_observation_requires_canonical_action", "canonical_action_id": "oem.x.observe", "replacement": "/operator/v2/actions/oem.x.observe"},
+        )
     return await _run_blocking(
         "serial-206 X physical observation reconciliation",
         lambda: _execute_provider_x_intent(
@@ -7719,7 +7898,10 @@ async def motion_oem_z_resume_after_abort(req: OemZResumeRequest | None = None):
 async def motion_oem_z_observation(req: OemZObservationRequest):
     context = current_operator_dispatch_context()
     if context is None:
-        raise HTTPException(status_code=410, detail={"error": "direct_z_observation_retired"})
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "legacy_z_observation_requires_canonical_action", "canonical_action_id": "oem.z.observe", "replacement": "/operator/v2/actions/oem.z.observe"},
+        )
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
     record = getattr(provider, "record_z_observation", None)
     if not callable(record):
@@ -8136,6 +8318,17 @@ async def motion_oem_move_xy(req: OemMoveXYRequest):
 
 @app.post("/motion/oem/home_xy")
 async def motion_oem_home_xy(req: OemHomeXYRequest):
+    if current_operator_dispatch_context() is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "canonical_xz_method_requires_v2_route",
+                "replacement_method_action_id": "oem.xy.home",
+                "replacement_route": "/operator/v2/methods",
+                "required_schema": "bioxp.operator_method_request.v1",
+                "physical_motion_commanded": False,
+            },
+        )
     if req.operator_ack != "HOMEXY":
         raise HTTPException(status_code=409, detail="operator_ack HOMEXY required for direct OEM HomeXY mode")
     if _serial206_oem_initialization_provider is None:
@@ -8155,6 +8348,17 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
 
 @app.post("/motion/oem/move_to")
 async def motion_oem_move_to(req: OemMoveToRequest):
+    if current_operator_dispatch_context() is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "canonical_xz_method_requires_v2_route",
+                "replacement_method_action_id": "oem.xyz.move_to",
+                "replacement_route": "/operator/v2/methods",
+                "required_schema": "bioxp.operator_method_request.v1",
+                "physical_motion_commanded": False,
+            },
+        )
     _require_motion_route_ready()
     return await _run_blocking(
         "serial-206 provider moveTo",
@@ -9082,6 +9286,7 @@ async def liquid_init(req: PipetteInitRequest):
         return operation()
 
     def action() -> dict[str, Any]:
+        attempt_id = _active_lifecycle_attempt_id("constructor_pipette_stage")
         result = asyncio.run(
             run_pipette_init_command(
                 command,
@@ -9096,6 +9301,8 @@ async def liquid_init(req: PipetteInitRequest):
                     "caller_class": "lifecycle",
                     "control_class": "pipette_state_command",
                     "lifecycle_stage_id": "constructor_pipette_stage",
+                    "lifecycle_attempt_id": attempt_id,
+                    "idempotency_key": f"constructor_pipette_stage:{attempt_id}",
                 },
             )
         )
@@ -9133,7 +9340,7 @@ async def liquid_tip(req: PipetteTipRequest):
 async def liquid_eject_all(req: PipetteEjectAllRequest):
     return await run_pipette_operation(
         "eject_all_tips",
-        lambda transport: getattr(transport, "eject_all_tips")(
+        lambda transport: transport.eject_all_tips(
             check_missing_tip=req.check_missing_tip,
             wait=req.wait,
             channels=req.channels,
@@ -9150,7 +9357,7 @@ async def liquid_eject_all(req: PipetteEjectAllRequest):
 async def liquid_keep_tip(req: PipetteKeepTipRequest):
     return await run_pipette_operation(
         "keep_tip",
-        lambda transport: getattr(transport, "KeepTip")(req.tip),
+        lambda transport: transport.KeepTip(req.tip),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9328,7 +9535,7 @@ async def liquid_error_log(req: PipetteErrorLogRequest):
 async def liquid_tip_status():
     return await run_pipette_operation(
         "tip_status",
-        lambda transport: getattr(transport, "query_tip_status_all")(),
+        lambda transport: transport.query_tip_status_all(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9337,11 +9544,19 @@ async def liquid_tip_status():
     )
 
 
-@app.get("/liquid/data")
+@app.get("/liquid/data", include_in_schema=False)
+async def liquid_data_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/data", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/data")
 async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
     return await run_pipette_operation(
         "data",
-        lambda transport: getattr(transport, "get_data")(query),
+        lambda transport: transport.get_data(query),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9350,11 +9565,20 @@ async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3
     )
 
 
-@app.get("/liquid/fluid-detection/{channel}/timestamp")
+@app.get("/liquid/fluid-detection/{channel}/timestamp", include_in_schema=False)
+async def liquid_fluid_timestamp_get_retired(channel: int):
+    del channel
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "receipt_producing_get_retired", "replacement": "POST /liquid/fluid-detection/{channel}/timestamp", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/fluid-detection/{channel}/timestamp")
 async def liquid_fluid_timestamp(channel: int):
     return await run_pipette_operation(
         "fluid_timestamp",
-        lambda transport: {"ok": True, "channel": channel, "timestamp": getattr(transport, "get_fluid_timestamp")(channel), "hardware_truth_level": "cached_oem_event"},
+        lambda transport: {"ok": True, "channel": channel, "timestamp": transport.get_fluid_timestamp(channel), "hardware_truth_level": "cached_oem_event"},
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=20.0,
@@ -9376,11 +9600,19 @@ async def liquid_set_top_speed(req: PipetteSpeedRequest):
     )
 
 
-@app.get("/liquid/pressure")
+@app.get("/liquid/pressure", include_in_schema=False)
+async def liquid_pressure_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/pressure", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/pressure")
 async def liquid_pressure():
     return await run_pipette_operation(
         "pressure",
-        lambda transport: getattr(transport, "read_pressure")(),
+        lambda transport: transport.read_pressure(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9406,7 +9638,7 @@ async def liquid_firmware(req: PipetteFirmwareRequest):
 async def liquid_reinitialize():
     return await run_pipette_operation(
         "reinitialize",
-        lambda transport: getattr(transport, "reinitialize_pipette")(),
+        lambda transport: transport.reinitialize_pipette(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=180.0,
@@ -9415,11 +9647,19 @@ async def liquid_reinitialize():
     )
 
 
-@app.get("/liquid/condition")
+@app.get("/liquid/condition", include_in_schema=False)
+async def liquid_condition_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/condition", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/condition")
 async def liquid_condition():
     return await run_pipette_operation(
         "condition",
-        lambda transport: getattr(transport, "checked_pipette_condition")(),
+        lambda transport: transport.checked_pipette_condition(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9428,11 +9668,19 @@ async def liquid_condition():
     )
 
 
-@app.get("/liquid/status/readback")
+@app.get("/liquid/status/readback", include_in_schema=False)
+async def liquid_status_readback_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/status/readback", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/status/readback")
 async def liquid_status_readback():
     return await run_pipette_operation(
         "status_readback",
-        lambda transport: getattr(transport, "checked_pipette_status")(),
+        lambda transport: transport.checked_pipette_status(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,

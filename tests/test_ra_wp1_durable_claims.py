@@ -6,11 +6,57 @@ from pathlib import Path
 
 import pytest
 
+import bioxp.pipette.receipts as pipette_receipts_module
 import bioxp.runtime_audit_store as runtime_store_module
+from bioxp.runtime_audit_store import NONTERMINAL_COMMAND_STATES
 from bioxp.operator_receipt_store import OperatorReceiptStore, runtime_state_root
 from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.pipette.receipts import PipetteReceiptError, PipetteReceiptStore
 from bioxp.services.pipette_service import _run_transport_call
+
+
+def _prepare_runtime(root: Path) -> None:
+    owner = OEMRuntimeStore(root)
+    owner.close()
+
+
+def _operator_store(root: Path) -> OperatorReceiptStore:
+    _prepare_runtime(root)
+    return OperatorReceiptStore(root)
+
+
+def _pipette_store(root: Path) -> PipetteReceiptStore:
+    _prepare_runtime(root)
+    return PipetteReceiptStore(root)
+
+
+@pytest.fixture(autouse=True)
+def _verified_replay_authority(monkeypatch):
+    monkeypatch.setattr(
+        pipette_receipts_module,
+        "current_release_identity",
+        lambda: {
+            "verified": True,
+            "release_id": "test-release",
+            "source": {
+                "manifest_sha256": "1" * 64,
+                "aggregate_sha256": "2" * 64,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        pipette_receipts_module,
+        "current_authority_identity",
+        lambda: {
+            "evidence_lock_identity_verified": True,
+            "evidence_lock_sha256": "3" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        pipette_receipts_module,
+        "current_registry_sha256",
+        lambda: "4" * 64,
+    )
 
 
 def _claim_payload(*, key: str = "idem-1", volume: float = 10.0) -> dict:
@@ -52,7 +98,7 @@ def test_legacy_pipette_jsonl_root_never_selects_a_sqlite_root(tmp_path, monkeyp
 
 
 def test_wp1_schema_is_versioned_and_append_only(tmp_path):
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
 
     assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -90,7 +136,7 @@ def test_wp1_schema_is_versioned_and_append_only(tmp_path):
 
 
 def test_claim_replay_requires_same_canonical_payload_and_persists_identity(tmp_path):
-    store = OperatorReceiptStore(tmp_path)
+    store = _operator_store(tmp_path)
     first, created = store.claim(_claim_payload())
     assert created is True
     assert first["status"] == "reserved"
@@ -115,7 +161,7 @@ def test_claim_replay_requires_same_canonical_payload_and_persists_identity(tmp_
 
 
 def test_pipette_receipts_use_the_canonical_sqlite_authority(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
     assert store.path == tmp_path / "bioxp_runtime.db"
     assert store.receipts_path is None
     claim, created = store.claim(
@@ -135,7 +181,7 @@ def test_pipette_receipts_use_the_canonical_sqlite_authority(tmp_path):
 
 
 def test_oem_runtime_store_uses_the_same_schema_authority(tmp_path):
-    operator = OperatorReceiptStore(tmp_path)
+    operator = _operator_store(tmp_path)
     runtime = OEMRuntimeStore(tmp_path)
 
     assert runtime.root == operator.root == tmp_path.resolve()
@@ -197,7 +243,7 @@ def test_service_claims_before_get_transport_and_operation():
 
 
 def test_pipette_claim_persists_all_typed_correlation_fields(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
     claim, created = store.claim(
         operation="aspirate",
         requested_inputs={"volume_ul": 10.0},
@@ -226,8 +272,11 @@ def test_pipette_claim_persists_all_typed_correlation_fields(tmp_path):
 
 
 def test_pipette_replay_repairs_missing_typed_child(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
     payload = _claim_payload(key="missing-child")
+    payload["source_identity"] = pipette_receipts_module._claim_source_identity(
+        payload["source_identity"]
+    )
     first, created = store._audit_database.claim(payload, pipette=False)
     assert created is True
     assert store.connection.execute(
@@ -235,17 +284,7 @@ def test_pipette_replay_repairs_missing_typed_child(tmp_path):
         (first["command_id"],),
     ).fetchone()[0] == 0
 
-    replay, replay_created = store.claim(
-        operation="aspirate",
-        requested_inputs=payload["requested_inputs"],
-        entrypoint_id=payload["entrypoint_id"],
-        caller_class=payload["caller_class"],
-        control_class=payload["control_class"],
-        idempotency_key=payload["idempotency_key"],
-        command_id=payload["command_id"],
-        ownership_generation=payload["ownership_generation"],
-        runtime_binding=payload["source_identity"],
-    )
+    replay, replay_created = store._audit_database.claim(payload, pipette=True)
 
     assert replay_created is False
     assert replay["pipette_operation_id"]
@@ -255,8 +294,99 @@ def test_pipette_replay_repairs_missing_typed_child(tmp_path):
     ).fetchone()[0] == 1
 
 
+def test_reconcile_claim_requires_exact_outer_and_child_terminal_states(tmp_path):
+    store = _pipette_store(tmp_path)
+    claim, _ = store.claim(
+        operation="status",
+        requested_inputs={},
+        entrypoint_id="direct.liquid.status",
+        caller_class="query",
+        control_class="hardware_query",
+        idempotency_key="terminal-reconcile",
+    )
+    audit = store._audit_database
+    audit.finalize_claim(
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+        expected_status="reserved",
+        status="outcome_unknown",
+        outcome="outcome_unknown",
+        failure_code="completion_ambiguous",
+        result={"ok": False, "completion_ambiguous": True},
+        receipt_json='{"receipt_id":"ambiguous-child"}',
+    )
+    audit.reconcile_claim(
+        command_id=claim["command_id"],
+        pipette_operation_id=claim["pipette_operation_id"],
+        expected_command_status="outcome_unknown",
+        expected_pipette_status="outcome_unknown",
+        status="completed",
+        outcome="completed",
+        failure_code=None,
+        result={"ok": True, "completion_verified": True},
+        receipt_json='{"receipt_id":"reconciled-child"}',
+    )
+    before = store.connection.execute(
+        """
+        SELECT o.status AS outer_status,o.receipt_json AS outer_receipt_json,
+               p.status AS pipette_status,p.receipt_json AS pipette_receipt_json
+        FROM operator_commands o
+        JOIN pipette_operations p ON p.command_id=o.command_id
+        WHERE o.command_id=?
+        """,
+        (claim["command_id"],),
+    ).fetchone()
+
+    with pytest.raises(
+        runtime_store_module.RuntimeAuditStoreError,
+        match="cannot mutate terminal outer state completed",
+    ):
+        audit.finalize_claim(
+            command_id=claim["command_id"],
+            pipette_operation_id=claim["pipette_operation_id"],
+            expected_status="completed",
+            status="failed",
+            outcome="failed",
+            failure_code="stale_writer",
+            result={"ok": False},
+            receipt_json='{"receipt_id":"stale-child"}',
+        )
+    with pytest.raises(
+        runtime_store_module.RuntimeAuditStoreError,
+        match="stale outer reconciliation expected state",
+    ):
+        audit.reconcile_claim(
+            command_id=claim["command_id"],
+            pipette_operation_id=claim["pipette_operation_id"],
+            expected_command_status="outcome_unknown",
+            expected_pipette_status="completed",
+            status="failed",
+            outcome="failed",
+            failure_code="stale_reconcile",
+            result={"ok": False},
+        )
+
+    after = store.connection.execute(
+        """
+        SELECT o.status AS outer_status,o.receipt_json AS outer_receipt_json,
+               p.status AS pipette_status,p.receipt_json AS pipette_receipt_json
+        FROM operator_commands o
+        JOIN pipette_operations p ON p.command_id=o.command_id
+        WHERE o.command_id=?
+        """,
+        (claim["command_id"],),
+    ).fetchone()
+    assert tuple(after) == tuple(before)
+    assert tuple(after) == (
+        "completed",
+        before["outer_receipt_json"],
+        "completed",
+        '{"receipt_id":"reconciled-child"}',
+    )
+
+
 def test_receipt_without_controller_ack_is_not_acknowledged(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
     claim, _ = store.claim(
         operation="aspirate",
         requested_inputs={"volume_ul": 10.0},
@@ -277,6 +407,7 @@ def test_receipt_without_controller_ack_is_not_acknowledged(tmp_path):
         },
         command_id=claim["command_id"],
         pipette_operation_id=claim["pipette_operation_id"],
+        expected_status="reserved",
     )
 
     row = store.connection.execute(
@@ -288,7 +419,7 @@ def test_receipt_without_controller_ack_is_not_acknowledged(tmp_path):
 
 
 def test_transport_exception_closes_claim_with_failure_receipt(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
 
     def get_transport():
         raise RuntimeError("transport unavailable")
@@ -318,7 +449,7 @@ def test_transport_exception_closes_claim_with_failure_receipt(tmp_path):
 
 
 def test_normalization_failure_closes_reserved_claim(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
     claim, _ = store.claim(
         operation="readback",
         requested_inputs={},
@@ -335,6 +466,7 @@ def test_normalization_failure_closes_reserved_claim(tmp_path):
             result={"ok": True, "channels": [{"channel": "not-an-int"}]},
             command_id=claim["command_id"],
             pipette_operation_id=claim["pipette_operation_id"],
+            expected_status="reserved",
         )
 
     row = store.connection.execute(
@@ -344,6 +476,94 @@ def test_normalization_failure_closes_reserved_claim(tmp_path):
     assert row["status"] == "failed"
     assert row["failure_code"] == "pipette_result_normalization_failed"
     assert row["outcome"] == "normalization_failed"
+
+
+def test_terminal_publication_cas_cannot_overwrite_a_winning_terminal_state(tmp_path):
+    store = _pipette_store(tmp_path)
+    claim, _ = store.claim(
+        operation="status",
+        requested_inputs={},
+        entrypoint_id="direct.liquid.status",
+        caller_class="query",
+        control_class="hardware_query",
+        idempotency_key="terminal-cas-winner",
+    )
+    store.connection.execute(
+        "UPDATE operator_commands SET status='cancelled' WHERE command_id=? AND status='reserved'",
+        (claim["command_id"],),
+    )
+
+    with pytest.raises(Exception, match="expected-source-state mismatch"):
+        store._audit_database.finalize_claim(
+            command_id=claim["command_id"],
+            pipette_operation_id=claim["pipette_operation_id"],
+            expected_status="cancelled",
+            status="completed",
+            outcome="completed",
+            failure_code=None,
+            result={"ok": True, "completion_verified": True},
+        )
+
+    rows = store.connection.execute(
+        """
+        SELECT c.status,p.status
+        FROM operator_commands AS c
+        JOIN pipette_operations AS p ON p.command_id=c.command_id
+        WHERE c.command_id=?
+        """,
+        (claim["command_id"],),
+    ).fetchone()
+    assert tuple(rows) == ("cancelled", "reserved")
+
+
+@pytest.mark.parametrize("state", sorted(NONTERMINAL_COMMAND_STATES))
+def test_startup_reconciliation_terminalizes_every_nonterminal_linked_projection(
+    tmp_path,
+    state,
+):
+    store = _pipette_store(tmp_path)
+    claim, _ = store.claim(
+        operation="status",
+        requested_inputs={},
+        entrypoint_id="direct.liquid.status",
+        caller_class="query",
+        control_class="hardware_query",
+        idempotency_key=f"reconcile-{state}",
+    )
+    store.connection.execute(
+        "UPDATE operator_commands SET status=? WHERE command_id=?",
+        (state, claim["command_id"]),
+    )
+    store.connection.execute(
+        "UPDATE pipette_operations SET status=? WHERE pipette_operation_id=?",
+        (state, claim["pipette_operation_id"]),
+    )
+
+    assert store._audit_database.reconcile_nonterminal_claims() == 1
+    row = store.connection.execute(
+        """
+        SELECT c.status,c.outcome,p.status,p.outcome
+        FROM operator_commands AS c
+        JOIN pipette_operations AS p ON p.command_id=c.command_id
+        WHERE c.command_id=?
+        """,
+        (claim["command_id"],),
+    ).fetchone()
+    assert tuple(row) == (
+        "outcome_unknown",
+        "outcome_unknown",
+        "outcome_unknown",
+        "outcome_unknown",
+    )
+
+
+def test_runtime_stores_share_one_process_wide_writer_boundary(tmp_path):
+    operator = _operator_store(tmp_path)
+    pipette = _pipette_store(tmp_path)
+    runtime = OEMRuntimeStore(tmp_path)
+
+    assert operator.lock is pipette.lock
+    assert pipette.lock is runtime._lock
 
 
 def test_serial206_pipette_lifecycle_calls_audit_runner_before_transport():
@@ -360,9 +580,33 @@ def test_serial206_pipette_lifecycle_calls_audit_runner_before_transport():
         generation_provider=lambda: 0,
     )
     calls = []
+    setattr(
+        adapter,
+        "_lifecycle_pipette_attempt",
+        {
+            "approval_id": "approval-lifecycle",
+            "idempotency_key": "idempotency-lifecycle",
+        },
+    )
 
-    def runner(operation_name, operation, *, requested_inputs, lifecycle_stage_id):
-        calls.append((operation_name, requested_inputs, lifecycle_stage_id))
+    def runner(
+        operation_name,
+        operation,
+        *,
+        requested_inputs,
+        lifecycle_stage_id,
+        lifecycle_attempt_id,
+        lifecycle_idempotency_key,
+    ):
+        calls.append(
+            (
+                operation_name,
+                requested_inputs,
+                lifecycle_stage_id,
+                lifecycle_attempt_id,
+                lifecycle_idempotency_key,
+            )
+        )
         assert operation(adapter.pipette_transport)["ok"] is True
         return {"ok": True, "receipt_id": "receipt-lifecycle"}
 
@@ -371,12 +615,18 @@ def test_serial206_pipette_lifecycle_calls_audit_runner_before_transport():
 
     assert result["receipt_id"] == "receipt-lifecycle"
     assert calls == [
-        ("initialize", {"pressure_profile": "1R", "prime_volume_ul": None}, "serial206.initiate_pipette_group")
+        (
+            "initialize",
+            {"pressure_profile": "1R", "prime_volume_ul": None},
+            "serial206.initiate_pipette_group",
+            "approval-lifecycle",
+            "idempotency-lifecycle",
+        )
     ]
 
 
 def test_coordinator_persists_explicit_connection_generation_fallback(tmp_path):
-    store = PipetteReceiptStore(tmp_path)
+    store = _pipette_store(tmp_path)
 
     def get_transport():
         return object()

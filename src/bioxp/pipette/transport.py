@@ -165,6 +165,7 @@ class CanPipetteTransport:
         delivery_verified = bool(extra.pop("delivery_verified", False))
         controller_acknowledged = extra.pop("controller_acknowledged", None)
         completion_verified = bool(extra.pop("completion_verified", False))
+        semantic_query_response_verified = bool(extra.pop("semantic_query_response_verified", False))
         hardware_precondition_verified = bool(extra.pop("hardware_precondition_verified", False))
         hardware_postcondition_verified = bool(extra.pop("hardware_postcondition_verified", False))
         state_reconciled = bool(extra.pop("state_reconciled", False))
@@ -203,6 +204,7 @@ class CanPipetteTransport:
             "delivery_verified": delivery_verified,
             "controller_acknowledged": controller_acknowledged,
             "completion_verified": completion_verified,
+            "semantic_query_response_verified": semantic_query_response_verified,
             "hardware_precondition_verified": hardware_precondition_verified,
             "hardware_postcondition_verified": hardware_postcondition_verified,
             "state_reconciled": state_reconciled,
@@ -233,11 +235,6 @@ class CanPipetteTransport:
             provenance_result = result.get("provenance")
             provenance = provenance_result if isinstance(provenance_result, Mapping) else {}
             completion = bool(provenance.get("completion_received", False))
-            if not completion:
-                completion = bool(
-                    result.get("ok") is True
-                    and result.get("outcome") in {"completion", "initialized"}
-                )
 
         return {
             "delivery_verified": bool(delivery),
@@ -761,7 +758,19 @@ class CanPipetteTransport:
     def query_pressure(self) -> dict[str, Any]:
         result = self._get_driver().query_pressure()
         self._last_pressure = result if isinstance(result, dict) else None
-        return {"ok": bool(isinstance(result, dict) and result.get("ok")), "result": result, "hardware_truth_level": "hardware_query"}
+        semantic_ok = bool(
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("semantic_ok") is True
+            and result.get("pressure") is not None
+        )
+        return {
+            "ok": semantic_ok,
+            "semantic_ok": semantic_ok,
+            "pressure": result.get("pressure") if isinstance(result, dict) else None,
+            "result": result,
+            "hardware_truth_level": "hardware_query",
+        }
 
     def query_firmware(self, number: int = 1) -> dict[str, Any]:
         result = self._get_driver().query_firmware(int(number))
@@ -1008,6 +1017,7 @@ class FourPipetteTransport:
             "include_data": bool(include_data),
             "live_query_performed": True,
             "truth_source": "live_hardware_queries",
+            "hardware_truth_level": "hardware_query",
             "delivery_verified": False,
             "controller_acknowledged": False,
             "completion_verified": False,
@@ -1083,8 +1093,29 @@ class FourPipetteTransport:
             {"channel": channel, "result": transport._get_driver().enable_pressure_stream(False)}
             for channel, transport in enumerate(self._transports)
         ]
-        pressure_offsets = router.calculate_pressure_offsets() if router is not None else {}
-        stream_ok = all(row["result"].get("ok") for row in stream_on + stream_off)
+        pressure_offset_evidence = (
+            router.calculate_pressure_offset_evidence() if router is not None else {}
+        )
+        pressure_offsets = {
+            channel: row["offset"]
+            for channel, row in pressure_offset_evidence.items()
+            if isinstance(row, Mapping) and row.get("valid") is True
+        }
+        stream_on_ok = all(row["result"].get("ok") for row in stream_on)
+        stream_off_ok = all(row["result"].get("ok") for row in stream_off)
+        stream_ok = stream_on_ok and stream_off_ok
+        delivery_verified = all(
+            row["result"].get("delivery_verified") is True
+            for row in sends + stream_on + stream_off
+        )
+        controller_acknowledged = all(
+            row["result"].get("controller_acknowledged") is True
+            for row in sends + stream_on + stream_off
+        )
+        completion_verified = all(
+            row["result"].get("ok") is True
+            for row in completions
+        )
         return {
             "ok": bool(stream_ok),
             "cycle": cycle,
@@ -1092,9 +1123,23 @@ class FourPipetteTransport:
             "sends": sends,
             "delayed_completions": completions,
             "completion_timeout_ms": 10_000,
-            "pressure_stream": {"on": stream_on, "wait_ms": 1_000, "off": stream_off},
+            "pressure_stream": {
+                "on": stream_on,
+                "wait_ms": 1_000,
+                "off": stream_off,
+                "selected_channels": list(self.CHANNELS),
+                "terminal_state": "stopped" if stream_off_ok else "stop_unconfirmed",
+            },
             "pressure_epoch": pressure_epoch,
             "pressure_offsets": pressure_offsets,
+            "pressure_offset_evidence": pressure_offset_evidence,
+            "pressure_offsets_valid": bool(
+                len(pressure_offset_evidence) == 4
+                and all(row.get("valid") is True for row in pressure_offset_evidence.values())
+            ),
+            "delivery_verified": delivery_verified,
+            "controller_acknowledged": controller_acknowledged,
+            "completion_verified": completion_verified,
             "pressure_offset_order": "new_epoch_stream_on_1000ms_stream_off_calculate",
         }
 
@@ -1169,6 +1214,7 @@ class FourPipetteTransport:
             "attempt": selected,
             "channels": exact_rows,
             "channel_count": len(exact_rows),
+            "hardware_truth_level": "hardware_query",
             "query_spacing_ms": 30,
             "post_query_settle_ms": 1,
             "oem_source_anchor": "ClassPipetteCollection.checkedPipetteStatus:726-748; ControlLib.initializeMotion:8833,8836",
@@ -1184,6 +1230,12 @@ class FourPipetteTransport:
                 "outcome": "initial_group_cycle_failed",
                 "channels": initial_group.get("sends", []),
                 "initial_group": initial_group,
+                "pressure_stream": dict(initial_group.get("pressure_stream") or {}),
+                "pressure_epoch": initial_group.get("pressure_epoch"),
+                "pressure_offsets": dict(initial_group.get("pressure_offsets") or {}),
+                "pressure_offset_evidence": dict(initial_group.get("pressure_offset_evidence") or {}),
+                "pressure_offsets_valid": initial_group.get("pressure_offsets_valid") is True,
+                "pressure_offset_order": initial_group.get("pressure_offset_order"),
                 "group_wait_ms": 10_000,
                 "liquid_mutation_enabled": self._liquid_mutation_enabled,
             }
@@ -1202,6 +1254,16 @@ class FourPipetteTransport:
         final_status = retry_status if retry_status is not None else first_status
         final_status_ok = all(row["result"].get("ok") for row in final_status)
         ok = bool(condition_ok and final_status_ok and (retry_group is None or retry_group.get("ok")))
+        pressure_group = (
+            retry_group
+            if isinstance(retry_group, Mapping)
+            and (
+                retry_group.get("pressure_stream")
+                or retry_group.get("pressure_offset_evidence")
+                or retry_group.get("pressure_epoch") is not None
+            )
+            else initial_group
+        )
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
@@ -1213,6 +1275,12 @@ class FourPipetteTransport:
             "retry_group": retry_group,
             "status_readback_retry": retry_status,
             "status_readback_final": final_status,
+            "pressure_stream": dict(pressure_group.get("pressure_stream") or {}),
+            "pressure_epoch": pressure_group.get("pressure_epoch"),
+            "pressure_offsets": dict(pressure_group.get("pressure_offsets") or {}),
+            "pressure_offset_evidence": dict(pressure_group.get("pressure_offset_evidence") or {}),
+            "pressure_offsets_valid": pressure_group.get("pressure_offsets_valid") is True,
+            "pressure_offset_order": pressure_group.get("pressure_offset_order"),
             "group_wait_ms": 10_000,
             "pipette_transaction_timeout_ms": 60_000,
             "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),
@@ -1333,6 +1401,7 @@ class FourPipetteTransport:
             "ok": ok,
             "channels": rows,
             "channel_count": len(rows),
+            "hardware_truth_level": "hardware_query",
             "null_reply_is_failure": True,
             "oem_source_anchor": "ClassPipetteCollection.checkedPipetteCondition: QueryFirmware(1)",
         }
@@ -1395,12 +1464,12 @@ class FourPipetteTransport:
     def query_firmware(self, number: int = 1, channels: list[int] | None = None) -> dict[str, Any]:
         selected = self._selected_channels(channels)
         rows = [{"channel": channel, "result": self._transports[channel].query_firmware(number)} for channel in selected]
-        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": f"&{int(number)}"}
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": f"&{int(number)}", "hardware_truth_level": "hardware_query"}
 
     def query_error_log(self, command: PipetteErrorLogCommand | None = None, channels: list[int] | None = None) -> dict[str, Any]:
         selected = self._selected_channels(channels)
         rows = [{"channel": channel, "result": self._transports[channel].query_error_log(command)} for channel in selected]
-        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1"}
+        return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1", "hardware_truth_level": "hardware_query"}
 
     def execute_diagnoses(self, command: PipetteDiagnosticCommand, channels: list[int] | None = None) -> dict[str, Any]:
         self._require_physical_command_admission("diagnoses")
@@ -1488,6 +1557,7 @@ class FourPipetteTransport:
             "expected_channel_count": len(selected),
             "expected_query_count": expected_query_count,
             "aggregate_oem_sweep": query is None,
+            "hardware_truth_level": "hardware_query",
             "oem_source_anchor": "ClassPipette.getData:211-261",
         }
 
@@ -1607,9 +1677,8 @@ class FourPipetteTransport:
                 "controller_acknowledged": all(
                     row["result"].get("controller_acknowledged") is True for row in rows
                 ),
-                "completion_verified": bool(
-                    not defer_completion
-                    or all(row.get("completion", {}).get("ok") is True for row in rows)
+                "completion_verified": all(
+                    row["result"].get("completion_verified") is True for row in rows
                 ),
                 "state_reconciled": all(
                     row["result"].get("state_reconciled") is True for row in rows
@@ -1973,6 +2042,7 @@ class FourPipetteTransport:
                 "channels_with_tips": loaded_channels,
                 "channels": channels,
                 "hardware_query_verified": True,
+                "hardware_truth_level": "hardware_query",
                 "physical_effect_verified": False,
                 "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
             }
@@ -2107,7 +2177,11 @@ class FourPipetteTransport:
             transport.close()
 
 
-def build_default_pipette_transport(*, shared_usb: Any | None = None) -> FourPipetteTransport:
+def build_default_pipette_transport(
+    *,
+    shared_usb: Any | None = None,
+    error_callback: Callable[[int, int], None] | None = None,
+) -> FourPipetteTransport:
     transport = os.environ.get("BIOXP_PIPETTE_TRANSPORT", "novo_usb").strip().lower().replace("-", "_")
     response_timeout_s = 60.0
     transports: list[CanPipetteTransport] = []
@@ -2138,6 +2212,6 @@ def build_default_pipette_transport(*, shared_usb: Any | None = None) -> FourPip
                     "shared_bioxp_usb_runtime": shared_usb is not None,
                 },
             ))
-        return FourPipetteTransport(transports)
+        return FourPipetteTransport(transports, error_callback=error_callback)
 
     raise ValueError(f"Unsupported BIOXP_PIPETTE_TRANSPORT={transport!r}; expected novo_usb or socketcan")

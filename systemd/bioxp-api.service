@@ -1,0 +1,36 @@
+[Unit]
+Description=Canonical BioXP immutable release API owner
+After=local-fs.target
+ConditionPathIsRegularFile=/etc/bioxp/release-identity.json
+ConditionPathIsRegularFile=/etc/bioxp/source-manifest.json
+ConditionPathIsRegularFile=/etc/bioxp/image-inspection.json
+ConditionPathIsExecutable=/usr/local/libexec/bioxp-udocker-image-inspector
+ConditionPathIsExecutable=/opt/bioxp/udocker-runtime/venv/bin/udocker
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=molbiofreak
+Group=molbiofreak
+ExecStart=/usr/local/libexec/bioxp-release-container-run
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillMode=control-group
+SendSIGKILL=yes
+UMask=0027
+RuntimeDirectory=bioxp-release
+RuntimeDirectoryMode=0750
+StateDirectory=bioxp-oem-runtime
+StateDirectoryMode=0700
+Environment=HOME=/home/molbiofreak
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/etc/bioxp/release-identity.json /etc/bioxp/source-manifest.json /etc/bioxp/image-inspection.json /usr/local/libexec/bioxp-release-container-run /usr/local/libexec/bioxp-udocker-image-inspector /opt/bioxp/udocker-runtime
+ReadWritePaths=/run/bioxp-release /var/lib/bioxp-oem-runtime -/home/molbiofreak/.udocker
+
+[Install]
+WantedBy=multi-user.target

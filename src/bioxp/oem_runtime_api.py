@@ -145,7 +145,25 @@ def _runtime_unavailable(component: str) -> dict[str, Any]:
     }
 
 
+def _retire_legacy_live_z_queue(name: str, req: RuntimeCommandRequest) -> None:
+    replacements = {
+        OEMCommandName.ABORT_JOB.value: "/operator/actions/oem.z.abort",
+        OEMCommandName.WAKE_FROM_PAUSE.value: "/operator/v2/actions/oem.z.resume_after_abort",
+    }
+    replacement = replacements.get(str(name))
+    if req.mode == "live" and replacement is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "legacy_live_z_queue_retired",
+                "command": str(name),
+                "replacement": replacement,
+            },
+        )
+
+
 def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
+    _retire_legacy_live_z_queue(name, req)
     _, worker, _, _ = _require_runtime()
     try:
         cmd = OEMRuntimeCommand(name=name, mode=req.mode, source=req.source, params=req.params, operator_ack=req.operator_ack, artifact_root=req.artifact_root, timeout_s=req.timeout_s)
@@ -405,9 +423,24 @@ def runtime_worker_status():
 @router.post("/commands/enqueue")
 def runtime_commands_enqueue(req: GenericCommandRequest):
     try:
-        OEMCommandName.validate(req.name)
+        selected = OEMCommandName.validate(req.name)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if selected in {OEMCommandName.ABORT_JOB, OEMCommandName.WAKE_FROM_PAUSE}:
+        replacement = (
+            "/operator/actions/oem.z.abort"
+            if selected == OEMCommandName.ABORT_JOB
+            else "/operator/v2/actions/oem.z.resume_after_abort"
+        )
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": f"runtime_command_{selected.value.lower()}_retired",
+                "replacement": replacement,
+                "provider_called": False,
+                "queue_called": False,
+            },
+        )
     return _enqueue(req.name, req)
 
 
@@ -444,7 +477,15 @@ def runtime_prepare_to_run_job_readiness_dry_run(req: RuntimeCommandRequest):
 
 @router.post("/commands/abortjob")
 def runtime_command_abortjob(req: RuntimeCommandRequest):
-    return _enqueue(OEMCommandName.ABORT_JOB.value, req)
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "runtime_command_abortjob_retired",
+            "replacement": "/operator/actions/oem.z.abort",
+            "provider_called": False,
+            "queue_called": False,
+        },
+    )
 
 
 @router.post("/commands/validateJob")
@@ -454,7 +495,15 @@ def runtime_command_validate_job(req: RuntimeCommandRequest):
 
 @router.post("/commands/wakefrompause")
 def runtime_command_wakefrompause(req: RuntimeCommandRequest):
-    return _enqueue(OEMCommandName.WAKE_FROM_PAUSE.value, req)
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "runtime_command_wakefrompause_retired",
+            "replacement": "/operator/v2/actions/oem.z.resume_after_abort",
+            "provider_called": False,
+            "queue_called": False,
+        },
+    )
 
 
 @router.post("/events/door")
@@ -471,6 +520,16 @@ def runtime_event_pause():
 
 @router.post("/events/resume")
 def runtime_event_resume(req: RuntimeCommandRequest = RuntimeCommandRequest()):
+    if req.mode == "live":
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "runtime_event_resume_live_retired",
+                "replacement": "/operator/v2/actions/oem.z.resume_after_abort",
+                "provider_called": False,
+                "queue_called": False,
+            },
+        )
     _, _, events, _ = _require_runtime()
     return events.handle_resume(mode=req.mode, artifact_root=req.artifact_root)
 

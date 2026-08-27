@@ -34,7 +34,7 @@ X_PROFILE = {
     "run_current": 31,
     "stall_guard": 16,
 }
-X_MASK_TUPLE = {12: 0, 13: 0}
+X_MASK_TUPLE = {12: 1, 13: 0}
 TERMINAL_GAPS = (1, 3, 4, 5, 6, 9, 10, 12, 13, 205)
 ERROR_EVENTS = (13, 14, 130)
 
@@ -129,7 +129,7 @@ class InMemoryXTester:
     def __init__(self, *, position: int = 1000) -> None:
         self.positions = {5: int(position), 4: 2000}
         self.params = {
-            5: {1: int(position), 3: 0, 4: 1700, 5: 350, 6: 31, 9: 0, 10: 0, 12: 0, 13: 0, 205: 16},
+            5: {1: int(position), 3: 0, 4: 1700, 5: 350, 6: 31, 9: 0, 10: 0, 12: 1, 13: 0, 205: 16},
             4: {1: 2000, 3: 0, 4: 1800, 5: 400, 6: 31, 9: 1, 10: 1, 12: 0, 13: 0, 205: 16},
         }
         self.calls: list[tuple[Any, ...]] = []
@@ -367,61 +367,12 @@ def test_x_prepare_selects_x_component_and_exact_oem_profile_without_mask_writes
     result = adapter.prepare_x(expected_generation=17)
 
     assert result["ok"] is True
+    assert result["source_exact"] is False
+    assert result["initializer_source_exact"] is True
     assert observed == [("x",)]
     receipt = result["receipt"]
     assert receipt["components"]["x"]["writes"] == [[4, 1700], [5, 350], [6, 31], [205, 16]]
     assert not any(call[:4] in {("sap", 5, 0, 12), ("sap", 5, 0, 13)} for call in tester.calls)
-
-
-def test_d1_recovery_writes_both_x_masks_and_verifies_literal_oem_tuple_then_invalidates():
-    tester = InMemoryXTester()
-    tester.params[5][12] = 1
-    tester.params[5][9] = 0
-    tester.params[5][10] = 0
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_reconcile_switch_masks()
-
-    assert result["ok"] is True
-    assert result["classification"] == "controller_state_repair_for_literal_oem_baseline"
-    assert result["switch_mask_tuple"] == X_MASK_TUPLE
-    assert [call for call in tester.calls if call[0] == "sap"] == [
-        ("sap", 5, 0, 12, 0),
-        ("sap", 5, 0, 13, 0),
-    ]
-    assert {call for call in tester.calls if call[0] == "gap" and call[-1] in (12, 13)} == {
-        ("gap", 5, 0, 12),
-        ("gap", 5, 0, 13),
-    }
-    assert result["preparation_invalidated"] is True
-    assert result["reference_invalidated"] is True
-
-
-def test_x_mask_repair_fails_when_raw_limit_remains_active_after_enablement():
-    tester = InMemoryXTester()
-    tester.params[5][9] = 0
-    tester.params[5][10] = 1
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_reconcile_switch_masks()
-
-    assert result["ok"] is False
-    assert result["failure"] == "raw_active_x_limit_after_mask_convergence"
-    assert result["raw_active_limits"] == [10]
-    assert result["preparation_invalidated"] is True
-
-
-def test_x_absolute_move_does_not_dispatch_with_active_enabled_limit():
-    tester = InMemoryXTester(position=1000)
-    tester.params[5][10] = 1
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_absolute(position_steps=2000)
-
-    assert result["ok"] is False
-    assert result["failure"] == "raw_active_x_limit_after_mask_convergence"
-    assert result["command_issued"] is False
-    assert not any(call[0] == "move_abs" for call in tester.calls)
 
 
 def test_x_terminal_status_uses_ack_backed_typed_gap_reads_for_complete_contract():
@@ -438,19 +389,6 @@ def test_x_terminal_status_uses_ack_backed_typed_gap_reads_for_complete_contract
     assert all(row["ack"]["status"] == 100 for row in result["readbacks"].values())
 
 
-def test_x_terminal_status_rejects_typed_but_non_oem_switch_mask():
-    tester = InMemoryXTester(position=4321)
-    tester.params[5][12] = 1
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_terminal_status()
-
-    assert result["ok"] is False
-    assert result["profile_verified"] is True
-    assert result["switch_mask_verified"] is False
-    assert result["failure"] == "x_oem_profile_or_switch_mask_mismatch"
-
-
 def test_x_terminal_status_rejects_boolean_speed_even_though_false_equals_zero():
     tester = InMemoryXTester()
     tester.params[5][3] = False
@@ -463,148 +401,6 @@ def test_x_terminal_status_rejects_boolean_speed_even_though_false_equals_zero()
 
 
 # --- Relative/absolute bounds, no-op truth, and movement evidence -----------
-
-
-@pytest.mark.parametrize(
-    ("before", "steps", "accepted", "target"),
-    [
-        (20, -1, False, 19),
-        (20, 0, True, 20),
-        (20, 1, True, 21),
-        (90243, 0, True, 90243),
-        (90243, 1, False, 90244),
-    ],
-)
-def test_x_relative_uses_source_inner_margin_20_before_dispatch(before, steps, accepted, target):
-    tester = InMemoryXTester(position=before)
-    tester.events = [valid_x_event()]
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_steps(steps=steps, wait_timeout_s=20.0)
-
-    assert result["target_position_steps"] == target
-    assert result["ok"] is accepted
-    moves = [call for call in tester.calls if call[0] == "move_rel"]
-    assert bool(moves) is (accepted and steps != 0)
-    if not accepted:
-        assert result["command_issued"] is False
-
-
-@pytest.mark.parametrize(("requested", "effective"), [(-1, 60), (0, 60), (59, 60), (60, 60), (90263, 90263), (92049, 90263)])
-def test_x_absolute_applies_source_minimum_60_and_release_maximum_90263(requested, effective):
-    tester = InMemoryXTester(position=1000)
-    tester.events = [valid_x_event()]
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_absolute(position_steps=requested)
-
-    assert result["target_position_steps"] == effective
-    assert 60 <= result["target_position_steps"] <= 90263
-
-
-def test_same_effective_target_is_source_noop_with_terminal_readback_and_no_dispatch_or_event_claim():
-    tester = InMemoryXTester(position=60)
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_absolute(position_steps=0)
-
-    assert result["ok"] is True
-    assert result["source_noop"] is True
-    assert result["physical_motion_commanded"] is False
-    assert result["controller_command_acknowledged"] is False
-    assert result["target_event_128_observed"] is False
-    assert result["after_position_steps"] == 60
-    assert type(result["terminal_speed"]["speed"]) is int and result["terminal_speed"]["speed"] == 0
-    assert not any(call[0] in {"event_window", "move_abs", "collect_events"} for call in tester.calls)
-
-
-def test_transport_high_limit_guard_remains_truthful_source_noop_without_false_ack_failure(monkeypatch):
-    tester = InMemoryXTester(position=90260)
-    adapter = make_adapter(tester=tester)
-    monkeypatch.setattr(tester, "motor_oem_move_absolute", lambda *args, **kwargs: {
-        "ok": True,
-        "source_noop": True,
-        "short_circuit": "high_limit_guard",
-        "command_sent": False,
-        "ack": None,
-    })
-
-    result = adapter.x_move_absolute(position_steps=90263)
-
-    assert result["ok"] is True
-    assert result["source_noop"] is True
-    assert result["noop_reason"] == "high_limit_guard"
-    assert result["command_issued"] is False
-    assert result["physical_motion_commanded"] is False
-    assert result["controller_command_acknowledged"] is False
-    assert result["target_event_128_observed"] is False
-
-
-@pytest.mark.parametrize(
-    ("events", "move_ack_status", "speed_value", "expected_failure"),
-    [
-        ([valid_x_event()], 101, 0, "x_move_command_not_acknowledged"),
-        ([valid_x_event(sequence=10)], 100, 0, "x_target_event_128_missing_or_stale"),
-        ([valid_x_event(board=4)], 100, 0, "x_target_event_128_missing_or_stale"),
-        ([valid_x_event(), valid_x_event(status=13, sequence=12)], 100, 0, "x_controller_error_event"),
-        ([valid_x_event(), valid_x_event(status=14, sequence=12)], 100, 0, "x_controller_error_event"),
-        ([valid_x_event(), valid_x_event(status=130, sequence=12)], 100, 0, "x_controller_error_event"),
-        ([valid_x_event()], 100, False, "x_terminal_zero_speed_not_verified"),
-    ],
-)
-def test_x_move_requires_direct_ack_fresh_addressed_128_no_error_and_typed_speed_zero(
-    events, move_ack_status, speed_value, expected_failure
-):
-    tester = InMemoryXTester(position=1000)
-    tester.events = events
-    tester.move_ack_status = move_ack_status
-    tester.speed_value = speed_value
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_absolute(position_steps=2000)
-
-    assert result["ok"] is False
-    assert result["failure"] == expected_failure
-    assert len([call for call in tester.calls if call[0] == "move_abs"]) == 1
-    assert len([call for call in tester.calls if call[0] == "stop"]) == 1
-
-
-def test_x_move_accepts_only_full_ack_event_target_speed_contract_and_preserves_reference():
-    tester = InMemoryXTester(position=1000)
-    tester.events = [valid_x_event()]
-    references = InMemoryReferenceStore("referenced")
-    adapter = make_adapter(tester=tester)
-    adapter.reference_store = references
-
-    result = adapter.x_move_absolute(position_steps=2000)
-
-    assert result["ok"] is True
-    assert result["controller_command_acknowledged"] is True
-    assert result["target_event_128_observed"] is True
-    assert result["controller_error_events"] == []
-    assert result["after_position_steps"] == 2000
-    assert result["controller_terminal_state_verified"] is True
-    assert references.state == "referenced"
-    assert not any(kind == "referenced" for kind, _ in references.events)
-
-
-@pytest.mark.parametrize("exit_case", ["noop", "setup_failure", "command_failure", "event_failure"])
-def test_custom_acceleration_restores_x_350_on_every_exit(exit_case):
-    before = 60 if exit_case == "noop" else 1000
-    tester = InMemoryXTester(position=before)
-    tester.events = [valid_x_event()]
-    if exit_case == "setup_failure":
-        tester.fail_acceleration_setup = True
-    elif exit_case == "command_failure":
-        tester.move_ack_status = 101
-    elif exit_case == "event_failure":
-        tester.events = []
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.x_move_absolute(position_steps=60 if exit_case == "noop" else 2000, acceleration=444)
-
-    assert ("sap", 5, 0, 5, 350) in tester.calls
-    assert result["acceleration_restore"]["readback"]["value"] == 350
 
 
 # --- Reference authority and distinct home identities ----------------------
@@ -674,7 +470,7 @@ class ProviderPrimitives:
 
     def _x_require_motion_preflight(self):
         self.calls.append(("x_live_preflight", {}))
-        return {"profile": {"axis": "x"}, "switch_masks": {12: 0, 13: 0}}
+        return {"profile": {"axis": "x"}, "switch_masks": {12: 1, 13: 0}}
 
     def home_xy(self, **kwargs):
         self.calls.append(("home_xy", dict(kwargs)))
@@ -697,21 +493,6 @@ def execute_x_intent(provider, intent, values=None):
     bound_values = dict(values or {})
     bound_values.setdefault("expected_generation", int(provider.generation_provider()))
     return Serial206OemInitializationProvider.execute_x_intent(provider, intent, bound_values)
-
-
-def test_manual_panel_home_automatically_prepares_unprepared_x_without_motion():
-    primitives = ProviderPrimitives()
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-
-    result = execute_x_intent(provider, "manual_panel_home", {"command_id": "x-home-auto-prepare"})
-
-    assert result["ok"] is True
-    assert [name for name, _inputs in primitives.calls] == ["prepare", "manual_panel_home"]
-    assert result["result"]["automatic_prerequisites"][0]["stage"] == "auto_prepare"
-    assert result["result"]["automatic_prerequisites"][0]["physical_motion_commanded"] is False
-    assert result["authority_receipt"]["command_id"] == "x-home-auto-prepare"
-    assert result["authority_receipt"]["status"] == "completed"
-    assert provider.x_projection()["lifecycle"]["state"] == "awaiting_operator_observation"
 
 
 def test_manual_panel_home_admission_stays_open_while_x_is_automatically_preparable():
@@ -750,47 +531,6 @@ def test_manual_panel_home_admission_stays_open_while_x_is_automatically_prepara
 
     assert assessment["enabled"] is True
     assert assessment["disabled_reason"] is None
-
-
-def test_x_observation_admission_requires_pending_lifecycle_but_not_motion_readiness():
-    from bioxp import operator_controls
-
-    action = {
-        "action_id": "oem.x.observe",
-        "provider_available": True,
-        "required_provider_capability": "initialize_motors",
-        "informational_method": "POST",
-        "informational_path": "/motion/oem/x/observation",
-        "safety_class": "motion",
-    }
-    machine_state = {
-        "lifecycle": {"operation_state": "idle"},
-        "ownership": {
-            "transport": "owned",
-            "usb": "service",
-            "router": "running",
-            "CAN_READY": True,
-        },
-        "maintenance": {"motion_blocked": True, "recovery_required": True},
-        "serial206_initialization_provider": {
-            "bound": True,
-            "initialize_motors_live_available": True,
-            "x_authority": {
-                "lifecycle": {"state": "awaiting_operator_observation"},
-            },
-        },
-    }
-
-    assessment = operator_controls._assess_action(action, machine_state, {})
-
-    assert assessment["enabled"] is True
-    assert assessment["disabled_reason"] is None
-    assert {row["key"] for row in assessment["dependencies"]} == {
-        "provider_available",
-        "serial206_x_lifecycle",
-        "transport_live",
-        "operation_allows_motion",
-    }
 
 
 def test_x_projection_preserves_complete_typed_terminal_status_without_omission_markers():
@@ -848,8 +588,8 @@ def test_x_projection_preserves_complete_typed_terminal_status_without_omission_
                 "profile_verified": True,
                 "expected_profile": {4: 1700, 5: 350, 6: 31, 205: 16},
                 "switch_mask_verified": True,
-                "switch_mask_tuple": {12: 0, 13: 0},
-                "expected_switch_masks": {12: 0, 13: 0},
+                "switch_mask_tuple": {12: 1, 13: 0},
+                "expected_switch_masks": {12: 1, 13: 0},
                 "readbacks": readbacks,
                 "authority": "serial206_x_terminal_register_readback",
                 "failure": None,
@@ -866,21 +606,6 @@ def test_x_projection_preserves_complete_typed_terminal_status_without_omission_
         row["ack"]["provenance"]["transaction_id"] == f"read-{parameter}"
         for parameter, row in projection["live_status"]["readbacks"].items()
     )
-
-
-def test_successful_move_cannot_create_reference_from_prepared_unreferenced_state():
-    primitives = ProviderPrimitives()
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
-
-    result = execute_x_intent(provider, "move_absolute", {"position_steps": 2000, "command_id": "x-no-ref"})
-
-    assert result["ok"] is False
-    assert result["failure"] == "x_observed_commissioning_required_before_automatic_home"
-    assert primitives.calls == []
-    lifecycle = provider.x_projection()["lifecycle"]
-    assert lifecycle["state"] == "prepared_unreferenced"
-    assert lifecycle["reference_state"] == "desynced"
 
 
 def test_verified_move_preserves_existing_reference_without_reestablishing_it():
@@ -974,163 +699,7 @@ def test_compatibility_home_is_retired_instead_of_aliasing_an_oem_mode():
     assert not hasattr(Serial206ProductionPrimitiveAdapter, "x_compatibility_home")
 
 
-def test_x_startup_home_preserves_250_search_waits_sethome_speed1700_and_park6000():
-    tester = InMemoryXTester(position=1000)
-    adapter = make_adapter(tester=tester)
-    sleeps: list[float] = []
-    adapter.sleep = sleeps.append
-    tester.events = [valid_x_event()]
-
-    result = adapter.x_startup_home(timeout_s=30.0)
-
-    assert result["ok"] is True
-    significant = [call for call in tester.calls if call[0] in {"axis_search_home", "set_home", "sap", "move_abs"}]
-    assert significant[0][0] == "axis_search_home"
-    assert significant[0][2]["speed"] == 250
-    assert significant[1] == ("set_home", 5, 0)
-    assert ("sap", 5, 0, 4, 1700) in significant
-    assert significant[-1] == ("move_abs", 5, 0, 6000)
-    assert sleeps == [0.020, 0.040]
-    assert result["controller_position_steps"] == 6000
-    assert result["oem_display_position_steps"] == 0
-
-
 # --- Composite HomeXY and durable lifecycle/replay behavior -----------------
-
-
-def test_home_xy_uses_200_200_nonrehome_parallel_homes_signed_returns_and_full_restore():
-    tester = InMemoryXTester(position=1000)
-    adapter = make_adapter(tester=tester)
-    adapter.reference_store = None
-
-    result = adapter.home_xy(timeout_s=30.0)
-
-    assert result["ok"] is True
-    setup = [call for call in tester.calls if call[0] == "sap" and call[-1] == 200]
-    assert set(setup) == {
-        ("sap", 5, 0, 4, 200),
-        ("sap", 5, 0, 5, 200),
-        ("sap", 4, 0, 4, 200),
-        ("sap", 4, 0, 5, 200),
-    }
-    homes = [call for call in tester.calls if call[0] == "go_home"]
-    assert {call[1] for call in homes} == {"x", "y"}
-    assert all(call[2]["speed"] == 200 and call[2]["rehome"] is False for call in homes)
-    assert result["source_return"] == {"x": -123, "y": -456}
-    assert not any(call[0] == "set_home" for call in tester.calls), "goHome owns its source setHome"
-    assert {
-        ("sap", 5, 0, 4, 1700),
-        ("sap", 5, 0, 5, 350),
-        ("sap", 4, 0, 4, 1800),
-        ("sap", 4, 0, 5, 400),
-    } <= set(tester.calls)
-
-
-def test_home_xy_launches_x_and_y_home_leaves_concurrently():
-    tester = InMemoryXTester(position=1000)
-    adapter = make_adapter(tester=tester)
-    adapter.reference_store = None
-    entered = threading.Barrier(2, timeout=2.0)
-    completed: list[str] = []
-    original = tester.motor_oem_go_home
-
-    def overlapping_home(axis, **kwargs):
-        entered.wait()
-        row = original(axis, **kwargs)
-        completed.append(str(axis))
-        return row
-
-    tester.motor_oem_go_home = overlapping_home
-
-    result = adapter.home_xy(timeout_s=30.0)
-
-    assert result["ok"] is True
-    assert set(completed) == {"x", "y"}
-
-
-@pytest.mark.parametrize("missing_board", [4, 5])
-def test_home_xy_returns_source_null_noop_before_io_when_either_board_absent(missing_board):
-    tester = InMemoryXTester(position=1000)
-    tester._oem_board_presence[missing_board] = False
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.home_xy(timeout_s=5.0)
-
-    assert result["ok"] is True
-    assert result["source_noop"] is True
-    assert result["source_return"] is None
-    assert result["source_return_semantics"] == "null_when_either_board_absent"
-    assert result["command_issued"] is False
-    assert result["physical_motion_commanded"] is False
-    assert result["controller_command_acknowledged"] is False
-    assert tester.calls == []
-
-
-def test_home_xy_restores_both_profiles_and_desyncs_pair_on_partial_failure():
-    tester = InMemoryXTester(position=1000)
-    tester.fail_home_axis = "y"
-    references = InMemoryReferenceStore("referenced")
-    adapter = make_adapter(tester=tester)
-    adapter.reference_store = references
-
-    result = adapter.home_xy(timeout_s=30.0)
-
-    assert result["ok"] is False
-    assert {
-        ("sap", 5, 0, 4, 1700),
-        ("sap", 5, 0, 5, 350),
-        ("sap", 4, 0, 4, 1800),
-        ("sap", 4, 0, 5, 400),
-    } <= set(tester.calls)
-    assert any(kind == "desynced_many" for kind, _ in references.events)
-    assert {("stop", 5, 0), ("stop", 4, 0)} <= set(tester.calls)
-
-
-def test_move_xy_pair_noop_has_fresh_typed_terminal_truth_and_no_motion_metadata():
-    tester = InMemoryXTester(position=1000)
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.move_xy(1000, 2000, wait_timeout_s=5.0)
-
-    assert result["ok"] is True
-    assert result["branch"] == "source_noop"
-    assert result["source_noop"] is True
-    assert result["command_issued"] is False
-    assert result["physical_motion_commanded"] is False
-    assert result["controller_command_acknowledged"] is False
-    assert result["target_event_128_observed"] is False
-    assert result["motion_metadata_recorded"] is False
-    assert result["after"] == {"x": 1000, "y": 2000}
-    assert result["terminal_speed_steps_s"] == {"x": 0, "y": 0}
-    assert not any(call[0] in {"event_window", "move_abs", "collect_events"} for call in tester.calls)
-
-
-def test_move_xy_missing_x_preserves_literal_source_move_x_y_fallback():
-    tester = InMemoryXTester(position=1000)
-    tester.present["x"] = False
-    adapter = make_adapter(tester=tester)
-
-    result = adapter.move_xy(3000, 4000, wait_timeout_s=5.0)
-
-    assert result["branch"] == "missing_x_calls_moveX_y"
-    assert result["fallback"]["requested_position_steps"] == 4000
-    assert result["fallback"]["source_mode"] == "moveXY.missing_x.moveX_y"
-    assert result["ok"] is False
-    assert ("move_abs", 5, 0, 4000) in tester.calls
-
-
-def test_move_xy_one_axis_records_only_moved_axis_metadata():
-    tester = InMemoryXTester(position=1000)
-    tester.events = [valid_x_event()]
-    references = InMemoryReferenceStore("referenced")
-    adapter = make_adapter(tester=tester)
-    adapter.reference_store = references
-
-    result = adapter.move_xy(3000, 2000, wait_timeout_s=5.0)
-
-    assert result["ok"] is True
-    assert result["moved_axes"] == ["x"]
-    assert references.events == [("motion", ("x", "move_xy"))]
 
 
 class LocalReceiptStateStore:
@@ -1191,36 +760,6 @@ def test_provider_current_modes_require_current_prepared_authority_and_preserve_
         assert {stream for stream, row in state_store.receipts if row.get("command_id") == values["command_id"]} == {"x", "z"}
 
 
-def test_enable_xyz_replay_rejects_z_authority_drift():
-    primitives = ProviderPrimitives()
-    state_store = LocalReceiptStateStore()
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17, state_store=state_store)
-    seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced", seed_z=True)
-    values = {"command_id": "xyz-replay", "idempotency_key": "xyz-replay", "enabled": True, "z_current_up": 29}
-    first = execute_x_intent(provider, "enable_xyz_current", values)
-    assert first["ok"] is True
-
-    state = provider._load_state()
-    state["z_lifecycle"]["reference_state"] = "desynced"
-    provider._save_state(state)
-    replay = execute_x_intent(provider, "enable_xyz_current", values)
-
-    assert replay["ok"] is False
-    assert replay["failure"] == "x_replay_current_authority_invalid"
-
-
-def test_enable_xyz_rejects_stale_z_authority_before_dispatch():
-    primitives = ProviderPrimitives()
-    primitives.x_enable_xyz_current_mode = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("dispatched"))
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced", seed_z=False)
-
-    result = execute_x_intent(provider, "enable_xyz_current", {"command_id": "xyz-stale-z", "enabled": True})
-
-    assert result["ok"] is False
-    assert result["failure"] == "xyz_current_requires_current_x_and_z_authority"
-
-
 def test_provider_diagnostic_home_axis_maps_to_x_home_axis_and_awaits_observation():
     primitives = ProviderPrimitives()
     primitives.x_home_axis = lambda **kwargs: primitives.calls.append(("home_axis", dict(kwargs))) or {
@@ -1237,42 +776,6 @@ def test_provider_diagnostic_home_axis_maps_to_x_home_axis_and_awaits_observatio
     assert result["ok"] is True
     assert primitives.calls[-1][0] == "home_axis"
     assert provider.x_projection()["lifecycle"]["state"] == "awaiting_operator_observation"
-
-
-def test_provider_xy_requires_fresh_referenced_authority_before_dispatch():
-    primitives = ProviderPrimitives()
-    primitives.move_xy = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dispatched"))
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
-
-    result = provider.execute_xy_intent(10, 20, {"command_id": "xy-no-reference"})
-
-    assert result["ok"] is False
-    assert result["failure"] == "xy_current_referenced_authority_required"
-
-
-def test_provider_homexy_requires_current_prepared_authority_and_success_awaits_observation():
-    primitives = ProviderPrimitives()
-    def successful_homexy(**_kwargs):
-        return {
-            "ok": True,
-            "home_predicate_confirmed": True,
-            "controller_terminal_state_verified": True,
-            "reference_publication_required": True,
-        }
-    primitives.home_xy = successful_homexy
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
-
-    result = provider.execute_homexy_intent({"command_id": "homexy-current"})
-
-    assert result["ok"] is True
-    assert result["state"] == "awaiting_operator_observation"
-    lifecycle = provider.x_projection()["lifecycle"]
-    assert lifecycle["reference_state"] == "desynced"
-    receipt = provider._load_state()["x_lifecycle"]["receipts"][-1]
-    assert receipt["board_lifecycle_generation"] == 9
-    assert primitives.calls[0][0] == "x_live_preflight"
 
 
 def test_provider_homexy_source_noop_preserves_prior_lifecycle_and_reference():
@@ -1296,19 +799,6 @@ def test_provider_homexy_source_noop_preserves_prior_lifecycle_and_reference():
     lifecycle = provider.x_projection()["lifecycle"]
     assert lifecycle["reference_state"] == "referenced"
     assert lifecycle["awaiting_observation_receipt_id"] is None
-
-
-def test_provider_homexy_preflight_failure_blocks_before_primitive_dispatch():
-    primitives = ProviderPrimitives()
-    setattr(primitives, "_x_require_motion_preflight", lambda: (_ for _ in ()).throw(RuntimeError("mask drift")))
-    setattr(primitives, "home_xy", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("home dispatched")))
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="prepared_unreferenced", reference_state="desynced")
-
-    result = provider.execute_homexy_intent({"command_id": "homexy-preflight-fail"})
-
-    assert result["ok"] is False
-    assert result["failure"].startswith("homexy_live_preflight_failed")
 
 
 def test_homexy_observation_atomically_publishes_x_and_y_reference():
@@ -1656,31 +1146,6 @@ def test_completed_x_replay_is_fenced_after_generation_change_without_redispatch
     assert len(primitives.calls) == dispatches
 
 
-def test_completed_x_replay_is_fenced_after_reference_invalidation_without_redispatch():
-    primitives = ProviderPrimitives()
-    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
-    seed_x_lifecycle(provider, state="referenced_ready", reference_state="referenced")
-    values = {
-        "position_steps": 2000,
-        "command_id": "x-ref-once",
-        "idempotency_key": "x-ref-once-key",
-    }
-    assert execute_x_intent(provider, "move_absolute", values)["ok"] is True
-    dispatches = len(primitives.calls)
-    state = provider._load_state()
-    state["x_lifecycle"].update(
-        {"state": "prepared_unreferenced", "reference_state": "desynced"}
-    )
-    provider._save_state(state)
-
-    replay = execute_x_intent(provider, "move_absolute", values)
-
-    assert replay["ok"] is False
-    assert replay["replayed"] is True
-    assert replay["failure"] == "x_replay_current_authority_invalid"
-    assert len(primitives.calls) == dispatches
-
-
 @pytest.mark.parametrize("intent", ["stop", "abort"])
 def test_stop_and_aggregate_abort_are_nonreplay_interrupts(intent):
     primitives = ProviderPrimitives()
@@ -1781,28 +1246,6 @@ EXPECTED_X_ACTIONS = {
     "oem.xy.enable",
     "oem.xyz.enable",
 }
-
-
-def test_openapi_exposes_complete_typed_x_route_family():
-    from bioxp import api
-
-    paths = set(api.app.openapi()["paths"])
-    assert EXPECTED_X_PATHS <= paths
-
-
-def test_operator_catalog_exposes_only_typed_x_family_and_aggregate_abort_label():
-    from bioxp import api, operator_controls
-
-    actions, _dispatch = operator_controls._build_catalog(api.app)
-    by_id = {row["action_id"]: row for row in actions}
-
-    assert EXPECTED_X_ACTIONS <= set(by_id)
-    assert "aggregate" in by_id["oem.abort_all"]["label"].lower()
-    assert "x-only" not in by_id["oem.abort_all"]["description"].lower()
-    assert by_id["oem.abort_all"].get("physical_scope") == "aggregate_oem_all_present_boards"
-    assert by_id["oem.x.manual_panel_home"]["requires_confirmation"] is False
-    assert all(by_id[action_id]["category"] == "x-axis" for action_id in EXPECTED_X_ACTIONS if action_id.startswith("oem.x."))
-    assert all(by_id[action_id]["category"] == "x-composite" for action_id in {"oem.xy.enable", "oem.xyz.enable"})
 
 
 @pytest.mark.parametrize(

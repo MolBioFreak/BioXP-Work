@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER_PATH = ROOT / "scripts" / "bioxp_handlerctl.py"
 INSTALLER_PATH = ROOT / "scripts" / "install_bioxp_handler_lifecycle.sh"
+EMERGENCY_PATH = ROOT / "scripts" / "bioxp_emergency_motor_kill.sh"
+RUNTIME_STORE_PATH = ROOT / "src" / "bioxp" / "runtime_audit_store.py"
+API_PATH = ROOT / "src" / "bioxp" / "api.py"
 
 spec = importlib.util.spec_from_file_location("bioxp_handlerctl", CONTROLLER_PATH)
 assert spec is not None and spec.loader is not None
@@ -25,44 +30,110 @@ def test_running_stage_detection_and_refusal():
         }
     }
     assert handlerctl.running_stages(status) == ["initialization_without_motion"]
+    details = {"ActiveState": "active", "SubState": "running"}
     with pytest.raises(RuntimeError, match="refusing lifecycle mutation"):
-        handlerctl.refuse_running(status, force=False)
-    handlerctl.refuse_running(status, force=True)
+        handlerctl.refuse_lifecycle_mutation(
+            status,
+            details,
+            listener_open=True,
+            recover_stuck=False,
+        )
+    handlerctl.refuse_lifecycle_mutation(
+        status,
+        details,
+        listener_open=True,
+        recover_stuck=True,
+    )
 
 
-def test_handoff_authorization_preflight_happens_before_recovery_stop(monkeypatch):
-    calls: list[tuple[str, ...]] = []
-
-    monkeypatch.setattr(handlerctl, "get_status", lambda required=False: {"startup": {"stages": {}}})
-
-    def fake_systemctl(*args, **kwargs):
-        calls.append(("system", *args))
-        raise RuntimeError("authorization denied")
-
-    def fake_user_systemctl(*args, **kwargs):
-        calls.append(("user", *args))
-        raise AssertionError("user service must not be touched before authorization succeeds")
-
-    monkeypatch.setattr(handlerctl, "systemctl", fake_systemctl)
-    monkeypatch.setattr(handlerctl, "user_systemctl", fake_user_systemctl)
-
-    with pytest.raises(RuntimeError, match="authorization denied"):
-        handlerctl.handoff(force=False)
-    assert calls == [("system", "reset-failed", "bioxp-api.service")]
+def test_single_owner_handoff_is_unconditionally_denied(monkeypatch):
+    monkeypatch.setattr(handlerctl, "systemctl", lambda *args, **kwargs: pytest.fail("handoff must not touch systemd"))
+    with pytest.raises(RuntimeError, match="sole runtime owner"):
+        handlerctl.handoff(force=True)
 
 
-def test_installer_policy_is_exact_unit_and_has_no_general_sudo():
+def test_controller_enforces_exact_loaded_unit_launcher_and_no_dropins(tmp_path, monkeypatch):
+    unit = tmp_path / "bioxp-api.service"
+    launcher = tmp_path / "bioxp-release-container-run"
+    receipt = tmp_path / "release-identity.json"
+    unit.write_bytes(b"unit-bytes\n")
+    launcher.write_bytes(b"launcher-bytes\n")
+    receipt.write_text(json.dumps({
+        "schema": "bioxp.release.identity.v1",
+        "status": "verified",
+        "binding": {
+            "unit_path": str(unit),
+            "launcher_path": str(launcher),
+            "unit_sha256": hashlib.sha256(unit.read_bytes()).hexdigest(),
+            "launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        },
+    }))
+    monkeypatch.setattr(handlerctl, "UNIT_PATH", unit)
+    monkeypatch.setattr(handlerctl, "LAUNCHER_PATH", launcher)
+    monkeypatch.setattr(handlerctl, "RECEIPT_PATH", receipt)
+    details = {
+        "FragmentPath": str(unit),
+        "DropInPaths": "",
+        "ExecStart": f"{{ path={launcher} ; argv[]={launcher} ; ignore_errors=no ; }}",
+    }
+    handlerctl.verify_loaded_authority(details)
+    details["DropInPaths"] = "/etc/systemd/system/bioxp-api.service.d/override.conf"
+    with pytest.raises(RuntimeError, match="forbidden DropInPaths"):
+        handlerctl.verify_loaded_authority(details)
+
+
+def test_installer_consumes_verified_exact_materialization_and_verifies_loaded_authority():
     text = INSTALLER_PATH.read_text()
+    assert 'source.get("mode") == "exact_commit_materialization"' in text
+    assert 'root == f"/opt/bioxp/releases/{commit}"' in text
+    assert "bioxp_source_manifest.py" in text
+    assert "systemctl daemon-reload" in text
+    assert "FragmentPath --value" in text
+    assert "DropInPaths --value" in text
+    assert "ExecStart --value" in text
+    assert "installed unit digest mismatch after daemon-reload" in text
+    assert "installed launcher digest mismatch after daemon-reload" in text
     assert 'action.lookup("unit") !== "bioxp-api.service"' in text
-    assert 'subject.user !== "molbiofreak"' in text
-    assert "org.freedesktop.systemd1.manage-units" in text
     assert "sudoers" not in text.lower()
     assert "NOPASSWD" not in text
-    assert '"reboot"' not in text
-    assert "systemctl reboot" not in text
-    assert "Restart=on-failure" in text
-    assert "KillMode=control-group" in text
-    assert "TimeoutStopSec=20s" in text
+
+
+def test_runtime_release_receipt_is_v5_append_only_and_readiness_gated():
+    store = RUNTIME_STORE_PATH.read_text()
+    api = API_PATH.read_text()
+    assert "SCHEMA_VERSION = 5" in store
+    assert "CREATE TABLE IF NOT EXISTS runtime_release_receipts" in store
+    assert '"runtime_release_receipts",' in store
+    for field in (
+        "systemd_invocation_id",
+        "application_pid",
+        "application_cgroup",
+        "application_start_time_ticks",
+        "configuration_sha256",
+        "oem_lock_sha256",
+        "unit_sha256",
+        "launcher_sha256",
+        "source_manifest_sha256",
+        "source_aggregate_sha256",
+        "image_id",
+        "image_inspection_receipt_sha256",
+        "declared_listener_json",
+        "observed_listener_json",
+    ):
+        assert field in store
+    assert "record_runtime_release_start" in api
+    assert "publish_runtime_release_receipt" in api
+    assert "runtime_release_start_receipt_unavailable" in api
+
+
+def test_emergency_preemption_failure_continues_to_physical_usb_stop_and_restarts_only_canonical_service():
+    text = EMERGENCY_PATH.read_text()
+    assert "preempt_api_warning=canonical_unit_stop_failed" in text
+    assert "continuing_physical_usb_stop=true" in text
+    assert text.index("preempt_api") < text.index("PYTHONPATH=src python3")
+    assert "systemctl restart bioxp-api.service" in text
+    assert "systemctl --user" not in text
+    assert "bioxp-recovery" not in text
 
 
 def test_controller_never_invokes_sudo_or_arbitrary_unit():
@@ -70,4 +141,3 @@ def test_controller_never_invokes_sudo_or_arbitrary_unit():
     assert 'UNIT = "bioxp-api.service"' in text
     assert '"sudo"' not in text
     assert "shell=True" not in text
-    assert "motion" not in handlerctl.RECOVERY_COMMAND

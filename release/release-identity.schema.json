@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioxp.local/schemas/release-identity.v1.json",
+  "title": "BioXP canonical release identity receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "release_id", "source", "image", "deployment", "binding"],
+  "properties": {
+    "schema": {"const": "bioxp.release.identity.v1"},
+    "status": {"const": "verified"},
+    "release_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree", "mode", "root", "host_path", "manifest_sha256", "aggregate_sha256"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "mode": {"const": "exact_commit_materialization"},
+        "root": {"const": "/app"},
+        "host_path": {"type": "string", "pattern": "^/opt/bioxp/releases/[0-9a-f]{40}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "aggregate_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "inspection_receipt_sha256"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "inspection_receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_id", "installed_at"],
+      "properties": {
+        "receipt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "installed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_unit", "unit_path", "unit_sha256", "launcher_path", "launcher_sha256", "configuration", "configuration_sha256", "oem_lock_path", "oem_lock_sha256"],
+      "properties": {
+        "service_unit": {"const": "bioxp-api.service"},
+        "unit_path": {"const": "/etc/systemd/system/bioxp-api.service"},
+        "unit_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "launcher_path": {"const": "/usr/local/libexec/bioxp-release-container-run"},
+        "launcher_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "configuration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "oem_lock_path": {"const": "/var/lib/bioxp-oem-authority/OEM_EVIDENCE_LOCK.json"},
+        "oem_lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["declared_listener", "database_root", "working_directory", "argv", "environment"],
+          "properties": {
+            "declared_listener": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host", "port"],
+              "properties": {"host": {"const": "0.0.0.0"}, "port": {"const": 8123}}
+            },
+            "database_root": {"const": "/app/.oem_runtime_state"},
+            "working_directory": {"const": "/app"},
+            "argv": {
+              "const": ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123"]
+            },
+            "environment": {
+              "const": {
+                "BIOXP_OEM_MACHINE_BUNDLE_LOCK": "/app/.oem_lock/OEM_EVIDENCE_LOCK.json",
+                "BIOXP_OEM_RUNTIME_ROOT": "/app/.oem_runtime_state",
+                "BIOXP_OEM_RUNTIME_STATE_ROOT": "/app/.oem_runtime_state",
+                "BIOXP_PHYSICAL_LABEL_SERIAL": "206",
+                "PYTHONPATH": "/app/src"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

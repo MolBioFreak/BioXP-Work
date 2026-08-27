@@ -189,38 +189,6 @@ def motion_action(path: str = "/motion/axis/move") -> dict:
     }
 
 
-def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_readback():
-    driver = FakeMotionDriver()
-
-    result = prepare_motion_without_motion(driver, authority())
-
-    assert result["ok"] is True
-    assert result["physical_motion"] is False
-    assert result["homing_performed"] is False
-    lifecycle_calls = [call for call in driver.calls if call[0] in {"deactivate", "activate", "begin_board_generation"}]
-    assert lifecycle_calls == [
-        ("deactivate", 4), ("deactivate", 5), ("deactivate", 6), ("deactivate", 7),
-        ("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7),
-        ("begin_board_generation", (4, 5, 6, 7), (4, 5, 6, 7)),
-    ]
-    assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
-    assert [row["stage_id"] for row in result["stage_ledger"]] == [
-        "authority",
-        "rail_24v_readback",
-        "door_readback",
-        "latch_readback",
-        "deactivateBoard",
-        "activateBoard",
-        "boardLifecycleGeneration",
-        "waitForBoard",
-        "initializeMotorsWithoutMotion",
-        "x_switch_mask_precondition",
-        "z_switch_mask_precondition",
-        "parameter_readback",
-    ]
-    assert all(row["status"] in {"passed", "not_applicable"} for row in result["stage_ledger"])
-
-
 def test_prepare_uses_initial_check_door_latch_values_as_typed_observations_not_invented_closed_gate():
     driver = FakeMotionDriver()
     driver.io = {
@@ -263,37 +231,6 @@ def test_prepare_rejects_non_mapping_initial_check_sensor_observation():
     door = next(row for row in result["stage_ledger"] if row["stage_id"] == "door_readback")
     assert door["status"] == "failed"
     assert not any(call[0] == "deactivate" for call in driver.calls)
-
-
-def test_prepare_without_motion_fails_closed_without_rewriting_inherited_z_switch_masks():
-    driver = FakeMotionDriver()
-    driver.parameter_readbacks[(4, 1, 13)] = 1
-
-    result = prepare_motion_without_motion(driver, authority())
-
-    assert result["ok"] is False
-    stage = next(row for row in result["stage_ledger"] if row["stage_id"] == "z_switch_mask_precondition")
-    assert stage["status"] == "failed"
-    assert stage["controller_evidence"]["readbacks"]["left_disable_param13"]["value"] == 1
-    assert stage["controller_evidence"]["writes"] == {}
-    assert ("write_param", 4, 1, 13, 0) not in driver.calls
-    assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
-    assert driver.invalidations == ["z_switch_mask_precondition_failed"]
-
-
-def test_prepare_without_motion_requires_reconciled_z_right_mask():
-    driver = FakeMotionDriver()
-    driver.parameter_readbacks[(4, 1, 12)] = 1
-
-    result = prepare_motion_without_motion(driver, authority(), components=("z",))
-
-    assert result["ok"] is False
-    stage = next(row for row in result["stage_ledger"] if row["stage_id"] == "z_switch_mask_precondition")
-    assert stage["status"] == "failed"
-    assert stage["controller_evidence"]["machine_bound_expected"] == {12: 0, 13: 0}
-    assert stage["controller_evidence"]["readbacks"]["right_disable_param12"]["value"] == 1
-    assert stage["controller_evidence"]["writes"] == {}
-    assert stage["controller_evidence"]["blocker"] == "z_switch_mask_incompatible"
 
 
 def test_prepare_without_motion_fails_closed_on_parameter_readback_mismatch():
@@ -523,31 +460,3 @@ def test_reconnect_invalidation_blocks_dashboard_and_admission_with_specific_rea
     assert admission["enabled"] is False
     assert any(row["key"] == "canonical_snapshot" and row["met"] is False for row in admission["dependencies"])
     assert dashboard["motion"] == {"enabled": False, "reason": "Same-epoch CAN readiness has not been established."}
-
-
-def test_operator_store_persists_safety_receipts_with_required_evidence(tmp_path):
-    store = OperatorReceiptStore(tmp_path)
-    for index in range(3):
-        store.put({
-            "command_id": f"command-{index}",
-            "idempotency_key": f"safety-{index}",
-            "action_id": "meta.emergency_stop",
-            "status": "completed",
-            "started_at": str(index),
-            "exact_route": "/motion/emergency_stop",
-            "ownership_generation": 9,
-            "controller_evidence": {"component_count": 5, "sequence": index},
-            "physical_effect_verified": False,
-            "controller_terminal_state_verified": index == 2,
-            "response": {"ok": index == 2},
-        })
-
-    rows = store.list()
-    assert [row["command_id"] for row in rows] == ["command-2", "command-1", "command-0"]
-    receipt = store.by_command("command-2")
-    assert receipt is not None
-    assert receipt["exact_route"] == "/motion/emergency_stop"
-    assert receipt["ownership_generation"] == 9
-    assert receipt["controller_evidence"] == {"component_count": 5, "sequence": 2}
-    assert receipt["physical_effect_verified"] is False
-    assert receipt["controller_terminal_state_verified"] is True

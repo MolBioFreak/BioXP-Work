@@ -743,6 +743,13 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
 
 @router.post("/motion/oem/pathing/scriptmove_execute")
 async def execute_oem_scriptmove_path(payload: OemScriptMoveExecuteRequest) -> dict[str, Any]:
+    if payload.mode == "live":
+        from .operator_controls import current_operator_dispatch_context
+        if current_operator_dispatch_context() is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "legacy_scriptmove_execute_requires_canonical_action", "canonical_action_id": "oem.z.scriptmove_to", "replacement": "/operator/v2/actions/oem.z.scriptmove_to"},
+            )
     return await _execute_oem_scriptmove_path_impl(payload.model_dump(exclude_none=True))
 
 
@@ -752,6 +759,12 @@ async def execute_oem_home_gz(req: OemHomeGZRequest) -> dict[str, Any]:
     payload = req.model_dump(exclude_none=True)
     mode = req.mode
     if mode == "live":
+        from .operator_controls import current_operator_dispatch_context
+        if current_operator_dispatch_context() is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "legacy_home_gz_requires_canonical_action", "canonical_action_id": "oem.z.home_gz", "replacement": "/operator/v2/actions/oem.z.home_gz"},
+            )
         if req.operator_ack != "OEM_HOME_GZ":
             raise HTTPException(status_code=409, detail="operator_ack OEM_HOME_GZ required")
         reason = str(req.reason or "").strip()

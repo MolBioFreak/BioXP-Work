@@ -26,7 +26,12 @@ class FakeHomeXYTester(BioXpTester):
 
     def motor_oem_go_home(self, axis, **kwargs):
         self.calls.append(("go_home", axis, kwargs))
-        return {"ok": True, "axis": axis}
+        return {
+            "ok": True,
+            "axis": axis,
+            "controller_terminal_state_verified": True,
+            "controller_home_proof_verified": True,
+        }
 
     def motor_axis_status(self, board, motor=0):
         axis = self._axis_for(board)
@@ -47,19 +52,17 @@ class FakeHomeXYTester(BioXpTester):
         return {"position": self.positions[(axis, board, motor)]}
 
 
-def test_oem_home_xy_sets_home_after_switch_confirmed():
+def test_oem_home_xy_uses_the_source_shaped_home_kernel_without_outer_rebase():
     tester = FakeHomeXYTester()
 
     result = tester.motor_oem_home_xy(timeout_s=30)
 
     assert result["ok"] is True
-    assert result["home_rebase"]["x"]["status_before_rebase"]["position"]["position"] == 1253
-    assert result["home_rebase"]["x"]["home_switch_confirmed"] is True
-    assert result["home_rebase"]["x"]["home_rebased"] is True
-    assert result["home_rebase"]["x"]["position_after_set_home"]["position"] == -1
-    assert result["home_rebase"]["y"]["home_rebased"] is True
-    assert ("set_home", "x", 0x05, 0) in tester.calls
-    assert ("set_home", "y", 0x04, 0) in tester.calls
+    assert "home_rebase" not in result
+    assert not any(call[0] == "set_home" for call in tester.calls)
+    home_calls = [call for call in tester.calls if call[0] == "go_home"]
+    assert {call[1] for call in home_calls} == {"x", "y"}
+    assert all(call[2]["require_switch_transition"] is False for call in home_calls)
 
 
 
@@ -79,7 +82,7 @@ def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
             return {"ok": True, "board": board, "param": param, "value": value}
 
         def motor_oem_go_home(self, axis, **kwargs):
-            assert kwargs["require_switch_transition"] is True
+            assert kwargs["require_switch_transition"] is False
             with calls_lock:
                 calls.append(("started", axis))
                 if len([row for row in calls if row[0] == "started"]) == 2:
@@ -87,7 +90,12 @@ def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
             assert both_started.wait(timeout=0.5), "other HomeXY task did not start concurrently"
             with calls_lock:
                 calls.append(("finished", axis))
-            return {"ok": True, "axis": axis}
+            return {
+                "ok": True,
+                "axis": axis,
+                "controller_terminal_state_verified": True,
+                "controller_home_proof_verified": True,
+            }
 
         def motor_axis_status(self, board, motor=0):
             return {"speed": {"speed": 0}, "switches": {"left_raw_active": True}}

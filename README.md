@@ -91,10 +91,15 @@ Legacy standalone 24V diagnostic:
 sudo .venv/bin/python src/bioxp/diagnostic_24v.py
 ```
 
-Typical robot-local HTTP API launch:
+The robot-local HTTP API has one owner. Do not launch `uvicorn`, a generic
+container runner, a watchdog fallback, or a user recovery unit. Install the
+immutable packet described in `release/README.md`, then control only the
+canonical unit:
 
 ```bash
-PYTHONPATH=src .venv/bin/uvicorn bioxp.api:app --host 0.0.0.0 --port 8123
+scripts/bioxp_handlerctl.py status
+scripts/bioxp_handlerctl.py start
+scripts/bioxp_handlerctl.py restart
 ```
 
 ## Documentation map

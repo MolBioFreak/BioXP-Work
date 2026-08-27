@@ -1,27 +1,52 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import fcntl
+import inspect
 import json
 import os
+import re
+import secrets
 import sqlite3
-import threading
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
-from .runtime_audit_store import RuntimeAuditDatabase
+from .runtime_audit_store import (
+    RuntimeAuditDatabase,
+    RuntimeMigrationIdentity,
+    RUNTIME_RELEASE_RECEIPTS_DDL,
+    RUNTIME_RELEASE_RECEIPTS_INDEX_DDL,
+    RUNTIME_RELEASE_RECEIPTS_TRIGGER_DDL,
+    _expected_foundation_connection,
+    assert_migration_slot,
+    ensure_schema,
+    runtime_audit_migration_identity,
+    runtime_lifecycle_lock,
+    runtime_write_coordinator,
+    verify_runtime_audit_foundation,
+)
 
 
 MAX_SERIAL206_INTERRUPT_FALLBACK_ARCHIVES = 8
 
 SERIAL206_SCHEMA_VERSION = 2
+REPORT_IDENTITY_SCHEMA_VERSION = 3
+RUNTIME_RELEASE_SCHEMA_VERSION = 4
+OPERATOR_COMMAND_PLANE_SCHEMA_VERSION = 5
 SERIAL206_BOARD4_MEMBERS = {"y": 0, "z": 1, "gripper": 2}
-_RUNTIME_PHYSICAL_SCHEMA_SHA256 = "1a6937590cbf8b12ec96faf2f8f62bb8d5560d1c3d1e24d1ff2f3599cc8a4075"
+_RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
+    2: "1a6937590cbf8b12ec96faf2f8f62bb8d5560d1c3d1e24d1ff2f3599cc8a4075",
+    3: "c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317",
+    4: "c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317",
+    5: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
+}
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
     "runtime_state_snapshots", "runtime_journal", "runtime_movement_runs", "serial206_receipts",
@@ -110,21 +135,6 @@ def _legacy_table_identity(
     rows = connection.execute(f"SELECT {projection} FROM {table} ORDER BY {order}").fetchall()
     encoded = json.dumps([list(row) for row in rows], sort_keys=False, separators=(",", ":"), default=str).encode("utf-8")
     return selected_columns, len(rows), hashlib.sha256(encoded).hexdigest()
-
-
-def _drop_unconditional_idempotency_indexes(connection: sqlite3.Connection) -> None:
-    for row in connection.execute("PRAGMA index_list(operator_commands)").fetchall():
-        if not row[1] or row[3] != "c" or row[4]:
-            continue
-        name = str(row[1])
-        columns = [
-            str(info[2])
-            for info in connection.execute(
-                "SELECT * FROM pragma_index_info(?)", (name,)
-            ).fetchall()
-        ]
-        if columns == ["idempotency_key"]:
-            connection.execute(f'DROP INDEX "{name.replace(chr(34), chr(34) * 2)}"')
 
 
 def _execute_schema_batch(connection: sqlite3.Connection, script: str) -> None:
@@ -328,6 +338,19 @@ def _rebuild_additive_operator_schema(connection: sqlite3.Connection) -> None:
     finally:
         connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
         connection.execute(f"PRAGMA foreign_keys={foreign_keys}")
+def _drop_unconditional_idempotency_indexes(connection: sqlite3.Connection) -> None:
+    for row in connection.execute("PRAGMA index_list(operator_commands)").fetchall():
+        if not row[1] or row[3] != "c" or row[4]:
+            continue
+        name = str(row[1])
+        columns = [
+            str(info[2])
+            for info in connection.execute(
+                "SELECT * FROM pragma_index_info(?)", (name,)
+            ).fetchall()
+        ]
+        if columns == ["idempotency_key"]:
+            connection.execute(f'DROP INDEX "{name.replace(chr(34), chr(34) * 2)}"')
 
 
 def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
@@ -877,7 +900,1184 @@ def _create_v2_authority_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def serial206_runtime_migration_identity() -> RuntimeMigrationIdentity:
+    ddl_source = inspect.getsource(_create_v2_authority_schema).encode("utf-8")
+    return RuntimeMigrationIdentity(
+        version=SERIAL206_SCHEMA_VERSION,
+        name="serial206_runtime_authority",
+        ddl_sha256=hashlib.sha256(ddl_source).hexdigest(),
+    )
+
+
+_REPORT_IDENTITY_TRIGGER_DDL = (
+    """
+    CREATE TRIGGER runtime_metadata_report_identity_insert_shape
+    BEFORE INSERT ON runtime_metadata
+    WHEN NEW.key IN ('database_incarnation_id','report_cursor_hmac_key')
+         AND (NEW.value='' OR (NEW.key='report_cursor_hmac_key'
+              AND (length(NEW.value)<64 OR length(NEW.value)%2<>0
+                   OR NEW.value<>lower(NEW.value)
+                   OR NEW.value GLOB '*[^0-9a-f]*')))
+    BEGIN
+        SELECT RAISE(ABORT, 'report identity metadata has invalid shape');
+    END
+    """,
+    """
+    CREATE TRIGGER runtime_metadata_report_identity_immutable_update
+    BEFORE UPDATE ON runtime_metadata
+    WHEN OLD.key IN ('database_incarnation_id','report_cursor_hmac_key')
+    BEGIN
+        SELECT RAISE(ABORT, 'report identity metadata is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER runtime_metadata_report_identity_immutable_delete
+    BEFORE DELETE ON runtime_metadata
+    WHEN OLD.key IN ('database_incarnation_id','report_cursor_hmac_key')
+    BEGIN
+        SELECT RAISE(ABORT, 'report identity metadata is immutable');
+    END
+    """,
+)
+
+
+def _apply_report_identity_metadata_v1(connection: sqlite3.Connection, now: float) -> None:
+    rows = {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute(
+            "SELECT key,value FROM runtime_metadata WHERE key IN (?,?)",
+            ("database_incarnation_id", "report_cursor_hmac_key"),
+        ).fetchall()
+    }
+    incarnation = rows.get("database_incarnation_id")
+    if incarnation is None:
+        incarnation = str(uuid.uuid4())
+        connection.execute(
+            "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?)",
+            ("database_incarnation_id", incarnation, now),
+        )
+    cursor_key = rows.get("report_cursor_hmac_key")
+    if cursor_key is None:
+        cursor_key = secrets.token_hex(32)
+        connection.execute(
+            "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?)",
+            ("report_cursor_hmac_key", cursor_key, now),
+        )
+    try:
+        canonical_incarnation = str(uuid.UUID(incarnation))
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError("database_incarnation_id is not a UUID") from exc
+    if canonical_incarnation != incarnation:
+        raise RuntimeError("database_incarnation_id is not canonical")
+    try:
+        key_bytes = bytes.fromhex(cursor_key)
+    except ValueError as exc:
+        raise RuntimeError("report_cursor_hmac_key is not canonical hex") from exc
+    if len(key_bytes) < 32 or cursor_key != cursor_key.lower() or cursor_key != key_bytes.hex():
+        raise RuntimeError("report_cursor_hmac_key must be canonical hex for at least 32 bytes")
+    for statement in _REPORT_IDENTITY_TRIGGER_DDL:
+        connection.execute(statement)
+
+
+def report_identity_migration_identity() -> RuntimeMigrationIdentity:
+    ddl_source = (
+        "\n".join(_REPORT_IDENTITY_TRIGGER_DDL)
+        + inspect.getsource(_apply_report_identity_metadata_v1)
+    ).encode("utf-8")
+    return RuntimeMigrationIdentity(
+        version=REPORT_IDENTITY_SCHEMA_VERSION,
+        name="report_identity_metadata_v1",
+        ddl_sha256=hashlib.sha256(ddl_source).hexdigest(),
+    )
+
+
+
+def _apply_runtime_release_start(connection: sqlite3.Connection) -> None:
+    connection.execute(RUNTIME_RELEASE_RECEIPTS_DDL)
+    connection.execute(RUNTIME_RELEASE_RECEIPTS_INDEX_DDL)
+    for statement in RUNTIME_RELEASE_RECEIPTS_TRIGGER_DDL:
+        connection.execute(statement)
+
+
+def runtime_release_migration_identity() -> RuntimeMigrationIdentity:
+    ddl_source = "\n".join(
+        (
+            RUNTIME_RELEASE_RECEIPTS_DDL,
+            RUNTIME_RELEASE_RECEIPTS_INDEX_DDL,
+            *RUNTIME_RELEASE_RECEIPTS_TRIGGER_DDL,
+            inspect.getsource(_apply_runtime_release_start),
+        )
+    ).encode("utf-8")
+    return RuntimeMigrationIdentity(
+        version=RUNTIME_RELEASE_SCHEMA_VERSION,
+        name="canonical_runtime_release_start",
+        ddl_sha256=hashlib.sha256(ddl_source).hexdigest(),
+    )
+
+
+_OPERATOR_COMMAND_PLANE_TABLE_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_metadata (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL
+    ) WITHOUT ROWID;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_idempotency (
+        operation_kind TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        command_id TEXT,
+        method_id TEXT,
+        response_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY(operation_kind, idempotency_key)
+    ) WITHOUT ROWID;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_methods (
+        method_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        failure_policy TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        ownership_generation INTEGER NOT NULL,
+        expanded_count INTEGER NOT NULL,
+        first_stream_sequence INTEGER,
+        last_stream_sequence INTEGER,
+        queued_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        recovery_outcome_pending INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_commands (
+        command_id TEXT PRIMARY KEY,
+        stream_sequence INTEGER NOT NULL UNIQUE,
+        method_id TEXT,
+        method_sequence INTEGER,
+        action_id TEXT NOT NULL,
+        requested_json TEXT NOT NULL,
+        effective_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        ownership_generation INTEGER NOT NULL,
+        dispatch_attempt_id TEXT,
+        dispatcher_epoch INTEGER,
+        dispatch_global_safety_epoch INTEGER,
+        dispatch_axis_safety_epoch INTEGER,
+        interrupt_id TEXT,
+        interrupt_global_safety_epoch INTEGER,
+        interrupt_axis_safety_epoch INTEGER,
+        source_noop INTEGER NOT NULL DEFAULT 0,
+        source_noop_reason TEXT,
+        controller_acknowledged INTEGER NOT NULL DEFAULT 0,
+        remote_acknowledged INTEGER NOT NULL DEFAULT 0,
+        physical_effect_verified INTEGER NOT NULL DEFAULT 0,
+        terminal_json TEXT,
+        queued_at REAL NOT NULL,
+        dispatched_at REAL,
+        finished_at REAL,
+        updated_at REAL NOT NULL,
+        FOREIGN KEY(method_id) REFERENCES operator_plane_methods(method_id)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_transitions (
+        transition_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_kind TEXT NOT NULL,
+        command_id TEXT,
+        method_id TEXT,
+        state TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_lane (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        active_command_id TEXT,
+        active_attempt_id TEXT,
+        dispatcher_epoch INTEGER NOT NULL,
+        owner_id TEXT,
+        owner_lease_until REAL,
+        updated_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_safety (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        global_epoch INTEGER NOT NULL,
+        x_epoch INTEGER NOT NULL,
+        y_epoch INTEGER NOT NULL DEFAULT 0,
+        z_epoch INTEGER NOT NULL,
+        recovery_epoch INTEGER NOT NULL,
+        recovery_version INTEGER NOT NULL,
+        recovery_hold INTEGER NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_z_home_authority (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        state TEXT NOT NULL CHECK(state IN ('invalid','valid')),
+        command_id TEXT,
+        ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK(ownership_generation>=0),
+        board_lifecycle_generation INTEGER,
+        authority_version INTEGER NOT NULL DEFAULT 0 CHECK(authority_version>=0),
+        invalidation_reason TEXT,
+        updated_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_board_authority (
+        board_id INTEGER PRIMARY KEY CHECK(board_id=5),
+        state TEXT NOT NULL CHECK(state IN ('active','faulted')),
+        active_board_epoch INTEGER,
+        state_version INTEGER NOT NULL DEFAULT 1,
+        updated_at REAL NOT NULL
+    ) WITHOUT ROWID;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_snapshots (
+        token TEXT PRIMARY KEY,
+        method_id TEXT NOT NULL,
+        watermark INTEGER NOT NULL,
+        expires_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_outbox (
+        outbox_id TEXT PRIMARY KEY,
+        command_id TEXT NOT NULL,
+        transition_sequence INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        payload_json TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_interrupt_history (
+        record_sha256 TEXT PRIMARY KEY,
+        stream TEXT NOT NULL CHECK(stream IN ('x','y','z','aggregate')),
+        interrupt_attempt_id TEXT NOT NULL,
+        receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+        imported_at REAL NOT NULL,
+        UNIQUE(stream,interrupt_attempt_id)
+    ) WITHOUT ROWID;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_command_versions (
+        version_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_id TEXT NOT NULL,
+        source_sequence INTEGER NOT NULL,
+        row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+        versioned_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_pipette_versions (
+        version_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        pipette_operation_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        source_rowid INTEGER NOT NULL,
+        row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+        versioned_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_pressure_stream_versions (
+        version_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        stream_session_id TEXT NOT NULL,
+        source_rowid INTEGER NOT NULL,
+        row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+        versioned_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_evidence_versions (
+        version_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        evidence_artifact_id TEXT NOT NULL,
+        source_rowid INTEGER NOT NULL,
+        row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+        versioned_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operator_plane_pipette_query_attestations (
+        pipette_operation_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        semantic_query_response_verified INTEGER NOT NULL CHECK(semantic_query_response_verified IN (0,1)),
+        observed_at REAL NOT NULL,
+        PRIMARY KEY(pipette_operation_id,semantic_query_response_verified),
+        FOREIGN KEY(pipette_operation_id) REFERENCES pipette_operations(pipette_operation_id),
+        FOREIGN KEY(command_id) REFERENCES operator_commands(command_id)
+    ) WITHOUT ROWID;
+    """,
+)
+
+_OPERATOR_COMMAND_PLANE_INDEX_DDL = (
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_commands_ready_idx
+        ON operator_plane_commands(status, stream_sequence);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_commands_method_idx
+        ON operator_plane_commands(method_id, method_sequence);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_command_versions_lookup_idx
+        ON operator_plane_command_versions(command_id, version_sequence DESC);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_pipette_versions_lookup_idx
+        ON operator_plane_pipette_versions(pipette_operation_id, version_sequence DESC);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_pressure_stream_versions_lookup_idx
+        ON operator_plane_pressure_stream_versions(stream_session_id, version_sequence DESC);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS operator_plane_evidence_versions_lookup_idx
+        ON operator_plane_evidence_versions(evidence_artifact_id, version_sequence DESC);
+    """,
+)
+
+_OPERATOR_COMMAND_PLANE_TRIGGER_DDL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_transitions_no_delete
+    BEFORE DELETE ON operator_plane_transitions
+    BEGIN SELECT RAISE(ABORT, 'operator transitions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_transitions_no_update
+    BEFORE UPDATE ON operator_plane_transitions
+    BEGIN SELECT RAISE(ABORT, 'operator transitions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_commands_no_terminal_delete
+    BEFORE DELETE ON operator_plane_commands
+    WHEN OLD.status IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')
+    BEGIN SELECT RAISE(ABORT, 'terminal operator commands are immutable'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_methods_no_terminal_delete
+    BEFORE DELETE ON operator_plane_methods
+    WHEN OLD.status IN ('completed','failed','cancelled','stopped','aborted','interrupted')
+    BEGIN SELECT RAISE(ABORT, 'terminal operator methods are immutable'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_command_versions_insert
+    AFTER INSERT ON operator_commands
+    BEGIN
+        INSERT INTO operator_plane_command_versions(command_id,source_sequence,row_json,deleted,versioned_at)
+        VALUES(NEW.command_id,NEW.sequence,json_object(
+            'sequence',NEW.sequence,'command_id',NEW.command_id,'idempotency_key',NEW.idempotency_key,
+            'operation',NEW.operation,'command_kind',NEW.command_kind,'entrypoint_id',NEW.entrypoint_id,
+            'caller_class',NEW.caller_class,'control_class',NEW.control_class,'action_id',NEW.action_id,
+            'status',NEW.status,'outcome',NEW.outcome,'failure_code',NEW.failure_code,
+            'ownership_generation',NEW.ownership_generation,'connection_generation',NEW.connection_generation,
+            'started_at',NEW.started_at,'admitted_at',NEW.admitted_at,'dispatched_at',NEW.dispatched_at,
+            'finished_at',NEW.finished_at,'duration_ms',NEW.duration_ms,'delivery_verified',NEW.delivery_verified,
+            'controller_acknowledged',NEW.controller_acknowledged,'completion_verified',NEW.completion_verified,
+            'hardware_precondition_verified',NEW.hardware_precondition_verified,
+            'hardware_postcondition_verified',NEW.hardware_postcondition_verified,
+            'physical_effect_verified',NEW.physical_effect_verified,'evidence_state',NEW.evidence_state,
+            'requested_inputs_json',NEW.requested_inputs_json,'effective_inputs_json',NEW.effective_inputs_json,
+            'source_identity_json',NEW.source_identity_json,'updated_at',NEW.updated_at,
+            'semantic_query_response_verified',COALESCE((SELECT MAX(semantic_query_response_verified) FROM operator_plane_pipette_query_attestations WHERE command_id=NEW.command_id),0)
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_command_versions_update
+    AFTER UPDATE ON operator_commands
+    BEGIN
+        INSERT INTO operator_plane_command_versions(command_id,source_sequence,row_json,deleted,versioned_at)
+        VALUES(NEW.command_id,NEW.sequence,json_object(
+            'sequence',NEW.sequence,'command_id',NEW.command_id,'idempotency_key',NEW.idempotency_key,
+            'operation',NEW.operation,'command_kind',NEW.command_kind,'entrypoint_id',NEW.entrypoint_id,
+            'caller_class',NEW.caller_class,'control_class',NEW.control_class,'action_id',NEW.action_id,
+            'status',NEW.status,'outcome',NEW.outcome,'failure_code',NEW.failure_code,
+            'ownership_generation',NEW.ownership_generation,'connection_generation',NEW.connection_generation,
+            'started_at',NEW.started_at,'admitted_at',NEW.admitted_at,'dispatched_at',NEW.dispatched_at,
+            'finished_at',NEW.finished_at,'duration_ms',NEW.duration_ms,'delivery_verified',NEW.delivery_verified,
+            'controller_acknowledged',NEW.controller_acknowledged,'completion_verified',NEW.completion_verified,
+            'hardware_precondition_verified',NEW.hardware_precondition_verified,
+            'hardware_postcondition_verified',NEW.hardware_postcondition_verified,
+            'physical_effect_verified',NEW.physical_effect_verified,'evidence_state',NEW.evidence_state,
+            'requested_inputs_json',NEW.requested_inputs_json,'effective_inputs_json',NEW.effective_inputs_json,
+            'source_identity_json',NEW.source_identity_json,'updated_at',NEW.updated_at,
+            'semantic_query_response_verified',COALESCE((SELECT MAX(semantic_query_response_verified) FROM operator_plane_pipette_query_attestations WHERE command_id=NEW.command_id),0)
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_versions_insert
+    AFTER INSERT ON pipette_operations
+    BEGIN
+        INSERT INTO operator_plane_pipette_versions(pipette_operation_id,command_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.pipette_operation_id,NEW.command_id,NEW.rowid,json_object(
+            'pipette_operation_id',NEW.pipette_operation_id,'command_id',NEW.command_id,'operation',NEW.operation,
+            'entrypoint_id',NEW.entrypoint_id,'caller_class',NEW.caller_class,'control_class',NEW.control_class,
+            'action_id',NEW.action_id,'status',NEW.status,'outcome',NEW.outcome,'failure_code',NEW.failure_code,
+            'ownership_generation',NEW.ownership_generation,'connection_generation',NEW.connection_generation,
+            'protocol_job_id',NEW.protocol_job_id,'protocol_action_id',NEW.protocol_action_id,
+            'lifecycle_stage_id',NEW.lifecycle_stage_id,'lifecycle_attempt_id',NEW.lifecycle_attempt_id,
+            'callback_session_id',NEW.callback_session_id,
+            'delivery_verified',NEW.delivery_verified,'controller_acknowledged',NEW.controller_acknowledged,
+            'completion_verified',NEW.completion_verified,'hardware_precondition_verified',NEW.hardware_precondition_verified,
+            'hardware_postcondition_verified',NEW.hardware_postcondition_verified,'dispatched_at',NEW.dispatched_at,
+            'finished_at',NEW.finished_at,
+            'physical_effect_verified',NEW.physical_effect_verified,'evidence_state',NEW.evidence_state,
+            'requested_inputs_json',NEW.requested_inputs_json,'effective_inputs_json',NEW.effective_inputs_json,
+            'source_identity_json',NEW.source_identity_json,'updated_at',NEW.updated_at,
+            'semantic_query_response_verified',COALESCE((SELECT MAX(semantic_query_response_verified) FROM operator_plane_pipette_query_attestations WHERE pipette_operation_id=NEW.pipette_operation_id),0)
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_versions_update
+    AFTER UPDATE ON pipette_operations
+    BEGIN
+        INSERT INTO operator_plane_pipette_versions(pipette_operation_id,command_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.pipette_operation_id,NEW.command_id,NEW.rowid,json_object(
+            'pipette_operation_id',NEW.pipette_operation_id,'command_id',NEW.command_id,'operation',NEW.operation,
+            'entrypoint_id',NEW.entrypoint_id,'caller_class',NEW.caller_class,'control_class',NEW.control_class,
+            'action_id',NEW.action_id,'status',NEW.status,'outcome',NEW.outcome,'failure_code',NEW.failure_code,
+            'ownership_generation',NEW.ownership_generation,'connection_generation',NEW.connection_generation,
+            'protocol_job_id',NEW.protocol_job_id,'protocol_action_id',NEW.protocol_action_id,
+            'lifecycle_stage_id',NEW.lifecycle_stage_id,'lifecycle_attempt_id',NEW.lifecycle_attempt_id,
+            'callback_session_id',NEW.callback_session_id,
+            'delivery_verified',NEW.delivery_verified,'controller_acknowledged',NEW.controller_acknowledged,
+            'completion_verified',NEW.completion_verified,'hardware_precondition_verified',NEW.hardware_precondition_verified,
+            'hardware_postcondition_verified',NEW.hardware_postcondition_verified,'dispatched_at',NEW.dispatched_at,
+            'finished_at',NEW.finished_at,
+            'physical_effect_verified',NEW.physical_effect_verified,'evidence_state',NEW.evidence_state,
+            'requested_inputs_json',NEW.requested_inputs_json,'effective_inputs_json',NEW.effective_inputs_json,
+            'source_identity_json',NEW.source_identity_json,'updated_at',NEW.updated_at,
+            'semantic_query_response_verified',COALESCE((SELECT MAX(semantic_query_response_verified) FROM operator_plane_pipette_query_attestations WHERE pipette_operation_id=NEW.pipette_operation_id),0)
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pressure_stream_versions_insert
+    AFTER INSERT ON pipette_pressure_streams
+    BEGIN
+        INSERT INTO operator_plane_pressure_stream_versions(stream_session_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.stream_session_id,NEW.rowid,json_object(
+            'stream_session_id',NEW.stream_session_id,'command_id',NEW.command_id,
+            'pipette_operation_id',NEW.pipette_operation_id,'channels_json',NEW.channels_json,
+            'sample_period_ms',NEW.sample_period_ms,'started_at',NEW.started_at,'stopped_at',NEW.stopped_at,
+            'source_generation',NEW.source_generation,'reader_generation',NEW.reader_generation,
+            'offset_identity',NEW.offset_identity,'terminal_state',NEW.terminal_state,'loss_count',NEW.loss_count
+        ),0,NEW.started_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pressure_stream_versions_update
+    AFTER UPDATE ON pipette_pressure_streams
+    BEGIN
+        INSERT INTO operator_plane_pressure_stream_versions(stream_session_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.stream_session_id,NEW.rowid,json_object(
+            'stream_session_id',NEW.stream_session_id,'command_id',NEW.command_id,
+            'pipette_operation_id',NEW.pipette_operation_id,'channels_json',NEW.channels_json,
+            'sample_period_ms',NEW.sample_period_ms,'started_at',NEW.started_at,'stopped_at',NEW.stopped_at,
+            'source_generation',NEW.source_generation,'reader_generation',NEW.reader_generation,
+            'offset_identity',NEW.offset_identity,'terminal_state',NEW.terminal_state,'loss_count',NEW.loss_count
+        ),0,CAST(strftime('%s','now') AS REAL));
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_versions_insert
+    AFTER INSERT ON runtime_evidence_objects
+    BEGIN
+        INSERT INTO operator_plane_evidence_versions(evidence_artifact_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.evidence_artifact_id,NEW.rowid,json_object(
+            'evidence_artifact_id',NEW.evidence_artifact_id,'command_id',NEW.command_id,
+            'pipette_operation_id',NEW.pipette_operation_id,'original_relpath',NEW.original_relpath,
+            'active_relpath',NEW.active_relpath,'sha256',NEW.sha256,'byte_count',NEW.byte_count,
+            'created_at',NEW.created_at,'retention_deadline',NEW.retention_deadline,'legal_hold',NEW.legal_hold,
+            'expiry_state',NEW.expiry_state,'expiry_receipt_id',NEW.expiry_receipt_id,'updated_at',NEW.updated_at
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_versions_update
+    AFTER UPDATE ON runtime_evidence_objects
+    BEGIN
+        INSERT INTO operator_plane_evidence_versions(evidence_artifact_id,source_rowid,row_json,deleted,versioned_at)
+        VALUES(NEW.evidence_artifact_id,NEW.rowid,json_object(
+            'evidence_artifact_id',NEW.evidence_artifact_id,'command_id',NEW.command_id,
+            'pipette_operation_id',NEW.pipette_operation_id,'original_relpath',NEW.original_relpath,
+            'active_relpath',NEW.active_relpath,'sha256',NEW.sha256,'byte_count',NEW.byte_count,
+            'created_at',NEW.created_at,'retention_deadline',NEW.retention_deadline,'legal_hold',NEW.legal_hold,
+            'expiry_state',NEW.expiry_state,'expiry_receipt_id',NEW.expiry_receipt_id,'updated_at',NEW.updated_at
+        ),0,NEW.updated_at);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_query_attestations_no_update
+    BEFORE UPDATE ON operator_plane_pipette_query_attestations
+    BEGIN SELECT RAISE(ABORT, 'pipette semantic-query attestations are immutable'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_query_attestations_no_delete
+    BEFORE DELETE ON operator_plane_pipette_query_attestations
+    BEGIN SELECT RAISE(ABORT, 'pipette semantic-query attestations are immutable'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_command_versions_no_update
+    BEFORE UPDATE ON operator_plane_command_versions
+    BEGIN SELECT RAISE(ABORT, 'operator command versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_command_versions_no_delete
+    BEFORE DELETE ON operator_plane_command_versions
+    BEGIN SELECT RAISE(ABORT, 'operator command versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_versions_no_update
+    BEFORE UPDATE ON operator_plane_pipette_versions
+    BEGIN SELECT RAISE(ABORT, 'pipette operation versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pipette_versions_no_delete
+    BEFORE DELETE ON operator_plane_pipette_versions
+    BEGIN SELECT RAISE(ABORT, 'pipette operation versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_commands_history_source_no_delete
+    BEFORE DELETE ON operator_commands
+    BEGIN SELECT RAISE(ABORT, 'operator command history sources cannot be deleted'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS pipette_operations_history_source_no_delete
+    BEFORE DELETE ON pipette_operations
+    BEGIN SELECT RAISE(ABORT, 'pipette operation history sources cannot be deleted'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pressure_stream_versions_no_update
+    BEFORE UPDATE ON operator_plane_pressure_stream_versions
+    BEGIN SELECT RAISE(ABORT, 'pressure stream versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_pressure_stream_versions_no_delete
+    BEFORE DELETE ON operator_plane_pressure_stream_versions
+    BEGIN SELECT RAISE(ABORT, 'pressure stream versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_versions_no_update
+    BEFORE UPDATE ON operator_plane_evidence_versions
+    BEGIN SELECT RAISE(ABORT, 'evidence versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_versions_no_delete
+    BEFORE DELETE ON operator_plane_evidence_versions
+    BEGIN SELECT RAISE(ABORT, 'evidence versions are append-only'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS pipette_pressure_streams_history_source_no_delete
+    BEFORE DELETE ON pipette_pressure_streams
+    BEGIN SELECT RAISE(ABORT, 'pressure stream history sources cannot be deleted'); END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS runtime_evidence_objects_history_source_no_delete
+    BEFORE DELETE ON runtime_evidence_objects
+    BEGIN SELECT RAISE(ABORT, 'evidence history sources cannot be deleted'); END;
+    """,
+)
+
+
+def _apply_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> None:
+    for statement in (*_OPERATOR_COMMAND_PLANE_TABLE_DDL, *_OPERATOR_COMMAND_PLANE_INDEX_DDL):
+        connection.execute(statement)
+
+    command_fields = (
+        "sequence", "command_id", "idempotency_key", "operation", "command_kind", "entrypoint_id",
+        "caller_class", "control_class", "action_id", "status", "outcome", "failure_code",
+        "ownership_generation", "connection_generation", "started_at", "admitted_at", "dispatched_at",
+        "finished_at", "duration_ms", "delivery_verified", "controller_acknowledged", "completion_verified",
+        "hardware_precondition_verified", "hardware_postcondition_verified", "physical_effect_verified",
+        "evidence_state", "requested_inputs_json", "effective_inputs_json", "source_identity_json", "updated_at",
+    )
+    pipette_fields = (
+        "pipette_operation_id", "command_id", "operation", "entrypoint_id", "caller_class", "control_class",
+        "action_id", "status", "outcome", "failure_code", "ownership_generation", "connection_generation",
+        "protocol_job_id", "protocol_action_id", "lifecycle_stage_id", "lifecycle_attempt_id", "callback_session_id",
+        "delivery_verified", "controller_acknowledged", "completion_verified", "hardware_precondition_verified",
+        "hardware_postcondition_verified", "physical_effect_verified", "evidence_state", "dispatched_at",
+        "finished_at", "requested_inputs_json", "effective_inputs_json", "source_identity_json", "updated_at",
+    )
+    pressure_fields = (
+        "stream_session_id", "command_id", "pipette_operation_id", "channels_json", "sample_period_ms",
+        "started_at", "stopped_at", "source_generation", "reader_generation", "offset_identity",
+        "terminal_state", "loss_count",
+    )
+    evidence_fields = (
+        "evidence_artifact_id", "command_id", "pipette_operation_id", "original_relpath", "active_relpath",
+        "sha256", "byte_count", "created_at", "retention_deadline", "legal_hold", "expiry_state",
+        "expiry_receipt_id", "updated_at",
+    )
+
+    command_cursor = connection.execute(
+        f"SELECT {','.join(command_fields)} FROM operator_commands ORDER BY sequence,command_id"
+    )
+    for values in command_cursor.fetchall():
+        row = {str(description[0]): values[index] for index, description in enumerate(command_cursor.description)}
+        if connection.execute(
+            "SELECT 1 FROM operator_plane_command_versions WHERE command_id=? LIMIT 1",
+            (str(row["command_id"]),),
+        ).fetchone() is not None:
+            continue
+        semantic = connection.execute(
+            "SELECT COALESCE(MAX(semantic_query_response_verified),0) FROM operator_plane_pipette_query_attestations WHERE command_id=?",
+            (str(row["command_id"]),),
+        ).fetchone()[0]
+        payload = {field: row[field] for field in command_fields}
+        payload["semantic_query_response_verified"] = int(semantic)
+        connection.execute(
+            "INSERT INTO operator_plane_command_versions(command_id,source_sequence,row_json,deleted,versioned_at) VALUES(?,?,?,?,?)",
+            (
+                str(row["command_id"]), int(row["sequence"]),
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False),
+                0, float(row["updated_at"]),
+            ),
+        )
+
+    pipette_cursor = connection.execute(
+        f"SELECT rowid AS source_rowid,{','.join(pipette_fields)} FROM pipette_operations ORDER BY pipette_operation_id,command_id"
+    )
+    for values in pipette_cursor.fetchall():
+        row = {str(description[0]): values[index] for index, description in enumerate(pipette_cursor.description)}
+        if connection.execute(
+            "SELECT 1 FROM operator_plane_pipette_versions WHERE pipette_operation_id=? LIMIT 1",
+            (str(row["pipette_operation_id"]),),
+        ).fetchone() is not None:
+            continue
+        semantic = connection.execute(
+            "SELECT COALESCE(MAX(semantic_query_response_verified),0) FROM operator_plane_pipette_query_attestations WHERE pipette_operation_id=?",
+            (str(row["pipette_operation_id"]),),
+        ).fetchone()[0]
+        payload = {field: row[field] for field in pipette_fields}
+        payload["semantic_query_response_verified"] = int(semantic)
+        connection.execute(
+            "INSERT INTO operator_plane_pipette_versions(pipette_operation_id,command_id,source_rowid,row_json,deleted,versioned_at) VALUES(?,?,?,?,?,?)",
+            (
+                str(row["pipette_operation_id"]), str(row["command_id"]), int(row["source_rowid"]),
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False),
+                0, float(row["updated_at"]),
+            ),
+        )
+
+    pressure_cursor = connection.execute(
+        f"SELECT rowid AS source_rowid,{','.join(pressure_fields)} FROM pipette_pressure_streams ORDER BY stream_session_id"
+    )
+    for values in pressure_cursor.fetchall():
+        row = {str(description[0]): values[index] for index, description in enumerate(pressure_cursor.description)}
+        if connection.execute(
+            "SELECT 1 FROM operator_plane_pressure_stream_versions WHERE stream_session_id=? LIMIT 1",
+            (str(row["stream_session_id"]),),
+        ).fetchone() is not None:
+            continue
+        payload = {field: row[field] for field in pressure_fields}
+        connection.execute(
+            "INSERT INTO operator_plane_pressure_stream_versions(stream_session_id,source_rowid,row_json,deleted,versioned_at) VALUES(?,?,?,?,?)",
+            (
+                str(row["stream_session_id"]), int(row["source_rowid"]),
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False), 0,
+                float(row["stopped_at"] if row["stopped_at"] is not None else row["started_at"]),
+            ),
+        )
+
+    evidence_cursor = connection.execute(
+        f"SELECT rowid AS source_rowid,{','.join(evidence_fields)} FROM runtime_evidence_objects ORDER BY evidence_artifact_id"
+    )
+    for values in evidence_cursor.fetchall():
+        row = {str(description[0]): values[index] for index, description in enumerate(evidence_cursor.description)}
+        if connection.execute(
+            "SELECT 1 FROM operator_plane_evidence_versions WHERE evidence_artifact_id=? LIMIT 1",
+            (str(row["evidence_artifact_id"]),),
+        ).fetchone() is not None:
+            continue
+        payload = {field: row[field] for field in evidence_fields}
+        connection.execute(
+            "INSERT INTO operator_plane_evidence_versions(evidence_artifact_id,source_rowid,row_json,deleted,versioned_at) VALUES(?,?,?,?,?)",
+            (
+                str(row["evidence_artifact_id"]), int(row["source_rowid"]),
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False),
+                0, float(row["updated_at"]),
+            ),
+        )
+
+    for statement in _OPERATOR_COMMAND_PLANE_TRIGGER_DDL:
+        connection.execute(statement)
+    now = time.time()
+    connection.execute(
+        "INSERT OR IGNORE INTO operator_plane_lane(singleton,dispatcher_epoch,updated_at) VALUES(1,1,?)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO operator_plane_safety(singleton,global_epoch,x_epoch,y_epoch,z_epoch,recovery_epoch,recovery_version,recovery_hold,updated_at) VALUES(1,0,0,0,0,0,1,0,?)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO operator_plane_z_home_authority(singleton,state,updated_at) VALUES(1,'invalid',?)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO operator_plane_board_authority(board_id,state,active_board_epoch,updated_at) VALUES(5,'faulted',NULL,?)",
+        (now,),
+    )
+
+
+def operator_command_plane_migration_identity() -> RuntimeMigrationIdentity:
+    ddl_source = "\n".join(
+        (
+            *_OPERATOR_COMMAND_PLANE_TABLE_DDL,
+            *_OPERATOR_COMMAND_PLANE_INDEX_DDL,
+            *_OPERATOR_COMMAND_PLANE_TRIGGER_DDL,
+            inspect.getsource(_apply_operator_command_plane_schema_v1),
+        )
+    ).encode("utf-8")
+    return RuntimeMigrationIdentity(
+        version=OPERATOR_COMMAND_PLANE_SCHEMA_VERSION,
+        name="operator_command_plane_schema_v1",
+        ddl_sha256=hashlib.sha256(ddl_source).hexdigest(),
+    )
+
+
+def normalize_sql_definition(value: str | None) -> str:
+    """Normalize SQLite syntax while preserving every quoted literal byte."""
+    text = "" if value is None else str(value).strip()
+    if text.endswith(";"):
+        text = text[:-1]
+    output: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote is not None:
+            output.append(character)
+            if quote == "]":
+                if character == "]":
+                    quote = None
+            elif character == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 1
+                    output.append(text[index])
+                else:
+                    quote = None
+        elif character in {"'", '"', "`"}:
+            quote = character
+            output.append(character)
+        elif character == "[":
+            quote = "]"
+            output.append(character)
+        elif not character.isspace():
+            output.append(character.upper())
+        index += 1
+    return "".join(output)
+
+
+_OPERATOR_COMMAND_PLANE_TABLE_NAMES = (
+    "operator_plane_metadata",
+    "operator_plane_idempotency",
+    "operator_plane_methods",
+    "operator_plane_commands",
+    "operator_plane_transitions",
+    "operator_plane_lane",
+    "operator_plane_safety",
+    "operator_plane_z_home_authority",
+    "operator_plane_board_authority",
+    "operator_plane_snapshots",
+    "operator_plane_outbox",
+    "operator_plane_interrupt_history",
+    "operator_plane_command_versions",
+    "operator_plane_pipette_versions",
+    "operator_plane_pressure_stream_versions",
+    "operator_plane_evidence_versions",
+    "operator_plane_pipette_query_attestations",
+)
+_OPERATOR_COMMAND_PLANE_INDEX_NAMES = (
+    "operator_plane_commands_ready_idx",
+    "operator_plane_commands_method_idx",
+    "operator_plane_command_versions_lookup_idx",
+    "operator_plane_pipette_versions_lookup_idx",
+    "operator_plane_pressure_stream_versions_lookup_idx",
+    "operator_plane_evidence_versions_lookup_idx",
+)
+_OPERATOR_COMMAND_PLANE_TRIGGER_NAMES = (
+    "operator_plane_transitions_no_delete",
+    "operator_plane_transitions_no_update",
+    "operator_plane_commands_no_terminal_delete",
+    "operator_plane_methods_no_terminal_delete",
+    "operator_plane_command_versions_insert",
+    "operator_plane_command_versions_update",
+    "operator_plane_pipette_versions_insert",
+    "operator_plane_pipette_versions_update",
+    "operator_plane_pressure_stream_versions_insert",
+    "operator_plane_pressure_stream_versions_update",
+    "operator_plane_evidence_versions_insert",
+    "operator_plane_evidence_versions_update",
+    "operator_plane_pipette_query_attestations_no_update",
+    "operator_plane_pipette_query_attestations_no_delete",
+    "operator_plane_command_versions_no_update",
+    "operator_plane_command_versions_no_delete",
+    "operator_plane_pipette_versions_no_update",
+    "operator_plane_pipette_versions_no_delete",
+    "operator_commands_history_source_no_delete",
+    "pipette_operations_history_source_no_delete",
+    "operator_plane_pressure_stream_versions_no_update",
+    "operator_plane_pressure_stream_versions_no_delete",
+    "operator_plane_evidence_versions_no_update",
+    "operator_plane_evidence_versions_no_delete",
+    "pipette_pressure_streams_history_source_no_delete",
+    "runtime_evidence_objects_history_source_no_delete",
+)
+_OPERATOR_COMMAND_PLANE_EXPECTED_COLUMNS = {
+    "operator_plane_metadata": (
+        ("key", "TEXT", 1, 1), ("value", "TEXT", 1, 0), ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_idempotency": (
+        ("operation_kind", "TEXT", 1, 1), ("idempotency_key", "TEXT", 1, 2),
+        ("fingerprint", "TEXT", 1, 0), ("command_id", "TEXT", 0, 0),
+        ("method_id", "TEXT", 0, 0), ("response_json", "TEXT", 1, 0),
+        ("created_at", "REAL", 1, 0),
+    ),
+    "operator_plane_methods": (
+        ("method_id", "TEXT", 0, 1), ("name", "TEXT", 1, 0),
+        ("source_json", "TEXT", 1, 0), ("digest", "TEXT", 1, 0),
+        ("failure_policy", "TEXT", 1, 0), ("status", "TEXT", 1, 0),
+        ("version", "INTEGER", 1, 0), ("ownership_generation", "INTEGER", 1, 0),
+        ("expanded_count", "INTEGER", 1, 0), ("first_stream_sequence", "INTEGER", 0, 0),
+        ("last_stream_sequence", "INTEGER", 0, 0), ("queued_at", "REAL", 1, 0),
+        ("updated_at", "REAL", 1, 0), ("recovery_outcome_pending", "INTEGER", 1, 0),
+    ),
+    "operator_plane_commands": (
+        ("command_id", "TEXT", 0, 1), ("stream_sequence", "INTEGER", 1, 0),
+        ("method_id", "TEXT", 0, 0), ("method_sequence", "INTEGER", 0, 0),
+        ("action_id", "TEXT", 1, 0), ("requested_json", "TEXT", 1, 0),
+        ("effective_json", "TEXT", 1, 0), ("status", "TEXT", 1, 0),
+        ("version", "INTEGER", 1, 0), ("ownership_generation", "INTEGER", 1, 0),
+        ("dispatch_attempt_id", "TEXT", 0, 0), ("dispatcher_epoch", "INTEGER", 0, 0),
+        ("dispatch_global_safety_epoch", "INTEGER", 0, 0),
+        ("dispatch_axis_safety_epoch", "INTEGER", 0, 0), ("interrupt_id", "TEXT", 0, 0),
+        ("interrupt_global_safety_epoch", "INTEGER", 0, 0),
+        ("interrupt_axis_safety_epoch", "INTEGER", 0, 0), ("source_noop", "INTEGER", 1, 0),
+        ("source_noop_reason", "TEXT", 0, 0), ("controller_acknowledged", "INTEGER", 1, 0),
+        ("remote_acknowledged", "INTEGER", 1, 0), ("physical_effect_verified", "INTEGER", 1, 0),
+        ("terminal_json", "TEXT", 0, 0), ("queued_at", "REAL", 1, 0),
+        ("dispatched_at", "REAL", 0, 0), ("finished_at", "REAL", 0, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_transitions": (
+        ("transition_sequence", "INTEGER", 0, 1), ("event_kind", "TEXT", 1, 0),
+        ("command_id", "TEXT", 0, 0), ("method_id", "TEXT", 0, 0),
+        ("state", "TEXT", 1, 0), ("payload_json", "TEXT", 1, 0),
+        ("created_at", "REAL", 1, 0),
+    ),
+    "operator_plane_lane": (
+        ("singleton", "INTEGER", 0, 1), ("active_command_id", "TEXT", 0, 0),
+        ("active_attempt_id", "TEXT", 0, 0), ("dispatcher_epoch", "INTEGER", 1, 0),
+        ("owner_id", "TEXT", 0, 0), ("owner_lease_until", "REAL", 0, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_safety": (
+        ("singleton", "INTEGER", 0, 1), ("global_epoch", "INTEGER", 1, 0),
+        ("x_epoch", "INTEGER", 1, 0), ("y_epoch", "INTEGER", 1, 0),
+        ("z_epoch", "INTEGER", 1, 0), ("recovery_epoch", "INTEGER", 1, 0),
+        ("recovery_version", "INTEGER", 1, 0), ("recovery_hold", "INTEGER", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_z_home_authority": (
+        ("singleton", "INTEGER", 0, 1), ("state", "TEXT", 1, 0),
+        ("command_id", "TEXT", 0, 0), ("ownership_generation", "INTEGER", 1, 0),
+        ("board_lifecycle_generation", "INTEGER", 0, 0), ("authority_version", "INTEGER", 1, 0),
+        ("invalidation_reason", "TEXT", 0, 0), ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_board_authority": (
+        ("board_id", "INTEGER", 1, 1), ("state", "TEXT", 1, 0),
+        ("active_board_epoch", "INTEGER", 0, 0), ("state_version", "INTEGER", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_snapshots": (
+        ("token", "TEXT", 0, 1), ("method_id", "TEXT", 1, 0),
+        ("watermark", "INTEGER", 1, 0), ("expires_at", "REAL", 1, 0),
+    ),
+    "operator_plane_outbox": (
+        ("outbox_id", "TEXT", 0, 1), ("command_id", "TEXT", 1, 0),
+        ("transition_sequence", "INTEGER", 1, 0), ("state", "TEXT", 1, 0),
+        ("payload_json", "TEXT", 0, 0), ("attempts", "INTEGER", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "operator_plane_interrupt_history": (
+        ("record_sha256", "TEXT", 1, 1), ("stream", "TEXT", 1, 0),
+        ("interrupt_attempt_id", "TEXT", 1, 0), ("receipt_json", "TEXT", 1, 0),
+        ("imported_at", "REAL", 1, 0),
+    ),
+    "operator_plane_command_versions": (
+        ("version_sequence", "INTEGER", 0, 1), ("command_id", "TEXT", 1, 0),
+        ("source_sequence", "INTEGER", 1, 0), ("row_json", "TEXT", 1, 0),
+        ("deleted", "INTEGER", 1, 0), ("versioned_at", "REAL", 1, 0),
+    ),
+    "operator_plane_pipette_versions": (
+        ("version_sequence", "INTEGER", 0, 1), ("pipette_operation_id", "TEXT", 1, 0),
+        ("command_id", "TEXT", 1, 0), ("source_rowid", "INTEGER", 1, 0),
+        ("row_json", "TEXT", 1, 0),
+        ("deleted", "INTEGER", 1, 0), ("versioned_at", "REAL", 1, 0),
+    ),
+    "operator_plane_pressure_stream_versions": (
+        ("version_sequence", "INTEGER", 0, 1), ("stream_session_id", "TEXT", 1, 0),
+        ("source_rowid", "INTEGER", 1, 0), ("row_json", "TEXT", 1, 0),
+        ("deleted", "INTEGER", 1, 0), ("versioned_at", "REAL", 1, 0),
+    ),
+    "operator_plane_evidence_versions": (
+        ("version_sequence", "INTEGER", 0, 1), ("evidence_artifact_id", "TEXT", 1, 0),
+        ("source_rowid", "INTEGER", 1, 0), ("row_json", "TEXT", 1, 0),
+        ("deleted", "INTEGER", 1, 0), ("versioned_at", "REAL", 1, 0),
+    ),
+    "operator_plane_pipette_query_attestations": (
+        ("pipette_operation_id", "TEXT", 1, 1),
+        ("command_id", "TEXT", 1, 0),
+        ("semantic_query_response_verified", "INTEGER", 1, 2),
+        ("observed_at", "REAL", 1, 0),
+    ),
+}
+
+def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> None:
+    def stored_definition(source: str) -> str:
+        return normalize_sql_definition(source).replace("IFNOTEXISTS", "", 1)
+
+    expected_sql = {
+        **{
+            name: ("table", stored_definition(statement))
+            for name, statement in zip(_OPERATOR_COMMAND_PLANE_TABLE_NAMES, _OPERATOR_COMMAND_PLANE_TABLE_DDL, strict=True)
+        },
+        **{
+            name: ("index", stored_definition(statement))
+            for name, statement in zip(_OPERATOR_COMMAND_PLANE_INDEX_NAMES, _OPERATOR_COMMAND_PLANE_INDEX_DDL, strict=True)
+        },
+        **{
+            name: ("trigger", stored_definition(statement))
+            for name, statement in zip(_OPERATOR_COMMAND_PLANE_TRIGGER_NAMES, _OPERATOR_COMMAND_PLANE_TRIGGER_DDL, strict=True)
+        },
+    }
+    actual_rows = connection.execute(
+        "SELECT type,name,sql FROM sqlite_master WHERE name IN (%s) ORDER BY type,name"
+        % ",".join("?" for _ in expected_sql),
+        tuple(sorted(expected_sql)),
+    ).fetchall()
+    actual_sql = {
+        str(row[1]): (str(row[0]), normalize_sql_definition(row[2]))
+        for row in actual_rows
+    }
+    if actual_sql != expected_sql:
+        missing = sorted(set(expected_sql) - set(actual_sql))
+        unexpected = sorted(set(actual_sql) - set(expected_sql))
+        mismatched = sorted(name for name in set(actual_sql) & set(expected_sql) if actual_sql[name] != expected_sql[name])
+        raise RuntimeError(
+            f"operator command-plane schema object attestation failed: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+        )
+    for table, expected in _OPERATOR_COMMAND_PLANE_EXPECTED_COLUMNS.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise RuntimeError(f"operator command-plane column attestation failed: {table}")
+    expected_index_columns = {
+        "operator_plane_commands_ready_idx": ("status", "stream_sequence"),
+        "operator_plane_commands_method_idx": ("method_id", "method_sequence"),
+    }
+    for name, expected in expected_index_columns.items():
+        actual = tuple(str(row[2]) for row in connection.execute(f"PRAGMA index_info({name})"))
+        if actual != expected:
+            raise RuntimeError(f"operator command-plane index-column attestation failed: {name}")
+    expected_foreign_keys: dict[str, tuple[tuple[str, str, str, str, str, str], ...]] = {
+        table: () for table in _OPERATOR_COMMAND_PLANE_TABLE_NAMES
+    }
+    expected_foreign_keys["operator_plane_commands"] = (
+        ("operator_plane_methods", "method_id", "method_id", "NO ACTION", "NO ACTION", "NONE"),
+    )
+    expected_foreign_keys["operator_plane_pipette_query_attestations"] = (
+        ("operator_commands", "command_id", "command_id", "NO ACTION", "NO ACTION", "NONE"),
+        ("pipette_operations", "pipette_operation_id", "pipette_operation_id", "NO ACTION", "NO ACTION", "NONE"),
+    )
+    for table, expected in expected_foreign_keys.items():
+        actual = tuple(
+            (str(row[2]), str(row[3]), str(row[4]), str(row[5]), str(row[6]), str(row[7]))
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        )
+        if actual != expected:
+            raise RuntimeError(f"operator command-plane foreign-key attestation failed: {table}")
+    singleton_seeds = {
+        "operator_plane_lane": ("singleton", 1),
+        "operator_plane_safety": ("singleton", 1),
+        "operator_plane_z_home_authority": ("singleton", 1),
+        "operator_plane_board_authority": ("board_id", 5),
+    }
+    for table, (column, expected_value) in singleton_seeds.items():
+        actual = tuple(int(row[0]) for row in connection.execute(f"SELECT {column} FROM {table} ORDER BY {column}"))
+        if actual != (expected_value,):
+            raise RuntimeError(f"operator command-plane singleton seed attestation failed: {table}")
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"operator command-plane migration left foreign-key violations: {violations}")
+    missing_command_history = connection.execute(
+        "SELECT c.command_id FROM operator_commands c LEFT JOIN operator_plane_command_versions v ON v.command_id=c.command_id WHERE v.command_id IS NULL LIMIT 1"
+    ).fetchone()
+    if missing_command_history is not None:
+        raise RuntimeError("operator command history backfill is incomplete")
+    missing_pipette_history = connection.execute(
+        "SELECT p.pipette_operation_id FROM pipette_operations p LEFT JOIN operator_plane_pipette_versions v ON v.pipette_operation_id=p.pipette_operation_id WHERE v.pipette_operation_id IS NULL LIMIT 1"
+    ).fetchone()
+    if missing_pipette_history is not None:
+        raise RuntimeError("pipette operation history backfill is incomplete")
+    missing_pressure_history = connection.execute(
+        "SELECT s.stream_session_id FROM pipette_pressure_streams s LEFT JOIN operator_plane_pressure_stream_versions v ON v.stream_session_id=s.stream_session_id WHERE v.stream_session_id IS NULL LIMIT 1"
+    ).fetchone()
+    if missing_pressure_history is not None:
+        raise RuntimeError("pressure stream history backfill is incomplete")
+    missing_evidence_history = connection.execute(
+        "SELECT e.evidence_artifact_id FROM runtime_evidence_objects e LEFT JOIN operator_plane_evidence_versions v ON v.evidence_artifact_id=e.evidence_artifact_id WHERE v.evidence_artifact_id IS NULL LIMIT 1"
+    ).fetchone()
+    if missing_evidence_history is not None:
+        raise RuntimeError("evidence history backfill is incomplete")
+
+
+def _verify_runtime_release_start(connection: sqlite3.Connection) -> None:
+    def stored_definition(source: str) -> str:
+        return normalize_sql_definition(source).replace("IFNOTEXISTS", "", 1)
+
+    table = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='runtime_release_receipts'"
+    ).fetchone()
+    if table is None or normalize_sql_definition(table[0]) != stored_definition(RUNTIME_RELEASE_RECEIPTS_DDL):
+        raise RuntimeError("canonical runtime release receipt table attestation failed")
+    expected_columns = (
+        ("receipt_id", "TEXT", 0, 1),
+        ("release_id", "TEXT", 1, 0),
+        ("deployment_receipt_id", "TEXT", 1, 0),
+        ("systemd_invocation_id", "TEXT", 1, 0),
+        ("application_pid", "INTEGER", 1, 0),
+        ("application_cgroup", "TEXT", 1, 0),
+        ("application_cgroup_sha256", "TEXT", 1, 0),
+        ("application_start_time_ticks", "INTEGER", 1, 0),
+        ("application_started_at", "REAL", 1, 0),
+        ("canonical_receipt_sha256", "TEXT", 1, 0),
+        ("source_manifest_sha256", "TEXT", 1, 0),
+        ("source_aggregate_sha256", "TEXT", 1, 0),
+        ("image_id", "TEXT", 1, 0),
+        ("image_inspection_receipt_sha256", "TEXT", 1, 0),
+        ("udocker_path", "TEXT", 1, 0),
+        ("udocker_sha256", "TEXT", 1, 0),
+        ("udocker_tree_sha256", "TEXT", 1, 0),
+        ("unit_sha256", "TEXT", 1, 0),
+        ("launcher_sha256", "TEXT", 1, 0),
+        ("configuration_sha256", "TEXT", 1, 0),
+        ("oem_lock_sha256", "TEXT", 1, 0),
+        ("declared_listener_json", "TEXT", 1, 0),
+        ("observed_listener_json", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("receipt_sha256", "TEXT", 1, 0),
+        ("recorded_at", "REAL", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(runtime_release_receipts)")
+    )
+    if actual_columns != expected_columns:
+        raise RuntimeError("canonical runtime release receipt column attestation failed")
+    index = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='runtime_release_receipts_time_idx'"
+    ).fetchone()
+    if index is None or normalize_sql_definition(index[0]) != stored_definition(RUNTIME_RELEASE_RECEIPTS_INDEX_DDL):
+        raise RuntimeError("canonical runtime release receipt index attestation failed")
+    index_columns = tuple(
+        str(row[2]) for row in connection.execute("PRAGMA index_info(runtime_release_receipts_time_idx)")
+    )
+    if index_columns != ("recorded_at", "receipt_id"):
+        raise RuntimeError("canonical runtime release receipt index shape mismatch")
+    expected_triggers = {
+        "runtime_release_receipts_append_only_update": stored_definition(RUNTIME_RELEASE_RECEIPTS_TRIGGER_DDL[0]),
+        "runtime_release_receipts_append_only_delete": stored_definition(RUNTIME_RELEASE_RECEIPTS_TRIGGER_DDL[1]),
+    }
+    actual_triggers = {
+        str(row[0]): normalize_sql_definition(row[1])
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (?,?)",
+            tuple(sorted(expected_triggers)),
+        ).fetchall()
+    }
+    if actual_triggers != expected_triggers:
+        raise RuntimeError("canonical runtime release append-only trigger attestation failed")
+
+def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ...]:
+    registry = (
+        runtime_audit_migration_identity(),
+        serial206_runtime_migration_identity(),
+        report_identity_migration_identity(),
+        runtime_release_migration_identity(),
+        operator_command_plane_migration_identity(),
+    )
+    versions = tuple(item.version for item in registry)
+    if versions != tuple(sorted(set(versions))):
+        raise RuntimeError("runtime migration registry versions must be unique and monotonic")
+    return registry
+
+
+def _verify_exact_v2_objects(connection: sqlite3.Connection) -> None:
+    expected = sqlite3.connect(":memory:")
+    expected.row_factory = sqlite3.Row
+    expected.execute("PRAGMA foreign_keys=ON")
+    try:
+        _create_v2_authority_schema(expected)
+        expected_objects = expected.execute(
+            """
+            SELECT type,name,sql FROM sqlite_master
+            WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+            ORDER BY type,name
+            """
+        ).fetchall()
+        for expected_object in expected_objects:
+            object_type = str(expected_object["type"])
+            name = str(expected_object["name"])
+            actual = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+                (object_type, name),
+            ).fetchone()
+            expected_sql = normalize_sql_definition(str(expected_object["sql"]))
+            actual_sql = "" if actual is None else normalize_sql_definition(str(actual[0]))
+            if actual_sql != expected_sql:
+                raise RuntimeError(f"serial-206 exact schema object mismatch: {object_type}:{name}")
+        tables = tuple(
+            str(row["name"])
+            for row in expected_objects
+            if str(row["type"]) == "table"
+        )
+        for table in tables:
+            expected_columns = tuple(tuple(row) for row in expected.execute(f'PRAGMA table_info("{table}")'))
+            actual_columns = tuple(tuple(row) for row in connection.execute(f'PRAGMA table_info("{table}")'))
+            expected_fks = tuple(tuple(row) for row in expected.execute(f'PRAGMA foreign_key_list("{table}")'))
+            actual_fks = tuple(tuple(row) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")'))
+            expected_indexes = tuple(tuple(row) for row in expected.execute(f'PRAGMA index_list("{table}")'))
+            actual_indexes = tuple(tuple(row) for row in connection.execute(f'PRAGMA index_list("{table}")'))
+            if actual_columns != expected_columns or actual_fks != expected_fks or actual_indexes != expected_indexes:
+                raise RuntimeError(f"serial-206 exact table shape mismatch: {table}")
+    finally:
+        expected.close()
+
+
 def _verify_v2_schema(connection: sqlite3.Connection) -> None:
+    verify_runtime_audit_foundation(connection)
+    _verify_exact_v2_objects(connection)
     required = {
         "runtime_schema_migrations",
         "runtime_retired_json_artifacts",
@@ -1026,19 +2226,26 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
     constraint_fragments = {
         "serial206_board_authority": ("CHECK(BOARD_ID=4)", "JSON_VALID(MEMBER_MOTORS_JSON)"),
         "serial206_board_transitions": ("REQUESTED_ACTIVE IN (0,1)", "ACCEPTED IN (0,1)"),
-        "serial206_axis_authority": ("AXIS IN ('Y','Z','GRIPPER')", "WITHOUT ROWID"),
-        "serial206_movement_methods": ("FAILURE_POLICY='REQUIRE_COMPLETED'", "WITHOUT ROWID"),
-        "serial206_movement_commands": ("JSON_VALID(EXPECTED_BOARD_EPOCHS_JSON)", "STATE IN ('QUEUED','DISPATCHED','ISSUED_PENDING','INTERRUPTING','COMPLETED','FAILED','CLEARED','INTERRUPTED','AMBIGUOUS','REJECTED')"),
+        "serial206_axis_authority": ("AXIS IN ('y','z','gripper')", "WITHOUT ROWID"),
+        "serial206_movement_methods": ("FAILURE_POLICY='require_completed'", "WITHOUT ROWID"),
+        "serial206_movement_commands": ("JSON_VALID(EXPECTED_BOARD_EPOCHS_JSON)", "STATE IN ('queued','dispatched','issued_pending','interrupting','completed','failed','cleared','interrupted','ambiguous','rejected')"),
         "serial206_command_dependencies": ("CHECK(COMMAND_ID<>DEPENDS_ON_COMMAND_ID)", "WITHOUT ROWID"),
         "serial206_interrupt_imports": ("CHECK(LENGTH(RECORD_SHA256)=64)", "WITHOUT ROWID"),
     }
     for table, fragments in constraint_fragments.items():
         row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-        normalized = "".join(str(row[0]).upper().split()) if row else ""
-        if any("".join(fragment.upper().split()) not in normalized for fragment in fragments):
+        normalized = normalize_sql_definition(str(row[0])) if row else ""
+        if any(normalize_sql_definition(fragment) not in normalized for fragment in fragments):
             raise RuntimeError(f"serial-206 v2 schema constraint shape mismatch: {table}")
     physical_schema_sha256 = _runtime_physical_schema_sha256(connection)
-    if physical_schema_sha256 != _RUNTIME_PHYSICAL_SCHEMA_SHA256:
+    schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    expected_physical_sha256 = _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION.get(schema_version)
+    if expected_physical_sha256 is None:
+        raise RuntimeError(f"runtime physical schema version is unsupported: {schema_version}")
+    allowed_physical_sha256 = {expected_physical_sha256}
+    if schema_version == SERIAL206_SCHEMA_VERSION:
+        allowed_physical_sha256.add("c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317")
+    if physical_schema_sha256 not in allowed_physical_sha256:
         raise RuntimeError(f"runtime physical schema fingerprint mismatch: {physical_schema_sha256}")
 
 
@@ -1049,96 +2256,373 @@ def verify_runtime_database_v2(connection: sqlite3.Connection) -> None:
     _verify_v2_schema(connection)
 
 
+def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
+    rows = {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute(
+            "SELECT key,value FROM runtime_metadata WHERE key IN (?,?)",
+            ("database_incarnation_id", "report_cursor_hmac_key"),
+        ).fetchall()
+    }
+    incarnation = rows.get("database_incarnation_id", "")
+    cursor_key = rows.get("report_cursor_hmac_key", "")
+    try:
+        if str(uuid.UUID(incarnation)) != incarnation:
+            raise ValueError("noncanonical UUID")
+        key_bytes = bytes.fromhex(cursor_key)
+    except ValueError as exc:
+        raise RuntimeError("runtime report identity metadata is invalid") from exc
+    if len(key_bytes) < 32 or cursor_key != key_bytes.hex():
+        raise RuntimeError("runtime report cursor key is invalid")
+    expected_triggers = {
+        "runtime_metadata_report_identity_insert_shape": normalize_sql_definition(
+            _REPORT_IDENTITY_TRIGGER_DDL[0]
+        ),
+        "runtime_metadata_report_identity_immutable_update": normalize_sql_definition(
+            _REPORT_IDENTITY_TRIGGER_DDL[1]
+        ),
+        "runtime_metadata_report_identity_immutable_delete": normalize_sql_definition(
+            _REPORT_IDENTITY_TRIGGER_DDL[2]
+        ),
+    }
+    triggers = {
+        str(row[0]): normalize_sql_definition(row[1])
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (?,?,?)",
+            tuple(sorted(expected_triggers)),
+        ).fetchall()
+    }
+    if triggers != expected_triggers:
+        raise RuntimeError("runtime report identity trigger attestation failed")
+
+
+def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
+    normalized = normalize_sql_definition(statement)
+    match = re.match(
+        r"^CREATE(?:UNIQUE)?(TABLE|INDEX|TRIGGER|VIEW)(?:IFNOTEXISTS)?([A-Z_][A-Z0-9_]*)",
+        normalized,
+    )
+    if match is None:
+        raise RuntimeError("canonical migration DDL contains an unclassifiable schema statement")
+    return (match.group(1).lower(), match.group(2).lower()), normalized
+
+
+def canonical_runtime_schema_manifest() -> dict[tuple[str, str], str]:
+    """Return the exact union of every registered non-SQLite schema object."""
+    expected = _expected_foundation_connection()
+    try:
+        expected.create_function("authority_write_allowed", 0, lambda: 1)
+        expected.create_function(
+            "sha256_utf8",
+            1,
+            lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest(),
+            deterministic=True,
+        )
+        expected.create_function(
+            "sha256_blob",
+            1,
+            lambda value: hashlib.sha256(bytes(value)).hexdigest(),
+            deterministic=True,
+        )
+        expected.create_function(
+            "canonical_json",
+            1,
+            lambda value: json.dumps(
+                json.loads(str(value)), sort_keys=True, separators=(",", ":"), allow_nan=False
+            ),
+            deterministic=True,
+        )
+        _create_v1_runtime_schema(expected)
+        _create_v2_authority_schema(expected)
+        for statement in _REPORT_IDENTITY_TRIGGER_DDL:
+            expected.execute(statement)
+        _apply_runtime_release_start(expected)
+        _apply_operator_command_plane_schema_v1(expected)
+        return {
+            (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
+            for row in expected.execute(
+                """
+                SELECT type,name,sql FROM sqlite_master
+                WHERE type IN ('table','index','trigger','view')
+                  AND name NOT LIKE 'sqlite_%'
+                  AND sql IS NOT NULL
+                """
+            ).fetchall()
+        }
+    finally:
+        expected.close()
+
+
+def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
+    registry = canonical_runtime_migration_registry()
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version != registry[-1].version:
+        raise RuntimeError(f"canonical runtime schema is not prepared (found {version})")
+    rows = connection.execute(
+        "SELECT version,name,ddl_sha256 FROM runtime_schema_migrations ORDER BY version"
+    ).fetchall()
+    actual = tuple((int(row[0]), str(row[1]), str(row[2])) for row in rows)
+    expected = tuple((item.version, item.name, item.ddl_sha256) for item in registry)
+    if actual != expected:
+        raise RuntimeError("runtime migration ledger is not the exact canonical ordered registry")
+    _verify_v2_schema(connection)
+    _verify_report_identity_metadata_v1(connection)
+    _verify_runtime_release_start(connection)
+    _verify_operator_command_plane_schema_v1(connection)
+    expected_manifest = canonical_runtime_schema_manifest()
+    actual_manifest = {
+        (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
+        for row in connection.execute(
+            """
+            SELECT type,name,sql FROM sqlite_master
+            WHERE type IN ('table','index','trigger','view')
+              AND name NOT LIKE 'sqlite_%'
+              AND sql IS NOT NULL
+            """
+        ).fetchall()
+    }
+    if actual_manifest != expected_manifest:
+        missing = sorted(set(expected_manifest) - set(actual_manifest))
+        unexpected = sorted(set(actual_manifest) - set(expected_manifest))
+        mismatched = sorted(
+            key for key in set(expected_manifest) & set(actual_manifest)
+            if expected_manifest[key] != actual_manifest[key]
+        )
+        raise RuntimeError(
+            f"canonical runtime schema manifest mismatch: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+        )
+    identity = connection.execute(
+        "SELECT schema_version FROM runtime_store_identity WHERE identity_id=1"
+    ).fetchone()
+    if identity is None or int(identity[0]) != OPERATOR_COMMAND_PLANE_SCHEMA_VERSION:
+        raise RuntimeError("runtime store identity does not attest canonical schema v5")
+
+
 def _verified_sqlite_backup(connection: sqlite3.Connection, root: Path) -> str:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    backup_path = root / f"bioxp_runtime.db.pre-v2.{time.time_ns()}.sqlite3"
-    backup = sqlite3.connect(backup_path)
-    try:
-        connection.backup(backup)
-        integrity = backup.execute("PRAGMA integrity_check").fetchone()
-        if integrity is None or str(integrity[0]).lower() != "ok":
-            raise RuntimeError("runtime SQLite backup integrity verification failed")
-    finally:
-        backup.close()
-    fd = os.open(backup_path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
-    if len(digest) != 64:
-        raise RuntimeError("runtime SQLite backup digest verification failed")
-    return digest
+    with runtime_lifecycle_lock(root, exclusive=True):
+        backup_path = root / f"bioxp_runtime.db.pre-v2.{time.time_ns()}.sqlite3"
+        backup = sqlite3.connect(backup_path)
+        try:
+            connection.backup(backup)
+            integrity = backup.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).lower() != "ok":
+                raise RuntimeError("runtime SQLite backup integrity verification failed")
+        finally:
+            backup.close()
+        fd = os.open(backup_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+        if len(digest) != 64:
+            raise RuntimeError("runtime SQLite backup digest verification failed")
+        return digest
 
-
-
-
-def _ensure_runtime_migration_ledger(connection: sqlite3.Connection) -> None:
-    """Extend the shared migration ledger without replacing its authority."""
-    existing = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(runtime_schema_migrations)").fetchall()
-    }
-    additions = {
-        "backup_sha256": "TEXT",
-        "source_json_digests_json": "TEXT",
-        "started_at": "REAL",
-        "finished_at": "REAL",
-        "result": "TEXT",
-    }
-    for name, definition in additions.items():
-        if name not in existing:
-            connection.execute(
-                f"ALTER TABLE runtime_schema_migrations ADD COLUMN {name} {definition}"
-            )
 
 
 def _record_runtime_migration(
     connection: sqlite3.Connection,
     *,
+    identity: RuntimeMigrationIdentity,
     backup_sha256: str,
     source_digests: dict[str, str | None],
     started_at: float,
     finished_at: float,
 ) -> None:
+    if assert_migration_slot(connection, identity):
+        return
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(runtime_schema_migrations)").fetchall()
     }
     values: dict[str, Any] = {
-        "version": SERIAL206_SCHEMA_VERSION,
+        "version": identity.version,
         "backup_sha256": backup_sha256,
         "source_json_digests_json": json.dumps(source_digests, sort_keys=True, separators=(",", ":")),
         "started_at": started_at,
         "finished_at": finished_at,
         "result": "committed",
-        "name": "serial206_runtime_authority",
-        "ddl_sha256": hashlib.sha256(b"serial206_runtime_authority_v2").hexdigest(),
+        "name": identity.name,
+        "ddl_sha256": identity.ddl_sha256,
         "applied_at": finished_at,
     }
     selected = [(name, values[name]) for name in values if name in columns]
     names = ",".join(name for name, _ in selected)
     placeholders = ",".join("?" for _ in selected)
     connection.execute(
-        f"INSERT OR REPLACE INTO runtime_schema_migrations({names}) VALUES({placeholders})",
+        f"INSERT INTO runtime_schema_migrations({names}) VALUES({placeholders})",
         tuple(value for _, value in selected),
     )
 
 
-def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
-    """Own the one-time v1-to-v2 runtime schema transition.
+def _migrate_report_identity_metadata_v1(
+    connection: sqlite3.Connection,
+    root: Path,
+    identity: RuntimeMigrationIdentity,
+) -> None:
+    if assert_migration_slot(connection, identity):
+        _verify_report_identity_metadata_v1(connection)
+        return
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= identity.version:
+        raise RuntimeError("runtime report identity version is occupied without exact ledger identity")
+    backup_sha256 = _verified_sqlite_backup(connection, root)
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        occupied_trigger = connection.execute(
+            """
+            SELECT name FROM sqlite_master WHERE type='trigger'
+            AND name IN (
+                'runtime_metadata_report_identity_immutable_update',
+                'runtime_metadata_report_identity_immutable_delete'
+            ) LIMIT 1
+            """
+        ).fetchone()
+        if occupied_trigger is not None:
+            raise RuntimeError(f"unregistered report identity trigger exists: {occupied_trigger[0]}")
+        now = time.time()
+        _apply_report_identity_metadata_v1(connection, now)
+        _record_runtime_migration(
+            connection,
+            identity=identity,
+            backup_sha256=backup_sha256,
+            source_digests={},
+            started_at=started_at,
+            finished_at=now,
+        )
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (identity.version, now),
+        )
+        connection.execute(f"PRAGMA user_version={identity.version}")
+        _verify_report_identity_metadata_v1(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
 
-    API lifespan calls this before route installation. Direct store construction
-    also calls it so isolated tools and tests cannot open an unprepared schema.
-    """
-    selected_root = Path(root)
+
+
+def _migrate_runtime_release_start(
+    connection: sqlite3.Connection,
+    root: Path,
+    identity: RuntimeMigrationIdentity,
+) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version > SERIAL206_SCHEMA_VERSION:
+    if assert_migration_slot(connection, identity):
+        if version != identity.version:
+            raise RuntimeError("runtime release migration ledger and PRAGMA user_version disagree")
+        _verify_runtime_release_start(connection)
+        return
+    if version >= identity.version:
+        raise RuntimeError("runtime release migration version is occupied without exact ledger identity")
+    if version != REPORT_IDENTITY_SCHEMA_VERSION:
+        raise RuntimeError("runtime release migration requires the exact canonical v1-v3 prefix")
+    occupied = connection.execute(
+        """
+        SELECT type,name FROM sqlite_master
+        WHERE name IN (
+            'runtime_release_receipts',
+            'runtime_release_receipts_time_idx',
+            'runtime_release_receipts_append_only_update',
+            'runtime_release_receipts_append_only_delete'
+        ) LIMIT 1
+        """
+    ).fetchone()
+    if occupied is not None:
+        raise RuntimeError(f"unregistered runtime release schema object exists: {occupied[0]}:{occupied[1]}")
+    backup_sha256 = _verified_sqlite_backup(connection, root)
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _apply_runtime_release_start(connection)
+        finished_at = time.time()
+        _record_runtime_migration(
+            connection,
+            identity=identity,
+            backup_sha256=backup_sha256,
+            source_digests={},
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (identity.version, finished_at),
+        )
+        connection.execute(f"PRAGMA user_version={identity.version}")
+        _verify_runtime_release_start(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_operator_command_plane_schema_v1(
+    connection: sqlite3.Connection,
+    root: Path,
+    identity: RuntimeMigrationIdentity,
+) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if assert_migration_slot(connection, identity):
+        if version != identity.version:
+            raise RuntimeError("operator command-plane migration ledger and PRAGMA user_version disagree")
+        _verify_operator_command_plane_schema_v1(connection)
+        return
+    if version >= identity.version:
+        raise RuntimeError("operator command-plane migration version is occupied without exact ledger identity")
+    if version != RUNTIME_RELEASE_SCHEMA_VERSION:
+        raise RuntimeError("operator command-plane migration requires the exact canonical v1-v4 prefix")
+    backup_sha256 = _verified_sqlite_backup(connection, root)
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # CREATE IF NOT EXISTS permits adoption only when every pre-ledger object
+        # already has the exact canonical definition. Any legacy shape other
+        # than that frozen v5 schema fails the attestation and rolls back.
+        _apply_operator_command_plane_schema_v1(connection)
+        _verify_operator_command_plane_schema_v1(connection)
+        finished_at = time.time()
+        _record_runtime_migration(
+            connection,
+            identity=identity,
+            backup_sha256=backup_sha256,
+            source_digests={},
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (identity.version, finished_at),
+        )
+        connection.execute(f"PRAGMA user_version={identity.version}")
+        _verify_operator_command_plane_schema_v1(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
+    """Apply the canonical ordered registry under the process-wide owner fence."""
+    coordinator = runtime_write_coordinator(root)
+    with coordinator.lock:
+        _migrate_runtime_database_v2_locked(connection, root)
+
+
+def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: str | Path) -> None:
+    selected_root = Path(root).expanduser().resolve(strict=False)
+    registry = canonical_runtime_migration_registry()
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version > registry[-1].version:
         raise RuntimeError(f"unsupported runtime schema version {version}")
     if version == SERIAL206_SCHEMA_VERSION:
         strict_tables = {
@@ -1156,18 +2640,75 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         }
         found_strict_tables = strict_tables & found_tables
         if found_strict_tables:
+            if _is_additive_operator_schema(connection):
+                _verified_sqlite_backup(connection, selected_root)
+                _rebuild_additive_operator_schema(connection)
             _reinstall_runtime_authority_triggers(connection)
-            if _runtime_physical_schema_sha256(connection) != _RUNTIME_PHYSICAL_SCHEMA_SHA256:
-                if _is_additive_operator_schema(connection):
-                    _verified_sqlite_backup(connection, selected_root)
-                    _rebuild_additive_operator_schema(connection)
-                    _reinstall_runtime_authority_triggers(connection)
             _verify_v2_schema(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
             if journal_mode != "wal" or synchronous != 2:
                 raise RuntimeError("runtime schema v2 durability settings are not WAL/synchronous FULL")
             return
+
+    try:
+        verify_runtime_audit_foundation(connection)
+    except Exception:
+        foundation_backup_sha256 = _verified_sqlite_backup(connection, selected_root)
+        ensure_schema(
+            connection,
+            selected_root,
+            backup_sha256=foundation_backup_sha256,
+        )
+    verify_runtime_audit_foundation(connection)
+
+    ledger_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_schema_migrations'"
+    ).fetchone() is not None
+    if ledger_exists:
+        ledger_rows = connection.execute(
+            "SELECT version,name,ddl_sha256 FROM runtime_schema_migrations ORDER BY version"
+        ).fetchall()
+        actual_registry = tuple(
+            (int(row[0]), str(row[1]), str(row[2])) for row in ledger_rows
+        )
+        expected_registry = tuple(
+            (item.version, item.name, item.ddl_sha256) for item in registry
+        )
+        if actual_registry != expected_registry[: len(actual_registry)]:
+            raise RuntimeError("runtime migration ledger is not a canonical ordered prefix")
+
+    foundation = registry[0]
+    if not assert_migration_slot(connection, foundation):
+        foundation_backup_sha256 = _verified_sqlite_backup(connection, selected_root)
+        ensure_schema(
+            connection,
+            selected_root,
+            backup_sha256=foundation_backup_sha256,
+        )
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    serial_identity = registry[1]
+    if assert_migration_slot(connection, serial_identity):
+        if version < serial_identity.version or version > registry[-1].version:
+            raise RuntimeError("runtime migration ledger and PRAGMA user_version disagree")
+        _verify_v2_schema(connection)
+        report_identity = registry[2]
+        _migrate_report_identity_metadata_v1(connection, selected_root, report_identity)
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) < OPERATOR_COMMAND_PLANE_SCHEMA_VERSION:
+            _migrate_runtime_release_start(connection, selected_root, registry[3])
+        _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
+        verify_canonical_runtime_database(connection)
+        journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+        if journal_mode != "wal" or synchronous != 2:
+            raise RuntimeError("canonical runtime durability settings are not WAL/synchronous FULL")
+        return
+    if version >= serial_identity.version:
+        raise RuntimeError(
+            "runtime PRAGMA user_version occupies serial-206 migration version without exact ledger identity"
+        )
+
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA foreign_keys=ON")
@@ -1189,21 +2730,24 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
+        table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_commands'").fetchone()
+        if table is not None and connection.execute("SELECT 1 FROM operator_commands WHERE status='executing' LIMIT 1").fetchone() is not None:
+            raise RuntimeError("runtime v2 migration requires quiesced operator mutation admission")
+        strict_existing = connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT,
-                ddl_sha256 TEXT,
-                applied_at REAL
-            ) WITHOUT ROWID
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN (
+                'serial206_board_authority','serial206_axis_authority',
+                'serial206_movement_methods','serial206_movement_commands',
+                'serial206_command_resources','serial206_command_dependencies',
+                'serial206_interrupt_imports'
+            ) LIMIT 1
             """
-        )
-        _ensure_runtime_migration_ledger(connection)
-        if version in {1, SERIAL206_SCHEMA_VERSION}:
-            table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_commands'").fetchone()
-            if table is not None and connection.execute("SELECT 1 FROM operator_commands WHERE status='executing' LIMIT 1").fetchone() is not None:
-                raise RuntimeError("runtime v2 migration requires quiesced operator mutation admission")
+        ).fetchone()
+        if strict_existing is not None:
+            raise RuntimeError(
+                f"serial-206 migration found unregistered authority table: {strict_existing[0]}"
+            )
         _create_v1_runtime_schema(connection)
         _create_v2_authority_schema(connection)
         reference_payload = source_payloads.get("reference-state.json")
@@ -1211,7 +2755,7 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         z_board_epoch = _find_nonnegative_int(initialization_payload, "board_lifecycle_generation")
         connection.execute(
             """
-            INSERT OR REPLACE INTO serial206_board_authority(
+            INSERT INTO serial206_board_authority(
                 board_id,state,prior_board_epoch,active_board_epoch,transition_id,
                 member_motors_json,state_version,updated_at
             ) VALUES(4,'faulted',?,NULL,'migration-v2-continuity-unproved',?,1,?)
@@ -1239,7 +2783,7 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
                 prepared_epoch = z_board_epoch
             connection.execute(
                 """
-                INSERT OR REPLACE INTO serial206_axis_authority(
+                INSERT INTO serial206_axis_authority(
                     axis,board_id,motor_id,ownership_generation,prepared_board_epoch,
                     lifecycle_state,reference_state,origin_position_steps,
                     interrupt_epoch,state_version,updated_at
@@ -1259,12 +2803,17 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         finished_at = time.time()
         _record_runtime_migration(
             connection,
+            identity=serial_identity,
             backup_sha256=backup_sha256,
             source_digests=source_digests,
             started_at=started_at,
             finished_at=finished_at,
         )
-        connection.execute("PRAGMA user_version=2")
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (serial_identity.version, finished_at),
+        )
+        connection.execute(f"PRAGMA user_version={serial_identity.version}")
         _verify_v2_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
@@ -1273,6 +2822,10 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
             if before is not None and _legacy_table_identity(connection, table, before[0]) != before:
                 raise RuntimeError(f"runtime v2 migration changed frozen legacy rows: {table}")
         connection.execute("COMMIT")
+        _migrate_report_identity_metadata_v1(connection, selected_root, registry[2])
+        _migrate_runtime_release_start(connection, selected_root, registry[3])
+        _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
+        verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
@@ -1376,11 +2929,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 class OEMRuntimeStore:
     def __init__(self, root: str | Path | None = None):
-        self._audit_database = RuntimeAuditDatabase(root=root)
+        self._audit_database = RuntimeAuditDatabase(root=root, initialize_schema=False)
         self.root = self._audit_database.root
         self.serial206_interrupt_fallback_path = self.root / "serial206_interrupt_fallback.jsonl"
         self.serial206_interrupt_fallback_lock_path = self.root / "serial206_interrupt_fallback.lock"
-        self._lock = threading.RLock()
+        self._lock = self._audit_database.writer_lock
         self._db = self._audit_database.connection
         self._authority_write_depth = 0
         self._db.create_function(

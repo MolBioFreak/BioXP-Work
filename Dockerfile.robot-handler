@@ -1,9 +1,23 @@
 FROM python:3.12-slim
 
+ARG BIOXP_SOURCE_COMMIT
+ARG BIOXP_SOURCE_TREE
+ARG BIOXP_SOURCE_MANIFEST_SHA256
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    BIOXP_RUNTIME_OWNER=udocker-container \
     PYTHONPATH=/app/src
+
+LABEL org.opencontainers.image.revision="${BIOXP_SOURCE_COMMIT}" \
+      com.bioxp.source.tree="${BIOXP_SOURCE_TREE}" \
+      com.bioxp.source.manifest.sha256="${BIOXP_SOURCE_MANIFEST_SHA256}"
+
+RUN case "${BIOXP_SOURCE_COMMIT}" in (*[!0-9a-f]*|'') exit 78;; esac \
+    && case "${BIOXP_SOURCE_TREE}" in (*[!0-9a-f]*|'') exit 78;; esac \
+    && case "${BIOXP_SOURCE_MANIFEST_SHA256}" in (*[!0-9a-f]*|'') exit 78;; esac \
+    && test "${#BIOXP_SOURCE_COMMIT}" -eq 40 \
+    && test "${#BIOXP_SOURCE_TREE}" -eq 40 \
+    && test "${#BIOXP_SOURCE_MANIFEST_SHA256}" -eq 64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
@@ -17,5 +31,17 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --requirement /app/requirements.txt
+
+# The build context must be produced by bioxp_source_manifest.py materialize.
+# Its generated .bioxp-release manifest is not a source file and is removed
+# after every /app byte has been checked against the exact commit inventory.
+COPY . /app
+RUN python /app/scripts/bioxp_source_manifest.py verify \
+      --root /app --manifest /app/.bioxp-release/source-manifest.json \
+    && test "$(sha256sum /app/.bioxp-release/source-manifest.json | cut -d' ' -f1)" = "${BIOXP_SOURCE_MANIFEST_SHA256}" \
+    && python -c 'import json; p=json.load(open("/app/.bioxp-release/source-manifest.json")); assert p["commit"] == "'"${BIOXP_SOURCE_COMMIT}"'" and p["tree"] == "'"${BIOXP_SOURCE_TREE}"'"' \
+    && install -d -m 0755 /usr/share/bioxp-release \
+    && install -m 0444 /app/.bioxp-release/source-manifest.json /usr/share/bioxp-release/source-manifest.json \
+    && rm -rf /app/.bioxp-release
 
 CMD ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123"]

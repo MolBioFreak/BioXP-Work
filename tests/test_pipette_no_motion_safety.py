@@ -247,12 +247,16 @@ def test_four_channel_live_readback_is_semantic_and_mutation_free(monkeypatch):
     from src.bioxp import api
 
     monkeypatch.setattr(api, "_pipette_transport", owner)
-    response = TestClient(api.app).post("/liquid/readback", json={"include_data": False})
+    response = TestClient(api.app).post(
+        "/liquid/readback",
+        json={"include_data": False},
+        headers={"Idempotency-Key": "readback-no-motion-1"},
+    )
     assert response.status_code == 200
     payload = response.json()
     assert payload["channel_count"] == 4
-    assert isinstance(payload["receipt_id"], str)
-    assert payload["receipt_truth"]["physical_effect_verified"] is False
+    assert payload["live_query_performed"] is True
+    assert payload["physical_effect_verified"] is False
 
 
 def test_oem_process_message_accepts_exact_dlc2_completion_and_uses_data_zero_error_code():
@@ -335,6 +339,8 @@ def test_get_data_requires_exact_query_identity_prefix_and_nonempty_ascii_value(
                 "ok": True,
                 "outcome": "completion",
                 "completion_received": True,
+                "query_response_correlated": True,
+                "semantic_query_response_verified": True,
                 "frames": [{
                     "arbitration_id": 0x506,
                     "dlc": len(self.response_data),
@@ -355,7 +361,7 @@ def test_get_data_requires_exact_query_identity_prefix_and_nonempty_ascii_value(
     assert empty["ok"] is False
     assert empty["semantic_ok"] is False
     assert empty["completion_verified"] is False
-    assert empty["semantic_query_response_verified"] is True
+    assert empty["semantic_query_response_verified"] is False
 
     driver.bus.response_data = [0x20, 0x60, 0xFF]
     non_ascii = driver.get_data("?40", wake_if_needed=False)
@@ -371,7 +377,7 @@ def test_get_data_requires_exact_query_identity_prefix_and_nonempty_ascii_value(
 def test_completion_owner_enforces_exact_tx_derived_rx_id():
     clock = [1.0]
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw, clock=lambda: clock[0])
-    token = router.prepare_pipette_completion(
+    router.prepare_pipette_completion(
         channel=0,
         command_family=1,
         command_name="aspirate",
@@ -380,14 +386,13 @@ def test_completion_owner_enforces_exact_tx_derived_rx_id():
     )
     router.bind_pipette_completion(
         channel=0,
-        owner_token=token,
         transaction_id="tx-exact-rx",
         tx_started_at=1.0,
     )
     router._dispatch(_frame(0x509, b"", 1.1))
     router._dispatch(_frame(0x509, bytes([0x20, 0x00]), 1.2))
     clock[0] = 2.1
-    result = router.wait_pipette_completion(channel=0, owner_token=token, timeout_s=0.0)
+    result = router.wait_pipette_completion(channel=0, timeout_s=0.0)
     assert result["ok"] is False
     assert result["expected_rx_id"] == 0x501
 
@@ -458,13 +463,13 @@ def test_completion_owner_enforces_family_ack_order_exact_dlc_and_freezes_first_
     clock = [1.0]
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw, clock=lambda: clock[0])
     router._reader_generation = 4
-    token = router.prepare_pipette_completion(
+    router.prepare_pipette_completion(
         0,
         10.0,
         command_family=1,
         command_name="pipette_initialize",
     )
-    router.bind_pipette_completion(0, owner_token=token, transaction_id="tx-1", tx_started_at=1.0)
+    router.bind_pipette_completion(0, transaction_id="tx-1", tx_started_at=1.0)
 
     router._dispatch(_frame(0x500, b"", 1.1))
     router._dispatch(_frame(0x500, bytes([0x20, 0x01]), 1.2))
@@ -476,7 +481,7 @@ def test_completion_owner_enforces_family_ack_order_exact_dlc_and_freezes_first_
 
     router._dispatch(_frame(0x501, bytes([0x20, 0xA5]), 1.6))
     router._dispatch(_frame(0x501, bytes([0x20, 0xFF]), 1.7))
-    result = router.wait_pipette_completion(0, 0.0, owner_token=token)
+    result = router.wait_pipette_completion(0, 0.0)
 
     assert result["ok"] is True
     assert result["command_family"] == 1
@@ -487,10 +492,10 @@ def test_completion_owner_enforces_family_ack_order_exact_dlc_and_freezes_first_
     assert result["duplicate_terminal_count"] == 1
 
 
-def test_completion_before_ack_rejects_and_taints_the_lane():
+def test_completion_before_ack_uses_oem_channel_state_without_taint():
     clock = [1.0]
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw, clock=lambda: clock[0])
-    token = router.prepare_pipette_completion(
+    router.prepare_pipette_completion(
         0,
         10.0,
         command_family=1,
@@ -498,18 +503,17 @@ def test_completion_before_ack_rejects_and_taints_the_lane():
     )
     router.bind_pipette_completion(
         0,
-        owner_token=token,
         transaction_id="tx-order",
         tx_started_at=1.0,
     )
 
     router._dispatch(_frame(0x501, bytes([0x20, 0x00]), 1.1))
     router._dispatch(_frame(0x501, b"", 1.2))
-    result = router.wait_pipette_completion(0, 0.0, owner_token=token)
+    result = router.wait_pipette_completion(0, 0.0)
 
-    assert result["ok"] is False
-    assert result["outcome"] == "completion_before_ack"
-    assert router.pipette_completion_taint(0)["reason"] == "completion_before_ack"
+    assert result["ok"] is True
+    assert result["outcome"] == "completion"
+    assert not hasattr(router, "pipette_completion_taint")
 
 
 def test_completion_success_does_not_invent_controller_acknowledgement():

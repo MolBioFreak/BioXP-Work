@@ -3,13 +3,27 @@ import sqlite3
 
 import pytest
 
-from src.bioxp.oem_runtime_store import OEMRuntimeStore
+import src.bioxp.oem_runtime_store as runtime_store_module
+from src.bioxp.oem_runtime_store import (
+    OEMRuntimeStore,
+    canonical_runtime_migration_registry,
+)
+from src.bioxp.runtime_audit_store import RuntimeAuditDatabase
+
+
+def test_plain_runtime_connection_defers_substantive_ddl_to_migration_owner(tmp_path):
+    database = RuntimeAuditDatabase(tmp_path, initialize_schema=False)
+
+    assert database.connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','index','trigger')"
+    ).fetchone()[0] == 0
+    database.close()
 
 
 def test_fresh_runtime_database_has_serial206_v2_authority(tmp_path):
     store = OEMRuntimeStore(tmp_path)
 
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
     tables = {
         row[0]
         for row in store._db.execute(
@@ -96,14 +110,14 @@ def test_existing_v1_operator_rows_are_preserved_and_migrated(tmp_path):
 
     store = OEMRuntimeStore(tmp_path)
 
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
     row = store._db.execute(
         "SELECT command_id,receipt_json FROM operator_commands"
     ).fetchone()
     assert tuple(row) == ("old-command", "{}")
     assert store._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 5
 
 
 def test_existing_v2_additive_operator_schema_is_rebuilt_without_data_loss(tmp_path):
@@ -230,10 +244,56 @@ def test_v2_migration_is_idempotent(tmp_path):
     first.close()
     second = OEMRuntimeStore(tmp_path)
 
-    assert second._db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert second._db.execute("PRAGMA user_version").fetchone()[0] == 5
     assert second._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 5
+
+
+def test_canonical_registry_has_unique_monotonic_exact_identities(tmp_path):
+    store = OEMRuntimeStore(tmp_path)
+    registry = canonical_runtime_migration_registry()
+
+    assert [item.version for item in registry] == [1, 2, 3, 4, 5]
+    assert len({item.version for item in registry}) == len(registry)
+    rows = store._db.execute(
+        """
+        SELECT version,name,ddl_sha256,backup_sha256
+        FROM runtime_schema_migrations ORDER BY version
+        """
+    ).fetchall()
+    assert [(row["version"], row["name"], row["ddl_sha256"]) for row in rows] == [
+        (item.version, item.name, item.ddl_sha256) for item in registry
+    ]
+    assert all(len(row["backup_sha256"]) == 64 for row in rows)
+
+
+def test_occupied_mismatched_migration_version_is_rejected_without_replacement(tmp_path):
+    db = tmp_path / "bioxp_runtime.db"
+    connection = sqlite3.connect(db)
+    connection.executescript(
+        """
+        PRAGMA user_version=1;
+        CREATE TABLE runtime_schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            ddl_sha256 TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        ) WITHOUT ROWID;
+        INSERT INTO runtime_schema_migrations(version,name,ddl_sha256,applied_at)
+        VALUES(1,'occupied-by-other-owner','deadbeef',1);
+        """
+    )
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="mismatched name or digest"):
+        OEMRuntimeStore(tmp_path)
+
+    connection = sqlite3.connect(db)
+    assert connection.execute(
+        "SELECT name,ddl_sha256 FROM runtime_schema_migrations WHERE version=1"
+    ).fetchone() == ("occupied-by-other-owner", "deadbeef")
+    connection.close()
 
 
 def test_shared_interrupt_fallback_import_preserves_x_y_z_history(tmp_path):
@@ -250,3 +310,37 @@ def test_shared_interrupt_fallback_import_preserves_x_y_z_history(tmp_path):
         assert [row["interrupt_attempt_id"] for row in receipts] == [f"{axis}-attempt-1"]
     assert not (tmp_path / "serial206_interrupt_fallback.jsonl").exists()
     assert len(list(tmp_path.glob("serial206_interrupt_fallback.imported.*.jsonl"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("blocked_symbol", "committed_version"),
+    [
+        ("_migrate_runtime_release_start", 3),
+        ("_migrate_operator_command_plane_schema_v1", 4),
+    ],
+)
+def test_committed_intermediate_migration_resumes_to_v5(
+    tmp_path,
+    monkeypatch,
+    blocked_symbol,
+    committed_version,
+):
+    original = getattr(runtime_store_module, blocked_symbol)
+
+    def interrupt(*_args, **_kwargs):
+        raise RuntimeError(f"simulated interruption after v{committed_version}")
+
+    monkeypatch.setattr(runtime_store_module, blocked_symbol, interrupt)
+    with pytest.raises(RuntimeError, match=f"simulated interruption after v{committed_version}"):
+        OEMRuntimeStore(tmp_path)
+
+    connection = sqlite3.connect(tmp_path / "bioxp_runtime.db")
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == committed_version
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(runtime_store_module, blocked_symbol, original)
+    resumed = OEMRuntimeStore(tmp_path)
+    assert resumed._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    resumed.close()

@@ -69,7 +69,7 @@ def test_group_initialization_defers_completion_until_collection_waits():
         assert sent["ok"] is True
         assert sent["immediate_ack_received"] is True
         assert sent["completion_deferred"] is True
-        assert isinstance(sent["completion_owner_token"], str)
+        assert "completion_owner_token" not in sent
         completion = driver.wait_pipette_initialization_completion(1.0)
         assert completion["ok"] is True
         assert completion["outcome"] == "completion"
@@ -158,7 +158,7 @@ def test_novo_usb_driver_reuses_bioxp_tester_endpoint_and_queries_tip_status():
         shared.close()
 
 
-def test_mutating_transaction_requires_dlc0_ack_before_deferred_token():
+def test_mutating_transaction_requires_dlc0_ack_before_deferred_completion():
     shared = FakeSharedUsb([_novo_frame(0x501, b"")])
     try:
         bus = NovoUsbCanBus(shared_usb=shared)
@@ -178,7 +178,31 @@ def test_mutating_transaction_requires_dlc0_ack_before_deferred_token():
         assert result["immediate_ack_received"] is True
         assert result["completion_received"] is False
         assert result["completion_deferred"] is True
-        assert isinstance(result["completion_owner_token"], str)
+        assert "completion_owner_token" not in result
+    finally:
+        shared.close()
+
+
+def test_mutating_waited_transaction_rejects_ack_only_without_delayed_completion():
+    shared = FakeSharedUsb([_novo_frame(0x501, b"")])
+    try:
+        bus = NovoUsbCanBus(shared_usb=shared)
+        msg = type("Msg", (), {"arbitration_id": 0x101, "data": list(b"P1,1R"), "dlc": 5})()
+
+        result = bus.transact_can(
+            msg,
+            channel=0,
+            expected_function=1,
+            timeout_s=0.1,
+            matcher_name="pipette_aspirate",
+            completion_timeout_s=0.01,
+            wait_for_completion=True,
+        )
+
+        assert result["ok"] is False
+        assert result["immediate_ack_received"] is True
+        assert result["completion_received"] is False
+        assert result["completion_deferred"] is False
     finally:
         shared.close()
 

@@ -209,7 +209,7 @@ class BioXpCanDriver:
         self._sleep = time.sleep
         self._pipette_message_state: dict[str, Any] = {}
         self._pipette_last_command: str | None = None
-        self._pipette_completion_owner_token: str | None = None
+
         self._pipette_error_callback = pipette_error_callback
 
     def pipette_can_ids(self) -> dict[str, int]:
@@ -257,6 +257,22 @@ class BioXpCanDriver:
         if len(data) > 2 and data[2] == 0x20:
             return True
         return False
+
+    @staticmethod
+    def _command_lifecycle_ok(provenance: Any, *, wait_for_completion: bool) -> bool:
+        if not isinstance(provenance, dict) or provenance.get("immediate_ack_received") is not True:
+            return False
+        if wait_for_completion:
+            return bool(
+                provenance.get("ok") is True
+                and provenance.get("completion_received") is True
+                and provenance.get("completion_deferred") is not True
+            )
+        return bool(
+            provenance.get("ok") is True
+            and provenance.get("completion_received") is not True
+            and provenance.get("completion_deferred") is True
+        )
 
     def _receive_reply(self, *, timeout_s: float, ack_mode: str, expected_arbitration_id: int | None = None) -> dict[str, Any]:
         recv = getattr(self.bus, 'recv', None)
@@ -385,10 +401,6 @@ class BioXpCanDriver:
                 )
             except Exception as exc:
                 return {**base, "tx_ok": False, "error": str(exc), "provenance": None}
-            if isinstance(provenance, dict):
-                owner_token = provenance.get("completion_owner_token")
-                if isinstance(owner_token, str) and owner_token:
-                    self._pipette_completion_owner_token = owner_token
             frames = list(provenance.get("frames", []))
             data: list[int] = []
             for frame in frames:
@@ -405,11 +417,20 @@ class BioXpCanDriver:
                     )
                 )
             )
-            ack_ok = bool(
-                provenance_ok and self._ack_ok(data, ack_mode=ack_mode)
-                if ack_mode == "query"
-                else immediate_ack_received
+            completion_received = bool(
+                isinstance(provenance, dict)
+                and provenance.get("completion_received", False)
             )
+            completion_deferred = bool(
+                isinstance(provenance, dict)
+                and provenance.get("completion_deferred", False)
+            )
+            if ack_mode == "query":
+                ack_ok = bool(provenance_ok and self._ack_ok(data, ack_mode=ack_mode))
+            elif wait_for_completion:
+                ack_ok = bool(immediate_ack_received and provenance_ok and completion_received)
+            else:
+                ack_ok = bool(immediate_ack_received and completion_deferred)
             ack = {
                 "ok": ack_ok,
                 "received": bool(frames),
@@ -424,7 +445,13 @@ class BioXpCanDriver:
             }
             message_state = self._apply_pipette_provenance(provenance, command_name)
             if not ack_ok:
-                ack["error"] = "ack_timeout" if provenance.get("outcome") == "timeout" else "pipette_reply_error"
+                ack["error"] = (
+                    "ack_timeout"
+                    if not immediate_ack_received
+                    else "completion_not_verified"
+                    if wait_for_completion
+                    else "completion_deferred_not_owned"
+                )
             return {
                 **base,
                 "ok": ack_ok,
@@ -432,23 +459,14 @@ class BioXpCanDriver:
                 "delivery_verified": True,
                 "immediate_ack_received": immediate_ack_received,
                 "controller_acknowledged": immediate_ack_received,
-                "completion_verified": bool(
-                    ack_mode != "query"
-                    and provenance.get("completion_received", False)
-                    if isinstance(provenance, dict)
-                    else False
-                ),
-                "semantic_query_response_verified": bool(
+                "completion_verified": bool(ack_mode != "query" and wait_for_completion and ack_ok),
+                "query_response_correlated": bool(
                     ack_mode == "query"
                     and isinstance(provenance, dict)
-                    and provenance.get("semantic_query_response_verified", provenance_ok)
+                    and provenance.get("query_response_correlated") is True
                 ),
-                "completion_deferred": bool(
-                    provenance.get("completion_deferred", False) if isinstance(provenance, dict) else False
-                ),
-                "completion_owner_token": (
-                    provenance.get("completion_owner_token") if isinstance(provenance, dict) else None
-                ),
+                "semantic_query_response_verified": False,
+                "completion_deferred": bool(ack_mode != "query" and not wait_for_completion and ack_ok),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -550,10 +568,6 @@ class BioXpCanDriver:
                 allow_multipart=ack_mode == "query",
                 wait_for_completion=wait_for_completion,
             )
-            if isinstance(provenance, dict):
-                owner_token = provenance.get("completion_owner_token")
-                if isinstance(owner_token, str) and owner_token:
-                    self._pipette_completion_owner_token = owner_token
             frames = list(provenance.get("frames", []))
             data = [int(byte) for frame in frames for byte in frame.get("data", [])]
             observed = frames[-1] if frames else {}
@@ -568,11 +582,20 @@ class BioXpCanDriver:
                     )
                 )
             )
-            ack_ok = bool(
-                provenance_ok and self._ack_ok(data, ack_mode=ack_mode)
-                if ack_mode == "query"
-                else immediate_ack_received
+            completion_received = bool(
+                isinstance(provenance, dict)
+                and provenance.get("completion_received", False)
             )
+            completion_deferred = bool(
+                isinstance(provenance, dict)
+                and provenance.get("completion_deferred", False)
+            )
+            if ack_mode == "query":
+                ack_ok = bool(provenance_ok and self._ack_ok(data, ack_mode=ack_mode))
+            elif wait_for_completion:
+                ack_ok = bool(immediate_ack_received and provenance_ok and completion_received)
+            else:
+                ack_ok = bool(immediate_ack_received and completion_deferred)
             ack = {
                 "ok": ack_ok,
                 "received": bool(frames),
@@ -587,30 +610,27 @@ class BioXpCanDriver:
             }
             message_state = self._apply_pipette_provenance(provenance, command_name)
             if not ack_ok:
-                ack["error"] = "ack_timeout" if provenance.get("outcome") == "timeout" else "pipette_reply_error"
+                ack["error"] = (
+                    "ack_timeout"
+                    if not immediate_ack_received
+                    else "completion_not_verified"
+                    if wait_for_completion
+                    else "completion_deferred_not_owned"
+                )
             return {
                 "ok": ack_ok,
                 "tx_ok": True,
                 "delivery_verified": True,
                 "immediate_ack_received": immediate_ack_received,
                 "controller_acknowledged": immediate_ack_received,
-                "completion_verified": bool(
-                    ack_mode != "query"
-                    and provenance.get("completion_received", False)
-                    if isinstance(provenance, dict)
-                    else False
-                ),
-                "semantic_query_response_verified": bool(
+                "completion_verified": bool(ack_mode != "query" and wait_for_completion and ack_ok),
+                "query_response_correlated": bool(
                     ack_mode == "query"
                     and isinstance(provenance, dict)
-                    and provenance.get("semantic_query_response_verified", provenance_ok)
+                    and provenance.get("query_response_correlated") is True
                 ),
-                "completion_deferred": bool(
-                    provenance.get("completion_deferred", False) if isinstance(provenance, dict) else False
-                ),
-                "completion_owner_token": (
-                    provenance.get("completion_owner_token") if isinstance(provenance, dict) else None
-                ),
+                "semantic_query_response_verified": False,
+                "completion_deferred": bool(ack_mode != "query" and not wait_for_completion and ack_ok),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -844,19 +864,7 @@ class BioXpCanDriver:
         wait = getattr(self.bus, "wait_pipette_completion", None)
         if not callable(wait):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
-        owner_token = self._pipette_completion_owner_token
-        try:
-            raw = wait(
-                int(self.pipette_id),
-                float(timeout_s),
-                owner_token=owner_token,
-            )
-        except TypeError:
-            if owner_token is not None:
-                raise
-            raw = wait(int(self.pipette_id), float(timeout_s))
-        if owner_token == self._pipette_completion_owner_token:
-            self._pipette_completion_owner_token = None
+        raw = wait(int(self.pipette_id), float(timeout_s))
         if not isinstance(raw, dict):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
         return self._enrich_pipette_completion(raw)
@@ -980,6 +988,7 @@ class BioXpCanDriver:
             "reply_received": reply_received,
             "error": result.get("error") if semantic_ok else "malformed_pressure_reply",
             "pressure": pressure,
+            "pressure_units": "controller_pressure_counts",
             "semantic_ok": semantic_ok,
             "hardware_truth_level": "hardware_query" if reply_received and pressure is not None else ("unparsed_hardware_reply" if reply_received else "no_readback"),
             "oem_source_anchor": "ClassPipette.QueryPressure: ?57",
@@ -1105,7 +1114,12 @@ class BioXpCanDriver:
         if wake_if_needed and self._pipette_message_state.get("initialized") is not True:
             wake_byte = 0x20 | int(self.pipette_id)
             wake = self._send_packet(0x080, [wake_byte, wake_byte], command_name="pipette_wake_address")
-        result = self._send_pipette_command(selected, address="report", ack_mode="query", command_name="get_data")
+        result = self._send_pipette_command(
+            selected,
+            address="report",
+            ack_mode="query",
+            command_name=f"get_data:{selected}",
+        )
         ack = result.get("ack", {}) if isinstance(result, dict) else {}
         data = list(ack.get("data", [])) if isinstance(ack, dict) else []
         label, unit = PIPETTE_DATA_QUERY_LABELS[selected]
@@ -1119,7 +1133,7 @@ class BioXpCanDriver:
         value_ascii = bytes(value_bytes).decode("ascii") if ascii_ok else None
         value = value_ascii.strip() if value_ascii is not None else None
         semantic_ok = bool(
-            result.get("semantic_query_response_verified")
+            result.get("query_response_correlated")
             and prefix_ok
             and ascii_ok
             and value
@@ -1211,6 +1225,12 @@ class BioXpCanDriver:
         )
         self._sleep(1.500)
         rows.append({"cycle": cycles, "aspirate": final_aspirate, "dispense": None})
+        constituent_results = [
+            result
+            for row in rows
+            for result in (row.get("aspirate"), row.get("dispense"))
+            if isinstance(result, dict)
+        ]
         return {
             "ok": all(
                 isinstance(row.get("aspirate"), dict)
@@ -1222,6 +1242,17 @@ class BioXpCanDriver:
             "volume_ul": float(volume_ul),
             "count": cycles,
             "cycles": rows,
+            "delivery_verified": bool(constituent_results) and all(
+                result.get("delivery_verified") is True for result in constituent_results
+            ),
+            "controller_acknowledged": bool(constituent_results) and all(
+                result.get("controller_acknowledged") is True for result in constituent_results
+            ),
+            "completion_verified": bool(constituent_results) and all(
+                result.get("completion_received") is True
+                or result.get("completion_verified") is True
+                for result in constituent_results
+            ),
             "oem_wire_semantics": "composite_P_D_no_dedicated_mix_command",
             "inter_command_wait_ms": 1_500,
         }

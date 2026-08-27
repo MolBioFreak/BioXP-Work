@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 import bioxp.operator_controls as operator_controls
 from bioxp.operator_controls import install_operator_control_plane
 from bioxp.operator_receipt_store import OperatorReceiptStore
+from bioxp.oem_runtime_store import OEMRuntimeStore
 
 
 class CamelBody(BaseModel):
@@ -38,6 +39,18 @@ class OptionalNestedBody(BaseModel):
 
 def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
+    monkeypatch.setattr(operator_controls, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+    monkeypatch.setattr(operator_controls, "current_authority_identity", lambda: {
+        "evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64,
+    })
+    monkeypatch.setattr(operator_controls, "current_registry_sha256", lambda: "4" * 64)
+    runtime_owner = OEMRuntimeStore(tmp_path)
+    runtime_owner.close()
     app = FastAPI()
     calls: list[tuple[str, object]] = []
 
@@ -186,7 +199,7 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.initialize_motors", "meta.initialize_motion"}
+    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.initialize_motors", "meta.initialize_motion"}
     motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
     motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
     assert motors["available"] is False
@@ -259,11 +272,10 @@ def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_
         if row["kind"] == "primitive" and row["safety_class"] == "motion"
     ]
     assert motor_actions
-    assert all(row["enabled"] is False for row in motor_actions)
-    assert all(row["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor." for row in motor_actions)
-    assert any("pipette" in row["informational_path"].lower() for row in motor_actions)
-
     target = next(row for row in motor_actions if "/motion/test/home_axis" == row["informational_path"])
+    assert target["enabled"] is False
+    assert target["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
+
     blocked = client.post(f"/operator/actions/{target['action_id']}", json={
         "expected_generation": catalog["ownership_generation"],
         "idempotency_key": "motion-blocked-123456",
@@ -319,6 +331,40 @@ def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_
     assert calls == [("home_axis", {"axis": "x"})]
 
 
+def test_operator_receipt_preserves_inner_completion_ambiguity(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+
+    async def ambiguous_dispatch(*_args, **_kwargs):
+        return 504, {
+            "detail": {
+                "error": "tester_operation_completion_ambiguous",
+                "completion_ambiguous": True,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
+            }
+        }
+
+    monkeypatch.setattr(operator_controls, "_dispatch_asgi", ambiguous_dispatch)
+    response = client.post(
+        f"/operator/actions/{action['action_id']}",
+        json={
+            "expected_generation": catalog["ownership_generation"],
+            "idempotency_key": "operator-ambiguous-pipette-1",
+            "inputs": {"body": {"axis": "x"}},
+        },
+    )
+    assert response.status_code == 200
+    receipt = response.json()
+    assert receipt["status"] == "outcome_unknown"
+    assert receipt["reconciliation_required"] is True
+    assert receipt["retry_forbidden"] is True
+    assert calls == []
+
+
 def test_operator_receipt_preserves_explicit_no_command_ack_over_nested_readback_acks(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     app.state.operator_test_home_axis_response = {
@@ -360,7 +406,7 @@ def test_operator_receipt_preserves_explicit_no_command_ack_over_nested_readback
     assert calls == [("home_axis", {"axis": "x"})]
 
 
-def test_idempotent_replay_rechecks_current_admission_state(tmp_path, monkeypatch):
+def test_idempotent_replay_returns_durable_receipt_before_mutable_admission(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
@@ -380,12 +426,12 @@ def test_idempotent_replay_rechecks_current_admission_state(tmp_path, monkeypatc
     })
     replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
 
-    assert replay.status_code == 409
-    assert replay.json()["detail"]["error"] == "action_unavailable"
+    assert replay.status_code == 200
+    assert replay.json()["command_id"] == first.json()["command_id"]
     assert calls == [("home_axis", {"axis": "x"})]
 
 
-def test_idempotent_replay_rejects_changed_current_authority_when_action_remains_enabled(tmp_path, monkeypatch):
+def test_idempotent_replay_ignores_mutable_authority_fingerprint_without_redispatch(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
@@ -401,8 +447,8 @@ def test_idempotent_replay_rejects_changed_current_authority_when_action_remains
     app.state.operator_test_lifecycle["operation_reason"] = "current lifecycle authority changed"
     replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
 
-    assert replay.status_code == 409
-    assert replay.json()["detail"] == "idempotency replay current authority mismatch"
+    assert replay.status_code == 200
+    assert replay.json()["command_id"] == first.json()["command_id"]
     assert calls == [("home_axis", {"axis": "x"})]
 
 
@@ -425,6 +471,27 @@ def test_idempotent_replay_is_bound_to_ownership_generation(tmp_path, monkeypatc
     )
     assert replay.status_code == 409
     assert replay.json()["detail"] == "idempotency receipt ownership generation mismatch"
+    assert calls == [("home_axis", {"axis": "x"})]
+
+
+def test_exact_replay_uses_stored_generation_before_current_ownership(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "stored-generation-replay-123",
+        "inputs": {"body": {"axis": "x"}},
+    }
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    assert first.status_code == 200
+    app.state.operator_test_hardware.ownership_epoch += 1
+
+    replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert replay.status_code == 200
+    assert replay.json()["command_id"] == first.json()["command_id"]
     assert calls == [("home_axis", {"axis": "x"})]
 
 
@@ -736,11 +803,12 @@ def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispa
     assert calls == []
 
 
-def test_home_xy_meta_maps_to_one_visible_source_route(tmp_path, monkeypatch):
+def test_home_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
-    response = client.post("/operator/actions/meta.home_xy", json={
+    action = action_for(catalog, "POST", "/motion/oem/home_xy")
+    response = client.post(f"/operator/actions/{action['action_id']}", json={
         "expected_generation": catalog["ownership_generation"],
         "idempotency_key": "home-xy-meta-1234",
         "inputs": {},
@@ -749,10 +817,6 @@ def test_home_xy_meta_maps_to_one_visible_source_route(tmp_path, monkeypatch):
     assert calls == [("home_xy", None)]
     receipt = response.json()
     assert receipt["stage_receipts"] == []
-    detailed = client.get(
-        f"/operator/actions/receipts/{receipt['command_id']}?detail=true"
-    ).json()
-    assert len(detailed["response"]["body"]["stages"]) == 2
 
 
 def test_generic_assessment_rejects_provider_owned_z_manual_home_receipt(tmp_path, monkeypatch):
@@ -802,6 +866,8 @@ def test_human_assessment_updates_existing_receipt_and_requires_generation(tmp_p
 
 
 def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path):
+    runtime_owner = OEMRuntimeStore(tmp_path)
+    runtime_owner.close()
     store = OperatorReceiptStore(tmp_path)
     for index in range(520):
         store.put({
@@ -813,21 +879,20 @@ def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path
             "status": "completed",
         })
     rows = store.list(200)
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
-    assert store.by_command("cmd-7") is None
-    assert store.by_command("cmd-8") is not None
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 520
+    assert store.by_command("cmd-7") is not None
     assert rows[0]["command_id"] == "cmd-519"
-    store.put({
-        "command_id": "cmd-519",
-        "idempotency_key": "key-519",
-        "action_id": "query.status",
-        "ownership_generation": 7,
-        "started_at": "519",
-        "status": "completed",
-        "operator_assessment": "fail",
-    })
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
-    assert store.by_command("cmd-519")["operator_assessment"] == "fail"
+    with pytest.raises(RuntimeError, match="stale operator receipt expected state"):
+        store.put({
+            "command_id": "cmd-519",
+            "idempotency_key": "key-519",
+            "action_id": "query.status",
+            "ownership_generation": 7,
+            "started_at": "519",
+            "status": "completed",
+            "operator_assessment": "fail",
+        })
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 520
 
 
 def test_successive_move_queue_mechanics_order_and_clear():
@@ -864,170 +929,22 @@ def test_successive_move_queue_mechanics_order_and_clear():
     asyncio.run(scenario())
 
 
-def test_successive_move_queues_and_dispatches_after_active_completes(tmp_path, monkeypatch):
-    import threading
-    import time as _time
-
+@pytest.mark.parametrize("idempotency_key", ["queue-first", "clear-first", "ghost-first"])
+def test_retired_legacy_x_move_route_requires_v2_authority(tmp_path, monkeypatch, idempotency_key):
     app, calls = make_app(tmp_path, monkeypatch)
-    release_first = threading.Event()
-    first_entered = threading.Event()
-
-    async def blocker():
-        first_entered.set()
-        await asyncio.to_thread(release_first.wait, 5)
-
-    app.state.operator_test_x_move_steps_blocker = blocker
     with TestClient(app) as client:
         catalog = client.get("/operator/control-catalog").json()
-        generation = catalog["ownership_generation"]
-        responses: list = []
-
-        def invoke(key: str):
-            responses.append(
-                client.post(
-                    "/operator/actions/oem.x.move_steps",
-                    json={"expected_generation": generation, "idempotency_key": key, "inputs": {"steps": 100}},
-                )
-            )
-
-        first = threading.Thread(target=invoke, args=("queue-first",))
-        first.start()
-        assert first_entered.wait(5), "first move provider never entered"
-        second = threading.Thread(target=invoke, args=("queue-second",))
-        second.start()
-        _time.sleep(0.3)
-        mid = client.get("/operator/dashboard").json()
-        queue = mid["successive_move_queue"].get("x", {})
-        assert queue["depth"] == 1, mid
-        assert queue["state"] == "running"
-        release_first.set()
-        first.join(5)
-        second.join(5)
-        assert not first.is_alive() and not second.is_alive()
-        assert responses[0].status_code == 200, responses[0].text
-        assert responses[1].status_code == 200, responses[1].text  # queued, never 409
-        history = client.get("/operator/actions/history?limit=10").json()
-    by_key = {row["idempotency_key"]: row for row in history["receipts"]}
-    second_receipt = by_key["queue-second"]
-    assert second_receipt["status"] == "completed", second_receipt
-    assert second_receipt.get("queued_at") is not None
-    assert second_receipt.get("dispatched_at") is not None
-    assert [name for name, _ in calls if name == "x_move_steps"] == ["x_move_steps", "x_move_steps"]
-    assert calls[0][1] != calls[1][1]  # distinct wire inputs (fresh position bases)
-
-
-def test_stop_clears_queued_successive_moves(tmp_path, monkeypatch):
-    import threading
-    import time as _time
-
-    app, calls = make_app(tmp_path, monkeypatch)
-    release_first = threading.Event()
-    first_entered = threading.Event()
-
-    async def blocker():
-        first_entered.set()
-        await asyncio.to_thread(release_first.wait, 5)
-
-    app.state.operator_test_x_move_steps_blocker = blocker
-    with TestClient(app) as client:
-        catalog = client.get("/operator/control-catalog").json()
-        generation = catalog["ownership_generation"]
-        responses: list = []
-
-        def invoke(key: str):
-            responses.append(
-                client.post(
-                    "/operator/actions/oem.x.move_steps",
-                    json={"expected_generation": generation, "idempotency_key": key, "inputs": {"steps": 100}},
-                )
-            )
-
-        first = threading.Thread(target=invoke, args=("clear-first",))
-        first.start()
-        assert first_entered.wait(5), f"first move provider never entered; responses={[(r.status_code, r.text[:120]) for r in responses]}"
-        second = threading.Thread(target=invoke, args=("clear-second",))
-        second.start()
-        _time.sleep(0.3)
-        stop = client.post(
-            "/operator/actions/meta.emergency_stop",
-            json={"expected_generation": generation, "idempotency_key": "clear-stop", "inputs": {}},
-        )
-        assert stop.status_code == 200, stop.text
-        release_first.set()
-        first.join(5)
-        second.join(5)
-        assert not first.is_alive() and not second.is_alive()
-        assert responses[1].status_code == 200, responses[1].text
-        history = client.get("/operator/actions/history?limit=10").json()
-        by_key = {row["idempotency_key"]: row for row in history["receipts"]}
-        cleared = by_key["clear-second"]
-        assert cleared["status"] == "cleared", cleared
-        assert cleared.get("cleared_at") is not None
-        queue = client.get("/operator/dashboard").json()["successive_move_queue"]
-        assert "x" not in queue or queue["x"]["depth"] == 0
-
-
-def test_queued_precheck_rejection_leaves_no_ghost_entry(tmp_path, monkeypatch):
-    import threading
-    import time as _time
-
-    app, calls = make_app(tmp_path, monkeypatch)
-    release_first = threading.Event()
-    first_entered = threading.Event()
-
-    async def blocker():
-        first_entered.set()
-        await asyncio.to_thread(release_first.wait, 5)
-
-    app.state.operator_test_x_move_steps_blocker = blocker
-    with TestClient(app) as client:
-        catalog = client.get("/operator/control-catalog").json()
-        generation = catalog["ownership_generation"]
-        responses: list = []
-
-        def invoke(key: str):
-            responses.append(
-                client.post(
-                    "/operator/actions/oem.x.move_steps",
-                    json={"expected_generation": generation, "idempotency_key": key, "inputs": {"steps": 100}},
-                )
-            )
-
-        first = threading.Thread(target=invoke, args=("ghost-first",))
-        first.start()
-        assert first_entered.wait(5), "first move provider never entered"
-        second = threading.Thread(target=invoke, args=("ghost-second",))
-        second.start()
-        _time.sleep(0.3)
-        lifecycle = app.state.operator_test_lifecycle
-        lifecycle["operation_state"] = "emergency"
-        third = client.post(
+        response = client.post(
             "/operator/actions/oem.x.move_steps",
-            json={"expected_generation": generation, "idempotency_key": "ghost-third", "inputs": {"steps": 100}},
+            json={
+                "expected_generation": catalog["ownership_generation"],
+                "idempotency_key": idempotency_key,
+                "inputs": {"steps": 100},
+            },
         )
-        assert third.status_code == 409, third.text  # queued-path pre-check rejects
-        lifecycle["operation_state"] = "stopped"  # restore before the queued second dispatches
-        release_first.set()
-        first.join(5)
-        second.join(5)
-        assert not first.is_alive() and not second.is_alive()
-        assert responses[0].status_code == 200, responses[0].text
-        assert responses[1].status_code == 200, responses[1].text
-        queue = client.get("/operator/dashboard").json()["successive_move_queue"]
-        assert "x" not in queue or queue["x"]["depth"] == 0, queue  # no ghost at head
-        lifecycle["operation_state"] = "stopped"
-        fourth: list = []
-
-        def invoke_fourth():
-            fourth.append(
-                client.post(
-                    "/operator/actions/oem.x.move_steps",
-                    json={"expected_generation": generation, "idempotency_key": "ghost-fourth", "inputs": {"steps": 100}},
-                )
-            )
-
-        four = threading.Thread(target=invoke_fourth)
-        four.start()
-        four.join(5)
-        assert not four.is_alive(), "axis stalled behind a ghost entry"
-        assert fourth[0].status_code == 200, fourth[0].text  # dispatches immediately, no stall
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["error"] == "canonical_xz_action_requires_v2_route"
+    assert detail["replacement_action_id"] == "oem.x.move_steps"
+    assert detail["required_schema"] == "bioxp.operator_action_request.v2"
+    assert calls == []

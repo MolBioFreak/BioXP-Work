@@ -19,7 +19,13 @@ from src.bioxp.pipette.models import (
     PipetteTipCommand,
     PipetteTipStateError,
 )
+from src.bioxp.operator_receipt_store import OperatorReceiptStore
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
+from src.bioxp.hardware_status import hardware_state
+from src.bioxp.pipette.receipts import PipetteReceiptStore
+import src.bioxp.pipette.receipts as pipette_receipts
 from src.bioxp.pipette.transport import CanPipetteTransport
+import src.bioxp.operator_controls as operator_controls
 from src.bioxp.services.pipette_service import (
     run_pipette_aspirate_command,
     run_pipette_dispense_command,
@@ -28,6 +34,37 @@ from src.bioxp.services.pipette_service import (
     run_pipette_status,
     run_pipette_tip_command,
 )
+
+
+@pytest.fixture(autouse=True)
+def verified_release_authority(monkeypatch):
+    monkeypatch.setattr(pipette_receipts, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+    monkeypatch.setattr(pipette_receipts, "current_authority_identity", lambda: {
+        "evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64,
+    })
+    monkeypatch.setattr(pipette_receipts, "current_registry_sha256", lambda: "4" * 64)
+
+
+def _prepare(root):
+    owner = OEMRuntimeStore(root)
+    owner.close()
+
+
+def _operator_store(root):
+    _prepare(root)
+    store = OperatorReceiptStore(root)
+    store.converge_startup_state()
+    return store
+
+
+def _pipette_store(root):
+    _prepare(root)
+    return PipetteReceiptStore(root)
 
 
 class FakeTransport:
@@ -144,6 +181,143 @@ def test_run_pipette_status_uses_transport_snapshot():
 
     assert result["transport"] == "fake"
     assert transport.calls == [("status", None)]
+
+
+def test_operator_pipette_dispatch_attaches_child_without_reclaiming_outer_digest(tmp_path):
+    outer_store = _operator_store(tmp_path)
+    outer, created = outer_store.claim(
+        {
+            "command_id": "operator-pipette-1",
+            "idempotency_key": "operator-pipette-key-1",
+            "action_id": "operator.pipette.status",
+            "operation": "operator_action",
+            "entrypoint_id": "operator.relay",
+            "caller_class": "operator",
+            "control_class": "service",
+            "ownership_generation": int(hardware_state.ownership_epoch),
+            "requested_inputs": {"channels": [0, 1, 2, 3]},
+            "status": "queued",
+        }
+    )
+    assert created is True
+    outer_before = outer_store.connection.execute(
+        "SELECT canonical_request_sha256,receipt_json FROM operator_commands WHERE command_id=?",
+        (outer["command_id"],),
+    ).fetchone()
+    digest_before = outer_before["canonical_request_sha256"]
+    receipt_before = outer_before["receipt_json"]
+    pipette_store = _pipette_store(tmp_path)
+    transport = FakeTransport()
+    token = operator_controls._DISPATCH_CONTEXT.set(
+        {
+            "operator_command_id": outer["command_id"],
+            "idempotency_key": "operator-pipette-key-1",
+            "expected_ownership_generation": int(hardware_state.ownership_epoch),
+            "entrypoint_id": "operator.relay",
+            "caller_class": "operator",
+            "action_id": "operator.pipette.status",
+        }
+    )
+    try:
+        result = asyncio.run(
+            run_pipette_status(
+                get_transport=lambda: transport,
+                run_blocking=_fake_run_blocking,
+                receipt_store=pipette_store,
+            )
+        )
+    finally:
+        operator_controls._DISPATCH_CONTEXT.reset(token)
+    outer_after = outer_store.connection.execute(
+        "SELECT canonical_request_sha256,status,receipt_json FROM operator_commands WHERE command_id=?",
+        (outer["command_id"],),
+    ).fetchone()
+    replay = outer_store.by_command(outer["command_id"], include_evidence=False)
+    child_count = outer_store.connection.execute(
+        "SELECT COUNT(*) FROM pipette_operations WHERE command_id=?",
+        (outer["command_id"],),
+    ).fetchone()[0]
+    assert result["command_id"] == outer["command_id"]
+    assert outer_after["canonical_request_sha256"] == digest_before
+    assert outer_after["receipt_json"] == receipt_before
+    assert replay is not None
+    assert replay["action_id"] == "operator.pipette.status"
+    assert replay["requested_inputs"] == {"channels": [0, 1, 2, 3]}
+    assert replay["ownership_generation"] == int(hardware_state.ownership_epoch)
+    assert replay["status"] == outer_after["status"]
+    assert child_count == 1
+    assert transport.calls == [("status", None)]
+
+
+def test_exact_direct_replay_returns_durable_pipette_receipt_without_redispatch(tmp_path):
+    store = _pipette_store(tmp_path)
+    transport = FakeTransport()
+    binding = {
+        "command_id": "direct-pipette-replay-1",
+        "idempotency_key": "direct-pipette-replay-key-1",
+        "ownership_generation": int(hardware_state.ownership_epoch),
+    }
+    first = asyncio.run(
+        run_pipette_status(
+            get_transport=lambda: transport,
+            run_blocking=_fake_run_blocking,
+            receipt_store=store,
+            runtime_binding=binding,
+        )
+    )
+    replay = asyncio.run(
+        run_pipette_status(
+            get_transport=lambda: transport,
+            run_blocking=_fake_run_blocking,
+            receipt_store=store,
+            runtime_binding=binding,
+        )
+    )
+    assert replay["replayed"] is True
+    assert replay["command_id"] == first["command_id"]
+    assert transport.calls == [("status", None)]
+
+
+def test_ambiguous_blocking_timeout_persists_outcome_unknown_and_forbids_retry(tmp_path):
+    store = _pipette_store(tmp_path)
+
+    async def ambiguous_runner(label, func, timeout_s=30.0):
+        del label, func, timeout_s
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "tester_operation_completion_ambiguous",
+                "completion_ambiguous": True,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
+            },
+        )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            run_pipette_status(
+                get_transport=FakeTransport,
+                run_blocking=ambiguous_runner,
+                receipt_store=store,
+                runtime_binding={
+                    "command_id": "ambiguous-pipette-1",
+                    "idempotency_key": "ambiguous-pipette-key-1",
+                    "ownership_generation": int(hardware_state.ownership_epoch),
+                },
+            )
+        )
+    assert exc_info.value.status_code == 504
+    operation = store.connection.execute(
+        "SELECT status,outcome FROM pipette_operations WHERE command_id=?",
+        ("ambiguous-pipette-1",),
+    ).fetchone()
+    outer = store.connection.execute(
+        "SELECT status,outcome FROM operator_commands WHERE command_id=?",
+        ("ambiguous-pipette-1",),
+    ).fetchone()
+    assert tuple(operation) == ("outcome_unknown", "outcome_unknown")
+    assert tuple(outer) == ("outcome_unknown", "outcome_unknown")
 
 
 def test_run_pipette_aspirate_command_delegates_to_transport():

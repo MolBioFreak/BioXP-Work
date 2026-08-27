@@ -99,39 +99,7 @@ class ReferenceStateStore:
             "canonical_json", 1, lambda value: json.dumps(json.loads(str(value)), sort_keys=True, separators=(",", ":")), deterministic=True
         )
         connection.execute("PRAGMA busy_timeout=2000")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS reference_state_authority (
-                authority_key TEXT PRIMARY KEY CHECK(authority_key='reference_state'),
-                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-                payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
-                updated_at REAL NOT NULL
-            ) WITHOUT ROWID;
-            DROP TRIGGER IF EXISTS reference_state_authority_coherence_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_authorized_insert_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_authorized_update_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_no_delete_v1;
-            CREATE TRIGGER reference_state_authority_coherence_v1
-            BEFORE INSERT ON reference_state_authority
-            WHEN NEW.payload_json<>canonical_json(NEW.payload_json)
-              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
-            BEGIN SELECT RAISE(ABORT,'reference authority bytes are incoherent'); END;
-            CREATE TRIGGER reference_state_authority_authorized_insert_v1
-            BEFORE INSERT ON reference_state_authority
-            WHEN reference_write_allowed()<>1
-            BEGIN SELECT RAISE(ABORT,'reference authority writer is not authoritative'); END;
-            CREATE TRIGGER reference_state_authority_authorized_update_v1
-            BEFORE UPDATE ON reference_state_authority
-            WHEN reference_write_allowed()<>1
-              OR NEW.authority_key IS NOT OLD.authority_key
-              OR NEW.payload_json<>canonical_json(NEW.payload_json)
-              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
-            BEGIN SELECT RAISE(ABORT,'reference authority update is not authoritative'); END;
-            CREATE TRIGGER reference_state_authority_no_delete_v1
-            BEFORE DELETE ON reference_state_authority
-            BEGIN SELECT RAISE(ABORT,'reference authority cannot be deleted'); END;
-            """
-        )
+
         expected_columns = (
             ("authority_key", "TEXT", 1, 1),
             ("payload_json", "TEXT", 1, 0),

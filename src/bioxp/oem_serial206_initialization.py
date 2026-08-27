@@ -799,7 +799,7 @@ class Serial206ProductionPrimitiveAdapter:
         return {
             "ok": False,
             "axis": "x",
-            "intent": "reconcile_switch_masks",
+            "intent": "verify_switch_masks",
             "source_exact": False,
             "retired": True,
             "physical_motion_commanded": False,
@@ -1218,7 +1218,7 @@ class Serial206ProductionPrimitiveAdapter:
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_prepare_result_not_mapping"}
         if result.get("ok") is True:
             self._x_profile_overrides.clear()
-        result.update({"axis": "x", "physical_motion": False, "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195", "source_exact": True, "literal_switch_mask_writes": []})
+        result.update({"axis": "x", "physical_motion": False, "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195", "source_exact": False, "initializer_source_exact": True, "literal_switch_mask_writes": []})
         return result
 
     def x_set_home(self) -> dict[str, Any]:
@@ -2286,18 +2286,28 @@ class Serial206ProductionPrimitiveAdapter:
         runner = self.pipette_audit_runner
         if not callable(runner):
             raise RuntimeError("pipette_audit_runner_not_bound")
+        attempt = getattr(self, "_lifecycle_pipette_attempt", None)
+        if not isinstance(attempt, Mapping):
+            raise RuntimeError("lifecycle_pipette_attempt_identity_not_bound")
         return runner(
             operation_name,
             operation,
             requested_inputs=dict(requested_inputs or {}),
             lifecycle_stage_id=lifecycle_stage_id,
+            lifecycle_attempt_id=str(attempt["approval_id"]),
+            lifecycle_idempotency_key=str(attempt["idempotency_key"]),
         )
 
-    def query_tip_status(self) -> dict[str, Any]:
+    def query_tip_status(
+        self,
+        *,
+        operation_name: str = "query_tip_status",
+        lifecycle_stage_id: str = "serial206.query_tip_status",
+    ) -> dict[str, Any]:
         raw = self._run_audited_pipette(
-            "query_tip_status",
+            operation_name,
             lambda transport: transport.query_tip_status_all(),
-            lifecycle_stage_id="serial206.query_tip_status",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
         rows = raw.get("channels") if isinstance(raw, Mapping) else None
         if not isinstance(rows, list) or len(rows) != 4:
@@ -2308,8 +2318,15 @@ class Serial206ProductionPrimitiveAdapter:
         self._last_tip_channels = [index for index, loaded in enumerate(channels) if loaded]
         return {"ok": True, "channels": channels, "controller_evidence": _json_safe(raw)}
 
-    def query_all_pipette_tip_states(self) -> dict[str, Any]:
-        result = self.query_tip_status()
+    def query_all_pipette_tip_states(
+        self,
+        *,
+        lifecycle_stage_id: str = "serial206.query_all_pipette_tip_states",
+    ) -> dict[str, Any]:
+        result = self.query_tip_status(
+            operation_name="query_all_pipette_tip_states",
+            lifecycle_stage_id=lifecycle_stage_id,
+        )
         channels = result.get("channels")
         loaded = [index for index, value in enumerate(channels or []) if value is True]
         return {
@@ -2363,20 +2380,30 @@ class Serial206ProductionPrimitiveAdapter:
             lifecycle_stage_id="serial206.initiate_pipette_group",
         )
 
-    def initiate_pipette_group_for_oem_initialize_motion(self, *, cycle: str) -> Any:
+    def initiate_pipette_group_for_oem_initialize_motion(
+        self,
+        *,
+        cycle: str,
+        lifecycle_stage_id: str,
+    ) -> Any:
         return self._run_audited_pipette(
             "initialize_group",
             lambda transport: transport.initiate_group_once_for_oem_initialize_motion(cycle=cycle),
             requested_inputs={"cycle": cycle},
-            lifecycle_stage_id="serial206.initiate_pipette_group_for_oem_initialize_motion",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
 
-    def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> Any:
+    def checked_pipette_status_for_oem_initialize_motion(
+        self,
+        *,
+        attempt: str,
+        lifecycle_stage_id: str,
+    ) -> Any:
         return self._run_audited_pipette(
             "checked_status",
             lambda transport: transport.checked_pipette_status_for_oem_initialize_motion(attempt=attempt),
             requested_inputs={"attempt": attempt},
-            lifecycle_stage_id="serial206.checked_pipette_status_for_oem_initialize_motion",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
 
     @staticmethod
@@ -2630,11 +2657,28 @@ class Serial206ProductionPrimitiveAdapter:
         tip_loaded: bool | None = None,
         plate_on_gantry: int | None = None,
         location19_y: int | None = None,
+        interrupt_reason: Callable[[], str | None] | None = None,
     ) -> dict[str, Any]:
         """Literal ClassControlInterface.moveTo branch ordering."""
         pseudo = int(pseudo_home_steps)
         target = {"x": int(x), "y": int(y), "z": int(z)}
         results: list[dict[str, Any]] = []
+
+        def interrupted(stage: str, branch: str | None = None) -> dict[str, Any] | None:
+            reason = interrupt_reason() if callable(interrupt_reason) else None
+            if not isinstance(reason, str) or not reason:
+                return None
+            return {
+                "ok": False,
+                "source_return_code": 1,
+                "branch": branch or "interrupted",
+                "target": target,
+                "pseudo_z_home": pseudo,
+                "operations": _json_safe(results),
+                "failure": reason,
+                "interrupted_before_stage": stage,
+                "source_anchor": "ClassControlInterface.moveTo:4463-4620",
+            }
 
         def home_axis(axis: str, speed: int) -> dict[str, Any]:
             profile = self._axis_profile(axis)
@@ -2679,7 +2723,13 @@ class Serial206ProductionPrimitiveAdapter:
                     "axis": axis, "target": effective, "set_acc": _json_safe(set_acc),
                     "move": _json_safe(move), "restore_acc": _json_safe(restore)}
 
-        def run_pair(first: Callable[[], dict[str, Any]], second: Callable[[], dict[str, Any]], delay_s: float) -> list[dict[str, Any]]:
+        def run_pair(
+            first: Callable[[], dict[str, Any]],
+            second: Callable[[], dict[str, Any]],
+            delay_s: float,
+            *,
+            second_stage: str,
+        ) -> list[dict[str, Any]]:
             first_result: list[dict[str, Any]] = []
             first_error: list[BaseException] = []
             started = threading.Event()
@@ -2693,19 +2743,27 @@ class Serial206ProductionPrimitiveAdapter:
             thread.start()
             started.wait()
             time.sleep(delay_s)
-            second_result = second()
+            interruption = interrupted(second_stage)
+            second_result = interruption if interruption is not None else second()
             thread.join()
             if first_error:
                 raise first_error[0]
             return first_result + [second_result]
 
         if target == {"x": 0, "y": 0, "z": 0}:
+            interruption = interrupted("all_zero_z_home", "all_zero_home")
+            if interruption is not None:
+                return interruption
             z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
             xy_results: dict[str, Any] = {}
             xy_errors: list[str] = []
 
             def home_xy_axis(axis: str, speed: int) -> None:
                 try:
+                    interruption = interrupted(f"all_zero_{axis}_home", "all_zero_home")
+                    if interruption is not None:
+                        xy_results[axis] = interruption
+                        return
                     if axis == "x":
                         xy_results[axis] = self.x_move_to_origin_home(timeout_s=float(wait_timeout_s))
                     else:
@@ -2773,6 +2831,9 @@ class Serial206ProductionPrimitiveAdapter:
 
         current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
         if current["z"] > pseudo:
+            interruption = interrupted("z_clearance")
+            if interruption is not None:
+                return interruption
             results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
         x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
         y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
@@ -2781,38 +2842,76 @@ class Serial206ProductionPrimitiveAdapter:
             return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
 
         if gripper_confirmed and not tip_loaded:
+            interruption = interrupted("move_xy")
+            if interruption is not None:
+                return interruption
             results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0))
             branch = "confirmed_gripper_no_tip_moveXY"
         elif target["y"] < current["y"] or target["y"] < 46800:
             if plate_on_gantry in {4, 5}:
                 if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
+                    interruption = interrupted("plate_clear_y", "descending_y_loaded_plate")
+                    if interruption is not None:
+                        return interruption
                     results.append(move_axis("y", plate_clear_y, y_acc))
+                interruption = interrupted("loaded_plate_x", "descending_y_loaded_plate")
+                if interruption is not None:
+                    return interruption
                 results.append(move_axis("x", target["x"], x_acc))
                 time.sleep(0.001)
+                interruption = interrupted("loaded_plate_y", "descending_y_loaded_plate")
+                if interruption is not None:
+                    return interruption
                 results.append(move_y_or_home())
                 branch = "descending_y_loaded_plate"
             elif run_in_parallel:
-                results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600))
+                interruption = interrupted("descending_parallel_x", "descending_y_parallel_x_first")
+                if interruption is not None:
+                    return interruption
+                results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600, second_stage="descending_parallel_y"))
                 branch = "descending_y_parallel_x_first"
             else:
-                results.extend((move_axis("x", target["x"], x_acc), move_y_or_home()))
+                interruption = interrupted("descending_sequential_x", "descending_y_sequential_x_first")
+                if interruption is not None:
+                    return interruption
+                results.append(move_axis("x", target["x"], x_acc))
+                interruption = interrupted("descending_sequential_y", "descending_y_sequential_x_first")
+                if interruption is not None:
+                    return interruption
+                results.append(move_y_or_home())
                 branch = "descending_y_sequential_x_first"
         elif run_in_parallel:
-            results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300))
+            interruption = interrupted("parallel_y", "parallel_y_first")
+            if interruption is not None:
+                return interruption
+            results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300, second_stage="parallel_x"))
             branch = "parallel_y_first"
         else:
-            results.extend((move_y_or_home(), move_axis("x", target["x"], x_acc)))
+            interruption = interrupted("sequential_y", "sequential_y_first")
+            if interruption is not None:
+                return interruption
+            results.append(move_y_or_home())
+            interruption = interrupted("sequential_x", "sequential_y_first")
+            if interruption is not None:
+                return interruption
+            results.append(move_axis("x", target["x"], x_acc))
             branch = "sequential_y_first"
 
         time.sleep(0.001)
         time.sleep(0.001)
         if target["z"] > pseudo:
+            interruption = interrupted("final_z", branch)
+            if interruption is not None:
+                return interruption
             results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
         px, py = self._axis_profile("x"), self._axis_profile("y")
         restore = {
             "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
             "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
         }
+        interruption = interrupted("complete", branch)
+        if interruption is not None:
+            return {**interruption, "restore_acc": _json_safe(restore)}
         return {
             "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
             "source_return_code": 0,
@@ -4513,10 +4612,39 @@ class Serial206OemInitializationProvider:
             admitted_interrupt_epoch = self._x_interrupt_epoch
             if self._x_interrupt_active:
                 return {"ok": False, "axis": "x", "failure": "x_safety_interrupt_in_progress"}
+        admitted_z_interrupt_epoch: int | None = None
+        if selected == "move_to":
+            with self._z_interrupt_state_lock:
+                admitted_z_interrupt_epoch = self._z_interrupt_epoch
+                if self._z_interrupt_active:
+                    return {"ok": False, "axis": "xyz", "failure": "z_safety_interrupt_in_progress"}
+
+        def move_to_interrupt_reason() -> str | None:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
+                    return "x_intent_interrupted_by_safety_command"
+            with self._z_interrupt_state_lock:
+                if (
+                    admitted_z_interrupt_epoch is not None
+                    and (
+                        self._z_interrupt_active
+                        or admitted_z_interrupt_epoch != self._z_interrupt_epoch
+                    )
+                ):
+                    return "z_intent_interrupted_by_safety_command"
+            return None
+
         with self._lock:
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
                     return {"ok": False, "axis": "x", "failure": "x_intent_superseded_by_safety_interrupt"}
+            if selected == "move_to":
+                with self._z_interrupt_state_lock:
+                    if (
+                        self._z_interrupt_active
+                        or admitted_z_interrupt_epoch != self._z_interrupt_epoch
+                    ):
+                        return {"ok": False, "axis": "xyz", "failure": "z_intent_superseded_by_safety_interrupt"}
             try:
                 state = self._load_state()
             except Exception as exc:
@@ -4674,6 +4802,7 @@ class Serial206OemInitializationProvider:
                             plate_on_gantry=(None if values.get("plate_on_gantry") is None else int(values["plate_on_gantry"])),
                             location19_y=int(values.get("location19_y", 0)),
                             wait_timeout_s=float(values.get("wait_timeout_s", 30.0)),
+                            interrupt_reason=move_to_interrupt_reason,
                         )
                     elif selected == "set_max_speed":
                         result = self.primitives.x_set_max_speed(value=int(values.get("value", 0)))
@@ -4713,14 +4842,25 @@ class Serial206OemInitializationProvider:
                 and result.get("controller_terminal_state_verified") is True
             ) and result.get("reference_publication_required") is not True:
                 result.update({"ok": False, "failure": "x_home_evidence_not_verified"})
-            with self._x_interrupt_state_lock:
-                if admitted_interrupt_epoch != self._x_interrupt_epoch:
+            if selected == "move_to":
+                interruption = move_to_interrupt_reason()
+                if interruption is not None:
                     result = {
                         "ok": False,
-                        "failure": "x_intent_interrupted_by_safety_command",
+                        "failure": interruption,
                         "command_issued": result.get("command_issued", True),
-                        "interrupt_epoch": self._x_interrupt_epoch,
+                        "x_interrupt_epoch": self._x_interrupt_epoch,
+                        "z_interrupt_epoch": self._z_interrupt_epoch,
                     }
+            else:
+                with self._x_interrupt_state_lock:
+                    if admitted_interrupt_epoch != self._x_interrupt_epoch:
+                        result = {
+                            "ok": False,
+                            "failure": "x_intent_interrupted_by_safety_command",
+                            "command_issued": result.get("command_issued", True),
+                            "interrupt_epoch": self._x_interrupt_epoch,
+                        }
             current_generation = int(self.generation_provider())
             if current_generation != generation:
                 result = {
@@ -7891,7 +8031,7 @@ class Serial206OemInitializationProvider:
         if stage == "initializeMotion.thermal_door_closed":
             return {"ok": True, "value": False, "source_anchor": "ControlLib.initializeMotion:8804"}
         if stage == "initializeMotion.queryTipStatus.initial":
-            result = p.query_all_pipette_tip_states()
+            result = p.query_all_pipette_tip_states(lifecycle_stage_id=stage)
             return {
                 **dict(result),
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True and type(result.get("tip_exists")) is bool),
@@ -7954,7 +8094,7 @@ class Serial206OemInitializationProvider:
         if stage == "initializeMotion.moveX.tip_exists":
             return p.oem_initialize_motion_move_absolute("x", 79000, timeout_s=min(bounded, 45.0))
         if stage == "initializeMotion.queryTipStatus.after_eject":
-            result = p.query_all_pipette_tip_states()
+            result = p.query_all_pipette_tip_states(lifecycle_stage_id=stage)
             return {
                 **dict(result),
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True and type(result.get("tip_exists")) is bool),
@@ -7971,7 +8111,10 @@ class Serial206OemInitializationProvider:
             self.sleep(0.002)
             return {"ok": True, "slept_ms": 2, "source_anchor": "ControlLib.initializeMotion:8831"}
         if stage == "initializeMotion.initiateGroup.initial":
-            result = p.initiate_pipette_group_for_oem_initialize_motion(cycle="initializeMotion.initial")
+            result = p.initiate_pipette_group_for_oem_initialize_motion(
+                cycle="initializeMotion.initial",
+                lifecycle_stage_id=stage,
+            )
             return {
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
                 "group_reported_ok": result.get("ok") if isinstance(result, Mapping) else False,
@@ -7979,7 +8122,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8832",
             }
         if stage == "initializeMotion.checkedPipetteStatus.initial":
-            result = p.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
+            result = p.checked_pipette_status_for_oem_initialize_motion(
+                attempt="initial",
+                lifecycle_stage_id=stage,
+            )
             host_forceabort = state["machine_status"].get("forceabort")
             return {
                 "ok": isinstance(result, Mapping),
@@ -7989,7 +8135,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8833",
             }
         if stage == "initializeMotion.initiateGroup.retry":
-            result = p.initiate_pipette_group_for_oem_initialize_motion(cycle="initializeMotion.retry")
+            result = p.initiate_pipette_group_for_oem_initialize_motion(
+                cycle="initializeMotion.retry",
+                lifecycle_stage_id=stage,
+            )
             return {
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
                 "group_reported_ok": result.get("ok") if isinstance(result, Mapping) else False,
@@ -7997,7 +8146,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8835",
             }
         if stage == "initializeMotion.checkedPipetteStatus.retry":
-            result = p.checked_pipette_status_for_oem_initialize_motion(attempt="retry")
+            result = p.checked_pipette_status_for_oem_initialize_motion(
+                attempt="retry",
+                lifecycle_stage_id=stage,
+            )
             host_forceabort = state["machine_status"].get("forceabort")
             return {
                 "ok": isinstance(result, Mapping),

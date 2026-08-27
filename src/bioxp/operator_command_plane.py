@@ -33,7 +33,9 @@ from .operator_controls import (
     _MAX_INPUT_BYTES,
 )
 from .operator_receipt_store import runtime_state_root
-from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
+from .runtime_audit_store import runtime_write_coordinator
+from .oem_runtime_store import verify_canonical_runtime_database
+from .runtime_audit_store import open_runtime_connection
 
 COMMAND_SCHEMA = "bioxp.operator_command_request.v1"
 ACTION_REQUEST_SCHEMA = "bioxp.operator_action_request.v2"
@@ -76,8 +78,35 @@ METHOD_NONTERMINAL = frozenset({
 })
 
 ALLOWED_ACTIONS = frozenset({
+    "oem.x.prepare",
+    "oem.x.diagnostic_home_axis",
+    "oem.x.startup_home",
+    "oem.x.move_to_origin_home",
+    "oem.x.caught_plate_recovery_home",
+    "oem.x.set_home",
+    "oem.x.set_max_speed",
+    "oem.x.set_max_acc",
+    "oem.x.restore_original_speed",
+    "oem.x.set_stall_guard",
+    "oem.x.reconcile_switch_masks",
+    "oem.x.observe",
     "oem.z.manual_home",
+    "oem.z.prepare",
     "oem.z.clear",
+    "oem.z.diagnostic_home_axis",
+    "oem.z.resume_after_abort",
+    "oem.z.set_home",
+    "oem.z.move_z_home",
+    "oem.z.control",
+    "oem.z.path_clean_mode",
+    "oem.z.move_gz",
+    "oem.z.lower_pipette",
+    "oem.z.lift_pipette",
+    "oem.z.self_test",
+    "oem.z.reconcile_switch_masks",
+    "oem.z.scriptmove_to",
+    "oem.z.home_gz",
+    "oem.z.observe",
     "oem.z.move_steps",
     "oem.z.move_absolute",
     "oem.x.manual_panel_home",
@@ -94,15 +123,122 @@ INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all", "oem.z.abort",
 })
 CANONICAL_ACTIONS = ALLOWED_ACTIONS | INTERRUPT_ACTIONS
+XZ_NORMAL_ACTIONS = frozenset({
+    "oem.x.prepare",
+    "oem.x.diagnostic_home_axis",
+    "oem.x.startup_home",
+    "oem.x.move_to_origin_home",
+    "oem.x.caught_plate_recovery_home",
+    "oem.x.set_home",
+    "oem.x.set_max_speed",
+    "oem.x.set_max_acc",
+    "oem.x.restore_original_speed",
+    "oem.x.set_stall_guard",
+    "oem.x.reconcile_switch_masks",
+    "oem.x.observe",
+    "oem.z.manual_home",
+    "oem.z.prepare",
+    "oem.z.clear",
+    "oem.z.diagnostic_home_axis",
+    "oem.z.resume_after_abort",
+    "oem.z.set_home",
+    "oem.z.move_z_home",
+    "oem.z.control",
+    "oem.z.path_clean_mode",
+    "oem.z.move_gz",
+    "oem.z.lower_pipette",
+    "oem.z.lift_pipette",
+    "oem.z.self_test",
+    "oem.z.reconcile_switch_masks",
+    "oem.z.scriptmove_to",
+    "oem.z.home_gz",
+    "oem.z.observe",
+    "oem.z.move_steps",
+    "oem.z.move_absolute",
+    "oem.x.manual_panel_home",
+    "oem.x.move_steps",
+    "oem.x.move_absolute",
+
+})
+STRICT_METHOD_ACTIONS = frozenset({
+    "oem.xy.move_absolute",
+    "oem.xy.home",
+    "oem.xyz.move_to",
+})
+XZ_CANONICAL_ACTION_BY_TARGET_PATH = {
+    "/motion/oem/x/prepare": "oem.x.prepare",
+    "/motion/oem/x/manual_home": "oem.x.manual_panel_home",
+    "/motion/oem/x/diagnostic_home_axis": "oem.x.diagnostic_home_axis",
+    "/motion/oem/x/startup_home": "oem.x.startup_home",
+    "/motion/oem/x/move_to_origin_home": "oem.x.move_to_origin_home",
+    "/motion/oem/x/caught_plate_recovery_home": "oem.x.caught_plate_recovery_home",
+    "/motion/oem/x/set_home": "oem.x.set_home",
+    "/motion/oem/x/set_max_speed": "oem.x.set_max_speed",
+    "/motion/oem/x/set_max_acc": "oem.x.set_max_acc",
+    "/motion/oem/x/restore_original_speed": "oem.x.restore_original_speed",
+    "/motion/oem/x/set_stall_guard": "oem.x.set_stall_guard",
+    "/motion/oem/x/reconcile_switch_masks": "oem.x.reconcile_switch_masks",
+    "/motion/oem/x/observation": "oem.x.observe",
+    "/motion/oem/x/move_steps": "oem.x.move_steps",
+    "/motion/oem/x/move_absolute": "oem.x.move_absolute",
+    "/motion/oem/z/clear": "oem.z.clear",
+    "/motion/oem/z/prepare": "oem.z.prepare",
+    "/motion/oem/z/diagnostic_home_axis": "oem.z.diagnostic_home_axis",
+    "/motion/oem/z/resume_after_abort": "oem.z.resume_after_abort",
+    "/motion/oem/z/set_home": "oem.z.set_home",
+    "/motion/oem/z/move_z_home": "oem.z.move_z_home",
+    "/motion/oem/z/control": "oem.z.control",
+    "/motion/oem/z/path_clean_mode": "oem.z.path_clean_mode",
+    "/motion/oem/z/move_gz": "oem.z.move_gz",
+    "/motion/oem/z/lower_pipette": "oem.z.lower_pipette",
+    "/motion/oem/z/lift_pipette": "oem.z.lift_pipette",
+    "/motion/oem/z/self_test": "oem.z.self_test",
+    "/motion/oem/z/reconcile_switch_masks": "oem.z.reconcile_switch_masks",
+    "/motion/oem/pathing/scriptmove_execute": "oem.z.scriptmove_to",
+    "/motion/oem/home_gz": "oem.z.home_gz",
+    "/motion/oem/z/observation": "oem.z.observe",
+}
+XZ_CANONICAL_ACTION_BY_AXIS_TARGET = {
+    ("/motion/oem/manual/relative", "x"): "oem.x.move_steps",
+    ("/motion/oem/manual/relative", "z"): "oem.z.move_steps",
+    ("/motion/oem/manual/absolute", "x"): "oem.x.move_absolute",
+    ("/motion/oem/manual/absolute", "z"): "oem.z.move_absolute",
+    ("/motion/oem/manual/home", "x"): "oem.x.manual_panel_home",
+    ("/motion/oem/manual/home", "z"): "oem.z.manual_home",
+}
 AXIS_BY_ACTION = {
+    "oem.x.prepare": "x",
+    "oem.x.diagnostic_home_axis": "x",
+    "oem.x.startup_home": "x",
+    "oem.x.move_to_origin_home": "x",
+    "oem.x.caught_plate_recovery_home": "x",
+    "oem.x.set_home": "x",
+    "oem.x.set_max_speed": "x",
+    "oem.x.set_max_acc": "x",
+    "oem.x.restore_original_speed": "x",
+    "oem.x.set_stall_guard": "x",
+    "oem.x.reconcile_switch_masks": "x",
+    "oem.x.observe": "x",
     "oem.x.manual_panel_home": "x",
     "oem.x.move_steps": "x",
     "oem.x.move_absolute": "x",
-    "oem.y.manual_panel_home": "y",
-    "oem.y.move_steps": "y",
-    "oem.y.move_absolute": "y",
     "oem.y.stop": "y",
     "oem.z.manual_home": "z",
+    "oem.z.prepare": "z",
+    "oem.z.diagnostic_home_axis": "z",
+    "oem.z.resume_after_abort": "z",
+    "oem.z.set_home": "z",
+    "oem.z.move_z_home": "z",
+    "oem.z.control": "z",
+    "oem.z.path_clean_mode": "z",
+    "oem.z.move_gz": "z",
+    "oem.z.lower_pipette": "z",
+    "oem.z.lift_pipette": "z",
+    "oem.z.self_test": "z",
+    "oem.z.reconcile_switch_masks": "z",
+    "oem.z.scriptmove_to": "z",
+    "oem.z.home_gz": "z",
+    "oem.z.observe": "z",
     "oem.z.clear": "z",
     "oem.z.move_steps": "z",
     "oem.z.move_absolute": "z",
@@ -211,8 +347,35 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
     if type(inputs) is not dict:
         raise HTTPException(status_code=422, detail={"error": "inputs_must_be_object"})
     allowed: dict[str, set[str]] = {
+        "oem.x.prepare": set(),
+        "oem.x.diagnostic_home_axis": set(),
+        "oem.x.startup_home": set(),
+        "oem.x.move_to_origin_home": set(),
+        "oem.x.caught_plate_recovery_home": set(),
+        "oem.x.set_home": {"operator_ack"},
+        "oem.x.set_max_speed": {"value"},
+        "oem.x.set_max_acc": {"value"},
+        "oem.x.restore_original_speed": set(),
+        "oem.x.set_stall_guard": {"value"},
+        "oem.x.reconcile_switch_masks": {"confirm"},
+        "oem.x.observe": {"command_id", "verdict", "physical_motion_observed", "expected_direction_observed", "home_endpoint_observed", "stopped_observed", "note"},
         "oem.z.manual_home": set(),
+        "oem.z.prepare": set(),
         "oem.z.clear": set(),
+        "oem.z.diagnostic_home_axis": set(),
+        "oem.z.resume_after_abort": {"wait_timeout_s"},
+        "oem.z.set_home": {"operator_ack"},
+        "oem.z.move_z_home": {"wait_timeout_s", "rehome"},
+        "oem.z.control": {"operation", "value"},
+        "oem.z.path_clean_mode": {"enabled"},
+        "oem.z.move_gz": {"gripper_position_steps", "z_position_steps", "wait_timeout_s"},
+        "oem.z.lower_pipette": {"location_id", "overpress"},
+        "oem.z.lift_pipette": {"location_id"},
+        "oem.z.self_test": {"wait_timeout_s"},
+        "oem.z.reconcile_switch_masks": {"confirm"},
+        "oem.z.scriptmove_to": {"location_id", "column", "row", "positionflag", "run_in_parallel", "wait_timeout_s", "speed", "acc", "root_dir"},
+        "oem.z.home_gz": {"delay_s", "wait_timeout_s", "reason"},
+        "oem.z.observe": {"command_id", "verdict", "physical_motion_observed", "expected_direction_observed", "home_endpoint_observed", "stopped_observed", "note"},
         "oem.x.manual_panel_home": set(),
         "oem.y.manual_panel_home": set(),
 
@@ -224,15 +387,101 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
         "oem.y.move_absolute": {"target_steps"},
         "oem.xy.move_absolute": {"x", "y"},
         "oem.xy.home": set(),
+        "oem.xyz.move_to": {
+            "x",
+            "y",
+            "z",
+            "pseudo_z_home",
+            "run_in_parallel",
+            "gripper_confirmed",
+            "tip_loaded",
+            "plate_on_gantry",
+            "location19_y",
+        },
     }
     unknown = sorted(set(inputs) - allowed.get(action_id, set()))
     if unknown:
         raise HTTPException(status_code=422, detail={"error": "unknown_command_inputs", "unknown": unknown})
     result = dict(inputs)
+    if action_id in {"oem.x.reconcile_switch_masks", "oem.z.reconcile_switch_masks"}:
+        expected = (
+            "RECONCILE_X_SWITCH_MASKS"
+            if action_id == "oem.x.reconcile_switch_masks"
+            else "RECONCILE_Z_SWITCH_MASKS"
+        )
+        if result.get("confirm") != expected:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_switch_mask_confirmation", "required": expected},
+            )
+        return result
+    if action_id in {"oem.x.observe", "oem.z.observe"}:
+        for field in ("command_id", "note"):
+            value = result.get(field)
+            minimum = 1 if field == "command_id" else 3
+            maximum = 128 if field == "command_id" else 1000
+            if not isinstance(value, str) or not minimum <= len(value.strip()) <= maximum:
+                raise HTTPException(status_code=422, detail={"error": "invalid_observation_field", "field": field})
+            result[field] = value.strip()
+        if result.get("verdict") not in {"pass", "fail"}:
+            raise HTTPException(status_code=422, detail={"error": "invalid_observation_field", "field": "verdict"})
+        for field in ("physical_motion_observed", "expected_direction_observed", "home_endpoint_observed", "stopped_observed"):
+            if type(result.get(field)) is not bool:
+                raise HTTPException(status_code=422, detail={"error": "invalid_observation_field", "field": field})
+        return result
+    if action_id == "oem.z.scriptmove_to":
+        location_id = result.get("location_id")
+        if not isinstance(location_id, str) or not 1 <= len(location_id.strip()) <= 64:
+            raise HTTPException(status_code=422, detail={"error": "invalid_scriptmove_input", "field": "location_id"})
+        result["location_id"] = location_id.strip()
+        for field in ("column", "row", "positionflag", "speed", "acc"):
+            if field in result and result[field] is not None and type(result[field]) is not int:
+                raise HTTPException(status_code=422, detail={"error": "invalid_scriptmove_input", "field": field})
+        if "run_in_parallel" in result and type(result["run_in_parallel"]) is not bool:
+            raise HTTPException(status_code=422, detail={"error": "invalid_scriptmove_input", "field": "run_in_parallel"})
+        if "wait_timeout_s" in result and (type(result["wait_timeout_s"]) is not float or not 0.5 <= result["wait_timeout_s"] <= 120.0):
+            raise HTTPException(status_code=422, detail={"error": "invalid_scriptmove_input", "field": "wait_timeout_s"})
+        if "root_dir" in result and result["root_dir"] is not None and not isinstance(result["root_dir"], str):
+            raise HTTPException(status_code=422, detail={"error": "invalid_scriptmove_input", "field": "root_dir"})
+        return result
+    if action_id == "oem.z.home_gz":
+        reason = result.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise HTTPException(status_code=422, detail={"error": "invalid_home_gz_input", "field": "reason"})
+        result["reason"] = reason.strip()
+        if "delay_s" in result and (type(result["delay_s"]) is not int or not 0 <= result["delay_s"] <= 60):
+            raise HTTPException(status_code=422, detail={"error": "invalid_home_gz_input", "field": "delay_s"})
+        if "wait_timeout_s" in result and (type(result["wait_timeout_s"]) is not float or not 2.0 <= result["wait_timeout_s"] <= 60.0):
+            raise HTTPException(status_code=422, detail={"error": "invalid_home_gz_input", "field": "wait_timeout_s"})
+        return result
+    if action_id in {"oem.x.set_max_speed", "oem.x.set_max_acc", "oem.x.set_stall_guard"}:
+        if type(result.get("value")) is not int:
+            raise HTTPException(status_code=422, detail={"error": "invalid_profile_value", "field": "value"})
+        return result
+    if action_id == "oem.z.control":
+        if not isinstance(result.get("operation"), str) or not str(result["operation"]).strip():
+            raise HTTPException(status_code=422, detail={"error": "invalid_z_control_operation"})
+        if "value" in result and type(result["value"]) is not int:
+            raise HTTPException(status_code=422, detail={"error": "invalid_profile_value", "field": "value"})
+        return result
     if action_id == "oem.xy.move_absolute":
         for key in ("x", "y"):
             if type(result.get(key)) is not int or not -2_147_483_648 <= result[key] <= 2_147_483_647:
                 raise HTTPException(status_code=422, detail={"error": "invalid_xy_target", "field": key, "required": "signed int32"})
+        return result
+    if action_id == "oem.xyz.move_to":
+        for key in ("x", "y", "z", "pseudo_z_home", "location19_y"):
+            if key not in result and key == "location19_y":
+                result[key] = 0
+            if type(result.get(key)) is not int:
+                raise HTTPException(status_code=422, detail={"error": "invalid_xyz_target", "field": key})
+        for key in ("run_in_parallel", "gripper_confirmed", "tip_loaded"):
+            if key not in result:
+                result[key] = key == "run_in_parallel"
+            if type(result.get(key)) is not bool:
+                raise HTTPException(status_code=422, detail={"error": "invalid_xyz_option", "field": key})
+        if "plate_on_gantry" in result and result["plate_on_gantry"] is not None and type(result["plate_on_gantry"]) is not int:
+            raise HTTPException(status_code=422, detail={"error": "invalid_xyz_option", "field": "plate_on_gantry"})
         return result
     if action_id.endswith("move_steps"):
         steps = result.get("steps")
@@ -352,7 +601,10 @@ def _effective_inputs(action_id: str, inputs: Mapping[str, Any], state: Mapping[
 def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, int]:
     provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
     axis = AXIS_BY_ACTION.get(action_id)
-    if action_id.startswith("oem.xy.") and isinstance(provider, Mapping):
+    if (
+        action_id.startswith(("oem.xy.", "oem.xyz."))
+        or action_id == "oem.z.scriptmove_to"
+    ) and isinstance(provider, Mapping):
         epochs: dict[str, int] = {}
         x_authority = provider.get("x_authority")
         if isinstance(x_authority, Mapping):
@@ -675,7 +927,7 @@ class OperatorMethodRequestV1(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     schema_version: str = Field(pattern=r"^bioxp\.operator_method_request\.v1$")
     idempotency_key: str = Field(min_length=1, max_length=128)
-    method_action_id: str = Field(pattern=r"^oem\.xy\.(move_absolute|home)$")
+    method_action_id: str = Field(pattern=r"^oem\.(?:xy\.(?:move_absolute|home)|xyz\.move_to)$")
     expected_ownership_generation: StrictInt = Field(ge=0)
     expected_board_epoch_by_board: dict[str, StrictInt]
     inputs: dict[str, Any]
@@ -725,7 +977,7 @@ class OperatorCommandStore:
         self._interrupt_spool_path = self.root / "operator_interrupt_reconciliation.db"
         self._y_interrupt_fallback_path = self.root / "operator_y_interrupt_fallback.v2.jsonl"
         self._y_interrupt_fallback_lock_path = self.root / "operator_y_interrupt_fallback.v2.lock"
-        self._lock = threading.RLock()
+        self._lock = runtime_write_coordinator(self.root).lock
         self._priority_fence = threading.Event()
         self._axis_priority_fences = {axis: threading.Event() for axis in ("x", "y", "z")}
         self._interrupt_lock = threading.Lock()
@@ -741,35 +993,21 @@ class OperatorCommandStore:
         self.owner_id = uuid.uuid4().hex
         self._owner_acquired = False
         self._configure_interrupt_spool()
-        # Converge the legacy shared X/Y/Z fallback before opening the command
-        # plane. The owner-specific v2 Y fallback is imported below.
-        shared_importer = OEMRuntimeStore(self.root)
-        shared_importer.close()
         self.connection = sqlite3.connect(self.path, timeout=2.0, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._configure()
-        migrate_runtime_database_v2(self.connection, self.root)
-        governed_tables = tuple(sorted(_OPERATOR_RUNTIME_TABLES))
-        placeholders = ",".join("?" for _ in governed_tables)
-        existing_triggers = self.connection.execute(
-            f"SELECT name FROM sqlite_master WHERE type='trigger' AND (tbl_name LIKE 'operator_plane_%' OR tbl_name IN ({placeholders}))",
-            governed_tables,
-        ).fetchall()
-        for trigger_row in existing_triggers:
-            trigger_name = str(trigger_row[0]).replace('"', '""')
-            self.connection.execute(f'DROP TRIGGER "{trigger_name}"')
-        with self._authority_write():
-            self._schema()
+        verify_canonical_runtime_database(self.connection)
         self._authority_schema_version = int(self.connection.execute("PRAGMA schema_version").fetchone()[0])
-        self._import_y_interrupt_fallback()
+        self._import_interrupt_fallback()
         self._owner_acquired = self._acquire_owner()
         if self._owner_acquired:
             self._startup_recover()
 
     def append_y_interrupt_fallback(self, receipt: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
-        raise RuntimeError("SQLite persistence is required; JSONL interrupt fallback is retired")
+        """Compatibility wrapper for the original Y-only caller."""
+        return self.append_interrupt_fallback(receipt, reason=reason)
 
-    def _import_y_interrupt_fallback(self) -> None:
+    def _import_interrupt_fallback(self) -> None:
         lock_descriptor = os.open(self._y_interrupt_fallback_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             os.fchmod(lock_descriptor, 0o600)
@@ -790,13 +1028,14 @@ class OperatorCommandStore:
             rows = [json.loads(line) for line in pending.read_text(encoding="utf-8").splitlines() if line.strip()]
             with self._transaction() as conn:
                 for wrapper in rows:
-                    if not isinstance(wrapper, Mapping) or str(wrapper.get("stream") or "") != "y" or not isinstance(wrapper.get("receipt"), Mapping):
-                        raise RuntimeError("Y interrupt fallback contains an invalid command-plane row")
+                    stream = str(wrapper.get("stream") or "") if isinstance(wrapper, Mapping) else ""
+                    if stream not in {"x", "y", "z", "aggregate"} or not isinstance(wrapper.get("receipt"), Mapping):
+                        raise RuntimeError("interrupt fallback contains an invalid command-plane row")
                     receipt = dict(wrapper["receipt"])
                     source_wrapper_json = _canonical(wrapper)
                     attempt_id = str(receipt.get("interrupt_attempt_id") or "")
                     if not attempt_id:
-                        raise RuntimeError("Y interrupt fallback is missing interrupt_attempt_id")
+                        raise RuntimeError("interrupt fallback is missing interrupt_attempt_id")
                     key = f"interrupt-attempt:{attempt_id}"
                     fingerprint = _digest(receipt)
                     record_sha256 = hashlib.sha256(source_wrapper_json.encode("utf-8")).hexdigest()
@@ -809,11 +1048,11 @@ class OperatorCommandStore:
                         (key, fingerprint, _canonical(receipt), _now()),
                     ).rowcount
                     if inserted == 1:
-                        self._insert_transition(conn, event_kind="y_interrupt_fallback_imported", state="interrupted", payload={"interrupt_attempt_id": attempt_id, "persistence_state": "fsync_fallback"})
+                        self._insert_transition(conn, event_kind=f"{stream}_interrupt_fallback_imported", state="interrupted", payload={"interrupt_attempt_id": attempt_id, "persistence_state": "fsync_fallback"})
                     else:
                         existing = conn.execute("SELECT fingerprint FROM operator_plane_idempotency WHERE operation_kind='interrupt' AND idempotency_key=?", (key,)).fetchone()
                         if existing is None or str(existing["fingerprint"]) != fingerprint:
-                            raise RuntimeError("Y interrupt fallback identity conflicts with canonical command-plane persistence")
+                            raise RuntimeError("interrupt fallback identity conflicts with canonical command-plane persistence")
             archive = self.root / pending.name.replace(".pending.", ".imported.")
             os.replace(pending, archive)
             directory = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -2110,12 +2349,29 @@ class OperatorCommandStore:
         axis = AXIS_BY_ACTION.get(action_id)
         motor_by_axis = {"y": 0, "z": 1}
         composite_xy = action_id.startswith("oem.xy.")
-        axis_scope = "xy" if composite_xy else axis
-        board_scope = {"4": [0], "5": [0]} if composite_xy else ({"4": [motor_by_axis[axis]]} if axis in motor_by_axis else {})
+        composite_xyz = action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
+        axis_scope = "xyz" if composite_xyz else "xy" if composite_xy else axis
+        board_scope = (
+            {"4": [0, 1], "5": [0]}
+            if composite_xyz
+            else {"4": [0], "5": [0]}
+            if composite_xy
+            else {"4": [motor_by_axis[axis]]}
+            if axis in motor_by_axis
+            else {}
+        )
         canonical_hash = _digest(dict(inputs))
-        expected_epochs = dict(expected_board_epochs or {}) if axis in motor_by_axis or composite_xy else {}
+        expected_epochs = dict(expected_board_epochs or {}) if axis in motor_by_axis or composite_xy or composite_xyz else {}
         safety = conn.execute("SELECT x_epoch,y_epoch,z_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
-        interrupt_epochs = {"x": int(safety["x_epoch"]), "y": int(safety["y_epoch"])} if composite_xy else ({axis: int(safety[f"{axis}_epoch"])} if axis in {"x", "y", "z"} else {})
+        interrupt_epochs = (
+            {"x": int(safety["x_epoch"]), "y": int(safety["y_epoch"]), "z": int(safety["z_epoch"])}
+            if composite_xyz
+            else {"x": int(safety["x_epoch"]), "y": int(safety["y_epoch"])}
+            if composite_xy
+            else {axis: int(safety[f"{axis}_epoch"])}
+            if axis in {"x", "y", "z"}
+            else {}
+        )
         conn.execute(
             """
             INSERT INTO serial206_movement_commands(
@@ -2144,7 +2400,9 @@ class OperatorCommandStore:
                 accepted_at,
             ),
         )
-        if composite_xy:
+        if composite_xyz:
+            resources = ["axis:x", "axis:y", "axis:z", "motor:5:0", "motor:4:0", "motor:4:1"]
+        elif composite_xy:
             resources = ["axis:x", "axis:y", "motor:5:0", "motor:4:0"]
         elif axis in {"y", "z"}:
             resources = [f"axis:{axis}", f"motor:4:{motor_by_axis[axis]}"]
@@ -2238,7 +2496,13 @@ class OperatorCommandStore:
             },
         }
 
-    def admit_command(self, request: Mapping[str, Any], *, state: Mapping[str, Any]) -> dict[str, Any]:
+    def admit_command(
+        self,
+        request: Mapping[str, Any],
+        *,
+        state: Mapping[str, Any],
+        assessment: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         action_id = str(request.get("action_id") or "")
         if action_id not in ALLOWED_ACTIONS:
             raise HTTPException(status_code=422, detail={"error": "action_not_allowed", "action_id": action_id})
@@ -2328,7 +2592,13 @@ class OperatorCommandStore:
         self._wake.set()
         return response
 
-    def admit_method(self, request: Mapping[str, Any], *, state: Mapping[str, Any]) -> dict[str, Any]:
+    def admit_method(
+        self,
+        request: Mapping[str, Any],
+        *,
+        state: Mapping[str, Any],
+        assessments: list[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         expected_generation = int(request["expected_ownership_generation"])
         requested_board_epochs = {
             str(key): int(value)
@@ -2886,10 +3156,13 @@ class OperatorCommandStore:
 
             attempt_id = str(uuid.uuid4())
             epoch = int(lane["dispatcher_epoch"])
-            action_axis = AXIS_BY_ACTION.get(str(row["action_id"]))
+            action_id = str(row["action_id"])
+            action_axis = AXIS_BY_ACTION.get(action_id)
             axis_epoch = (
-                int(safety["x_epoch"]) + int(safety["y_epoch"])
-                if str(row["action_id"]).startswith("oem.xy.")
+                int(safety["x_epoch"]) + int(safety["y_epoch"]) + int(safety["z_epoch"])
+                if action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
+                else int(safety["x_epoch"]) + int(safety["y_epoch"])
+                if action_id.startswith("oem.xy.")
                 else int(safety[{"x": "x_epoch", "y": "y_epoch", "z": "z_epoch"}.get(action_axis or "", "z_epoch")])
             )
             command_claimed = conn.execute(
@@ -3595,14 +3868,53 @@ class OperatorCommandPlane:
         self.store = OperatorCommandStore()
         self.router = APIRouter(prefix="/operator", tags=["operator-command-plane"])
         self._install_routes()
+
+    def start(self) -> None:
         self.store.start(self._dispatch_one)
 
     def is_canonical(self, action_id: str) -> bool:
         return action_id in CANONICAL_ACTIONS
 
+    def canonical_xz_target_action(self, action_id: str, inputs: Mapping[str, Any] | None = None) -> str | None:
+        """Map a normal X/Z target to the sole v2 action that may own it."""
+        if action_id in INTERRUPT_ACTIONS:
+            return None
+        if action_id in XZ_NORMAL_ACTIONS:
+            return action_id
+        target = self.dispatch.get(action_id)
+        if not isinstance(target, Mapping) or str(target.get("method") or "").upper() != "POST":
+            return None
+        path = str(target.get("path") or "").lower()
+        canonical_action_id = XZ_CANONICAL_ACTION_BY_TARGET_PATH.get(path)
+        if canonical_action_id is not None:
+            return canonical_action_id
+        effective = {**dict(target.get("fixed_inputs") or {}), **dict(inputs or {})}
+        axis = effective.get("axis")
+        body = effective.get("body")
+        if axis is None and isinstance(body, Mapping):
+            axis = body.get("axis")
+        return XZ_CANONICAL_ACTION_BY_AXIS_TARGET.get((path, str(axis or "").strip().lower()))
+
     def _state(self) -> dict[str, Any]:
         value = self.machine_state_provider()
         return dict(value) if isinstance(value, Mapping) else {}
+
+    def _current_assessment(
+        self,
+        action_id: str,
+        inputs: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        action = self.by_id.get(action_id)
+        if not isinstance(action, Mapping):
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "action_assessment_authority_unavailable", "action_id": action_id},
+            )
+        target = self.dispatch.get(action_id)
+        fixed_inputs = dict(target.get("fixed_inputs") or {}) if isinstance(target, Mapping) else {}
+        effective = _effective_inputs(action_id, {**fixed_inputs, **dict(inputs)}, state)
+        return _assess_action(action, state, effective)
 
     def _action_target(self, action_id: str) -> Mapping[str, Any]:
         target = self.dispatch.get(action_id)
@@ -3742,7 +4054,16 @@ class OperatorCommandPlane:
 
         @router.post("/commands")
         async def admit_command(request: CommandRequest) -> dict[str, Any]:
-            return await asyncio.to_thread(self.store.admit_command, request.model_dump(), state=self._state())
+            body = request.model_dump()
+            state = self._state()
+            action_id = str(body.get("action_id") or "")
+            assessment = self._current_assessment(action_id, dict(body.get("inputs") or {}), state)
+            return await asyncio.to_thread(
+                self.store.admit_command,
+                body,
+                state=state,
+                assessment=assessment,
+            )
 
         @router.post("/methods")
         async def admit_method(request: MethodRequest, http_request: Request) -> dict[str, Any]:
@@ -3753,7 +4074,19 @@ class OperatorCommandPlane:
                 raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
             if body_bytes is not None and body_bytes > 1_048_576:
                 raise HTTPException(status_code=413, detail="BioXP method document exceeds the 1 MiB limit")
-            return await asyncio.to_thread(self.store.admit_method, request.model_dump(), state=self._state())
+            body = request.model_dump()
+            state = self._state()
+            assessments: list[Mapping[str, Any]] = []
+            for step in body.get("steps", []):
+                action_id = str(step.get("action_id") or "")
+                assessment = self._current_assessment(action_id, dict(step.get("inputs") or {}), state)
+                assessments.extend([assessment] * int(step.get("repeat", 1)))
+            return await asyncio.to_thread(
+                self.store.admit_method,
+                body,
+                state=state,
+                assessments=assessments,
+            )
 
         @router.get("/commands/{command_id}")
         async def command_detail(command_id: str) -> dict[str, Any]:
@@ -3822,9 +4155,14 @@ class OperatorCommandPlane:
         assessment = _assess_action(self.by_id[action_id], state, effective)
         return {"action_id": action_id, "ownership_generation": int(state.get("ownership_generation") or 0), **assessment}
 
-    async def admit_strict_method(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    async def admit_strict_method(
+        self,
+        request: Mapping[str, Any],
+        *,
+        assessment: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         method_action_id = str(request.get("method_action_id"))
-        if method_action_id not in {"oem.xy.move_absolute", "oem.xy.home"}:
+        if method_action_id not in STRICT_METHOD_ACTIONS:
             raise HTTPException(status_code=404, detail="unknown v2 operator method")
         state = self._state()
         observed_generation = int(request.get("expected_ownership_generation") or 0)
@@ -3833,8 +4171,17 @@ class OperatorCommandPlane:
         actual_epochs = _active_board_epochs(state, method_action_id)
         expected_epochs: dict[str, int] = {}
         raw_inputs = dict(request.get("inputs") or {})
-        inputs = ({"x": raw_inputs.get("x_steps"), "y": raw_inputs.get("y_steps")} if method_action_id == "oem.xy.move_absolute" else raw_inputs)
+        inputs = (
+            {"x": raw_inputs.get("x_steps"), "y": raw_inputs.get("y_steps")}
+            if method_action_id == "oem.xy.move_absolute"
+            else raw_inputs
+        )
         validated_inputs = _validate_inputs(method_action_id, inputs)
+        current_assessment = assessment or self._current_assessment(
+            method_action_id,
+            validated_inputs,
+            state,
+        )
         generic = {
             "schema_version": "bioxp.operator_method_request.v1",
             "name": method_action_id,
@@ -3852,7 +4199,12 @@ class OperatorCommandPlane:
                 "board_epoch_policy": "observational_not_dispatch_fence",
             },
         }
-        return await asyncio.to_thread(self.store.admit_method, generic, state=state)
+        return await asyncio.to_thread(
+            self.store.admit_method,
+            generic,
+            state=state,
+            assessments=[current_assessment],
+        )
 
     async def invoke_internal_y_absolute(
         self,

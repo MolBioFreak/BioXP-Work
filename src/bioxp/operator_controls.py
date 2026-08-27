@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
@@ -21,7 +22,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from starlette.types import Message, Scope
 
 from .hardware_status import hardware_state
@@ -33,6 +34,7 @@ from .oem_full_lifecycle import (
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
 from .operator_receipt_store import OperatorReceiptStore
+from .release_identity import current_release_identity
 from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGE_KEYS
 from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
 
@@ -54,6 +56,7 @@ _MAX_RESPONSE_BYTES = 131_072
 _MAX_INTERNAL_RESPONSE_BYTES = 8_388_608
 _ACTION_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+_LINKED_FINALIZATION_KEY = "_bioxp_linked_pipette_finalization"
 
 
 class InvokeRequest(BaseModel):
@@ -75,6 +78,8 @@ class AssessmentRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=128)
     verdict: str
     note: str = Field(min_length=1, max_length=2000)
+    legal_hold: StrictBool | None = None
+    actor: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 # Keep the old import surface while replacing its full-document JSON behavior.
@@ -1024,6 +1029,16 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
 }
 
 
+_PRIVATE_METHOD_ACTION_IDS = frozenset({
+    "meta.home_xy",
+    "oem.xy.home",
+    "oem.xy.home_xy",
+    "oem.xy.move_absolute",
+    "oem.xy.move_xy",
+    "oem.xyz.move_to",
+})
+
+
 def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     document = app.openapi()
     actions: list[dict[str, Any]] = []
@@ -1191,6 +1206,11 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             label=label,
             description=description,
             source_anchor=source_anchor,
+            fixed_inputs=(
+                {"operator_ack": "MOVETO", "timeout_s": 120.0}
+                if action_id == "oem.xyz.move_to"
+                else None
+            ),
             required_provider_capability="initialize_motors",
         )
     y_semantic_actions = (
@@ -1305,6 +1325,22 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         description="Distinct source MoveZHome identity: set Z max current, then goHome(rehome=true, speed=1791).",
         source_anchor="ClassControlInterface.MoveZHome:4623-4632",
         fixed_inputs={"rehome": True},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.control",
+        path="/motion/oem/z/control",
+        label="OEM Z control",
+        description="Canonical typed Z control operation for the existing serial-206 provider route.",
+        source_anchor="ClassControlInterface.setMaxSpeed/setMaxAcc/restoreOriginalSpeed/setZaxisVmax/setZaxisCurrentmax",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.z.path_clean_mode",
+        path="/motion/oem/z/path_clean_mode",
+        label="OEM Z path clean mode",
+        description="Canonical typed clean-path mode for source-shaped moveTo/scriptmoveTo planning.",
+        source_anchor="ClassControlInterface.scriptmoveTo:3875-3903",
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -1645,9 +1681,6 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
     actions = [row for row in actions if not str(row.get("action_id", "")).startswith("oem.y.internal.")]
-    # Composite routes are private command-plane method targets. They are not
-    # direct operator actions, but strict admitted methods must still dispatch.
-    dispatch = {key: value for key, value in dispatch.items() if not key.startswith("oem.xyz.")}
     return actions, dispatch
 
 
@@ -1836,9 +1869,19 @@ def install_operator_control_plane(
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
+    private_method_by_id = {
+        str(row["action_id"]): row
+        for row in actions
+        if str(row.get("action_id", "")) in _PRIVATE_METHOD_ACTION_IDS
+    }
+    actions = [
+        row
+        for row in actions
+        if str(row.get("action_id", "")) not in _PRIVATE_METHOD_ACTION_IDS
+    ]
+    command_plane_actions = [*actions, *private_method_by_id.values()]
     by_id = {row["action_id"]: row for row in actions}
     store = OperatorReceiptStore()
-    store.reconcile_nonterminal_receipts()
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
@@ -1917,7 +1960,7 @@ def install_operator_control_plane(
     command_plane = OperatorCommandPlane(
         app,
         machine_state_provider=machine_state,
-        actions=actions,
+        actions=command_plane_actions,
         dispatch=dispatch,
     )
     app.state.operator_command_plane = command_plane
@@ -1943,6 +1986,38 @@ def install_operator_control_plane(
             default=str,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def replay_source_identity() -> dict[str, Any]:
+        release = current_release_identity()
+        if release.get("verified") is not True:
+            raise HTTPException(status_code=409, detail="verified release identity is required for replay")
+        source_value = release.get("source")
+        source = source_value if isinstance(source_value, Mapping) else {}
+        try:
+            source_authority = current_authority_identity()
+            registry_sha256 = current_registry_sha256()
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"serial-206 replay authority unavailable: {exc}") from exc
+        if source_authority.get("evidence_lock_identity_verified") is not True:
+            raise HTTPException(status_code=409, detail="verified serial-206 evidence-lock identity is required for replay")
+        return {
+            "robot_identity": os.getenv("BIOXP_ROBOT_IDENTITY", "serial206").strip() or "serial206",
+            "release_id": release.get("release_id") if isinstance(release.get("release_id"), str) else None,
+            "source_manifest_sha256": source.get("manifest_sha256") if isinstance(source.get("manifest_sha256"), str) else None,
+            "source_aggregate_sha256": source.get("aggregate_sha256") if isinstance(source.get("aggregate_sha256"), str) else None,
+            "release_verified": True,
+            "registry_sha256": registry_sha256,
+            "evidence_lock_sha256": source_authority.get("evidence_lock_sha256"),
+            "evidence_lock_identity_verified": True,
+        }
+
+    def verify_replay_source_identity(receipt: Mapping[str, Any]) -> None:
+        stored = receipt.get("source_identity")
+        if not isinstance(stored, Mapping):
+            raise HTTPException(status_code=409, detail="idempotency receipt source identity unavailable")
+        for key, expected_value in replay_source_identity().items():
+            if stored.get(key) != expected_value:
+                raise HTTPException(status_code=409, detail=f"idempotency receipt {key} is stale")
 
     def assessed_action(action: Mapping[str, Any], state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
         assessment = _assess_action(action, state, inputs)
@@ -2088,7 +2163,21 @@ def install_operator_control_plane(
         if not isinstance(payload, OperatorActionRequestV2):
             raise HTTPException(status_code=422, detail={"error": "action_request_schema_required"})
         state = machine_state()
-        result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=state)
+        action = by_id.get(action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
+        target = dispatch.get(action_id, {})
+        effective_inputs = {
+            **dict(target.get("fixed_inputs") or {}),
+            **dict(payload.inputs),
+        }
+        assessment = _assess_action(action, state, effective_inputs)
+        result = await asyncio.to_thread(
+            command_plane.store.admit_command,
+            {**payload.model_dump(), "action_id": action_id},
+            state=state,
+            assessment=assessment,
+        )
         admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
         return _v2_compact_receipt(admitted or result)
 
@@ -2133,6 +2222,9 @@ def install_operator_control_plane(
 
     @router.post("/v2/methods")
     async def submit_method_v2(payload: OperatorMethodRequestV1) -> dict[str, Any]:
+        method_action_id = str(payload.method_action_id)
+        if method_action_id not in private_method_by_id:
+            raise HTTPException(status_code=404, detail="unknown v2 operator method")
         method = await command_plane.admit_strict_method(payload.model_dump())
         return await _v2_method_receipt(method)
 
@@ -2204,14 +2296,26 @@ def install_operator_control_plane(
 
     @router.post("/actions/{action_id}/admission")
     async def action_admission(action_id: str, payload: AdmissionRequest) -> dict[str, Any]:
+        if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
+            raise HTTPException(status_code=404, detail="unknown operator action_id")
+        canonical_action_id = command_plane.canonical_xz_target_action(action_id, payload.inputs)
+        if canonical_action_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical_xz_action_requires_v2_route",
+                    "action_id": action_id,
+                    "replacement_action_id": canonical_action_id,
+                    "replacement_route": f"/operator/v2/actions/{canonical_action_id}",
+                    "required_schema": "bioxp.operator_action_request.v2",
+                },
+            )
         if command_plane.is_canonical(action_id):
             return await asyncio.to_thread(
                 command_plane.compat_admission,
                 action_id,
                 {"expected_generation": payload.expected_generation, "inputs": payload.inputs},
             )
-        if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
-            raise HTTPException(status_code=404, detail="unknown operator action_id")
         state = machine_state()
         if payload.expected_generation != int(state["ownership_generation"]):
             raise HTTPException(status_code=409, detail="ownership generation mismatch")
@@ -2264,6 +2368,11 @@ def install_operator_control_plane(
             raise HTTPException(status_code=409, detail="ownership generation mismatch")
         if payload.verdict not in {"pass", "fail"}:
             raise HTTPException(status_code=422, detail="verdict must be pass or fail")
+        if (payload.legal_hold is None) != (payload.actor is None):
+            raise HTTPException(
+                status_code=422,
+                detail="legal_hold and actor must be supplied together",
+            )
         if not _IDEMPOTENCY_RE.fullmatch(payload.idempotency_key):
             raise HTTPException(status_code=422, detail="invalid idempotency_key")
         row = await asyncio.to_thread(store.by_command, command_id)
@@ -2278,16 +2387,21 @@ def install_operator_control_plane(
                     "authority_receipt_id": row.get("authority_receipt_id") or command_id,
                 },
             )
-        row = dict(row)
-        row["operator_assessment"] = payload.verdict
-        row["operator_note"] = payload.note.strip()
-        if payload.verdict == "pass" and row.get("safety_class") == "motion":
-            row["physical_effect_verified"] = True
-        elif payload.verdict == "fail":
-            row["physical_effect_verified"] = False
-        row["operator_assessment_idempotency_key"] = payload.idempotency_key
-        row["operator_assessed_at"] = time.time()
-        return await asyncio.to_thread(store.put, row)
+        try:
+            return await asyncio.to_thread(
+                store.assess,
+                command_id,
+                expected_generation=payload.expected_generation,
+                verdict=payload.verdict,
+                note=payload.note,
+                idempotency_key=payload.idempotency_key,
+                legal_hold=payload.legal_hold,
+                actor=payload.actor,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="operator action receipt not found") from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/actions/{action_id}")
     async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
@@ -2296,11 +2410,38 @@ def install_operator_control_plane(
                 return await command_plane.invoke_y_interrupt(payload.model_dump())
             if action_id not in {"oem.x.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
                 raise HTTPException(status_code=404, detail="unknown X/Z interrupt action_id")
-            return await command_plane.compat_invoke(action_id, payload.model_dump())
+            return await command_plane.invoke_xz_interrupt(action_id, payload.model_dump())
+        if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
+            raise HTTPException(status_code=404, detail="unknown operator action_id")
+        canonical_action_id = command_plane.canonical_xz_target_action(action_id, payload.inputs)
+        if canonical_action_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical_xz_action_requires_v2_route",
+                    "action_id": action_id,
+                    "replacement_action_id": canonical_action_id,
+                    "replacement_route": f"/operator/v2/actions/{canonical_action_id}",
+                    "required_schema": "bioxp.operator_action_request.v2",
+                },
+            )
         if isinstance(payload, OperatorActionRequestV2):
             if not command_plane.is_canonical(action_id):
                 raise HTTPException(status_code=404, detail="unknown normal v2 operator action_id")
-            result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=machine_state())
+            state = machine_state()
+            action = by_id[action_id]
+            target = dispatch.get(action_id, {})
+            effective_inputs = {
+                **dict(target.get("fixed_inputs") or {}),
+                **dict(payload.inputs),
+            }
+            assessment = _assess_action(action, state, effective_inputs)
+            result = await asyncio.to_thread(
+                command_plane.store.admit_command,
+                {**payload.model_dump(), "action_id": action_id},
+                state=state,
+                assessment=assessment,
+            )
             admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
             return _v2_compact_receipt(admitted or result)
         if command_plane.is_canonical(action_id):
@@ -2315,17 +2456,35 @@ def install_operator_control_plane(
                 },
             )
         request_received_at = time.time()
-        if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
-            raise HTTPException(status_code=404, detail="unknown operator action_id")
         if not _IDEMPOTENCY_RE.fullmatch(payload.idempotency_key):
             raise HTTPException(status_code=422, detail="invalid idempotency_key")
-        expected = int(hardware_state.ownership_epoch)
-        if payload.expected_generation != expected:
-            raise HTTPException(status_code=409, detail="ownership generation mismatch")
         encoded_inputs = json.dumps(payload.inputs, default=str, separators=(",", ":")).encode()
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
         action = by_id[action_id]
+        existing = await asyncio.to_thread(
+            store.by_idempotency,
+            payload.idempotency_key,
+            include_evidence=False,
+        )
+        if existing is not None:
+            if existing.get("action_id") != action_id or existing.get(
+                "requested_inputs", existing.get("inputs")
+            ) != payload.inputs:
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency_key already bound to different action request",
+                )
+            if int(existing.get("ownership_generation", -1)) != payload.expected_generation:
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency receipt ownership generation mismatch",
+                )
+            verify_replay_source_identity(existing)
+            return existing
+        expected = int(hardware_state.ownership_epoch)
+        if payload.expected_generation != expected:
+            raise HTTPException(status_code=409, detail="ownership generation mismatch")
         is_safety_interrupt = action_id in {
             "meta.emergency_stop",
             "oem.x.stop",
@@ -2410,26 +2569,101 @@ def install_operator_control_plane(
                     },
                 )
         effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
+        command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
+        started = time.time()
+        receipt = {
+            "schema_version": RECEIPT_SCHEMA,
+            "command_id": command_id,
+            "action_id": action_id,
+            "kind": action["kind"],
+            "safety_class": action["safety_class"],
+            "status": "admission_pending",
+            "idempotency_key": payload.idempotency_key,
+            "idempotency_replay_enabled": not is_safety_interrupt,
+            "ownership_generation": payload.expected_generation,
+            "authority_fingerprint": replay_authority_fingerprint(machine_state()),
+            "source_identity": replay_source_identity(),
+            "started_at": str(started),
+            "request_received_at": request_received_at,
+            "lock_acquired_at": None,
+            "admission_completed_at": None,
+            "provider_entry_at": None,
+            "provider_returned_at": None,
+            "finished_at": None,
+            "duration_ms": None,
+            "remote_acknowledged": False,
+            "controller_acknowledged": False,
+            "physical_effect_verified": False,
+            "machine_assessment": "unverified",
+            "operator_assessment": None,
+            "operator_note": None,
+            "requested_inputs": _bounded_json(payload.inputs, _MAX_INPUT_BYTES),
+            "inputs": _bounded_json(effective_inputs, _MAX_INPUT_BYTES),
+            "response": None,
+            "error": None,
+            "stage_receipts": [],
+        }
+        claim_expected_status: str | None = None
+        if not is_safety_interrupt:
+            claimed, created = await asyncio.to_thread(store.claim, receipt)
+            if not created:
+                if claimed.get("action_id") != action_id or claimed.get(
+                    "requested_inputs", claimed.get("inputs")
+                ) != payload.inputs:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency_key already bound to different action request",
+                    )
+                if int(claimed.get("ownership_generation", -1)) != payload.expected_generation:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency receipt ownership generation mismatch",
+                    )
+                verify_replay_source_identity(claimed)
+                return claimed
+            claim_expected_status = str(claimed["status"])
+
+        async def persist_pre_dispatch_rejection(detail: Any) -> None:
+            finished = time.time()
+            receipt.update({
+                "status": "rejected",
+                "finished_at": str(finished),
+                "duration_ms": (finished - started) * 1000.0,
+                "machine_assessment": "fail",
+                "response": _bounded_json(
+                    {"http_status": 409, "body": {"detail": detail}},
+                    _MAX_RESPONSE_BYTES,
+                ),
+                "error": "operator admission returned HTTP 409",
+            })
+            await asyncio.to_thread(
+                store.put,
+                receipt,
+                _expected_status=claim_expected_status,
+            )
+
         queue_axis = _SINGLE_AXIS_MOVE_AXES.get(action_id) if not is_safety_interrupt else None
         queued_entry = None
         queue_queued_at = None
         if queue_axis is not None:
             queue_entry = {
                 "axis": queue_axis,
-                "command_id": f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}",
+                "command_id": command_id,
                 "action_id": action_id,
                 "event": asyncio.Event(),
                 "cleared": False,
             }
             admission = await _successive_move_queue.admit(queue_axis, queue_entry)
             if admission == "full":
+                detail = {
+                    "error": "queue_full",
+                    "axis": queue_axis,
+                    "max_depth": _successive_move_queue.max_depth,
+                }
+                await persist_pre_dispatch_rejection(detail)
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "error": "queue_full",
-                        "axis": queue_axis,
-                        "max_depth": _successive_move_queue.max_depth,
-                    },
+                    detail=detail,
                 )
             if admission == "queued":
                 queued_entry = queue_entry
@@ -2437,17 +2671,20 @@ def install_operator_control_plane(
                 pre_state = machine_state()
                 if int(pre_state["ownership_generation"]) != payload.expected_generation:
                     await _successive_move_queue.remove(queue_axis, queue_entry)
+                    await persist_pre_dispatch_rejection("ownership generation mismatch")
                     raise HTTPException(status_code=409, detail="ownership generation mismatch")
                 pre_assessment = _assess_action(action, pre_state, effective_inputs)
                 if not pre_assessment["enabled"]:
                     await _successive_move_queue.remove(queue_axis, queue_entry)
+                    detail = {
+                        "error": "action_unavailable",
+                        "reason": pre_assessment["disabled_reason"],
+                        "dependencies": pre_assessment["dependencies"],
+                    }
+                    await persist_pre_dispatch_rejection(detail)
                     raise HTTPException(
                         status_code=409,
-                        detail={
-                            "error": "action_unavailable",
-                            "reason": pre_assessment["disabled_reason"],
-                            "dependencies": pre_assessment["dependencies"],
-                        },
+                        detail=detail,
                     )
                 if not await _successive_move_queue.wait_dispatched(queued_entry):
                     cleared = time.time()
@@ -2500,64 +2737,12 @@ def install_operator_control_plane(
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
-            existing = None
-            if not is_safety_interrupt and queued_entry is None:
-                existing = await asyncio.to_thread(
-                    store.by_idempotency,
-                    payload.idempotency_key,
-                    include_evidence=False,
-                )
-            if existing is not None:
-                if existing.get("action_id") != action_id or existing.get("requested_inputs", existing.get("inputs")) != payload.inputs:
-                    raise HTTPException(status_code=409, detail="idempotency_key already bound to different action request")
-                if int(existing.get("ownership_generation", -1)) != locked_expected:
-                    raise HTTPException(status_code=409, detail="idempotency receipt ownership generation mismatch")
-                replay_assessment = _assess_action(action, locked_state or {}, effective_inputs)
-                if not replay_assessment["enabled"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "error": "action_unavailable",
-                            "reason": replay_assessment["disabled_reason"],
-                            "dependencies": replay_assessment["dependencies"],
-                        },
-                    )
-                if existing.get("authority_fingerprint") != current_authority_fingerprint:
-                    raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
-                return existing
-            command_id = queued_entry["command_id"] if queued_entry is not None else f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
-            started = time.time()
-            receipt = {
-                "schema_version": RECEIPT_SCHEMA,
-                "command_id": command_id,
-                "action_id": action_id,
-                "kind": action["kind"],
-                "safety_class": action["safety_class"],
-                "status": "admission_pending",
-                "idempotency_key": payload.idempotency_key,
-                "idempotency_replay_enabled": not is_safety_interrupt,
+            receipt.update({
                 "ownership_generation": locked_expected,
                 "authority_fingerprint": current_authority_fingerprint,
-                "started_at": str(started),
-                "request_received_at": request_received_at,
                 "lock_acquired_at": lock_acquired_at,
-                "admission_completed_at": None,
-                "provider_entry_at": None,
-                "provider_returned_at": None,
-                "finished_at": None,
-                "duration_ms": None,
-                "remote_acknowledged": False,
-                "controller_acknowledged": False,
-                "physical_effect_verified": False,
-                "machine_assessment": "unverified",
-                "operator_assessment": None,
-                "operator_note": None,
-                "requested_inputs": _bounded_json(payload.inputs, _MAX_INPUT_BYTES),
                 "inputs": _bounded_json(effective_inputs, _MAX_INPUT_BYTES),
-                "response": None,
-                "error": None,
-                "stage_receipts": [],
-            }
+            })
             assessment = (
                 {"enabled": True, "disabled_reason": None, "dependencies": []}
                 if is_safety_interrupt
@@ -2578,46 +2763,15 @@ def install_operator_control_plane(
                     "response": _bounded_json({"http_status": 409, "body": {"detail": detail}}, _MAX_RESPONSE_BYTES),
                     "error": "operator admission returned HTTP 409",
                 })
-                claimed, created = await asyncio.to_thread(store.claim, receipt)
-                if not created:
-                    if claimed.get("action_id") != action_id or claimed.get(
-                        "requested_inputs", claimed.get("inputs")
-                    ) != payload.inputs:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="idempotency_key already bound to different action request",
-                        )
-                    if int(claimed.get("ownership_generation", -1)) != locked_expected:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="idempotency receipt ownership generation mismatch",
-                        )
-                    if claimed.get("authority_fingerprint") != current_authority_fingerprint:
-                        raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
-                    if claimed.get("status") == "completed":
-                        raise HTTPException(status_code=409, detail=detail)
-                    return claimed
+                if not is_safety_interrupt:
+                    await asyncio.to_thread(
+                        store.put,
+                        receipt,
+                        _expected_status=claim_expected_status,
+                    )
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
             receipt["queued_at"] = queue_queued_at if queued_entry is not None else time.time()
-            if not is_safety_interrupt:
-                claimed, created = await asyncio.to_thread(store.claim, receipt)
-                if not created:
-                    if claimed.get("action_id") != action_id or claimed.get(
-                        "requested_inputs", claimed.get("inputs")
-                    ) != payload.inputs:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="idempotency_key already bound to different action request",
-                        )
-                    if int(claimed.get("ownership_generation", -1)) != locked_expected:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="idempotency receipt ownership generation mismatch",
-                        )
-                    if claimed.get("authority_fingerprint") != current_authority_fingerprint:
-                        raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
-                    return claimed
             receipt["admission_completed_at"] = time.time()
             target = dispatch[action_id]
             wire_inputs = {
@@ -2631,6 +2785,7 @@ def install_operator_control_plane(
                 "expected_ownership_generation": payload.expected_generation,
                 "action_id": action_id,
             })
+            linked_pipette_finalization = None
             try:
                 receipt["provider_entry_at"] = time.time()
                 receipt["status"] = "dispatched"
@@ -2640,17 +2795,32 @@ def install_operator_control_plane(
                     timeout=float(action["timeout_seconds"]),
                 )
                 receipt["provider_returned_at"] = time.time()
+                if isinstance(response, dict):
+                    candidate = response.pop(_LINKED_FINALIZATION_KEY, None)
+                    detail_value = response.get("detail")
+                    if candidate is None and isinstance(detail_value, dict):
+                        candidate = detail_value.pop(_LINKED_FINALIZATION_KEY, None)
+                    if isinstance(candidate, Mapping):
+                        linked_pipette_finalization = dict(candidate)
                 full_response = {"http_status": status_code, "body": response}
                 ok = 200 <= status_code < 300 and not (isinstance(response, dict) and response.get("ok") is False)
                 authority_receipt = None
                 observation_receipt = None
+                pipette_truth = None
+                completion_ambiguous = False
                 if isinstance(response, dict):
                     receipt_source = response
                     detail = response.get("detail")
                     if isinstance(detail, Mapping):
                         receipt_source = detail
+                    completion_ambiguous = bool(
+                        receipt_source.get("completion_ambiguous") is True
+                        or receipt_source.get("outcome_unknown") is True
+                        or receipt_source.get("error") == "tester_operation_completion_ambiguous"
+                    )
                     authority_receipt = receipt_source.get("authority_receipt")
                     observation_receipt = receipt_source.get("observation_receipt")
+                    pipette_truth = response.get("receipt_truth")
                 authority_controller_acknowledged = (
                     authority_receipt.get("controller_command_acknowledged")
                     if (
@@ -2659,20 +2829,81 @@ def install_operator_control_plane(
                     )
                     else None
                 )
+                linked_status = None
+                if isinstance(pipette_truth, Mapping):
+                    linked_status = (
+                        "observed"
+                        if pipette_truth.get("semantic_query_response_verified") is True
+                        else "completed"
+                        if pipette_truth.get("completion_verified") is True
+                        else "acknowledged"
+                        if pipette_truth.get("controller_acknowledged") is True
+                        else "dispatched"
+                        if pipette_truth.get("delivery_verified") is True
+                        else "failed"
+                    )
                 receipt.update({
-                    "status": "completed" if ok else "failed",
+                    "status": (
+                        "outcome_unknown"
+                        if completion_ambiguous
+                        else linked_status
+                        if linked_status is not None
+                        else "completed"
+                        if ok
+                        else "failed"
+                    ),
                     "remote_acknowledged": 200 <= status_code < 300,
+                    "delivery_verified": bool(
+                        isinstance(pipette_truth, Mapping)
+                        and pipette_truth.get("delivery_verified") is True
+                    ) or bool(
+                        isinstance(response, Mapping)
+                        and response.get("delivery_verified") is True
+                    ),
                     "controller_acknowledged": (
-                        authority_controller_acknowledged
+                        pipette_truth.get("controller_acknowledged")
+                        if (
+                            isinstance(pipette_truth, Mapping)
+                            and type(pipette_truth.get("controller_acknowledged")) is bool
+                        )
+                        else authority_controller_acknowledged
                         if type(authority_controller_acknowledged) is bool
                         else _controller_acknowledged(response)
+                    ),
+                    "completion_verified": bool(
+                        isinstance(pipette_truth, Mapping)
+                        and pipette_truth.get("completion_verified") is True
+                    ) or bool(
+                        isinstance(response, Mapping)
+                        and response.get("completion_verified") is True
+                    ),
+                    "hardware_precondition_verified": bool(
+                        isinstance(pipette_truth, Mapping)
+                        and pipette_truth.get("hardware_precondition_verified") is True
+                    ) or bool(
+                        isinstance(response, Mapping)
+                        and response.get("hardware_precondition_verified") is True
+                    ),
+                    "hardware_postcondition_verified": bool(
+                        isinstance(pipette_truth, Mapping)
+                        and pipette_truth.get("hardware_postcondition_verified") is True
+                    ) or bool(
+                        isinstance(response, Mapping)
+                        and response.get("hardware_postcondition_verified") is True
                     ),
                     "physical_effect_verified": bool(
                         isinstance(response, Mapping) and response.get("physical_effect_verified") is True
                     ),
-                    "machine_assessment": "pass" if ok else "fail",
+                    "machine_assessment": "unverified" if completion_ambiguous else "pass" if ok else "fail",
                     "response": full_response,
-                    "error": None if ok else f"robot route returned HTTP {status_code}",
+                    "error": (
+                        "pipette outcome unknown; reconciliation required and retry forbidden"
+                        if completion_ambiguous
+                        else None if ok else f"robot route returned HTTP {status_code}"
+                    ),
+                    "completion_ambiguous": completion_ambiguous,
+                    "reconciliation_required": completion_ambiguous,
+                    "retry_forbidden": completion_ambiguous,
                     "authority_receipt_id": (
                         authority_receipt.get("command_id")
                         if isinstance(authority_receipt, Mapping) else None
@@ -2693,7 +2924,16 @@ def install_operator_control_plane(
                 })
             except asyncio.TimeoutError:
                 receipt["provider_returned_at"] = time.time()
-                receipt.update({"status": "failed", "machine_assessment": "fail", "error": "operator action timed out"})
+                receipt.update({
+                    "status": "outcome_unknown",
+                    "machine_assessment": "unverified",
+                    "error": "operator action timed out; physical outcome is unknown",
+                    "automatic_retry": False,
+                    "physical_outcome": "ambiguous",
+                    "completion_ambiguous": True,
+                    "reconciliation_required": True,
+                    "retry_forbidden": True,
+                })
             except Exception as exc:
                 receipt["provider_returned_at"] = time.time()
                 receipt.update({"status": "failed", "machine_assessment": "fail", "error": f"{type(exc).__name__}: {exc}"[:2000]})
@@ -2703,8 +2943,14 @@ def install_operator_control_plane(
             receipt["finished_at"] = str(finished)
             receipt["duration_ms"] = (finished - started) * 1000.0
             receipt["receipt_persist_started_at"] = time.time()
-            persist_receipt = store.put_interrupt if is_safety_interrupt else store.put
-            persisted = await asyncio.to_thread(persist_receipt, receipt)
+            if is_safety_interrupt:
+                persisted = await asyncio.to_thread(store.put_interrupt, receipt)
+            else:
+                persisted = await asyncio.to_thread(
+                    store.put,
+                    receipt,
+                    _expected_status=claim_expected_status,
+                )
             if queue_axis is not None:
                 await _successive_move_queue.complete(queue_axis)
             return persisted

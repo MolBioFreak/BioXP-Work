@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ from src.bioxp.can_driver import BioXpCanDriver
 from src.bioxp import api
 from src.bioxp.novo_router import NovoFrame, NovoRouter, NovoRouterError
 from src.bioxp.novo_usb_can import NovoUsbCanError, novo_decode, novo_encode
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
+import src.bioxp.pipette.receipts as pipette_receipts_module
 from src.bioxp.pipette.models import PipetteAspirateCommand, PipetteDispenseCommand
 from src.bioxp.pipette.receipts import PipetteReceiptStore
 from src.bioxp.pipette.transport import CanPipetteTransport
@@ -28,6 +31,26 @@ os.environ.pop("BIOXP_OEM_RUNTIME_STATE_ROOT", None)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def verified_pipette_authority(monkeypatch):
+    monkeypatch.setattr(pipette_receipts_module, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+    monkeypatch.setattr(pipette_receipts_module, "current_authority_identity", lambda: {
+        "evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64,
+    })
+    monkeypatch.setattr(pipette_receipts_module, "current_registry_sha256", lambda: "4" * 64)
+
+
+def _pipette_store(root: Path) -> PipetteReceiptStore:
+    owner = OEMRuntimeStore(root)
+    owner.close()
+    return PipetteReceiptStore(root)
 
 
 def test_wp0_matrix_has_all_gap_rows_and_no_unclassified_rows():
@@ -169,7 +192,7 @@ def test_service_rejects_unmapped_liquid_extensions_before_transport():
 
 
 def test_receipt_store_binds_authority_redacts_metadata_and_suppresses_physical_claim(tmp_path):
-    store = PipetteReceiptStore(tmp_path / "receipts")
+    store = _pipette_store(tmp_path / "receipts")
     receipt = store.record(
         operation="status",
         requested_inputs={"metadata": {"token": "secret-value", "run": "fixture"}},
@@ -242,22 +265,41 @@ def test_transport_keeps_tip_precondition_separate_from_liquid_postcondition():
     assert result["physical_effect_verified"] is False
 
 
-def test_generated_runtime_entrypoint_denominator_is_closed_world(tmp_path):
+_DENOMINATOR_IDENTITY_ENV = {
+    "robot_root": "BIOXP_DENOMINATOR_ROBOT_ROOT",
+    "robot_repository_url": "BIOXP_DENOMINATOR_ROBOT_REPOSITORY_URL",
+    "robot_commit": "BIOXP_DENOMINATOR_ROBOT_COMMIT",
+    "robot_tree": "BIOXP_DENOMINATOR_ROBOT_TREE",
+    "bms_root": "BIOXP_DENOMINATOR_BMS_ROOT",
+    "bms_repository_url": "BIOXP_DENOMINATOR_BMS_REPOSITORY_URL",
+    "bms_commit": "BIOXP_DENOMINATOR_BMS_COMMIT",
+    "bms_tree": "BIOXP_DENOMINATOR_BMS_TREE",
+}
+
+
+def _denominator_identity() -> dict[str, str]:
+    values = {name: os.environ.get(environment, "") for name, environment in _DENOMINATOR_IDENTITY_ENV.items()}
+    missing = [environment for name, environment in _DENOMINATOR_IDENTITY_ENV.items() if not values[name]]
+    assert not missing, f"exact denominator regeneration requires supplied identities: {missing}"
+    assert Path(values["robot_root"]).resolve() == ROOT
+    return values
+
+
+@pytest.fixture(scope="module")
+def exact_denominator_payload():
     from scripts.generate_bioxp_runtime_audit_entrypoint_denominator import generate_denominator
 
-    output = tmp_path / "denominator.json"
-    bms_root = Path("/home/dalab/worktrees/bms-runtime-audit-complete-20260821")
-    payload = generate_denominator(ROOT, bms_root=bms_root if bms_root.is_dir() else None, output_path=output)
+    return generate_denominator(**_denominator_identity())
 
-    assert payload["schema"] == "bioxp.runtime_audit.entrypoint_denominator.v1"
-    assert payload["rows"]
-    families = {row["family"] for row in payload["rows"]}
-    assert {"robot_route", "protocol_handler", "lifecycle_caller", "transport_method"} <= families
-    assert {"bms_relay", "cockpit_action"} <= families
-    assert payload["invariants"]["unclassified_count"] == 0
-    assert payload["invariants"]["direct_transport_bypass_count"] == 0
-    assert payload["invariants"]["duplicate_identity_count"] == 0
-    assert output.read_bytes() == json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+
+def _reseal_denominator_mutant(payload):
+    from scripts import generate_bioxp_runtime_audit_entrypoint_denominator as generator
+
+    payload["invariants"] = generator._invariants(
+        payload["rows"], payload["authority"]["source_manifest"]
+    )
+    payload["canonical_payload"]["sha256"] = generator.canonical_payload_sha256(payload)
+    return payload
 
 
 def test_driver_deferred_send_requires_ack_without_claiming_completion():
@@ -271,6 +313,7 @@ def test_driver_deferred_send_requires_ack_without_claiming_completion():
                 "frames": [{"arbitration_id": 0x501, "dlc": 0, "data": [], "raw": []}],
                 "immediate_ack_received": True,
                 "completion_received": False,
+                "completion_deferred": True,
             }
 
     driver = BioXpCanDriver.__new__(BioXpCanDriver)
@@ -310,7 +353,7 @@ def test_driver_uses_oem_numeric_command_formatting():
 
 
 def test_service_status_can_persist_a_source_bound_receipt(tmp_path):
-    store = PipetteReceiptStore(tmp_path / "receipts")
+    store = _pipette_store(tmp_path / "receipts")
     result = asyncio.run(
         run_pipette_status(
             get_transport=lambda: _StatusTransport(),
@@ -319,10 +362,11 @@ def test_service_status_can_persist_a_source_bound_receipt(tmp_path):
         )
     )
     row = store.connection.execute(
-        "SELECT receipt_json FROM operator_commands ORDER BY sequence DESC LIMIT 1"
+        "SELECT source_identity_json FROM pipette_operations ORDER BY created_at DESC LIMIT 1",
     ).fetchone()
     assert row is not None
-    assert result["receipt_id"] == json.loads(row[0])["receipt_id"]
+    assert isinstance(result["receipt_id"], str)
+    assert json.loads(row[0])["release_verified"] is True
     assert not store._legacy_path.exists()
     assert result["receipt_truth"]["physical_effect_verified"] is False
 
@@ -344,7 +388,7 @@ def test_pipette_id_range_and_strict_novo_frame_contracts():
         novo_encode(payload + b"\x00")
 
 
-def test_multipart_matcher_requires_explicit_opt_in_and_rebind_fences_completion():
+def test_multipart_matcher_requires_explicit_opt_in_and_generation_fences_completion():
     multipart = NovoRouter._decode_record(
         (0x513).to_bytes(4, "big") + bytes([0]), b"raw", 1.0
     )
@@ -355,25 +399,25 @@ def test_multipart_matcher_requires_explicit_opt_in_and_rebind_fences_completion
     assert enabled(multipart).matched is True
 
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    token = router.prepare_pipette_completion(2, 10.0)
+    router.prepare_pipette_completion(2, 10.0)
     router._reader_generation += 1
-    result = router.wait_pipette_completion(2, 0.0, owner_token=token)
+    result = router.wait_pipette_completion(2, 0.0)
     assert result["ok"] is False
     assert result["generation_changed"] is True
 
 
-def test_generation_matched_pipette_completion_accepts_only_oem_initialized_byte():
+def test_generation_matched_pipette_completion_uses_channel_family_and_exact_dlc():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    token = router.prepare_pipette_completion(
+    router.prepare_pipette_completion(
         1,
         10.0,
         command_family=1,
         command_name="pipette_aspirate",
+        expected_rx_id=0x509,
     )
     started = router._clock()
     router.bind_pipette_completion(
         1,
-        owner_token=token,
         transaction_id="tx",
         tx_started_at=started,
     )
@@ -393,61 +437,17 @@ def test_generation_matched_pipette_completion_accepts_only_oem_initialized_byte
         received_at=started + 0.02,
         classification="pipette_report",
     ))
-    result = router.wait_pipette_completion(1, 0.0, owner_token=token)
+    result = router.wait_pipette_completion(1, 0.0)
     assert result["ok"] is True
     assert result["generation_changed"] is False
-
-
-def test_pipette_completion_requires_bound_command_owner_and_matching_token():
-    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    token = router.prepare_pipette_completion(
-        1,
-        10.0,
-        command_family=1,
-        command_name="pipette_aspirate",
-    )
-    router.bind_pipette_completion(
-        1,
-        owner_token=token,
-        transaction_id="tx-1",
-        tx_started_at=10.0,
-    )
-
-    mismatch = router.wait_pipette_completion(1, 0.0, owner_token="wrong-token")
-    assert mismatch["ok"] is False
-    assert mismatch["outcome"] == "completion_owner_mismatch"
-
-    router._dispatch(
-        NovoFrame(
-            arbitration_id=0x509,
-            dlc=0,
-            data=b"",
-            raw=b"raw",
-            received_at=10.05,
-            classification="pipette_report",
-        )
-    )
-    router._dispatch(
-        NovoFrame(
-            arbitration_id=0x509,
-            dlc=2,
-            data=bytes((0x20, 0)),
-            raw=b"raw",
-            received_at=10.1,
-            classification="pipette_report",
-        )
-    )
-    result = router.wait_pipette_completion(1, 0.0, owner_token=token)
-    assert result["ok"] is True
-    assert result["owner_token"] == token
-    assert result["transaction_id"] == "tx-1"
+    assert result["transaction_id"] == "tx"
     assert result["command_name"] == "pipette_aspirate"
-    assert result["command_family"] == 1
+    assert "owner_token" not in result
 
 
-def test_completion_timeout_taints_channel_until_router_rebind():
+def test_completion_timeout_allows_oem_style_replacement_without_taint():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    token = router.prepare_pipette_completion(
+    router.prepare_pipette_completion(
         1,
         10.0,
         command_family=1,
@@ -455,63 +455,17 @@ def test_completion_timeout_taints_channel_until_router_rebind():
     )
     router.bind_pipette_completion(
         1,
-        owner_token=token,
         transaction_id="tx-timeout",
         tx_started_at=router._clock(),
     )
 
-    timeout = router.wait_pipette_completion(1, 0.0, owner_token=token)
+    timeout = router.wait_pipette_completion(1, 0.0)
     assert timeout["ok"] is False
     assert timeout["outcome"] == "timeout"
-    taint = router.pipette_completion_taint(1)
-    assert taint is not None
-    assert taint["reason"] == "completion_timeout"
-    with pytest.raises(NovoRouterError, match="router rebind is required"):
-        router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
-
-    router.shutdown()
-    assert router.pipette_completion_taint(1) is None
+    assert not hasattr(router, "pipette_completion_taint")
     router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
-
-
-def test_wait_pipette_completion_rejects_missing_token_without_mutating_owner():
-    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    token = router.prepare_pipette_completion(
-        0,
-        10.0,
-        command_family=0,
-        command_name="pipette_initialize",
-    )
-    router.bind_pipette_completion(
-        0,
-        owner_token=token,
-        transaction_id="tx-token-required",
-        tx_started_at=router._clock(),
-    )
-
-    rejected = router.wait_pipette_completion(0, 0.0)
-    assert rejected["ok"] is False
-    assert rejected["outcome"] == "completion_token_required"
     with router._completion_lock:
-        assert 0 in router._pipette_completions
-
-    rejected_empty = router.wait_pipette_completion(0, 0.0, owner_token="")
-    assert rejected_empty["ok"] is False
-    assert rejected_empty["outcome"] == "completion_token_required"
-    with router._completion_lock:
-        assert 0 in router._pipette_completions
-
-    mismatch = router.wait_pipette_completion(0, 0.0, owner_token="wrong-token")
-    assert mismatch["ok"] is False
-    assert mismatch["outcome"] == "completion_owner_mismatch"
-    with router._completion_lock:
-        assert 0 in router._pipette_completions
-
-    owned = router.wait_pipette_completion(0, 0.0, owner_token=token)
-    assert owned["ok"] is False
-    assert owned["outcome"] == "timeout"
-    with router._completion_lock:
-        assert 0 not in router._pipette_completions
+        assert router._pipette_completions[1].command_name == "next"
 
 
 def test_api_init_rejects_unmapped_pressure_profile_before_readiness_gate():

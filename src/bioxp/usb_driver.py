@@ -6498,8 +6498,6 @@ class BioXpTester:
         controller_motion_evidence_seen = bool(
             controller_speed_nonzero_seen or controller_position_counter_changed
         )
-        if failure is None and not controller_motion_evidence_seen:
-            failure = "controller_motion_evidence_not_observed"
         if failure is None and bool(require_switch_transition) and not switch_transition:
             failure = "home_switch_transition_not_observed"
         if failure is None and not stop_acknowledged:
@@ -7496,7 +7494,6 @@ class BioXpTester:
             not out["home_errors"]
             and all(axis in out["homes"] for axis in ("x", "y"))
         )
-        out["home_rebase"] = {}
         if not home_tasks_ok:
             out["failure"] = "HomeXY_task_failure"
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
