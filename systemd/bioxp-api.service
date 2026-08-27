@@ -30,7 +30,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=/etc/bioxp/release-identity.json /etc/bioxp/source-manifest.json /etc/bioxp/image-inspection.json /usr/local/libexec/bioxp-release-container-run /usr/local/libexec/bioxp-udocker-image-inspector /opt/bioxp/udocker-runtime
-ReadWritePaths=/run/bioxp-release /var/lib/bioxp-oem-runtime -/home/molbiofreak/.udocker
+ReadWritePaths=/run/bioxp-release /var/lib/bioxp-oem-runtime /opt/bioxp/udocker-runtime/store/containers -/home/molbiofreak/.udocker
 
 [Install]
 WantedBy=multi-user.target
