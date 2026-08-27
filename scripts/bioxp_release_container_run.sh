@@ -372,6 +372,24 @@ PY
 printf 'release-mode\n' >"$RELEASE_MODE_MARKER"
 /bin/chmod 0444 "$RELEASE_MODE_MARKER"
 
+IMAGE_REF=$(/usr/bin/python3 - "$UDOCKER_ROOT/store" "$IMAGE_ID" <<'PY'
+import hashlib, sys
+from pathlib import Path
+store = Path(sys.argv[1]).resolve()
+digest = sys.argv[2].removeprefix("sha256:")
+matches = []
+for tag in sorted((store / "repos").glob("*/*")):
+    config = tag / "container.json"
+    if not config.is_file():
+        config = tag / f"{digest}.layer"
+    if config.is_file() and hashlib.sha256(config.read_bytes()).hexdigest() == digest:
+        matches.append(f"{tag.parent.name}:{tag.name}")
+if len(matches) != 1:
+    raise SystemExit("immutable image ID does not resolve to exactly one local uDocker reference")
+print(matches[0])
+PY
+) || fail "immutable local uDocker image reference resolution failed"
+
 SOURCE_VOLUME=()
 [[ "$SOURCE_MODE" == exact_commit_materialization ]] || fail "unsupported source mode"
 SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app:ro")
@@ -395,5 +413,5 @@ exec "$UDOCKER_BIN" run \
   --volume=/dev:/dev \
   --volume=/run/udev:/run/udev:ro \
   --workdir=/app \
-  "$IMAGE_ID" \
+  "$IMAGE_REF" \
   /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123'

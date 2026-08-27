@@ -89,7 +89,7 @@ def _image_root(store: Path, image_id: str) -> Path:
     if root.exists() and root.is_dir() and not root.is_symlink():
         return root
     matches = []
-    for tag_root in sorted((store / "repos").glob(f"*/{image_id[7:]}")):
+    for tag_root in sorted((store / "repos").glob("*/*")):
         config_path = tag_root / "container.json"
         if not config_path.is_file():
             config_path = tag_root / f"{image_id[7:]}.layer"
