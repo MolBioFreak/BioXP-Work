@@ -78,7 +78,8 @@ def _seal_tree(root: Path) -> None:
         if path.is_dir() and not path.is_symlink():
             os.chmod(path, 0o555)
         elif path.is_file() and not path.is_symlink():
-            os.chmod(path, 0o444)
+            relative = path.relative_to(root)
+            os.chmod(path, 0o555 if relative.parts and relative.parts[0] == "bin" else 0o444)
     os.chmod(root, 0o555)
 
 
