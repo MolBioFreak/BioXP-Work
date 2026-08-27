@@ -176,6 +176,160 @@ def _runtime_physical_schema_sha256(connection: sqlite3.Connection) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+_OPERATOR_COMMAND_COLUMNS = (
+    "sequence", "command_id", "idempotency_key", "canonical_request_sha256", "operation",
+    "command_kind", "entrypoint_id", "caller_class", "control_class",
+    "idempotency_replay_enabled", "action_id", "status", "safety_class",
+    "ownership_generation", "connection_generation", "source_identity_json",
+    "requested_inputs_json", "effective_inputs_json", "started_at", "admitted_at",
+    "dispatched_at", "finished_at", "duration_ms", "delivery_verified",
+    "controller_acknowledged", "completion_verified", "hardware_precondition_verified",
+    "hardware_postcondition_verified", "physical_effect_verified", "outcome", "failure_code",
+    "evidence_state", "receipt_json", "response_summary_json", "evidence_relpath",
+    "evidence_sha256", "evidence_bytes", "updated_at",
+)
+
+
+def _is_additive_operator_schema(connection: sqlite3.Connection) -> bool:
+    command_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_commands)")
+    }
+    if command_columns != set(_OPERATOR_COMMAND_COLUMNS):
+        return False
+    transition_columns = tuple(
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_transitions)")
+    )
+    if transition_columns != ("transition_id", "command_id", "state", "observed_at", "detail_json"):
+        return False
+    transition_fks = connection.execute("PRAGMA foreign_key_list(operator_transitions)").fetchall()
+    return len(transition_fks) == 1 and str(transition_fks[0][6]).upper() in {"CASCADE", "NO ACTION"}
+
+
+def _rebuild_additive_operator_schema(connection: sqlite3.Connection) -> None:
+    """Rebuild the known additive v2 lineage into the canonical physical schema."""
+    if not _is_additive_operator_schema(connection):
+        raise RuntimeError("operator schema is not the recognized additive v2 lineage")
+
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    legacy_alter_table = int(connection.execute("PRAGMA legacy_alter_table").fetchone()[0])
+    if connection.in_transaction:
+        raise RuntimeError("operator schema rebuild requires a transaction boundary")
+    sequence_rows = dict(connection.execute(
+        "SELECT name,seq FROM sqlite_sequence WHERE name IN ('operator_commands','operator_transitions')"
+    ).fetchall())
+    columns = ",".join(_OPERATOR_COMMAND_COLUMNS)
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ALTER TABLE operator_transitions RENAME TO operator_transitions_additive_v2")
+        connection.execute("ALTER TABLE operator_commands RENAME TO operator_commands_additive_v2")
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        _execute_schema_batch(connection,
+            """
+            CREATE TABLE operator_commands (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT NOT NULL,
+                canonical_request_sha256 TEXT NOT NULL DEFAULT '',
+                operation TEXT NOT NULL DEFAULT 'operator_action',
+                command_kind TEXT NOT NULL DEFAULT 'pipette',
+                entrypoint_id TEXT NOT NULL DEFAULT 'unknown',
+                caller_class TEXT NOT NULL DEFAULT 'operator',
+                control_class TEXT NOT NULL DEFAULT 'service',
+                idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1 CHECK(idempotency_replay_enabled IN (0,1)),
+                action_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                safety_class TEXT,
+                ownership_generation INTEGER NOT NULL DEFAULT 0,
+                connection_generation INTEGER,
+                source_identity_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(source_identity_json)),
+                requested_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(requested_inputs_json)),
+                effective_inputs_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(effective_inputs_json)),
+                started_at TEXT NOT NULL,
+                admitted_at TEXT,
+                dispatched_at TEXT,
+                finished_at TEXT,
+                duration_ms REAL,
+                delivery_verified INTEGER NOT NULL DEFAULT 0 CHECK(delivery_verified IN (0,1)),
+                controller_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_acknowledged IN (0,1)),
+                completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(completion_verified IN (0,1)),
+                hardware_precondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_precondition_verified IN (0,1)),
+                hardware_postcondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1)),
+                physical_effect_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_effect_verified IN (0,1)),
+                outcome TEXT,
+                failure_code TEXT,
+                evidence_state TEXT,
+                receipt_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(receipt_json)),
+                response_summary_json TEXT CHECK(response_summary_json IS NULL OR json_valid(response_summary_json)),
+                evidence_relpath TEXT,
+                evidence_sha256 TEXT,
+                evidence_bytes INTEGER,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE operator_transitions (
+                transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE RESTRICT,
+                state TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json))
+            );
+            """
+        )
+        connection.execute(
+            f"INSERT INTO operator_commands({columns}) SELECT {columns} FROM operator_commands_additive_v2"
+        )
+        connection.execute(
+            "INSERT INTO operator_transitions(transition_id,command_id,state,observed_at,detail_json) "
+            "SELECT transition_id,command_id,state,observed_at,detail_json "
+            "FROM operator_transitions_additive_v2"
+        )
+        connection.execute("DROP TABLE operator_transitions_additive_v2")
+        connection.execute("DROP TABLE operator_commands_additive_v2")
+        _execute_schema_batch(connection,
+            """
+            CREATE INDEX operator_commands_history_idx ON operator_commands(sequence DESC);
+            CREATE INDEX operator_commands_updated_idx ON operator_commands(updated_at DESC, sequence DESC);
+            CREATE INDEX operator_commands_action_status_idx ON operator_commands(action_id, status, sequence DESC);
+            CREATE UNIQUE INDEX operator_commands_replay_key_idx
+                ON operator_commands(idempotency_key) WHERE idempotency_replay_enabled=1;
+            CREATE INDEX operator_transitions_command_idx
+                ON operator_transitions(command_id, transition_id);
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER operator_transitions_append_only_update
+                BEFORE UPDATE ON operator_transitions
+                BEGIN
+                    SELECT RAISE(ABORT, 'append-only table cannot be updated');
+                END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER operator_transitions_append_only_delete
+                BEFORE DELETE ON operator_transitions
+                BEGIN
+                    SELECT RAISE(ABORT, 'append-only table cannot be deleted');
+                END
+            """
+        )
+        for name, sequence in sequence_rows.items():
+            connection.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (int(sequence), str(name)))
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(f"operator schema rebuild foreign-key failure: {foreign_key_errors[:3]}")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
+        connection.execute(f"PRAGMA foreign_keys={foreign_keys}")
+
+
 def _create_v1_runtime_schema(connection: sqlite3.Connection) -> None:
     _execute_schema_batch(connection,
         """
@@ -1003,6 +1157,11 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
         found_strict_tables = strict_tables & found_tables
         if found_strict_tables:
             _reinstall_runtime_authority_triggers(connection)
+            if _runtime_physical_schema_sha256(connection) != _RUNTIME_PHYSICAL_SCHEMA_SHA256:
+                if _is_additive_operator_schema(connection):
+                    _verified_sqlite_backup(connection, selected_root)
+                    _rebuild_additive_operator_schema(connection)
+                    _reinstall_runtime_authority_triggers(connection)
             _verify_v2_schema(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -1025,6 +1184,8 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
             )
         preserved_identities[table] = _legacy_table_identity(connection, table, columns)
     backup_sha256 = _verified_sqlite_backup(connection, selected_root)
+    if _is_additive_operator_schema(connection):
+        _rebuild_additive_operator_schema(connection)
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
