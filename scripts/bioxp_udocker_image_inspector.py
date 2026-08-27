@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import os
 import re
+import shutil
 import stat
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -81,16 +86,73 @@ def _image_root(store: Path, image_id: str) -> Path:
     _need(IMAGE_ID_RE.fullmatch(image_id) is not None, "image ID must be a full immutable sha256:<64-hex>")
     _need(store.exists() and store.is_dir() and not store.is_symlink(), "uDocker image store is absent or symlinked")
     root = store / "images" / "sha256" / image_id[7:]
-    _need(root.exists() and root.is_dir() and not root.is_symlink(), "full immutable image ID is absent from the local store")
-    return root
+    if root.exists() and root.is_dir() and not root.is_symlink():
+        return root
+    matches = []
+    for tag_root in sorted((store / "repos").glob(f"*/{image_id[7:]}")):
+        config_path = tag_root / "container.json"
+        if not config_path.is_file():
+            config_path = tag_root / f"{image_id[7:]}.layer"
+        if config_path.is_file() and sha256_file(config_path) == image_id[7:]:
+            matches.append(tag_root)
+    _need(len(matches) == 1, "full immutable image ID does not have exactly one uDocker tag authority")
+    return matches[0]
+
+
+def _materialize_udocker_rootfs(store: Path, tag_root: Path, destination: Path) -> None:
+    ancestry = json.loads(_safe_regular(tag_root / "ancestry", "uDocker ancestry"))
+    _need(isinstance(ancestry, list) and bool(ancestry), "uDocker ancestry is invalid")
+    destination.mkdir(parents=True, exist_ok=True)
+    for digest in ancestry:
+        _need(isinstance(digest, str) and HEX64_RE.fullmatch(digest) is not None, "uDocker layer digest is invalid")
+        layer = store / "layers" / f"{digest}.layer"
+        _need(layer.is_file() and not layer.is_symlink() and sha256_file(layer) == digest, f"uDocker layer is absent or corrupt: {digest}")
+        with tarfile.open(layer, "r:*") as archive:
+            members = archive.getmembers()
+            for member in members:
+                parts = Path(member.name).parts
+                _need(not member.name.startswith("/") and ".." not in parts, f"unsafe image layer path: {member.name}")
+                name = Path(member.name).name
+                parent = destination.joinpath(*parts[:-1]) if parts[:-1] else destination
+                if name == ".wh..wh..opq" and parent.is_dir():
+                    for child in parent.iterdir():
+                        if child.is_dir() and not child.is_symlink():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                elif name.startswith(".wh."):
+                    target = parent / name[4:]
+                    if target.exists() or target.is_symlink():
+                        if target.is_dir() and not target.is_symlink():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+            def image_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo | None:
+                selected = member
+                if member.issym() and member.linkname.startswith("/"):
+                    selected = copy.copy(member)
+                    parent = Path(member.name).parent
+                    selected.linkname = os.path.relpath(member.linkname.lstrip("/"), parent.as_posix() or ".")
+                return tarfile.data_filter(selected, path)
+
+            archive.extractall(destination, filter=image_filter)
+    for marker in destination.rglob(".wh.*"):
+        marker.unlink()
 
 
 def _measure(store: Path, image_id: str, source_manifest: Path) -> tuple[dict[str, Any], dict[str, str]]:
     root = _image_root(store, image_id)
+    normalized = (root / "oci-config.json").is_file()
     for path in (root, *root.rglob("*")):
-        _need(not stat.S_ISLNK(path.lstat().st_mode), f"image store symlink is forbidden: {path}")
-    config_path = root / "oci-config.json"
-    config_raw = _safe_regular(config_path, "OCI config")
+        if normalized:
+            _need(not stat.S_ISLNK(path.lstat().st_mode), f"image store symlink is forbidden: {path}")
+        elif path.is_symlink():
+            resolved = path.resolve(strict=True)
+            _need(resolved.parent == (store / "layers").resolve(), f"uDocker image symlink escapes the layer store: {path}")
+    config_path = root / "oci-config.json" if normalized else root / "container.json"
+    if not normalized and not config_path.is_file():
+        config_path = root / f"{image_id[7:]}.layer"
+    config_raw = _safe_regular(config_path, "OCI config") if normalized else config_path.read_bytes()
     _need("sha256:" + hashlib.sha256(config_raw).hexdigest() == image_id, "OCI config digest does not equal the requested full image ID")
     try:
         config = json.loads(config_raw)
@@ -106,7 +168,14 @@ def _measure(store: Path, image_id: str, source_manifest: Path) -> tuple[dict[st
 
     external_raw = _safe_regular(source_manifest, "external source manifest")
     external = validate_manifest_bytes(external_raw)
-    embedded_path = root / "rootfs" / EMBEDDED_MANIFEST_PATH.lstrip("/")
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    if normalized:
+        rootfs = root / "rootfs"
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="bioxp-udocker-inspection-")
+        rootfs = Path(temporary.name)
+        _materialize_udocker_rootfs(store, root, rootfs)
+    embedded_path = rootfs / EMBEDDED_MANIFEST_PATH.lstrip("/")
     embedded_raw = _safe_regular(embedded_path, "embedded source manifest")
     _need(embedded_raw == external_raw, "embedded source manifest bytes differ from the external manifest")
     embedded = validate_manifest_bytes(embedded_raw)
@@ -115,12 +184,14 @@ def _measure(store: Path, image_id: str, source_manifest: Path) -> tuple[dict[st
     _need(selected[REQUIRED_LABELS[1]] == external["tree"], "OCI tree label contradicts the source manifest")
     _need(selected[REQUIRED_LABELS[2]] == manifest_sha, "OCI manifest label contradicts the source manifest bytes")
 
-    app = root / "rootfs" / "app"
+    app = rootfs / "app"
     _need(app.is_dir() and not app.is_symlink(), "image /app source root is absent or symlinked")
     for row in embedded["files"]:
         candidate = app / row["path"]
         raw = _safe_regular(candidate, f"image source file {row['path']}")
         _need(len(raw) == row["size"] and hashlib.sha256(raw).hexdigest() == row["sha256"], f"image source bytes mismatch: {row['path']}")
+    if temporary is not None:
+        temporary.cleanup()
     return external, selected
 
 

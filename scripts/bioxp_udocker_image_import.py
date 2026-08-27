@@ -117,11 +117,31 @@ def import_image(
             _make_staging_writable(staged_store)
         else:
             staged_store.mkdir()
-        destination = staged_store / "images" / "sha256" / image_id[7:]
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(bundle, destination)
+        actual_udocker_bundle = (bundle / "repos").is_dir() and (bundle / "layers").is_dir()
+        if actual_udocker_bundle:
+            for config_path in list(staged_store.glob("repos/*/*/container.json")):
+                if config_path.is_file() and hashlib.sha256(config_path.read_bytes()).hexdigest() == image_id[7:]:
+                    shutil.rmtree(config_path.parent)
+            (staged_store / "layers").mkdir(parents=True, exist_ok=True)
+            for layer in sorted((bundle / "layers").glob("*.layer")):
+                target = staged_store / "layers" / layer.name
+                if target.exists():
+                    _need(hashlib.sha256(target.read_bytes()).hexdigest() == layer.stem, f"existing layer digest mismatch: {layer.name}")
+                else:
+                    shutil.copy2(layer, target)
+            for repository in sorted((bundle / "repos").iterdir()):
+                _need(repository.is_dir() and not repository.is_symlink(), "bundle repository authority is invalid")
+                target = staged_store / "repos" / repository.name
+                if target.exists():
+                    shutil.copytree(repository, target, dirs_exist_ok=True)
+                else:
+                    shutil.copytree(repository, target)
+        else:
+            destination = staged_store / "images" / "sha256" / image_id[7:]
+            if destination.exists():
+                shutil.rmtree(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(bundle, destination)
         _seal_tree(staged_store)
         receipt = inspector.inspect_image(staged_store, image_id, source_manifest, inspected_at, verifier_source)
         staged_receipt.write_bytes(inspector.canonical_bytes(receipt))
