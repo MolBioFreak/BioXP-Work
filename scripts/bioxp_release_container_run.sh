@@ -81,7 +81,7 @@ paths = [
 ]
 for path in sorted(paths, key=lambda item: item.as_posix().encode("utf-8")):
     info = path.lstat()
-    if info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o022:
+    if info.st_uid != 0 or info.st_gid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
         raise SystemExit(f"mutable or non-root-owned udocker runtime path: {path}")
     relative = "." if path == root else path.relative_to(root).as_posix()
     if stat.S_ISREG(info.st_mode):
