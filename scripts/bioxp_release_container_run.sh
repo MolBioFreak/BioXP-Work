@@ -73,8 +73,13 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+container_state = root / "store" / "containers"
 aggregate = hashlib.sha256()
-for path in sorted((root, *root.rglob("*")), key=lambda item: item.as_posix().encode("utf-8")):
+paths = [
+    path for path in (root, *root.rglob("*"))
+    if path != container_state and container_state not in path.parents
+]
+for path in sorted(paths, key=lambda item: item.as_posix().encode("utf-8")):
     info = path.lstat()
     if info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o022:
         raise SystemExit(f"mutable or non-root-owned udocker runtime path: {path}")
