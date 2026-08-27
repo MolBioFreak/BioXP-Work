@@ -1362,12 +1362,85 @@ class OperatorCommandStore:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
-            interrupt_history_columns = {
+            interrupt_history_columns = tuple(
                 str(row[1])
-                for row in self.connection.execute("PRAGMA table_info(operator_plane_interrupt_history)").fetchall()
-            }
-            if "source_wrapper_json" not in interrupt_history_columns:
-                self.connection.execute("ALTER TABLE operator_plane_interrupt_history ADD COLUMN source_wrapper_json TEXT")
+                for row in self.connection.execute(
+                    "PRAGMA table_info(operator_plane_interrupt_history)"
+                ).fetchall()
+            )
+            canonical_interrupt_history_columns = (
+                "record_sha256", "stream", "interrupt_attempt_id", "receipt_json",
+                "source_wrapper_json", "imported_at",
+            )
+            additive_interrupt_history_columns = (
+                "record_sha256", "stream", "interrupt_attempt_id", "receipt_json",
+                "imported_at", "source_wrapper_json",
+            )
+            if interrupt_history_columns == additive_interrupt_history_columns:
+                invalid_history = self.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM operator_plane_interrupt_history
+                    WHERE source_wrapper_json IS NULL
+                       OR source_wrapper_json<>canonical_json(source_wrapper_json)
+                       OR record_sha256<>sha256_utf8(source_wrapper_json)
+                       OR json_extract(source_wrapper_json,'$.stream') IS NOT stream
+                       OR json_extract(source_wrapper_json,'$.receipt.interrupt_attempt_id') IS NOT interrupt_attempt_id
+                       OR canonical_json(json_extract(source_wrapper_json,'$.receipt'))<>receipt_json
+                    """
+                ).fetchone()
+                if invalid_history is not None and int(invalid_history[0]) > 0:
+                    raise RuntimeError(
+                        "operator interrupt history requires exact-wrapper recovery from archived fallback bytes"
+                    )
+                try:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                    self.connection.execute(
+                        "ALTER TABLE operator_plane_interrupt_history "
+                        "RENAME TO operator_plane_interrupt_history_additive_v4"
+                    )
+                    self.connection.execute(
+                        """
+                        CREATE TABLE operator_plane_interrupt_history (
+                            record_sha256 TEXT PRIMARY KEY,
+                            stream TEXT NOT NULL CHECK(stream IN ('x','y','z')),
+                            interrupt_attempt_id TEXT NOT NULL,
+                            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+                            source_wrapper_json TEXT NOT NULL CHECK(json_valid(source_wrapper_json)),
+                            imported_at REAL NOT NULL,
+                            UNIQUE(stream,interrupt_attempt_id)
+                        ) WITHOUT ROWID
+                        """
+                    )
+                    self.connection.execute(
+                        """
+                        INSERT INTO operator_plane_interrupt_history(
+                            record_sha256,stream,interrupt_attempt_id,receipt_json,
+                            source_wrapper_json,imported_at
+                        )
+                        SELECT record_sha256,stream,interrupt_attempt_id,receipt_json,
+                               source_wrapper_json,imported_at
+                        FROM operator_plane_interrupt_history_additive_v4
+                        """
+                    )
+                    self.connection.execute(
+                        "DROP TABLE operator_plane_interrupt_history_additive_v4"
+                    )
+                    self.connection.execute("COMMIT")
+                except Exception:
+                    if self.connection.in_transaction:
+                        self.connection.execute("ROLLBACK")
+                    raise
+                interrupt_history_columns = canonical_interrupt_history_columns
+            elif "source_wrapper_json" not in interrupt_history_columns:
+                self.connection.execute(
+                    "ALTER TABLE operator_plane_interrupt_history ADD COLUMN source_wrapper_json TEXT"
+                )
+                interrupt_history_columns = tuple(
+                    str(row[1])
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(operator_plane_interrupt_history)"
+                    ).fetchall()
+                )
             incomplete_history = self.connection.execute(
                 "SELECT COUNT(*) FROM operator_plane_interrupt_history WHERE source_wrapper_json IS NULL"
             ).fetchone()

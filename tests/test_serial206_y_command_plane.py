@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
@@ -28,6 +29,65 @@ def _state(*, generation=4, board4_epoch=7, board5_epoch=11):
             "z_authority": {"state": "referenced_ready", "reference_state": "referenced"},
         },
     }
+
+
+def test_additive_interrupt_history_schema_is_rebuilt_without_data_loss(tmp_path):
+    initial = OperatorCommandStore(tmp_path)
+    initial.stop()
+    initial.connection.close()
+    connection = sqlite3.connect(tmp_path / "bioxp_runtime.db")
+    connection.execute("PRAGMA foreign_keys=OFF")
+    receipt = {"interrupt_attempt_id": "attempt-1", "status": "stopped"}
+    wrapper = {"receipt": receipt, "stream": "y"}
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    wrapper_json = json.dumps(wrapper, sort_keys=True, separators=(",", ":"))
+    record_sha256 = hashlib.sha256(wrapper_json.encode("utf-8")).hexdigest()
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+        ALTER TABLE operator_plane_interrupt_history
+            RENAME TO operator_plane_interrupt_history_canonical;
+        CREATE TABLE operator_plane_interrupt_history (
+            record_sha256 TEXT PRIMARY KEY,
+            stream TEXT NOT NULL CHECK(stream IN ('x','y','z')),
+            interrupt_attempt_id TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+            imported_at REAL NOT NULL,
+            source_wrapper_json TEXT,
+            UNIQUE(stream,interrupt_attempt_id)
+        ) WITHOUT ROWID;
+        DROP TABLE operator_plane_interrupt_history_canonical;
+        COMMIT;
+        """
+    )
+    connection.execute(
+        "INSERT INTO operator_plane_interrupt_history("
+        "record_sha256,stream,interrupt_attempt_id,receipt_json,imported_at,source_wrapper_json"
+        ") VALUES(?,?,?,?,?,?)",
+        (record_sha256, "y", "attempt-1", receipt_json, 1.0, wrapper_json),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = OperatorCommandStore(tmp_path)
+
+    columns = tuple(
+        row[1]
+        for row in migrated.connection.execute(
+            "PRAGMA table_info(operator_plane_interrupt_history)"
+        ).fetchall()
+    )
+    row = migrated.connection.execute(
+        "SELECT record_sha256,stream,interrupt_attempt_id,receipt_json,source_wrapper_json,imported_at "
+        "FROM operator_plane_interrupt_history"
+    ).fetchone()
+    assert columns == (
+        "record_sha256", "stream", "interrupt_attempt_id", "receipt_json",
+        "source_wrapper_json", "imported_at",
+    )
+    assert tuple(row) == (record_sha256, "y", "attempt-1", receipt_json, wrapper_json, 1.0)
+    migrated.stop()
+    migrated.connection.close()
 
 
 def test_command_store_accepts_typed_y_actions_and_bounds(tmp_path):
