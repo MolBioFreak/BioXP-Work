@@ -2767,11 +2767,11 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
             _verify_v2_schema(connection)
             if version == registry[-1].version:
                 verify_canonical_runtime_database(connection)
-            journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-            synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
-            if journal_mode != "wal" or synchronous != 2:
-                raise RuntimeError("runtime schema v2 durability settings are not WAL/synchronous FULL")
-            return
+                journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+                if journal_mode != "wal" or synchronous != 2:
+                    raise RuntimeError("runtime schema v2 durability settings are not WAL/synchronous FULL")
+                return
 
     try:
         verify_runtime_audit_foundation(connection)
