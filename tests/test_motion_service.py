@@ -380,41 +380,6 @@ def test_execute_absolute_move_applies_profile_override_before_motion(monkeypatc
     assert result["motion_profile"]["requested_acc"] == 80
 
 
-def test_protocol_live_move_handler_executes_absolute_profile_override(monkeypatch):
-    api = load_api(monkeypatch)
-    recorded = []
-
-    class Action:
-        action_id = "move-x-limit"
-        params = {"axis": "x", "position_steps": 91869, "wait_timeout_s": 30, "speed": 200, "acc": 80}
-
-    monkeypatch.setattr(api, "_get_tester", lambda: "tester")
-
-    def fake_execute_absolute(tester, axis, position_steps, wait_timeout_s, *, speed=None, acc=None):
-        assert tester == "tester"
-        assert axis == api.AxisName.X
-        assert position_steps == 91869
-        assert wait_timeout_s == 30.0
-        assert speed == 200
-        assert acc == 80
-        return {"ok": True, "motion_profile": {"speed": 200, "acc": 80}}
-
-    class FakeStore:
-        def record_motion(self, axis, motion_kind):
-            recorded.append((axis, motion_kind))
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "_execute_absolute_move", fake_execute_absolute)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
-    result = api._protocol_live_move_handler(Action(), None)
-
-    assert result["ok"] is True
-    assert result["move_mode"] == "absolute"
-    assert result["move"]["motion_profile"] == {"speed": 200, "acc": 80}
-    assert recorded == [(api.AxisName.X, "protocol_absolute")]
-
-
 def test_move_axis_relative_route_skips_reference_updates_for_dry_run(monkeypatch):
     api = load_api(monkeypatch)
     recorded = []

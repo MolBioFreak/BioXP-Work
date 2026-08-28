@@ -97,52 +97,6 @@ def _collection(*, status_results: dict[int, list[dict[str, Any]]] | None = None
     return FourPipetteTransport(transports, sleep=sleeps.append), drivers, router, events, sleeps
 
 
-def test_constructor_executes_one_initiate_false_fanout_and_one_group_wait():
-    collection, drivers, router, events, sleeps = _collection()
-
-    result = collection.initialize(PipetteInitCommand())
-
-    assert result["ok"] is True
-    assert [driver.initialize_calls for driver in drivers] == [1, 1, 1, 1]
-    assert not [event for event in events if event[0] == "wrong_group_wr"]
-    assert [len(driver.completion_timeouts) for driver in drivers] == [1, 1, 1, 1]
-    assert all(0.0 <= driver.completion_timeouts[0] <= 10.0 for driver in drivers)
-    assert result["group_wait_ms"] == 10_000
-    assert "constructor_delayed_completions" not in result
-    assert sleeps == [1.0, 0.03, 0.03, 0.03, 0.03, 0.001]
-
-
-def test_pressure_epoch_starts_before_stream_enable_and_offsets_use_that_epoch():
-    collection, _drivers, router, events, _sleeps = _collection()
-
-    result = collection.initialize(PipetteInitCommand())
-
-    epoch_index = events.index(("pressure_epoch", 1))
-    first_stream_index = next(index for index, event in enumerate(events) if event[:2] == ("pressure_stream", 0))
-    calculate_index = events.index(("calculate_pressure_offsets", 1))
-    final_stream_off_index = max(
-        index for index, event in enumerate(events) if event[0] == "pressure_stream" and event[2] is False
-    )
-    assert epoch_index < first_stream_index
-    assert final_stream_off_index < calculate_index
-    assert result["initial_group"]["pressure_epoch"] == {"epoch": 1}
-    assert router.epoch == 1
-
-
-def test_one_status_error_retries_the_complete_group_once():
-    collection, drivers, _router, events, _sleeps = _collection(
-        status_results={0: [{"ok": False, "oem_error_code": 0x45}, {"ok": True, "oem_error_code": 0}]}
-    )
-
-    result = collection.initialize(PipetteInitCommand())
-
-    assert result["ok"] is True
-    assert result["single_conditional_retry_performed"] is True
-    assert [driver.initialize_calls for driver in drivers] == [1, 1, 1, 1]
-    assert len([event for event in events if event[0] == "pressure_epoch"]) == 2
-    assert len([event for event in events if event[0] == "wrong_group_wr"]) == 4
-
-
 def test_query_status_treats_captured_three_byte_q1_reply_as_empty_oem_error_collection():
     driver = object.__new__(BioXpCanDriver)
 

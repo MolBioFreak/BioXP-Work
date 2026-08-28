@@ -189,6 +189,36 @@ def motion_action(path: str = "/motion/axis/move") -> dict:
     }
 
 
+def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_readback():
+    driver = FakeMotionDriver()
+
+    result = prepare_motion_without_motion(driver, authority())
+
+    assert result["ok"] is True
+    assert result["physical_motion"] is False
+    assert result["homing_performed"] is False
+    lifecycle_calls = [call for call in driver.calls if call[0] in {"deactivate", "activate", "begin_board_generation"}]
+    assert lifecycle_calls == [
+        ("deactivate", 4), ("deactivate", 5), ("deactivate", 6), ("deactivate", 7),
+        ("activate", 4), ("activate", 5), ("activate", 6), ("activate", 7),
+        ("begin_board_generation", (4, 5, 6, 7), (4, 5, 6, 7)),
+    ]
+    assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
+    assert [row["stage_id"] for row in result["stage_ledger"]] == [
+        "authority",
+        "rail_24v_readback",
+        "door_readback",
+        "latch_readback",
+        "deactivateBoard",
+        "activateBoard",
+        "boardLifecycleGeneration",
+        "waitForBoard",
+        "initializeMotorsWithoutMotion",
+        "parameter_readback",
+    ]
+    assert all(row["status"] in {"passed", "not_applicable"} for row in result["stage_ledger"])
+
+
 def test_prepare_uses_initial_check_door_latch_values_as_typed_observations_not_invented_closed_gate():
     driver = FakeMotionDriver()
     driver.io = {

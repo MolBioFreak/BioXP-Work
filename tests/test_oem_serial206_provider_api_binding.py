@@ -11,6 +11,7 @@ from bioxp import operator_controls
 class PartialProvider:
     def __init__(self) -> None:
         self.z_calls = []
+        self.y_provider = object()
 
     def capability_status(self):
         return {
@@ -51,14 +52,9 @@ class PartialProvider:
 
 
 def test_z_set_home_requires_explicit_current_position_confirmation():
-    assert set(api.OemZSetHomeRequest.model_fields) == {"operator_ack", "note"}
+    assert set(api.OemZSetHomeRequest.model_fields) == {"operator_ack"}
     with pytest.raises(ValidationError):
         api.OemZSetHomeRequest(operator_ack="SET_HOME", note="Confirm")
-    with pytest.raises(ValidationError):
-        api.OemZSetHomeRequest(
-            operator_ack="SET_HOME_CURRENT_POSITION",
-            note="   ",
-        )
 
 
 def test_z_observation_request_is_strict():

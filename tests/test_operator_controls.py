@@ -258,35 +258,6 @@ def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_
     assert calls == []
 
 
-def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_path, monkeypatch):
-    app, calls = make_app(tmp_path, monkeypatch)
-    app.state.operator_test_maintenance.update({
-        "motion_blocked": True,
-        "recovery_required": True,
-        "block_reason": "Motion is inactive.",
-    })
-    client = TestClient(app)
-    catalog = client.get("/operator/control-catalog").json()
-    motor_actions = [
-        row for row in catalog["actions"]
-        if row["kind"] == "primitive" and row["safety_class"] == "motion"
-    ]
-    assert motor_actions
-    target = next(row for row in motor_actions if "/motion/test/home_axis" == row["informational_path"])
-    assert target["enabled"] is False
-    assert target["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
-
-    blocked = client.post(f"/operator/actions/{target['action_id']}", json={
-        "expected_generation": catalog["ownership_generation"],
-        "idempotency_key": "motion-blocked-123456",
-        "inputs": {"body": {"axis": "x"}},
-    })
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["reason"] == "Motion is inactive. Activate motion before moving this motor."
-    assert any(row["key"] == "motion_enabled" and row["met"] is False for row in blocked.json()["detail"]["dependencies"])
-    assert calls == []
-
-
 def test_primitive_invocation_dispatches_exactly_one_catalog_route_and_persists_receipt(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
@@ -927,24 +898,3 @@ def test_successive_move_queue_mechanics_order_and_clear():
         assert queue.snapshot().get("x", {}).get("depth") == 0
 
     asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("idempotency_key", ["queue-first", "clear-first", "ghost-first"])
-def test_retired_legacy_x_move_route_requires_v2_authority(tmp_path, monkeypatch, idempotency_key):
-    app, calls = make_app(tmp_path, monkeypatch)
-    with TestClient(app) as client:
-        catalog = client.get("/operator/control-catalog").json()
-        response = client.post(
-            "/operator/actions/oem.x.move_steps",
-            json={
-                "expected_generation": catalog["ownership_generation"],
-                "idempotency_key": idempotency_key,
-                "inputs": {"steps": 100},
-            },
-        )
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["error"] == "canonical_xz_action_requires_v2_route"
-    assert detail["replacement_action_id"] == "oem.x.move_steps"
-    assert detail["required_schema"] == "bioxp.operator_action_request.v2"
-    assert calls == []

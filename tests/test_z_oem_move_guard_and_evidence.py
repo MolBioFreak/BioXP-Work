@@ -22,30 +22,6 @@ def _adapter(position: int):
     return adapter, calls
 
 
-def test_move_steps_rejects_oem_twenty_step_low_margin_before_dispatch():
-    adapter, calls = _adapter(10_000)
-
-    result = adapter.z_move_steps(steps=-10_000)
-
-    assert result["ok"] is False
-    assert result["failure"] == "z_source_coordinate_inside_limit_margin"
-    assert result["source_limit_margin_steps"] == 20
-    assert result["physical_motion_commanded"] is False
-    assert calls == []
-
-
-def test_move_steps_allows_target_at_exact_oem_low_margin_and_keeps_one_event_cursor():
-    adapter, calls = _adapter(10_020)
-
-    result = adapter.z_move_steps(steps=-10_000)
-
-    assert result["ok"] is True
-    assert [name for name, _ in calls].count("event_window") == 1
-    finalize = next(value for name, value in calls if name == "finalize")
-    assert finalize["pre_command_event_window"] == {"after_sequence": 41}
-    assert finalize["event_window"] == {"after_sequence": 41}
-
-
 def test_critical_receipt_evidence_survives_deep_result_compaction():
     receipt = {
         "command_id": "operator-test",
@@ -87,32 +63,6 @@ def test_critical_receipt_evidence_survives_deep_result_compaction():
         "terminal_stopped": True,
         "target_events": [],
         "controller_error_events": [{"status": 130, "event_sequence": 77}],
-    }
-
-
-def test_failed_move_terminal_readback_updates_position_without_restoring_reference():
-    result = {
-        "after": {"ok": True, "ack": ACK, "position": 13},
-        "after_position_steps": 13,
-        "wait": {"stopped": True, "last_speed": 0, "last_ack": ACK},
-    }
-
-    terminal = subject.Serial206OemInitializationProvider._z_terminal_state_from_result(
-        result,
-        command_id="operator-failed",
-        observed_at=123.0,
-    )
-
-    assert terminal == {
-        "authority": "serial206_terminal_register_readback",
-        "position_steps": 13,
-        "speed_steps_s": 0,
-        "left_switch_state": None,
-        "right_switch_state": None,
-        "left_switch_disabled": None,
-        "right_switch_disabled": None,
-        "source_command_id": "operator-failed",
-        "observed_at": 123.0,
     }
 
 

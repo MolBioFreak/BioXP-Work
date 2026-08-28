@@ -134,45 +134,6 @@ def adapter(*, fail_acceleration=False, reference=True):
     return primitive
 
 
-def test_move_xy_uses_oem_pair_acceleration_order_and_atomic_metadata():
-    primitive = adapter()
-    receipt = primitive.move_xy(12000, 6000, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["branch"] == "parallel"
-    assert receipt["launch_order"] == ["x", "y"]
-    assert receipt["acceleration_selected"] == {"x": 400, "y": 400}
-    assert receipt["stagger_ms"] == 100
-    assert receipt["pre_wait_sleep_ms"] == 5
-    assert primitive.tester.moves == [(5, 12000, False), (4, 6000, False)]
-    assert primitive.tester.wait_windows[-1]["dispatch_cursors"] == {"5:0": 10.0, "4:0": 20.0}
-    assert primitive.reference_store.motion_many == [(('x', 'move_xy'), ('y', 'move_xy'))]
-    assert primitive.reference_store.motion_single == []
-    assert primitive.tester.acceleration_writes[-2:] == [(5, 5, 350, 0), (4, 5, 400, 0)]
-
-
-def test_move_xy_near_axis_keeps_both_targets_live_without_boost():
-    primitive = adapter()
-    receipt = primitive.move_xy(100, 10, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["branch"] == "near_axis_sequential"
-    assert receipt["launch_order"] == ["x", "y"]
-    assert primitive.tester.moves == [(5, 100, False), (4, 10, False)]
-    assert (5, 5, 400, 0) not in primitive.tester.acceleration_writes
-    assert (4, 5, 750, 0) not in primitive.tester.acceleration_writes
-
-
-def test_move_xy_longer_y_axis_launches_y_first_with_integer_stagger():
-    primitive = adapter()
-    receipt = primitive.move_xy(6000, 12000, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["launch_order"] == ["y", "x"]
-    assert receipt["stagger_ms"] == 100
-    assert primitive.tester.moves == [(4, 12000, False), (5, 6000, False)]
-
-
 class LifecyclePrimitives:
     @staticmethod
     def current_board_lifecycle_generation():

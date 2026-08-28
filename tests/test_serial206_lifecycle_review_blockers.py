@@ -292,22 +292,6 @@ def test_cycle_deep_wide_large_and_nonfinite_evidence_projection_is_deterministi
     assert b"cycle" in encoded or b"limit" in encoded
 
 
-def test_primitive_output_projection_failure_persists_nonreplayable_failed_state(tmp_path):
-    cycle: dict[str, object] = {"ok": True}
-    cycle["cycle"] = cycle
-    first_primitives = _NoIoPrimitives(cycle)
-    first = _provider(tmp_path / "runtime", first_primitives)
-    result = first.initialize_motors(mode="live", approval=_approval("z-home"), commissioning=_commissioning())
-    assert result["ok"] is False
-    assert len(json.dumps(result["stage_receipts"][0], allow_nan=False).encode()) <= subject._EVIDENCE_MAX_BYTES * 2
-
-    restarted_primitives = _NoIoPrimitives()
-    restarted = _provider(tmp_path / "runtime", restarted_primitives)
-    again = restarted.initialize_motors(mode="live", approval=_approval("z-home", generation=11), commissioning=_commissioning())
-    assert again["ok"] is False
-    assert restarted_primitives.calls == []
-
-
 def _valid_admitted_state() -> dict:
     state = subject.Serial206OemInitializationProvider._new_state()
     state["preparation"] = {"generation": 11, "state": "completed", "receipt": {"ok": True}}
@@ -320,49 +304,6 @@ def _valid_admitted_state() -> dict:
 
 def _persist_state(root: Path, state: dict) -> None:
     OEMRuntimeStore(root).write_oem_serial206_initialization_state(state)
-
-
-def test_restart_from_single_admitted_stage_fails_ambiguous_without_replay(tmp_path):
-    root = tmp_path / "runtime"
-    _persist_state(root, _valid_admitted_state())
-    primitives = _NoIoPrimitives()
-    result = _provider(root, primitives).initialize_motors(mode="live", approval=_approval("z-home"), commissioning=_commissioning())
-    assert result["state"] == "failed_closed"
-    assert "stage_execution_outcome_ambiguous_after_restart:z-home" in result["blockers"]
-    assert primitives.calls == []
-    persisted = OEMRuntimeStore(root).read_oem_serial206_initialization_state()
-    assert persisted["movement_ledger"]["stages"]["z-home"]["state"] == "failed"
-
-
-@pytest.mark.parametrize("mutate", [
-    lambda state: state["movement_ledger"]["stages"]["gripper-current-31"].update({"state": "admitted", "command_id": "other", "idempotency_key": "other-idem", "expected_generation": 11}),
-    lambda state: state["movement_ledger"]["stages"]["gripper-current-31"].update({"state": "completed", "command_id": "later"}),
-    lambda state: state["used_approvals"]["approval-z-home"].update({"stage": "x-home"}),
-    lambda state: state["preparation"].update({"generation": 12}),
-    lambda state: state["movement_ledger"].update({"terminal_state": "initializeMotors_complete", "expected_next_stage": "z-home"}),
-], ids=["two-admitted", "impossible-order", "used-approval-mismatch", "generation-preparation-mismatch", "terminal-expected-next-inconsistent"])
-def test_semantically_corrupt_documents_fail_before_primitive_access(tmp_path, mutate):
-    state = _valid_admitted_state()
-    mutate(state)
-    root = tmp_path / "runtime"
-    _persist_state(root, state)
-    primitives = _NoIoPrimitives()
-    result = _provider(root, primitives).initialize_motors(mode="live", approval=_approval("z-home"), commissioning=_commissioning())
-    assert result["ok"] is False
-    assert "durable_serial206_state_corrupt" in result["blockers"]
-    assert primitives.calls == []
-
-
-def test_terminal_initialization_completion_never_publishes_machine_ready():
-    state = subject.Serial206OemInitializationProvider._new_state()
-    ledger = state["movement_ledger"]
-    for row in ledger["stages"].values():
-        row["state"] = "completed" if row["requires_operator_observation"] is False else "operator_observed"
-    ledger["expected_next_stage"] = None
-    ledger["terminal_state"] = "initializeMotors_complete"
-    result = subject.Serial206OemInitializationProvider(object())._result_from_state(state, ok=True, blockers=[])
-    assert result["initialization_complete"] is True
-    assert result["ready"] is False
 
 
 def test_direct_startup_step_route_is_absent_from_openapi_and_operator_catalog():

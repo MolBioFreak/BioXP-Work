@@ -125,71 +125,60 @@
     }
   },
   "deviations_to_live_linux": [
-    "Current live Linux homing is a guarded reconstruction with safety/workaround paths, not a clean line-by-line port.",
-    "Z startup may use a live GAP10/controller-zero reference workaround; source model keeps that separate from OEM ClassHeadBoard.queryHome/GAP9 provenance.",
+    "Source-shaped software contracts are present; controller and physical acceptance remain pending.",
     "BMS /api/bioxp/* is a proxy/linkage layer and may not expose every raw FastAPI route."
   ],
   "live_target_mappings": [
     {
       "deviations": [
-        "Constants are partly reconstructed/defaulted without recovered machine config.xml."
-      ],
-      "source_mode": "initializeMotorsWithoutMotion",
-      "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3397,
-      "target_status": "implemented_source_shaped_setup",
-      "target_symbol": "BioXpTester.motor_oem_initialize_without_motion"
-    },
-    {
-      "deviations": [
         "The provider owns admission, physical execution, atomic state, observation, and receipts."
       ],
       "source_mode": "initializeMotors/initializeMotion",
-      "target_file": "src/bioxp/api.py",
-      "target_line": 1307,
+      "target_file": "src/bioxp/oem_serial206_initialization.py",
+      "target_line": 3529,
       "target_status": "canonical_atomic_serial206_authority",
       "target_symbol": "Serial206OemInitializationProvider"
     },
     {
       "deviations": [
-        "Poll/guard implementation is Linux reconstruction of board primitive semantics.",
-        "Z startup may bypass source GAP9 search via GAP10/controller-zero workaround."
+        "The source-shaped leaf is owned by the canonical serial-206 provider.",
+        "Switch transitions remain telemetry rather than an OEM success predicate; controller and physical acceptance remain pending."
       ],
       "source_mode": "startup axisSearchHome",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3418,
-      "target_status": "partial_guarded_reconstruction",
+      "target_line": 5576,
+      "target_status": "source_shaped_provider_authority",
       "target_symbol": "BioXpTester.motor_oem_axis_search_home"
     },
     {
       "deviations": [
-        "Manual /motion/axis/home has known Z/X failure incidents and must not be treated as proven true homing.",
-        "Requires switch deassert->active proof before setHome/reporting reference."
+        "Direct external mutation is retired; canonical operator/provider dispatch owns this source-shaped leaf.",
+        "Controller and physical acceptance remain pending."
       ],
       "source_mode": "manual button goHome(true)",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3510,
-      "target_status": "unsafe_until_predicate_matrix_fixed",
+      "target_line": 5663,
+      "target_status": "provider_owned_leaf_direct_route_retired",
       "target_symbol": "BioXpTester.motor_oem_go_home / motor_oem_home_axis(startup=False)"
     },
     {
       "deviations": [
-        "Door search is implemented separately but still needs physical predicate proof for parity."
+        "The source-shaped software contract is present; physical predicate confirmation remains pending."
       ],
       "source_mode": "doorSearchHome",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3725,
-      "target_status": "partial_guarded_reconstruction",
+      "target_line": 6557,
+      "target_status": "source_shaped_software_contract_physical_unverified",
       "target_symbol": "BioXpTester.motor_oem_door_search_home"
     },
     {
       "deviations": [
-        "Current public home route routes through Linux helper selection, not a direct HomeAxis source clone."
+        "Direct external mutation is retired; canonical operator/provider dispatch owns the source-shaped axis-home leaf."
       ],
       "source_mode": "HomeAxis",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3787,
-      "target_status": "not_clean_one_to_one_port",
+      "target_line": 7055,
+      "target_status": "provider_owned_leaf_direct_route_retired",
       "target_symbol": "BioXpTester.motor_oem_switch_search_home_axis / motor_oem_home_axis"
     },
     {
@@ -200,7 +189,7 @@
       ],
       "source_mode": "HomeXY",
       "target_file": "src/bioxp/usb_driver.py",
-      "target_line": 3925,
+      "target_line": 7146,
       "target_status": "direct_oem_parallel_task_run_waitall",
       "target_symbol": "BioXpTester.motor_oem_home_xy / motion_oem_home_xy"
     }
@@ -348,7 +337,7 @@
   },
   "raw_fastapi_route_table": [
     {
-      "classification": "direct HomeXY mode surface; guarded X/Y switch-search",
+      "classification": "provider-owned source-shaped HomeXY leaf; direct external mutation retired",
       "methods": "POST",
       "name": "motion_oem_home_xy",
       "path": "/motion/oem/home_xy"
@@ -416,12 +405,12 @@
   ],
   "routes": [
     {
-      "equivalence": "not-equivalent-to-single-axis-home-or-zero",
-      "maps_to": "direct HomeXY mode surface",
+      "equivalence": "direct-external-mutation-retired",
+      "maps_to": "provider-owned source-shaped HomeXY leaf",
       "method": "POST",
       "notes": [
-        "Preserves HomeXY source-mode label and launches X/Y goHome concurrently like OEM Task.Run/WaitAll.",
-        "This is not manual single-axis Home and not controller Zero."
+        "The canonical operator/provider path owns execution.",
+        "The leaf preserves OEM Task.Run/WaitAll concurrency and profile restoration."
       ],
       "route": "/motion/oem/home_xy",
       "surface": "raw-fastapi"
@@ -447,12 +436,12 @@
       "surface": "raw-fastapi"
     },
     {
-      "equivalence": "not-equivalent-to-startup-axisSearchHome",
-      "maps_to": "manual button goHome-style route",
+      "equivalence": "direct-external-mutation-retired",
+      "maps_to": "provider-owned source-shaped axis-home leaf",
       "method": "POST",
       "notes": [
-        "Historically routed through _execute_home_axis(... startup=False).",
-        "Unsafe until per-axis predicates/transitions are repaired and proven."
+        "The canonical operator/provider path owns execution.",
+        "Controller and physical acceptance remain pending."
       ],
       "route": "/motion/axis/home",
       "surface": "raw-fastapi"

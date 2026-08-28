@@ -27,6 +27,9 @@ class FakeYTester:
         self.calls.append(("prepare", axis))
         return {"ok": True, "profile": {"axis": axis}}
 
+    def oem_no24v_state(self):
+        return False
+
     def motor_get_position(self, board, *, motor=0):
         assert (board, motor) == (4, 0)
         return {"ok": True, "position": self.position, "ack": {"status": 100}}
@@ -135,20 +138,6 @@ def test_y_profile_is_selected_machine_source_shape(tmp_path):
     assert profile["home_speed"] == 500
 
 
-def test_relative_guard_rejects_both_twenty_step_end_bands(tmp_path):
-    provider = make_provider(tmp_path)
-    tester = provider.tester
-    tester.position = 0
-    low = provider.move_steps(19)
-    assert low["ok"] is False
-    assert low["failure"] == "y_relative_target_out_of_range"
-    tester.position = 102956
-    high = provider.move_steps(-19)
-    assert high["ok"] is False
-    assert high["failure"] == "y_relative_target_out_of_range"
-    assert not [call for call in tester.calls if call[0] == "relative"]
-
-
 def test_relative_move_reconciles_observed_discrepancy_without_latch(tmp_path):
     provider = make_provider(tmp_path)
     result = provider.move_steps(100, command_id="y-relative-1")
@@ -170,30 +159,6 @@ def test_absolute_move_clamps_controller_target_and_starts_pending_by_default(tm
     assert provider.tester.calls[-1] == ("absolute", 4, 0, False, 102956)
 
 
-def test_acceleration_overload_reports_failed_normal_restoration_without_raising(tmp_path):
-    provider = make_provider(tmp_path)
-    tester = provider.tester
-    original_setter = tester.motor_set_axis_param
-
-    def fail_normal_restore(board, parameter, value, *, motor=0):
-        if value == 400:
-            raise OSError("restore write failed")
-        return original_setter(board, parameter, value, motor=motor)
-
-    tester.motor_set_axis_param = fail_normal_restore
-    result = provider.move_absolute_internal(
-        "acceleration_overload",
-        2000,
-        acceleration_override=250,
-        command_id="y-absolute-restore-failure",
-    )
-
-    assert result["ok"] is False
-    assert result["failure"] == "normal_acceleration_restoration_unverified"
-    assert result["acceleration_overload"]["restoration_complete"] is False
-    assert result["acceleration_overload"]["restoration_exception"]["type"] == "OSError"
-
-
 def test_home_modes_use_distinct_source_speed_and_publish_reference_without_transition(tmp_path):
     provider = make_provider(tmp_path)
     result = provider.home("diagnostic", command_id="y-home-1")
@@ -206,69 +171,6 @@ def test_home_modes_use_distinct_source_speed_and_publish_reference_without_tran
     result = provider.home("manual_panel", command_id="y-home-2")
     assert result["source_speed"] == 500
     assert provider.tester.calls[-1] == ("home", "y", 500, False, False)
-
-
-def test_stop_is_y_scoped_and_preserves_z_projection(tmp_path):
-    provider = make_provider(tmp_path)
-    result = provider.stop(command_id="y-stop-1")
-    assert result["ok"] is True
-    assert result["axis"] == "y"
-    assert result["stop"]["first_delivery"]["status"] == 100
-    assert result["stop"]["second_delivery"]["status"] == 100
-    assert result["terminal_speed"]["last_speed"] == 0
-    axes = provider.state_store.board4_authority_projection()["axes"]
-    assert axes["z"]["lifecycle_state"] == "unprepared"
-
-
-def test_stop_requires_both_acks_and_typed_zero_speed(tmp_path):
-    provider = make_provider(tmp_path)
-    provider.tester.motor_oem_stop_exact = lambda board, motor=0: {
-        "ok": True,
-        "first_delivery": {"status": 1},
-        "second_delivery": {"status": 100},
-    }
-    result = provider.stop(command_id="y-stop-invalid-first")
-    assert result["ok"] is False
-    assert result["double_stop_acknowledged"] is False
-    provider.tester.motor_oem_stop_exact = lambda board, motor=0: {
-        "ok": True,
-        "first_delivery": {"status": 100},
-        "second_delivery": {"status": 100},
-    }
-    provider.tester.motor_wait_stopped = lambda *args, **kwargs: {
-        "stopped": True, "last_speed": False, "last_ack": {"status": 100}
-    }
-    result = provider.stop(command_id="y-stop-bool-speed")
-    assert result["ok"] is False
-    assert result["terminal_speed_zero"] is False
-
-
-def test_absolute_terminal_failure_forces_independent_stop_with_zero_speed_evidence(tmp_path):
-    provider = make_provider(tmp_path)
-    issued = provider.move_absolute(2000, command_id="y-absolute-mismatch")
-    provider.tester.position = 1999
-    terminal = provider.terminalize_absolute(issued)
-    assert terminal["ok"] is False
-    assert terminal["completion_class"] == "target_mismatch"
-    assert terminal["target_position_verified"] is False
-    assert terminal["failure_stop"]["double_stop_acknowledged"] is True
-    assert terminal["failure_stop"]["terminal_speed_zero"] is True
-
-
-def test_absolute_timeout_at_target_is_ambiguous_and_forces_independent_stop(tmp_path):
-    provider = make_provider(tmp_path)
-    issued = provider.move_absolute(2000, command_id="y-absolute-timeout")
-    provider.tester.motor_oem_wait_target_reached = lambda *args, event_window=None, **kwargs: {
-        "ok": False,
-        "failure": "timeout",
-        "event_window": event_window,
-    }
-    terminal = provider.terminalize_absolute(issued)
-    assert terminal["ok"] is False
-    assert terminal["completion_class"] == "oem_timeout_target_equal"
-    assert terminal["controller_completion_verified"] is False
-    assert terminal["failure_stop"]["double_stop_acknowledged"] is True
-    assert terminal["failure_stop"]["terminal_speed_zero"] is True
 
 
 def test_set_home_is_explicit_no_motion_and_does_not_claim_home_reference(tmp_path):

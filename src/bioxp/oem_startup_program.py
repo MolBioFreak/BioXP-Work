@@ -257,23 +257,14 @@ class BioXpStartupHardware:
         }
 
     def configure_without_motion(self, *, mode: str = "shadow") -> dict:
-        tester = self.tester
-        if hasattr(tester, "motor_oem_initialize_without_motion") and mode == "live":
-            prep = tester.motor_oem_initialize_without_motion()
-            if isinstance(prep, dict) and "ok" in prep:
-                return prep
-            # Backward-compatible guard for older tester implementations that returned
-            # raw {axis: prep_row} without an aggregate success bit.  The startup
-            # state machine requires a top-level ok; otherwise live startup falsely
-            # failed at initializeMotorsWithoutMotion even when all prep writes ACKed.
-            return {
-                "ok": True,
-                "physical_motion": False,
-                "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"],
-                "axes": prep,
-                "normalized_from_raw_axis_prep": True,
-            }
-        return {"ok": True, "physical_motion": False, "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"], "skipped_live_write": mode != "live"}
+        live = mode == "live"
+        return {
+            "ok": not live,
+            "physical_motion": False,
+            "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"],
+            "skipped_live_write": True,
+            "failure": "provider_owned_initialize_motors_required" if live else None,
+        }
 
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:
         return {"ok": False, "required": True, "available": False, "skipped": True, "blocks_ready": True, "reason": "pipette ACK/readback parity gate not yet proven"}

@@ -25,6 +25,7 @@ def test_home_gz_normal_branch_fails_if_any_source_command_fails(monkeypatch):
         gripper_version=0,
         development_machine=True,
         timeout_s=30.0,
+        caught_plate_x_home=lambda: {"ok": True},
     )
 
     assert result["ok"] is False
