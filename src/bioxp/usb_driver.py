@@ -5372,7 +5372,7 @@ class BioXpTester:
         for name, profile, speed, acc, current, stall, masks in (
             ("x", x, 1700, 350, 31, 16, ()),
             ("y", y, 1800, 400, 31, 16, ((12, 1, "disable_right"),)),
-            ("z", z, 1791, 576, z_current, z_stall, ()),
+            ("z", z, 1791, 576, z_current, z_stall, ((12, 1, "disable_right"),)),
         ):
             if name not in selected:
                 continue
