@@ -1108,7 +1108,12 @@ def _normalized_schema_sql(value: str | None) -> str:
 
 
 def _foundation_schema_manifest(connection: sqlite3.Connection) -> dict[str, Any]:
-    objects = connection.execute(
+    def rows(sql: str) -> list[sqlite3.Row]:
+        cursor = connection.cursor()
+        cursor.row_factory = sqlite3.Row
+        return cursor.execute(sql).fetchall()
+
+    objects = rows(
         """
         SELECT type,name,sql FROM sqlite_master
         WHERE type IN ('table','index','trigger')
@@ -1116,7 +1121,7 @@ def _foundation_schema_manifest(connection: sqlite3.Connection) -> dict[str, Any
           AND sql IS NOT NULL
         ORDER BY type,name
         """
-    ).fetchall()
+    )
     tables = tuple(str(row["name"]) for row in objects if str(row["type"]) == "table")
     return {
         "objects": {
@@ -1132,12 +1137,12 @@ def _foundation_schema_manifest(connection: sqlite3.Connection) -> dict[str, Any
                     None if row["dflt_value"] is None else str(row["dflt_value"]),
                     int(row["pk"]),
                 )
-                for row in connection.execute(f'PRAGMA table_info("{table}")')
+                for row in rows(f'PRAGMA table_info("{table}")')
             )
             for table in tables
         },
         "foreign_keys": {
-            table: tuple(tuple(row) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")'))
+            table: tuple(tuple(row) for row in rows(f'PRAGMA foreign_key_list("{table}")'))
             for table in tables
         },
         "indexes": {
@@ -1149,12 +1154,12 @@ def _foundation_schema_manifest(connection: sqlite3.Connection) -> dict[str, Any
                     int(row["partial"]),
                     tuple(
                         str(item["name"])
-                        for item in connection.execute(
+                        for item in rows(
                             f'PRAGMA index_info("{str(row["name"]).replace(chr(34), chr(34) * 2)}")'
                         )
                     ),
                 )
-                for row in connection.execute(f'PRAGMA index_list("{table}")')
+                for row in rows(f'PRAGMA index_list("{table}")')
             ))
             for table in tables
         },
