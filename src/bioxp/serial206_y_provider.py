@@ -550,6 +550,9 @@ class Serial206YProvider:
             require_switch_transition=False,
         ) if callable(primitive) else {"ok": False, "failure": "y_home_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_home_result_not_mapping", "raw": result}
+        source_home_raw = result.get("home")
+        source_home = dict(source_home_raw) if isinstance(source_home_raw, Mapping) else {}
+        source_home_ok = bool(result.get("ok") is True or source_home.get("ok") is True)
         proof = self._home_proof(result)
         proof_ok = all(proof.values())
         reference = None
@@ -565,7 +568,7 @@ class Serial206YProvider:
                 )
                 reference_published = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
         return {
-            "ok": bool(result.get("ok") is True),
+            "ok": bool(source_home_ok and proof_ok and reference_published),
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
