@@ -399,8 +399,7 @@ SOURCE_VOLUME=()
 [[ "$SOURCE_MODE" == exact_commit_materialization ]] || fail "unsupported source mode"
 SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app:ro")
 
-exec "$UDOCKER_BIN" run \
-  --repo="$UDOCKER_ROOT/store" \
+exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --pull=never \
   --user=root \
   --env="BIOXP_RELEASE_ID=$RELEASE_ID" \
