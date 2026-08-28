@@ -1261,14 +1261,34 @@ def _rebuild_runtime_audit_foundation(connection: sqlite3.Connection) -> None:
                 str(row["name"])
                 for row in connection.execute(f'PRAGMA table_info("{legacy}")')
             }
-            selected = tuple(name for name, *_ in manifest["columns"][table] if name in actual_columns)
+            derived_columns = {
+                "runtime_evidence_links": {
+                    "target_kind": (
+                        "CASE WHEN command_id IS NOT NULL THEN 'command' "
+                        "ELSE 'pipette_operation' END"
+                    ),
+                    "target_identity": "COALESCE(command_id,pipette_operation_id)",
+                },
+            }.get(table, {})
+            selected = tuple(
+                name
+                for name, *_ in manifest["columns"][table]
+                if name in actual_columns or name in derived_columns
+            )
             if selected:
-                projection = ",".join(
+                insert_projection = ",".join(
                     f'"{name.replace(chr(34), chr(34) * 2)}"' for name in selected
                 )
+                select_projection = ",".join(
+                    derived_columns.get(
+                        name,
+                        f'"{name.replace(chr(34), chr(34) * 2)}"',
+                    )
+                    for name in selected
+                )
                 connection.execute(
-                    f'INSERT INTO "{table.replace(chr(34), chr(34) * 2)}" ({projection}) '
-                    f'SELECT {projection} FROM "{legacy.replace(chr(34), chr(34) * 2)}"'
+                    f'INSERT INTO "{table.replace(chr(34), chr(34) * 2)}" ({insert_projection}) '
+                    f'SELECT {select_projection} FROM "{legacy.replace(chr(34), chr(34) * 2)}"'
                 )
         for legacy in reversed(tuple(renamed.values())):
             connection.execute(f'DROP TABLE "{legacy.replace(chr(34), chr(34) * 2)}"')
