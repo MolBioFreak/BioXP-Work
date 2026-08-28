@@ -90,18 +90,28 @@ def test_source_matrix_is_json_serializable_and_no_motion_scoped():
     assert matrix["truth_level"] == "source_model_only_no_motion_no_usb"
     assert matrix["axis_to_board"]["x"] == {"board": "deck/CAN5", "motor": 0, "oem_designator": "MotorX"}
     assert matrix["axis_to_board"]["z"] == {"board": "head/CAN4", "motor": 1, "oem_designator": "MotorZ"}
-    assert "Current live Linux homing is a guarded reconstruction" in matrix["deviations_to_live_linux"][0]
+    assert matrix["deviations_to_live_linux"] == [
+        "Source-shaped software contracts are present; controller and physical acceptance remain pending.",
+        "BMS /api/bioxp/* is a proxy/linkage layer and may not expose every raw FastAPI route.",
+    ]
     json.dumps(matrix, sort_keys=True)
 
 
 
-def test_live_target_mapping_labels_missing_or_partial_ports_explicitly():
+def test_live_target_mapping_uses_current_provider_owned_source_positive_contracts():
     by_mode = {m.source_mode: m for m in LIVE_TARGET_MAPPINGS}
 
-    assert by_mode["initializeMotorsWithoutMotion"].target_symbol == "BioXpTester.motor_oem_initialize_without_motion"
-    assert by_mode["startup axisSearchHome"].target_status == "partial_guarded_reconstruction"
-    assert any("GAP10/controller-zero" in d for d in by_mode["startup axisSearchHome"].deviations)
-    assert by_mode["manual button goHome(true)"].target_status == "unsafe_until_predicate_matrix_fixed"
+    assert "initializeMotorsWithoutMotion" not in by_mode
+    assert by_mode["initializeMotors/initializeMotion"].target_line == 3529
+    assert by_mode["startup axisSearchHome"].target_line == 5576
+    assert by_mode["startup axisSearchHome"].target_status == "source_shaped_provider_authority"
+    assert all("GAP10/controller-zero" not in d for d in by_mode["startup axisSearchHome"].deviations)
+    assert by_mode["manual button goHome(true)"].target_line == 5663
+    assert by_mode["manual button goHome(true)"].target_status == "provider_owned_leaf_direct_route_retired"
+    assert by_mode["doorSearchHome"].target_line == 6557
+    assert by_mode["HomeAxis"].target_line == 7055
+    assert by_mode["HomeAxis"].target_status == "provider_owned_leaf_direct_route_retired"
+    assert by_mode["HomeXY"].target_line == 7146
     assert by_mode["HomeXY"].target_status == "direct_oem_parallel_task_run_waitall"
     assert any("concurrently" in d or "Task.Run" in d for d in by_mode["HomeXY"].deviations)
     assert by_mode["initializeMotors/initializeMotion"].target_status == "canonical_atomic_serial206_authority"

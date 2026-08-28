@@ -137,6 +137,60 @@ def _legacy_table_identity(
     return selected_columns, len(rows), hashlib.sha256(encoded).hexdigest()
 
 
+def _is_legacy_v1_serial206_receipts_schema(connection: sqlite3.Connection) -> bool:
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='serial206_receipts'"
+    ).fetchone()
+    if table_row is None:
+        return False
+    normalized = "".join(str(table_row[0] or "").upper().split())
+    if "CHECK(IDEMPOTENCY_REPLAY_ENABLEDIN(0,1))" in normalized:
+        return False
+    columns = tuple(str(row[1]) for row in connection.execute("PRAGMA table_info(serial206_receipts)"))
+    expected = (
+        "stream", "receipt_id", "command_id", "idempotency_key",
+        "idempotency_replay_enabled", "status", "observed_at", "receipt_json",
+    )
+    if columns != expected:
+        raise RuntimeError("serial206_receipts is not the recognized v1 lineage")
+    return True
+
+
+def _normalize_legacy_v1_serial206_receipts(connection: sqlite3.Connection) -> None:
+    """Restore the canonical replay constraint on the recognized v1 receipt table."""
+    if not _is_legacy_v1_serial206_receipts_schema(connection):
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE serial206_receipts RENAME TO serial206_receipts_legacy_v1")
+        connection.execute(
+            """
+            CREATE TABLE serial206_receipts (
+                stream TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                command_id TEXT,
+                idempotency_key TEXT,
+                idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1
+                    CHECK(idempotency_replay_enabled IN (0, 1)),
+                status TEXT,
+                observed_at REAL NOT NULL,
+                receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+                PRIMARY KEY(stream, receipt_id)
+            ) WITHOUT ROWID
+            """
+        )
+        connection.execute(
+            "INSERT INTO serial206_receipts SELECT * FROM serial206_receipts_legacy_v1"
+        )
+        connection.execute("DROP TABLE serial206_receipts_legacy_v1")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+
 def _execute_schema_batch(connection: sqlite3.Connection, script: str) -> None:
     for statement in script.split(";"):
         statement = statement.strip()
@@ -200,6 +254,28 @@ _OPERATOR_COMMAND_COLUMNS = (
 )
 
 
+_LEGACY_V1_OPERATOR_COMMAND_COLUMNS = {
+    "sequence", "command_id", "idempotency_key", "idempotency_replay_enabled",
+    "action_id", "status", "safety_class", "ownership_generation", "started_at",
+    "finished_at", "duration_ms", "controller_acknowledged",
+    "physical_effect_verified", "receipt_json", "response_summary_json",
+    "evidence_relpath", "evidence_sha256", "evidence_bytes", "updated_at",
+}
+
+
+def _is_legacy_v1_operator_schema(connection: sqlite3.Connection) -> bool:
+    command_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_commands)")
+    }
+    transition_columns = tuple(
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_transitions)")
+    )
+    return (
+        command_columns == _LEGACY_V1_OPERATOR_COMMAND_COLUMNS
+        and transition_columns == ("transition_id", "command_id", "state", "observed_at", "detail_json")
+    )
+
+
 def _is_additive_operator_schema(connection: sqlite3.Connection) -> bool:
     command_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(operator_commands)")
@@ -216,10 +292,13 @@ def _is_additive_operator_schema(connection: sqlite3.Connection) -> bool:
 
 
 def _rebuild_additive_operator_schema(connection: sqlite3.Connection) -> None:
-    """Rebuild the known additive v2 lineage into the canonical physical schema."""
-    if not _is_additive_operator_schema(connection):
-        raise RuntimeError("operator schema is not the recognized additive v2 lineage")
+    """Rebuild a recognized legacy/additive lineage into the canonical schema."""
+    if not (_is_additive_operator_schema(connection) or _is_legacy_v1_operator_schema(connection)):
+        raise RuntimeError("operator schema is not a recognized rebuildable lineage")
 
+    source_command_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_commands)")
+    }
     foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
     legacy_alter_table = int(connection.execute("PRAGMA legacy_alter_table").fetchone()[0])
     if connection.in_transaction:
@@ -286,8 +365,19 @@ def _rebuild_additive_operator_schema(connection: sqlite3.Connection) -> None:
             );
             """
         )
+        canonical_column_info = {
+            str(row[1]): row for row in connection.execute("PRAGMA table_info(operator_commands)")
+        }
+        select_expressions = []
+        for column in _OPERATOR_COMMAND_COLUMNS:
+            if column in source_command_columns:
+                select_expressions.append(f'"{column}"')
+                continue
+            default_value = canonical_column_info[column][4]
+            select_expressions.append(str(default_value) if default_value is not None else "NULL")
         connection.execute(
-            f"INSERT INTO operator_commands({columns}) SELECT {columns} FROM operator_commands_additive_v2"
+            f"INSERT INTO operator_commands({columns}) SELECT {','.join(select_expressions)} "
+            "FROM operator_commands_additive_v2"
         )
         connection.execute(
             "INSERT INTO operator_transitions(transition_id,command_id,state,observed_at,detail_json) "
@@ -2640,11 +2730,33 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         }
         found_strict_tables = strict_tables & found_tables
         if found_strict_tables:
-            if _is_additive_operator_schema(connection):
+            rebuild_operator = (
+                _is_additive_operator_schema(connection)
+                or _is_legacy_v1_operator_schema(connection)
+            )
+            rebuild_receipts = _is_legacy_v1_serial206_receipts_schema(connection)
+            if rebuild_operator or rebuild_receipts:
                 _verified_sqlite_backup(connection, selected_root)
-                _rebuild_additive_operator_schema(connection)
+                if rebuild_operator:
+                    _rebuild_additive_operator_schema(connection)
+                if rebuild_receipts:
+                    _normalize_legacy_v1_serial206_receipts(connection)
             _reinstall_runtime_authority_triggers(connection)
+            ledger_row = connection.execute(
+                "SELECT MAX(version) FROM runtime_schema_migrations"
+            ).fetchone()
+            ledger_version = int(ledger_row[0]) if ledger_row and ledger_row[0] is not None else version
+            if ledger_version > version:
+                expected_ledger_hash = _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION.get(ledger_version)
+                if expected_ledger_hash is None:
+                    raise RuntimeError(f"unsupported runtime schema version {ledger_version}")
+                physical_hash = _runtime_physical_schema_sha256(connection)
+                if physical_hash == expected_ledger_hash:
+                    connection.execute(f"PRAGMA user_version={ledger_version}")
+                    version = ledger_version
             _verify_v2_schema(connection)
+            if version == registry[-1].version:
+                verify_canonical_runtime_database(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
             if journal_mode != "wal" or synchronous != 2:
@@ -2725,8 +2837,9 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
             )
         preserved_identities[table] = _legacy_table_identity(connection, table, columns)
     backup_sha256 = _verified_sqlite_backup(connection, selected_root)
-    if _is_additive_operator_schema(connection):
+    if _is_additive_operator_schema(connection) or _is_legacy_v1_operator_schema(connection):
         _rebuild_additive_operator_schema(connection)
+    _normalize_legacy_v1_serial206_receipts(connection)
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -3053,7 +3166,7 @@ class OEMRuntimeStore:
         selected = str(axis).strip().lower()
         if selected not in SERIAL206_BOARD4_MEMBERS:
             raise ValueError("unsupported board-4 axis")
-        with self._lock:
+        with self._lock, self._authority_write():
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 changed = self._db.execute(
@@ -3085,7 +3198,7 @@ class OEMRuntimeStore:
         reply_valid = isinstance(ack, Mapping)
         accepted = reply_valid and status_code == 100
         now = time.time()
-        with self._lock:
+        with self._lock, self._authority_write():
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 current = self._db.execute(
@@ -3209,7 +3322,7 @@ class OEMRuntimeStore:
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
-        with self._lock:
+        with self._lock, self._authority_write():
             board = self._board4_row_locked()
             if board.get("state") != "active" or board.get("active_board_epoch") is None:
                 return {"ok": False, "failure": "board4_not_active", "axis": axis, "board": board}
@@ -3244,7 +3357,7 @@ class OEMRuntimeStore:
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
-        with self._lock:
+        with self._lock, self._authority_write():
             board = self._board4_row_locked()
             row = self._axis_rows_locked().get(axis, {})
             if board.get("state") != "active" or row.get("prepared_board_epoch") != board.get("active_board_epoch"):
@@ -3281,7 +3394,7 @@ class OEMRuntimeStore:
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
         discrepancy = int(observed_position_steps) - int(requested_position_steps)
-        with self._lock:
+        with self._lock, self._authority_write():
             now = time.time()
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -3750,7 +3863,7 @@ class OEMRuntimeStore:
         run_id = str(payload.get("run_id") or "").strip()
         if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
             raise ValueError("valid robot-owned run_id required")
-        with self._lock:
+        with self._lock, self._authority_write():
             sequence = self.next_seq()
             payload["sequence"] = sequence
             encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)

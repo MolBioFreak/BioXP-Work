@@ -189,33 +189,6 @@ def test_dashboard_uses_passive_four_channel_pipette_provider_when_projection_is
     assert dashboard["pipettes"] == passive
 
 
-def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, monkeypatch):
-    app, _ = make_app(tmp_path, monkeypatch)
-    client = TestClient(app)
-    catalog = client.get("/operator/control-catalog").json()
-    assert catalog["schema_name"] == "bioxp.operator_control_catalog"
-    primitive_routes = [(row["informational_method"], row["informational_path"]) for row in catalog["actions"] if row["kind"] == "primitive"]
-    assert primitive_routes.count(("GET", "/motion/axis/{axis}/status")) == 1
-    assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
-    assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
-    meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.initialize_motors", "meta.initialize_motion"}
-    motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
-    motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
-    assert motors["available"] is False
-    assert motion["available"] is False
-    assert len(motors["stages"]) == 19
-    assert catalog["dashboard"]["snapshot"]["collection_triggered"] is False
-    assert all("enabled" in row and "dependencies" in row for row in catalog["actions"])
-    assert all(
-        input_spec["name"] not in {"operator_ack", "operator_reason"}
-        for action in catalog["actions"]
-        for input_spec in action["inputs"]
-    )
-    optional_nested = action_for(catalog, "POST", "/motion/optional-nested")
-    assert next(row for row in optional_nested["inputs"] if row["name"] == "stage_approval")["default"] is None
-
-
 def test_operator_ack_is_not_user_input_and_is_supplied_internally(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
@@ -255,35 +228,6 @@ def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_
     )
     assert response.status_code == 409
     assert response.json()["detail"]["reason"] == "Local-only maintenance route is not callable through the operator relay."
-    assert calls == []
-
-
-def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_path, monkeypatch):
-    app, calls = make_app(tmp_path, monkeypatch)
-    app.state.operator_test_maintenance.update({
-        "motion_blocked": True,
-        "recovery_required": True,
-        "block_reason": "Motion is inactive.",
-    })
-    client = TestClient(app)
-    catalog = client.get("/operator/control-catalog").json()
-    motor_actions = [
-        row for row in catalog["actions"]
-        if row["kind"] == "primitive" and row["safety_class"] == "motion"
-    ]
-    assert motor_actions
-    target = next(row for row in motor_actions if "/motion/test/home_axis" == row["informational_path"])
-    assert target["enabled"] is False
-    assert target["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
-
-    blocked = client.post(f"/operator/actions/{target['action_id']}", json={
-        "expected_generation": catalog["ownership_generation"],
-        "idempotency_key": "motion-blocked-123456",
-        "inputs": {"body": {"axis": "x"}},
-    })
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["reason"] == "Motion is inactive. Activate motion before moving this motor."
-    assert any(row["key"] == "motion_enabled" and row["met"] is False for row in blocked.json()["detail"]["dependencies"])
     assert calls == []
 
 

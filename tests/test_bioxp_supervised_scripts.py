@@ -1,5 +1,4 @@
 from pathlib import Path
-import py_compile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,15 +21,5 @@ def test_supervised_relative_move_preserves_controller_only_truth_warning():
     assert "Operator must be physically watching" in script
 
 
-def test_oem_reference_challenge_is_live_only_and_records_required_proof():
-    script_path = REPO_ROOT / "scripts" / "bioxp_oem_reference_challenge.py"
-    script = script_path.read_text()
-
-    py_compile.compile(str(script_path), doraise=True)
-    assert "no dry-run/demo mode" in script
-    assert "--execute" in script
-    assert "CHALLENGE_TARGETS = {\"z\": -70000, \"x\": 50000, \"y\": 50000}" in script
-    assert 'and h.get("switch_transition")' in script
-    assert 'and h.get("false_home_guard") is None' in script
-    assert "MarkAxisReferencedCommand" in script
-    assert "sensor_reference_artifacts" in script
+def test_legacy_oem_reference_challenge_is_absent():
+    assert not (REPO_ROOT / "scripts" / "bioxp_oem_reference_challenge.py").exists()

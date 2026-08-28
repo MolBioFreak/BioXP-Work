@@ -221,6 +221,55 @@ def test_existing_v2_additive_operator_schema_is_rebuilt_without_data_loss(tmp_p
     assert migrated._db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_existing_v2_legacy_receipt_constraint_is_repaired_without_data_loss(tmp_path):
+    store = OEMRuntimeStore(tmp_path)
+    store.close()
+    db = tmp_path / "bioxp_runtime.db"
+    connection = sqlite3.connect(db)
+    for (trigger_name,) in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='serial206_receipts'"
+    ).fetchall():
+        connection.execute(f'DROP TRIGGER "{trigger_name}"')
+    connection.executescript(
+        """
+        ALTER TABLE serial206_receipts RENAME TO serial206_receipts_canonical;
+        CREATE TABLE serial206_receipts (
+            stream TEXT NOT NULL,
+            receipt_id TEXT NOT NULL,
+            command_id TEXT,
+            idempotency_key TEXT,
+            idempotency_replay_enabled INTEGER NOT NULL DEFAULT 1,
+            status TEXT,
+            observed_at REAL NOT NULL,
+            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+            PRIMARY KEY(stream, receipt_id)
+        ) WITHOUT ROWID;
+        INSERT INTO serial206_receipts(
+            stream,receipt_id,command_id,idempotency_key,
+            idempotency_replay_enabled,status,observed_at,receipt_json
+        ) VALUES('x','legacy-receipt','legacy-command','legacy-key',1,'completed',1,'{}');
+        DROP TABLE serial206_receipts_canonical;
+        PRAGMA user_version=2;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = OEMRuntimeStore(tmp_path)
+
+    row = migrated._db.execute(
+        "SELECT stream,receipt_id,command_id,idempotency_key,status,receipt_json "
+        "FROM serial206_receipts WHERE receipt_id='legacy-receipt'"
+    ).fetchone()
+    assert tuple(row) == (
+        "x", "legacy-receipt", "legacy-command", "legacy-key", "completed", "{}"
+    )
+    table_sql = migrated._db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='serial206_receipts'"
+    ).fetchone()[0]
+    assert "CHECK(idempotency_replay_enabled IN (0, 1))" in table_sql
+
+
 def test_future_schema_version_refuses_without_mutation(tmp_path):
     db = tmp_path / "bioxp_runtime.db"
     connection = sqlite3.connect(db)

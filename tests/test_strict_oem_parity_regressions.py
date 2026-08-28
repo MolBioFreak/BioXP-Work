@@ -1853,6 +1853,19 @@ def test_board_stop_preserves_oem_no24v_and_uninitialized_board_semantics():
         driver.motor_oem_board_stop(BioXpTester.BOARD_HEAD, motor=1, axis_name="z")
     assert calls == ["leaf"]
 
+    calls.clear()
+    states = iter([False, False])
+    driver.oem_no24v_state = lambda: next(states)
+    driver.motor_oem_stop_exact = lambda *_args, **_kwargs: calls.append("leaf") or {
+        "ok": True,
+        "source_call_completed": True,
+        "source_return_code": 0,
+    }
+    stopped = driver.motor_oem_board_stop(BioXpTester.BOARD_HEAD, motor=1, axis_name="z")
+    assert stopped["ok"] is True
+    assert stopped["source_return_code"] == 0
+    assert calls == ["leaf"]
+
 
 def test_xyz_stop_providers_use_board_wrapper_not_motor_leaf():
     assert "motor_oem_board_stop" in inspect.getsource(Serial206ProductionPrimitiveAdapter.x_stop)
