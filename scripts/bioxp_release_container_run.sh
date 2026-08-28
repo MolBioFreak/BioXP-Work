@@ -400,6 +400,7 @@ SOURCE_VOLUME=()
 SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app:ro")
 
 exec "$UDOCKER_BIN" run \
+  --repo="$UDOCKER_ROOT/store" \
   --pull=never \
   --user=root \
   --env="BIOXP_RELEASE_ID=$RELEASE_ID" \
