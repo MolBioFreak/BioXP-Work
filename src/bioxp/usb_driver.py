@@ -84,8 +84,10 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for X.
-            # Absence means no-write; do not actively force controller mask params to 0.
+            # Serial-206 reports the X right switch active at controller zero.
+            # Disable it during profile preparation so bounded positive moves
+            # can leave the home end before the left-home search restores zero.
+            "disable_right": True,
             "warm_enable": True,
         },
         "y": {
@@ -5370,7 +5372,7 @@ class BioXpTester:
             sleep_ms(1)
 
         for name, profile, speed, acc, current, stall, masks in (
-            ("x", x, 1700, 350, 31, 16, ()),
+            ("x", x, 1700, 350, 31, 16, ((12, 1, "disable_right"),)),
             ("y", y, 1800, 400, 31, 16, ((12, 1, "disable_right"),)),
             ("z", z, 1791, 576, z_current, z_stall, ((12, 1, "disable_right"),)),
         ):
