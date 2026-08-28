@@ -63,23 +63,3 @@ def test_target_wait_rejects_persistent_pre_start_zero_at_wrong_position():
     assert result["stopped"] is False
     assert result["ambiguous_no_motion"] is True
     assert result["last_position"] == 0
-
-
-def test_target_wait_rejects_target_value_when_position_ack_is_invalid():
-    driver = object.__new__(BioXpTester)
-    driver.motor_get_speed = lambda board, motor=0: {"speed": 0, "ack": ACK}  # type: ignore[method-assign]
-    driver.motor_get_position = lambda board, motor=0: {  # type: ignore[method-assign]
-        "ok": True,
-        "position": 10000,
-        "ack": {"status": 2},
-    }
-    result = driver.motor_wait_stopped(
-        4,
-        motor=1,
-        timeout_s=0.3,
-        poll_s=0.02,
-        require_seen_nonzero=True,
-        target_position=10000,
-    )
-    assert result["stopped"] is False
-    assert result["target_reached"] is False

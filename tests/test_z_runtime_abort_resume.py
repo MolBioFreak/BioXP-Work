@@ -1,8 +1,27 @@
+import threading
+
+import pytest
+
 from src.bioxp.lifecycle_state import CanonicalLifecycleOwner
 from src.bioxp.oem_runtime_commands import OEMRuntimeCommandHandlers
 from src.bioxp.oem_runtime_store import OEMRuntimeStore
 from src.bioxp.oem_runtime_types import OEMRuntimeCommand
 from src.bioxp.oem_runtime_worker import OEMRuntimeWorker
+
+
+@pytest.fixture(autouse=True)
+def _stop_leaked_operator_dispatchers_before_runtime_store_tests():
+    stores = []
+    for thread in threading.enumerate():
+        if thread.name != "bioxp-operator-dispatcher":
+            continue
+        target = getattr(thread, "_target", None)
+        store = getattr(target, "__self__", None)
+        if store is not None and all(existing is not store for existing in stores):
+            stores.append(store)
+    for store in stores:
+        store.stop()
+    yield
 
 
 def _live_command(name: str, tmp_path, *, params=None) -> OEMRuntimeCommand:

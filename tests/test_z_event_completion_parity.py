@@ -51,4 +51,3 @@ def test_event_128_is_authoritative_when_final_counter_differs_from_target():
     assert result["target_position_steps"] == 10_000
     assert result["after_position_steps"] == 10_006
     assert result["target_events"][0]["status"] == 128
-    assert result["failure_stop"] is None

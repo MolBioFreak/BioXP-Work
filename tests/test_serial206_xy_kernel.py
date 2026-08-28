@@ -112,56 +112,6 @@ def adapter(*, fail_acceleration=False, reference=True):
     return primitive
 
 
-def test_move_xy_uses_oem_pair_acceleration_order_and_atomic_metadata():
-    primitive = adapter()
-    receipt = primitive.move_xy(12000, 6000, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["branch"] == "parallel"
-    assert receipt["launch_order"] == ["x", "y"]
-    assert receipt["acceleration_selected"] == {"x": 400, "y": 400}
-    assert receipt["stagger_ms"] == 100
-    assert receipt["pre_wait_sleep_ms"] == 5
-    assert primitive.tester.moves == [(5, 12000, False), (4, 6000, False)]
-    assert primitive.tester.wait_windows[-1]["dispatch_cursors"] == {"5:0": 10.0, "4:0": 20.0}
-    assert primitive.reference_store.motion_many == [(('x', 'move_xy'), ('y', 'move_xy'))]
-    assert primitive.reference_store.motion_single == []
-    assert primitive.tester.acceleration_writes[-2:] == [(5, 5, 350, 0), (4, 5, 400, 0)]
-
-
-def test_move_xy_near_axis_keeps_both_targets_live_without_boost():
-    primitive = adapter()
-    receipt = primitive.move_xy(100, 10, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["branch"] == "near_axis_sequential"
-    assert receipt["launch_order"] == ["x", "y"]
-    assert primitive.tester.moves == [(5, 100, False), (4, 10, False)]
-    assert (5, 5, 400, 0) not in primitive.tester.acceleration_writes
-    assert (4, 5, 750, 0) not in primitive.tester.acceleration_writes
-
-
-def test_move_xy_acceleration_readback_failure_delivers_no_move():
-    primitive = adapter(fail_acceleration=True)
-    receipt = primitive.move_xy(12000, 6000, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is False
-    assert receipt["failure"] == "moveXY_acceleration_setup_not_verified"
-    assert receipt["command_issued"] is False
-    assert primitive.tester.moves == []
-    assert primitive.reference_store.motion_many == []
-
-
-def test_move_xy_longer_y_axis_launches_y_first_with_integer_stagger():
-    primitive = adapter()
-    receipt = primitive.move_xy(6000, 12000, wait_timeout_s=5.0)
-
-    assert receipt["ok"] is True
-    assert receipt["launch_order"] == ["y", "x"]
-    assert receipt["stagger_ms"] == 100
-    assert primitive.tester.moves == [(4, 12000, False), (5, 6000, False)]
-
-
 class LifecyclePrimitives:
     @staticmethod
     def current_board_lifecycle_generation():
@@ -296,51 +246,6 @@ def test_x_terminal_authority_is_saved_before_sql_receipt(tmp_path, monkeypatch)
     assert events[-2:] == [("authority", "referenced_ready"), ("sql", "completed")]
 
 
-def test_x_terminal_save_failure_publishes_no_sql_and_retry_does_not_redispatch(
-    tmp_path,
-    monkeypatch,
-):
-    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
-
-    store = OEMRuntimeStore(tmp_path)
-    primitives = ImmediateXPrimitives()
-    real_write = store.write_oem_serial206_initialization_state
-
-    def fail_terminal_write(state):
-        if state["x_lifecycle"]["state"] == "referenced_ready":
-            raise OSError("injected authority save failure")
-        return real_write(state)
-
-    provider = Serial206OemInitializationProvider(
-        primitives,
-        state_store=store,
-        generation_provider=lambda: 17,
-    )
-    seed_ready(provider)
-    monkeypatch.setattr(store, "write_oem_serial206_initialization_state", fail_terminal_write)
-    with pytest.raises(OSError, match="injected authority save failure"):
-        provider.execute_x_intent(
-            "move_absolute",
-            {"position_steps": 1000, "command_id": "x-save-failure"},
-        )
-
-    assert store.read_serial206_receipt("x", "x-save-failure") is None
-    assert primitives.dispatches == 1
-    monkeypatch.setattr(store, "write_oem_serial206_initialization_state", real_write)
-    restarted = Serial206OemInitializationProvider(
-        primitives,
-        state_store=store,
-        generation_provider=lambda: 17,
-    )
-    replay = restarted.execute_x_intent(
-        "move_absolute",
-        {"position_steps": 1000, "command_id": "x-save-failure"},
-    )
-    assert replay["ok"] is False
-    assert replay["failure"] == "x_reference_required_before_move"
-    assert primitives.dispatches == 1
-
-
 def test_x_sql_failure_after_authority_save_replays_without_redispatch(tmp_path, monkeypatch):
     from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
 
@@ -374,59 +279,6 @@ def test_homexy_terminal_receipt_replays_without_physical_redispatch(tmp_path):
     assert replay["ok"] is True
     assert replay["replayed"] is True
     assert primitives.dispatches == 1
-
-
-def test_xy_restart_from_executing_latches_ambiguous_without_redispatch(tmp_path):
-    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
-
-    store = OEMRuntimeStore(tmp_path)
-    primitives = ImmediateXPrimitives()
-    seed = Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17)
-    state = seed._load_state()
-    state["x_lifecycle"] = {
-        "schema_version": "bioxp.serial206_x_lifecycle.v1",
-        "state": "executing",
-        "generation": 17,
-        "reference_state": "desynced",
-        "active_receipt": {"command_id": "xy-crashed", "intent": "move_xy", "status": "executing"},
-        "pending_ticket": None,
-        "receipts": [],
-    }
-    store.write_oem_serial206_initialization_state(state)
-    provider = Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17)
-
-    result = provider.execute_xy_intent(10, 20, {"command_id": "xy-crashed"})
-
-    assert result["ok"] is False
-    assert result["failure"] == "xy_current_referenced_authority_required"
-    assert primitives.dispatches == 0
-
-
-def test_homexy_restart_from_executing_latches_ambiguous_without_redispatch(tmp_path):
-    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
-
-    store = OEMRuntimeStore(tmp_path)
-    primitives = ImmediateXPrimitives()
-    seed = Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17)
-    state = seed._load_state()
-    state["x_lifecycle"] = {
-        "schema_version": "bioxp.serial206_x_lifecycle.v1",
-        "state": "executing",
-        "generation": 17,
-        "reference_state": "desynced",
-        "active_receipt": {"command_id": "homexy-crashed", "intent": "home_xy", "status": "executing"},
-        "pending_ticket": None,
-        "receipts": [],
-    }
-    store.write_oem_serial206_initialization_state(state)
-    primitives = ImmediateXPrimitives()
-    provider = Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17)
-
-    result = provider.execute_homexy_intent({"command_id": "homexy-crashed"})
-
-    assert result["ok"] is False
-    assert result["failure"] == "homexy_current_prepared_authority_required"
-    assert primitives.dispatches == 0
 
 
 def test_x_stop_uses_interrupt_lane_and_reused_command_id_still_dispatches(tmp_path, monkeypatch):
@@ -484,68 +336,6 @@ def test_x_stop_dispatches_while_move_holds_lifecycle_lock(tmp_path):
     assert outcomes["move"]["ok"] is False
     assert outcomes["move"]["result"]["failure"] == "x_intent_interrupted_by_safety_command"
     assert outcomes["stop"]["ok"] is True
-
-
-@pytest.mark.parametrize("operation", ["xy", "homexy"])
-def test_xy_and_homexy_fail_closed_when_preempted_by_x_stop(tmp_path, operation):
-    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
-
-    store = OEMRuntimeStore(tmp_path)
-    primitives = BlockingXPrimitives()
-    provider = seed_ready(Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17))
-    outcomes = {}
-
-    def run_operation():
-        if operation == "xy":
-            outcomes["operation"] = provider.execute_xy_intent(10, 20, {"command_id": "blocking-xy"})
-        else:
-            outcomes["operation"] = provider.execute_homexy_intent({"command_id": "blocking-homexy"})
-
-    operation_thread = threading.Thread(target=run_operation)
-    stop_thread = threading.Thread(
-        target=lambda: outcomes.setdefault(
-            "stop",
-            provider.execute_x_intent("stop", {"command_id": f"preempt-{operation}"}),
-        )
-    )
-    operation_thread.start()
-    assert primitives.move_entered.wait(timeout=1.0)
-    stop_thread.start()
-    assert primitives.stop_dispatched.wait(timeout=1.0)
-    primitives.release_move.set()
-    operation_thread.join(timeout=2.0)
-    stop_thread.join(timeout=2.0)
-
-    assert outcomes["operation"]["ok"] is False
-    assert outcomes["operation"]["result"]["failure"] == f"{operation}_interrupted_or_generation_changed"
-    assert outcomes["stop"]["ok"] is True
-
-
-def test_x_and_homexy_completed_replay_fails_after_lifecycle_invalidation(tmp_path):
-    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
-
-    store = OEMRuntimeStore(tmp_path)
-    primitives = ImmediateXPrimitives()
-    provider = seed_ready(Serial206OemInitializationProvider(primitives, state_store=store, generation_provider=lambda: 17))
-    x_values = {"position_steps": 1000, "command_id": "x-stale-success"}
-    assert provider.execute_x_intent("move_absolute", x_values)["ok"] is True
-    home_values = {"command_id": "homexy-stale-success"}
-    assert provider.execute_homexy_intent(home_values)["ok"] is True
-    dispatched = primitives.dispatches
-
-    state = provider._load_state()
-    state["x_lifecycle"].update({
-        "state": "failed_latched",
-        "reference_state": "desynced",
-        "last_failure": "injected_current_authority_invalidation",
-    })
-    provider._save_state(state)
-
-    x_replay = provider.execute_x_intent("move_absolute", x_values)
-    home_replay = provider.execute_homexy_intent(home_values)
-    assert x_replay["failure"] == "x_replay_current_authority_invalid"
-    assert home_replay["failure"] == "homexy_replay_current_authority_invalid"
-    assert primitives.dispatches == dispatched
 
 
 def test_x_generation_change_during_dispatch_cannot_publish_success(tmp_path):

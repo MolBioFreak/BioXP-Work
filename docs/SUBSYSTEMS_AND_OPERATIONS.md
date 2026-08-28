@@ -73,7 +73,7 @@ Function presets:
 ### Primary Methods
 - Axis IO: `motor_get_axis_param`, `motor_set_axis_param`, status helpers
 - Motion: `motor_move_relative`, `motor_move_absolute`, `motor_stop`
-- Homing/seek: `motor_axis_search_home`, `motor_startup_homing_mimic`
+- Homing/seek: `motor_axis_search_home`, `motor_oem_home_xy`
 - Prep/guard: `motor_prepare_axis`, `motor_prepare_motion_interlock`
 - Diagnostics: `motor_step_test`, `motor_visible_oneway_probe`, driver/profile diagnostics
 - Recovery: `motor_hard_reset`, `motor_quick_reliability_smoke`

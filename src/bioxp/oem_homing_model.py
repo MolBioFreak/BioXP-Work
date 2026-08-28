@@ -88,6 +88,7 @@ THERMAL = "ClassCanLib/ClassThermalBoard.cs"
 MOTOR = "ClassCanLib/ClassMotor.cs"
 API = "src/bioxp/api.py"
 USB = "src/bioxp/usb_driver.py"
+SERIAL206_PROVIDER = "src/bioxp/oem_serial206_initialization.py"
 BMS = "BioModStack/BMS proxy /api/bioxp/* surface"
 
 
@@ -220,7 +221,7 @@ INITIALIZE_MOTION_TRACE: tuple[OemTraceStep, ...] = (
 
 
 RAW_FASTAPI_ROUTE_TABLE: tuple[dict[str, str], ...] = (
-    {"methods": "POST", "path": "/motion/oem/home_xy", "name": "motion_oem_home_xy", "classification": "direct HomeXY mode surface; guarded X/Y switch-search"},
+    {"methods": "POST", "path": "/motion/oem/home_xy", "name": "motion_oem_home_xy", "classification": "provider-owned source-shaped HomeXY leaf; direct external mutation retired"},
     {"methods": "POST", "path": "/motion/oem/initialization/initialize_motors", "name": "motion_oem_serial206_initialize_motors", "classification": "canonical serial-206 initializeMotors provider"},
     {"methods": "POST", "path": "/motion/oem/initialization/initialize_motion", "name": "motion_oem_serial206_initialize_motion", "classification": "canonical serial-206 initializeMotion provider"},
     {"methods": "GET", "path": "/motion/oem/initialization/provider-status", "name": "motion_oem_initialization_provider_status", "classification": "canonical serial-206 initialization state"},
@@ -236,18 +237,10 @@ RAW_FASTAPI_ROUTE_TABLE: tuple[dict[str, str], ...] = (
 
 LIVE_TARGET_MAPPINGS: tuple[LiveTargetMapping, ...] = (
     LiveTargetMapping(
-        "initializeMotorsWithoutMotion",
-        USB,
-        "BioXpTester.motor_oem_initialize_without_motion",
-        3397,
-        "implemented_source_shaped_setup",
-        ("Constants are partly reconstructed/defaulted without recovered machine config.xml.",),
-    ),
-    LiveTargetMapping(
         "initializeMotors/initializeMotion",
-        API,
+        SERIAL206_PROVIDER,
         "Serial206OemInitializationProvider",
-        1307,
+        3529,
         "canonical_atomic_serial206_authority",
         ("The provider owns admission, physical execution, atomic state, observation, and receipts.",),
     ),
@@ -255,39 +248,39 @@ LIVE_TARGET_MAPPINGS: tuple[LiveTargetMapping, ...] = (
         "startup axisSearchHome",
         USB,
         "BioXpTester.motor_oem_axis_search_home",
-        3418,
-        "partial_guarded_reconstruction",
-        ("Poll/guard implementation is Linux reconstruction of board primitive semantics.", "Z startup may bypass source GAP9 search via GAP10/controller-zero workaround."),
+        5576,
+        "source_shaped_provider_authority",
+        ("The source-shaped leaf is owned by the canonical serial-206 provider.", "Switch transitions remain telemetry rather than an OEM success predicate; controller and physical acceptance remain pending."),
     ),
     LiveTargetMapping(
         "manual button goHome(true)",
         USB,
         "BioXpTester.motor_oem_go_home / motor_oem_home_axis(startup=False)",
-        3510,
-        "unsafe_until_predicate_matrix_fixed",
-        ("Manual /motion/axis/home has known Z/X failure incidents and must not be treated as proven true homing.", "Requires switch deassert->active proof before setHome/reporting reference."),
+        5663,
+        "provider_owned_leaf_direct_route_retired",
+        ("Direct external mutation is retired; canonical operator/provider dispatch owns this source-shaped leaf.", "Controller and physical acceptance remain pending."),
     ),
     LiveTargetMapping(
         "doorSearchHome",
         USB,
         "BioXpTester.motor_oem_door_search_home",
-        3725,
-        "partial_guarded_reconstruction",
-        ("Door search is implemented separately but still needs physical predicate proof for parity.",),
+        6557,
+        "source_shaped_software_contract_physical_unverified",
+        ("The source-shaped software contract is present; physical predicate confirmation remains pending.",),
     ),
     LiveTargetMapping(
         "HomeAxis",
         USB,
         "BioXpTester.motor_oem_switch_search_home_axis / motor_oem_home_axis",
-        3787,
-        "not_clean_one_to_one_port",
-        ("Current public home route routes through Linux helper selection, not a direct HomeAxis source clone.",),
+        7055,
+        "provider_owned_leaf_direct_route_retired",
+        ("Direct external mutation is retired; canonical operator/provider dispatch owns the source-shaped axis-home leaf.",),
     ),
     LiveTargetMapping(
         "HomeXY",
         USB,
         "BioXpTester.motor_oem_home_xy / motion_oem_home_xy",
-        3925,
+        7146,
         "direct_oem_parallel_task_run_waitall",
         ("Direct HomeXY label/setup/restore surface exists.", "X and Y goHome(false, axis, 200, true) are launched concurrently to match OEM Task.Run/WaitAll semantics.", "This is a source-parity surface, not a manual single-axis home or controller-zero route."),
     ),
@@ -295,10 +288,10 @@ LIVE_TARGET_MAPPINGS: tuple[LiveTargetMapping, ...] = (
 
 
 ROUTE_MAPPINGS: tuple[ApiRouteMapping, ...] = (
-    ApiRouteMapping("raw-fastapi", "/motion/oem/home_xy", "POST", "direct HomeXY mode surface", "not-equivalent-to-single-axis-home-or-zero", ("Preserves HomeXY source-mode label and launches X/Y goHome concurrently like OEM Task.Run/WaitAll.", "This is not manual single-axis Home and not controller Zero.")),
+    ApiRouteMapping("raw-fastapi", "/motion/oem/home_xy", "POST", "provider-owned source-shaped HomeXY leaf", "direct-external-mutation-retired", ("The canonical operator/provider path owns execution.", "The leaf preserves OEM Task.Run/WaitAll concurrency and profile restoration.")),
     ApiRouteMapping("raw-fastapi", "/motion/oem/initialization/initialize_motors", "POST", "canonical serial-206 initializeMotors stage", "canonical-provider-authority", ("Admission, execution, observation, and receipt state are atomic in the serial-206 provider.",)),
     ApiRouteMapping("raw-fastapi", "/motion/oem/initialization/initialize_motion", "POST", "canonical serial-206 initializeMotion stage", "canonical-provider-authority", ("The provider advances only the expected approved stage.",)),
-    ApiRouteMapping("raw-fastapi", "/motion/axis/home", "POST", "manual button goHome-style route", "not-equivalent-to-startup-axisSearchHome", ("Historically routed through _execute_home_axis(... startup=False).", "Unsafe until per-axis predicates/transitions are repaired and proven.")),
+    ApiRouteMapping("raw-fastapi", "/motion/axis/home", "POST", "provider-owned source-shaped axis-home leaf", "direct-external-mutation-retired", ("The canonical operator/provider path owns execution.", "Controller and physical acceptance remain pending.")),
     ApiRouteMapping("raw-fastapi", "/motion/axis/zero", "POST", "Linux absolute controller-zero route", "linux-only-not-oem-home", ("Return-to-controller-zero is not switch/reference homing.",)),
     ApiRouteMapping("bms-proxy", "/api/bioxp/operator-controls/actions/{action_id}/invoke", "POST", "robot-owned catalog action invocation", "proxy-not-authority", ("BMS forwards robot action identifiers and robot admission receipts without local mutation policy.",)),
 )
@@ -346,9 +339,8 @@ def source_matrix() -> dict[str, Any]:
         "routes": [mapping.to_dict() for mapping in ROUTE_MAPPINGS],
         "raw_fastapi_route_table": list(RAW_FASTAPI_ROUTE_TABLE),
         "live_target_mappings": [mapping.to_dict() for mapping in LIVE_TARGET_MAPPINGS],
-        "deviations_to_live_linux": (
-            "Current live Linux homing is a guarded reconstruction with safety/workaround paths, not a clean line-by-line port.",
-            "Z startup may use a live GAP10/controller-zero reference workaround; source model keeps that separate from OEM ClassHeadBoard.queryHome/GAP9 provenance.",
+        "deviations_to_live_linux": [
+            "Source-shaped software contracts are present; controller and physical acceptance remain pending.",
             "BMS /api/bioxp/* is a proxy/linkage layer and may not expose every raw FastAPI route.",
-        ),
+        ],
     }

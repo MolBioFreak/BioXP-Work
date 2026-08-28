@@ -24,10 +24,14 @@ from src.bioxp.pipette.receipts import PipetteReceiptStore
 from src.bioxp.pipette.transport import CanPipetteTransport
 from src.bioxp.services.pipette_service import run_pipette_dispense_command, run_pipette_status
 
-os.environ.pop("BIOXP_OEM_RUNTIME_STATE_ROOT", None)
-
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_test_runtime_root_is_isolated_from_inherited_environment():
+    assert os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") is None
+    assert os.environ.get("BIOXP_OEM_RUNTIME_ROOT") is None
+    assert api.runtime_state_root().resolve() != Path("/var/lib/bioxp-oem-runtime")
 
 
 def test_wp0_matrix_has_all_gap_rows_and_no_unclassified_rows():

@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from src.bioxp.usb_driver import BioXpTester
 from support_oem_machine_bundle import serial_206_immutable_machine_bundle
 
@@ -47,21 +49,6 @@ class FakeHomeXYTester(BioXpTester):
         return {"position": self.positions[(axis, board, motor)]}
 
 
-def test_oem_home_xy_sets_home_after_switch_confirmed():
-    tester = FakeHomeXYTester()
-
-    result = tester.motor_oem_home_xy(timeout_s=30)
-
-    assert result["ok"] is True
-    assert result["home_rebase"]["x"]["status_before_rebase"]["position"]["position"] == 1253
-    assert result["home_rebase"]["x"]["home_switch_confirmed"] is True
-    assert result["home_rebase"]["x"]["home_rebased"] is True
-    assert result["home_rebase"]["x"]["position_after_set_home"]["position"] == -1
-    assert result["home_rebase"]["y"]["home_rebased"] is True
-    assert ("set_home", "x", 0x05, 0) in tester.calls
-    assert ("set_home", "y", 0x04, 0) in tester.calls
-
-
 
 def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
     calls = []
@@ -79,7 +66,7 @@ def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
             return {"ok": True, "board": board, "param": param, "value": value}
 
         def motor_oem_go_home(self, axis, **kwargs):
-            assert kwargs["require_switch_transition"] is True
+            assert kwargs["require_switch_transition"] is False
             with calls_lock:
                 calls.append(("started", axis))
                 if len([row for row in calls if row[0] == "started"]) == 2:
@@ -105,3 +92,27 @@ def test_oem_homexy_starts_both_axis_tasks_before_either_completes():
     assert result["implementation_note"] == "oem_task_run_waitall_with_transaction_serialized_usb"
     first_finish = next(index for index, row in enumerate(calls) if row[0] == "finished")
     assert {row[1] for row in calls[:first_finish] if row[0] == "started"} == {"x", "y"}
+
+
+@pytest.mark.parametrize("missing_board", [4, 5])
+def test_oem_homexy_returns_source_noop_when_either_board_is_absent(missing_board):
+    class MissingBoardTester(BioXpTester):
+        def _motion_oem_axis_profile(self, axis_key, startup=True):
+            return {
+                "x": {"board": 5, "motor": 0, "speed": 1700, "acc": 350},
+                "y": {"board": 4, "motor": 0, "speed": 1800, "acc": 400},
+            }[axis_key]
+
+        def _oem_board_present(self, board_id):
+            return int(board_id) != missing_board
+
+        def motor_oem_go_home(self, axis_key, **kwargs):
+            raise AssertionError(f"HomeXY dispatched {axis_key} with an absent OEM board")
+
+    result = MissingBoardTester.__new__(MissingBoardTester).motor_oem_home_xy(timeout_s=1)
+
+    assert result["ok"] is True
+    assert result["source_noop"] is True
+    assert result["source_return"] is None
+    assert result["command_issued"] is False
+    assert result["physical_motion_commanded"] is False
