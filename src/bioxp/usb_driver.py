@@ -111,9 +111,11 @@ class BioXpTester:
             "standby_current": 10,
             # Serial-206 immutable OEM machine config m_Z_MOTOR_STALL_GUARD_THRESHOLD.
             "stall_guard": 3,
-            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
-            # The explicit provider reconciliation action establishes the
-            # literal-OEM enabled-mask baseline; source preparation verifies it.
+            # Serial-206 hardware reports the upper Z switch active at the
+            # controller zero position. Disable that right-limit input during
+            # profile preparation so the required 10,000-step pre-clear can
+            # move away from the home end before the GAP9 home search.
+            "disable_right": True,
             "warm_enable": True,
         },
         "g": {
