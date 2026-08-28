@@ -516,7 +516,31 @@ class Serial206YProvider:
         command_id = command_id or f"y-home-{uuid.uuid4().hex}"
         speed, startup = self._HOME_MODES[mode]
         profile = self.profile(startup=startup)
-        authority = self._current_authority(allow_unprepared=True)
+        authority_raw = self._current_authority(allow_unprepared=True)
+        authority = dict(authority_raw) if isinstance(authority_raw, Mapping) else {"ok": False}
+        preparation = None
+        axis_raw = authority.get("axis")
+        board_raw = authority.get("board")
+        axis_authority = dict(axis_raw) if isinstance(axis_raw, Mapping) else {}
+        board_authority = dict(board_raw) if isinstance(board_raw, Mapping) else {}
+        if (
+            authority.get("ok") is True
+            and (
+                axis_authority.get("prepared_board_epoch") != board_authority.get("active_board_epoch")
+                or axis_authority.get("lifecycle_state") not in {"prepared_unreferenced", "referenced_ready"}
+            )
+        ):
+            preparation = self.prepare(command_id=f"{command_id}:prepare")
+            if not isinstance(preparation, Mapping) or preparation.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "axis": self.axis,
+                    "command_id": command_id,
+                    "failure": "y_home_preparation_failed",
+                    "physical_motion": False,
+                    "preparation": preparation,
+                }
+            authority = self._current_authority(allow_unprepared=False)
         primitive = getattr(self.tester, "motor_oem_home_axis", None)
         result = primitive(
             self.axis,
