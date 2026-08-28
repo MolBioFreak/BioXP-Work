@@ -2741,6 +2741,16 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
                     _rebuild_additive_operator_schema(connection)
                 if rebuild_receipts:
                     _normalize_legacy_v1_serial206_receipts(connection)
+            try:
+                verify_runtime_audit_foundation(connection)
+            except Exception:
+                foundation_backup_sha256 = _verified_sqlite_backup(connection, selected_root)
+                ensure_schema(
+                    connection,
+                    selected_root,
+                    backup_sha256=foundation_backup_sha256,
+                )
+            verify_runtime_audit_foundation(connection)
             _reinstall_runtime_authority_triggers(connection)
             ledger_row = connection.execute(
                 "SELECT MAX(version) FROM runtime_schema_migrations"
