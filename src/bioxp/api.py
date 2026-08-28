@@ -6461,16 +6461,20 @@ async def motion_oem_prepare_without_motion():
                 "ok": False,
                 "failure": "global_motion_preparation_result_invalid",
             }
-        z_receipt = _execute_provider_z_intent("prepare", {})
-        z_prepared = bool(
-            isinstance(z_receipt, Mapping)
-            and z_receipt.get("ok") is True
-        )
+        # Z preparation is now owned by the first explicit Z action. The
+        # retired direct provider mutation must not block global non-motion
+        # preparation or claim a Z reference before the required Z home.
+        z_receipt = {
+            "ok": True,
+            "physical_motion_commanded": False,
+            "state": "deferred_to_explicit_z_action",
+            "next_required_action": "home_z",
+        }
         can_ready = hardware_state.publish_can_ready_from_preparation(
             expected_ownership_epoch=hardware_state.ownership_epoch,
             reason="oem_prepare_without_motion_completed",
         )
-        ready = bool(z_prepared and can_ready.get("published") is True)
+        ready = bool(can_ready.get("published") is True)
         if ready:
             arm_confirm = getattr(tester, "motion_arm_confirm", None)
             arm_state = (
