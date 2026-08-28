@@ -488,12 +488,25 @@ class Serial206YProvider:
         wait = self._mapping_at(home, "wait") or {}
         set_home = self._mapping_at(home, "set_home") or {}
         zero = self._mapping_at(home, "position_after_sethome") or self._mapping_at(home, "position_after_set_home") or {}
+        home_decision = self._mapping_at(home, "home_decision") or {}
+        zero_readback = bool(zero.get("position") == 0)
+        set_home_valid = bool(
+            (
+                set_home.get("ok") is True
+                and isinstance(set_home.get("readback"), Mapping)
+                and set_home["readback"].get("value") == 0
+            )
+            or (
+                home_decision.get("set_home_verified") is True
+                and zero_readback
+            )
+        )
         return {
             "home_predicate_active": bool(home_after and home_after.get("value") == 1),
             "stop_complete": bool(stop.get("ok") is True and isinstance(stop.get("first_delivery"), Mapping) and isinstance(stop.get("second_delivery"), Mapping)),
             "speed_zero": bool(wait.get("stopped") is True and wait.get("last_speed") == 0),
-            "set_home_valid": bool(set_home.get("ok") is True and isinstance(set_home.get("readback"), Mapping) and set_home["readback"].get("value") == 0),
-            "zero_readback": bool(zero.get("position") == 0),
+            "set_home_valid": set_home_valid,
+            "zero_readback": zero_readback,
         }
 
     def home(self, mode: str, *, command_id: str | None = None, wait_timeout_s: float = 30.0) -> dict[str, Any]:
