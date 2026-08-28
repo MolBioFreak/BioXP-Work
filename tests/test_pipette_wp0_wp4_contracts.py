@@ -27,6 +27,8 @@ from src.bioxp.pipette.receipts import PipetteReceiptStore
 from src.bioxp.pipette.transport import CanPipetteTransport
 from src.bioxp.services.pipette_service import run_pipette_dispense_command, run_pipette_status
 
+os.environ.pop("BIOXP_OEM_RUNTIME_STATE_ROOT", None)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
