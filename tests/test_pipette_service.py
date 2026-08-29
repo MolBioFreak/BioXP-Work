@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+import tempfile
 import types
 
 import pytest
@@ -106,6 +107,9 @@ async def _fake_run_blocking(label, func, timeout_s=30.0):
 
 
 def load_api(monkeypatch):
+    monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", tempfile.mkdtemp(prefix="bioxp-api-test-"))
     usb_pkg = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
     usb_util = types.ModuleType("usb.util")
@@ -388,6 +392,18 @@ def test_liquid_route_attaches_reference_preflight_and_location_context(monkeypa
         return {"ok": True, **command.to_payload(), "preflight": preflight}
 
     monkeypatch.setattr(api, "_reference_state_store", ReferenceStore())
+    monkeypatch.setattr(
+        api,
+        "_serial206_oem_initialization_provider",
+        types.SimpleNamespace(
+            z_projection=lambda: {
+                "available": True,
+                "state": "referenced_ready",
+                "reference_state": "referenced",
+                "board_lifecycle_generation_fresh": True,
+            }
+        ),
+    )
     monkeypatch.setattr(api, "run_pipette_aspirate_command", fake_aspirate)
 
     result = asyncio.run(

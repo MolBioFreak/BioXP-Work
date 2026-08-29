@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from src.bioxp.novo_usb_can import BioXpNovoUsbDriver, NovoUsbCanBus, novo_decode, novo_encode
 from src.bioxp.novo_router import NovoRouter
 
@@ -54,6 +56,55 @@ def _novo_frame(arbitration_id: int, data: list[int] | bytes | bytearray) -> byt
     return novo_encode(NovoUsbCanBus.build_payload(arbitration_id, data, len(data)))
 
 
+def test_group_initialization_defers_completion_until_collection_waits():
+    shared = FakeSharedUsb([
+        _novo_frame(0x501, []),
+        _novo_frame(0x501, [0x20, 0x20]),
+    ])
+    try:
+        driver = BioXpNovoUsbDriver(shared_usb=shared, pipette_id=0)
+
+        sent = driver.pipette_initiate_group()
+
+        assert sent["ok"] is True
+        assert sent["immediate_ack_received"] is True
+        assert sent["completion_deferred"] is True
+        assert isinstance(sent["completion_owner_token"], str)
+        completion = driver.wait_pipette_initialization_completion(1.0)
+        assert completion["ok"] is True
+        assert completion["outcome"] == "completion"
+    finally:
+        shared.close()
+
+
+def test_pipette_transactions_reject_rx_domain_and_wrong_multipart_tx_ids():
+    shared = FakeSharedUsb([])
+    try:
+        bus = NovoUsbCanBus(shared_usb=shared)
+        rx_domain = type("Msg", (), {"arbitration_id": 0x501, "data": [ord("W"), ord("R")], "dlc": 2})()
+        with pytest.raises(Exception, match="TX tuple"):
+            bus.transact_can(
+                rx_domain,
+                channel=0,
+                expected_function=1,
+                timeout_s=0.0,
+                matcher_name="invalid_rx_domain",
+            )
+
+        wrong_first = type("Msg", (), {"arbitration_id": 0x104, "data": list(b"12345678"), "dlc": 8})()
+        valid_final = type("Msg", (), {"arbitration_id": 0x101, "data": list(b"R"), "dlc": 1})()
+        with pytest.raises(Exception, match="multipart TX tuple"):
+            bus.transact_can_many(
+                [wrong_first, valid_final],
+                channel=0,
+                expected_function=1,
+                timeout_s=0.0,
+                matcher_name="invalid_first_fragment",
+            )
+    finally:
+        shared.close()
+
+
 def test_novo_encoding_round_trips_and_escapes_frame_bytes():
     payload = bytes([0x00, 0x00, 0x01, 0x06, 0x04, 0x7E, 0x7D, 0x31, 0x00])
     frame = novo_encode(payload)
@@ -103,6 +154,59 @@ def test_novo_usb_driver_reuses_bioxp_tester_endpoint_and_queries_tip_status():
         decoded = novo_decode(written)
         assert decoded[:5] == bytes([0x00, 0x00, 0x01, 0x06, 0x03])
         assert decoded[5:8] == b"?31"
+    finally:
+        shared.close()
+
+
+def test_mutating_transaction_requires_dlc0_ack_before_deferred_token():
+    shared = FakeSharedUsb([_novo_frame(0x501, b"")])
+    try:
+        bus = NovoUsbCanBus(shared_usb=shared)
+        msg = type("Msg", (), {"arbitration_id": 0x101, "data": list(b"P1,1R"), "dlc": 5})()
+
+        result = bus.transact_can(
+            msg,
+            channel=0,
+            expected_function=1,
+            timeout_s=0.1,
+            matcher_name="pipette_aspirate",
+            wait_for_completion=False,
+        )
+
+        assert result["ok"] is True
+        assert result["outcome"] == "ack"
+        assert result["immediate_ack_received"] is True
+        assert result["completion_received"] is False
+        assert result["completion_deferred"] is True
+        assert isinstance(result["completion_owner_token"], str)
+    finally:
+        shared.close()
+
+
+def test_mutating_transaction_waits_for_dlc0_ack_then_exact_dlc2_completion():
+    shared = FakeSharedUsb([
+        _novo_frame(0x501, b""),
+        _novo_frame(0x501, bytes([0x20, 0xA5])),
+    ])
+    try:
+        bus = NovoUsbCanBus(shared_usb=shared)
+        msg = type("Msg", (), {"arbitration_id": 0x101, "data": list(b"P1,1R"), "dlc": 5})()
+
+        result = bus.transact_can(
+            msg,
+            channel=0,
+            expected_function=1,
+            timeout_s=0.1,
+            matcher_name="pipette_aspirate",
+            completion_timeout_s=0.2,
+            wait_for_completion=True,
+        )
+
+        assert result["ok"] is True
+        assert result["immediate_ack_received"] is True
+        assert result["completion_received"] is True
+        assert result["completion"]["observed_rx_dlc"] == 2
+        assert result["completion"]["data"] == [0x20, 0xA5]
     finally:
         shared.close()
 

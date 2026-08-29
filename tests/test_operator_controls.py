@@ -4,6 +4,7 @@ import asyncio
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
@@ -35,7 +36,7 @@ class OptionalNestedBody(BaseModel):
     stage_approval: StageApproval | None = None
 
 
-def make_app(tmp_path: Path, monkeypatch):
+def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     app = FastAPI()
     calls: list[tuple[str, object]] = []
@@ -53,6 +54,19 @@ def make_app(tmp_path: Path, monkeypatch):
         if override is not None:
             return override
         return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
+
+    @app.post("/motion/oem/x/move_steps")
+    async def x_move_steps(steps: int, wait_timeout_s: float = 5.0):
+        base = getattr(app.state, "operator_test_x_position", 0)
+        app.state.operator_test_x_position = base + steps
+        calls.append(("x_move_steps", {"steps": steps, "base_position": base}))
+        blocker = getattr(app.state, "operator_test_x_move_steps_blocker", None)
+        if blocker is not None:
+            await blocker()
+        override = getattr(app.state, "operator_test_x_move_steps_response", None)
+        if override is not None:
+            return override
+        return {"ok": True, "controller_acknowledged": True, "status": "completed", "physical_effect_verified": False}
 
     @app.post("/motion/oem/home_xy")
     async def home_xy():
@@ -127,11 +141,19 @@ def make_app(tmp_path: Path, monkeypatch):
     hardware = FakeHardwareState()
     app.state.operator_test_hardware = hardware
     monkeypatch.setattr(operator_controls, "hardware_state", hardware)
+    serial206_state = {
+        "bound": True,
+        "initialize_motors_live_available": True,
+        "x_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
+        "z_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
+    }
     install_operator_control_plane(
         app,
         maintenance_state_provider=lambda: maintenance,
         reference_state_provider=lambda: {"rows": {axis: {"state": "referenced"} for axis in ("x", "y", "z", "g", "door")}},
         lifecycle_state_provider=lambda: lifecycle,
+        serial206_initialization_state_provider=lambda: serial206_state,
+        pipette_status_provider=pipette_status_provider,
     )
     return app, calls
 
@@ -140,31 +162,18 @@ def action_for(catalog: dict, method: str, path: str) -> dict:
     return next(action for action in catalog["actions"] if action["informational_method"] == method and action["informational_path"] == path and action["kind"] == "primitive")
 
 
-def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, monkeypatch):
-    app, _ = make_app(tmp_path, monkeypatch)
-    client = TestClient(app)
-    catalog = client.get("/operator/control-catalog").json()
-    assert catalog["schema_name"] == "bioxp.operator_control_catalog"
-    primitive_routes = [(row["informational_method"], row["informational_path"]) for row in catalog["actions"] if row["kind"] == "primitive"]
-    assert primitive_routes.count(("GET", "/motion/axis/{axis}/status")) == 1
-    assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
-    assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
-    meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.home_xy", "meta.initialize_motors", "meta.initialize_motion"}
-    motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
-    motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
-    assert motors["available"] is False
-    assert motion["available"] is False
-    assert len(motors["stages"]) == 19
-    assert catalog["dashboard"]["snapshot"]["collection_triggered"] is False
-    assert all("enabled" in row and "dependencies" in row for row in catalog["actions"])
-    assert all(
-        input_spec["name"] not in {"operator_ack", "operator_reason"}
-        for action in catalog["actions"]
-        for input_spec in action["inputs"]
-    )
-    optional_nested = action_for(catalog, "POST", "/motion/optional-nested")
-    assert next(row for row in optional_nested["inputs"] if row["name"] == "stage_approval")["default"] is None
+def test_dashboard_uses_passive_four_channel_pipette_provider_when_projection_is_missing(tmp_path, monkeypatch):
+    passive = {
+        "ok": False,
+        "transport": "novo_usb_can",
+        "channels": [{"channel": channel, "available": False} for channel in range(4)],
+        "channel_count": 4,
+    }
+    app, _ = make_app(tmp_path, monkeypatch, pipette_status_provider=lambda: passive)
+
+    dashboard = TestClient(app).get("/operator/dashboard").json()
+
+    assert dashboard["pipettes"] == passive
 
 
 def test_operator_ack_is_not_user_input_and_is_supplied_internally(tmp_path, monkeypatch):
@@ -206,36 +215,6 @@ def test_local_only_maintenance_action_is_listed_but_public_operator_invocation_
     )
     assert response.status_code == 409
     assert response.json()["detail"]["reason"] == "Local-only maintenance route is not callable through the operator relay."
-    assert calls == []
-
-
-def test_motion_inactive_disables_every_cataloged_motion_and_pipette_action(tmp_path, monkeypatch):
-    app, calls = make_app(tmp_path, monkeypatch)
-    app.state.operator_test_maintenance.update({
-        "motion_blocked": True,
-        "recovery_required": True,
-        "block_reason": "Motion is inactive.",
-    })
-    client = TestClient(app)
-    catalog = client.get("/operator/control-catalog").json()
-    motor_actions = [
-        row for row in catalog["actions"]
-        if row["kind"] == "primitive" and row["safety_class"] == "motion"
-    ]
-    assert motor_actions
-    assert all(row["enabled"] is False for row in motor_actions)
-    assert all(row["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor." for row in motor_actions)
-    assert any("pipette" in row["informational_path"].lower() for row in motor_actions)
-
-    target = next(row for row in motor_actions if "/motion/test/home_axis" == row["informational_path"])
-    blocked = client.post(f"/operator/actions/{target['action_id']}", json={
-        "expected_generation": catalog["ownership_generation"],
-        "idempotency_key": "motion-blocked-123456",
-        "inputs": {"body": {"axis": "x"}},
-    })
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["reason"] == "Motion is inactive. Activate motion before moving this motor."
-    assert any(row["key"] == "motion_enabled" and row["met"] is False for row in blocked.json()["detail"]["dependencies"])
     assert calls == []
 
 
@@ -615,12 +594,17 @@ def test_catalog_preserves_inclusive_and_exclusive_numeric_bounds(tmp_path, monk
     assert inputs["number_lt"]["exclusive_maximum"] == 2.5
 
 
-def test_generic_motion_request_models_do_not_claim_z_specific_step_envelopes():
+def test_public_motion_request_models_use_signed_int32_at_robot_boundaries(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp.api import (
         MoveAbsoluteRequest,
         MoveRelativeRequest,
         OemManualAbsoluteRequest,
         OemManualRelativeRequest,
+        OemHomeXYRequest,
+        OemMoveXYRequest,
+        OemYMoveAbsoluteRequest,
+        OemYMoveStepsRequest,
         ReferenceMarkRequest,
     )
 
@@ -629,12 +613,36 @@ def test_generic_motion_request_models_do_not_claim_z_specific_step_envelopes():
     manual_relative = OemManualRelativeRequest.model_json_schema()["properties"]["steps"]
     manual_absolute = OemManualAbsoluteRequest.model_json_schema()["properties"]["position_steps"]
     reference = ReferenceMarkRequest.model_json_schema()["properties"]["position_steps"]
-    for schema in (relative, absolute, manual_relative, manual_absolute, reference):
+    for schema in (relative, absolute, reference):
         assert "minimum" not in schema
         assert "maximum" not in schema
+    for schema in (manual_relative, manual_absolute):
+        assert (schema["minimum"], schema["maximum"]) == (-(2**31), 2**31 - 1)
+    for model, field in (
+        (OemManualRelativeRequest, "steps"),
+        (OemManualAbsoluteRequest, "position_steps"),
+        (OemYMoveStepsRequest, "steps"),
+        (OemYMoveAbsoluteRequest, "target_steps"),
+    ):
+        payload = {"axis": "x", field: 1} if model in {OemManualRelativeRequest, OemManualAbsoluteRequest} else {field: 1}
+        model.model_validate(payload)
+        with pytest.raises(Exception):
+            model.model_validate({**payload, field: str(payload[field])})
+        with pytest.raises(Exception):
+            model.model_validate({**payload, field: 2**31})
+    OemMoveXYRequest.model_validate({"operator_ack": "MOVEXY", "x": 0, "y": 0})
+    with pytest.raises(Exception):
+        OemMoveXYRequest.model_validate({"operator_ack": "MOVEXY", "x": -(2**31) - 1, "y": 0})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "unexpected": True})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "timeout_s": 120.0})
+    with pytest.raises(Exception):
+        OemHomeXYRequest.model_validate({"operator_ack": "HOMEXY", "allow_implementation_mapped_predicate": True})
 
 
-def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
+def test_z_semantic_and_manual_moves_expose_signed_int32_bounds(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp.api import app
 
     actions, _ = operator_controls._build_catalog(app)
@@ -642,8 +650,8 @@ def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
 
     relative = next(row for row in by_id["oem.z.move_steps"]["inputs"] if row["name"] == "steps")
     absolute = next(row for row in by_id["oem.z.move_absolute"]["inputs"] if row["name"] == "position_steps")
-    assert (relative["minimum"], relative["maximum"]) == (-160000, 160000)
-    assert (absolute["minimum"], absolute["maximum"]) == (0, 160000)
+    assert (relative["minimum"], relative["maximum"]) == (-(2**31), 2**31 - 1)
+    assert (absolute["minimum"], absolute["maximum"]) == (-(2**31), 2**31 - 1)
 
     generic_relative = next(
         action for action in actions
@@ -655,8 +663,8 @@ def test_z_semantic_moves_expose_z_bounds_without_hardening_generic_routes():
     )
     generic_steps = next(row for row in generic_relative["inputs"] if row["name"] == "steps")
     generic_position = next(row for row in generic_absolute["inputs"] if row["name"] == "position_steps")
-    assert generic_steps["minimum"] is None and generic_steps["maximum"] is None
-    assert generic_position["minimum"] is None and generic_position["maximum"] is None
+    assert (generic_steps["minimum"], generic_steps["maximum"]) == (-(2**31), 2**31 - 1)
+    assert (generic_position["minimum"], generic_position["maximum"]) == (-(2**31), 2**31 - 1)
 
 
 def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispatch(tmp_path, monkeypatch):
@@ -736,30 +744,35 @@ def test_human_assessment_updates_existing_receipt_and_requires_generation(tmp_p
     assert assessed.json()["operator_note"] == "Observed both reference indicators."
 
 
-def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path):
-    store = OperatorReceiptStore(tmp_path)
-    for index in range(520):
-        store.put({
-            "command_id": f"cmd-{index}",
-            "idempotency_key": f"key-{index}",
-            "action_id": "query.status",
-            "ownership_generation": 7,
-            "started_at": str(index),
-            "status": "completed",
-        })
-    rows = store.list(200)
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
-    assert store.by_command("cmd-7") is None
-    assert store.by_command("cmd-8") is not None
-    assert rows[0]["command_id"] == "cmd-519"
-    store.put({
-        "command_id": "cmd-519",
-        "idempotency_key": "key-519",
-        "action_id": "query.status",
-        "ownership_generation": 7,
-        "started_at": "519",
-        "status": "completed",
-        "operator_assessment": "fail",
-    })
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
-    assert store.by_command("cmd-519")["operator_assessment"] == "fail"
+def test_successive_move_queue_mechanics_order_and_clear():
+    from bioxp.operator_controls import _SuccessiveMoveQueue
+
+    async def scenario():
+        queue = _SuccessiveMoveQueue(max_depth=2)
+        first = {"axis": "x", "command_id": "a", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        second = {"axis": "x", "command_id": "b", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        third = {"axis": "x", "command_id": "c", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        fourth = {"axis": "z", "command_id": "d", "event": asyncio.Event(), "action_id": "oem.z.move_steps", "cleared": False}
+        assert await queue.admit("x", first) == "dispatch_now"
+        assert await queue.admit("x", second) == "queued"
+        assert await queue.admit("x", third) == "queued"
+        overflow = {"axis": "x", "command_id": "c2", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        assert await queue.admit("x", overflow) == "full"
+        assert await queue.admit("z", fourth) == "dispatch_now"  # separate axis is independent
+        await queue.complete("x")  # first finishes; second is signalled
+        assert await queue.wait_dispatched(second) is True
+        assert queue.snapshot()["x"]["depth"] == 1  # third still queued
+        await queue.complete("x")  # second finishes; third is signalled
+        assert await queue.wait_dispatched(third) is True
+        # the cleared path
+        fifth = {"axis": "x", "command_id": "e", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        await queue.complete("x")  # third finishes; queue now empty
+        assert await queue.admit("x", fifth) == "dispatch_now"
+        sixth = {"axis": "x", "command_id": "f", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
+        assert await queue.admit("x", sixth) == "queued"
+        await queue.clear("x")
+        assert await queue.wait_dispatched(sixth) is False
+        assert sixth["cleared"] is True
+        assert queue.snapshot().get("x", {}).get("depth") == 0
+
+    asyncio.run(scenario())

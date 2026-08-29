@@ -70,3 +70,17 @@ def test_protocol_executor_completes_tiny_native_protocol_in_dry_run_mode():
     assert all(state.status is StageExecutionStatus.COMPLETED for state in result.stage_states.values())
     assert [entry["kind"] for entry in result.action_results] == ["move", "inspect"]
     assert result.events[-1].event == "protocol_completed"
+
+
+def test_protocol_runtime_state_retains_generated_job_identity():
+    document = compile_native_protocol(
+        {
+            "protocol_id": "job-bound",
+            "stages": [{"stage_id": "inspect", "actions": [{"kind": "inspect"}]}],
+        }
+    )
+
+    result = ProtocolExecutor(dry_run=True, job_id="protocol-job-123").execute(document)
+
+    assert result.job_id == "protocol-job-123"
+    assert result.to_payload()["job_id"] == "protocol-job-123"

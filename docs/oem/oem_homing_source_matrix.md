@@ -37,27 +37,26 @@ This artifact separates OEM homing modes and route surfaces before any further l
 - Raw FastAPI route `/motion/oem/initialization/initialize_motors` (POST): canonical serial-206 provider entry point for the next approved `initializeMotors` stage.
 - Raw FastAPI route `/motion/oem/initialization/initialize_motion` (POST): canonical serial-206 provider entry point for the next approved `initializeMotion` stage.
 - Raw FastAPI route `/motion/oem/initialization/provider-status` (GET): canonical atomic initialization-state projection.
-- Raw FastAPI route `/motion/axis/home` (POST): manual-button/goHome-style route (`startup=False` historically), not equivalent to startup `axisSearchHome`/full re-reference.
+- Raw FastAPI route `/motion/axis/home` (POST): provider-owned source-shaped leaf; direct external mutation is retired.
 - Raw FastAPI route `/motion/axis/zero` (POST): Linux absolute controller-zero route, not OEM switch/reference homing.
 - BMS `/api/bioxp/operator-controls/actions/{action_id}/invoke`: thin proxy for robot-owned catalog actions and receipts; BMS does not own a second mutation policy.
 
-## Live Linux deviation note
+## Live Linux acceptance note
 
-The current live robot implementation is a guarded Linux reconstruction with safety/workaround paths, not a clean one-for-one OEM port. In particular, Z startup live handling may use a GAP10/controller-zero workaround while the source model keeps OEM `ClassHeadBoard.queryHome`/left-switch provenance separate. Focused tests prove source-model consistency only, not physical/OEM parity.
+Source-shaped software contracts are present. Controller and physical acceptance remain pending. Focused tests prove software/source consistency and do not establish physical parity.
 
 Machine-readable matrix source: `src/bioxp/oem_homing_model.py::source_matrix()`.
 
 
 ## Source-to-live-target status
 
-This is the part that was missing from the first pass. Current Linux target status is explicitly not clean parity:
+Current software binding is source-shaped and provider-owned. Controller and physical acceptance remain separate gates:
 
-- `initializeMotorsWithoutMotion` -> `BioXpTester.motor_oem_initialize_without_motion` (`usb_driver.py:3397`): source-shaped setup, constants partly reconstructed/defaulted without recovered `config.xml`.
-- `initializeMotors` and `initializeMotion` -> `Serial206OemInitializationProvider`: one atomic authority owns admission, expected-stage execution, observation, persistence, and receipts.
-- startup `axisSearchHome` -> `motor_oem_axis_search_home` (`usb_driver.py:3418`): partial guarded reconstruction; Z may use GAP10/controller-zero workaround instead of source GAP9 search.
-- manual button `goHome(true)` -> `motor_oem_go_home` / `motor_oem_home_axis(startup=False)` (`usb_driver.py:3510`, `3833`; `/motion/axis/home` at `api.py:2894`): unsafe until predicate matrix and deassert->active proof are fixed.
-- `doorSearchHome` -> `motor_oem_door_search_home` (`usb_driver.py:3725`): separate partial reconstruction, needs physical predicate proof.
-- `HomeXY` -> `BioXpTester.motor_oem_home_xy` / `/motion/oem/home_xy`: direct mode label/setup/restore surface now exists; X/Y `goHome(false, axis, 200, true)` calls are launched concurrently to match OEM `Task.Run`/`Task.WaitAll`; this is separate from manual single-axis Home and Zero.
+- `initializeMotors` and `initializeMotion` -> `Serial206OemInitializationProvider` (`oem_serial206_initialization.py:3529`): one atomic authority owns admission, expected-stage execution, observation, persistence, and receipts.
+- startup `axisSearchHome` -> `motor_oem_axis_search_home` (`usb_driver.py:5576`): the canonical serial-206 provider owns the source-shaped leaf; switch transitions are telemetry rather than an OEM success predicate.
+- manual button `goHome(true)` -> `motor_oem_go_home` / `motor_oem_home_axis(startup=False)` (`usb_driver.py:5664`, `7056`): direct external mutation is retired; canonical operator/provider dispatch owns execution.
+- `doorSearchHome` -> `motor_oem_door_search_home` (`usb_driver.py:6558`): source-shaped software contract present; physical predicate confirmation remains pending.
+- `HomeXY` -> `BioXpTester.motor_oem_home_xy` (`usb_driver.py:7147`): provider-owned leaf preserves concurrent X/Y `goHome(false, axis, 200, true)` calls and OEM `Task.Run`/`Task.WaitAll` profile restoration.
 - Retired compatibility wrappers (`startup_step`, `rehome`, the no-homing `initialize_motion` diagnostic, and `initialization/run`) are absent from executable source and route topology.
 
 Raw FastAPI route table was enumerated by importing `src.bioxp.api:app` only; no USB or motion endpoint was called.

@@ -35,13 +35,14 @@ def receipt(
     }
 
 
-def test_runtime_root_prefers_canonical_state_root(tmp_path, monkeypatch):
+def test_runtime_root_rejects_conflicting_state_roots(tmp_path, monkeypatch):
     canonical = tmp_path / "canonical"
     legacy = tmp_path / "legacy"
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(canonical))
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(legacy))
 
-    assert runtime_state_root() == canonical
+    with pytest.raises(ValueError, match="conflicting BioXP runtime roots"):
+        runtime_state_root()
 
 
 def test_legacy_import_is_transactional_compact_and_keeps_source(tmp_path):
@@ -72,6 +73,7 @@ def test_legacy_import_is_transactional_compact_and_keeps_source(tmp_path):
     assert compact is not None
     assert compact["response"] == {"http_status": 200, "body": {}}
     assert compact["stage_receipts"] == []
+    assert store.connection.execute("SELECT COUNT(*) FROM runtime_evidence_objects").fetchone()[0] == 2
     detailed = store.by_command("legacy-1", include_evidence=True)
     assert detailed is not None
     assert detailed["response"]["body"] == large_body
@@ -194,10 +196,10 @@ def test_terminal_update_moves_command_to_newest_and_keeps_transitions(tmp_path)
     transitions = store.connection.execute(
         "SELECT state FROM operator_transitions WHERE command_id='first' ORDER BY transition_id"
     ).fetchall()
-    assert [row[0] for row in transitions] == ["queued", "completed"]
+    assert [row[0] for row in transitions] == ["reserved", "completed"]
 
 
-def test_retention_keeps_512_newest_commands_and_removes_pruned_evidence(tmp_path: Path) -> None:
+def test_retention_keeps_all_command_metadata_and_evidence_until_lifecycle_expiry(tmp_path: Path) -> None:
     store = OperatorReceiptStore(tmp_path)
     first_evidence: Path | None = None
 
@@ -214,10 +216,10 @@ def test_retention_keeps_512_newest_commands_and_removes_pruned_evidence(tmp_pat
             ).fetchone()
             first_evidence = tmp_path / selected[0]
 
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
-    assert store.by_command("bounded-0") is None
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 513
+    assert store.by_command("bounded-0") is not None
     assert first_evidence is not None
-    assert not first_evidence.exists()
+    assert first_evidence.exists()
     assert store.list(200)[0]["command_id"] == "bounded-512"
 
 
@@ -225,7 +227,7 @@ def test_startup_reconciliation_marks_queued_receipt_ambiguous_without_retry(tmp
     store = OperatorReceiptStore(tmp_path)
     claimed, created = store.claim(receipt("crash-queued", status="queued", started_at="100.0"))
     assert created is True
-    assert claimed["status"] == "queued"
+    assert claimed["status"] == "reserved"
 
     assert store.reconcile_nonterminal_receipts() == 1
     reconciled = store.by_command("crash-queued")
@@ -575,8 +577,8 @@ def test_retention_never_deletes_an_inflight_idempotency_claim(tmp_path: Path) -
 
     retained = store.by_idempotency("key-active-claim")
     assert retained is not None
-    assert retained["status"] == "queued"
-    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 512
+    assert retained["status"] == "reserved"
+    assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 601
 
 
 def test_interrupt_fallback_rotation_does_not_lose_concurrent_append(tmp_path: Path, monkeypatch) -> None:
@@ -620,12 +622,10 @@ def test_evidence_cleanup_failure_propagates(tmp_path: Path, monkeypatch) -> Non
         status="completed",
         response={"http_status": 200, "body": {"payload": "x" * 9000}},
     ))
-    row = store.connection.execute(
-        "SELECT evidence_relpath FROM operator_commands WHERE command_id='cleanup-propagates'"
-    ).fetchone()
-    relpath = str(row[0])
+    relpath = "operator_evidence/orphan-cleanup.json"
     evidence_path = tmp_path / relpath
-    store.connection.execute("DELETE FROM operator_commands WHERE command_id='cleanup-propagates'")
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text("{}", encoding="utf-8")
     original_unlink = Path.unlink
 
     def fail_evidence_unlink(path, *args, **kwargs):

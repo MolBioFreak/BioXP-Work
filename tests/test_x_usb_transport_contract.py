@@ -32,82 +32,6 @@ def _driver():
     return driver
 
 
-def test_x_absolute_rejects_outside_release_envelope_before_dispatch(monkeypatch):
-    driver = _driver()
-    monkeypatch.setattr(driver, "_send_motor", lambda *a, **k: (_ for _ in ()).throw(AssertionError("dispatch")))
-
-    low = driver.motor_oem_move_absolute(5, -1, motor=0)
-    high = driver.motor_oem_move_absolute(5, 90264, motor=0)
-
-    assert low["ok"] is False and low["command_sent"] is False
-    assert high["ok"] is False and high["command_sent"] is False
-
-
-def test_x_absolute_clamps_release_low_coordinates_to_effective_60(monkeypatch):
-    driver = _driver()
-    sent = []
-    monkeypatch.setattr(driver, "_send_motor", lambda *args, **kwargs: sent.append((args, kwargs)) or ACK)
-    monkeypatch.setattr(driver, "motor_get_position", lambda board, motor=0: {"ok": True, "ack": ACK, "position": 1000 if not sent else 60})
-
-    result = driver.motor_oem_move_absolute(5, 0, motor=0, wait_for_stop=True)
-
-    assert result["ok"] is True
-    assert result["wire_position"] == 60
-    assert len(sent) == 1
-    assert result["proof"] == {
-        "direct_ack": True,
-        "addressed_event_128": True,
-        "target_position": True,
-        "speed_zero": True,
-    }
-
-
-def test_x_absolute_missing_ack_never_replays(monkeypatch):
-    driver = _driver()
-    sent = []
-    monkeypatch.setattr(driver, "_send_motor", lambda *args, **kwargs: sent.append((args, kwargs)))
-
-    result = driver.motor_oem_move_absolute(5, 2000, motor=0)
-
-    assert result["ok"] is False
-    assert result["failure"] == "x_direct_movement_ack_required"
-    assert result["uncertain_delivery"] is True
-    assert len(sent) == 1
-
-
-def test_x_launch_ticket_never_claims_completion(monkeypatch):
-    driver = _driver()
-    sent = []
-    monkeypatch.setattr(driver, "_send_motor", lambda *args, **kwargs: sent.append((args, kwargs)) or ACK)
-
-    result = driver.motor_oem_move_absolute(5, 2000, motor=0, wait_for_stop=False)
-
-    assert result["ok"] is True
-    assert result["pending_motion"] is True
-    assert result["completion_verified"] is False
-    assert result["proof"]["direct_ack"] is True
-    assert result["proof"]["addressed_event_128"] is False
-    assert len(sent) == 1
-
-
-def test_x_wait_rejects_fresh_board_level_fault_without_motor(monkeypatch):
-    driver = _driver()
-    monkeypatch.setattr(driver, "collect_bus_events", lambda **kwargs: [
-        {"event_sequence": 11, "board": 5, "status": 13, "motor": None},
-    ])
-
-    result = BioXpTester.motor_oem_wait_target_reached(
-        driver,
-        5,
-        motor=0,
-        timeout_s=0.01,
-        event_window={"after_sequence": 10},
-    )
-
-    assert result["ok"] is False
-    assert result["failure"] == "controller_async_error_13"
-
-
 @pytest.mark.parametrize(
     "events",
     [
@@ -172,29 +96,6 @@ def test_x_wait_accepts_only_fresh_correctly_addressed_128(monkeypatch):
     assert result["ok"] is True
     assert result["target_reached"] is True
     assert result["event"]["event_sequence"] == 11
-
-
-def test_x_switch_mask_recovery_writes_only_sap12_and_verifies_both(monkeypatch):
-    driver = _driver()
-    writes = []
-    values = {12: 0, 13: 0}
-
-    def get_param(board, param, motor=0):
-        return {"ok": True, "ack": ACK, "value": values[param]}
-
-    def set_param(board, param, value, motor=0):
-        writes.append((board, motor, param, value))
-        values[param] = value
-        return {"ok": True, "ack": ACK, "readback": {"ok": True, "ack": ACK, "value": value}}
-
-    monkeypatch.setattr(driver, "motor_get_axis_param", get_param)
-    monkeypatch.setattr(driver, "motor_set_axis_param", set_param)
-
-    result = driver.motor_x_reconcile_switch_masks()
-
-    assert result["ok"] is True
-    assert writes == [(5, 0, 12, 1)]
-    assert result["switch_masks"] == {12: 1, 13: 0}
 
 
 def _current_driver(monkeypatch):

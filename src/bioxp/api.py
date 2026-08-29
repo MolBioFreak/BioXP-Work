@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import shutil
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -18,7 +19,8 @@ from contextlib import asynccontextmanager
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal, Mapping, Optional, Protocol, cast
+from typing import Any, Callable, Literal, Mapping, Optional, Protocol, cast
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
@@ -46,8 +48,11 @@ from .oem_serial206_initialization import (
     Serial206ProductionPrimitiveAdapter,
     Serial206StageApproval,
 )
-from .oem_runtime_store import OEMRuntimeStore
+from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
+from .runtime_audit_store import runtime_state_root
+from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .operator_reports import create_operator_reports_router
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
 # must neither activate a camera nor present an unqueried cache as observation.
@@ -56,12 +61,7 @@ DEFAULT_HARDWARE_SNAPSHOT_DOMAINS = tuple(
 )
 from .oem_compat.api import router as oem_compat_router
 from .oem_homing_routes import router as oem_homing_router
-from .oem_runtime_api import (
-    configure_runtime as configure_oem_runtime,
-    record_physical_emergency_stop,
-    router as oem_runtime_router,
-    shutdown_runtime as shutdown_oem_runtime,
-)
+
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
 from .oem_switch_audit import OfflineSwitchAuditFixture, interpret_home_predicate, run_switch_audit
@@ -83,6 +83,7 @@ from starlette.responses import Response, StreamingResponse
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
 from .pipette.receipts import PipetteReceiptStore
+from .pipette.application import PipetteApplicationPlanner
 from .pipette import (
     PipetteAspirateCommand,
     PipetteDiagnosticCommand,
@@ -165,6 +166,15 @@ except ModuleNotFoundError as exc:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError(f"BioXP USB runtime dependency unavailable: {_usb_driver_import_error}") from _usb_driver_import_error
 
+        def motion_arm_state(self):
+            return {"armed": False}
+
+        def motion_disarm(self, reason="manual", note=None):
+            return {"armed": False, "reason": str(reason), "note": note, "updated_ms": 0, "arm_seq": 0}
+
+        def motion_arm_confirm(self, reason="oem_activation_completed", note=None):
+            return {"armed": True, "reason": str(reason), "note": note, "updated_ms": 0, "arm_seq": 0}
+
 from .vision.barcode import BarcodeReadCommand
 from .vision.inspection import InspectionCommand
 
@@ -192,7 +202,7 @@ def _default_reference_state_path() -> str:
     # every container replacement.
     runtime_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
     if runtime_root:
-        return os.path.join(runtime_root, "reference-state.json")
+        return os.path.join(runtime_root, "bioxp_runtime.db")
     xdg_state_home = os.environ.get("XDG_STATE_HOME")
     if xdg_state_home:
         base_dir = xdg_state_home
@@ -202,7 +212,7 @@ def _default_reference_state_path() -> str:
             base_dir = os.path.join(home_dir, ".local", "state")
         else:
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".state"))
-    return os.path.join(base_dir, "bioxp", "reference-state.json")
+    return os.path.join(base_dir, "bioxp", "bioxp_runtime.db")
 
 
 _reference_state_store = ReferenceStateStore(
@@ -211,15 +221,134 @@ _reference_state_store = ReferenceStateStore(
 _pipette_transport = None
 _pipette_receipts = PipetteReceiptStore()
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
+_serial206_y_provider: Serial206YProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
+_operator_control_plane_installed = False
+
+
+def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
+    provider = _serial206_oem_initialization_provider
+    pipette = _pipette_transport
+    ownership_epoch = int(getattr(hardware_state, "ownership_epoch", 0)) if "hardware_state" in globals() else 0
+
+    def snapshot_generation(payload: Mapping[str, Any] | None, fallback: int) -> int:
+        if isinstance(payload, Mapping):
+            for key in ("generation", "reference_generation", "ownership_epoch", "reader_generation"):
+                value = payload.get(key)
+                if isinstance(value, int):
+                    return value
+        return int(fallback)
+
+    def payload_blockers(payload: Mapping[str, Any] | None, unavailable: str) -> list[str]:
+        if not isinstance(payload, Mapping):
+            return [unavailable]
+        blockers = payload.get("blockers")
+        rows = [str(item) for item in blockers] if isinstance(blockers, list) else []
+        if payload.get("available") is False and unavailable not in rows:
+            rows.append(unavailable)
+        return rows
+
+    provider_status = serial206_oem_initialization_provider_status() if provider is not None else {}
+    x_state = provider_status.get("x_authority") if isinstance(provider_status.get("x_authority"), Mapping) else {}
+    z_state = provider_status.get("z_authority") if isinstance(provider_status.get("z_authority"), Mapping) else {}
+
+    try:
+        deck_layout = load_deck_layout()
+        deck_state: dict[str, Any] = {
+            "deck_identity": hashlib.sha256(
+                json.dumps(deck_layout, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest(),
+            "location_state": {"representation": str(deck_layout)},
+        }
+        deck_blockers: list[str] = []
+    except Exception as exc:
+        deck_state = {"deck_identity": None, "location_state": None, "error": str(exc)}
+        deck_blockers = ["deck_layout_unavailable"]
+
+    cached_channels: list[dict[str, Any]] = []
+    reader_generations: list[int] = []
+    if pipette is not None:
+        for channel, transport in enumerate(getattr(pipette, "_transports", [])):
+            cached_channels.append({
+                "channel": channel,
+                "tip": getattr(transport, "_last_tip_status", None),
+                "pressure": getattr(transport, "_last_pressure", None),
+            })
+            driver = getattr(transport, "_driver", None)
+            router = getattr(getattr(driver, "bus", None), "router", None)
+            generation = getattr(router, "reader_generation", None)
+            if isinstance(generation, int):
+                reader_generations.append(generation)
+    transport_generation = max(reader_generations) if reader_generations else ownership_epoch
+
+    plate_strip_state: dict[str, Any] = {}
+    if "hardware_state" in globals():
+        for domain in ("pipette", "plate", "strip"):
+            try:
+                plate_strip_state[domain] = hardware_state.project(domain)
+            except Exception as exc:
+                plate_strip_state[domain] = {"available": False, "error": str(exc)}
+
+    provider_bound = provider is not None
+    pipette_bound = pipette is not None
+    return {
+        "deck": {
+            "bound": callable(load_deck_layout) and not deck_blockers,
+            "authority": "domain.deck.load_deck_layout",
+            "generation": ownership_epoch,
+            "state": deck_state,
+            "blockers": deck_blockers,
+        },
+        "gantry": {
+            "bound": provider_bound,
+            "authority": "Serial206OemInitializationProvider.xy" if provider_bound else None,
+            "generation": snapshot_generation(x_state, ownership_epoch),
+            "state": dict(x_state),
+            "blockers": payload_blockers(x_state, "gantry_reference_unavailable") if provider_bound else ["serial206_provider_not_bound"],
+        },
+        "z": {
+            "bound": bool(provider_bound and callable(getattr(provider, "execute_z_intent", None))),
+            "authority": "Serial206OemInitializationProvider.z" if provider_bound else None,
+            "generation": snapshot_generation(z_state, ownership_epoch),
+            "state": dict(z_state),
+            "blockers": payload_blockers(z_state, "z_reference_unavailable") if provider_bound else ["serial206_provider_not_bound"],
+        },
+        "pressure": {
+            "bound": pipette_bound,
+            "authority": "FourPipetteTransport.pressure" if pipette_bound else None,
+            "generation": transport_generation,
+            "state": {"tip_waste_state": cached_channels},
+            "blockers": [] if pipette_bound else ["pipette_transport_not_bound"],
+        },
+        "pipette": {
+            "bound": pipette_bound,
+            "authority": "FourPipetteTransport" if pipette_bound else None,
+            "generation": transport_generation,
+            "state": {"transport_owner_generation": transport_generation, "channels": cached_channels},
+            "blockers": [] if pipette_bound else ["pipette_transport_not_bound"],
+        },
+        "machine_state": {
+            "bound": "hardware_state" in globals(),
+            "authority": "hardware_state" if "hardware_state" in globals() else None,
+            "generation": ownership_epoch,
+            "state": {"plate_strip_state": plate_strip_state},
+            "blockers": [] if "hardware_state" in globals() else ["hardware_state_not_bound"],
+        },
+    }
+
+
+_pipette_application = PipetteApplicationPlanner(
+    dependency_resolver=_pipette_application_dependencies,
+)
 
 
 def bind_serial206_oem_initialization_provider(
     provider: Serial206OemInitializationProvider | None,
 ) -> dict[str, Any]:
     """Bind or explicitly clear the live serial-206 initialization provider."""
-    global _serial206_oem_initialization_provider, _serial206_oem_initialization_provider_binding_error
+    global _serial206_oem_initialization_provider, _serial206_y_provider, _serial206_oem_initialization_provider_binding_error
     _serial206_oem_initialization_provider = provider
+    _serial206_y_provider = getattr(provider, "y_provider", None) if provider is not None else None
     _serial206_oem_initialization_provider_binding_error = None
     return serial206_oem_initialization_provider_status()
 
@@ -240,6 +369,9 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     z_projection_raw = z_projection_fn() if callable(z_projection_fn) else None
     x_projection_fn = getattr(provider, "x_projection", None) if provider is not None else None
     x_projection_raw = x_projection_fn() if callable(x_projection_fn) else None
+    y_provider = getattr(provider, "y_provider", None) if provider is not None else None
+    y_projection_fn = getattr(y_provider, "projection", None) if y_provider is not None else None
+    y_projection_raw = y_projection_fn() if callable(y_projection_fn) else None
     projection = dict(projection_raw) if isinstance(projection_raw, Mapping) else {
         "initialize_motion_ledger": None,
         "machine_status": None,
@@ -264,6 +396,11 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
             "available": False,
             "state": "unbound",
             "blockers": ["serial206_provider_not_bound"],
+        },
+        "y_authority": dict(y_projection_raw) if isinstance(y_projection_raw, Mapping) else {
+            "available": False,
+            "state": "unbound",
+            "blockers": ["serial206_y_provider_not_bound"],
         },
         "physical_acceptance_required": True,
         "provider": None if provider is None else type(provider).__name__,
@@ -325,6 +462,38 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
     return dict(result)
 
 
+def _run_serial206_pipette_audit(
+    operation_name: str,
+    operation: Callable[[Any], Any],
+    *,
+    requested_inputs: Mapping[str, Any],
+    lifecycle_stage_id: str,
+) -> dict[str, Any]:
+    async def inline_run(_label: str, callback, *, timeout_s: float):
+        del _label, timeout_s
+        return callback()
+
+    return asyncio.run(
+        run_pipette_operation(
+            operation_name,
+            operation,
+            get_transport=_get_pipette_transport,
+            run_blocking=inline_run,
+            timeout_s=1800.0,
+            receipt_store=_pipette_receipts,
+            requested_inputs=dict(requested_inputs),
+            runtime_binding={
+                "owner": "shared_bioxp_tester_pipette",
+                "transport_owner_bound": True,
+                "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
+                "caller_class": "lifecycle",
+                "control_class": "pipette_state_command",
+                "lifecycle_stage_id": lifecycle_stage_id,
+            },
+        )
+    )
+
+
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
     if _tester is None or _pipette_transport is None:
         raise RuntimeError("owned BioXpTester and FourPipetteTransport are required")
@@ -334,15 +503,24 @@ def _build_serial206_oem_initialization_provider() -> Serial206OemInitialization
         authority_provider=Serial206MotionAuthority.from_active_snapshot,
         generation_provider=lambda: hardware_state.ownership_epoch,
         reference_store=_reference_state_store,
+        pipette_audit_runner=_run_serial206_pipette_audit,
     )
     store_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT") or os.environ.get("BIOXP_OEM_RUNTIME_ROOT")
+    state_store = OEMRuntimeStore(store_root)
     provider = Serial206OemInitializationProvider(
         adapter,
-        state_store=OEMRuntimeStore(store_root),
+        state_store=state_store,
         reference_store=_reference_state_store,
         generation_provider=lambda: hardware_state.ownership_epoch,
         preparation_provider=adapter,
     )
+    provider.y_provider = Serial206YProvider(
+        _tester,
+        state_store=state_store,
+        generation_provider=lambda: hardware_state.ownership_epoch,
+        reference_store=_reference_state_store,
+    )
+    adapter.bind_y_provider(provider.y_provider)
     adapter.bind_x_lifecycle_executor(provider.execute_x_intent)
     _tester.set_board_activation_observer(provider.notify_board_activation)
     return provider
@@ -350,16 +528,19 @@ def _build_serial206_oem_initialization_provider() -> Serial206OemInitialization
 
 def _sync_serial206_oem_initialization_provider(*, transport: str, usb: str, router: str) -> None:
     """Bind only to the current managed USB owner; clear on every other state."""
-    global _serial206_oem_initialization_provider, _serial206_oem_initialization_provider_binding_error
+    global _serial206_oem_initialization_provider, _serial206_y_provider, _serial206_oem_initialization_provider_binding_error
     if (transport, usb, router) != ("owned", "service", "running"):
         _serial206_oem_initialization_provider = None
+        _serial206_y_provider = None
         _serial206_oem_initialization_provider_binding_error = None
         return
     try:
         _serial206_oem_initialization_provider = _build_serial206_oem_initialization_provider()
+        _serial206_y_provider = _serial206_oem_initialization_provider.y_provider
         _serial206_oem_initialization_provider_binding_error = None
     except Exception as exc:
         _serial206_oem_initialization_provider = None
+        _serial206_y_provider = None
         _serial206_oem_initialization_provider_binding_error = f"{type(exc).__name__}: {exc}"
 
 
@@ -396,15 +577,12 @@ def _initial_maintenance_state() -> dict[str, Any]:
     return {
         "schema_version": MAINTENANCE_STATE_SCHEMA_VERSION,
         "usb_owner": "service",
-        "motion_blocked": True,
-        "recovery_required": True,
-        "block_reason": "Service startup requires explicit non-homing motion recovery.",
-        "recovery_hint": (
-            "Run non-homing strict startup or localhost-only POST /maintenance/usb/recover_motion "
-            "before any axis/home/clear-lock motion."
-        ),
-        "blocked_by": "service_start",
-        "last_transition": "service_start",
+        "motion_blocked": False,
+        "recovery_required": False,
+        "block_reason": None,
+        "recovery_hint": None,
+        "blocked_by": None,
+        "last_transition": "service_start_clean",
         "last_transition_at": None,
         "last_recovery": None,
     }
@@ -447,7 +625,7 @@ def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]
 
 def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
     """Invalidate every hardware and camera projection on ownership changes."""
-    global _camera_projection_epoch, _camera_probe_cache
+    global _camera_projection_epoch, _camera_probe_cache, _camera_session
     epoch = hardware_state.change_ownership(
         reason=reason,
         transport=transport,
@@ -455,6 +633,8 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
         router=router,
     )
     with _camera_projection_lock:
+        session = _camera_session
+        _camera_session = None
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         _camera_stream_state.update(
@@ -464,6 +644,23 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
                 "last_frame_at": None,
             }
         )
+    if session is not None:
+        process = session.get("process")
+        if process is not None and process.returncode is None:
+            process.terminate()
+        queue = session.get("queue")
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+        task = session.get("reader_task")
+        if task is not None and not task.done():
+            task.cancel()
     _sync_serial206_oem_initialization_provider(transport=transport, usb=usb, router=router)
     return epoch
 
@@ -621,8 +818,33 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    del app
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _operator_control_plane_installed
+    runtime_root = runtime_state_root()
+    runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
+    migration_authorized = False
+    migration_connection.create_function("authority_write_allowed", 0, lambda: 1 if migration_authorized else 0)
+    migration_connection.create_function(
+        "sha256_utf8", 1, lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest(), deterministic=True
+    )
+    migration_connection.create_function(
+        "sha256_blob", 1, lambda value: hashlib.sha256(bytes(value)).hexdigest(), deterministic=True
+    )
+    migration_connection.create_function(
+        "canonical_json", 1, lambda value: json.dumps(json.loads(str(value)), sort_keys=True, separators=(",", ":"), allow_nan=False), deterministic=True
+    )
+    try:
+        migration_authorized = True
+        migrate_runtime_database_v2(migration_connection, runtime_root)
+    finally:
+        migration_authorized = False
+        migration_connection.close()
+    try:
+        app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
+    except Exception as exc:
+        _startup_error = f"Pipette JSONL migration/readiness failed: {exc}"
+        app.state.pipette_migration = {"status": "failed", "error": str(exc)}
+        raise RuntimeError(_startup_error) from exc
     try:
         machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
         configure_oem_runtime_state_from_env(machine_snapshot)
@@ -660,15 +882,16 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
-    # Construct the local OEM runtime/store/worker owners after the transport
-    # owner attempt, preserving the OEM startup ordering without dispatching
-    # homing or motion from generic API lifespan.
-    configure_oem_runtime(
-        store_root=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT"),
-        z_abort_provider=_runtime_z_abort_provider,
-        z_resume_provider=_runtime_z_resume_provider,
-        autostart=True,
-    )
+    if not _operator_control_plane_installed:
+        install_operator_control_plane(
+            app,
+            maintenance_state_provider=_maintenance_state_payload,
+            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
+            lifecycle_state_provider=lifecycle_state.projection,
+            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+            pipette_status_provider=_operator_pipette_status,
+        )
+        _operator_control_plane_installed = True
     try:
         yield
     finally:
@@ -682,10 +905,12 @@ async def lifespan(app: FastAPI):
                     await _stop_owned_camera_session(reason="lifespan shutdown")
                 except Exception as exc:
                     shutdown_errors.append(f"camera shutdown: {exc}")
-                try:
-                    shutdown_oem_runtime()
-                except Exception as exc:
-                    shutdown_errors.append(f"OEM runtime shutdown: {exc}")
+                command_plane = getattr(app.state, "operator_command_plane", None)
+                if command_plane is not None:
+                    try:
+                        command_plane.stop()
+                    except Exception as exc:
+                        shutdown_errors.append(f"operator command plane shutdown: {exc}")
                 cleanup_errors = list(shutdown_errors)
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
@@ -740,8 +965,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(oem_compat_router)
-app.include_router(oem_runtime_router)
 app.include_router(oem_homing_router)
+app.include_router(create_operator_reports_router(_pipette_receipts))
 
 
 def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -1080,7 +1305,13 @@ def _constructor_pipette_action() -> dict[str, Any]:
     owner = _get_pipette_transport()
     if owner.__class__.__name__ != "FourPipetteTransport":
         return {"ok": False, "error": "exact_four_pipette_owner_required"}
-    result = owner.initialize(PipetteInitCommand())
+    command = PipetteInitCommand()
+    result = _run_serial206_pipette_audit(
+        "initialize",
+        lambda transport: transport.initialize(command),
+        requested_inputs=command.to_payload(),
+        lifecycle_stage_id="constructor_pipette_stage",
+    )
     return {
         **result,
         "ok": bool(result.get("ok")),
@@ -1118,6 +1349,76 @@ def _get_pipette_transport():
     if _pipette_transport is None:
         raise HTTPException(status_code=503, detail="Pipette transport owner is unavailable")
     return _pipette_transport
+
+
+def _operator_pipette_status() -> dict[str, Any]:
+    owner = _pipette_transport
+    if owner is not None:
+        status = owner.get_status()
+        if isinstance(status, Mapping):
+            return dict(status)
+    channels = []
+    for channel in range(4):
+        channels.append({
+            "ok": False,
+            "transport": "novo_usb_can",
+            "channel": channel,
+            "bitrate": 0,
+            "pipette_id": channel,
+            "transport_details": {
+                "source": "OEM Novo.Devices.CanInterfaceBoard over one shared NovoRouter",
+                "vid": "0x03eb",
+                "pid": "0x2423",
+                "alt": 1,
+                "shared_bioxp_usb_runtime": False,
+            },
+            "available": False,
+            "initialized": False,
+            "software_initialized": False,
+            "tip_loaded": False,
+            "software_tip_loaded": False,
+            "pressure_profile": "1R",
+            "top_speed": 1000.0,
+            "last_command": None,
+            "last_transaction": None,
+            "pipette_message_state": {},
+            "oem_initialization_counter": 0,
+            "oem_diagnosis": None,
+            "oem_error_queue": [],
+            "oem_process_error_code": None,
+            "hardware_tip_status": None,
+            "hardware_pressure": None,
+            "hardware_truth_level": "unavailable",
+            "ack_required": True,
+            "delivery_verified": False,
+            "controller_acknowledged": None,
+            "completion_verified": False,
+            "hardware_precondition_verified": False,
+            "hardware_postcondition_verified": False,
+            "state_reconciled": False,
+            "state_reconciliation_source": None,
+            "physical_effect_verified": False,
+            "response_timeout_s": 60.0,
+            "liquid_level_ul": 0.0,
+            "front_air_level_ul": 0.0,
+            "rear_air_level_ul": 0.0,
+        })
+    return {
+        "ok": False,
+        "transport": "novo_usb_can",
+        "channels": channels,
+        "channel_count": 4,
+        "group_status_spacing_ms": 30,
+        "live_query_performed": False,
+        "last_group_transaction": None,
+        "liquid_mutation_enabled": False,
+        "tip_type": 201,
+        "tip_location": -1,
+        "allow_to_stop": True,
+        "fluid_detection_timestamps": {str(channel): None for channel in range(4)},
+        "last_error": None,
+        "physical_effect_verified": False,
+    }
 
 
 def _oem_non_motion_startup_result(
@@ -1367,10 +1668,10 @@ class AxisName(str, Enum):
 class OemManualRelativeRequest(BaseModel):
     """Exact OEM moveSteps inputs; board/profile details stay robot-owned."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     axis: Literal["x", "y", "z", "g"]
-    steps: int
+    steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
 
 
 class OemManualHomeRequest(BaseModel):
@@ -1394,30 +1695,67 @@ class OemManualSetHomeRequest(BaseModel):
 class OemManualAbsoluteRequest(BaseModel):
     """Exact OEM moveX/moveY/moveZ/moveG absolute inputs."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     axis: Literal["x", "y", "z", "g"]
-    position_steps: int
-    wait_timeout_s: float = Field(default=20.0, ge=0.5, le=60.0)
+    position_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    wait_timeout_s: StrictFloat = Field(default=20.0, ge=0.5, le=60.0)
 
 
 class OemZSetHomeRequest(BaseModel):
     operator_ack: Literal["SET_HOME_CURRENT_POSITION"] = "SET_HOME_CURRENT_POSITION"
 
 
+class OemYMoveStepsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+
+
+class OemYMoveAbsoluteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+
+
+class OemYAccelerationOverloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    acceleration_override: StrictInt = Field(ge=1, le=2047)
+
+
+class OemYBoardTestMyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+
+
+class OemYHomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source_mode: Literal[
+        "startup", "diagnostic", "manual_panel", "homexy", "location_workflow", "board_test"
+    ] = "manual_panel"
+
+
+class OemYSetHomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: Literal["SET_HOME_CURRENT_POSITION"] = "SET_HOME_CURRENT_POSITION"
+
+
 class OemXMoveStepsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    steps: StrictInt = Field(ge=-90243, le=90243)
-    wait_timeout_s: StrictFloat = Field(default=20.0, ge=0.5, le=60.0)
+    steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
 
 
 class OemXMoveAbsoluteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    position_steps: StrictInt = Field(ge=0, le=90263)
+    position_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
     acceleration: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
-    wait_timeout_s: StrictFloat = Field(default=20.0, ge=0.5, le=60.0)
 
 
 class OemXReconcileRequest(BaseModel):
@@ -1873,18 +2211,15 @@ class OemMoveXYRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     operator_ack: Literal["MOVEXY"]
-    x: StrictInt
-    y: StrictInt
+    x: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    y: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
     timeout_s: StrictFloat = Field(default=20.0, gt=0.1, le=120.0)
 
 
 class OemHomeXYRequest(BaseModel):
-    operator_ack: str = Field(..., description="Must be exactly HOMEXY for the direct OEM HomeXY mode.")
-    timeout_s: float = Field(30.0, gt=0.1, le=120.0)
-    allow_implementation_mapped_predicate: bool = Field(
-        False,
-        description="Supervised commissioning override; each axis still uses guarded switch-search and does not collapse to /motion/axis/zero.",
-    )
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operator_ack: Literal["HOMEXY"]
 
 
 class OemMoveToRequest(BaseModel):
@@ -1931,25 +2266,20 @@ class OemSerial206CommissioningEvidenceRequest(BaseModel):
 
 
 class OemSerial206InitializeMotorsStepRequest(BaseModel):
-    """One admitted source-ordered initializeMotors transition."""
+    """One synchronous recovered-OEM initializeMotors invocation."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    operator_ack: StrictStr = Field(..., description="Must be exactly INITIALIZE_MOTORS_STAGE.")
-    stage_approval: OemSerial206StageApprovalRequest | None = None
-    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
+    idempotency_key: StrictStr = Field(min_length=8, max_length=200)
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
 
 
 class OemSerial206InitializeMotionStepRequest(BaseModel):
-    """One admitted source-ordered initializeMotion transition."""
+    """One synchronous recovered-OEM initializeMotion invocation."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    operator_ack: StrictStr = Field(..., description="Must be exactly INITIALIZE_MOTION_STAGE.")
-    motor_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
-    motion_stage_approvals: dict[str, OemSerial206StageApprovalRequest] = Field(default_factory=dict)
-    commissioning: dict[str, OemSerial206CommissioningEvidenceRequest] = Field(default_factory=dict)
+    idempotency_key: StrictStr = Field(min_length=8, max_length=200)
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
 
 
@@ -2069,7 +2399,7 @@ class PipetteDispenseAllRequest(PipetteChannelsRequest):
 
 
 class PipetteSpeedRequest(PipetteChannelsRequest):
-    velocity: int = Field(..., ge=1, le=10000)
+    velocity: float = Field(..., gt=0, le=10000)
 
 
 class PipetteFirmwareRequest(BaseModel):
@@ -2102,6 +2432,20 @@ class PipetteFluidDetectionRequest(BaseModel):
     dry_run: bool = True
 
 
+class PipetteReadbackRequest(BaseModel):
+    include_data: bool = False
+
+
+class PipetteApplicationPlanRequest(BaseModel):
+    operation: Literal["load_tip", "move_to_waste", "detect_fluid", "plunger_up", "plunger_down"]
+    tip_tray: Optional[str] = Field(None, max_length=120)
+    tip_well: Optional[str] = Field(None, max_length=32)
+    tip_type: Optional[int] = None
+    tip_location: Optional[int] = Field(None, ge=0, le=3)
+    home_z_after: bool = True
+    fluid_class: Optional[Literal["TC", "MS", "OC", "RC", "STRIP"]] = None
+
+
 class PipetteTerminateRequest(BaseModel):
     operator: Optional[str] = Field(None, max_length=120)
     reason: Optional[str] = Field(None, max_length=120)
@@ -2120,6 +2464,18 @@ class ChillerRequest(BaseModel):
 
 class CameraSnapshotRequest(BaseModel):
     """Finite snapshot command: the provider owns all camera identity and settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CameraStreamStartRequest(BaseModel):
+    """Start the fixed serial-206 stream profile without caller tuning."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CameraStreamStopRequest(BaseModel):
+    """Stop the currently owned camera stream."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -5496,7 +5852,6 @@ async def _camera_mjpeg_response(
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
-        "X-BioXp-Camera-Device": device,
     }
     return StreamingResponse(
         iterator(),
@@ -5543,23 +5898,81 @@ async def _stop_owned_camera_session(*, reason: str) -> dict[str, Any]:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
+        queue = session.get("queue")
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+        viewer_shutdown = session.get("viewer_shutdown_task")
+        if viewer_shutdown is not None and viewer_shutdown is not asyncio.current_task() and not viewer_shutdown.done():
+            viewer_shutdown.cancel()
         task = session.get("reader_task")
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
     _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
-    return {"ok": True, "stopped_session_id": None if session is None else session.get("session_id"), "replacement": reason == "replacement", "camera_ownership_epoch": epoch}
+    return {
+        **_camera_stream_control_payload(session, state="off", error=reason),
+        "ok": True,
+        "stopped_session_id": None if session is None else session.get("session_id"),
+        "replacement": reason == "replacement",
+    }
+
+
+def _camera_stream_control_payload(
+    session: dict[str, Any] | None,
+    *,
+    state: str,
+    idempotent: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
+    latest_frame_at = _camera_stream_state.get("last_frame_at")
+    if latest_frame_at is not None:
+        latest_frame_at = datetime.fromtimestamp(float(latest_frame_at), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "schema_version": "bioxp.camera_stream.v1",
+        "state": state,
+        "active": state in {"starting", "live"},
+        "stream_id": None if session is None else session.get("session_id"),
+        "camera_ownership_epoch": _camera_projection_epoch,
+        "device": None if session is None else session.get("device"),
+        "fps": None if session is None else session.get("fps"),
+        "quality": None if session is None else session.get("quality"),
+        "width": None if session is None else session.get("width"),
+        "height": None if session is None else session.get("height"),
+        "frames_emitted": int(_camera_stream_state.get("frames_emitted") or 0),
+        "dropped_frames": int(_camera_stream_state.get("dropped_frames") or 0),
+        "latest_frame_at": latest_frame_at,
+        "last_error": error if error is not None else _camera_stream_state.get("last_error"),
+        "idempotent": idempotent,
+    }
 
 
 async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]:
+    del payload
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
-    replacement = _camera_session is not None
+    with _camera_projection_lock:
+        existing = _camera_session
+        existing_active = bool(
+            existing is not None
+            and _camera_stream_state.get("active")
+            and existing.get("process") is not None
+            and existing["process"].returncode is None
+        )
+        if existing_active:
+            return _camera_stream_control_payload(existing, state="live", idempotent=True)
+    replacement = existing is not None
     if replacement:
         await _stop_owned_camera_session(reason="replacement")
-    device = str(payload.get("device") or "/dev/video0")
-    fps = max(1, min(int(payload.get("fps") or 8), 30))
-    quality = max(2, min(int(payload.get("quality") or 7), 15))
-    width = max(160, min(int(payload.get("width") or 640), 1920))
-    height = max(120, min(int(payload.get("height") or 480), 1080))
+    device = "/dev/video0"
+    fps = 8
+    quality = 7
+    width = 640
+    height = 480
     pick = _pick_stream_device(device)
     if not pick.get("ok"):
         raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
@@ -5571,13 +5984,13 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
     if proc.stdout is None:
         proc.terminate()
         raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=8)
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
     session_id = uuid.uuid4().hex
     with _camera_projection_lock:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         epoch = _camera_projection_epoch
-        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
         _camera_session = session
     hardware_state.invalidate(reason="camera ownership changed: stream started")
     _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
@@ -5607,6 +6020,7 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
                     if queue.full():
                         try:
                             queue.get_nowait()
+                            _camera_stream_state["dropped_frames"] = int(_camera_stream_state.get("dropped_frames") or 0) + 1
                         except asyncio.QueueEmpty:
                             pass
                     queue.put_nowait(part)
@@ -5631,7 +6045,12 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
 
     task = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
     session["reader_task"] = task
-    return {"ok": True, "session_id": session_id, "camera_ownership_epoch": epoch, "replacement": replacement, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue_max_frames": queue.maxsize, "mjpeg_url": "/camera/mjpeg"}
+    return {
+        **_camera_stream_control_payload(session, state="starting"),
+        "replacement": replacement,
+        "queue_max_frames": queue.maxsize,
+        "mjpeg_url": "/camera/mjpeg",
+    }
 
 
 def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -6042,21 +6461,36 @@ async def motion_oem_prepare_without_motion():
                 "ok": False,
                 "failure": "global_motion_preparation_result_invalid",
             }
-        z_receipt = _execute_provider_z_intent("prepare", {})
-        z_prepared = bool(
-            isinstance(z_receipt, Mapping)
-            and z_receipt.get("ok") is True
-        )
+        # Z preparation is now owned by the first explicit Z action. The
+        # retired direct provider mutation must not block global non-motion
+        # preparation or claim a Z reference before the required Z home.
+        z_receipt = {
+            "ok": True,
+            "physical_motion_commanded": False,
+            "state": "deferred_to_explicit_z_action",
+            "next_required_action": "home_z",
+        }
         can_ready = hardware_state.publish_can_ready_from_preparation(
             expected_ownership_epoch=hardware_state.ownership_epoch,
             reason="oem_prepare_without_motion_completed",
         )
-        ready = bool(z_prepared and can_ready.get("published") is True)
+        ready = bool(can_ready.get("published") is True)
+        if ready:
+            arm_confirm = getattr(tester, "motion_arm_confirm", None)
+            arm_state = (
+                arm_confirm(reason="oem_prepare_without_motion_completed")
+                if callable(arm_confirm)
+                else {"state": "armed", "source": "preparation"}
+            )
+        else:
+            arm_state_fn = getattr(tester, "motion_arm_state", None)
+            arm_state = arm_state_fn() if callable(arm_state_fn) else {"state": "unknown"}
         return {
             **dict(global_result),
             "ok": ready,
             "z_prepare_receipt": _json_safe(z_receipt),
             "can_ready_publication": _json_safe(can_ready),
+            "motion_arm_state": _json_safe(arm_state),
             "failure": None if ready else "operator_motion_state_publication_failed",
         }
 
@@ -6090,32 +6524,19 @@ async def motion_oem_prepare_without_motion():
 
 @app.post("/motion/emergency_stop")
 async def motion_emergency_stop():
-    try:
-        authority = Serial206MotionAuthority.from_active_snapshot()
-    except Exception as exc:
-        failed = {
-            "ok": False,
-            "error": "serial_206_authority_unavailable",
-            "message": str(exc),
-            "delivery_attempted": False,
-            "controller_terminal_state_verified": False,
-            "physical_effect_verified": False,
-        }
-        failed["runtime_event"] = record_physical_emergency_stop(result=failed)
-        raise HTTPException(
-            status_code=409,
-            detail=failed,
-        ) from exc
-    result = await _run_safety_interrupt_blocking(
-        "Physical aggregate motion stop",
-        lambda tester: physical_aggregate_stop(tester, authority),
-        timeout_s=30.0,
+    """Compatibility alias for the canonical SQLite-backed OEM abort lane."""
+    command_plane = getattr(app.state, "operator_command_plane", None)
+    if command_plane is None:
+        raise HTTPException(status_code=503, detail={"error": "operator_command_plane_unavailable"})
+    return await command_plane.compat_invoke(
+        "oem.abort_all",
+        {
+            "idempotency_key": f"legacy-emergency-stop-{uuid.uuid4().hex}",
+            "reason": "legacy_motion_emergency_stop_alias",
+            "observed_ownership_generation": None,
+            "observed_board_epoch_by_board": {},
+        },
     )
-    hardware_state.invalidate(reason="physical_aggregate_stop_attempted")
-    result["runtime_event"] = record_physical_emergency_stop(result=result)
-    if result.get("ok") is not True:
-        raise HTTPException(status_code=409, detail=result)
-    return result
 
 
 @app.get("/motion/power/status")
@@ -6586,6 +7007,15 @@ async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
 
 @app.post("/motion/diagnostics/stop")
 async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
+    if req.axis == "y":
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "direct_y_diagnostic_stop_retired",
+                "replacement_action_id": None,
+                "physical_motion_commanded": False,
+            },
+        )
     try:
         action = resolve_axis_diagnostic(req.axis, "stop")
     except AxisDiagnosticContractError as exc:  # pragma: no cover - literal axis restricts this
@@ -6692,6 +7122,8 @@ def _record_z_motion_outcome(result: dict[str, Any], *, source: str, motion_kind
 async def motion_oem_manual_relative(req: OemManualRelativeRequest):
     """Dispatch literal OEM moveSteps(axis, steps) with robot-owned bounds/evidence."""
     axis = AxisName(req.axis)
+    if axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/move_steps", "physical_motion_commanded": False})
     if axis is AxisName.X:
         return await _run_blocking(
             "serial-206 X moveSteps",
@@ -6745,6 +7177,8 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
 async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
     """Dispatch exact OEM moveX/moveY/moveZ/moveG absolute semantics."""
     axis = AxisName(req.axis)
+    if axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/move_absolute", "physical_motion_commanded": False})
     if axis is AxisName.X:
         return await _run_blocking(
             "serial-206 X moveX",
@@ -6870,6 +7304,139 @@ def _record_z_home_outcome(result: dict[str, Any], *, source: str, motion_kind: 
     return payload
 
 
+def _require_serial206_y_provider() -> Serial206YProvider:
+    provider = _serial206_y_provider
+    if provider is None:
+        candidate = getattr(_serial206_oem_initialization_provider, "y_provider", None)
+        provider = candidate if isinstance(candidate, Serial206YProvider) else None
+    if provider is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "serial206_y_provider_unavailable",
+                "physical_motion_commanded": False,
+            },
+        )
+    return provider
+
+
+def _execute_serial206_y_call(method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    if method_name in {"prepare", "move_steps", "move_absolute", "move_absolute_internal", "terminalize_absolute", "home", "set_home", "stop"}:
+        context = current_operator_dispatch_context()
+        if not isinstance(context, Mapping):
+            raise HTTPException(status_code=410, detail={"error": "direct_serial206_y_mutation_retired", "replacement": "/operator/actions/{semantic_y_action_id}", "physical_motion_commanded": False})
+        if method_name != "terminalize_absolute":
+            kwargs.setdefault("command_id", str(context["operator_command_id"]))
+    provider = _require_serial206_y_provider()
+    method = getattr(provider, method_name)
+    try:
+        result = method(*args, **kwargs)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "schema": provider.schema,
+            "axis": "y",
+            "failure": f"{type(exc).__name__}: {exc}",
+            "physical_motion_commanded": False,
+        }
+    return dict(result) if isinstance(result, Mapping) else {
+        "ok": False,
+        "schema": provider.schema,
+        "axis": "y",
+        "failure": "serial206_y_provider_result_not_mapping",
+        "physical_motion_commanded": False,
+    }
+
+
+@app.get("/motion/oem/y/status")
+async def motion_oem_y_status():
+    return await _run_blocking("serial-206 Y status", lambda: _execute_serial206_y_call("status"), timeout_s=30.0)
+
+
+
+@app.post("/motion/oem/y/move_steps")
+async def motion_oem_y_move_steps(req: OemYMoveStepsRequest):
+    return await _run_blocking(
+        "serial-206 Y moveSteps",
+        lambda: _execute_serial206_y_call("move_steps", int(req.steps)),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/y/move_absolute")
+async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
+    return await _run_blocking(
+        "serial-206 Y moveY absolute",
+        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/y/internal/acceleration_overload")
+async def motion_oem_y_acceleration_overload(req: OemYAccelerationOverloadRequest):
+    return await _run_blocking(
+        "serial-206 Y acceleration overload",
+        lambda: _execute_serial206_y_call(
+            "move_absolute_internal",
+            "acceleration_overload",
+            int(req.target_steps),
+            acceleration_override=int(req.acceleration_override),
+        ),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/y/internal/board_test_my")
+async def motion_oem_y_board_test_my(req: OemYBoardTestMyRequest):
+    return await _run_blocking(
+        "serial-206 Y board_test_my",
+        lambda: _execute_serial206_y_call(
+            "move_absolute_internal",
+            "board_test_my",
+            int(req.target_steps),
+        ),
+        timeout_s=30.0,
+    )
+
+
+def _terminalize_serial206_y_internal(issued_receipt: Mapping[str, Any], timeout_s: float) -> dict[str, Any]:
+    return _execute_serial206_y_call(
+        "terminalize_absolute",
+        dict(issued_receipt),
+        timeout_s=float(timeout_s),
+    )
+
+
+app.state.serial206_y_terminalizer = _terminalize_serial206_y_internal
+
+
+@app.post("/motion/oem/y/home")
+async def motion_oem_y_home(req: OemYHomeRequest):
+    return await _run_blocking(
+        f"serial-206 Y home {req.source_mode}",
+        lambda: _execute_serial206_y_call("home", req.source_mode),
+        timeout_s=60.0,
+    )
+
+
+@app.post("/motion/oem/y/set_home")
+async def motion_oem_y_set_home(req: OemYSetHomeRequest):
+    return await _run_blocking(
+        "serial-206 Y set-home current position",
+        lambda: _execute_serial206_y_call("set_home", req.operator_ack),
+        timeout_s=30.0,
+    )
+
+
+@app.post("/motion/oem/y/stop")
+async def motion_oem_y_stop():
+    return await _run_safety_interrupt_blocking(
+        "serial-206 Y stop",
+        lambda tester: _execute_serial206_y_call("stop"),
+        timeout_s=10.0,
+    )
+
+
 @app.get("/motion/oem/x/status")
 async def motion_oem_x_status():
     """Return the provider-owned X lifecycle, telemetry, and receipt projection."""
@@ -6880,24 +7447,6 @@ async def motion_oem_x_status():
     return projection()
 
 
-@app.post("/motion/oem/x/prepare")
-async def motion_oem_x_prepare():
-    return await _run_blocking(
-        "serial-206 X prepare",
-        lambda: _execute_provider_x_intent("prepare"),
-        timeout_s=60.0,
-    )
-
-
-@app.post("/motion/oem/x/reconcile_switch_masks")
-async def motion_oem_x_reconcile_switch_masks(req: OemXReconcileRequest):
-    return await _run_blocking(
-        "serial-206 X switch-mask reconciliation",
-        lambda: _execute_provider_x_intent(
-            "reconcile_switch_masks", {"confirm": req.confirm}
-        ),
-        timeout_s=30.0,
-    )
 
 
 @app.post("/motion/oem/x/move_steps")
@@ -6906,9 +7455,9 @@ async def motion_oem_x_move_steps(req: OemXMoveStepsRequest):
         "serial-206 X moveSteps",
         lambda: _execute_provider_x_intent(
             "move_steps",
-            {"steps": int(req.steps), "wait_timeout_s": float(req.wait_timeout_s)},
+            {"steps": int(req.steps)},
         ),
-        timeout_s=float(req.wait_timeout_s) + 10.0,
+        timeout_s=600.0,
     )
 
 
@@ -6916,14 +7465,13 @@ async def motion_oem_x_move_steps(req: OemXMoveStepsRequest):
 async def motion_oem_x_move_absolute(req: OemXMoveAbsoluteRequest):
     inputs: dict[str, Any] = {
         "position_steps": int(req.position_steps),
-        "wait_timeout_s": float(req.wait_timeout_s),
     }
     if req.acceleration is not None:
         inputs["acceleration"] = int(req.acceleration)
     return await _run_blocking(
         "serial-206 X moveX",
         lambda: _execute_provider_x_intent("move_absolute", inputs),
-        timeout_s=float(req.wait_timeout_s) + 10.0,
+        timeout_s=600.0,
     )
 
 
@@ -7102,14 +7650,6 @@ async def motion_oem_z_status():
     return projection()
 
 
-@app.post("/motion/oem/z/prepare")
-async def motion_oem_z_prepare():
-    return await _run_blocking(
-        "serial-206 Z prepare",
-        lambda: _execute_provider_z_intent("prepare"),
-        timeout_s=60.0,
-    )
-
 
 @app.post("/motion/oem/z/clear")
 async def motion_oem_z_clear():
@@ -7132,14 +7672,6 @@ async def motion_oem_z_live_right_reference():
         },
     )
 
-
-@app.post("/motion/oem/z/reconcile_switch_masks")
-async def motion_oem_z_reconcile_switch_masks(req: OemZReconcileRequest):
-    return await _run_blocking(
-        "serial-206 Z switch-mask recovery",
-        lambda: _execute_provider_z_intent("reconcile_switch_masks", {"confirm": req.confirm}),
-        timeout_s=30.0,
-    )
 
 
 @app.post("/motion/oem/z/diagnostic_home_axis")
@@ -7315,6 +7847,8 @@ async def motion_oem_z_self_test(req: OemZSelfTestRequest):
 @app.post("/motion/oem/manual/home")
 async def motion_oem_manual_home(req: OemManualHomeRequest):
     """Dispatch source-exact semantic home through the axis authority owner."""
+    if req.axis == "y":
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/home", "physical_motion_commanded": False})
     if req.axis == "x":
         return await _run_blocking(
             "serial-206 X manual panel Home",
@@ -7378,6 +7912,8 @@ async def motion_oem_manual_sethome(req: OemManualSetHomeRequest):
     exact OEM setHome write (SAP param 1 = 0) with readback and a durable
     reference mark. No search, no motion, no switch transition is required.
     """
+    if req.axis == "y":
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/set_home", "physical_motion_commanded": False})
     if req.axis == "x":
         return await _run_blocking(
             "serial-206 X manual set-home (no motion)",
@@ -7588,7 +8124,6 @@ async def motion_thermal_door_close():
 
 @app.post("/motion/oem/move_xy")
 async def motion_oem_move_xy(req: OemMoveXYRequest):
-    _require_motion_route_ready()
     if _serial206_oem_initialization_provider is None:
         raise HTTPException(
             status_code=503,
@@ -7607,7 +8142,6 @@ async def motion_oem_move_xy(req: OemMoveXYRequest):
 async def motion_oem_home_xy(req: OemHomeXYRequest):
     if req.operator_ack != "HOMEXY":
         raise HTTPException(status_code=409, detail="operator_ack HOMEXY required for direct OEM HomeXY mode")
-    _require_motion_route_ready()
     if _serial206_oem_initialization_provider is None:
         raise HTTPException(
             status_code=503,
@@ -7618,8 +8152,8 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
         )
     return await _run_blocking(
         "serial-206 provider HomeXY",
-        lambda: _execute_serial206_motion_intent("home_xy", {"timeout_s": float(req.timeout_s), "allow_implementation_mapped_predicate": bool(req.allow_implementation_mapped_predicate)}),
-        timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 180.0),
+        lambda: _execute_serial206_motion_intent("home_xy", {}),
+        timeout_s=45.0,
     )
 
 
@@ -7657,33 +8191,92 @@ def _serial206_commissioning_evidence(
     return {key: Serial206CommissioningEvidence(**value.model_dump()) for key, value in rows.items()}
 
 
+def _run_idempotent_serial206_initialization(
+    provider: Serial206OemInitializationProvider,
+    *,
+    initialization_kind: Literal["initialize_motors", "initialize_motion"],
+    idempotency_key: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    store = provider.state_store
+    if store is None or not callable(getattr(store, "read_serial206_receipt_by_idempotency", None)) or not callable(getattr(store, "append_serial206_receipt", None)):
+        return {"ok": False, "state": "failed_closed", "failure": "sqlite_initialization_run_store_unavailable", "physical_motion_commanded": False, "persistence_state": "unavailable", "recovery_hold": True}
+    request_payload = {
+        "initialization_kind": initialization_kind,
+        "timeout_s": float(timeout_s),
+    }
+    request_sha256 = hashlib.sha256(
+        json.dumps(request_payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    existing = store.read_serial206_receipt_by_idempotency(initialization_kind, idempotency_key)
+    if isinstance(existing, Mapping):
+        if existing.get("request_sha256") != request_sha256:
+            return {
+                "ok": False,
+                "state": "failed",
+                "failure": "initialization_idempotency_conflict",
+                "run_id": existing.get("command_id"),
+                "idempotent_replay": True,
+                "physical_motion_commanded": False,
+                "persistence_state": "committed",
+                "recovery_hold": False,
+            }
+        saved_response = existing.get("response")
+        if str(existing.get("status")) in {"completed", "failed"} and isinstance(saved_response, Mapping):
+            return {**dict(saved_response), "run_id": existing.get("command_id"), "idempotent_replay": True, "persistence_state": "committed"}
+        return {"ok": False, "state": "ambiguous", "failure": "initialization_run_recovery_required", "run_id": existing.get("command_id"), "physical_motion_commanded": False, "idempotent_replay": True, "persistence_state": "recovery_required", "recovery_hold": True}
+
+    run_id = f"{initialization_kind}-{uuid.uuid4().hex}"
+    started_at = time.time()
+    admission = {
+        "schema_version": "bioxp.serial206_initialization_run.v1",
+        "receipt_id": run_id,
+        "command_id": run_id,
+        "run_id": run_id,
+        "idempotency_key": idempotency_key,
+        "idempotency_replay_enabled": True,
+        "intent": initialization_kind,
+        "status": "running",
+        "started_at": started_at,
+        "timeout_s": float(timeout_s),
+        "request": request_payload,
+        "request_sha256": request_sha256,
+        "ownership_generation": int(provider.generation_provider()),
+        "response": None,
+    }
+    store.append_serial206_receipt(initialization_kind, admission)
+    try:
+        if initialization_kind == "initialize_motors":
+            result = provider.initialize_motors(mode="live", timeout_s=float(timeout_s))
+        else:
+            result = provider.initialize_motion(mode="live", timeout_s=float(timeout_s))
+    except Exception as exc:
+        result = {"ok": False, "state": "failed", "failure": f"initialization_source_exception:{type(exc).__name__}", "physical_motion_commanded": False}
+    result_payload = dict(result) if isinstance(result, Mapping) else {"ok": False, "state": "failed", "failure": "initialization_source_return_not_mapping", "source_return": _json_safe(result)}
+    final_status = "completed" if result_payload.get("ok") is True else "failed"
+    finished = {**admission, "status": final_status, "finished_at": time.time(), "response": _json_safe(result_payload)}
+    try:
+        store.append_serial206_receipt(initialization_kind, finished)
+    except Exception as exc:
+        return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "recovery_required", "recovery_hold": True, "persistence_error": f"initialization_terminal_persistence_failed:{type(exc).__name__}"}
+    return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "committed", "recovery_hold": False}
+
+
 @app.get("/motion/oem/initialization/provider-status")
 async def motion_oem_initialization_provider_status():
     return serial206_oem_initialization_provider_status()
 
 
-@app.post("/motion/oem/initialization/observation")
-async def motion_oem_initialization_observation(req: OemSerial206ObservationRequest):
-    """Persist post-command human evidence without readiness or USB access."""
-    provider = _require_serial206_oem_initialization_provider("initialize_motors")
-    result = provider.record_observation(**req.model_dump())
-    if result.get("ok") is not True:
-        raise HTTPException(status_code=409, detail=result)
-    return result
-
-
 @app.post("/motion/oem/initialization/initialize_motors")
 async def motion_oem_serial206_initialize_motors(req: OemSerial206InitializeMotorsStepRequest):
-    if req.operator_ack != "INITIALIZE_MOTORS_STAGE":
-        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTORS_STAGE required")
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
     _require_motion_route_ready()
     result = await _run_blocking(
-        "Typed serial-206 initializeMotors expected stage",
-        lambda: provider.initialize_motors(
-            mode="live",
-            approval=_serial206_stage_approval(req.stage_approval),
-            commissioning=_serial206_commissioning_evidence(req.commissioning),
+        "Recovered serial-206 initializeMotors sequence",
+        lambda: _run_idempotent_serial206_initialization(
+            provider,
+            initialization_kind="initialize_motors",
+            idempotency_key=req.idempotency_key,
             timeout_s=req.timeout_s,
         ),
         timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
@@ -7695,17 +8288,14 @@ async def motion_oem_serial206_initialize_motors(req: OemSerial206InitializeMoto
 
 @app.post("/motion/oem/initialization/initialize_motion")
 async def motion_oem_serial206_initialize_motion(req: OemSerial206InitializeMotionStepRequest):
-    if req.operator_ack != "INITIALIZE_MOTION_STAGE":
-        raise HTTPException(status_code=409, detail="operator_ack INITIALIZE_MOTION_STAGE required")
     provider = _require_serial206_oem_initialization_provider("initialize_motion")
     _require_motion_route_ready()
     result = await _run_blocking(
         "Typed serial-206 initializeMotion expected stage",
-        lambda: provider.initialize_motion(
-            mode="live",
-            approvals=_serial206_stage_approvals(req.motor_stage_approvals),
-            motion_approvals=_serial206_stage_approvals(req.motion_stage_approvals),
-            commissioning=_serial206_commissioning_evidence(req.commissioning),
+        lambda: _run_idempotent_serial206_initialization(
+            provider,
+            initialization_kind="initialize_motion",
+            idempotency_key=req.idempotency_key,
             timeout_s=req.timeout_s,
         ),
         timeout_s=min(max(float(req.timeout_s) + 20.0, 45.0), 360.0),
@@ -7734,6 +8324,8 @@ def _motion_response_allows_reference_update(response: dict) -> bool:
 
 @app.post("/motion/axis/relative")
 async def move_axis_relative(req: MoveRelativeRequest):
+    if req.axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/move_steps", "physical_motion_commanded": False})
     if req.axis is AxisName.X and req.dry_run_bundle and not req.capture_bundle:
         raise HTTPException(status_code=400, detail="dry_run_bundle requires capture_bundle=true")
     if req.axis is AxisName.X and not _motion_request_is_validation_only(req):
@@ -7763,6 +8355,8 @@ async def move_axis_relative(req: MoveRelativeRequest):
 
 @app.post("/motion/axis/absolute")
 async def move_axis_absolute(req: MoveAbsoluteRequest):
+    if req.axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/move_absolute", "physical_motion_commanded": False})
     if req.axis is AxisName.X and req.dry_run_bundle and not req.capture_bundle:
         raise HTTPException(status_code=400, detail="dry_run_bundle requires capture_bundle=true")
     if req.axis is AxisName.X and not _motion_request_is_validation_only(req):
@@ -7794,6 +8388,8 @@ async def move_axis_absolute(req: MoveAbsoluteRequest):
 @app.post("/motion/axis/zero")
 async def move_axis_zero(req: MoveAxisZeroRequest):
     """Compatibility-safe operator command: return an axis to controller coordinate 0."""
+    if req.axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/set_home", "physical_motion_commanded": False})
     if req.axis is AxisName.X:
         raise HTTPException(status_code=410, detail={
             "error": "generic_x_zero_retired",
@@ -7848,6 +8444,8 @@ async def move_axis_zero(req: MoveAxisZeroRequest):
 
 @app.post("/motion/axis/home")
 async def home_axis(req: HomeAxisRequest):
+    if req.axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_authority_retired", "replacement": "/motion/oem/y/home", "physical_motion_commanded": False})
     if req.axis is AxisName.X:
         raise HTTPException(status_code=410, detail={
             "error": "ambiguous_generic_x_home_retired",
@@ -7915,6 +8513,8 @@ async def motion_reference_status(
 
 @app.post("/motion/reference/mark_referenced")
 async def motion_reference_mark_referenced(req: ReferenceMarkRequest):
+    if req.axis is AxisName.Y:
+        raise HTTPException(status_code=410, detail={"error": "alternate_y_reference_authority_retired", "replacement": "/motion/oem/y/home", "physical_motion_commanded": False})
     if req.axis is AxisName.Z:
         raise HTTPException(status_code=410, detail={
             "error": "unproven_z_reference_mutation_retired",
@@ -8181,9 +8781,16 @@ async def camera_probe(payload: dict[str, Any] | None = None):
         return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
 
 
-async def camera_stream_start(payload: dict[str, Any] | None = None):
-    result = await _start_owned_camera_session(payload or {})
-    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("ok")), "provenance": "POST /camera/stream/start"})
+@app.post("/camera/stream/start")
+async def camera_stream_start(
+    request: Request,
+    req: CameraStreamStartRequest = CameraStreamStartRequest(),
+):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
+    del req
+    result = await _start_owned_camera_session({})
+    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("active")), "provenance": "POST /camera/stream/start"})
     return result
 
 
@@ -8300,41 +8907,122 @@ async def camera_reset(req: CameraSnapshotRequest):
     return {**reset, "owned_session": stopped}
 
 
-async def camera_stop(req: CameraSnapshotRequest):
+@app.post("/camera/stream/stop")
+async def camera_stop(
+    request: Request,
+    req: CameraStreamStopRequest = CameraStreamStopRequest(),
+):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     del req
     return await _stop_owned_camera_session(reason="explicit stop")
 
 
-async def camera_stream_state():
-    _, projection = _camera_session_projection()
-    return {**projection, **_camera_stream_state_payload()}
+@app.get("/camera/stream/state")
+async def camera_stream_state(request: Request):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
+    session, projection = _camera_session_projection()
+    state = "live" if projection.get("available") and _camera_stream_state.get("last_frame_at") else "starting" if projection.get("available") else "off"
+    return {
+        **_camera_stream_control_payload(session, state=state),
+        "session": projection.get("session"),
+        "freshness": projection.get("freshness"),
+        "provenance": projection.get("provenance"),
+    }
 
 
-async def camera_mjpeg(
-    device: str = "/dev/video0",
-    fps: int = Query(8, ge=1, le=30),
-    quality: int = Query(7, ge=2, le=15),
-    width: int = Query(640, ge=160, le=1920),
-    height: int = Query(480, ge=120, le=1080),
-):
-    del device, fps, quality, width, height
+@app.get("/camera/mjpeg")
+async def camera_mjpeg(request: Request):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     session, projection = _camera_session_projection()
     if session is None or not projection.get("available"):
         raise HTTPException(status_code=503, detail={**projection, "error": "no active POST-started camera session"})
     queue = session["queue"]
+    with _camera_projection_lock:
+        session["viewers"] = int(session.get("viewers") or 0) + 1
+        pending_shutdown = session.get("viewer_shutdown_task")
+        if pending_shutdown is not None and not pending_shutdown.done():
+            pending_shutdown.cancel()
+        session["viewer_shutdown_task"] = None
+
+    async def stop_after_viewer_grace(session_id: str) -> None:
+        try:
+            await asyncio.sleep(5.0)
+            with _camera_projection_lock:
+                current = _camera_session
+                viewers = 0 if current is None else int(current.get("viewers") or 0)
+                should_stop = current is not None and current.get("session_id") == session_id and viewers == 0
+            if should_stop:
+                await _stop_owned_camera_session(reason="viewer grace expired")
+        except asyncio.CancelledError:
+            return
 
     async def iterator():
-        while True:
-            part = await queue.get()
-            if part is None:
-                break
-            yield part
+        try:
+            while True:
+                part = await queue.get()
+                if part is None:
+                    break
+                yield part
+        finally:
+            with _camera_projection_lock:
+                current = _camera_session
+                if current is not None and current.get("session_id") == session["session_id"]:
+                    current["viewers"] = max(0, int(current.get("viewers") or 0) - 1)
+                    if current["viewers"] == 0:
+                        task = asyncio.create_task(stop_after_viewer_grace(session["session_id"]), name=f"bioxp-camera-grace-{session['session_id']}")
+                        current["viewer_shutdown_task"] = task
 
     return StreamingResponse(
         iterator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store", "X-BioXp-Camera-Session": str(session["session_id"]), "X-BioXp-Camera-Ownership-Epoch": str(session["camera_ownership_epoch"])},
     )
+
+
+@app.get("/liquid/application/status")
+async def liquid_application_status():
+    return _pipette_application.status()
+
+
+@app.post("/liquid/application/plan")
+async def liquid_application_plan(req: PipetteApplicationPlanRequest):
+    if req.operation == "load_tip":
+        if req.tip_tray is None or req.tip_well is None or req.tip_type is None or req.tip_location is None:
+            raise HTTPException(status_code=422, detail="load_tip requires tip_tray, tip_well, tip_type, and tip_location")
+        plan = _pipette_application.plan_load_tip(
+            tip_tray=req.tip_tray,
+            tip_well=req.tip_well,
+            tip_type=req.tip_type,
+            tip_location=req.tip_location,
+            home_z_after=req.home_z_after,
+        )
+    elif req.operation == "move_to_waste":
+        plan = _pipette_application.plan_move_to_waste()
+    elif req.operation == "detect_fluid":
+        if req.fluid_class is None:
+            raise HTTPException(status_code=422, detail="detect_fluid requires fluid_class")
+        plan = _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
+    else:
+        plan = _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
+    requested = req.model_dump(exclude_none=True)
+    receipt = _pipette_receipts.record(
+        operation=f"application_plan:{req.operation}",
+        requested_inputs=requested,
+        result=plan,
+        runtime_binding={
+            "owner": "PipetteApplicationPlanner",
+            "mode": "plan_only",
+            "dependencies": plan.get("dependencies", {}),
+        },
+    )
+    return {
+        **plan,
+        "receipt_id": receipt["receipt_id"],
+        "receipt_truth": receipt["truth"],
+    }
 
 
 @app.get("/liquid/status")
@@ -8348,7 +9036,29 @@ async def liquid_status():
         "live_query_performed": False,
         "truth_source": "hardware_state_projection_only",
         "latest_receipt": _pipette_receipts.latest(),
+        "application": _pipette_application.status(),
     }
+
+
+@app.post("/liquid/readback")
+async def liquid_readback(req: PipetteReadbackRequest):
+    return await run_pipette_operation(
+        "live_readback",
+        lambda transport: transport.readback_all(include_data=req.include_data),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=180.0 if req.include_data else 60.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs=req.model_dump(),
+        runtime_binding={
+            "owner": "shared_bioxp_tester_pipette",
+            "transport_owner_bound": True,
+            "query_only": True,
+            "entrypoint_id": "direct.liquid.readback",
+            "caller_class": "direct_api",
+            "control_class": "hardware_query",
+        },
+    )
 
 
 @app.post("/liquid/init")
@@ -8363,21 +9073,42 @@ async def liquid_init(req: PipetteInitRequest):
                 "physical_motion_commanded": False,
             },
         )
-    if command.prime_volume_ul is not None:
-        raise HTTPException(status_code=409, detail="constructor initialization cannot prime or mutate liquid")
-    if _can_ready_observation() is not True:
-        raise HTTPException(status_code=409, detail="constructor pipette stage requires explicit CAN_READY=true evidence")
+
+    def init_preflight(_operation: str, _command: Any) -> dict[str, Any]:
+        if command.prime_volume_ul is not None:
+            raise ValueError("constructor initialization cannot prime or mutate liquid")
+        if _can_ready_observation() is not True:
+            raise ValueError("constructor pipette stage requires explicit CAN_READY=true evidence")
+        return {"can_ready": True, "motion_commanded": False}
+
+    async def inline_run(_label: str, operation, *, timeout_s: float):
+        del _label, timeout_s
+        return operation()
 
     def action() -> dict[str, Any]:
-        result = _get_pipette_transport().initialize(command)
-        result = {**result, "channel_count": 4, "channels_constructed_unconditionally": [0, 1, 2, 3], "motion_commanded": False}
-        receipt = _pipette_receipts.record(
-            operation="init",
-            requested_inputs=command.to_payload(),
-            result=result,
-            runtime_binding={"owner": "shared_bioxp_tester_pipette", "transport_owner_bound": True},
+        result = asyncio.run(
+            run_pipette_init_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=init_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding={
+                    "owner": "shared_bioxp_tester_pipette",
+                    "transport_owner_bound": True,
+                    "entrypoint_id": "lifecycle.constructor_pipette_stage",
+                    "caller_class": "lifecycle",
+                    "control_class": "pipette_state_command",
+                    "lifecycle_stage_id": "constructor_pipette_stage",
+                },
+            )
         )
-        return {**result, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
+        return {
+            **result,
+            "channel_count": 4,
+            "channels_constructed_unconditionally": [0, 1, 2, 3],
+            "motion_commanded": False,
+        }
 
     try:
         projection = await _run_blocking(
@@ -8611,7 +9342,7 @@ async def liquid_tip_status():
 
 
 @app.get("/liquid/data")
-async def liquid_data(query: str = Query(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
+async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
     return await run_pipette_operation(
         "data",
         lambda transport: getattr(transport, "get_data")(query),
@@ -8736,77 +9467,145 @@ def _protocol_live_move_handler(action, state):
         raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
     axis = AxisName(str(raw_axis).strip().lower())
     wait_timeout_s = float(params.get("wait_timeout_s") or params.get("timeout_s") or 30.0)
-    speed = _optional_int_payload(params, "speed", "max_speed")
     acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
-    tester = _get_tester()
-
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise RuntimeError("serial206 OEM provider unavailable")
+    command_id = f"protocol-{axis.value}-{uuid.uuid4().hex}"
     position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
-    if position_steps is not None:
-        result = _execute_absolute_move(
-            tester,
-            axis,
-            int(position_steps),
-            wait_timeout_s,
-            speed=speed,
-            acc=acc,
-        )
-        _reference_state_store.record_motion(axis, "protocol_absolute")
-        return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute", "move": result}
-
     steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
-    if steps is None:
-        raise ValueError(
-            f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps"
+    if position_steps is None and steps is None:
+        raise ValueError(f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps")
+    is_absolute = position_steps is not None
+    move_value = int(position_steps) if position_steps is not None else int(steps)  # type: ignore[arg-type]
+    if axis.value == "x":
+        selected = "move_absolute" if position_steps is not None else "move_steps"
+        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
+        if position_steps is not None:
+            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True, "source_mode": "protocol.x.move_absolute"})
+        else:
+            values["steps"] = move_value
+        result = provider.execute_x_intent(selected, values)
+    elif axis.value == "y":
+        y_provider = provider.y_provider
+        if y_provider is None:
+            raise RuntimeError("serial206 Y provider unavailable")
+        result = y_provider.move_absolute(move_value, wait_for_stop=True, wait_timeout_s=wait_timeout_s, command_id=command_id) if is_absolute else y_provider.move_steps(move_value, wait_timeout_s=wait_timeout_s, command_id=command_id)
+    else:
+        selected = "move_absolute" if position_steps is not None else "move_steps"
+        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
+        if position_steps is not None:
+            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True})
+        else:
+            values["steps"] = move_value
+        result = provider.execute_z_intent(
+            selected,
+            inputs=values,
+            expected_generation=int(provider.generation_provider()),
+            idempotency_key=command_id,
         )
-    result = _execute_relative_move(
-        tester,
-        axis,
-        int(steps),
-        wait_timeout_s,
-        speed=speed,
-        acc=acc,
-        reuse_prepared=bool(params.get("reuse_prepared", False)),
-    )
-    _reference_state_store.record_motion(axis, "protocol_relative")
-    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "relative", "move": result}
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        raise RuntimeError(f"Protocol move failed: {result}")
+    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute" if position_steps is not None else "relative", "move": dict(result)}
 
 
 def _protocol_live_pipette_handler(action, state):
-    del state
     params = dict(action.params or {})
-    transport = _get_pipette_transport()
     kind = action.kind
+    job_id = getattr(state, "job_id", None) or getattr(state, "protocol_id", None)
+    runtime_binding = {
+        "owner": "shared_bioxp_tester_pipette",
+        "transport_owner_bound": True,
+        "entrypoint_id": f"protocol.{kind.value}",
+        "caller_class": "protocol",
+        "control_class": "physical_liquid_command",
+        "protocol_job_id": job_id,
+        "protocol_action_id": action.action_id,
+        "lifecycle_stage_id": action.stage_id,
+    }
+
+    async def inline_run(_label: str, operation, *, timeout_s: float):
+        del _label, timeout_s
+        return operation()
+
     if kind is ProtocolActionKind.PIPETTE_INIT:
         command = PipetteInitCommand.from_request(params)
-        result = transport.initialize(command)
+        result = asyncio.run(
+            run_pipette_init_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_TIP:
         command = PipetteTipCommand.from_request(params)
-        result = transport.set_tip(command)
+        result = asyncio.run(
+            run_pipette_tip_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.TIP_EJECT:
         command = PipetteTipCommand(action=PipetteTipAction.EJECT, metadata=params)
-        result = transport.set_tip(command)
+        result = asyncio.run(
+            run_pipette_tip_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_ASPIRATE:
         command = PipetteAspirateCommand.from_request(params)
-        _liquid_reference_preflight("pipette_aspirate", command)
-        result = transport.aspirate(command)
+        result = asyncio.run(
+            run_pipette_aspirate_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_DISPENSE:
         command = PipetteDispenseCommand.from_request(params)
-        _liquid_reference_preflight("pipette_dispense", command)
-        result = transport.dispense(command)
+        result = asyncio.run(
+            run_pipette_dispense_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     elif kind is ProtocolActionKind.PIPETTE_MIX:
         command = PipetteMixCommand.from_request(params)
-        _liquid_reference_preflight("pipette_mix", command)
-        result = transport.mix(command)
+        result = asyncio.run(
+            run_pipette_mix_command(
+                command,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                preflight=_liquid_reference_preflight,
+                receipt_store=_pipette_receipts,
+                runtime_binding=runtime_binding,
+            )
+        )
     else:  # pragma: no cover - handler map is explicit
         raise ValueError(f"Unsupported live pipette action kind: {kind.value}")
-    payload = {**dict(result), "protocol_action_id": action.action_id, "physical_effect_verified": False}
-    receipt = _pipette_receipts.record(
-        operation=f"protocol:{kind.value}",
-        requested_inputs=command.to_payload(),
-        result=payload,
-        runtime_binding={"owner": "shared_bioxp_tester_pipette", "protocol_action_id": action.action_id},
-    )
-    return {**payload, "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"]}
+    return {
+        **dict(result),
+        "protocol_job_id": job_id,
+        "protocol_action_id": action.action_id,
+        "lifecycle_stage_id": action.stage_id,
+        "physical_effect_verified": False,
+    }
 
 
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
@@ -8864,15 +9663,3 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-# Install after every primitive/lifecycle route has been declared.  The
-# catalog is therefore an exact snapshot of the final production route table,
-# and the operator router cannot accidentally enumerate/dispatch itself.
-install_operator_control_plane(
-    app,
-    maintenance_state_provider=_maintenance_state_payload,
-    reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
-    lifecycle_state_provider=lifecycle_state.projection,
-    serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
-)

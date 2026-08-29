@@ -14,7 +14,7 @@ SS=/usr/bin/ss
 SED=/usr/bin/sed
 SORT=/usr/bin/sort
 UDOCKER_BIN=/home/molbiofreak/.local/share/bioxp-container-tools/venv/bin/udocker
-CONTAINER_NAME=bioxp-robot-handler-prod
+CONTAINER_NAME=07252f6e0fbdc226:20260821-4374bdc
 PORT=8123
 LOCK_DIR=/var/lib/bioxp-oem-authority
 LOCK_FILE=/var/lib/bioxp-oem-authority/OEM_EVIDENCE_LOCK.json
@@ -71,6 +71,7 @@ if [[ -n "$(listener_pids)" ]]; then
 fi
 
 exec "$UDOCKER_BIN" run \
+  --pull=never \
   --user=root \
   --volume="$APP_DIR:/app" \
   --volume="$LOCK_DIR:/app/.oem_lock" \

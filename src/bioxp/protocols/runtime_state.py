@@ -80,6 +80,7 @@ class ProtocolStageState:
 class ProtocolRuntimeState:
     protocol_id: str
     dry_run: bool
+    job_id: str | None = None
     current_stage_id: str | None = None
     paused: bool = False
     awaiting_review: bool = False
@@ -90,10 +91,17 @@ class ProtocolRuntimeState:
     action_results: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
-    def from_document(cls, document: ProtocolDocument, *, dry_run: bool) -> "ProtocolRuntimeState":
+    def from_document(
+        cls,
+        document: ProtocolDocument,
+        *,
+        dry_run: bool,
+        job_id: str | None = None,
+    ) -> "ProtocolRuntimeState":
         return cls(
             protocol_id=document.protocol_id,
             dry_run=bool(dry_run),
+            job_id=job_id,
             stage_states={
                 stage.stage_id: ProtocolStageState(
                     stage_id=stage.stage_id,
@@ -109,6 +117,7 @@ class ProtocolRuntimeState:
         return cls(
             protocol_id=str(payload["protocol_id"]),
             dry_run=bool(payload.get("dry_run", False)),
+            job_id=payload.get("job_id"),
             current_stage_id=payload.get("current_stage_id"),
             paused=bool(payload.get("paused", False)),
             awaiting_review=bool(payload.get("awaiting_review", False)),
@@ -147,6 +156,7 @@ class ProtocolRuntimeState:
         return {
             "protocol_id": self.protocol_id,
             "dry_run": bool(self.dry_run),
+            "job_id": self.job_id,
             "current_stage_id": self.current_stage_id,
             "paused": bool(self.paused),
             "awaiting_review": bool(self.awaiting_review),

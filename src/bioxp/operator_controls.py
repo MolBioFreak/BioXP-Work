@@ -15,11 +15,12 @@ import math
 import re
 import time
 import uuid
+from collections import deque
 from contextvars import ContextVar
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.types import Message, Scope
 
@@ -171,6 +172,7 @@ _IMPLICIT_OPERATOR_ACK_BY_PATH = {
     "/oem/startup/initialize_environment": "INITIALIZE",
     "/oem/startup/request": "INITIALIZE",
     "/oem/runtime/movement-runs": "OEM_PATH_EXECUTE",
+    "/motion/oem/pathing/scriptmove_execute": "OEM_PATH_EXECUTE",
 }
 
 
@@ -193,8 +195,7 @@ _NO_MOTION_PREPARATION_PATHS = {
     # movement/homing action.  It must remain available to repair a stale Z
     # coordinate while the physical-motion arm is deliberately disarmed.
     "/motion/oem/z/set_home",
-    "/motion/oem/x/prepare",
-    "/motion/oem/x/reconcile_switch_masks",
+
     "/motion/oem/x/set_home",
     "/motion/oem/x/set_max_speed",
     "/motion/oem/x/set_max_acc",
@@ -263,14 +264,12 @@ def _home_action(action: Mapping[str, Any]) -> bool:
 
 
 _Z_NO_MOTION_STATE_ACTIONS = frozenset({
-    "oem.z.prepare",
-    "oem.z.reconcile_switch_masks",
     "oem.z.set_home",
 })
 
+_Y_NO_MOTION_STATE_ACTIONS = frozenset()
+
 _X_NO_MOTION_STATE_ACTIONS = frozenset({
-    "oem.x.prepare",
-    "oem.x.reconcile_switch_masks",
     "oem.x.set_home",
     "oem.x.set_max_speed",
     "oem.x.set_max_acc",
@@ -282,6 +281,8 @@ _X_NO_MOTION_STATE_ACTIONS = frozenset({
 
 _X_AUTO_PREREQUISITE_ACTIONS = frozenset({
     "oem.x.manual_panel_home",
+    "oem.x.move_steps",
+    "oem.x.move_absolute",
 })
 
 _Z_AUTO_PREREQUISITE_ACTIONS = frozenset({
@@ -528,71 +529,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
 
     action_id = str(action.get("action_id") or "")
     x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
-    if x_provider_action and action_id != "oem.x.status":
-        provider_state_value = machine_state.get("serial206_initialization_provider")
-        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
-        x_authority_value = provider_state.get("x_authority")
-        x_authority = x_authority_value if isinstance(x_authority_value, Mapping) else {}
-        x_lifecycle_value = x_authority.get("lifecycle")
-        x_lifecycle = x_lifecycle_value if isinstance(x_lifecycle_value, Mapping) else x_authority
-        x_state = str(x_lifecycle.get("state") or "unbound")
-        allowed_by_action = {
-            "oem.x.prepare": {"unprepared", "failed_latched", "reconciliation_required"},
-            "oem.x.reconcile_switch_masks": {"unprepared", "failed_latched", "reconciliation_required"},
-            "oem.x.manual_panel_home": {"unprepared", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.startup_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_to_origin_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.caught_plate_recovery_home": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.x.move_steps": {"referenced_ready"},
-            "oem.x.move_absolute": {"referenced_ready"},
-            "oem.x.set_max_speed": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_max_acc": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.restore_original_speed": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.set_stall_guard": {"prepared_unreferenced", "referenced_ready"},
-            "oem.x.observe": {"awaiting_operator_observation"},
-            "oem.x.stop": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
-            "oem.abort_all": {"unprepared", "prepared_unreferenced", "executing", "awaiting_operator_observation", "referenced_ready", "failed_latched", "reconciliation_required"},
-            "oem.xy.home_xy": {"prepared_unreferenced", "referenced_ready"},
-            "oem.xy.move_xy": {"referenced_ready"},
-            "oem.xyz.move_to": {"prepared_unreferenced", "referenced_ready", "failed_latched"},
-        }
-        allowed = allowed_by_action.get(action_id)
-        if allowed is not None:
-            dependencies.append(_dependency(
-                "serial206_x_lifecycle",
-                "Serial-206 X lifecycle",
-                x_state in allowed,
-                f"Current X lifecycle state {x_state!r}; expected one of {sorted(allowed)}.",
-            ))
-    if action_id.startswith("oem.z.") and action_id != "oem.z.status":
-        provider_state_value = machine_state.get("serial206_initialization_provider")
-        provider_state = provider_state_value if isinstance(provider_state_value, Mapping) else {}
-        z_authority_value = provider_state.get("z_authority")
-        z_authority = z_authority_value if isinstance(z_authority_value, Mapping) else {}
-        z_state = str(z_authority.get("state") or "unbound")
-        allowed_by_action = {
-            "oem.z.prepare": {"unprepared", "failed_latched"},
-            "oem.z.reconcile_switch_masks": {"unprepared", "failed_latched"},
-            "oem.z.manual_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.diagnostic_home_axis": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.set_home": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.resume_after_abort": {"failed_latched"},
-            "oem.z.move_steps": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.move_absolute": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.clear": {"unprepared", "failed_latched", "prepared_unreferenced", "referenced_ready"},
-            "oem.z.observe": {"awaiting_operator_observation"},
-        }
-        allowed = allowed_by_action.get(action_id)
-        if allowed is not None:
-            dependencies.append(_dependency(
-                "serial206_z_lifecycle",
-                "Serial-206 Z lifecycle",
-                z_state in allowed,
-                f"Current Z lifecycle state {z_state!r}; expected one of {sorted(allowed)}.",
-            ))
-
+    y_provider_action = action_id.startswith("oem.y.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     method = str(action.get("informational_method") or "GET")
     safety = str(action.get("safety_class") or "read_only")
     path = str(action.get("informational_path") or "").lower()
@@ -645,48 +582,40 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         and action_id not in _Z_NO_MOTION_STATE_ACTIONS
         and action_id not in {"oem.z.status", "oem.z.stop", "oem.z.abort", "oem.z.observe"}
     )
+    provider_owned_y_motion = bool(
+        y_provider_action
+        and action_id not in _Y_NO_MOTION_STATE_ACTIONS
+        and action_id not in {"oem.y.status", "oem.y.stop", "oem.y.observe"}
+    )
     motion_action = source_initializer or safety == "motion" or _motor_motion_action(action)
     if motion_action:
-        dependencies.append(_operation_motion_dependency(machine_state))
+        if not (provider_owned_x_motion or provider_owned_y_motion or provider_owned_z_motion):
+            dependencies.append(_operation_motion_dependency(machine_state))
         x_state_establishing = action_id in _X_NO_MOTION_STATE_ACTIONS
         z_state_establishing = _z_no_motion_state_action(action) or action_id == "oem.z.resume_after_abort"
+        y_state_establishing = action_id in _Y_NO_MOTION_STATE_ACTIONS
         observation_action = action_id in {"oem.x.observe", "oem.z.observe"}
         required_axes = (
             []
-            if source_initializer or z_state_establishing or x_state_establishing or observation_action
+            if source_initializer or z_state_establishing or x_state_establishing or y_state_establishing or observation_action
             else _required_reference_axes(action, values)
         )
-        if x_state_establishing or observation_action:
-            readiness = {"dependencies": []}
-        elif action_id in _X_AUTO_PREREQUISITE_ACTIONS:
-            # Manual X Home composes the source-backed no-motion preparation
-            # inside the provider transaction. Cached lifecycle and board
-            # freshness must not pre-disable the operator's requested Home.
-            readiness = {"dependencies": []}
-        elif provider_owned_x_motion:
-            readiness = _provider_x_motion_readiness(machine_state)
-        elif z_state_establishing or action_id in _Z_AUTO_PREREQUISITE_ACTIONS:
-            # OEM state-establishing operations create readiness. Normal Z
-            # controls also compose missing preparation/reference work inside
-            # the provider transaction, so cached readiness must not pre-disable
-            # the operator's requested action.
+        if (
+            x_state_establishing
+            or y_state_establishing
+            or z_state_establishing
+            or observation_action
+            or provider_owned_x_motion
+            or provider_owned_y_motion
+            or provider_owned_z_motion
+        ):
             readiness = {"dependencies": []}
         else:
-            readiness = (
-                _provider_z_motion_readiness(machine_state)
-                if provider_owned_z_motion
-                else _motion_readiness(machine_state, required_axes)
-            )
+            readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
         )
-        if action_id == "oem.xy.move_xy":
-            existing_keys = {str(row.get("key")) for row in dependencies}
-            y_readiness = _motion_readiness(machine_state, ["y"])
-            dependencies.extend(
-                row for row in y_readiness["dependencies"] if str(row.get("key")) not in existing_keys
-            )
         effective_axis = str(values.get("axis") or "").lower()
         if effective_axis == "z" and not provider_owned_z_motion:
             domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
@@ -698,7 +627,7 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
             z_switches = z_row.get("switch_activity") if isinstance(z_row, Mapping) else None
             z_preset = z_row.get("preset") if isinstance(z_row, Mapping) else None
             left_home_enabled = isinstance(z_switches, Mapping) and z_switches.get("left_disabled") is False
-            right_inhibit_disabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is True
+            right_switch_enabled = isinstance(z_switches, Mapping) and z_switches.get("right_disabled") is False
             # OEM no-motion preparation establishes the motor profile without
             # a prior Z GAP12/GAP13 snapshot. Keep this replacement check only
             # on ordinary generic Z operations, never on state-establishing
@@ -707,8 +636,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                 dependencies.append(_dependency(
                     "z_switch_masks_machine_bound",
                     "Z machine-bound GAP12/GAP13 state",
-                    left_home_enabled and right_inhibit_disabled,
-                    "Expected GAP12/right disabled and GAP13/GAP9-left enabled; run Z mask reconciliation.",
+                    left_home_enabled and right_switch_enabled,
+                    "Expected GAP12/right enabled and GAP13/left enabled; run Z mask reconciliation.",
                 ))
             # Preparation and mask reconciliation do not move Z and therefore
             # must not require an already-valid OEM coordinate.  Movement and
@@ -742,30 +671,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
                         target_ok,
                         "Requested Z target is outside the OEM nonnegative envelope.",
                     ))
-        elif provider_owned_z_motion and action_id == "oem.z.move_absolute":
-            target = values.get("position_steps")
-            dependencies.append(_dependency(
-                "z_target_oem_envelope",
-                "Z target in OEM 0..160000 envelope",
-                type(target) is int and 0 <= target <= 160000,
-                "Requested Z target is outside the OEM nonnegative envelope.",
-            ))
-        elif provider_owned_x_motion and action_id == "oem.x.move_absolute":
-            target = values.get("position_steps")
-            dependencies.append(_dependency(
-                "x_target_oem_envelope",
-                "X target in OEM 0..90263 envelope (effective minimum 60)",
-                type(target) is int and 0 <= target <= 90263,
-                "Requested X target is outside the OEM 0..90263 envelope.",
-            ))
-        elif provider_owned_x_motion and action_id == "oem.x.move_steps":
-            steps = values.get("steps")
-            dependencies.append(_dependency(
-                "x_relative_oem_envelope",
-                "X relative request respects the source 20-step inner margin",
-                type(steps) is int and -90243 <= steps <= 90243,
-                "Requested X relative delta exceeds the maximum source-margin span; live target preflight remains provider-owned.",
-            ))
 
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
@@ -963,16 +868,21 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
         if provider_z_available
         else _motion_readiness(machine_state, [])
     )
+    z_terminal_value = z_authority.get("terminal_state")
+    z_terminal_state: Mapping[str, Any] = z_terminal_value if isinstance(z_terminal_value, Mapping) else {}
     z_provider = {
         **z_authority,
         "bound": provider_state.get("bound") if isinstance(provider_state, Mapping) else False,
         "expected_startup_stage": initialize_motors.get("expected_next_stage") if isinstance(initialize_motors, Mapping) else None,
         "startup_terminal_state": initialize_motors.get("terminal_state") if isinstance(initialize_motors, Mapping) else None,
+        "switch_mask_policy": "observed_only_oem_source_omits_z_writes",
+        "switch_mask_tuple": z_terminal_state.get("switch_mask_tuple"),
     }
     return {
         "schema_version": "bioxp.operator_dashboard.v1",
         "ownership_generation": int(machine_state.get("ownership_generation") or 0),
         "connection": {"live": connection_live, "ownership": dict(ownership)},
+        "successive_move_queue": _successive_move_queue.snapshot(),
         "motion": {"enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"]},
         "operation": {"state": lifecycle.get("operation_state"), "reason": lifecycle.get("operation_reason")},
         "enclosure": {
@@ -1074,7 +984,7 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/manual/home": "initialize_motors",
     "/motion/oem/x/status": "initialize_motors",
     "/motion/oem/x/prepare": "initialize_motors",
-    "/motion/oem/x/reconcile_switch_masks": "initialize_motors",
+
     "/motion/oem/x/move_steps": "initialize_motors",
     "/motion/oem/x/move_absolute": "initialize_motors",
     "/motion/oem/x/manual_home": "initialize_motors",
@@ -1087,6 +997,13 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/x/stop": "initialize_motors",
     "/motion/oem/x/abort": "initialize_motors",
     "/motion/oem/x/observation": "initialize_motors",
+    "/motion/oem/y/status": "initialize_motors",
+    "/motion/oem/y/prepare": "initialize_motors",
+    "/motion/oem/y/move_steps": "initialize_motors",
+    "/motion/oem/y/move_absolute": "initialize_motors",
+    "/motion/oem/y/home": "initialize_motors",
+    "/motion/oem/y/set_home": "initialize_motors",
+    "/motion/oem/y/stop": "initialize_motors",
     "/motion/oem/z/prepare": "initialize_motors",
     "/motion/oem/z/move_z_home": "initialize_motors",
     "/motion/oem/z/control": "initialize_motors",
@@ -1097,7 +1014,7 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/z/lower_pipette": "initialize_motors",
     "/motion/oem/z/lift_pipette": "initialize_motors",
     "/motion/oem/z/self_test": "initialize_motors",
-    "/motion/oem/z/reconcile_switch_masks": "initialize_motors",
+
     "/motion/oem/z/set_home": "initialize_motors",
     "/motion/oem/z/diagnostic_home_axis": "initialize_motors",
     "/motion/oem/z/stop": "initialize_motors",
@@ -1184,14 +1101,23 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             None,
         )
         if route is None:
-            return
+            if provider.get("provider_available") is not True:
+                return
+            route = {
+                "method": str(provider.get("informational_method") or "POST"),
+                "path": path,
+                "locations": {},
+                "inputs": {row["name"] for row in provider.get("inputs", []) if isinstance(row, Mapping) and row.get("name")},
+            }
         fixed = dict(fixed_inputs or {})
         visible_inputs = [dict(row) for row in provider.get("inputs", []) if row.get("name") not in fixed]
         action_bounds = {
-            "oem.z.move_steps": ("steps", -160000, 160000),
-            "oem.z.move_absolute": ("position_steps", 0, 160000),
-            "oem.x.move_steps": ("steps", -90243, 90243),
-            "oem.x.move_absolute": ("position_steps", 0, 90263),
+            "oem.z.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.z.move_absolute": ("position_steps", -(2**31), 2**31 - 1),
+            "oem.x.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.x.move_absolute": ("position_steps", -(2**31), 2**31 - 1),
+            "oem.y.move_steps": ("steps", -(2**31), 2**31 - 1),
+            "oem.y.move_absolute": ("target_steps", -(2**31), 2**31 - 1),
         }.get(action_id)
         if action_bounds is not None:
             input_name, minimum, maximum = action_bounds
@@ -1212,14 +1138,14 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "description": description,
             "source_anchor": source_anchor,
             "requires_confirmation": action_id in {
-                "oem.z.reconcile_switch_masks",
                 "oem.z.set_home",
-                "oem.x.reconcile_switch_masks",
                 "oem.x.set_home",
             },
             "category": (
                 "x-axis"
                 if action_id.startswith("oem.x.")
+                else "y-axis"
+                if action_id.startswith("oem.y.")
                 else "x-composite"
                 if action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.")
                 else "z-axis"
@@ -1235,11 +1161,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         }
 
     x_semantic_actions = (
-        ("oem.x.status", "/motion/oem/x/status", "X axis authority status", "Provider-owned X lifecycle, terminal telemetry, reconciliation state, and durable receipt projection.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
-        ("oem.x.prepare", "/motion/oem/x/prepare", "Prepare OEM X profile", "Run the exact X no-motion profile and verify the Serial-206 machine tuple without movement.", "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195"),
-        ("oem.x.reconcile_switch_masks", "/motion/oem/x/reconcile_switch_masks", "Reconcile Serial-206 X switch masks", "Apply the explicit Serial-206 machine adaptation SAP12=1 and verify GAP12=1/GAP13=0; invalidates X preparation/reference.", "Serial-206 D1 machine safety adaptation"),
-        ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Source-shaped relative X movement with the provider-owned 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
-        ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Source-shaped absolute X movement in 0..90263 with effective minimum 60 and optional temporary acceleration.", "ClassControlInterface.moveX:4206-4243"),
+        ("oem.x.status", "/motion/oem/x/status", "X axis controller status", "Provider-owned X terminal telemetry and durable receipt projection. SAP12/SAP13 are observed because recovered OEM X initialization writes neither register.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
+
+        ("oem.x.move_steps", "/motion/oem/x/move_steps", "OEM X moveSteps", "Signed-int32 relative request; ClassMotor returns -1 without movement when the resulting target crosses its 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204"),
+        ("oem.x.move_absolute", "/motion/oem/x/move_absolute", "OEM X moveX", "Signed-int32 absolute request; the public wrapper clamps values below 60 and ClassHeadBoard returns the current position without movement at or above the high guard.", "ClassControlInterface.moveX:4206-4243"),
         ("oem.x.manual_panel_home", "/motion/oem/x/manual_home", "OEM X manual panel Home", "Exact manual-panel goHome(rehome=true, speed=500) identity.", "ClassControlInterface manual panel Home:2270-2278"),
         ("oem.x.diagnostic_home_axis", "/motion/oem/x/diagnostic_home_axis", "Diagnostic X HomeAxis", "Exact diagnostic axisSearchHome(X,250) identity; not the manual Home action.", "ClassControlInterface.HomeAxis:4997-5008"),
         ("oem.x.startup_home", "/motion/oem/x/startup_home", "OEM X startup home", "Exact startup axisSearchHome(X,250), setHome, profile restore, and park sequence.", "ClassControlInterface.initializeMotors:3203-3220"),
@@ -1268,6 +1193,57 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             source_anchor=source_anchor,
             required_provider_capability="initialize_motors",
         )
+    y_semantic_actions = (
+        ("oem.y.status", "/motion/oem/y/status", "OEM Y status", "Passive Serial-206 Y authority and controller-status projection.", "ClassControlInterface Y status", {}),
+        ("oem.y.manual_panel_home", "/motion/oem/y/home", "OEM Y manual-panel Home", "Exact manual-panel Y home identity.", "ClassControlInterface.btnYHome_Click:1847-1856", {"source_mode": "manual_panel"}),
+        ("oem.y.move_steps", "/motion/oem/y/move_steps", "OEM Y moveSteps", "Signed-int32 relative request; ClassMotor returns -1 without movement when the resulting target crosses its 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204", {}),
+        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM Y moveY absolute", "Signed-int32 nonblocking absolute request; ClassHeadBoard clamps negative values to zero and returns the current position without movement at or above the high guard.", "ClassControlInterface.moveY overloads:4206-4252", {}),
+        ("oem.y.stop", "/motion/oem/y/stop", "OEM Y Stop", "Independent priority-lane Y stop.", "ClassMotor.stopMotor", {}),
+    )
+    for action_id, path, label, description, source_anchor, fixed_inputs in y_semantic_actions:
+        add_semantic_alias(
+            action_id=action_id,
+            path=path,
+            label=label,
+            description=description,
+            source_anchor=source_anchor,
+            fixed_inputs=fixed_inputs,
+            required_provider_capability="initialize_motors",
+        )
+    add_semantic_alias(
+        action_id="oem.y.internal.acceleration_overload",
+        path="/motion/oem/y/internal/acceleration_overload",
+        label="Internal Y acceleration overload",
+        description="Typed source-only M04 acceleration overload with mandatory restoration.",
+        source_anchor="ClassControlInterface.moveY acceleration overload",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.y.internal.board_test_my",
+        path="/motion/oem/y/internal/board_test_my",
+        label="Internal board_test_my Y move",
+        description="Typed board-test moveY source identity with fixed source acceleration.",
+        source_anchor="board_test_my",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.move_absolute",
+        path="/motion/oem/move_xy",
+        label="OEM moveXY absolute",
+        description="Exact OEM parallel X/Y absolute composite.",
+        source_anchor="ClassControlInterface.moveXY",
+        fixed_inputs={"timeout_s": 120.0},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.home",
+        path="/motion/oem/home_xy",
+        label="OEM HomeXY",
+        description="Exact OEM parallel HomeXY composite.",
+        source_anchor="ClassControlInterface.HomeXY",
+        fixed_inputs={"operator_ack": "HOMEXY"},
+        required_provider_capability="initialize_motors",
+    )
     x_abort_action = next((row for row in actions if row.get("action_id") == "oem.abort_all"), None)
     if x_abort_action is not None:
         x_abort_action.update({
@@ -1277,24 +1253,6 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "x-axis",
         })
 
-    add_semantic_alias(
-        action_id="oem.z.prepare",
-        path="/motion/oem/z/prepare",
-        label="Prepare OEM Z profile",
-        description="Run the OEM safety check and cmd64=0→1 board cycle, then execute the source Z no-motion segment and verify exact readbacks without moving.",
-        source_anchor="ClassControlInterface.initializeMotorsWithoutMotion:3225-3232",
-        fixed_inputs={"axis": "z"},
-        required_provider_capability="initialize_motors",
-    )
-    add_semantic_alias(
-        action_id="oem.z.reconcile_switch_masks",
-        path="/motion/oem/z/reconcile_switch_masks",
-        label="Reconcile OEM Z switch masks",
-        description="Restore the serial-206 persistent Z wiring state: disable mirrored GAP10/right inhibit while keeping GAP9/left home protection enabled; requires fresh Z preparation afterward.",
-        source_anchor="ClassMotor param12 right-disable; param13 left-disable",
-        fixed_inputs={"axis": "z"},
-        required_provider_capability="initialize_motors",
-    )
     add_semantic_alias(
         action_id="oem.z.set_home",
         path="/motion/oem/z/set_home",
@@ -1412,6 +1370,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         fixed_inputs={
             "mode": "live",
             "operator_ack": "OEM_PATH_EXECUTE",
+            "reason": "operator-invoked OEM scriptmoveTo via BioModStack operator plane",
             "current_loc": None,
             "current_well": None,
             "current_x": 0,
@@ -1685,6 +1644,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     if initialize_motion_route:
         dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
+    actions = [row for row in actions if not str(row.get("action_id", "")).startswith("oem.y.internal.")]
+    # Composite routes are private command-plane method targets. They are not
+    # direct operator actions, but strict admitted methods must still dispatch.
+    dispatch = {key: value for key, value in dispatch.items() if not key.startswith("oem.xyz.")}
     return actions, dispatch
 
 
@@ -1763,6 +1726,105 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
         return status, {"body": raw.decode("utf-8", "replace")}
 
 
+class _SuccessiveMoveQueue:
+    """Per-axis bounded queue for successive single-axis moves (WP-B R-B1).
+
+    OEM parity: ClassNovoCommandQueue never rejects; successive moves dispatch
+    in order when the motor stops (queryMotorStop semantics). The queue admits
+    the second same-axis move as `queued` (HTTP 200, never 409), dispatches it
+    when the active move completes, and clears on stop/abort.
+    """
+
+    def __init__(self, max_depth: int = 8):
+        self._max_depth = max_depth
+        self._queues: dict[str, deque[dict[str, Any]]] = {}
+        self._active: dict[str, str] = {}
+        self._guard = asyncio.Lock()
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
+
+    async def admit(self, axis: str, entry: dict[str, Any]) -> str:
+        """Return `dispatch_now` when the axis is idle, `queued` when enqueued, `full` at depth."""
+        async with self._guard:
+            pending = self._queues.get(axis)
+            if axis not in self._active and not (pending and len(pending)):
+                self._active[axis] = str(entry["command_id"])
+                return "dispatch_now"
+            queue = pending if pending is not None else deque()
+            self._queues[axis] = queue
+            if len(queue) >= self._max_depth:
+                return "full"
+            queue.append(entry)
+            return "queued"
+
+    async def wait_dispatched(self, entry: dict[str, Any]) -> bool:
+        """Wait until this entry is signalled. Returns False when the queue was cleared."""
+        await entry["event"].wait()
+        async with self._guard:
+            queue = self._queues.get(str(entry["axis"]))
+            if queue and queue[0] is entry:
+                queue.popleft()
+                self._active[str(entry["axis"])] = str(entry["command_id"])
+            return not bool(entry.get("cleared"))
+
+    async def mark_active(self, axis: str, command_id: str) -> None:
+        async with self._guard:
+            self._active[axis] = command_id
+
+    async def complete(self, axis: str) -> None:
+        """Signal the next queued move after the active move's terminal."""
+        async with self._guard:
+            self._active.pop(str(axis), None)
+            queue = self._queues.get(str(axis))
+            if queue:
+                head = queue[0]
+                head["event"].set()
+
+    async def remove(self, axis: str, entry: dict[str, Any]) -> None:
+        """Remove an admitted entry that will not wait (pre-check rejection paths)."""
+        async with self._guard:
+            queue = self._queues.get(str(axis))
+            if queue:
+                for i, item in enumerate(queue):
+                    if item is entry:
+                        del queue[i]
+                        break
+
+    async def clear(self, axis: str | None = None) -> None:
+        """Clear queued moves (stop/abort). Waiter receipts finalize as `cleared`."""
+        async with self._guard:
+            for ax, queue in list(self._queues.items()):
+                if axis is not None and ax != axis:
+                    continue
+                for entry in queue:
+                    entry["cleared"] = True
+                    entry["event"].set()
+                queue.clear()
+                self._active.pop(ax, None)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            axis: {
+                "active_command_id": self._active.get(axis),
+                "depth": len(queue),
+                "head_action_id": queue[0].get("action_id") if queue else None,
+                "state": "running" if axis in self._active else ("queued" if queue else "idle"),
+            }
+            for axis, queue in sorted(self._queues.items())
+        }
+
+
+_successive_move_queue = _SuccessiveMoveQueue()
+_SINGLE_AXIS_MOVE_AXES = {
+    "oem.x.move_steps": "x",
+    "oem.x.move_absolute": "x",
+    "oem.z.move_steps": "z",
+    "oem.z.move_absolute": "z",
+}
+
+
 def install_operator_control_plane(
     app: FastAPI,
     *,
@@ -1770,6 +1832,7 @@ def install_operator_control_plane(
     reference_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     lifecycle_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     serial206_initialization_state_provider: Callable[[], Mapping[str, Any]] | None = None,
+    pipette_status_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -1794,6 +1857,15 @@ def install_operator_control_plane(
             freshness = projection.get("freshness")
             if isinstance(freshness, Mapping):
                 freshness_rows.append(dict(freshness))
+        if pipette_status_provider is not None:
+            pipette_status = pipette_status_provider()
+            if not isinstance(pipette_status, Mapping):
+                raise RuntimeError("pipette status provider returned a non-mapping payload")
+            domains["pipette"] = {
+                "status": "observed" if pipette_status.get("ok") is True else "unavailable",
+                "observation": dict(pipette_status),
+                "error": None if pipette_status.get("ok") is True else "passive pipette status unavailable",
+            }
         ownership_projection = hardware_state.ownership_projection()
         state_rank = {"fresh": 0, "stale": 1, "missing": 2}
         freshness = max(
@@ -1827,6 +1899,30 @@ def install_operator_control_plane(
             "freshness": freshness or {"state": "missing", "age_s": None, "fresh_for_s": 30.0},
             "snapshot_id": snapshot_id,
         }
+
+    # The durable command plane is instantiated after the complete machine-state
+    # closure exists. It owns canonical X/Z admission and execution while the
+    # compatibility router below continues to expose non-motion maintenance
+    # actions.
+    from .operator_command_plane import (
+        OperatorActionRequestV2,
+        OperatorCommandPlane,
+        OperatorInterruptRequestV1,
+        OperatorMethodRequestV1,
+    )
+    globals()["OperatorActionRequestV2"] = OperatorActionRequestV2
+    globals()["OperatorInterruptRequestV1"] = OperatorInterruptRequestV1
+    globals()["OperatorMethodRequestV1"] = OperatorMethodRequestV1
+
+    command_plane = OperatorCommandPlane(
+        app,
+        machine_state_provider=machine_state,
+        actions=actions,
+        dispatch=dispatch,
+    )
+    app.state.operator_command_plane = command_plane
+    app.state.operator_receipt_store = store
+    app.include_router(command_plane.router)
 
     def replay_authority_fingerprint(state: Mapping[str, Any]) -> str:
         authority_projection = {
@@ -1868,9 +1964,214 @@ def install_operator_control_plane(
         except (OemFullLifecycleError, OSError, ValueError, KeyError):
             return {"registry_sha256": "unavailable", "evidence_lock_sha256": "unavailable", "source_authority_verified": False}
 
-    @router.get("/control-catalog")
-    async def control_catalog() -> dict[str, Any]:
+    def _v2_compact_receipt(row: Mapping[str, Any]) -> dict[str, Any]:
+        raw_status = str(row.get("status") or "queued")
+        status = {
+            "acknowledged": "queued",
+            "admission_pending": "queued",
+            "blocked": "rejected",
+            "reconciliation_required": "failed",
+            "stop_requested": "interrupting",
+            "abort_requested": "interrupting",
+            "stopped": "interrupted",
+            "aborted": "interrupted",
+            "cancelled": "cleared",
+        }.get(raw_status, raw_status)
+        if status not in {"queued", "dispatched", "issued_pending", "interrupting", "completed", "failed", "cleared", "interrupted", "ambiguous", "rejected"}:
+            status = "failed"
+        now = time.time()
+        def finite_time(value: Any) -> float | None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+        accepted = finite_time(row.get("accepted_at") or row.get("started_at")) or now
+        queued = finite_time(row.get("queued_at")) or accepted
+        dispatched = finite_time(row.get("dispatched_at"))
+        finished = finite_time(row.get("finished_at"))
+        error = None
+        if status in {"failed", "rejected", "ambiguous"}:
+            error = {"code": str(row.get("error") or row.get("reason") or raw_status), "message": str(row.get("error") or row.get("reason") or raw_status), "retryable": status == "ambiguous"}
+        return {
+            "schema_version": "bioxp.operator_action_receipt.v2",
+            "command_id": str(row.get("command_id") or "unknown"),
+            "action_id": str(row.get("action_id") or "unknown"),
+            "status": status,
+            "terminal": status not in {"queued", "dispatched", "issued_pending", "interrupting"},
+            "sequence": int(row.get("sequence") or row.get("stream_sequence") or 1),
+            "method_id": row.get("method_id"),
+            "ownership_generation": int(row.get("ownership_generation") or 0),
+            "expected_board_epoch_by_board": {str(key): int(value) for key, value in dict(row.get("expected_board_epoch_by_board") or {}).items()},
+            "state_version": max(1, int(row.get("state_version") or row.get("version") or 1)),
+            "status_path": f"/operator/v2/actions/receipts/{row.get('command_id')}",
+            "accepted_at": accepted,
+            "queued_at": queued,
+            "dispatched_at": dispatched,
+            "finished_at": finished,
+            "terminal_receipt_id": row.get("terminal_receipt_id"),
+            "completion_class": row.get("completion_class"),
+            "physical_effect_verified": bool(row.get("physical_effect_verified") is True),
+            "error": error,
+        }
+
+    def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:
+        provider = state.get("serial206_initialization_provider")
+        provider_map = dict(provider) if isinstance(provider, Mapping) else {}
+        raw = provider_map.get("y_authority")
+        if not isinstance(raw, Mapping):
+            raw = {}
+        if isinstance(raw.get("authority"), Mapping):
+            raw = {**dict(raw.get("authority") or {}), **{key: value for key, value in raw.items() if key != "authority"}}
+        now = time.time()
+        return {
+            "axis": "y", "board_id": 4, "motor_id": 0,
+            "ownership_generation": int(raw.get("ownership_generation") or state.get("ownership_generation") or 0),
+            "prior_board_epoch": raw.get("prior_board_epoch"), "active_board_epoch": raw.get("active_board_epoch"), "prepared_board_epoch": raw.get("prepared_board_epoch"),
+            "lifecycle_state": str(raw.get("lifecycle_state") or raw.get("state") or "unprepared"),
+            "reference_state": str(raw.get("reference_state") or "unreferenced"),
+            "position_steps": raw.get("position_steps"), "position_reply_valid": bool(raw.get("position_reply_valid", False)), "position_status_code": raw.get("position_status_code"),
+            "speed_steps_s": raw.get("speed_steps_s"), "speed_reply_valid": bool(raw.get("speed_reply_valid", False)), "speed_status_code": raw.get("speed_status_code"),
+            "left_switch_raw": raw.get("left_switch_raw"), "left_switch_reply_valid": bool(raw.get("left_switch_reply_valid", False)), "left_switch_status_code": raw.get("left_switch_status_code"),
+            "home_effective": raw.get("home_effective"), "profile_fingerprint": raw.get("profile_fingerprint"), "profile_readback_valid": bool(raw.get("profile_readback_valid", False)), "profile_mismatches": list(raw.get("profile_mismatches") or []),
+            "active_command": None, "interrupt_epoch": int(raw.get("interrupt_epoch") or 0), "latest_compact_receipt": None, "last_discrepancy_steps": raw.get("last_discrepancy_steps"), "state_version": max(1, int(raw.get("state_version") or 1)), "updated_at": float(raw.get("updated_at") or now), "physical_position_verified": bool(raw.get("physical_position_verified", False)),
+        }
+
+    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        queue_projection = queue_projection or {}
+        rows = rows or []
+        compact = [_v2_compact_receipt(row) for row in rows]
+        active = [row for row in compact if not row["terminal"]]
+        queue_items = []
+        for row in compact:
+            if not row["terminal"]:
+                queue_items.append({"command_id": row["command_id"], "sequence": row["sequence"], "status": row["status"], "method_id": row["method_id"], "resource_keys": [], "accepted_at": row["accepted_at"]})
+        provider = state.get("serial206_initialization_provider")
+        provider_map = dict(provider) if isinstance(provider, Mapping) else {}
+        board = provider_map.get("board4_authority") if isinstance(provider_map.get("board4_authority"), Mapping) else {}
+        if not board and isinstance(provider_map.get("y_authority"), Mapping):
+            candidate = provider_map["y_authority"].get("board_authority")
+            board = candidate if isinstance(candidate, Mapping) else {}
+        now = time.time()
+        board4 = {"state": str(board.get("state") or "unknown"), "prior_board_epoch": board.get("prior_board_epoch"), "active_board_epoch": board.get("active_board_epoch"), "transition_phase": str(board.get("transition_phase") or "unknown"), "transition_evidence": dict(board.get("transition_evidence") or {}), "member_motors": {str(key): int(value) for key, value in dict(board.get("member_motors") or {"y": 0, "z": 1, "gripper": 2}).items()}, "state_version": max(1, int(board.get("state_version") or 1)), "updated_at": float(board.get("updated_at") or now)}
+        y_axis = _v2_y_axis(state)
+        y_rows = [row for row in compact if str(row.get("action_id", "")).startswith("oem.y.")]
+        y_axis["active_command"] = next((row for row in y_rows if not row["terminal"]), None)
+        y_axis["latest_compact_receipt"] = y_rows[0] if y_rows else None
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
+
+    @router.get("/v2/dashboard")
+    async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
+        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=100)
+        return _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), rows)
+
+    @router.get("/v2/control-catalog")
+    async def control_catalog_v2() -> dict[str, Any]:
+        state = machine_state()
+        dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=100))
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"]))]}
+
+    @router.post("/v2/actions/{action_id}")
+    async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        if not command_plane.is_canonical(action_id):
+            raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
+        if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
+            if not isinstance(payload, OperatorInterruptRequestV1):
+                raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
+            request_body = payload.model_dump()
+            if action_id == "oem.y.stop":
+                return await command_plane.invoke_y_interrupt(request_body)
+            return await command_plane.compat_invoke(action_id, request_body)
+        if isinstance(payload, OperatorInterruptRequestV1):
+            raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
+        if not isinstance(payload, OperatorActionRequestV2):
+            raise HTTPException(status_code=422, detail={"error": "action_request_schema_required"})
+        state = machine_state()
+        result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=state)
+        admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
+        return _v2_compact_receipt(admitted or result)
+
+    @router.get("/v2/actions/history")
+    async def action_history_v2(limit: int = Query(default=100, ge=1, le=200), cursor: str | None = None) -> dict[str, Any]:
+        before = None
+        if cursor is not None:
+            if not cursor.isdecimal() or int(cursor) < 1:
+                raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
+            before = int(cursor)
+        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=limit, before_sequence=before)
+        items = [_v2_compact_receipt(row) for row in rows]
+        next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+        return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
+
+    @router.get("/v2/actions/receipts/{command_id}")
+    async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
+        row = await asyncio.to_thread(command_plane.store.command_detail_v2 if detail else command_plane.store.get_command, command_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="operator action receipt not found")
+        compact = _v2_compact_receipt(row)
+        if not detail:
+            return compact
+        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("raw_return_layers") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
+
+    async def _v2_method_receipt(method: Mapping[str, Any]) -> dict[str, Any]:
+        raw_status = str(method.get("status") or "queued")
+        status = {"running": "active", "cancelled": "cleared", "stopped": "interrupted", "aborted": "interrupted", "recovery_required": "ambiguous"}.get(raw_status, raw_status)
+        children = await asyncio.to_thread(command_plane.store.list_method_commands, str(method["method_id"]))
+        terminal = status in {"completed", "completed_partial", "failed", "cleared", "interrupted", "ambiguous"}
+        accepted_at = float(method.get("queued_at") or time.time())
+        return {
+            "schema_version": "bioxp.operator_method.v1",
+            "method_id": str(method["method_id"]),
+            "action_id": str(method.get("name") or ""),
+            "status": status,
+            "state_version": max(1, int(method.get("version") or 1)),
+            "child_receipts": [_v2_compact_receipt(row) for row in children],
+            "accepted_at": accepted_at,
+            "finished_at": float(method.get("updated_at") or accepted_at) if terminal else None,
+        }
+
+    @router.post("/v2/methods")
+    async def submit_method_v2(payload: OperatorMethodRequestV1) -> dict[str, Any]:
+        method = await command_plane.admit_strict_method(payload.model_dump())
+        return await _v2_method_receipt(method)
+
+    @router.get("/v2/methods/{method_id}")
+    async def method_status_v2(method_id: str) -> dict[str, Any]:
+        method = await asyncio.to_thread(command_plane.store.get_method, method_id)
+        if method is None:
+            raise HTTPException(status_code=404, detail="operator method not found")
+        return await _v2_method_receipt(method)
+
+    @router.get("/v2/commands/{command_id}")
+    async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
+        return await action_receipt_v2(command_id, detail=detail)
+
+    @router.get("/control-catalog")
+    async def control_catalog(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
+        state = machine_state()
+        if schema_version == "bioxp.operator_control_catalog.v2":
+            dashboard = _v2_dashboard(
+                state,
+                await asyncio.to_thread(command_plane.store.queue),
+                await asyncio.to_thread(command_plane.store.list_commands, limit=100),
+            )
+            return {
+                "schema_version": "bioxp.operator_control_catalog.v2",
+                "dashboard": dashboard,
+                "actions": [
+                    {
+                        "action_id": str(action["action_id"]),
+                        "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                        "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2",
+                        "interrupt": str(action["safety_class"]) == "stop",
+                        "enabled": bool(assessed_action(action, state).get("enabled")),
+                        "disabled_reason": assessed_action(action, state).get("disabled_reason"),
+                    }
+                    for action in actions
+                    if str(action["action_id"]) in command_plane.by_id
+                ],
+            }
         return {
             "schema_name": "bioxp.operator_control_catalog",
             "schema_version": CATALOG_SCHEMA,
@@ -1882,11 +2183,33 @@ def install_operator_control_plane(
         }
 
     @router.get("/dashboard")
-    async def operator_dashboard() -> dict[str, Any]:
-        return _dashboard_payload(machine_state())
+    async def operator_dashboard(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
+        if schema_version == "bioxp.operator_dashboard.v2":
+            state = machine_state()
+            rows = await asyncio.to_thread(command_plane.store.list_commands, limit=100)
+            return _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), rows)
+        dashboard = _dashboard_payload(machine_state())
+        queue_projection = await asyncio.to_thread(command_plane.store.queue)
+        active = queue_projection.get("active_command")
+        dashboard["successive_move_queue"] = {
+            "global": {
+                "active_command_id": active.get("command_id") if isinstance(active, Mapping) else None,
+                "depth": int(queue_projection.get("pending_count") or 0),
+                "head_action_id": active.get("action_id") if isinstance(active, Mapping) else None,
+                "state": "running" if active else "queued" if queue_projection.get("pending_count") else "idle",
+            }
+        }
+        dashboard["command_queue"] = queue_projection
+        return dashboard
 
     @router.post("/actions/{action_id}/admission")
     async def action_admission(action_id: str, payload: AdmissionRequest) -> dict[str, Any]:
+        if command_plane.is_canonical(action_id):
+            return await asyncio.to_thread(
+                command_plane.compat_admission,
+                action_id,
+                {"expected_generation": payload.expected_generation, "inputs": payload.inputs},
+            )
         if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
             raise HTTPException(status_code=404, detail="unknown operator action_id")
         state = machine_state()
@@ -1897,12 +2220,35 @@ def install_operator_control_plane(
         return {"action_id": action_id, "ownership_generation": state["ownership_generation"], **_assess_action(by_id[action_id], state, effective_inputs)}
 
     @router.get("/actions/history")
-    async def action_history(limit: int = 100) -> dict[str, Any]:
+    async def action_history(
+        limit: int = Query(default=100, ge=1, le=200),
+        schema_version: str | None = Query(default=None),
+        cursor: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        if schema_version == "bioxp.operator_action_history.v2":
+            before = None
+            if cursor is not None:
+                if not cursor.isdecimal() or int(cursor) < 1:
+                    raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
+                before = int(cursor)
+            command_rows = await asyncio.to_thread(command_plane.store.list_commands, limit=limit, before_sequence=before)
+            items = [_v2_compact_receipt(row) for row in command_rows]
+            next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+            return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
         rows = await asyncio.to_thread(store.list, limit)
         return {"schema_version": HISTORY_SCHEMA, "receipts": rows}
 
     @router.get("/actions/receipts/{command_id}")
     async def action_receipt(command_id: str, detail: bool = False) -> dict[str, Any]:
+        command_row = await asyncio.to_thread(
+            command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
+            command_id,
+        )
+        if command_row is not None:
+            compact = _v2_compact_receipt(command_row)
+            if not detail:
+                return compact
+            return {**compact, "canonical_inputs": dict(command_row.get("canonical_inputs") or {}), "requested_values": dict(command_row.get("requested_values") or {}), "effective_values": dict(command_row.get("effective_values") or {}), "observed_values": dict(command_row.get("observed_values") or {}), "raw_return_layers": dict(command_row.get("raw_return_layers") or {}), "controller_evidence": dict(command_row.get("controller_evidence") or {}), "transport_artifacts": list(command_row.get("transport_artifacts") or []), "child_receipts": list(command_row.get("child_receipts") or []), "transitions": list(command_row.get("transitions") or [])}
         row = await asyncio.to_thread(
             store.by_command,
             command_id,
@@ -1944,7 +2290,30 @@ def install_operator_control_plane(
         return await asyncio.to_thread(store.put, row)
 
     @router.post("/actions/{action_id}")
-    async def invoke_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
+    async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        if isinstance(payload, OperatorInterruptRequestV1):
+            if action_id == "oem.y.stop":
+                return await command_plane.invoke_y_interrupt(payload.model_dump())
+            if action_id not in {"oem.x.stop", "oem.z.stop", "oem.z.abort", "oem.abort_all"}:
+                raise HTTPException(status_code=404, detail="unknown X/Z interrupt action_id")
+            return await command_plane.compat_invoke(action_id, payload.model_dump())
+        if isinstance(payload, OperatorActionRequestV2):
+            if not command_plane.is_canonical(action_id):
+                raise HTTPException(status_code=404, detail="unknown normal v2 operator action_id")
+            result = await asyncio.to_thread(command_plane.store.admit_command, {**payload.model_dump(), "action_id": action_id}, state=machine_state())
+            admitted = await asyncio.to_thread(command_plane.store.get_command, str(result["command_id"]))
+            return _v2_compact_receipt(admitted or result)
+        if command_plane.is_canonical(action_id):
+            if action_id.startswith("oem.y."):
+                raise HTTPException(status_code=410, detail={"error": "legacy_y_action_mutation_retired", "required_schema": "bioxp.operator_action_request.v2"})
+            return await command_plane.compat_invoke(
+                action_id,
+                {
+                    "expected_generation": payload.expected_generation,
+                    "idempotency_key": payload.idempotency_key,
+                    "inputs": payload.inputs,
+                },
+            )
         request_received_at = time.time()
         if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
             raise HTTPException(status_code=404, detail="unknown operator action_id")
@@ -1959,6 +2328,8 @@ def install_operator_control_plane(
         action = by_id[action_id]
         is_safety_interrupt = action_id in {
             "meta.emergency_stop",
+            "oem.x.stop",
+            "oem.y.stop",
             "oem.z.stop",
             "oem.z.abort",
         }
@@ -1973,10 +2344,16 @@ def install_operator_control_plane(
                 "/motion/diagnostics/stop",
                 "/motion/oem/x/stop",
                 "/motion/oem/x/abort",
+                "/motion/oem/y/stop",
                 "/motion/oem/z/stop",
                 "/motion/oem/z/abort",
             }
         )
+        interrupt_axis = {
+            "/motion/oem/x/stop": "x",
+            "/motion/oem/y/stop": "y",
+            "/motion/oem/z/stop": "z",
+        }.get(str(target.get("path"))) if is_safety_interrupt else None
         unknown_inputs = set(payload.inputs) - set(target["inputs"])
         if unknown_inputs:
             raise HTTPException(
@@ -2032,6 +2409,84 @@ def install_operator_control_plane(
                         "required": "command_id, pass/fail verdict, four booleans, and a 3+ character note",
                     },
                 )
+        effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
+        queue_axis = _SINGLE_AXIS_MOVE_AXES.get(action_id) if not is_safety_interrupt else None
+        queued_entry = None
+        queue_queued_at = None
+        if queue_axis is not None:
+            queue_entry = {
+                "axis": queue_axis,
+                "command_id": f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}",
+                "action_id": action_id,
+                "event": asyncio.Event(),
+                "cleared": False,
+            }
+            admission = await _successive_move_queue.admit(queue_axis, queue_entry)
+            if admission == "full":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "queue_full",
+                        "axis": queue_axis,
+                        "max_depth": _successive_move_queue.max_depth,
+                    },
+                )
+            if admission == "queued":
+                queued_entry = queue_entry
+                queue_queued_at = time.time()
+                pre_state = machine_state()
+                if int(pre_state["ownership_generation"]) != payload.expected_generation:
+                    await _successive_move_queue.remove(queue_axis, queue_entry)
+                    raise HTTPException(status_code=409, detail="ownership generation mismatch")
+                pre_assessment = _assess_action(action, pre_state, effective_inputs)
+                if not pre_assessment["enabled"]:
+                    await _successive_move_queue.remove(queue_axis, queue_entry)
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "action_unavailable",
+                            "reason": pre_assessment["disabled_reason"],
+                            "dependencies": pre_assessment["dependencies"],
+                        },
+                    )
+                if not await _successive_move_queue.wait_dispatched(queued_entry):
+                    cleared = time.time()
+                    cleared_receipt = {
+                        "schema_version": RECEIPT_SCHEMA,
+                        "command_id": queued_entry["command_id"],
+                        "action_id": action_id,
+                        "kind": action["kind"],
+                        "safety_class": action["safety_class"],
+                        "status": "cleared",
+                        "idempotency_key": payload.idempotency_key,
+                        "idempotency_replay_enabled": True,
+                        "ownership_generation": int(pre_state["ownership_generation"]),
+                        "authority_fingerprint": replay_authority_fingerprint(pre_state),
+                        "started_at": str(queue_queued_at),
+                        "request_received_at": request_received_at,
+                        "queued_at": float(queue_queued_at),
+                        "cleared_at": float(cleared),
+                        "finished_at": str(cleared),
+                        "duration_ms": (cleared - queue_queued_at) * 1000.0,
+                        "remote_acknowledged": True,
+                        "controller_acknowledged": False,
+                        "physical_effect_verified": False,
+                        "machine_assessment": "pass",
+                        "operator_assessment": None,
+                        "operator_note": None,
+                        "requested_inputs": _bounded_json(payload.inputs, _MAX_INPUT_BYTES),
+                        "inputs": _bounded_json(effective_inputs, _MAX_INPUT_BYTES),
+                        "response": _bounded_json(
+                            {"http_status": 200, "body": {"detail": {"error": "queue_cleared", "axis": queue_axis}}},
+                            _MAX_RESPONSE_BYTES,
+                        ),
+                        "error": None,
+                        "stage_receipts": [],
+                    }
+                    claimed, created = await asyncio.to_thread(store.claim, cleared_receipt)
+                    return claimed
+        if is_safety_interrupt:
+            await _successive_move_queue.clear(interrupt_axis)
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
         async with action_lock:
             lock_acquired_at = time.time()
@@ -2041,12 +2496,12 @@ def install_operator_control_plane(
                 if locked_state is None
                 else int(locked_state["ownership_generation"])
             )
-            if payload.expected_generation != locked_expected:
+            if not is_safety_interrupt and payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
             existing = None
-            if not is_safety_interrupt:
+            if not is_safety_interrupt and queued_entry is None:
                 existing = await asyncio.to_thread(
                     store.by_idempotency,
                     payload.idempotency_key,
@@ -2070,7 +2525,7 @@ def install_operator_control_plane(
                 if existing.get("authority_fingerprint") != current_authority_fingerprint:
                     raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
                 return existing
-            command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
+            command_id = queued_entry["command_id"] if queued_entry is not None else f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
             started = time.time()
             receipt = {
                 "schema_version": RECEIPT_SCHEMA,
@@ -2144,6 +2599,7 @@ def install_operator_control_plane(
                     return claimed
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
+            receipt["queued_at"] = queue_queued_at if queued_entry is not None else time.time()
             if not is_safety_interrupt:
                 claimed, created = await asyncio.to_thread(store.claim, receipt)
                 if not created:
@@ -2177,6 +2633,8 @@ def install_operator_control_plane(
             })
             try:
                 receipt["provider_entry_at"] = time.time()
+                receipt["status"] = "dispatched"
+                receipt["dispatched_at"] = receipt["provider_entry_at"]
                 status_code, response = await asyncio.wait_for(
                     _dispatch_asgi(app, target["method"], target["path"], wire_inputs, target["locations"]),
                     timeout=float(action["timeout_seconds"]),
@@ -2187,8 +2645,12 @@ def install_operator_control_plane(
                 authority_receipt = None
                 observation_receipt = None
                 if isinstance(response, dict):
-                    authority_receipt = response.get("authority_receipt")
-                    observation_receipt = response.get("observation_receipt")
+                    receipt_source = response
+                    detail = response.get("detail")
+                    if isinstance(detail, Mapping):
+                        receipt_source = detail
+                    authority_receipt = receipt_source.get("authority_receipt")
+                    observation_receipt = receipt_source.get("observation_receipt")
                 authority_controller_acknowledged = (
                     authority_receipt.get("controller_command_acknowledged")
                     if (
@@ -2242,7 +2704,10 @@ def install_operator_control_plane(
             receipt["duration_ms"] = (finished - started) * 1000.0
             receipt["receipt_persist_started_at"] = time.time()
             persist_receipt = store.put_interrupt if is_safety_interrupt else store.put
-            return await asyncio.to_thread(persist_receipt, receipt)
+            persisted = await asyncio.to_thread(persist_receipt, receipt)
+            if queue_axis is not None:
+                await _successive_move_queue.complete(queue_axis)
+            return persisted
 
     app.include_router(router)
     app.openapi_schema = None

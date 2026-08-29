@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
+import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -67,12 +70,101 @@ class ReferenceStateAuthorityError(RuntimeError):
 class ReferenceStateStore:
     def __init__(self, state_path: str | Path | None = None) -> None:
         self._state_path = None if state_path is None else Path(state_path)
-        self._state_lock_path = None if self._state_path is None else self._state_path.with_suffix(self._state_path.suffix + ".lock")
+        self._database_path = (
+            None
+            if self._state_path is None
+            else self._state_path
+            if self._state_path.suffix == ".db"
+            else self._state_path.parent / "bioxp_runtime.db"
+        )
+        self._state_lock_path = None if self._database_path is None else self._database_path.with_suffix(".db.lock")
         self._rows: dict[str, AxisReferenceRecord] = {}
         self._disk_state_dirty = False
         self._authority_untrusted = self._state_path is None
         self._lock = Lock()
+        self._authority_write_depth = 0
         self._load_from_disk()
+
+    def _open_database(self) -> sqlite3.Connection:
+        if self._database_path is None:
+            raise ReferenceStateAuthorityError("durable reference database path required")
+        connection = sqlite3.connect(self._database_path, timeout=2.0)
+        connection.create_function(
+            "reference_write_allowed", 0, lambda: 1 if self._authority_write_depth > 0 else 0
+        )
+        connection.create_function(
+            "sha256_utf8", 1, lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest(), deterministic=True
+        )
+        connection.create_function(
+            "canonical_json", 1, lambda value: json.dumps(json.loads(str(value)), sort_keys=True, separators=(",", ":")), deterministic=True
+        )
+        connection.execute("PRAGMA busy_timeout=2000")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS reference_state_authority (
+                authority_key TEXT PRIMARY KEY CHECK(authority_key='reference_state'),
+                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+                payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
+                updated_at REAL NOT NULL
+            ) WITHOUT ROWID;
+            DROP TRIGGER IF EXISTS reference_state_authority_coherence_v1;
+            DROP TRIGGER IF EXISTS reference_state_authority_authorized_insert_v1;
+            DROP TRIGGER IF EXISTS reference_state_authority_authorized_update_v1;
+            DROP TRIGGER IF EXISTS reference_state_authority_no_delete_v1;
+            CREATE TRIGGER reference_state_authority_coherence_v1
+            BEFORE INSERT ON reference_state_authority
+            WHEN NEW.payload_json<>canonical_json(NEW.payload_json)
+              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
+            BEGIN SELECT RAISE(ABORT,'reference authority bytes are incoherent'); END;
+            CREATE TRIGGER reference_state_authority_authorized_insert_v1
+            BEFORE INSERT ON reference_state_authority
+            WHEN reference_write_allowed()<>1
+            BEGIN SELECT RAISE(ABORT,'reference authority writer is not authoritative'); END;
+            CREATE TRIGGER reference_state_authority_authorized_update_v1
+            BEFORE UPDATE ON reference_state_authority
+            WHEN reference_write_allowed()<>1
+              OR NEW.authority_key IS NOT OLD.authority_key
+              OR NEW.payload_json<>canonical_json(NEW.payload_json)
+              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
+            BEGIN SELECT RAISE(ABORT,'reference authority update is not authoritative'); END;
+            CREATE TRIGGER reference_state_authority_no_delete_v1
+            BEFORE DELETE ON reference_state_authority
+            BEGIN SELECT RAISE(ABORT,'reference authority cannot be deleted'); END;
+            """
+        )
+        expected_columns = (
+            ("authority_key", "TEXT", 1, 1),
+            ("payload_json", "TEXT", 1, 0),
+            ("payload_sha256", "TEXT", 1, 0),
+            ("updated_at", "REAL", 1, 0),
+        )
+        actual_columns = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute("PRAGMA table_info(reference_state_authority)").fetchall()
+        )
+        table_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reference_state_authority'"
+        ).fetchone()
+        table_sql = "".join(str(table_row[0] if table_row else "").upper().split())
+        if actual_columns != expected_columns or "CHECK(AUTHORITY_KEY='REFERENCE_STATE')" not in table_sql or "WITHOUTROWID" not in table_sql:
+            connection.close()
+            raise ReferenceStateAuthorityError("reference authority table shape is not exact")
+        expected = {
+            "reference_state_authority_coherence_v1",
+            "reference_state_authority_authorized_insert_v1",
+            "reference_state_authority_authorized_update_v1",
+            "reference_state_authority_no_delete_v1",
+        }
+        actual = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='reference_state_authority'"
+            ).fetchall()
+        }
+        if actual != expected:
+            connection.close()
+            raise ReferenceStateAuthorityError("reference authority trigger set is not exact")
+        return connection
 
     @staticmethod
     def _unknown_row(axis: str) -> dict[str, Any]:
@@ -388,14 +480,29 @@ class ReferenceStateStore:
         self._authority_untrusted = False
 
     def _read_rows_from_disk_locked(self) -> dict[str, AxisReferenceRecord] | None:
-        if self._state_path is None:
+        if self._database_path is None:
             return None
-        if not self._state_path.exists():
-            return {}
         try:
-            payload = json.loads(self._state_path.read_text())
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            connection = self._open_database()
+            try:
+                selected = connection.execute(
+                    "SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key=?",
+                    ("reference_state",),
+                ).fetchone()
+                if selected is None:
+                    payload = {"version": 1, "rows": {}}
+                else:
+                    encoded = str(selected[0])
+                    if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":")):
+                        raise ReferenceStateAuthorityError("reference authority JSON is not canonical")
+                    if str(selected[1]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
+                        raise ReferenceStateAuthorityError("reference authority digest mismatch")
+                    payload = json.loads(encoded)
+            finally:
+                connection.close()
         except Exception:
-            logger.warning("Failed to load reference state from %s", self._state_path, exc_info=True)
+            logger.warning("Failed to load reference state from SQLite %s", self._database_path, exc_info=True)
             return None
         rows = payload.get("rows", {}) if isinstance(payload, dict) else {}
         if not isinstance(rows, dict):
@@ -419,22 +526,32 @@ class ReferenceStateStore:
         return loaded
 
     def _persist_locked(self) -> bool:
-        if self._state_path is None:
+        if self._database_path is None:
             self._disk_state_dirty = True
             return False
         try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "version": 1,
                 "rows": {axis: record.to_payload() for axis, record in self._rows.items()},
             }
-            tmp_path = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2))
-            tmp_path.replace(self._state_path)
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            connection = self._open_database()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._authority_write_depth += 1
+                connection.execute(
+                    "INSERT INTO reference_state_authority(authority_key,payload_json,payload_sha256,updated_at) VALUES(?,?,?,?) ON CONFLICT(authority_key) DO UPDATE SET payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256,updated_at=excluded.updated_at",
+                    ("reference_state", encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
+                )
+                connection.execute("COMMIT")
+            finally:
+                self._authority_write_depth = max(0, self._authority_write_depth - 1)
+                connection.close()
             return True
         except Exception:
             self._disk_state_dirty = True
-            logger.warning("Failed to persist reference state to %s", self._state_path, exc_info=True)
+            logger.warning("Failed to persist reference state to SQLite %s", self._database_path, exc_info=True)
             return False
 
     @contextmanager

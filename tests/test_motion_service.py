@@ -270,36 +270,19 @@ def test_run_relative_motion_command_dry_run_bundle_failure_is_structured_not_50
     assert "disk full" in result["artifact_bundle_error"]["message"]
 
 
-def test_move_axis_relative_route_delegates_to_motion_service(monkeypatch):
+def test_move_axis_relative_route_is_retired_with_replacement(monkeypatch):
     api = load_api(monkeypatch)
-    captured = {}
+    req = api.MoveRelativeRequest(axis=api.AxisName.X, steps=9, wait_timeout_s=4.0)
 
-    async def fake_runner(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return {"ok": True, "axis": "x"}
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.move_axis_relative(req))
 
-    monkeypatch.setattr(api, "run_relative_motion_command", fake_runner)
-
-    req = api.MoveRelativeRequest(
-        axis=api.AxisName.X,
-        steps=9,
-        wait_timeout_s=4.0,
-        speed=200,
-        acc=80,
-        capture_bundle=True,
-        operator_note="route smoke",
-    )
-    result = asyncio.run(api.move_axis_relative(req))
-
-    assert result == {"ok": True, "axis": "x"}
-    assert captured["command"].steps == 9
-    assert captured["command"].speed == 200
-    assert captured["command"].acc == 80
-    assert captured["command"].artifact.capture_bundle is True
-    assert captured["command"].artifact.operator_note == "route smoke"
-    assert captured["kwargs"]["get_tester"] is api._get_tester
-    assert captured["kwargs"]["run_blocking"] is api._run_blocking
+    assert exc_info.value.status_code == 410
+    assert exc_info.value.detail == {
+        "error": "alternate_x_authority_retired",
+        "replacement": "/motion/oem/x/move_steps",
+        "physical_motion_commanded": False,
+    }
 
 
 def test_move_axis_absolute_route_records_motion_after_success(monkeypatch):
@@ -397,41 +380,6 @@ def test_execute_absolute_move_applies_profile_override_before_motion(monkeypatc
     assert result["motion_profile"]["requested_acc"] == 80
 
 
-def test_protocol_live_move_handler_executes_absolute_profile_override(monkeypatch):
-    api = load_api(monkeypatch)
-    recorded = []
-
-    class Action:
-        action_id = "move-x-limit"
-        params = {"axis": "x", "position_steps": 91869, "wait_timeout_s": 30, "speed": 200, "acc": 80}
-
-    monkeypatch.setattr(api, "_get_tester", lambda: "tester")
-
-    def fake_execute_absolute(tester, axis, position_steps, wait_timeout_s, *, speed=None, acc=None):
-        assert tester == "tester"
-        assert axis == api.AxisName.X
-        assert position_steps == 91869
-        assert wait_timeout_s == 30.0
-        assert speed == 200
-        assert acc == 80
-        return {"ok": True, "motion_profile": {"speed": 200, "acc": 80}}
-
-    class FakeStore:
-        def record_motion(self, axis, motion_kind):
-            recorded.append((axis, motion_kind))
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "_execute_absolute_move", fake_execute_absolute)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
-    result = api._protocol_live_move_handler(Action(), None)
-
-    assert result["ok"] is True
-    assert result["move_mode"] == "absolute"
-    assert result["move"]["motion_profile"] == {"speed": 200, "acc": 80}
-    assert recorded == [(api.AxisName.X, "protocol_absolute")]
-
-
 def test_move_axis_relative_route_skips_reference_updates_for_dry_run(monkeypatch):
     api = load_api(monkeypatch)
     recorded = []
@@ -454,59 +402,34 @@ def test_move_axis_relative_route_skips_reference_updates_for_dry_run(monkeypatc
     assert recorded == []
 
 
-def test_move_axis_zero_route_moves_to_absolute_zero(monkeypatch):
+def test_move_axis_zero_route_is_retired_with_replacement(monkeypatch):
     api = load_api(monkeypatch)
-    recorded = []
-
-    async def fake_runner(command, **kwargs):
-        recorded.append(command)
-        return {"axis": getattr(command.axis, "value", command.axis), "move": {"ok": True, "mode": "absolute"}, "motion_evidence": {"classification": {"controller_motion_evidence": True}}}
-
-    class FakeStore:
-        def record_motion(self, axis, motion_kind):
-            recorded.append((axis, motion_kind))
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "run_absolute_motion_command", fake_runner)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
     req = api.MoveAxisZeroRequest(axis=api.AxisName.Y, wait_timeout_s=6.0)
-    result = asyncio.run(api.move_axis_zero(req))
 
-    assert recorded[0].position_steps == 0
-    assert result["move"]["ok"] is True
-    assert result["route_semantics"]["home_semantics"] == "not_homing_absolute_zero_only"
-    assert result["route_semantics"]["oem_switch_search_homing_executed"] is False
-    assert recorded[1] == (api.AxisName.Y, "absolute_zero")
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.move_axis_zero(req))
+
+    assert exc_info.value.status_code == 410
+    assert exc_info.value.detail == {
+        "error": "alternate_y_authority_retired",
+        "replacement": "/motion/oem/y/set_home",
+        "physical_motion_commanded": False,
+    }
 
 
-def test_home_axis_route_preserves_oem_switch_search_and_marks_reference(monkeypatch):
+def test_home_axis_route_is_retired_with_replacement(monkeypatch):
     api = load_api(monkeypatch)
-    recorded = []
-
-    async def fake_runner(command, **kwargs):
-        recorded.append(command)
-        return {"axis": getattr(command.axis, "value", command.axis), "home": {"ok": True}, "motion_evidence": {"classification": {"controller_motion_evidence": True}}}
-
-    class FakeStore:
-        def mark_referenced(self, command):
-            recorded.append(command)
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "run_home_axis_command", fake_runner)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
     req = api.HomeAxisRequest(axis=api.AxisName.Y, timeout_s=6.0)
-    result = asyncio.run(api.home_axis(req))
 
-    assert result["home"]["ok"] is True
-    assert result["route_semantics"]["source_command"] == "home_axis_manual_button_goHome_guarded"
-    assert result["route_semantics"]["home_semantics"] == "manual_goHome_style_switch_search_not_startup_axisSearchHome_not_zero"
-    assert result["route_semantics"]["oem_switch_search_homing_executed"] is True
-    assert recorded[0].axis is api.AxisName.Y
-    assert recorded[1].axis is api.AxisName.Y
-    assert recorded[1].source == "home_axis"
-    assert recorded[1].motion_kind == "home"
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.home_axis(req))
+
+    assert exc_info.value.status_code == 410
+    assert exc_info.value.detail == {
+        "error": "alternate_y_authority_retired",
+        "replacement": "/motion/oem/y/home",
+        "physical_motion_commanded": False,
+    }
 
 
 def test_generic_z_home_route_is_retired_even_for_dry_run(monkeypatch):
@@ -789,30 +712,16 @@ def test_motion_error_events_fail_relative_move_even_with_counter_delta(monkeypa
     assert result["motion_failure"]["event_status"] == 14
 
 
-def test_move_axis_relative_skips_reference_update_for_structured_motion_failure(monkeypatch):
+def test_move_axis_relative_failure_route_is_retired(monkeypatch):
     api = load_api(monkeypatch)
-    recorded = []
-
-    async def fake_runner(command, **kwargs):
-        return {
-            "axis": getattr(command.axis, "value", command.axis),
-            "ok": False,
-            "motion_failure": {"category": "guardrail_no_motion", "message": "no position delta detected"},
-        }
-
-    class FakeStore:
-        def record_motion(self, axis, motion_kind):
-            recorded.append((axis, motion_kind))
-            return {"ok": True}
-
-    monkeypatch.setattr(api, "run_relative_motion_command", fake_runner)
-    monkeypatch.setattr(api, "_reference_state_store", FakeStore())
-
     req = api.MoveRelativeRequest(axis=api.AxisName.X, steps=5)
-    result = asyncio.run(api.move_axis_relative(req))
 
-    assert result["ok"] is False
-    assert recorded == []
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api.move_axis_relative(req))
+
+    assert exc_info.value.status_code == 410
+    assert exc_info.value.detail["error"] == "alternate_x_authority_retired"
+    assert exc_info.value.detail["physical_motion_commanded"] is False
 
 
 class _LocalRequest:
@@ -844,9 +753,9 @@ def test_maintenance_usb_release_blocks_live_axis_motion_until_recovery(monkeypa
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(api.move_axis_relative(api.MoveRelativeRequest(axis=api.AxisName.X, steps=5)))
 
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.detail["error"] == "post_maintenance_motion_recovery_required"
-    assert exc_info.value.detail["hardware_motion_commanded"] is False
+    assert exc_info.value.status_code == 410
+    assert exc_info.value.detail["error"] == "alternate_x_authority_retired"
+    assert exc_info.value.detail["physical_motion_commanded"] is False
 
 
 def test_maintenance_block_allows_validation_only_dry_run_bundle(monkeypatch):
@@ -1036,15 +945,19 @@ def test_preparation_can_ready_publication_requires_same_owned_epoch():
     assert stale == {"published": False, "reason": "ownership_epoch_changed"}
 
 
-def test_service_start_defaults_to_pending_non_homing_recovery(monkeypatch):
+def test_service_start_is_clean_without_non_homing_recovery_gate(monkeypatch):
     api = load_api(monkeypatch, startup_recovered=False)
 
     state = api._maintenance_state_payload()
 
-    assert state["motion_blocked"] is True
-    assert state["recovery_required"] is True
-    assert state["blocked_by"] == "service_start"
-    assert api._require_non_homing_motion_recovery_pending() == 1
+    assert state["motion_blocked"] is False
+    assert state["recovery_required"] is False
+    assert state["block_reason"] is None
+    assert state["blocked_by"] is None
+    with pytest.raises(HTTPException) as exc_info:
+        api._require_non_homing_motion_recovery_pending()
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "motion_recovery_not_required"
 
 
 def test_remote_strict_startup_requires_recover_motion_ack_before_hardware(monkeypatch):

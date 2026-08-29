@@ -1,0 +1,25 @@
+from src.bioxp.api import app
+from src.bioxp.operator_controls import _build_catalog
+
+
+def test_operator_catalog_contains_canonical_y_actions_and_exact_bounds():
+    actions, dispatch = _build_catalog(app)
+    by_id = {row["action_id"]: row for row in actions}
+    for action_id in ("oem.y.status", "oem.y.move_steps", "oem.y.move_absolute", "oem.y.manual_panel_home", "oem.y.stop"):
+        assert action_id in by_id
+        assert action_id in dispatch or action_id == "oem.y.stop"
+    relative = {row["name"]: row for row in by_id["oem.y.move_steps"]["inputs"]}
+    absolute = {row["name"]: row for row in by_id["oem.y.move_absolute"]["inputs"]}
+    assert relative["steps"]["minimum"] == -(2**31)
+    assert relative["steps"]["maximum"] == 2**31 - 1
+    assert absolute["target_steps"]["minimum"] == -(2**31)
+    assert absolute["target_steps"]["maximum"] == 2**31 - 1
+    assert by_id["oem.y.manual_panel_home"]["inputs"] == []
+    assert dispatch["oem.y.manual_panel_home"]["fixed_inputs"]["source_mode"] == "manual_panel"
+    assert "oem.xy.move_absolute" in by_id
+    assert "oem.xy.home" in by_id
+    assert "oem.xy.move_absolute" in dispatch
+    assert "oem.xy.home" in dispatch
+    for action_id in ("oem.y.internal.acceleration_overload", "oem.y.internal.board_test_my"):
+        assert action_id not in by_id
+        assert action_id in dispatch

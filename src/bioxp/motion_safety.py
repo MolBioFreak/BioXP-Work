@@ -16,12 +16,6 @@ from .oem_machine_bundle import OEM_MACHINE_SERIAL, get_active_oem_machine_snaps
 PREPARE_SCHEMA = "bioxp.oem_prepare_without_motion.v2"
 STOP_SCHEMA = "bioxp.physical_aggregate_stop.v1"
 
-# One immutable serial-206 machine adaptation contract.  The recovered X
-# initializer does not write either mask; recovery writes SAP12=1 separately
-# and preparation/motion/status only verify this effective tuple.
-SERIAL206_X_SWITCH_MASKS = {12: 1, 13: 0}
-SERIAL206_Z_SWITCH_MASKS = {12: 1, 13: 0}
-
 # ClassControlInterface construction for the accepted BioXP 3200 serial-206 machine.
 # Board 7 is the chiller/temperature controller.  Its status-2 reply to command 64 is
 # not a motor-board activation ACK and is therefore represented explicitly rather
@@ -143,6 +137,7 @@ def prepare_motion_without_motion(
     authority: Serial206MotionAuthority,
     *,
     components: tuple[str, ...] | None = None,
+    reuse_current_board_lifecycle: bool = False,
 ) -> dict[str, Any]:
     """Run bounded OEM activation, literal no-motion parameterization, and queries."""
     ledger: list[dict[str, Any]] = []
@@ -217,50 +212,82 @@ def prepare_motion_without_motion(
         if not observed_ok:
             return _preparation_result(authority, ledger)
 
-    # Normal production initialCheck is a complete ESM(false) -> ESM(true)
-    # transition over all four constructed OEM boards. Activation-only recovery
-    # is not equivalent and must never preserve a stale motor profile.
+    # A component refresh inside an already established lifecycle must not run
+    # initialCheck's machine-wide cmd64 cycle. In particular, X is on board 5
+    # while the gravity-loaded Z head is on board 4. Cycling every board and
+    # then restoring only X removes Z holding current. OEM initialCheck avoids
+    # that incomplete state by following the cycle with full motor setup.
     cycle_boards = tuple(int(board) for board in authority.activation_boards)
-    try:
-        deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
-    except Exception as exc:
-        deactivation = {"error": f"{type(exc).__name__}: {exc}"}
-    deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
-    ledger.append(_stage(
-        "deactivateBoard",
-        "passed" if deactivation_ok else "failed",
-        "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
-        deactivation,
-    ))
-    if not deactivation_ok:
-        return _preparation_result(authority, ledger)
-
-    try:
-        activation = driver.activate_boards(expect_reply=True, fail_fast=True)
-    except Exception as exc:
-        activation = {"error": f"{type(exc).__name__}: {exc}"}
-    activation_ok = _board_cycle_ok(activation, cycle_boards)
-    ledger.append(_stage(
-        "activateBoard",
-        "passed" if activation_ok else "failed",
-        "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
-        activation,
-    ))
-    if not activation_ok:
-        return _preparation_result(authority, ledger)
-
-    try:
-        lifecycle = driver.oem_begin_board_lifecycle_generation(
-            deactivation=deactivation,
-            activation=activation,
+    if reuse_current_board_lifecycle:
+        generation_fn = getattr(driver, "oem_current_board_lifecycle_generation", None)
+        state_fn = getattr(driver, "_oem_board_state", None)
+        current_generation = generation_fn() if callable(generation_fn) else None
+        board_state = state_fn() if callable(state_fn) else None
+        lifecycle_ok = bool(
+            type(current_generation) is int
+            and isinstance(board_state, Mapping)
+            and all(board_state.get(board) is True for board in cycle_boards)
         )
-    except Exception as exc:
-        lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
+        lifecycle = {
+            "ok": lifecycle_ok,
+            "board_lifecycle_generation": current_generation if lifecycle_ok else None,
+            "reused": True,
+            "command64_emitted": False,
+            "required_initialized_boards": list(cycle_boards),
+            "initialized_boards": sorted(
+                int(board) for board in cycle_boards
+                if isinstance(board_state, Mapping) and board_state.get(board) is True
+            ),
+            "failure": None if lifecycle_ok else "current_board_lifecycle_unavailable_or_incomplete",
+        }
+    else:
+        # Normal production initialCheck is a complete ESM(false) -> ESM(true)
+        # transition over all four constructed OEM boards. Activation-only
+        # recovery is not equivalent and must not preserve a stale profile.
+        try:
+            deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
+        except Exception as exc:
+            deactivation = {"error": f"{type(exc).__name__}: {exc}"}
+        deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
+        ledger.append(_stage(
+            "deactivateBoard",
+            "passed" if deactivation_ok else "failed",
+            "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
+            deactivation,
+        ))
+        if not deactivation_ok:
+            return _preparation_result(authority, ledger)
+
+        try:
+            activation = driver.activate_boards(expect_reply=True, fail_fast=True)
+        except Exception as exc:
+            activation = {"error": f"{type(exc).__name__}: {exc}"}
+        activation_ok = _board_cycle_ok(activation, cycle_boards)
+        ledger.append(_stage(
+            "activateBoard",
+            "passed" if activation_ok else "failed",
+            "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
+            activation,
+        ))
+        if not activation_ok:
+            return _preparation_result(authority, ledger)
+
+        try:
+            lifecycle = driver.oem_begin_board_lifecycle_generation(
+                deactivation=deactivation,
+                activation=activation,
+            )
+        except Exception as exc:
+            lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
     ledger.append(_stage(
         "boardLifecycleGeneration",
         "passed" if lifecycle_ok else "failed",
-        "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1",
+        (
+            "Existing complete acknowledged OEM board lifecycle; component profile refresh emits no cmd64"
+            if reuse_current_board_lifecycle
+            else "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1"
+        ),
         lifecycle,
     ))
     if not lifecycle_ok:
@@ -305,50 +332,6 @@ def prepare_motion_without_motion(
     if not initialization_ok:
         invalidate_profile("initialize_without_motion_evidence_failed")
         return _preparation_result(authority, ledger)
-
-    # The serial-206 X and Z source sequences write neither SAP12 nor SAP13.
-    # Their machine-bound mask policy is verified here and repaired only through
-    # the separately admitted recovery transaction.
-    mask_contracts = {
-        "x": SERIAL206_X_SWITCH_MASKS,
-        "z": SERIAL206_Z_SWITCH_MASKS,
-    }
-    for axis, board, motor in (("x", 5, 0), ("z", 4, 1)):
-        if axis not in selected:
-            continue
-        expected_masks = mask_contracts[axis]
-        mask_rows: dict[str, Any] = {}
-        mask_ok = True
-        for parameter, label in ((12, "right_disable_param12"), (13, "left_disable_param13")):
-            try:
-                row = driver.motor_get_axis_param(board, parameter, motor=motor)
-            except Exception as exc:
-                row = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
-            mask_rows[label] = row
-            if _ack_status(row) != 100 or row.get("value") != expected_masks[parameter]:
-                mask_ok = False
-        mask_evidence = {
-            "board": board,
-            "motor": motor,
-            "writes": {},
-            "readbacks": mask_rows,
-            "source_sequence_modified": False,
-            "blocker": None if mask_ok else f"{axis}_switch_mask_incompatible",
-            "machine_bound_expected": expected_masks,
-            "source_anchor": (
-                "ClassMotor param12 right-disable; param13 left-disable; "
-                f"serial-206 {axis.upper()} source omits both writes"
-            ),
-        }
-        ledger.append(_stage(
-            f"{axis}_switch_mask_precondition",
-            "passed" if mask_ok else "failed",
-            f"effective serial-206 OEM {axis.upper()} switch-mask precondition",
-            mask_evidence,
-        ))
-        if not mask_ok:
-            invalidate_profile(f"{axis}_switch_mask_precondition_failed")
-            return _preparation_result(authority, ledger)
 
     readbacks: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -404,8 +387,7 @@ def physical_aggregate_stop(
     not prove that a mechanism physically moved or stopped, so operator-observed
     physical-effect verification remains explicitly false.
     """
-    latch = getattr(driver, "motor_oem_force_abort_motion", None)
-    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
+    force_abort_latch = None
     components: list[dict[str, Any]] = []
     present_rows: list[tuple[dict[str, Any], int, int]] = []
     for component, board, motor, present in authority.components:
@@ -423,10 +405,16 @@ def physical_aggregate_stop(
             })
             continue
         try:
-            stop = driver.motor_stop(board, motor=motor)
+            stop = driver.motor_oem_board_stop(board, motor=motor, axis_name=component)
         except Exception as exc:
-            stop = {"ack": None, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        acknowledged = bool(_ack_status(stop) == 100 and stop.get("ok") is True)
+            stop = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        acknowledged = bool(
+            isinstance(stop, Mapping)
+            and stop.get("source_call_completed") is True
+            and stop.get("source_return_code") == 0
+            and stop.get("double_stop_acknowledged") is True
+            and stop.get("controller_command_acknowledged") is True
+        )
         row = {
             "component": component,
             "board": board,
@@ -443,6 +431,11 @@ def physical_aggregate_stop(
         }
         components.append(row)
         present_rows.append((row, board, motor))
+
+    # ClassMotor.StopMotor must run before forceAbortMotion latches No24V.
+    # The source StopMotor path rejects delivery after that latch is active.
+    latch = getattr(driver, "motor_oem_force_abort_motion", None)
+    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
 
     # Complete the fan-out before polling so one slow component cannot delay a
     # StopMotor command to another component that may still be moving.

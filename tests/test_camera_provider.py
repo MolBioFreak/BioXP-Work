@@ -86,6 +86,10 @@ def test_camera_routes_are_finite_and_callers_cannot_select_device(monkeypatch):
         "/camera/status",
         "/camera/frame/latest",
         "/camera/snapshot",
+        "/camera/stream/start",
+        "/camera/stream/state",
+        "/camera/mjpeg",
+        "/camera/stream/stop",
     }
 
     with pytest.raises(ValidationError):
@@ -155,3 +159,40 @@ def test_camera_status_does_not_block_event_loop(monkeypatch):
         return event_loop_delay
 
     assert asyncio.run(scenario()) < 0.1
+
+
+def test_stream_control_routes_use_fixed_profile_and_reject_caller_parameters(monkeypatch):
+    from src.bioxp import api
+
+    async def start(payload):
+        assert payload == {}
+        return {"ok": True, "state": "live", "fps": 8, "width": 640, "height": 480}
+
+    async def stop(*, reason):
+        assert reason == "explicit stop"
+        return {"ok": True, "state": "off"}
+
+    monkeypatch.setattr(api, "_start_owned_camera_session", start)
+    monkeypatch.setattr(api, "_stop_owned_camera_session", stop)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api.app)
+    rejected_start = client.post("/camera/stream/start", json={"device": "/dev/video9"})
+    rejected_start_query = client.post("/camera/stream/start", params={"fps": 30}, json={})
+    started = client.post("/camera/stream/start", json={})
+    rejected_state_query = client.get("/camera/stream/state", params={"width": 1920})
+    rejected_stop = client.post("/camera/stream/stop", json={"quality": 2})
+    rejected_stop_query = client.post("/camera/stream/stop", params={"quality": 2}, json={})
+    stopped = client.post("/camera/stream/stop", json={})
+    rejected_mjpeg = client.get("/camera/mjpeg", params={"fps": 30})
+
+    assert rejected_start.status_code == 422
+    assert rejected_start_query.status_code == 422
+    assert started.status_code == 200
+    assert started.json()["fps"] == 8
+    assert rejected_state_query.status_code == 422
+    assert rejected_stop.status_code == 422
+    assert rejected_stop_query.status_code == 422
+    assert stopped.status_code == 200
+    assert rejected_mjpeg.status_code == 422

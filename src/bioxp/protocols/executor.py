@@ -14,9 +14,11 @@ class ProtocolExecutor:
         self,
         *,
         dry_run: bool = True,
+        job_id: str | None = None,
         handlers: Mapping[ProtocolActionKind | str, ActionHandler] | None = None,
     ) -> None:
         self.dry_run = bool(dry_run)
+        self.job_id = job_id
         self._handlers = {
             normalize_action_kind(kind): handler
             for kind, handler in (handlers or {}).items()
@@ -29,7 +31,11 @@ class ProtocolExecutor:
         state: ProtocolRuntimeState | None = None,
     ) -> ProtocolRuntimeState:
         validate_protocol_document(document)
-        runtime_state = state or ProtocolRuntimeState.from_document(document, dry_run=self.dry_run)
+        runtime_state = state or ProtocolRuntimeState.from_document(
+            document,
+            dry_run=self.dry_run,
+            job_id=self.job_id,
+        )
         if runtime_state.protocol_id != document.protocol_id:
             raise ValueError(
                 f"Protocol state belongs to '{runtime_state.protocol_id}', expected '{document.protocol_id}'."

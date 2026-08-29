@@ -4,7 +4,7 @@ from typing import Callable
 
 import pytest
 
-from src.bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+from src.bioxp.oem_serial206_initialization import Serial206OemInitializationProvider, Serial206ProductionPrimitiveAdapter
 from src.bioxp.usb_driver import BioXpTester
 
 
@@ -45,11 +45,9 @@ def test_z_profile_is_source_positive_board_four_motor_one(monkeypatch):
     assert "disable_left" not in profile
 
 
-def test_signed_z_reference_authority_is_retired():
+def test_signed_z_reference_authority_is_absent():
     tester = BioXpTester.__new__(BioXpTester)
-
-    with pytest.raises(RuntimeError, match="retired signed-Z reference authority"):
-        tester.motor_oem_move_z_to_reference(target_position=0, timeout_s=10)
+    assert not hasattr(tester, "motor_oem_move_z_to_reference")
 
 
 class _ZPrimitiveSpy:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from fastapi import HTTPException
 from ..pipette.models import (
@@ -43,6 +46,41 @@ def _validate_oem_admission(operation_name: str | None, command: Any | None) -> 
             )
 
 
+def _persist_failure(
+    *,
+    receipt_store: Any,
+    claim_record: dict[str, Any] | None,
+    operation_name: str | None,
+    failure_code: str,
+    message: str,
+    status: str,
+    requested_inputs: dict[str, Any],
+    runtime_binding: dict[str, Any] | None,
+) -> None:
+    if receipt_store is None or claim_record is None or not hasattr(receipt_store, "record_failure"):
+        return
+    command_id = claim_record.get("command_id")
+    operation_id = claim_record.get("pipette_operation_id") or command_id
+    if not command_id or not operation_id:
+        return
+    try:
+        receipt_store.record_failure(
+            command_id=str(command_id),
+            pipette_operation_id=str(operation_id),
+            operation=str(operation_name or "pipette"),
+            failure_code=str(failure_code),
+            message=str(message),
+            status=str(status),
+            requested_inputs=requested_inputs,
+            runtime_binding=runtime_binding,
+        )
+    except PipetteReceiptError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "pipette_failure_receipt_persistence_failed", "message": str(exc)},
+        ) from exc
+
+
 async def _run_transport_call(
     label: str,
     *,
@@ -57,34 +95,168 @@ async def _run_transport_call(
     runtime_binding: dict[str, Any] | None = None,
     requested_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    requested_for_receipt = (
+        dict(requested_inputs)
+        if requested_inputs is not None
+        else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
+    )
+    claim_record: dict[str, Any] | None = None
+    effective_runtime_binding = dict(runtime_binding or {})
+    if receipt_store is not None and hasattr(receipt_store, "claim"):
+        try:
+            from ..operator_controls import current_operator_dispatch_context
+
+            dispatch_context = current_operator_dispatch_context() or {}
+        except Exception:
+            dispatch_context = {}
+        binding = dict(runtime_binding or {})
+        control_class = (
+            "hardware_query"
+            if str(operation_name or label).lower() in {
+                "status",
+                "readback",
+                "query_status",
+                "query_pressure",
+                "read_pressure",
+                "query_tip_status",
+                "query_error_log",
+                "get_data",
+                "get_all_data",
+            }
+            else "physical_liquid_command"
+        )
+        idempotency_key = str(
+            effective_runtime_binding.get("idempotency_key")
+            or dispatch_context.get("idempotency_key")
+            or f"pipette-attempt:{uuid4().hex}"
+        )
+        effective_runtime_binding.setdefault(
+            "callback_session_id",
+            f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
+        )
+        binding = effective_runtime_binding
+        try:
+            claim_record, _ = receipt_store.claim(
+                operation=str(operation_name or label),
+                requested_inputs=requested_for_receipt,
+                entrypoint_id=str(
+                    binding.get("entrypoint_id")
+                    or dispatch_context.get("entrypoint_id")
+                    or f"service.pipette.{operation_name or label}"
+                ),
+                caller_class=str(
+                    binding.get("caller_class")
+                    or dispatch_context.get("caller_class")
+                    or "direct_api"
+                ),
+                control_class=str(binding.get("control_class") or control_class),
+                idempotency_key=idempotency_key,
+                command_id=(
+                    str(binding.get("command_id") or dispatch_context.get("operator_command_id"))
+                    if (binding.get("command_id") or dispatch_context.get("operator_command_id"))
+                    else None
+                ),
+                ownership_generation=int(
+                    binding.get("ownership_generation")
+                    or dispatch_context.get("expected_ownership_generation")
+                    or 0
+                ),
+                connection_generation=(
+                    int(binding["connection_generation"])
+                    if binding.get("connection_generation") is not None
+                    else (
+                        int(dispatch_context["connection_generation"])
+                        if dispatch_context.get("connection_generation") is not None
+                        else 0
+                    )
+                ),
+                protocol_job_id=binding.get("protocol_job_id"),
+                protocol_action_id=binding.get("protocol_action_id"),
+                lifecycle_stage_id=binding.get("lifecycle_stage_id"),
+                callback_session_id=binding.get("callback_session_id"),
+                runtime_binding=binding,
+            )
+        except (PipetteReceiptError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "pipette_claim_persistence_failed", "message": str(exc)},
+            ) from exc
     preflight_payload: dict[str, Any] | None = None
+    stage = "admission"
     try:
         _validate_oem_admission(operation_name, command)
-    except PipetteError as exc:
-        raise _pipette_error_to_http_exception(exc) from exc
-    if preflight is not None:
-        try:
+        if preflight is not None:
             preflight_payload = preflight(operation_name or label, command)
-        except PipetteError as exc:
-            raise _pipette_error_to_http_exception(exc) from exc
-        except ValueError as exc:
-            raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
-    transport = get_transport()
-    try:
+        stage = "transport"
+        transport = get_transport()
+        stage = "dispatch"
         result = await run_blocking(label, lambda: operation(transport), timeout_s=timeout_s)
+        if isinstance(result, dict) and effective_runtime_binding.get("callback_session_id"):
+            callback_session_id = str(effective_runtime_binding["callback_session_id"])
+            result.setdefault("callback_session_id", callback_session_id)
+            provenance = result.get("provenance")
+            if isinstance(provenance, dict):
+                result["provenance"] = {**provenance, "callback_session_id": callback_session_id}
     except PipetteError as exc:
+        status = "rejected" if stage == "admission" else "failed"
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code=exc.code,
+            message=exc.message,
+            status=status,
+            requested_inputs=requested_for_receipt,
+            runtime_binding=effective_runtime_binding,
+        )
         raise _pipette_error_to_http_exception(exc) from exc
     except ValueError as exc:
-        raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
+        failure_code = "validation_error" if stage == "admission" else "malformed_response"
+        status = "rejected" if stage == "admission" else "failed"
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code=failure_code,
+            message=str(exc),
+            status=status,
+            requested_inputs=requested_for_receipt,
+            runtime_binding=effective_runtime_binding,
+        )
+        if stage == "admission":
+            raise _pipette_error_to_http_exception(PipetteValidationError(str(exc))) from exc
+        raise HTTPException(status_code=502, detail={"error": failure_code, "message": str(exc)}) from exc
+    except asyncio.TimeoutError as exc:
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code="timeout",
+            message="pipette operation timed out",
+            status="failed",
+            requested_inputs=requested_for_receipt,
+            runtime_binding=effective_runtime_binding,
+        )
+        raise HTTPException(status_code=504, detail={"error": "timeout", "message": str(exc)}) from exc
+    except Exception as exc:
+        _persist_failure(
+            receipt_store=receipt_store,
+            claim_record=claim_record,
+            operation_name=operation_name or label,
+            failure_code="transport_exception" if stage != "admission" else "admission_exception",
+            message=str(exc),
+            status="failed" if stage != "admission" else "rejected",
+            requested_inputs=requested_for_receipt,
+            runtime_binding=effective_runtime_binding,
+        )
+        raise HTTPException(
+            status_code=503 if stage != "admission" else 400,
+            detail={"error": "pipette_operation_failed", "message": str(exc)},
+        ) from exc
     if preflight_payload is not None and isinstance(result, dict):
         result.setdefault("preflight", preflight_payload)
     if receipt_store is not None and isinstance(result, dict):
         try:
-            requested_for_receipt = (
-                dict(requested_inputs)
-                if requested_inputs is not None
-                else (command.to_payload() if command is not None and hasattr(command, "to_payload") else {})
-            )
             effective_candidate = result.get("effective")
             effective_inputs = dict(effective_candidate) if isinstance(effective_candidate, dict) else dict(requested_for_receipt)
             if "effective_volume_ul" in result:
@@ -96,7 +268,9 @@ async def _run_transport_call(
                 requested_inputs=requested_for_receipt,
                 effective_inputs=effective_inputs,
                 result=result,
-                runtime_binding=runtime_binding,
+                runtime_binding=effective_runtime_binding,
+                command_id=claim_record.get("command_id") if claim_record is not None else None,
+                pipette_operation_id=claim_record.get("pipette_operation_id") if claim_record is not None else None,
             )
         except PipetteReceiptError as exc:
             raise HTTPException(
@@ -106,6 +280,8 @@ async def _run_transport_call(
         result["receipt_id"] = receipt["receipt_id"]
         result["receipt_truth"] = receipt["truth"]
         result["source_identity"] = receipt["source_identity"]
+        if claim_record is not None and claim_record.get("command_id"):
+            result["command_id"] = claim_record["command_id"]
     return result
 
 
@@ -119,6 +295,7 @@ async def run_pipette_operation(
     receipt_store: PipetteReceiptStore | None = None,
     requested_inputs: dict[str, Any] | None = None,
     preflight: PipettePreflight | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Route a non-command OEM control through the same receipt/error owner."""
     return await _run_transport_call(
@@ -131,6 +308,7 @@ async def run_pipette_operation(
         preflight=preflight,
         receipt_store=receipt_store,
         requested_inputs=requested_inputs,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -139,6 +317,7 @@ async def run_pipette_status(
     get_transport: TransportGetter,
     run_blocking: BlockingRunner,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette status",
@@ -148,6 +327,7 @@ async def run_pipette_status(
         operation=lambda transport: transport.get_status(),
         operation_name="status",
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -158,6 +338,7 @@ async def run_pipette_init_command(
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette init",
@@ -169,6 +350,7 @@ async def run_pipette_init_command(
         command=command,
         preflight=preflight,
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -179,6 +361,7 @@ async def run_pipette_tip_command(
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette tip",
@@ -190,6 +373,7 @@ async def run_pipette_tip_command(
         command=command,
         preflight=preflight,
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -200,6 +384,7 @@ async def run_pipette_aspirate_command(
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette aspirate",
@@ -211,6 +396,7 @@ async def run_pipette_aspirate_command(
         command=command,
         preflight=preflight,
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -221,6 +407,7 @@ async def run_pipette_dispense_command(
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette dispense",
@@ -232,6 +419,7 @@ async def run_pipette_dispense_command(
         command=command,
         preflight=preflight,
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )
 
 
@@ -242,6 +430,7 @@ async def run_pipette_mix_command(
     run_blocking: BlockingRunner,
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette mix",
@@ -253,4 +442,5 @@ async def run_pipette_mix_command(
         command=command,
         preflight=preflight,
         receipt_store=receipt_store,
+        runtime_binding=runtime_binding,
     )

@@ -1,0 +1,1939 @@
+{
+  "caller_scan": {
+    "match_count": 311,
+    "pattern": "\\b(?:moveY|moveSteps|moveXY|HomeXY|HomeAxis|axisSearchHome|goHome|setHome|StopMotor|forceAbortMotion|enableXY|enableXYZ|enableYZ|moveToAbs|MovetoRelPosition|beyondLimit)\\b",
+    "rows": [
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1318,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "moveY(500, 300);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1324,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "Task task3 = Task.Run(() => x = m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(true, m_AxisIODesignater[\"MotorX\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1325,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "Task task4 = Task.Run(() => y = m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1351,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "moveY(500, 300);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1355,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "task3 = Task.Run(() => x = m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(true, m_AxisIODesignater[\"MotorX\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1356,
+        "method": "private void btnXYTest_Click(int cycles)",
+        "source_text": "task4 = Task.Run(() => y = m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1381,
+        "method": "private void btnZGTest_Click(int cycles)",
+        "source_text": "HomeAxis(\"g\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1410,
+        "method": "private void btnZGTest_Click(int cycles)",
+        "source_text": "int num = HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1411,
+        "method": "private void btnZGTest_Click(int cycles)",
+        "source_text": "int num2 = HomeAxis(\"g\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 1439,
+        "method": "private void btntpMoveDoor_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, result, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2036,
+        "method": "private void btnClose_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, m_settingsWindow.m_gripperposition[(GripperStatus)2], true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2059,
+        "method": "private void btnGripperHome_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(true, m_AxisIODesignater[\"MotorGrip\"].axis, 600, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2063,
+        "method": "private void btnGripperHome_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(true, m_AxisIODesignater[\"MotorGrip\"].axis, 200, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2116,
+        "method": "private void btnMoveDTo_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, result, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2273,
+        "method": "private void btnHomeX_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(true, m_AxisIODesignater[\"MotorX\"].axis, 500, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2313,
+        "method": "private void btnHomeY_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 500, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2336,
+        "method": "private void btnMoveYTo_Click(object sender, RoutedEventArgs e)",
+        "source_text": "moveY(result, waitforstop: false, appAdjustment: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2361,
+        "method": "private void btnHomeZ_Click(object sender, RoutedEventArgs e)",
+        "source_text": "int num = m_Boards[m_AxisIODesignater[\"MotorZ\"].board].goHome(true, m_AxisIODesignater[\"MotorZ\"].axis, 1791, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2630,
+        "method": "public void moveDoor(int pos)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, pos, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2657,
+        "method": "public bool openThermalDoor()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, m_settingsWindow.TCDoorOpen, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 2687,
+        "method": "public bool closeThermalDoor()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, 0, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3352,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].axisSearchHome(m_AxisIODesignater[\"MotorZ\"].axis, 1791);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3355,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveSteps(m_AxisIODesignater[\"MotorGrip\"].axis, 10000, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3360,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].axisSearchHome(m_AxisIODesignater[\"MotorGrip\"].axis, 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3364,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].axisSearchHome(m_AxisIODesignater[\"MotorGrip\"].axis, 200);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3369,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].axisSearchHome(m_AxisIODesignater[\"MotorX\"].axis, 250);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3371,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].setHome(m_AxisIODesignater[\"MotorX\"].axis);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3378,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].axisSearchHome(m_AxisIODesignater[\"MotorY\"].axis, 250);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3391,
+        "method": "public void initializeMotors()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].setHome(m_AxisIODesignater[\"MotorY\"].axis);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3558,
+        "method": "public int OpenGripper(bool recover = false, bool openwide = false, bool resetSpeed = true, bool resetStallGThre = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, m_settingsWindow.m_gripperposition[(GripperStatus)4], true, recover, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3562,
+        "method": "public int OpenGripper(bool recover = false, bool openwide = false, bool resetSpeed = true, bool resetStallGThre = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, m_settingsWindow.m_gripperposition[(GripperStatus)3], true, recover, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3589,
+        "method": "public int CloseGripper(bool resetSpeed = true, bool resetStallGThre = true, int stallGuardThre = 5)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, m_settingsWindow.m_gripperposition[(GripperStatus)2], true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3617,
+        "method": "public void StopCloseGripper(bool resetSpeed = true, bool resetStallGThre = true, int stallGuardThre = 5)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, m_settingsWindow.m_gripperposition[(GripperStatus)1], true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3631,
+        "method": "public void sendGripperHome()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(true, m_AxisIODesignater[\"MotorGrip\"].axis, 600, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3635,
+        "method": "public void sendGripperHome()",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(true, m_AxisIODesignater[\"MotorGrip\"].axis, 200, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3871,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3879,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3885,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY((int)((Point)(ref midPoint[i])).X, (int)((Point)(ref midPoint[i])).Y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3894,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY(82450, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3901,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY((int)((Point)(ref midPoint[j])).X, (int)((Point)(ref midPoint[j])).Y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3912,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveSteps(\"x\", -1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3926,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3936,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3945,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3950,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3962,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(PositionTable[(locationID)3].y + m_yIncrement / 2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3964,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3967,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveSteps(\"x\", -1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3974,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(m_settingsWindow.PositionTable[(locationID)19].y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3977,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3981,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveSteps(\"x\", -1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 3999,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(46600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4002,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4006,
+        "method": "public int scriptmoveTo(locationID currentLoc, wellID currentWell, locationID locationid, int column, int row, int positionflag = 0, bool runInParallel = true)",
+        "source_text": "moveSteps(\"x\", -1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4038,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveXY(num + num5, num2 + num6);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4041,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveXY(num - num5, num2 - num6);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4044,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveXY(num - num5, num2 + num6);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4047,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveXY(num + num5, num2 - num6);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4050,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveXY(num, num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4054,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveY(num2 + num6 / 2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4056,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveY(num2 - num6 / 2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4058,
+        "method": "public int hokeypokey(locationID locationid, int column, int row)",
+        "source_text": "moveY(num2 + num6 / 2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4111,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3 - num5);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4114,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3 + num5);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4117,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4125,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3 + num5);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4127,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4128,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3 - num5);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4131,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4132,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3 + num5);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4134,
+        "method": "public int CirclePunch(locationID locationid, int column, int row)",
+        "source_text": "moveY(num3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4165,
+        "method": "public int moveSteps(string axis, int steps)",
+        "source_text": "public int moveSteps(string axis, int steps)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4174,
+        "method": "public int moveSteps(string axis, int steps)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].moveSteps(m_AxisIODesignater[\"MotorX\"].axis, steps, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4182,
+        "method": "public int moveSteps(string axis, int steps)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].moveSteps(m_AxisIODesignater[\"MotorY\"].axis, steps, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4190,
+        "method": "public int moveSteps(string axis, int steps)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveSteps(m_AxisIODesignater[\"MotorZ\"].axis, steps, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4198,
+        "method": "public int moveSteps(string axis, int steps)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveSteps(m_AxisIODesignater[\"MotorGrip\"].axis, steps, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4217,
+        "method": "public void moveX(int x, int acc, bool waitforstop = true, bool appAdjustment = true, ManualResetEvent moveStarted = null)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].moveToAbs(m_AxisIODesignater[\"MotorX\"].axis, num, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4222,
+        "method": "public void moveY(int y, int acc, bool waitforstop = true, bool appAdjustment = true, ManualResetEvent moveStarted = null)",
+        "source_text": "public void moveY(int y, int acc, bool waitforstop = true, bool appAdjustment = true, ManualResetEvent moveStarted = null)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4228,
+        "method": "public void moveY(int y, int acc, bool waitforstop = true, bool appAdjustment = true, ManualResetEvent moveStarted = null)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].moveToAbs(m_AxisIODesignater[\"MotorY\"].axis, y, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4242,
+        "method": "public void moveX(int x, bool waitforstop = true, bool appAdjustment = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].moveToAbs(m_AxisIODesignater[\"MotorX\"].axis, num, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4246,
+        "method": "public void moveY(int y, bool waitforstop = true, bool appAdjustment = true)",
+        "source_text": "public void moveY(int y, bool waitforstop = true, bool appAdjustment = true)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4250,
+        "method": "public void moveY(int y, bool waitforstop = true, bool appAdjustment = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].moveToAbs(m_AxisIODesignater[\"MotorY\"].axis, y, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4264,
+        "method": "public void moveZ(int z, int motorCurrent = 31, bool appAdjustment = true, bool waitforstop = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveToAbs(m_AxisIODesignater[\"MotorZ\"].axis, num, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4272,
+        "method": "public void moveG(int z, bool waitforstop = true)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, z, waitforstop, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4285,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "public void moveXY(int x, int y)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4309,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4332,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].moveToAbs(m_AxisIODesignater[\"MotorX\"].axis, x, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4337,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].moveToAbs(m_AxisIODesignater[\"MotorY\"].axis, y, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4341,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].moveToAbs(m_AxisIODesignater[\"MotorY\"].axis, y, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4346,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].moveToAbs(m_AxisIODesignater[\"MotorX\"].axis, x, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4357,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "ClassMessageLog.logMessage(\"moveXY timeout 1 ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4363,
+        "method": "public void moveXY(int x, int y)",
+        "source_text": "ClassMessageLog.logMessage(\"moveXY timeout 2 ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4380,
+        "method": "public void moveGZ(int g, int z)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].moveToAbs(m_AxisIODesignater[\"MotorGrip\"].axis, g, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4381,
+        "method": "public void moveGZ(int g, int z)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveToAbs(m_AxisIODesignater[\"MotorZ\"].axis, z, false, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4407,
+        "method": "public void lowerPipette(locationID location)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveToAbs(m_AxisIODesignater[\"MotorZ\"].axis, PositionTable[location].zLow, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4418,
+        "method": "public void lowerPipette(locationID location, bool overpress)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveToAbs(m_AxisIODesignater[\"MotorZ\"].axis, PositionTable[location].zLow + 4030, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4429,
+        "method": "public void liftPipette(locationID location)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorZ\"].board].moveToAbs(m_AxisIODesignater[\"MotorZ\"].axis, PositionTable[location].zHigh, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4482,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(true, m_AxisIODesignater[\"MotorX\"].axis, 1700, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4489,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 1800, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4498,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(true, m_AxisIODesignater[\"MotorX\"].axis, 1700, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4502,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 1800, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4527,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4535,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(m_settingsWindow.PositionTable[(locationID)19].y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4543,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 1800, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4548,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(y, yAcc);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4566,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 1800, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4571,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(y, yAcc);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4583,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(true, m_AxisIODesignater[\"MotorY\"].axis, 1800, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4588,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(y, yAcc);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4597,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(y, yAcc, waitforstop: true, appAdjustment: true, moveStarted2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4609,
+        "method": "public int moveTo(int x, int y, int z, bool runInParalel)",
+        "source_text": "moveY(y, yAcc);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4629,
+        "method": "public int MoveZHome(bool rehome = true)",
+        "source_text": "return m_Boards[m_AxisIODesignater[\"MotorZ\"].board].goHome(rehome, m_AxisIODesignater[\"MotorZ\"].axis, 1791, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4661,
+        "method": "public void homeGZ(int delay)",
+        "source_text": "HomeAxis(\"G\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4673,
+        "method": "public void homeGZ(int delay)",
+        "source_text": "num = ((m_settingsWindow.GripperVersion != 0) ? m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(false, m_AxisIODesignater[\"MotorGrip\"].axis, 200, true) : m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].goHome(false, m_AxisIODesignater[\"MotorGrip\"].axis, 600, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4677,
+        "method": "public void homeGZ(int delay)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(false, m_AxisIODesignater[\"MotorX\"].axis, 1700, true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 4997,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "internal int HomeAxis(string axis)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5006,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "result = m_Boards[m_AxisIODesignater[\"MotorX\"].board].axisSearchHome(m_AxisIODesignater[\"MotorX\"].axis, 250);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5013,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "result = m_Boards[m_AxisIODesignater[\"MotorY\"].board].axisSearchHome(m_AxisIODesignater[\"MotorY\"].axis, 250);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5021,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "result = m_Boards[m_AxisIODesignater[\"MotorZ\"].board].axisSearchHome(m_AxisIODesignater[\"MotorZ\"].axis, 597);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5030,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "result = ((m_settingsWindow.GripperVersion != 0) ? m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].axisSearchHome(m_AxisIODesignater[\"MotorGrip\"].axis, 200) : m_Boards[m_AxisIODesignater[\"MotorGrip\"].board].axisSearchHome(m_AxisIODesignater[\"MotorGrip\"].axis, 150));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5044,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "m_Boards[m_AxisIODesignater[\"ThermalDoor\"].board].moveToAbs(m_AxisIODesignater[\"ThermalDoor\"].axis, 1000, true, false, false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5054,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "internal int[] HomeXY()"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5062,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "Task task = Task.Run(() => x = m_Boards[m_AxisIODesignater[\"MotorX\"].board].goHome(false, m_AxisIODesignater[\"MotorX\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5063,
+        "method": "internal int HomeAxis(string axis)",
+        "source_text": "Task task2 = Task.Run(() => y = m_Boards[m_AxisIODesignater[\"MotorY\"].board].goHome(false, m_AxisIODesignater[\"MotorY\"].axis, 200, true));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5082,
+        "method": "internal void moveAxis(string axis, int pos)",
+        "source_text": "moveY(pos);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5095,
+        "method": "internal void forceAbortMotion()",
+        "source_text": "internal void forceAbortMotion()"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5103,
+        "method": "internal void forceAbortMotion()",
+        "source_text": "m_Boards[i].forceAbortMotion();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5113,
+        "method": "internal void enableXYZ(bool enable)",
+        "source_text": "internal void enableXYZ(bool enable)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5161,
+        "method": "internal void enableXY(bool enable)",
+        "source_text": "internal void enableXY(bool enable)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+        "line": 5224,
+        "method": "internal void enableYZ(bool enable)",
+        "source_text": "internal void enableYZ(bool enable)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 60,
+        "method": "public override int goHome(bool rehome, int axis, int speed, bool waitforstop = true)",
+        "source_text": "public override int goHome(bool rehome, int axis, int speed, bool waitforstop = true)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 78,
+        "method": "public override int goHome(bool rehome, int axis, int speed, bool waitforstop = true)",
+        "source_text": "result = moveToAbs(axis, 10000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 101,
+        "method": "public override int goHome(bool rehome, int axis, int speed, bool waitforstop = true)",
+        "source_text": "moveToAbs(axis, position, waitforstop: true, stallRecover: false, gripperRecover: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 113,
+        "method": "public override int goHome(bool rehome, int axis, int speed, bool waitforstop = true)",
+        "source_text": "setHome(axis);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 121,
+        "method": "public override void setHome(int axis)",
+        "source_text": "public override void setHome(int axis)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 123,
+        "method": "public override void setHome(int axis)",
+        "source_text": "m_Motors[axis].setHome();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 158,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 162,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "throw new Exception(\"Lost 24V power move abs1. moveToAbs() axis: \" + AxisName(axis) + \"; position: \" + position);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 184,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "m_Motors[axis].moveToAbs(position);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 191,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "axisSearchHome(axis, 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 195,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "axisSearchHome(axis, 1500);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 198,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "axisSearchHome(0, 1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 226,
+        "method": "public override int moveToAbs(int axis, int position, bool waitforstop = true, bool stallRecover = false, bool gripperRecover = false)",
+        "source_text": "throw new Exception(\"Lost 24V power move abs2. moveToAbs() axis: \" + AxisName(axis) + \"; position: \" + position);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 231,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "public override int moveSteps(int axis, int steps, bool waitforstop = true)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 235,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "throw new Exception(\"Lost 24V power moveSteps1. moveSteps() axis: \" + AxisName(axis) + \"; steps: \" + steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 241,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "if (m_Motors[axis].beyondLimit(steps + m_Motors[axis].CurrentPosition))"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 244,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "if (m_Motors[axis].beyondLimit(steps + m_Motors[axis].CurrentPosition))"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 248,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "throw new Exception(\"Lost 24V power moveSteps2. moveSteps() axis: \" + AxisName(axis) + \"; steps: \" + steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 256,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "m_Motors[axis].MovetoRelPosition(steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 272,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "throw new Exception(\"Lost 24V power moveSteps3. moveSteps() axis: \" + AxisName(axis) + \"; steps: \" + steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 283,
+        "method": "public override int moveSteps(int axis, int steps, bool waitforstop = true)",
+        "source_text": "throw new Exception(\"Lost 24V power moveSteps4. moveSteps() axis: \" + AxisName(axis) + \"; steps: \" + steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 312,
+        "method": "public override void stopMotor(int axis, bool waitforstop = true)",
+        "source_text": "m_Motors[axis].StopMotor();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 334,
+        "method": "public override void doorSearchHome(int axis, int speed, int stallThread)",
+        "source_text": "moveSteps(axis, 2000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 356,
+        "method": "public override void doorSearchHome(int axis, int speed, int stallThread)",
+        "source_text": "setHome(axis);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 360,
+        "method": "public override void doorSearchHome(int axis, int speed, int stallThread)",
+        "source_text": "setHome(axis);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 368,
+        "method": "public override int axisSearchHome(int axis, int speed)",
+        "source_text": "public override int axisSearchHome(int axis, int speed)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 372,
+        "method": "public override int axisSearchHome(int axis, int speed)",
+        "source_text": "throw new Exception(\"Lost 24V power axisSearchHome(). axis: \" + AxisName(axis));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 378,
+        "method": "public override int axisSearchHome(int axis, int speed)",
+        "source_text": "m_Motors[axis].setHome();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 382,
+        "method": "public override int axisSearchHome(int axis, int speed)",
+        "source_text": "moveToAbs(axis, 10000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 386,
+        "method": "public override int axisSearchHome(int axis, int speed)",
+        "source_text": "return goHome(rehome: false, axis, speed);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 453,
+        "method": "public void HomeZandGripper(int axis1, int speed1, int axis2, int speed2)",
+        "source_text": "moveToAbs(axis1, 1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 454,
+        "method": "public void HomeZandGripper(int axis1, int speed1, int axis2, int speed2)",
+        "source_text": "moveToAbs(axis2, 1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 481,
+        "method": "public void HomeZandGripper(int axis1, int speed1, int axis2, int speed2)",
+        "source_text": "setHome(axis1);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 492,
+        "method": "public void HomeZandGripper(int axis1, int speed1, int axis2, int speed2)",
+        "source_text": "setHome(axis2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+        "line": 523,
+        "method": "public override void forceAbortMotion()",
+        "source_text": "public override void forceAbortMotion()"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 161,
+        "method": "public int StopMotor()",
+        "source_text": "public int StopMotor()"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 166,
+        "method": "public int StopMotor()",
+        "source_text": "m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array, \"StopMotor\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 167,
+        "method": "public int StopMotor()",
+        "source_text": "byte[] array2 = m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array, \"StopMotor\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 170,
+        "method": "public int StopMotor()",
+        "source_text": "ClassMessageLog.logMessage(\"StopMotor returned null ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 180,
+        "method": "public int StopMotor()",
+        "source_text": "ClassMessageLog.logMessage(\"StopMotor return error: \" + m_AxisID + \"; return: \" + array2[1] + \" ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 231,
+        "method": "public int MovetoRelPosition(int steps)",
+        "source_text": "public int MovetoRelPosition(int steps)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 246,
+        "method": "public int MovetoRelPosition(int steps)",
+        "source_text": "byte[] array2 = m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array, \"MovetoRelPosition\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 249,
+        "method": "public int MovetoRelPosition(int steps)",
+        "source_text": "ClassMessageLog.logMessage(\"MovetoRelPosition returned null ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 258,
+        "method": "public int MovetoRelPosition(int steps)",
+        "source_text": "ClassMessageLog.logMessage(\"MovetoRelPosition return error: \" + m_AxisID + \"; return: \" + array2[1] + \" ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 290,
+        "method": "public int moveToAbs(int pos)",
+        "source_text": "public int moveToAbs(int pos)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 323,
+        "method": "public int moveToAbs(int pos)",
+        "source_text": "byte[] array3 = m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array2, \"moveToAbs\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 326,
+        "method": "public int moveToAbs(int pos)",
+        "source_text": "array3 = m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array2, \"moveToAbs\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 327,
+        "method": "public int moveToAbs(int pos)",
+        "source_text": "ClassMessageLog.logMessage(\"moveToAbs returned null ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 336,
+        "method": "public int moveToAbs(int pos)",
+        "source_text": "ClassMessageLog.logMessage(\"moveToAbs return error: \" + m_AxisID + \"; return: \" + array3[1] + \" ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 492,
+        "method": "public int setHome()",
+        "source_text": "public int setHome()"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 500,
+        "method": "public int setHome()",
+        "source_text": "byte[] array2 = m_canControl.TransmitMessage(m_byteCANid[1], m_byteCANid[0], array, \"setHome\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 503,
+        "method": "public int setHome()",
+        "source_text": "ClassMessageLog.logMessage(\"setHome returned null ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 512,
+        "method": "public int setHome()",
+        "source_text": "ClassMessageLog.logMessage(\"setHome return error: \" + m_AxisID + \"; return: \" + array2[1] + \" ****************\", false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+        "line": 774,
+        "method": "public bool beyondLimit(int pos)",
+        "source_text": "public bool beyondLimit(int pos)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1422,
+        "method": "private void btnPDown_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", result);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1431,
+        "method": "private void btnPup_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", -result);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1734,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", 80000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1752,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 2132);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1756,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", -2132);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1767,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", (int)(num7 * 236.94));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1769,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", (int)(num7 * 236.94));"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1772,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 7463);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1773,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", -3198);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1774,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 3198);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1775,
+        "method": "private bool calibrateCamera()",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", -3198);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1857,
+        "method": "private bool adjustFocus()",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", 1000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 1871,
+        "method": "private bool adjustFocus()",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", num6);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2155,
+        "method": "private void btnStart_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2204,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2213,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2230,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2247,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2264,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2281,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2298,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2315,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2332,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2349,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2366,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2407,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2426,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2436,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 4000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2444,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2466,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2484,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2504,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2521,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2541,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2557,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2577,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2586,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2606,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2624,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2645,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2670,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2683,
+        "method": "private void btnAutoNext_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2712,
+        "method": "private void autoCalibrate(string location)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2714,
+        "method": "private void autoCalibrate(string location)",
+        "source_text": "int steps = m_ControlInterface.HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2720,
+        "method": "private void autoCalibrate(string location)",
+        "source_text": "steps = m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2722,
+        "method": "private void autoCalibrate(string location)",
+        "source_text": "steps = m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2863,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.HomeAxis(\"d\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2868,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.HomeAxis(\"g\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2880,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "doorPosition = m_ControlInterface.moveSteps(\"g\", -result3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2887,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "doorPosition = m_ControlInterface.moveSteps(\"g\", result3);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2896,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2915,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2934,
+        "method": "private void btnTPCalibration_click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2985,
+        "method": "private void chkEnableXY_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 2990,
+        "method": "private void chkEnableXY_Click(object sender, RoutedEventArgs e)",
+        "source_text": "m_ControlInterface.enableXY(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3059,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3060,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num2 = m_ControlInterface.HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3061,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num3 = m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3063,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "num2 = m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3065,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.moveY(num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3067,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3076,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3077,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num2 = m_ControlInterface.HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3078,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num3 = m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3080,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "num2 = m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3082,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.moveY(num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3084,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3093,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3094,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num2 = m_ControlInterface.HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3095,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num3 = m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3097,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "num2 = m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3099,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.moveY(num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3101,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3110,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: true);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3111,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num2 = m_ControlInterface.HomeAxis(\"z\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3112,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "int num3 = m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3114,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "num2 = m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3120,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.moveY((int)m_y_shift.Average());"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 3122,
+        "method": "private void imgPoolPlate_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)",
+        "source_text": "m_ControlInterface.enableXYZ(enable: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4367,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveXY(34000, 500);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4627,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", -8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4649,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", -8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4671,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", 8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4693,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 4715,
+        "method": "private bool CalibrateStripHandlLocation()",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", 8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 5115,
+        "method": "public void run_job(bool delayed_start = false)",
+        "source_text": "m_ControlInterface.HomeAxis(\"g\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6695,
+        "method": "private void sendText(string str)",
+        "source_text": "forceAbortMotion();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6699,
+        "method": "private void sendText(string str)",
+        "source_text": "forceAbortMotion();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6952,
+        "method": "private void sendText(string str)",
+        "source_text": "m_ControlInterface.moveY(y + 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6953,
+        "method": "private void sendText(string str)",
+        "source_text": "m_ControlInterface.moveY(y - 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6954,
+        "method": "private void sendText(string str)",
+        "source_text": "m_ControlInterface.moveY(y + 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6955,
+        "method": "private void sendText(string str)",
+        "source_text": "m_ControlInterface.moveY(y - 600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 6956,
+        "method": "private void sendText(string str)",
+        "source_text": "m_ControlInterface.moveY(y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7104,
+        "method": "public void parkGantry(bool rehome = false)",
+        "source_text": "int[] array = m_ControlInterface.HomeXY();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7274,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x + num4, y + num4);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7275,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x - num4, y + num4);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7276,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x - num4, y - num4);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7277,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x + num4, y - num4);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7278,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x + num4, y + num4);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7279,
+        "method": "private void rmb(double aspirate_volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, bool orbit, int count, bool tipDip)",
+        "source_text": "m_ControlInterface.moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7598,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x + num2, y + num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7605,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x - num2, y + num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7612,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x - num2, y - num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7619,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x + num2, y - num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7626,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x + num2, y + num2);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 7633,
+        "method": "private void mmix(double volume, double aspirate_air, double aspirate_speed, int aspirate_delay, double dispense_volume, double dispense_speed, int dispense_delay, int count, bool tipDip, string mixType)",
+        "source_text": "m_ControlInterface.moveXY(x, y);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8386,
+        "method": "public void catchPlate(plateName plate, bool runInParallel = true)",
+        "source_text": "m_ControlInterface.moveSteps(\"z\", -6000);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8387,
+        "method": "public void catchPlate(plateName plate, bool runInParallel = true)",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", -800);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8388,
+        "method": "public void catchPlate(plateName plate, bool runInParallel = true)",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", 1600);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8587,
+        "method": "public bool doorOpen(bool bopen, bool scriptRunning = false)",
+        "source_text": "m_ControlInterface.HomeAxis(\"D\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8604,
+        "method": "public bool doorOpen(bool bopen, bool scriptRunning = false)",
+        "source_text": "m_ControlInterface.HomeAxis(\"D\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 8878,
+        "method": "private void surveyTips(int index)",
+        "source_text": "m_ControlInterface.HomeAxis(\"g\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 9321,
+        "method": "private void shiftCameraForTrayPicture()",
+        "source_text": "m_ControlInterface.moveSteps(\"X\", 2832);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 9322,
+        "method": "private void shiftCameraForTrayPicture()",
+        "source_text": "m_ControlInterface.moveSteps(\"Y\", -1888);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 9991,
+        "method": "private unsafe bool checkTips(int tiptray, tipLocation tiplocation)",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", num);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 9992,
+        "method": "private unsafe bool checkTips(int tiptray, tipLocation tiplocation)",
+        "source_text": "m_ControlInterface.moveSteps(\"x\", steps);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10106,
+        "method": "private unsafe bool checkTips(int tiptray, tipLocation tiplocation)",
+        "source_text": "m_ControlInterface.moveSteps(\"y\", 8528);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10564,
+        "method": "public void forceAbortMotion(bool waitforpipette = false)",
+        "source_text": "public void forceAbortMotion(bool waitforpipette = false)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10593,
+        "method": "public void forceAbortMotion(bool waitforpipette = false)",
+        "source_text": "m_ControlInterface.forceAbortMotion();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10608,
+        "method": "public void forceAbortMotion(bool waitforpipette = false)",
+        "source_text": "m_ControlInterface.forceAbortMotion();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10715,
+        "method": "public bool selftest()",
+        "source_text": "m_ControlInterface.HomeAxis(\"x\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10716,
+        "method": "public bool selftest()",
+        "source_text": "m_ControlInterface.HomeAxis(\"y\");"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10726,
+        "method": "public bool selftest()",
+        "source_text": "m_ControlInterface.moveY(m_settingsWindow.SelfTestYMax, waitforstop: true, appAdjustment: false);"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10732,
+        "method": "public bool selftest()",
+        "source_text": "int[] array = m_ControlInterface.HomeXY();"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10745,
+        "method": "public bool selftest()",
+        "source_text": "if (Math.Abs(m_ControlInterface.HomeAxis(\"z\") - m_settingsWindow.SelfTestZMax) > 100)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 10751,
+        "method": "public bool selftest()",
+        "source_text": "if (Math.Abs(m_ControlInterface.HomeAxis(\"g\") - m_settingsWindow.m_gripperposition[(GripperStatus)2]) > 500)"
+      },
+      {
+        "file": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+        "line": 11041,
+        "method": "public void homeGripper()",
+        "source_text": "m_ControlInterface.HomeAxis(\"g\");"
+      }
+    ]
+  },
+  "intentional_replacements": [
+    "one SQLite movement authority and resource scheduler",
+    "shared board-4 epoch with independent axis authority",
+    "STOP interrupt epoch fence and existing operator fallback",
+    "typed v2 robot/BMS relay and cockpit projection"
+  ],
+  "physical_scope": "No controller mutation or physical motion is authorized by this artifact.",
+  "purpose": "Exact recovered OEM source and selected-machine contract for Serial-206 Y implementation.",
+  "recovered_files": [
+    {
+      "line_count": 5558,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+      "sha256": "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
+    },
+    {
+      "line_count": 560,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+      "sha256": "342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea"
+    },
+    {
+      "line_count": 799,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassMotor.cs",
+      "sha256": "9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99"
+    },
+    {
+      "line_count": 237,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_can/ClassCanLib/ClassNovoCommandQueue.cs",
+      "sha256": "70bed5af6c244d63f6506e1ed9003d5c3e9f07dae5aac1262520ec56506f35dd"
+    },
+    {
+      "line_count": 11220,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/ControlLib.cs",
+      "sha256": "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+    },
+    {
+      "line_count": 787,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src/BioXPControlLib/WindowDiagnosticPanel.cs",
+      "sha256": "175d932b5e9de07ed81746b23519210e5a7d3d6362e62a26a7b21aef15f47d22"
+    },
+    {
+      "line_count": 64,
+      "path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/oem_machine_runtime_bundle_serial206/appdata/config.xml",
+      "sha256": "33aadf87f631cf33f2e0b4c86948c92be3b21412ca5477ea8fa8bc7848cbf475"
+    }
+  ],
+  "robot_baseline": {
+    "commit": "3d317b25037caa96faaea627563d6b68ac2ab302",
+    "tree": "97a02766cf02ce9ffd55bc55378327bc0350b277"
+  },
+  "schema_version": "bioxp.serial206_y_axis_source_lock.v1",
+  "selected_machine": {
+    "board": 4,
+    "home_switch": "GAP9",
+    "home_switch_raw_active": 1,
+    "max_current": 31,
+    "max_steps": 102956,
+    "min_steps": 0,
+    "motor": 0,
+    "normal_acceleration": 400,
+    "normal_speed": 1800,
+    "right_switch_disabled": true,
+    "stall_event": 130,
+    "stall_guard": 16,
+    "target_event": 128
+  }
+}

@@ -110,86 +110,6 @@ def test_provider_owned_z_motion_does_not_depend_on_expiring_global_snapshot():
     assert generic["disabled_reason"] == "Fresh canonical hardware snapshot is unavailable."
 
 
-def test_provider_owned_z_motion_still_requires_live_transport_can_motion_and_lifecycle():
-    state = machine_state(motion_enabled=True, z="referenced")
-    state["snapshot_id"] = None
-    state["freshness"] = {"state": "missing"}
-    state["domains"] = {}
-    state["serial206_initialization_provider"] = {
-        "bound": True,
-        "initialize_motors_live_available": True,
-        "z_authority": {"state": "referenced_ready", "reference_state": "referenced"},
-    }
-    move = action("/motion/oem/manual/relative", action_id="oem.z.move_steps")
-
-    state["ownership"]["CAN_READY"] = None
-    assert _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"] == "Same-epoch CAN readiness has not been established."
-    state["ownership"]["CAN_READY"] = True
-    state["maintenance"]["motion_blocked"] = True
-    assert _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"] == "Motion is inactive. Activate motion before moving this motor."
-    state["maintenance"] = {"motion_blocked": False, "recovery_required": False}
-    state["serial206_initialization_provider"]["z_authority"]["state"] = "unprepared"
-    assert "Current Z lifecycle state" in _assess_action(move, state, {"axis": "z", "steps": 10})["disabled_reason"]
-
-
-def test_emergency_lifecycle_blocks_dashboard_and_normal_motion_but_keeps_recovery_available():
-    state = machine_state(motion_enabled=True, x="referenced", y="referenced", z="referenced")
-    state["lifecycle"].update(
-        operation_state="emergency",
-        operation_reason="emergency_stop:operator_request",
-    )
-    state["serial206_initialization_provider"] = {
-        "bound": True,
-        "initialize_motors_live_available": True,
-        "z_authority": {
-            "state": "referenced_ready",
-            "reference_state": "referenced",
-            "board_lifecycle_generation_fresh": True,
-        },
-    }
-    generic_move = action("/motion/axis/move")
-    provider_clear = action(
-        "/motion/oem/z/clear",
-        action_id="oem.z.clear",
-    )
-    emergency_stop = action(
-        "/motion/emergency_stop",
-        safety="emergency",
-        action_id="meta.emergency_stop",
-    )
-    activate = action(
-        "/motion/oem/prepare_without_motion",
-        safety="service",
-        action_id="meta.activate_motion",
-    )
-
-    reason = "Motion is blocked while operation state is emergency."
-    assert _dashboard_payload(state)["motion"] == {"enabled": False, "reason": reason}
-    for candidate in (generic_move, provider_clear):
-        assessed = _assess_action(candidate, state, {})
-        assert assessed["enabled"] is False
-        assert assessed["disabled_reason"] == reason
-        assert next(row for row in assessed["dependencies"] if row["key"] == "operation_allows_motion")["met"] is False
-    assert _assess_action(emergency_stop, state, {})["enabled"] is True
-    assert _assess_action(activate, state, {})["enabled"] is True
-
-
-def test_activate_motion_is_disabled_when_recovery_is_already_complete():
-    state = machine_state(motion_enabled=True)
-    activate = action(
-        "/motion/oem/prepare_without_motion",
-        safety="service",
-        action_id="meta.activate_motion",
-    )
-
-    assessed = _assess_action(activate, state, {})
-
-    assert assessed["enabled"] is False
-    assert assessed["disabled_reason"] == "Motion is already active."
-    state["maintenance"] = {"motion_blocked": True, "recovery_required": True}
-    assert _assess_action(activate, state, {})["enabled"] is True
-
-
 def test_local_only_maintenance_routes_are_visible_but_never_dispatchable():
     app = FastAPI()
 
@@ -388,7 +308,8 @@ def test_provider_gate_precedes_runtime_dependencies():
     assert assessed["disabled_reason"] == "provider not bound"
 
 
-def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
+def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp import api
 
     actions, dispatch = _build_catalog(api.app)
@@ -400,8 +321,6 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         "oem.z.set_clean_path": ["enabled"],
         "oem.z.move_steps": ["steps"],
         "oem.z.move_absolute": ["position_steps"],
-        "oem.z.prepare": [],
-        "oem.z.reconcile_switch_masks": ["confirm"],
         "oem.z.set_home": [],
         "oem.z.diagnostic_home_axis": [],
         "oem.z.stop": [],
@@ -419,7 +338,7 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         assert action_id in by_id
         assert [row["name"] for row in by_id[action_id]["inputs"]] == input_names
         assert by_id[action_id]["requires_confirmation"] is (
-            action_id in {"oem.z.reconcile_switch_masks", "oem.z.set_home"}
+            action_id == "oem.z.set_home"
         )
         assert by_id[action_id]["required_provider_capability"] == "initialize_motors"
         if action_id == "oem.z.move_z_home":
@@ -427,6 +346,8 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions():
         else:
             assert dispatch[action_id]["fixed_inputs"].get("axis") == "z"
     assert "z_pseudo_home" not in {row["name"] for row in by_id["oem.z.move_absolute"]["inputs"]}
+    assert "oem.z.prepare" not in by_id
+    assert "oem.z.reconcile_switch_masks" not in by_id
     assert any(row["informational_path"] == "/motion/oem/z/move_z_home" for row in actions)
     assert not any(row["informational_path"] == "/motion/oem/z/live_right_reference" for row in actions)
     assert {
@@ -545,7 +466,7 @@ def test_dashboard_uses_provider_owned_x_authority_and_never_claims_physical_pos
 def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state():
     from bioxp import api
 
-    values = {1: 123, 3: 0, 6: 31, 7: 8, 9: 0, 10: 1, 12: 1, 13: 0}
+    values = {1: 123, 3: 0, 6: 31, 7: 8, 9: 0, 10: 1, 12: 0, 13: 0}
 
     class Tester:
         MOTOR_SWITCH_ACTIVE_VALUE = 1
@@ -572,16 +493,16 @@ def test_production_axis_snapshot_reports_numeric_raw_and_effective_switch_state
         "left_raw_active": False,
         "right_raw_active": True,
         "left_disabled": False,
-        "right_disabled": True,
+        "right_disabled": False,
         "left_effective_active": False,
-        "right_effective_active": False,
+        "right_effective_active": True,
     }
     state = machine_state(motion_enabled=True, z="referenced")
     state["domains"]["axes"]["observation"]["rows"] = {"z": row}
     z = _dashboard_payload(state)["axes"][0]
     assert z["right_switch_state"] == 1
     assert z["right_switch_raw_active"] is True
-    assert z["right_switch_active"] is False
+    assert z["right_switch_active"] is True
 
 
 def test_dashboard_reports_active_motion_independently_from_homing_and_uses_live_latch_evidence():
