@@ -3897,7 +3897,7 @@ class OperatorCommandPlane:
             "operator_command_id": interrupt_attempt_id,
             "operator_interrupt_id": interrupt_attempt_id,
             "idempotency_key": interrupt_attempt_id,
-            "expected_ownership_generation": None,
+            "expected_ownership_generation": int(self._state().get("ownership_generation") or 0),
             "action_id": action_id,
         })
         try:

@@ -406,10 +406,18 @@ def physical_aggregate_stop(
             })
             continue
         try:
-            stop = driver.motor_stop(board, motor=motor)
+            stop = driver.motor_oem_board_stop(board, motor=motor, axis_name=component)
         except Exception as exc:
-            stop = {"ack": None, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        acknowledged = bool(_ack_status(stop) == 100 and stop.get("ok") is True)
+            stop = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        first = stop.get("first_delivery") if isinstance(stop, Mapping) else None
+        second = stop.get("second_delivery") if isinstance(stop, Mapping) else None
+        acknowledged = bool(
+            isinstance(stop, Mapping)
+            and stop.get("source_call_completed") is True
+            and stop.get("source_return_code") == 0
+            and _ack_status(first) == 100
+            and _ack_status(second) == 100
+        )
         row = {
             "component": component,
             "board": board,

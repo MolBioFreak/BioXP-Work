@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from .motion_safety import prepare_motion_without_motion
+from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
 from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
@@ -1204,10 +1204,15 @@ class Serial206ProductionPrimitiveAdapter:
         return {"ok": source_return_ok, "axis": "x", "intent": "stop", "stop": _json_safe(stop), "wait": None, "source_call_completed": source_completed, "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None, "controller_command_acknowledged": acknowledged, "controller_terminal_state_verified": False, "timeout_s_omitted_by_source": float(timeout_s), "physical_motion": False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_stop_source_return_failure" if source_completed else "x_stop_source_call_failed"}
 
     def x_abort(self, *, reason: str = "forceAbortMotion") -> dict[str, Any]:
-        abort = self.tester.motor_oem_force_abort_motion(reason=reason)
+        abort = physical_aggregate_stop(
+            self.tester,
+            Serial206MotionAuthority.from_active_snapshot(),
+            terminal_timeout_s=3.0,
+        )
         desync = self._x_desync(reason, "abort") if self.reference_store is not None else None
         source_completed = isinstance(abort, Mapping)
-        return {"ok": source_completed, "axis_context": "x", "intent": "aggregate_oem_abort", "physical_scope": "aggregate_oem_all_present_boards", "x_only": False, "logical_abort": _json_safe(abort), "x_terminal_stop": None, "reference_desync": _json_safe(desync), "controller_command_acknowledged": abort.get("controller_command_acknowledged") is True if isinstance(abort, Mapping) else False, "controller_terminal_state_verified": False, "physical_effect_verified": False, "failure": None if source_completed else "aggregate_oem_abort_source_call_failed"}
+        source_return_ok = bool(source_completed and abort.get("ok") is True)
+        return {"ok": source_return_ok, "axis_context": "x", "intent": "aggregate_oem_abort", "physical_scope": "aggregate_oem_all_present_boards", "x_only": False, "logical_abort": _json_safe(abort), "x_terminal_stop": None, "reference_desync": _json_safe(desync), "source_call_completed": source_completed, "source_return_ok": source_return_ok, "controller_command_acknowledged": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "controller_terminal_state_verified": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_abort_source_return_failure" if source_completed else "x_abort_source_call_failed"}
 
     def prepare_x(self, *, expected_generation: int) -> dict[str, Any]:
         result = self.prepare_for_initialize_motors(
@@ -4467,6 +4472,11 @@ class Serial206OemInitializationProvider:
                             "axis": "x",
                             "intent": selected,
                             "state": "failed_latched",
+                            "source_call_completed": result.get("source_call_completed") is True,
+                            "source_return_ok": result.get("source_return_ok") is True,
+                            "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
+                            "controller_terminal_state_verified": result.get("controller_terminal_state_verified") is True,
+                            "physical_effect_verified": False,
                             "result": _json_safe(result),
                             "authority_receipt": _json_safe(receipt),
                         }
