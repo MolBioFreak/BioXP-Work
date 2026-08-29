@@ -983,6 +983,7 @@ class OperatorCommandStore:
         self._interrupt_lock = threading.Lock()
         self._pending_interrupt_lock = threading.RLock()
         self._pending_interrupt_reconciliations: list[dict[str, Any]] = []
+        self._active_interrupt_deliveries: set[str] = set()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -3732,9 +3733,13 @@ class OperatorCommandStore:
         completed: set[str] = set()
         for row in pending:
             attempt_id = str(row["interrupt_attempt_id"])
+            action_id = str(row["action_id"])
+            with self._pending_interrupt_lock:
+                if attempt_id in self._active_interrupt_deliveries:
+                    continue
             try:
                 receipt = self.begin_interrupt(
-                    str(row["action_id"]),
+                    action_id,
                     state=dict(row.get("state") or {}),
                     request=dict(row["request"]),
                     interrupt_attempt_id=attempt_id,
@@ -3766,6 +3771,14 @@ class OperatorCommandStore:
                     if str(row.get("interrupt_attempt_id")) not in completed
                 ]
         return len(completed)
+
+    def mark_interrupt_delivery_active(self, interrupt_attempt_id: str) -> None:
+        with self._pending_interrupt_lock:
+            self._active_interrupt_deliveries.add(str(interrupt_attempt_id))
+
+    def mark_interrupt_delivery_inactive(self, interrupt_attempt_id: str) -> None:
+        with self._pending_interrupt_lock:
+            self._active_interrupt_deliveries.discard(str(interrupt_attempt_id))
 
 
     def start(self, dispatch_one: Callable[[dict[str, Any]], None]) -> None:
@@ -4313,24 +4326,29 @@ class OperatorCommandPlane:
     async def compat_invoke(self, action_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if action_id in INTERRUPT_ACTIONS:
             self.store.arm_interrupt_fence(action_id)
+            interrupt_attempt_id: str | None = None
             try:
                 interrupt_attempt_id = str(uuid.uuid4())
+                self.store.mark_interrupt_delivery_active(interrupt_attempt_id)
                 state: Mapping[str, Any] = {
                     "ownership_generation": int(payload.get("observed_ownership_generation") or 0),
                     "board_epoch_by_board": dict(payload.get("observed_board_epoch_by_board") or {}),
                 }
                 pending_spooled = False
                 try:
-                    self.store.queue_pending_interrupt_reconciliation({
-                        "action_id": action_id,
-                        "state": dict(state),
-                        "request": dict(payload),
-                        "interrupt_attempt_id": interrupt_attempt_id,
-                        "attempted": True,
-                        "acknowledged": False,
-                        "response": None,
-                        "error": "controller_delivery_pending",
-                    })
+                    self.store._append_interrupt_spool_event(
+                        phase="pending",
+                        payload={
+                            "action_id": action_id,
+                            "state": dict(state),
+                            "request": dict(payload),
+                            "interrupt_attempt_id": interrupt_attempt_id,
+                            "attempted": True,
+                            "acknowledged": False,
+                            "response": None,
+                            "error": "controller_delivery_pending",
+                        },
+                    )
                     pending_spooled = True
                 except Exception:
                     # Interrupt delivery remains independent of persistence health.
@@ -4483,6 +4501,8 @@ class OperatorCommandPlane:
                         "recovery_hold": True,
                     }
             finally:
+                if interrupt_attempt_id is not None:
+                    self.store.mark_interrupt_delivery_inactive(interrupt_attempt_id)
                 self.store.clear_interrupt_fence(action_id)
 
         state = self._state()
