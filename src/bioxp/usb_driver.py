@@ -84,10 +84,8 @@ class BioXpTester:
             "run_current": 31,
             "standby_current": 10,
             "stall_guard": 16,
-            # Serial-206 reports the X right switch active at controller zero.
-            # Disable it during profile preparation so bounded positive moves
-            # can leave the home end before the left-home search restores zero.
-            "disable_right": True,
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for X.
+            # Absence means no-write; do not alter controller switch masks here.
             "warm_enable": True,
         },
         "y": {
@@ -113,11 +111,8 @@ class BioXpTester:
             "standby_current": 10,
             # Serial-206 immutable OEM machine config m_Z_MOTOR_STALL_GUARD_THRESHOLD.
             "stall_guard": 3,
-            # Serial-206 hardware reports the upper Z switch active at the
-            # controller zero position. Disable that right-limit input during
-            # profile preparation so the required 10,000-step pre-clear can
-            # move away from the home end before the GAP9 home search.
-            "disable_right": True,
+            # OEM initializeMotorsWithoutMotion does not write SAP12/SAP13 for Z.
+            # Absence means no-write; do not alter controller switch masks here.
             "warm_enable": True,
         },
         "g": {
@@ -5372,9 +5367,9 @@ class BioXpTester:
             sleep_ms(1)
 
         for name, profile, speed, acc, current, stall, masks in (
-            ("x", x, 1700, 350, 31, 16, ((12, 1, "disable_right"),)),
+            ("x", x, 1700, 350, 31, 16, ()),
             ("y", y, 1800, 400, 31, 16, ((12, 1, "disable_right"),)),
-            ("z", z, 1791, 576, z_current, z_stall, ((12, 1, "disable_right"),)),
+            ("z", z, 1791, 576, z_current, z_stall, ()),
         ):
             if name not in selected:
                 continue
