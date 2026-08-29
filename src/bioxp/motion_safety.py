@@ -387,8 +387,7 @@ def physical_aggregate_stop(
     not prove that a mechanism physically moved or stopped, so operator-observed
     physical-effect verification remains explicitly false.
     """
-    latch = getattr(driver, "motor_oem_force_abort_motion", None)
-    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
+    force_abort_latch = None
     components: list[dict[str, Any]] = []
     present_rows: list[tuple[dict[str, Any], int, int]] = []
     for component, board, motor, present in authority.components:
@@ -434,6 +433,11 @@ def physical_aggregate_stop(
         }
         components.append(row)
         present_rows.append((row, board, motor))
+
+    # ClassMotor.StopMotor must run before forceAbortMotion latches No24V.
+    # The source StopMotor path rejects delivery after that latch is active.
+    latch = getattr(driver, "motor_oem_force_abort_motion", None)
+    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
 
     # Complete the fan-out before polling so one slow component cannot delay a
     # StopMotor command to another component that may still be moving.
