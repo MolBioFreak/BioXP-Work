@@ -397,7 +397,7 @@ PY
 
 SOURCE_VOLUME=()
 [[ "$SOURCE_MODE" == exact_commit_materialization ]] || fail "unsupported source mode"
-SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app:ro")
+SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app")
 
 exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --pull=never \
@@ -408,8 +408,12 @@ exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --env="BIOXP_RELEASE_UDOCKER_SHA256=$UDOCKER_SHA256" \
   --env="BIOXP_RELEASE_UDOCKER_TREE_SHA256=$UDOCKER_TREE_SHA256" \
   "${SOURCE_VOLUME[@]}" \
-  --volume="$RUNTIME_DIR:/run/bioxp-release:ro" \
-  --volume="$OEM_LOCK_DIR:/app/.oem_lock:ro" \
+  --volume="$RECEIPT_FILE:/run/bioxp-release/release-identity.json" \
+  --volume="$SOURCE_MANIFEST_FILE:/run/bioxp-release/source-manifest.json" \
+  --volume="$IMAGE_INSPECTION_FILE:/run/bioxp-release/image-inspection.json" \
+  --volume="$RUNTIME_BINDING_FILE:/run/bioxp-release/runtime-binding.json" \
+  --volume="$RELEASE_MODE_MARKER:/run/bioxp-release/release-mode" \
+  --volume="$OEM_LOCK_DIR:/app/.oem_lock" \
   --volume="$STATE_DIR:/app/.oem_runtime_state" \
   --volume=/dev:/dev \
   --volume=/run/udev:/run/udev:ro \

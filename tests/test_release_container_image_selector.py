@@ -20,6 +20,11 @@ def test_release_runner_uses_only_immutable_image_and_verified_manifest_contract
     assert "image_inspection_receipt_sha256" in source
     assert '"declared_listener": {"host": "0.0.0.0", "port": 8123}' in source
     assert '"observed_listener": None' in source
-    assert '--volume="$RUNTIME_DIR:/run/bioxp-release:ro"' in source
+    assert 'SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app")' in source
+    assert '--volume="$RECEIPT_FILE:/run/bioxp-release/release-identity.json"' in source
+    assert '--volume="$RUNTIME_BINDING_FILE:/run/bioxp-release/runtime-binding.json"' in source
+    assert '--volume="$OEM_LOCK_DIR:/app/.oem_lock"' in source
+    assert '$HOST_SOURCE:/app:ro' not in source
     assert ':/run/bioxp-release/release-identity.json:ro' not in source
+    assert '$OEM_LOCK_DIR:/app/.oem_lock:ro' not in source
     assert "install -d -m 0755 /run/bioxp-release" in DOCKERFILE.read_text()
