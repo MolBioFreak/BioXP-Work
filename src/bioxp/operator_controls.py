@@ -2063,13 +2063,13 @@ def install_operator_control_plane(
     @router.get("/v2/dashboard")
     async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
-        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=100)
+        rows = await asyncio.to_thread(command_plane.store.list_commands, limit=25)
         return _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), rows)
 
     @router.get("/v2/control-catalog")
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
-        dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=100))
+        dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=25))
         return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"]))]}
 
     @router.post("/v2/actions/{action_id}")
@@ -2635,10 +2635,30 @@ def install_operator_control_plane(
                 receipt["provider_entry_at"] = time.time()
                 receipt["status"] = "dispatched"
                 receipt["dispatched_at"] = receipt["provider_entry_at"]
-                status_code, response = await asyncio.wait_for(
-                    _dispatch_asgi(app, target["method"], target["path"], wire_inputs, target["locations"]),
-                    timeout=float(action["timeout_seconds"]),
-                )
+                if action_id == "meta.activate_motion":
+                    # OEM preparation is one synchronous controller transaction.
+                    # A disconnected caller must not abandon it after the durable
+                    # command reservation or release the action lock while its
+                    # blocking controller work continues.
+                    provider_task = asyncio.create_task(
+                        _dispatch_asgi(
+                            app,
+                            target["method"],
+                            target["path"],
+                            wire_inputs,
+                            target["locations"],
+                        ),
+                        name=f"operator-{command_id}-activate-motion",
+                    )
+                    try:
+                        status_code, response = await asyncio.shield(provider_task)
+                    except asyncio.CancelledError:
+                        status_code, response = await provider_task
+                else:
+                    status_code, response = await asyncio.wait_for(
+                        _dispatch_asgi(app, target["method"], target["path"], wire_inputs, target["locations"]),
+                        timeout=float(action["timeout_seconds"]),
+                    )
                 receipt["provider_returned_at"] = time.time()
                 full_response = {"http_status": status_code, "body": response}
                 ok = 200 <= status_code < 300 and not (isinstance(response, dict) and response.get("ok") is False)
