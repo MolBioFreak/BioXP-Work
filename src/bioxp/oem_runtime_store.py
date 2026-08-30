@@ -40,6 +40,32 @@ SERIAL206_SCHEMA_VERSION = 2
 REPORT_IDENTITY_SCHEMA_VERSION = 3
 RUNTIME_RELEASE_SCHEMA_VERSION = 4
 OPERATOR_COMMAND_PLANE_SCHEMA_VERSION = 5
+_ACCEPTED_LEGACY_SERIAL206_MIGRATION_DIGESTS = frozenset({
+    "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c",
+})
+LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256 = "e90c58225c2bb49fadade1fce4f63cdb88ff334ba84b5b5ba74566a92bc29258"
+LEGACY_OPERATOR_COMMAND_PLANE_TABLES = frozenset({
+    "operator_plane_board_authority",
+    "operator_plane_commands",
+    "operator_plane_evidence",
+    "operator_plane_idempotency",
+    "operator_plane_interrupt_attempts",
+    "operator_plane_interrupt_evidence",
+    "operator_plane_interrupt_history",
+    "operator_plane_lane",
+    "operator_plane_metadata",
+    "operator_plane_methods",
+    "operator_plane_outbox",
+    "operator_plane_recovery_acknowledgements",
+    "operator_plane_safety",
+    "operator_plane_snapshots",
+    "operator_plane_transitions",
+    "operator_plane_z_home_authority",
+    "serial206_command_dependencies",
+    "serial206_command_resources",
+    "serial206_movement_commands",
+    "serial206_movement_methods",
+})
 SERIAL206_BOARD4_MEMBERS = {"y": 0, "z": 1, "gripper": 2}
 _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     2: "1a6937590cbf8b12ec96faf2f8f62bb8d5560d1c3d1e24d1ff2f3599cc8a4075",
@@ -251,6 +277,54 @@ def _runtime_physical_schema_sha256(connection: sqlite3.Connection) -> str:
             ],
         }
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def legacy_operator_command_plane_schema_sha256(connection: sqlite3.Connection) -> str:
+    def normalize_sql(value: Any) -> str:
+        return "".join(str(value or "").upper().split())
+
+    manifest: dict[str, Any] = {}
+    for table in sorted(LEGACY_OPERATOR_COMMAND_PLANE_TABLES):
+        table_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if table_row is None:
+            return "missing:" + table
+        indexes = []
+        for index_row in connection.execute(f'PRAGMA index_list("{table}")').fetchall():
+            index_name = str(index_row[1])
+            index_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
+            ).fetchone()
+            indexes.append((
+                index_name,
+                int(index_row[2]),
+                str(index_row[3]),
+                int(index_row[4]),
+                normalize_sql(index_sql_row[0] if index_sql_row else ""),
+                [tuple(row) for row in connection.execute(f'PRAGMA index_xinfo("{index_name}")').fetchall()],
+            ))
+        manifest[table] = {
+            "sql": normalize_sql(table_row[0]),
+            "columns": [tuple(row) for row in connection.execute(f'PRAGMA table_xinfo("{table}")').fetchall()],
+            "indexes": sorted(indexes),
+            "foreign_keys": [tuple(row) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()],
+            "triggers": [
+                (str(row[0]), normalize_sql(row[1]))
+                for row in connection.execute(
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name",
+                    (table,),
+                ).fetchall()
+            ],
+        }
+    encoded = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        default=str,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -1982,19 +2056,39 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
         str(row[1]): (str(row[0]), normalize_sql_definition(row[2]))
         for row in actual_rows
     }
+    legacy_compatibility = (
+        legacy_operator_command_plane_schema_sha256(connection)
+        == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
+    )
     if actual_sql != expected_sql:
         missing = sorted(set(expected_sql) - set(actual_sql))
         unexpected = sorted(set(actual_sql) - set(expected_sql))
         mismatched = sorted(name for name in set(actual_sql) & set(expected_sql) if actual_sql[name] != expected_sql[name])
-        raise RuntimeError(
-            f"operator command-plane schema object attestation failed: missing={missing},unexpected={unexpected},mismatched={mismatched}"
-        )
+        if not (
+            legacy_compatibility
+            and not missing
+            and not unexpected
+            and mismatched == ["operator_plane_interrupt_history"]
+        ):
+            raise RuntimeError(
+                f"operator command-plane schema object attestation failed: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+            )
     for table, expected in _OPERATOR_COMMAND_PLANE_EXPECTED_COLUMNS.items():
         actual = tuple(
             (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
             for row in connection.execute(f"PRAGMA table_info({table})")
         )
-        if actual != expected:
+        accepted = expected
+        if table == "operator_plane_interrupt_history" and legacy_compatibility:
+            accepted = (
+                ("record_sha256", "TEXT", 1, 1),
+                ("stream", "TEXT", 1, 0),
+                ("interrupt_attempt_id", "TEXT", 1, 0),
+                ("receipt_json", "TEXT", 1, 0),
+                ("source_wrapper_json", "TEXT", 1, 0),
+                ("imported_at", "REAL", 1, 0),
+            )
+        if actual != accepted:
             raise RuntimeError(f"operator command-plane column attestation failed: {table}")
     expected_index_columns = {
         "operator_plane_commands_ready_idx": ("status", "stream_sequence"),
@@ -2135,6 +2229,51 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
     if versions != tuple(sorted(set(versions))):
         raise RuntimeError("runtime migration registry versions must be unique and monotonic")
     return registry
+
+
+def _runtime_migration_row_matches(
+    actual: tuple[int, str, str],
+    expected: RuntimeMigrationIdentity,
+) -> bool:
+    version, name, digest = actual
+    if version != expected.version or name != expected.name:
+        return False
+    if digest == expected.ddl_sha256:
+        return True
+    return (
+        version == SERIAL206_SCHEMA_VERSION
+        and digest in _ACCEPTED_LEGACY_SERIAL206_MIGRATION_DIGESTS
+    )
+
+
+def _runtime_migration_registry_matches(
+    actual: tuple[tuple[int, str, str], ...],
+    expected: tuple[RuntimeMigrationIdentity, ...],
+    *,
+    allow_prefix: bool,
+) -> bool:
+    if len(actual) > len(expected) or (not allow_prefix and len(actual) != len(expected)):
+        return False
+    return all(
+        _runtime_migration_row_matches(row, expected[index])
+        for index, row in enumerate(actual)
+    )
+
+
+def _assert_runtime_migration_slot(
+    connection: sqlite3.Connection,
+    identity: RuntimeMigrationIdentity,
+) -> bool:
+    row = connection.execute(
+        "SELECT version,name,ddl_sha256 FROM runtime_schema_migrations WHERE version=?",
+        (identity.version,),
+    ).fetchone()
+    if row is None:
+        return False
+    return _runtime_migration_row_matches(
+        (int(row[0]), str(row[1]), str(row[2])),
+        identity,
+    )
 
 
 def _verify_exact_v2_objects(connection: sqlite3.Connection) -> None:
@@ -2466,8 +2605,7 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
         "SELECT version,name,ddl_sha256 FROM runtime_schema_migrations ORDER BY version"
     ).fetchall()
     actual = tuple((int(row[0]), str(row[1]), str(row[2])) for row in rows)
-    expected = tuple((item.version, item.name, item.ddl_sha256) for item in registry)
-    if actual != expected:
+    if not _runtime_migration_registry_matches(actual, registry, allow_prefix=False):
         raise RuntimeError("runtime migration ledger is not the exact canonical ordered registry")
     _verify_v2_schema(connection)
     _verify_report_identity_metadata_v1(connection)
@@ -2492,9 +2630,32 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
             key for key in set(expected_manifest) & set(actual_manifest)
             if expected_manifest[key] != actual_manifest[key]
         )
-        raise RuntimeError(
-            f"canonical runtime schema manifest mismatch: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+        legacy_compatibility = (
+            legacy_operator_command_plane_schema_sha256(connection)
+            == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
         )
+        compatibility_objects_are_bound = True
+        for object_type, object_name in unexpected:
+            row = connection.execute(
+                "SELECT type,tbl_name FROM sqlite_master WHERE type=? AND name=?",
+                (object_type, object_name),
+            ).fetchone()
+            if (
+                row is None
+                or str(row[0]) != object_type
+                or str(row[1]) not in LEGACY_OPERATOR_COMMAND_PLANE_TABLES
+            ):
+                compatibility_objects_are_bound = False
+                break
+        if not (
+            legacy_compatibility
+            and compatibility_objects_are_bound
+            and not missing
+            and mismatched == [("table", "operator_plane_interrupt_history")]
+        ):
+            raise RuntimeError(
+                f"canonical runtime schema manifest mismatch: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+            )
     identity = connection.execute(
         "SELECT schema_version FROM runtime_store_identity WHERE identity_id=1"
     ).fetchone()
@@ -2689,9 +2850,9 @@ def _migrate_operator_command_plane_schema_v1(
     started_at = time.time()
     connection.execute("BEGIN IMMEDIATE")
     try:
-        # CREATE IF NOT EXISTS permits adoption only when every pre-ledger object
-        # already has the exact canonical definition. Any legacy shape other
-        # than that frozen v5 schema fails the attestation and rolls back.
+        # CREATE IF NOT EXISTS adopts canonical v5 objects and one exact,
+        # fingerprint-bound deployed command-plane compatibility manifold.
+        # Every other pre-ledger shape fails attestation and rolls back.
         _apply_operator_command_plane_schema_v1(connection)
         _verify_operator_command_plane_schema_v1(connection)
         finished_at = time.time()
@@ -2782,10 +2943,11 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         actual_registry = tuple(
             (int(row[0]), str(row[1]), str(row[2])) for row in ledger_rows
         )
-        expected_registry = tuple(
-            (item.version, item.name, item.ddl_sha256) for item in registry
-        )
-        if actual_registry != expected_registry[: len(actual_registry)]:
+        if not _runtime_migration_registry_matches(
+            actual_registry,
+            registry,
+            allow_prefix=True,
+        ):
             raise RuntimeError("runtime migration ledger is not a canonical ordered prefix")
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if actual_registry and actual_registry[-1][0] > version:
@@ -2823,7 +2985,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
     serial_identity = registry[1]
-    if assert_migration_slot(connection, serial_identity):
+    if _assert_runtime_migration_slot(connection, serial_identity):
         if version < serial_identity.version or version > registry[-1].version:
             raise RuntimeError("runtime migration ledger and PRAGMA user_version disagree")
         _verify_v2_schema(connection)

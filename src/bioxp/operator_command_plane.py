@@ -34,7 +34,11 @@ from .operator_controls import (
 )
 from .operator_receipt_store import runtime_state_root
 from .runtime_audit_store import runtime_write_coordinator
-from .oem_runtime_store import verify_canonical_runtime_database
+from .oem_runtime_store import (
+    LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256,
+    legacy_operator_command_plane_schema_sha256,
+    verify_canonical_runtime_database,
+)
 from .runtime_audit_store import open_runtime_connection
 
 COMMAND_SCHEMA = "bioxp.operator_command_request.v1"
@@ -262,58 +266,11 @@ def _canonical(value: Any) -> str:
     )
 
 
-_OPERATOR_PHYSICAL_SCHEMA_SHA256 = "e90c58225c2bb49fadade1fce4f63cdb88ff334ba84b5b5ba74566a92bc29258"
-_OPERATOR_RUNTIME_TABLES = {
-    "serial206_movement_methods",
-    "serial206_movement_commands",
-    "serial206_command_resources",
-    "serial206_command_dependencies",
-}
+_OPERATOR_PHYSICAL_SCHEMA_SHA256 = LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
 
 
 def _operator_physical_schema_sha256(connection: sqlite3.Connection) -> str:
-    tables = sorted(
-        str(row[0])
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        if str(row[0]).startswith("operator_plane_") or str(row[0]) in _OPERATOR_RUNTIME_TABLES
-    )
-
-    def normalize_sql(value: Any) -> str:
-        return "".join(str(value or "").upper().split())
-
-    manifest: dict[str, Any] = {}
-    for table in tables:
-        table_row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()
-        indexes = []
-        for index_row in connection.execute(f'PRAGMA index_list("{table}")').fetchall():
-            index_name = str(index_row[1])
-            index_sql_row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
-            ).fetchone()
-            indexes.append((
-                index_name,
-                int(index_row[2]),
-                str(index_row[3]),
-                int(index_row[4]),
-                normalize_sql(index_sql_row[0] if index_sql_row else ""),
-                [tuple(row) for row in connection.execute(f'PRAGMA index_xinfo("{index_name}")').fetchall()],
-            ))
-        manifest[table] = {
-            "sql": normalize_sql(table_row[0] if table_row else ""),
-            "columns": [tuple(row) for row in connection.execute(f'PRAGMA table_xinfo("{table}")').fetchall()],
-            "indexes": sorted(indexes),
-            "foreign_keys": [tuple(row) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()],
-            "triggers": [
-                (str(row[0]), normalize_sql(row[1]))
-                for row in connection.execute(
-                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name",
-                    (table,),
-                ).fetchall()
-            ],
-        }
-    return hashlib.sha256(_canonical(manifest).encode("utf-8")).hexdigest()
+    return legacy_operator_command_plane_schema_sha256(connection)
 
 
 def _canonical_request(value: Any) -> str:
@@ -2064,6 +2021,7 @@ class OperatorCommandStore:
         if self._authority_write_depth == 0 and hasattr(self, "_authority_schema_version"):
             schema_version = int(self.connection.execute("PRAGMA schema_version").fetchone()[0])
             if schema_version != self._authority_schema_version:
+                verify_canonical_runtime_database(self.connection)
                 physical_schema_sha256 = _operator_physical_schema_sha256(self.connection)
                 if physical_schema_sha256 != _OPERATOR_PHYSICAL_SCHEMA_SHA256:
                     raise RuntimeError(

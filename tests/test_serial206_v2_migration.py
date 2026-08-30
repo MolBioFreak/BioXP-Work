@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 
@@ -5,10 +6,18 @@ import pytest
 
 import src.bioxp.oem_runtime_store as runtime_store_module
 from src.bioxp.oem_runtime_store import (
+    LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256,
     OEMRuntimeStore,
     canonical_runtime_migration_registry,
+    legacy_operator_command_plane_schema_sha256,
+    verify_canonical_runtime_database,
 )
-from src.bioxp.runtime_audit_store import RuntimeAuditDatabase
+from src.bioxp.operator_command_plane import OperatorCommandStore
+from src.bioxp.runtime_audit_store import (
+    RuntimeAuditDatabase,
+    RuntimeMigrationIdentity,
+    runtime_write_coordinator,
+)
 
 
 def test_plain_runtime_connection_defers_substantive_ddl_to_migration_owner(tmp_path):
@@ -299,6 +308,151 @@ def test_v2_migration_is_idempotent(tmp_path):
     assert second._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
     ).fetchone()[0] == 5
+
+
+def _seed_committed_v2_identity(tmp_path, monkeypatch, digest):
+    current_identity_provider = runtime_store_module.serial206_runtime_migration_identity
+    current_identity = current_identity_provider()
+    report_migration = runtime_store_module._migrate_report_identity_metadata_v1
+    legacy_identity = RuntimeMigrationIdentity(
+        version=current_identity.version,
+        name=current_identity.name,
+        ddl_sha256=digest,
+    )
+    monkeypatch.setattr(
+        runtime_store_module,
+        "serial206_runtime_migration_identity",
+        lambda: legacy_identity,
+    )
+    monkeypatch.setattr(
+        runtime_store_module,
+        "_migrate_report_identity_metadata_v1",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop after v2")),
+    )
+    with pytest.raises(RuntimeError, match="stop after v2"):
+        OEMRuntimeStore(tmp_path)
+    monkeypatch.setattr(
+        runtime_store_module,
+        "serial206_runtime_migration_identity",
+        current_identity_provider,
+    )
+    monkeypatch.setattr(
+        runtime_store_module,
+        "_migrate_report_identity_metadata_v1",
+        report_migration,
+    )
+
+
+def _seed_deployed_operator_manifold(tmp_path, monkeypatch):
+    deployed_digest = "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c"
+    _seed_committed_v2_identity(tmp_path, monkeypatch, deployed_digest)
+    seed = object.__new__(OperatorCommandStore)
+    seed.root = tmp_path
+    seed.path = tmp_path / "bioxp_runtime.db"
+    seed._lock = runtime_write_coordinator(tmp_path).lock
+    seed._authority_write_depth = 0
+    seed.connection = sqlite3.connect(
+        seed.path,
+        timeout=2.0,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    seed.connection.row_factory = sqlite3.Row
+    seed._configure()
+    seed._schema()
+    receipt = {"interrupt_attempt_id": "legacy-attempt-1", "status": "stopped"}
+    wrapper = {"receipt": receipt, "stream": "x"}
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    wrapper_json = json.dumps(wrapper, sort_keys=True, separators=(",", ":"))
+    with seed._transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO operator_plane_interrupt_history(
+                record_sha256,stream,interrupt_attempt_id,receipt_json,
+                source_wrapper_json,imported_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                hashlib.sha256(wrapper_json.encode("utf-8")).hexdigest(),
+                "x",
+                "legacy-attempt-1",
+                receipt_json,
+                wrapper_json,
+                1.0,
+            ),
+        )
+    assert (
+        legacy_operator_command_plane_schema_sha256(seed.connection)
+        == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
+    )
+    seed.connection.close()
+
+
+def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_loss(
+    tmp_path,
+    monkeypatch,
+):
+    _seed_deployed_operator_manifold(tmp_path, monkeypatch)
+
+    migrated = OEMRuntimeStore(tmp_path)
+    verify_canonical_runtime_database(migrated._db)
+
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute(
+        "SELECT source_wrapper_json FROM operator_plane_interrupt_history "
+        "WHERE interrupt_attempt_id='legacy-attempt-1'"
+    ).fetchone()[0] == '{"receipt":{"interrupt_attempt_id":"legacy-attempt-1","status":"stopped"},"stream":"x"}'
+    assert (
+        legacy_operator_command_plane_schema_sha256(migrated._db)
+        == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="interrupt history is immutable"):
+        migrated._db.execute(
+            "DELETE FROM operator_plane_interrupt_history "
+            "WHERE interrupt_attempt_id='legacy-attempt-1'"
+        )
+    migrated.close()
+
+    operator_store = OperatorCommandStore(tmp_path)
+    operator_store.stop()
+
+
+def test_v5_compatibility_manifold_rejects_unfingerprinted_legacy_trigger(
+    tmp_path,
+    monkeypatch,
+):
+    _seed_deployed_operator_manifold(tmp_path, monkeypatch)
+    migrated = OEMRuntimeStore(tmp_path)
+    migrated._db.execute(
+        """
+        CREATE TRIGGER operator_plane_commands_unregistered_compatibility_trigger
+        BEFORE UPDATE ON operator_plane_commands
+        BEGIN SELECT 1; END
+        """
+    )
+
+    with pytest.raises(RuntimeError, match="attestation failed|manifest mismatch"):
+        verify_canonical_runtime_database(migrated._db)
+    migrated.close()
+
+
+def test_deployed_v2_migration_identity_advances_without_rewriting_history(tmp_path, monkeypatch):
+    deployed_digest = "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c"
+    _seed_committed_v2_identity(tmp_path, monkeypatch, deployed_digest)
+
+    migrated = OEMRuntimeStore(tmp_path)
+
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute(
+        "SELECT ddl_sha256 FROM runtime_schema_migrations WHERE version=2"
+    ).fetchone()[0] == deployed_digest
+
+
+def test_unknown_v2_migration_identity_is_rejected(tmp_path, monkeypatch):
+    _seed_committed_v2_identity(tmp_path, monkeypatch, "f" * 64)
+
+    with pytest.raises(RuntimeError, match="canonical ordered prefix"):
+        OEMRuntimeStore(tmp_path)
 
 
 def test_canonical_registry_has_unique_monotonic_exact_identities(tmp_path):
