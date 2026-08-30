@@ -19,3 +19,5 @@ def test_release_runner_uses_only_immutable_image_and_verified_manifest_contract
     assert "image_inspection_receipt_sha256" in source
     assert '"declared_listener": {"host": "0.0.0.0", "port": 8123}' in source
     assert '"observed_listener": None' in source
+    assert '--volume="$RUNTIME_DIR:/run/bioxp-release:ro"' in source
+    assert ':/run/bioxp-release/release-identity.json:ro' not in source
