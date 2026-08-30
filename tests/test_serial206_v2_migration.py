@@ -219,6 +219,7 @@ def test_existing_v2_additive_operator_schema_is_rebuilt_without_data_loss(tmp_p
     ).fetchall())
     assert sequences == {"operator_commands": 15, "operator_transitions": 21}
     assert migrated._db.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_existing_v2_legacy_receipt_constraint_is_repaired_without_data_loss(tmp_path):
@@ -268,6 +269,7 @@ def test_existing_v2_legacy_receipt_constraint_is_repaired_without_data_loss(tmp
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='serial206_receipts'"
     ).fetchone()[0]
     assert "CHECK(idempotency_replay_enabled IN (0, 1))" in table_sql
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_future_schema_version_refuses_without_mutation(tmp_path):

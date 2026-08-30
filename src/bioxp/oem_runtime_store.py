@@ -160,9 +160,16 @@ def _normalize_legacy_v1_serial206_receipts(connection: sqlite3.Connection) -> N
     """Restore the canonical replay constraint on the recognized v1 receipt table."""
     if not _is_legacy_v1_serial206_receipts_schema(connection):
         return
-    connection.execute("BEGIN IMMEDIATE")
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    legacy_alter_table = int(connection.execute("PRAGMA legacy_alter_table").fetchone()[0])
+    if connection.in_transaction:
+        raise RuntimeError("serial206 receipt rebuild requires a transaction boundary")
     try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute("ALTER TABLE serial206_receipts RENAME TO serial206_receipts_legacy_v1")
+        connection.execute("PRAGMA legacy_alter_table=OFF")
         connection.execute(
             """
             CREATE TABLE serial206_receipts (
@@ -183,11 +190,19 @@ def _normalize_legacy_v1_serial206_receipts(connection: sqlite3.Connection) -> N
             "INSERT INTO serial206_receipts SELECT * FROM serial206_receipts_legacy_v1"
         )
         connection.execute("DROP TABLE serial206_receipts_legacy_v1")
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(
+                f"serial206 receipt rebuild foreign-key failure: {foreign_key_errors[:3]}"
+            )
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
+    finally:
+        connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
+        connection.execute(f"PRAGMA foreign_keys={foreign_keys}")
 
 
 def _execute_schema_batch(connection: sqlite3.Connection, script: str) -> None:
@@ -2741,12 +2756,10 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
                 if rebuild_receipts:
                     _normalize_legacy_v1_serial206_receipts(connection)
             _reinstall_runtime_authority_triggers(connection)
-            _verify_v2_schema(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
             if journal_mode != "wal" or synchronous != 2:
                 raise RuntimeError("runtime schema v2 durability settings are not WAL/synchronous FULL")
-            return
 
     try:
         verify_runtime_audit_foundation(connection)
@@ -2774,6 +2787,30 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         )
         if actual_registry != expected_registry[: len(actual_registry)]:
             raise RuntimeError("runtime migration ledger is not a canonical ordered prefix")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if actual_registry and actual_registry[-1][0] > version:
+            ledger_head = actual_registry[-1][0]
+            expected_physical_sha256 = _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION.get(ledger_head)
+            physical_schema_sha256 = _runtime_physical_schema_sha256(connection)
+            if (
+                expected_physical_sha256 is not None
+                and physical_schema_sha256 != expected_physical_sha256
+                and ledger_head == OPERATOR_COMMAND_PLANE_SCHEMA_VERSION
+            ):
+                _verified_sqlite_backup(connection, selected_root)
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _apply_operator_command_plane_schema_v1(connection)
+                    connection.execute("COMMIT")
+                except Exception:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+                physical_schema_sha256 = _runtime_physical_schema_sha256(connection)
+            if expected_physical_sha256 is None or physical_schema_sha256 != expected_physical_sha256:
+                raise RuntimeError("runtime migration ledger is ahead of the physical schema")
+            _verified_sqlite_backup(connection, selected_root)
+            connection.execute(f"PRAGMA user_version={ledger_head}")
 
     foundation = registry[0]
     if not assert_migration_slot(connection, foundation):
