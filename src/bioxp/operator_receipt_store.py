@@ -488,10 +488,24 @@ class OperatorReceiptStore:
             )
         command_id = receipt.get("command_id")
         if command_id:
-            self.connection.execute(
-                "INSERT INTO runtime_evidence_links(evidence_artifact_id,target_kind,target_identity,command_id,link_kind,created_at) VALUES(?,?,?,?,?,?)",
-                (artifact_id, "command", str(command_id), str(command_id), "command_evidence", now),
-            )
+            link_columns = {
+                str(row["name"])
+                for row in self.connection.execute("PRAGMA table_info(runtime_evidence_links)").fetchall()
+            }
+            if {"target_kind", "target_identity"}.issubset(link_columns):
+                self.connection.execute(
+                    """
+                    INSERT INTO runtime_evidence_links(
+                        evidence_artifact_id,target_kind,target_identity,command_id,link_kind,created_at
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (artifact_id, "command", str(command_id), str(command_id), "command_evidence", now),
+                )
+            else:
+                self.connection.execute(
+                    "INSERT INTO runtime_evidence_links(evidence_artifact_id,command_id,link_kind,created_at) VALUES(?,?,?,?)",
+                    (artifact_id, str(command_id), "command_evidence", now),
+                )
         return artifact_id
 
     def _apply_legal_hold_assessment_locked(
