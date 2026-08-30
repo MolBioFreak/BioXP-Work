@@ -529,9 +529,11 @@ def test_retired_v1_migration_attests_historical_empty_outcome_without_rewrite(t
     backup_connection.close()
     backup_receipts = backup_root / "receipts.jsonl"
     backup_receipts.write_bytes(raw)
+    runtime_backup_alias = Path("/var/lib/bioxp-oem-runtime/backups") / backup_root.name
     sums = (
-        f"{hashlib.sha256(backup_database.read_bytes()).hexdigest()}  {backup_database}\n"
-        f"{source_sha256}  {backup_receipts}\n"
+        f"{hashlib.sha256(backup_database.read_bytes()).hexdigest()}  "
+        f"{runtime_backup_alias / backup_database.name}\n"
+        f"{source_sha256}  {runtime_backup_alias / backup_receipts.name}\n"
     )
     (backup_root / "SHA256SUMS").write_text(sums, encoding="utf-8")
     backup_relpath = backup_root.relative_to(store.root).as_posix()

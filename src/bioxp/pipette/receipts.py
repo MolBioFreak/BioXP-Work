@@ -1199,6 +1199,10 @@ class PipetteReceiptStore:
             lines = sums_raw.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
             raise PipetteReceiptError("retired v1 migration checksum file is invalid") from exc
+        checksum_parents = {
+            backup_root,
+            Path("/var/lib/bioxp-oem-runtime/backups") / backup_root.name,
+        }
         for line in lines:
             try:
                 digest, selected = line.split("  ", 1)
@@ -1209,7 +1213,7 @@ class PipetteReceiptStore:
                 len(digest) != 64
                 or any(character not in "0123456789abcdef" for character in digest)
                 or not selected_path.is_absolute()
-                or selected_path.parent != backup_root
+                or selected_path.parent not in checksum_parents
                 or selected_path.name not in {"bioxp_runtime.db", "receipts.jsonl"}
                 or selected_path.name in listed
             ):
