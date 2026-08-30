@@ -18,6 +18,7 @@ from src.bioxp.runtime_audit_store import (
     RuntimeMigrationIdentity,
     runtime_write_coordinator,
 )
+from src.bioxp.storage_operations import inspect_database
 
 
 def test_plain_runtime_connection_defers_substantive_ddl_to_migration_owner(tmp_path):
@@ -396,6 +397,7 @@ def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_lo
 
     migrated = OEMRuntimeStore(tmp_path)
     verify_canonical_runtime_database(migrated._db)
+    assert inspect_database(tmp_path / "bioxp_runtime.db")["schema_contract_issues"] == []
 
     assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
     assert migrated._db.execute(
@@ -433,6 +435,8 @@ def test_v5_compatibility_manifold_rejects_unfingerprinted_legacy_trigger(
 
     with pytest.raises(RuntimeError, match="attestation failed|manifest mismatch"):
         verify_canonical_runtime_database(migrated._db)
+    issues = inspect_database(tmp_path / "bioxp_runtime.db")["schema_contract_issues"]
+    assert any(row["check"] == "canonical_schema_identity" for row in issues)
     migrated.close()
 
 

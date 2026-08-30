@@ -982,14 +982,18 @@ def _schema_identity(connection: sqlite3.Connection) -> dict[str, Any]:
 
 def _schema_contract_issues(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
+    canonical = False
     try:
         from .oem_runtime_store import verify_canonical_runtime_database
 
         verify_canonical_runtime_database(connection)
+        canonical = True
     except Exception as exc:
         issues.append(
             {"check": "canonical_schema_identity", "error": str(exc)[:500]}
         )
+    if canonical:
+        return issues
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version != SCHEMA_VERSION:
         issues.append(
