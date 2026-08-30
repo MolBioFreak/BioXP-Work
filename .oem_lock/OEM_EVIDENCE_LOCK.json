@@ -791,16 +791,12 @@
       "sha256": "163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed"
     },
     {
+      "name": "CVisionLib.dll",
+      "sha256": "84ab0c851f1bb418289035efd9fa84420e9ff82ea0a69ec0c00bb5d401e750f2"
+    },
+    {
       "name": "ClassCanLib.dll",
       "sha256": "7d91d8279fa967c20d006679c1c2d6545451b898fdeca9028224ef6d0c46dac1"
-    },
-    {
-      "name": "NovoCANUSBLib.dll",
-      "sha256": "6856ba3bda0033b938483ea7deeb664478cf446dabc93d1048fbb843d3cda3c3"
-    },
-    {
-      "name": "Novo.Devices.dll",
-      "sha256": "971efffd20c753de10f0750193cefb437ac64aac6ae6b6c22788d5bc5f2e1729"
     },
     {
       "name": "CommonLib.dll",
@@ -809,56 +805,194 @@
     {
       "name": "GenBotApp.exe",
       "sha256": "d7cb7c94ebcfc386bc0a4acebb92f13d8463bb2b675f5439adf43be35198c6d9"
+    },
+    {
+      "name": "Novo.Devices.dll",
+      "sha256": "971efffd20c753de10f0750193cefb437ac64aac6ae6b6c22788d5bc5f2e1729"
+    },
+    {
+      "name": "NovoCANUSBLib.dll",
+      "sha256": "6856ba3bda0033b938483ea7deeb664478cf446dabc93d1048fbb843d3cda3c3"
     }
   ],
   "decompile_binary_map": {
     "BioXPCommonLib.dll": [
+      "decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs",
       "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
       "decompiled_src_bioxpcommon/BioXPCommonLib/ClassCalibrationReference.cs",
-      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs"
+      "decompiled_src_bioxpcommon/BioXPCommonLib/ClassStatusLog.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
+      "decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs"
     ],
     "BioXPControlLib.dll": [
-      "decompiled_src_can/BioXPControlLib/ClassPipette.cs",
+      "decompiled_src/BioXPControlLib/ClassControlInterface.cs",
       "decompiled_src/BioXPControlLib/ClassPipetteCollection.cs",
       "decompiled_src/BioXPControlLib/ControlLib.cs",
-      "decompiled_src/BioXPControlLib/ClassControlInterface.cs"
+      "decompiled_src_can/BioXPControlLib/ClassPipette.cs"
     ],
     "ClassCanLib.dll": [
-      "decompiled_src_can/ClassCanLib/ClassNovo.cs",
+      "decompiled_src_can/ClassCanLib/ClassBaseBoard.cs",
+      "decompiled_src_can/ClassCanLib/ClassChillerBoard.cs",
+      "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs",
+      "decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
       "decompiled_src_can/ClassCanLib/ClassIOControl.cs",
-      "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs"
+      "decompiled_src_can/ClassCanLib/ClassMotor.cs",
+      "decompiled_src_can/ClassCanLib/ClassNovo.cs",
+      "decompiled_src_can/ClassCanLib/ClassThermalBoard.cs",
+      "decompiled_src_can/ClassCanLib/ClassThermalControl.cs",
+      "decompiled_src_can/ClassCanLib/InterfaceCAN.cs"
     ],
     "NovoCANUSBLib.dll": [
       "decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs"
     ],
     "Novo.Devices.dll": [
+      "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/CanPacket.cs",
+      "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/ICanPacket.cs",
       "decompiled_src_novodevices/Novo/Devices/CanInterfaceBoard.cs",
       "decompiled_src_novodevices/Novo/Devices/NovoEncoding.cs",
-      "decompiled_src_novodevices/Novo/Devices/TecanADP.cs"
+      "decompiled_src_novodevices/Novo/Devices/TecanADP.cs",
+      "decompiled_src_novodevices/WinUsb/WinUsbCommunications.cs"
     ],
     "CommonLib.dll": [
-      "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs"
+      "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs",
+      "decompiled_src_commonlib/CommonLib/locationID.cs",
+      "decompiled_src_commonlib/CommonLib/positionStruct.cs",
+      "decompiled_src_commonlib/CommonLib/wellID.cs"
     ],
     "GenBotApp.exe": [
       "decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs"
+    ],
+    "CVisionLib.dll": [
+      "decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs"
     ]
   },
   "decompiled_source_anchors": [
     {
-      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
-      "sha256": "08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41"
-    },
-    {
-      "path": "decompiled_src_can/BioXPControlLib/ClassPipette.cs",
-      "sha256": "681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957"
+      "path": "decompiled_src/BioXPControlLib/ClassControlInterface.cs",
+      "sha256": "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
     },
     {
       "path": "decompiled_src/BioXPControlLib/ClassPipetteCollection.cs",
       "sha256": "ffe3729fa35642d04ef6fe45501e52200dd7c2977a70902aa20e46fb26d4011e"
     },
     {
+      "path": "decompiled_src/BioXPControlLib/ControlLib.cs",
+      "sha256": "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/CameraSettings.cs",
+      "sha256": "cca71fc368eb4afd9e231926e37168136e9177f48d7489508e49134d1693e630"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs",
+      "sha256": "174d719c1f08d8474ae4cf6175839962bc3b2062546b9c90cfe1dba91f44760e"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPSettings.cs",
+      "sha256": "08155dc24602bc12cf25af745c74cc478f33e0f2675fc0d4b6f2e1ba917d8d41"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassCalibrationReference.cs",
+      "sha256": "5d6c630f63906c083912244fe1a2d6e0885095b88c23e92c5b7f57480c46d940"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassStatusLog.cs",
+      "sha256": "2e22a2c32ec78234cb5e5529b7957bbbe100eabe5fab7fd9af03b58756efc21b"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/DefaultParameters.cs",
+      "sha256": "04f53c129317f8ae508d6971d2cf9fb534e1bc8307b192f8db395cbbcdf64fd2"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/InspectionItems.cs",
+      "sha256": "1d11cd0b2371ad513ef226b543fc2c6b944a45087d81008e96ef72b355ce523e"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/OperationMode.cs",
+      "sha256": "efd41903654e20c1d3d23961c7d72ae1782efcdf5fed4038349e2719da0a17cb"
+    },
+    {
+      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/plateName.cs",
+      "sha256": "5819dd8a2bf7aa74787d88da74595eee81da9adfe15b0693a98cea249490a4a0"
+    },
+    {
+      "path": "decompiled_src_can/BioXPControlLib/ClassPipette.cs",
+      "sha256": "681f959cf527b060cece17b3cf7ff59c1ba1f5ead99fea53520d09486ac0c957"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassBaseBoard.cs",
+      "sha256": "2622aee1810b9a8a52bed54a49196d50e50751465608c8420dd1e5077d95dd5e"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassChillerBoard.cs",
+      "sha256": "c048e2cdfcecc58c97f857e2c2bad85eb9766c2196981fa8fde67df7334981fd"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs",
+      "sha256": "bcae5ce4662cb3208dbc2fdf6e4c7ad0e23774307b633fc7a9ce5b727318698f"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassHeadBoard.cs",
+      "sha256": "342a9b2f09731002194b67e37f1d4e866ecbfb3c25effd85b3cd609e8cbdd1ea"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassIOControl.cs",
+      "sha256": "cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassMotor.cs",
+      "sha256": "9fb1b4bec771165053a82b4fe95510615d6ed9beda1a041280584ceb4ab7fe99"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassNovo.cs",
+      "sha256": "11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassThermalBoard.cs",
+      "sha256": "23d50725da200044422fde56b00611df708b514cef0f3637b2ad8d19e0b23f26"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/ClassThermalControl.cs",
+      "sha256": "fdefde9b38c70b9fec47e6ffdd4929ad8f25bc90c57c43baf03722addbe6cf25"
+    },
+    {
+      "path": "decompiled_src_can/ClassCanLib/InterfaceCAN.cs",
+      "sha256": "aed90411d2966ae45142f8a988a2c6757011845c3ab2c5823c98090783419da1"
+    },
+    {
+      "path": "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs",
+      "sha256": "34b87252bde7c3aed86f1b2443c7e8cc728d484b56141c04e570b866efcdb434"
+    },
+    {
+      "path": "decompiled_src_commonlib/CommonLib/locationID.cs",
+      "sha256": "e99a88c5cf114526c2a08fb1f57fc6ab8860cdda17f838c3f13b48f868f59031"
+    },
+    {
+      "path": "decompiled_src_commonlib/CommonLib/positionStruct.cs",
+      "sha256": "202d6082f3d37273a782a9c719b93dce5fcf0a3065bf53d0ce42de39c9a75bd3"
+    },
+    {
+      "path": "decompiled_src_commonlib/CommonLib/wellID.cs",
+      "sha256": "e117e32acf2c61483c5033762d685e992e786d99e4d0ee1aff754b8edf9c6114"
+    },
+    {
+      "path": "decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs",
+      "sha256": "b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c"
+    },
+    {
       "path": "decompiled_src_novo/NovoCANUSBLib/ClassNovoCANUSB.cs",
       "sha256": "e4cf1c311ed5ae79e9490564a48947bced5f46af36890cf4a77120a3b50ffb06"
+    },
+    {
+      "path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/CanPacket.cs",
+      "sha256": "07e359eb6479388925ffd94b3689010321b13eee183c55b3689947eb8cf97181"
+    },
+    {
+      "path": "decompiled_src_novodevices/Novo/Devices/CAN/Interfaces/ICanPacket.cs",
+      "sha256": "b98c3bbb458e9ba0e012f8abfd45fe1488bf413a104fd02a5cfa36c22249fc91"
     },
     {
       "path": "decompiled_src_novodevices/Novo/Devices/CanInterfaceBoard.cs",
@@ -873,40 +1007,12 @@
       "sha256": "53b0ca7f3504a80a1c35ba84849ef8211401831f0a065697daaaa291f97a5c59"
     },
     {
-      "path": "decompiled_src/BioXPControlLib/ControlLib.cs",
-      "sha256": "f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2"
+      "path": "decompiled_src_novodevices/WinUsb/WinUsbCommunications.cs",
+      "sha256": "d4423e07690f5029692fcb2ae13c11dd990f2c23e0ca1f12a1bf1059d08a07ec"
     },
     {
-      "path": "decompiled_src/BioXPControlLib/ClassControlInterface.cs",
-      "sha256": "86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e"
-    },
-    {
-      "path": "decompiled_src_can/ClassCanLib/ClassNovo.cs",
-      "sha256": "11293074caec278076723666e69022b547c43f32b5fa886c99f75d5b60043d06"
-    },
-    {
-      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassCalibrationReference.cs",
-      "sha256": "5d6c630f63906c083912244fe1a2d6e0885095b88c23e92c5b7f57480c46d940"
-    },
-    {
-      "path": "decompiled_src_commonlib/CommonLib/ClassTimeEstimate.cs",
-      "sha256": "34b87252bde7c3aed86f1b2443c7e8cc728d484b56141c04e570b866efcdb434"
-    },
-    {
-      "path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassBioXPScriptHandler.cs",
-      "sha256": "174d719c1f08d8474ae4cf6175839962bc3b2062546b9c90cfe1dba91f44760e"
-    },
-    {
-      "path": "decompiled_src_genbotapp/GenBotApp/BioXPMainWindow.cs",
-      "sha256": "b288a45e2de54cd2c8d30a4498a343cd6f423aff7e88a78847076bfbfb4e904c"
-    },
-    {
-      "path": "decompiled_src_can/ClassCanLib/ClassIOControl.cs",
-      "sha256": "cb684f0afc788503601ce4b71babacaf83bb57bdccd3cbfba20c9b49c1fa2b1f"
-    },
-    {
-      "path": "decompiled_src_can/ClassCanLib/ClassDeckBoard.cs",
-      "sha256": "bcae5ce4662cb3208dbc2fdf6e4c7ad0e23774307b633fc7a9ce5b727318698f"
+      "path": "decompiled_src_vision/CVisionLib/ClassFrameGrabber.cs",
+      "sha256": "6eec22f02eae5b4738a6d857b57691009dacd5b1b9bb615d41e9d8a8e4d28501"
     }
   ],
   "runtime_log_anchor": {
