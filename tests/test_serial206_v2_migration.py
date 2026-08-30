@@ -18,7 +18,7 @@ from src.bioxp.runtime_audit_store import (
     RuntimeMigrationIdentity,
     runtime_write_coordinator,
 )
-from src.bioxp.storage_operations import inspect_database
+from src.bioxp.storage_operations import create_backup_unit, inspect_database
 
 
 def test_plain_runtime_connection_defers_substantive_ddl_to_migration_owner(tmp_path):
@@ -382,6 +382,33 @@ def _seed_deployed_operator_manifold(tmp_path, monkeypatch):
                 1.0,
             ),
         )
+    evidence_raw = b'{"legacy":"operator-evidence"}\n'
+    evidence_digest = hashlib.sha256(evidence_raw).hexdigest()
+    evidence_relpath = f"operator_evidence/2026-08-01/legacy-command.{evidence_digest}.json"
+    evidence_path = tmp_path / evidence_relpath
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_bytes(evidence_raw)
+    with seed._transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO operator_commands(
+                command_id,idempotency_key,action_id,status,started_at,receipt_json,
+                evidence_relpath,evidence_sha256,evidence_bytes,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "legacy-command-with-evidence",
+                "legacy-command-with-evidence-key",
+                "legacy_action",
+                "completed",
+                "1785909997.825",
+                "{}",
+                evidence_relpath,
+                evidence_digest,
+                len(evidence_raw),
+                1785909997.825,
+            ),
+        )
     assert (
         legacy_operator_command_plane_schema_sha256(seed.connection)
         == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
@@ -400,6 +427,28 @@ def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_lo
     assert inspect_database(tmp_path / "bioxp_runtime.db")["schema_contract_issues"] == []
 
     assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    evidence_digest = hashlib.sha256(b'{"legacy":"operator-evidence"}\n').hexdigest()
+    evidence = migrated._db.execute(
+        """
+        SELECT evidence_artifact_id,command_id,active_relpath,sha256,byte_count,expiry_state
+        FROM runtime_evidence_objects WHERE command_id='legacy-command-with-evidence'
+        """
+    ).fetchone()
+    assert tuple(evidence) == (
+        f"evidence:{evidence_digest}",
+        "legacy-command-with-evidence",
+        f"operator_evidence/2026-08-01/legacy-command.{evidence_digest}.json",
+        evidence_digest,
+        len(b'{"legacy":"operator-evidence"}\n'),
+        "active",
+    )
+    assert migrated._db.execute(
+        """
+        SELECT COUNT(*) FROM runtime_evidence_links
+        WHERE command_id='legacy-command-with-evidence' AND target_kind='command'
+          AND target_identity='legacy-command-with-evidence' AND link_kind='command_evidence'
+        """
+    ).fetchone()[0] == 1
     assert migrated._db.execute(
         "SELECT source_wrapper_json FROM operator_plane_interrupt_history "
         "WHERE interrupt_attempt_id='legacy-attempt-1'"
@@ -417,6 +466,8 @@ def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_lo
 
     operator_store = OperatorCommandStore(tmp_path)
     operator_store.stop()
+    backup = create_backup_unit(tmp_path, label="compatibility-manifold", phase="post-migration")
+    assert backup["status"] == "verified"
 
 
 def test_v5_compatibility_manifold_rejects_unfingerprinted_legacy_trigger(

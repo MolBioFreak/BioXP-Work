@@ -5,6 +5,7 @@ import hashlib
 import fcntl
 import inspect
 import json
+import math
 import os
 import re
 import secrets
@@ -14,6 +15,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1676,6 +1678,135 @@ _OPERATOR_COMMAND_PLANE_TRIGGER_DDL = (
 def _apply_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> None:
     for statement in (*_OPERATOR_COMMAND_PLANE_TABLE_DDL, *_OPERATOR_COMMAND_PLANE_INDEX_DDL):
         connection.execute(statement)
+
+    evidence_commands = connection.execute(
+        """
+        SELECT command_id,evidence_relpath,evidence_sha256,evidence_bytes,updated_at
+        FROM operator_commands
+        WHERE evidence_relpath IS NOT NULL
+        ORDER BY sequence,command_id
+        """
+    ).fetchall()
+    for row in evidence_commands:
+        command_id = str(row["command_id"])
+        relpath = str(row["evidence_relpath"])
+        digest = str(row["evidence_sha256"])
+        byte_count = row["evidence_bytes"]
+        updated_at = float(row["updated_at"])
+        selected = Path(relpath)
+        if (
+            selected.is_absolute()
+            or len(selected.parts) < 2
+            or selected.parts[0] != "operator_evidence"
+            or any(part in {"", ".", ".."} for part in selected.parts)
+        ):
+            raise RuntimeError(f"operator evidence path is outside the governed root: {command_id}")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(f"operator evidence digest is invalid: {command_id}")
+        if type(byte_count) is not int or byte_count < 0:
+            raise RuntimeError(f"operator evidence size is invalid: {command_id}")
+        if not math.isfinite(updated_at):
+            raise RuntimeError(f"operator evidence timestamp is invalid: {command_id}")
+        artifact_id = f"evidence:{digest}"
+        current = datetime.fromtimestamp(updated_at, tz=timezone.utc)
+        try:
+            retention_deadline = current.replace(year=current.year + 5).timestamp()
+        except ValueError:
+            retention_deadline = current.replace(year=current.year + 5, day=28).timestamp()
+        existing = connection.execute(
+            """
+            SELECT original_relpath,active_relpath,sha256,byte_count
+            FROM runtime_evidence_objects WHERE evidence_artifact_id=?
+            """,
+            (artifact_id,),
+        ).fetchone()
+        expected_identity = (relpath, relpath, digest, byte_count)
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO runtime_evidence_objects(
+                    evidence_artifact_id,command_id,pipette_operation_id,original_relpath,active_relpath,
+                    sha256,byte_count,created_at,retention_deadline,legal_hold,expiry_state,updated_at
+                ) VALUES(?,?,NULL,?,?,?,?,?,?,0,'active',?)
+                """,
+                (
+                    artifact_id,
+                    command_id,
+                    relpath,
+                    relpath,
+                    digest,
+                    byte_count,
+                    updated_at,
+                    retention_deadline,
+                    updated_at,
+                ),
+            )
+        elif tuple(existing) != expected_identity:
+            raise RuntimeError(f"operator evidence object identity collision: {command_id}")
+        detail_json = json.dumps(
+            {"byte_count": byte_count, "relpath": relpath, "sha256": digest},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        published = connection.execute(
+            """
+            SELECT detail_json FROM runtime_evidence_events
+            WHERE evidence_artifact_id=? AND event_kind='published'
+            ORDER BY event_id LIMIT 1
+            """,
+            (artifact_id,),
+        ).fetchone()
+        if published is None:
+            connection.execute(
+                """
+                INSERT INTO runtime_evidence_events(
+                    evidence_artifact_id,event_kind,observed_at,detail_json
+                ) VALUES(?,'published',?,?)
+                """,
+                (artifact_id, updated_at, detail_json),
+            )
+        elif str(published["detail_json"]) != detail_json:
+            raise RuntimeError(f"operator evidence publication identity collision: {command_id}")
+        linked = connection.execute(
+            """
+            SELECT 1 FROM runtime_evidence_links
+            WHERE evidence_artifact_id=? AND target_kind='command'
+              AND target_identity=? AND command_id=? AND link_kind='command_evidence'
+            LIMIT 1
+            """,
+            (artifact_id, command_id, command_id),
+        ).fetchone()
+        if linked is None:
+            connection.execute(
+                """
+                INSERT INTO runtime_evidence_links(
+                    evidence_artifact_id,target_kind,target_identity,command_id,link_kind,created_at
+                ) VALUES(?,'command',?,?, 'command_evidence',?)
+                """,
+                (artifact_id, command_id, command_id, updated_at),
+            )
+
+    unmatched = connection.execute(
+        """
+        SELECT c.command_id
+        FROM operator_commands c
+        WHERE c.evidence_relpath IS NOT NULL
+          AND NOT EXISTS(
+              SELECT 1 FROM runtime_evidence_objects e
+              JOIN runtime_evidence_links l ON l.evidence_artifact_id=e.evidence_artifact_id
+              WHERE e.active_relpath=c.evidence_relpath
+                AND e.sha256=c.evidence_sha256
+                AND e.byte_count=c.evidence_bytes
+                AND l.target_kind='command'
+                AND l.target_identity=c.command_id
+                AND l.command_id=c.command_id
+                AND l.link_kind='command_evidence'
+          )
+        ORDER BY c.sequence LIMIT 1
+        """
+    ).fetchone()
+    if unmatched is not None:
+        raise RuntimeError(f"operator evidence compatibility projection is incomplete: {unmatched[0]}")
 
     command_fields = (
         "sequence", "command_id", "idempotency_key", "operation", "command_kind", "entrypoint_id",
