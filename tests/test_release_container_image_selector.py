@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 RUNNER = Path(__file__).parents[1] / "scripts" / "bioxp_release_container_run.sh"
+DOCKERFILE = Path(__file__).parents[1] / "Dockerfile.robot-handler"
 
 
 def test_release_runner_uses_only_immutable_image_and_verified_manifest_contract():
@@ -21,3 +22,4 @@ def test_release_runner_uses_only_immutable_image_and_verified_manifest_contract
     assert '"observed_listener": None' in source
     assert '--volume="$RUNTIME_DIR:/run/bioxp-release:ro"' in source
     assert ':/run/bioxp-release/release-identity.json:ro' not in source
+    assert "install -d -m 0755 /run/bioxp-release" in DOCKERFILE.read_text()

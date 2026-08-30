@@ -41,6 +41,7 @@ RUN python /app/scripts/bioxp_source_manifest.py verify \
     && test "$(sha256sum /app/.bioxp-release/source-manifest.json | cut -d' ' -f1)" = "${BIOXP_SOURCE_MANIFEST_SHA256}" \
     && python -c 'import json; p=json.load(open("/app/.bioxp-release/source-manifest.json")); assert p["commit"] == "'"${BIOXP_SOURCE_COMMIT}"'" and p["tree"] == "'"${BIOXP_SOURCE_TREE}"'"' \
     && install -d -m 0755 /usr/share/bioxp-release \
+    && install -d -m 0755 /run/bioxp-release \
     && install -m 0444 /app/.bioxp-release/source-manifest.json /usr/share/bioxp-release/source-manifest.json \
     && rm -rf /app/.bioxp-release
 
