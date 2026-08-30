@@ -1675,6 +1675,199 @@ _OPERATOR_COMMAND_PLANE_TRIGGER_DDL = (
 )
 
 
+_LEGACY_STEPWISE_ARTIFACT_DIRECTORY_RE = re.compile(
+    r"startupHomingStepwise_(?P<created_ms>[0-9]{13})_[0-9a-f]{10}"
+)
+_LEGACY_STEPWISE_ARTIFACT_FILE_RE = re.compile(
+    r"runtime_stepwise_homing_(?P<homing_step>[a-z0-9]+(?:-[a-z0-9]+)*)\.json"
+)
+
+
+def _backfill_legacy_stepwise_homing_evidence(
+    connection: sqlite3.Connection,
+    root: Path,
+) -> None:
+    """Bind intact historical OEM homing artifacts without changing their bytes."""
+    artifacts_root = root / "artifacts"
+    if not artifacts_root.exists():
+        return
+    if artifacts_root.is_symlink() or not artifacts_root.is_dir():
+        raise RuntimeError("legacy stepwise homing artifact root is not a regular directory")
+
+    for artifact_directory in sorted(artifacts_root.iterdir(), key=lambda path: path.name):
+        directory_match = _LEGACY_STEPWISE_ARTIFACT_DIRECTORY_RE.fullmatch(artifact_directory.name)
+        if directory_match is None:
+            continue
+        if artifact_directory.is_symlink() or not artifact_directory.is_dir():
+            raise RuntimeError(
+                f"legacy stepwise homing artifact directory is not regular: {artifact_directory.name}"
+            )
+        for artifact_path in sorted(artifact_directory.iterdir(), key=lambda path: path.name):
+            file_match = _LEGACY_STEPWISE_ARTIFACT_FILE_RE.fullmatch(artifact_path.name)
+            if file_match is None:
+                continue
+            if artifact_path.is_symlink() or not artifact_path.is_file():
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact is not a regular file: {artifact_path.name}"
+                )
+            raw = artifact_path.read_bytes()
+            try:
+                payload = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact is not valid JSON: {artifact_path.name}"
+                ) from exc
+            if not isinstance(payload, dict) or set(payload) != {"command", "stepwise_homing"}:
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact envelope is invalid: {artifact_path.name}"
+                )
+            command = payload.get("command")
+            result = payload.get("stepwise_homing")
+            if not isinstance(command, dict) or not isinstance(result, dict):
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact payload is invalid: {artifact_path.name}"
+                )
+            command_id = command.get("command_id")
+            created_at = command.get("created_at")
+            homing_step = file_match.group("homing_step")
+            params = command.get("params")
+            artifact_root = command.get("artifact_root")
+            if not isinstance(command_id, str) or re.fullmatch(
+                r"cmd_[0-9]{13}_[0-9a-f]{10}", command_id
+            ) is None:
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact identity is invalid: {artifact_path.name}"
+                )
+            if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact timestamp is invalid: {artifact_path.name}"
+                )
+            created_at_value = float(created_at)
+            if not math.isfinite(created_at_value):
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact timestamp is invalid: {artifact_path.name}"
+                )
+            if (
+                command.get("mode") != "live"
+                or not isinstance(params, dict)
+                or params.get("homing_step") != homing_step
+                or not isinstance(artifact_root, str)
+                or Path(artifact_root).name != artifact_directory.name
+                or result.get("mode") != "live"
+            ):
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact identity is invalid: {artifact_path.name}"
+                )
+            command_created_ms = int(round(created_at_value * 1000.0))
+            directory_created_ms = int(directory_match.group("created_ms"))
+            command_id_created_ms = int(command_id.split("_", 2)[1])
+            if (
+                abs(command_created_ms - directory_created_ms) > 1000
+                or abs(command_created_ms - command_id_created_ms) > 1000
+            ):
+                raise RuntimeError(
+                    f"legacy stepwise homing artifact timestamp is contradictory: {artifact_path.name}"
+                )
+
+            relpath = artifact_path.relative_to(root).as_posix()
+            digest = hashlib.sha256(raw).hexdigest()
+            byte_count = len(raw)
+            evidence_id = f"historical-stepwise:{digest}"
+            current = datetime.fromtimestamp(created_at_value, tz=timezone.utc)
+            try:
+                retention_deadline = current.replace(year=current.year + 5).timestamp()
+            except ValueError:
+                retention_deadline = current.replace(year=current.year + 5, day=28).timestamp()
+            expected_identity = (relpath, relpath, digest, byte_count)
+            existing = connection.execute(
+                """
+                SELECT original_relpath,active_relpath,sha256,byte_count
+                FROM runtime_evidence_objects WHERE evidence_artifact_id=?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_evidence_objects(
+                        evidence_artifact_id,command_id,pipette_operation_id,original_relpath,
+                        active_relpath,sha256,byte_count,created_at,retention_deadline,
+                        legal_hold,expiry_state,expiry_receipt_id,updated_at
+                    ) VALUES(?,NULL,NULL,?,?,?,?,?,?,0,'active',NULL,?)
+                    """,
+                    (
+                        evidence_id,
+                        relpath,
+                        relpath,
+                        digest,
+                        byte_count,
+                        created_at_value,
+                        retention_deadline,
+                        created_at_value,
+                    ),
+                )
+            elif tuple(existing) != expected_identity:
+                raise RuntimeError(
+                    f"legacy stepwise homing evidence identity collision: {artifact_path.name}"
+                )
+
+            detail_json = json.dumps(
+                {
+                    "byte_count": byte_count,
+                    "command_id": command_id,
+                    "homing_step": homing_step,
+                    "relpath": relpath,
+                    "sha256": digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            published = connection.execute(
+                """
+                SELECT detail_json FROM runtime_evidence_events
+                WHERE evidence_artifact_id=? AND event_kind='published'
+                ORDER BY event_id LIMIT 1
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if published is None:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_evidence_events(
+                        evidence_artifact_id,event_kind,observed_at,detail_json
+                    ) VALUES(?,'published',?,?)
+                    """,
+                    (evidence_id, created_at_value, detail_json),
+                )
+            elif str(published["detail_json"]) != detail_json:
+                raise RuntimeError(
+                    f"legacy stepwise homing publication identity collision: {artifact_path.name}"
+                )
+
+            target_identity = f"historical-stepwise-homing:{command_id}"
+            linked = connection.execute(
+                """
+                SELECT 1 FROM runtime_evidence_links
+                WHERE evidence_artifact_id=? AND target_kind='migration'
+                  AND target_identity=? AND command_id IS NULL
+                  AND pipette_operation_id IS NULL
+                  AND link_kind='historical_runtime_artifact'
+                LIMIT 1
+                """,
+                (evidence_id, target_identity),
+            ).fetchone()
+            if linked is None:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_evidence_links(
+                        evidence_artifact_id,target_kind,target_identity,command_id,
+                        pipette_operation_id,link_kind,created_at
+                    ) VALUES(?,'migration',?,NULL,NULL,'historical_runtime_artifact',?)
+                    """,
+                    (evidence_id, target_identity, created_at_value),
+                )
+
+
 def _apply_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> None:
     for statement in (*_OPERATOR_COMMAND_PLANE_TABLE_DDL, *_OPERATOR_COMMAND_PLANE_INDEX_DDL):
         connection.execute(statement)
@@ -1952,6 +2145,7 @@ def operator_command_plane_migration_identity() -> RuntimeMigrationIdentity:
             *_OPERATOR_COMMAND_PLANE_TABLE_DDL,
             *_OPERATOR_COMMAND_PLANE_INDEX_DDL,
             *_OPERATOR_COMMAND_PLANE_TRIGGER_DDL,
+            inspect.getsource(_backfill_legacy_stepwise_homing_evidence),
             inspect.getsource(_apply_operator_command_plane_schema_v1),
         )
     ).encode("utf-8")
@@ -2985,6 +3179,7 @@ def _migrate_operator_command_plane_schema_v1(
         # fingerprint-bound deployed command-plane compatibility manifold.
         # Every other pre-ledger shape fails attestation and rolls back.
         _apply_operator_command_plane_schema_v1(connection)
+        _backfill_legacy_stepwise_homing_evidence(connection, root)
         _verify_operator_command_plane_schema_v1(connection)
         finished_at = time.time()
         _record_runtime_migration(

@@ -388,6 +388,28 @@ def _seed_deployed_operator_manifold(tmp_path, monkeypatch):
     evidence_path = tmp_path / evidence_relpath
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_bytes(evidence_raw)
+    historical_directory = "startupHomingStepwise_1785083802764_199e98d2bc"
+    historical_relpath = (
+        f"artifacts/{historical_directory}/runtime_stepwise_homing_z-home.json"
+    )
+    historical_payload = {
+        "command": {
+            "artifact_root": f"/app/.oem_runtime_state/artifacts/{historical_directory}",
+            "command_id": "cmd_1785083802765_15ddf52504",
+            "created_at": 1785083802.7651615,
+            "mode": "live",
+            "params": {"homing_step": "z-home"},
+        },
+        "stepwise_homing": {"mode": "live", "result": {"preserved": True}},
+    }
+    historical_raw = json.dumps(
+        historical_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    historical_path = tmp_path / historical_relpath
+    historical_path.parent.mkdir(parents=True, exist_ok=True)
+    historical_path.write_bytes(historical_raw)
     with seed._transaction() as connection:
         connection.execute(
             """
@@ -414,13 +436,17 @@ def _seed_deployed_operator_manifold(tmp_path, monkeypatch):
         == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
     )
     seed.connection.close()
+    return {
+        "historical_raw": historical_raw,
+        "historical_relpath": historical_relpath,
+    }
 
 
 def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_loss(
     tmp_path,
     monkeypatch,
 ):
-    _seed_deployed_operator_manifold(tmp_path, monkeypatch)
+    seeded = _seed_deployed_operator_manifold(tmp_path, monkeypatch)
 
     migrated = OEMRuntimeStore(tmp_path)
     verify_canonical_runtime_database(migrated._db)
@@ -448,6 +474,33 @@ def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_lo
         WHERE command_id='legacy-command-with-evidence' AND target_kind='command'
           AND target_identity='legacy-command-with-evidence' AND link_kind='command_evidence'
         """
+    ).fetchone()[0] == 1
+    historical_raw = seeded["historical_raw"]
+    historical_relpath = seeded["historical_relpath"]
+    historical_digest = hashlib.sha256(historical_raw).hexdigest()
+    historical = migrated._db.execute(
+        """
+        SELECT evidence_artifact_id,command_id,active_relpath,sha256,byte_count,expiry_state
+        FROM runtime_evidence_objects WHERE active_relpath=?
+        """,
+        (historical_relpath,),
+    ).fetchone()
+    assert tuple(historical) == (
+        f"historical-stepwise:{historical_digest}",
+        None,
+        historical_relpath,
+        historical_digest,
+        len(historical_raw),
+        "active",
+    )
+    assert migrated._db.execute(
+        """
+        SELECT COUNT(*) FROM runtime_evidence_links
+        WHERE evidence_artifact_id=? AND target_kind='migration'
+          AND target_identity='historical-stepwise-homing:cmd_1785083802765_15ddf52504'
+          AND link_kind='historical_runtime_artifact'
+        """,
+        (f"historical-stepwise:{historical_digest}",),
     ).fetchone()[0] == 1
     assert migrated._db.execute(
         "SELECT source_wrapper_json FROM operator_plane_interrupt_history "
