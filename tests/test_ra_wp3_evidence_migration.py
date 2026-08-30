@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -466,6 +467,128 @@ def test_atomic_migration_resumes_valid_v1_marker_before_retirement(tmp_path):
         "SELECT source_digest,archive_relpath FROM runtime_migration_retirements"
     ).fetchone()
     assert tuple(retirement) == (source_sha256, archive_relpath)
+
+
+def test_retired_v1_migration_attests_historical_empty_outcome_without_rewrite(tmp_path):
+    store = _pipette_store(tmp_path)
+    legacy = legacy_pipette_receipt(
+        "retired-v1-empty-outcome",
+        created_at="2026-08-20T00:00:00Z",
+        operation="status",
+        channel=0,
+    )
+    legacy["result"]["outcome"] = ""
+    raw = (json.dumps(legacy, sort_keys=True) + "\n").encode("utf-8")
+    source_sha256 = hashlib.sha256(raw).hexdigest()
+    migration_id = f"pipette-jsonl:{source_sha256}"
+    archive_relpath = f"archive/receipts.jsonl.{source_sha256}"
+    command_id = "legacy.pipette.retired-v1-empty-outcome"
+    source_identity = {
+        "legacy_receipt_id": "retired-v1-empty-outcome",
+        "source_sha256": source_sha256,
+    }
+    claim, created = store._audit_database.claim(
+        {
+            "command_id": command_id,
+            "pipette_operation_id": command_id,
+            "idempotency_key": "legacy-pipette:retired-v1-empty-outcome",
+            "action_id": "pipette.status",
+            "operation": "status",
+            "entrypoint_id": "migration.pipette_jsonl.v1",
+            "caller_class": "legacy_migration",
+            "control_class": "historical_import",
+            "ownership_generation": 0,
+            "connection_generation": 0,
+            "source_identity": source_identity,
+            "requested_inputs": {"channel": 0},
+        },
+        pipette=True,
+    )
+    assert created is True
+    store._audit_database.finalize_claim(
+        command_id=command_id,
+        pipette_operation_id=claim["pipette_operation_id"],
+        expected_status=claim["status"],
+        status="completed",
+        outcome="completed",
+        failure_code=None,
+        result={**legacy["result"], **legacy["truth"]},
+        effective_inputs=legacy["effective_inputs"],
+        receipt_json=json.dumps(legacy, sort_keys=True),
+    )
+    store._write_immutable_migration_artifact(
+        store.root / archive_relpath,
+        raw,
+        expected_sha256=source_sha256,
+    )
+    backup_root = store.root / "backups" / "pipette-audit-pre-migration-retired-v1"
+    backup_root.mkdir(parents=True)
+    backup_database = backup_root / "bioxp_runtime.db"
+    backup_connection = sqlite3.connect(backup_database)
+    store.connection.backup(backup_connection)
+    backup_connection.close()
+    backup_receipts = backup_root / "receipts.jsonl"
+    backup_receipts.write_bytes(raw)
+    sums = (
+        f"{hashlib.sha256(backup_database.read_bytes()).hexdigest()}  {backup_database}\n"
+        f"{source_sha256}  {backup_receipts}\n"
+    )
+    (backup_root / "SHA256SUMS").write_text(sums, encoding="utf-8")
+    backup_relpath = backup_root.relative_to(store.root).as_posix()
+    now = time.time()
+    store.connection.execute(
+        """
+        INSERT INTO runtime_migration_receipts(
+            migration_id,source_kind,source_digest,source_count,imported_count,
+            duplicate_count,quarantined_count,status,archive_relpath,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            migration_id,
+            "pipette_receipts_jsonl",
+            source_sha256,
+            1,
+            1,
+            0,
+            0,
+            "completed",
+            archive_relpath,
+            now,
+        ),
+    )
+    store.connection.execute(
+        """
+        INSERT INTO runtime_migration_retirements(
+            migration_id,source_digest,archive_relpath,retired_at,retirement_sha256
+        ) VALUES(?,?,?,?,?)
+        """,
+        (migration_id, source_sha256, archive_relpath, now, source_sha256),
+    )
+    store._ensure_migration_evidence(
+        migration_id=migration_id,
+        source_path=str(store._legacy_path),
+        source_digest=source_sha256,
+        source_bytes=len(raw),
+        source_count=1,
+        imported_count=1,
+        duplicate_count=0,
+        quarantined_count=0,
+        backup_relpath=backup_relpath,
+        archive_relpath=archive_relpath,
+    )
+
+    restarted = store.migrate_legacy_jsonl()
+
+    assert restarted["status"] == "already_imported"
+    assert restarted["duplicate_count"] == 1
+    assert restarted["quarantined_count"] == 0
+    assert (store.root / archive_relpath).read_bytes() == raw
+    persisted = store.connection.execute(
+        "SELECT outcome,source_identity_json FROM pipette_operations WHERE command_id=?",
+        (command_id,),
+    ).fetchone()
+    assert persisted["outcome"] == "completed"
+    assert json.loads(persisted["source_identity_json"]) == source_identity
 
 
 def test_record_without_typed_ids_uses_sqlite_and_does_not_append_jsonl(tmp_path):

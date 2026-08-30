@@ -6,6 +6,7 @@ import fcntl
 from functools import wraps
 import json
 import os
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1036,6 +1037,207 @@ class PipetteReceiptStore:
         )
         return valid, quarantine_bytes, source_count
 
+    def _attest_retired_v1_imports(
+        self,
+        raw: bytes,
+        *,
+        migration_id: str,
+        source_sha256: str,
+        source_count: int,
+        imported_count: int,
+        duplicate_count: int,
+        quarantined_count: int,
+        current_quarantine: bytes,
+    ) -> int:
+        """Attest a completed v1 import without rewriting its historical source."""
+        if (
+            migration_id != f"pipette-jsonl:{source_sha256}"
+            or source_count <= 0
+            or imported_count != source_count
+            or duplicate_count != 0
+            or quarantined_count != 0
+        ):
+            raise PipetteReceiptError("retired migration valid-row count mismatch")
+        try:
+            current_quarantine_rows = [
+                json.loads(line) for line in current_quarantine.splitlines() if line.strip()
+            ]
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+            raise PipetteReceiptError("retired migration quarantine evidence is invalid") from exc
+        if not current_quarantine_rows or any(
+            not isinstance(row, Mapping) or row.get("reason_code") != "invalid_result_outcome"
+            for row in current_quarantine_rows
+        ):
+            raise PipetteReceiptError("retired migration valid-row count mismatch")
+
+        archived: dict[str, Mapping[str, Any]] = {}
+        for raw_line in raw.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                row = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                raise PipetteReceiptError("retired v1 archive is not valid JSONL") from exc
+            if not isinstance(row, Mapping):
+                raise PipetteReceiptError("retired v1 archive row is not an object")
+            receipt_id = row.get("receipt_id")
+            operation = row.get("operation")
+            requested_inputs = row.get("requested_inputs")
+            result = row.get("result")
+            if (
+                not isinstance(receipt_id, str)
+                or not receipt_id
+                or receipt_id in archived
+                or not isinstance(operation, str)
+                or not operation.strip()
+                or not isinstance(requested_inputs, Mapping)
+                or not isinstance(result, Mapping)
+                or not isinstance(result.get("ok"), bool)
+            ):
+                raise PipetteReceiptError("retired v1 archive row identity is invalid")
+            archived[receipt_id] = row
+        if len(archived) != source_count:
+            raise PipetteReceiptError("retired v1 archive source count mismatch")
+
+        expected_ids = set(archived)
+        observed_ids: set[str] = set()
+        for receipt_id, legacy in archived.items():
+            command_id = f"legacy.pipette.{receipt_id}"
+            prior = self.connection.execute(
+                """
+                SELECT c.idempotency_key,c.action_id,c.operation,c.entrypoint_id,
+                       c.caller_class,c.control_class,c.requested_inputs_json,
+                       c.source_identity_json AS command_source_identity_json,
+                       p.pipette_operation_id,p.operation AS pipette_operation,
+                       p.entrypoint_id AS pipette_entrypoint_id,p.caller_class AS pipette_caller_class,
+                       p.control_class AS pipette_control_class,p.status,p.outcome,
+                       p.source_identity_json AS pipette_source_identity_json
+                FROM operator_commands AS c
+                JOIN pipette_operations AS p ON p.command_id=c.command_id
+                WHERE c.command_id=?
+                """,
+                (command_id,),
+            ).fetchone()
+            expected_source = {
+                "legacy_receipt_id": receipt_id,
+                "source_sha256": source_sha256,
+            }
+            if (
+                prior is None
+                or str(prior["idempotency_key"]) != f"legacy-pipette:{receipt_id}"
+                or str(prior["action_id"]) != f"pipette.{legacy['operation']}"
+                or str(prior["operation"]) != str(legacy["operation"])
+                or str(prior["pipette_operation"]) != str(legacy["operation"])
+                or str(prior["entrypoint_id"]) != "migration.pipette_jsonl.v1"
+                or str(prior["pipette_entrypoint_id"]) != "migration.pipette_jsonl.v1"
+                or str(prior["caller_class"]) != "legacy_migration"
+                or str(prior["pipette_caller_class"]) != "legacy_migration"
+                or str(prior["control_class"]) != "historical_import"
+                or str(prior["pipette_control_class"]) != "historical_import"
+                or str(prior["pipette_operation_id"]) != command_id
+                or str(prior["requested_inputs_json"])
+                != canonical_json(dict(legacy["requested_inputs"]))
+                or json.loads(str(prior["command_source_identity_json"])) != expected_source
+                or json.loads(str(prior["pipette_source_identity_json"])) != expected_source
+                or str(prior["status"]) in NONTERMINAL_COMMAND_STATES
+                or not str(prior["outcome"] or "").strip()
+            ):
+                raise PipetteReceiptError("retired v1 import binding conflicts with its archive")
+            observed_ids.add(receipt_id)
+
+        rows = self.connection.execute(
+            """
+            SELECT c.source_identity_json,p.source_identity_json
+            FROM operator_commands AS c
+            JOIN pipette_operations AS p ON p.command_id=c.command_id
+            WHERE c.entrypoint_id='migration.pipette_jsonl.v1'
+              AND p.entrypoint_id='migration.pipette_jsonl.v1'
+            """
+        ).fetchall()
+        source_bound_ids: set[str] = set()
+        for row in rows:
+            command_source = json.loads(str(row[0]))
+            pipette_source = json.loads(str(row[1]))
+            if command_source != pipette_source:
+                raise PipetteReceiptError("retired v1 import source identities disagree")
+            if command_source.get("source_sha256") == source_sha256:
+                receipt_id = command_source.get("legacy_receipt_id")
+                if not isinstance(receipt_id, str) or not receipt_id:
+                    raise PipetteReceiptError("retired v1 import source identity is invalid")
+                source_bound_ids.add(receipt_id)
+        if observed_ids != expected_ids or source_bound_ids != expected_ids:
+            raise PipetteReceiptError("retired v1 import inventory conflicts with its archive")
+        return len(observed_ids)
+
+    @staticmethod
+    def _verify_retired_v1_backup(
+        backup_root: Path,
+        *,
+        source_sha256: str,
+        archive_raw: bytes,
+    ) -> dict[str, Any]:
+        if backup_root.is_symlink() or not backup_root.is_dir():
+            raise PipetteReceiptError("retired v1 migration backup is unavailable")
+        allowed = {
+            "SHA256SUMS",
+            "bioxp_runtime.db",
+            "bioxp_runtime.db-shm",
+            "bioxp_runtime.db-wal",
+            "receipts.jsonl",
+        }
+        observed = {path.name for path in backup_root.iterdir()}
+        required = {"SHA256SUMS", "bioxp_runtime.db", "receipts.jsonl"}
+        if not required.issubset(observed) or not observed.issubset(allowed):
+            raise PipetteReceiptError("retired v1 migration backup inventory is invalid")
+        for path in backup_root.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise PipetteReceiptError("retired v1 migration backup contains an invalid file")
+
+        sums_raw = (backup_root / "SHA256SUMS").read_bytes()
+        listed: dict[str, str] = {}
+        try:
+            lines = sums_raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise PipetteReceiptError("retired v1 migration checksum file is invalid") from exc
+        for line in lines:
+            try:
+                digest, selected = line.split("  ", 1)
+            except ValueError as exc:
+                raise PipetteReceiptError("retired v1 migration checksum row is invalid") from exc
+            selected_path = Path(selected)
+            if (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or not selected_path.is_absolute()
+                or selected_path.parent != backup_root
+                or selected_path.name not in {"bioxp_runtime.db", "receipts.jsonl"}
+                or selected_path.name in listed
+            ):
+                raise PipetteReceiptError("retired v1 migration checksum binding is invalid")
+            raw = (backup_root / selected_path.name).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise PipetteReceiptError("retired v1 migration backup digest mismatch")
+            listed[selected_path.name] = digest
+        if set(listed) != {"bioxp_runtime.db", "receipts.jsonl"}:
+            raise PipetteReceiptError("retired v1 migration checksum closure is incomplete")
+        if (
+            listed["receipts.jsonl"] != source_sha256
+            or (backup_root / "receipts.jsonl").read_bytes() != archive_raw
+        ):
+            raise PipetteReceiptError("retired v1 migration backup source binding is invalid")
+        wal = backup_root / "bioxp_runtime.db-wal"
+        if wal.exists() and wal.stat().st_size != 0:
+            raise PipetteReceiptError("retired v1 migration backup has unsealed WAL state")
+        database = backup_root / "bioxp_runtime.db"
+        with sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True) as connection:
+            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise PipetteReceiptError("retired v1 migration backup database is invalid")
+        return {
+            "status": "verified_retired_v1",
+            "backup_id": backup_root.name,
+            "sha256sums_sha256": hashlib.sha256(sums_raw).hexdigest(),
+        }
+
     def _retirement_authority(
         self,
         *,
@@ -1258,8 +1460,21 @@ class PipetteReceiptStore:
                 )
                 if source_count != int(latest["source_count"]):
                     raise PipetteReceiptError("retired migration source count mismatch")
-                if len(valid) != int(latest["imported_count"]) + int(latest["duplicate_count"]):
-                    raise PipetteReceiptError("retired migration valid-row count mismatch")
+                validated_count = len(valid)
+                retired_v1_compatible = False
+                if validated_count != int(latest["imported_count"]) + int(latest["duplicate_count"]):
+                    validated_count = self._attest_retired_v1_imports(
+                        archive_raw,
+                        migration_id=str(latest["migration_id"]),
+                        source_sha256=source_sha256,
+                        source_count=source_count,
+                        imported_count=int(latest["imported_count"]),
+                        duplicate_count=int(latest["duplicate_count"]),
+                        quarantined_count=int(latest["quarantined_count"]),
+                        current_quarantine=quarantine_bytes,
+                    )
+                    quarantine_bytes = b""
+                    retired_v1_compatible = True
                 if quarantine_bytes.count(b"\n") != int(latest["quarantined_count"]):
                     raise PipetteReceiptError("retired migration quarantine state mismatch")
                 quarantine_relpath = None
@@ -1287,7 +1502,15 @@ class PipetteReceiptStore:
                 )
                 if backup_relpath is None:
                     raise PipetteReceiptError("completed migration is missing its bound backup")
-                verified_backup = verify_backup_unit(self.root / backup_relpath)
+                verified_backup = (
+                    self._verify_retired_v1_backup(
+                        self.root / backup_relpath,
+                        source_sha256=source_sha256,
+                        archive_raw=archive_raw,
+                    )
+                    if retired_v1_compatible
+                    else verify_backup_unit(self.root / backup_relpath)
+                )
                 if str(verified_backup.get("backup_id") or "") != Path(backup_relpath).name:
                     raise PipetteReceiptError("migration backup identity mismatch")
                 self._ensure_migration_evidence(
@@ -1309,7 +1532,7 @@ class PipetteReceiptStore:
                     "source_bytes": len(archive_raw),
                     "source_count": source_count,
                     "imported_count": 0,
-                    "duplicate_count": len(valid),
+                    "duplicate_count": validated_count,
                     "quarantined_count": int(latest["quarantined_count"]),
                     "quarantine_relpath": quarantine_relpath,
                     "quarantine_sha256": quarantine_sha256,
