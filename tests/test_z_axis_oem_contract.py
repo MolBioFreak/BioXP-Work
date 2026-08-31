@@ -153,12 +153,18 @@ def test_begin_event_window_returns_monotonic_cursor(monkeypatch):
     driver = _driver()
     driver._bus_event_sequence = 7
     driver._bus_event_buffer = [{"status": 128}]
-    monkeypatch.setattr(driver, "clear_bus_event_buffer", lambda: {"cleared": 1, "router_cleared": {}})
+    monkeypatch.setattr(
+        driver,
+        "clear_bus_event_buffer",
+        lambda: (_ for _ in ()).throw(AssertionError("OEM wait-latch reset must not purge queues")),
+    )
 
     window = driver.begin_bus_event_window()
 
     assert window["after_sequence"] == 7
-    assert window["cleared"] == 1
+    assert window["oem_wait_latch_reset"] is True
+    assert window["cleared"] == 0
+    assert window["queue_purge_omitted_by_source"] is True
 
 
 def test_wait_target_reached_ignores_stale_event_and_accepts_fresh_event(monkeypatch):
@@ -198,7 +204,7 @@ def test_move_z_home_is_distinct_source_method_at_1791_without_standby_write(mon
             "home_search_max_abs_delta": 160000,
         },
     )
-    monkeypatch.setattr(driver, "motor_oem_require_no_motion_profile", lambda axis: calls.append(("require_profile", axis)) or {"ok": True})
+
     monkeypatch.setattr(
         driver,
         "motor_set_axis_param",
@@ -221,7 +227,6 @@ def test_move_z_home_is_distinct_source_method_at_1791_without_standby_write(mon
     assert result["oem_method"] == "ClassControlInterface.MoveZHome"
     assert result["standby_current_param7_written"] is False
     assert calls == [
-        ("require_profile", "z"),
         ("set", 4, 1, 6, 31),
         ("get", 4, 1, 6),
         ("go_home", "z", {"speed": 1791, "rehome": True, "timeout_s": 30.0, "max_search_abs_delta": None}),

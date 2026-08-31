@@ -439,7 +439,7 @@ def test_existing_database_migrates_replay_column_before_replacing_unique_index(
     ).fetchall())
     assert replay_by_action == {
         "oem.z.stop": 0,
-        "oem.z.abort": 0,
+        "oem.z.abort": 1,
         "oem.x.stop": 0,
         "oem.abort_all": 0,
         "meta.emergency_stop": 0,

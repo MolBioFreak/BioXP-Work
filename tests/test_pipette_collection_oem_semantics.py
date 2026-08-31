@@ -60,16 +60,18 @@ def collection(*, tips=(False, False, False, False), speeds=(10.0, 10.0, 10.0, 1
     ), transports
 
 
-def test_default_liquid_channel_selection_uses_oem_tip_location():
+def test_standard_liquid_selection_uses_oem_tip_location_not_metadata():
     subject, _ = collection()
     subject.loadTip(200, 2)
 
-    assert subject._channels_from_metadata({"selection_mode": "tip_location"}) == [2]
-    assert subject._channels_from_metadata({"channels": [0, 3]}) == [0, 3]
+    assert subject._tip_location_channels() == [2]
 
     subject.loadTip(200, -1)
-    with pytest.raises(PipetteCommandError, match="unresolved"):
-        subject._channels_from_metadata({"selection_mode": "tip_location"})
+    assert subject._tip_location_channels() == [0, 1, 2, 3]
+
+    command = PipetteAspirateCommand(volume_ul=1.0, metadata={"channels": [3], "speed": 2})
+    assert command.channels is None
+    assert command.speed is None
 
 
 def test_set_top_speed_skips_channels_without_tips_and_honors_oem_early_return():

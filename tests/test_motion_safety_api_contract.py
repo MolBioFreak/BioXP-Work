@@ -19,8 +19,8 @@ def test_source_grounded_prepare_and_physical_stop_are_bound_operator_actions():
     assert prepare["enabled"] is True
     assert prepare["inputs"] == []
 
-    emergency = actions["meta.emergency_stop"]
-    assert emergency["informational_path"] == "/motion/emergency_stop"
+    emergency = actions["oem.abort_all"]
+    assert emergency["informational_path"] == "/motion/oem/x/abort"
     assert emergency["provider_available"] is True
     assert emergency["enabled"] is True
     assert emergency["requires_confirmation"] is False

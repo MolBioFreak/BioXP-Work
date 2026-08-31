@@ -13,6 +13,8 @@ class FakeReferenceStore:
     def __init__(self):
         self.motion_many = []
         self.motion_single = []
+        self.reference_commits = []
+        self.fail_reference_commit = False
 
     def snapshot(self, axes):
         return {"ok": True, "durable_clean": True, "rows": {axis: {"state": "referenced"} for axis in axes}}
@@ -26,6 +28,10 @@ class FakeReferenceStore:
         return {"ok": True, "durable_clean": True, "commands": list(commands)}
 
     def mark_referenced_many(self, commands):
+        commands = tuple(commands)
+        if self.fail_reference_commit:
+            return {"ok": False, "durable_clean": False, "rows": {}}
+        self.reference_commits.append(tuple(command.axis for command in commands))
         return {"ok": True, "durable_clean": True, "rows": {command.axis: {"state": "referenced"} for command in commands}}
 
 
@@ -123,6 +129,14 @@ class LifecyclePrimitives:
     def x_wait_for_motor(self, **kwargs):
         return {"ok": True, "target_position_verified": True}
 
+    @staticmethod
+    def _x_profile():
+        return {
+            "axis_min_steps": 0,
+            "axis_max_steps": 90263,
+            "axis_max_source": "test_selected_machine_configuration",
+        }
+
 
 class ImmediateXPrimitives:
     def __init__(self):
@@ -135,6 +149,14 @@ class ImmediateXPrimitives:
     @staticmethod
     def _x_require_motion_preflight():
         return {"profile": {"axis": "x"}, "switch_masks": {12: 0, 13: 0}}
+
+    @staticmethod
+    def _x_profile():
+        return {
+            "axis_min_steps": 0,
+            "axis_max_steps": 90263,
+            "axis_max_source": "test_selected_machine_configuration",
+        }
 
     def x_move_absolute(self, **_kwargs):
         self.dispatches += 1
@@ -153,6 +175,30 @@ class ImmediateXPrimitives:
         return {"ok": True, "command_issued": True, "target_position_verified": True, "controller_terminal_state_verified": True, "acceleration_restore_verified": True}
 
 
+class CompositeYAuthority:
+    def __init__(self):
+        self.interrupt_epoch = 0
+        self.lifecycle_state = "referenced_ready"
+        self.prepared_board_epoch = 7
+        self.active_board_epoch = 7
+        self.pending_ticket = None
+
+    def _authority(self):
+        return {
+            "board": {"state": "active", "active_board_epoch": self.active_board_epoch},
+            "axes": {
+                "y": {
+                    "ownership_generation": 17,
+                    "prepared_board_epoch": self.prepared_board_epoch,
+                    "lifecycle_state": self.lifecycle_state,
+                    "reference_state": "referenced",
+                    "interrupt_epoch": self.interrupt_epoch,
+                    "pending_ticket": self.pending_ticket,
+                }
+            },
+        }
+
+
 def seed_ready(provider, *, referenced=True):
     state = provider._load_state()
     state["x_lifecycle"].update({
@@ -163,6 +209,8 @@ def seed_ready(provider, *, referenced=True):
         "prepared_receipt": {"ok": True, "board_lifecycle_generation": 9},
     })
     provider._save_state(state)
+    if provider.y_provider is None:
+        provider.y_provider = CompositeYAuthority()
     return provider
 
 
@@ -279,6 +327,145 @@ def test_homexy_terminal_receipt_replays_without_physical_redispatch(tmp_path):
     assert replay["ok"] is True
     assert replay["replayed"] is True
     assert primitives.dispatches == 1
+
+
+@pytest.mark.parametrize("persist_ok", [True, False])
+def test_homexy_parent_observation_publishes_x_and_y_atomically_or_neither(persist_ok):
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    primitives = ImmediateXPrimitives()
+    reference_store = FakeReferenceStore()
+    reference_store.fail_reference_commit = not persist_ok
+    provider = seed_ready(
+        Serial206OemInitializationProvider(
+            primitives,
+            reference_store=reference_store,
+            generation_provider=lambda: 17,
+        )
+    )
+    command_id = f"homexy-observe-{persist_ok}"
+    assert provider.execute_homexy_intent({"command_id": command_id})["ok"] is True
+
+    observed = provider.record_x_observation(
+        command_id=command_id,
+        verdict="pass",
+        physical_motion_observed=True,
+        expected_direction_observed=True,
+        home_endpoint_observed=True,
+        stopped_observed=True,
+        note="operator observed both axes home",
+        expected_generation=17,
+    )
+
+    assert observed["ok"] is persist_ok
+    assert reference_store.reference_commits == ([("x", "y")] if persist_ok else [])
+
+
+@pytest.mark.parametrize("operation", ["xy", "homexy"])
+def test_xy_composites_persist_both_child_receipts_and_replay_fences_y_interrupt(tmp_path, operation):
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    store = OEMRuntimeStore(tmp_path)
+    primitives = ImmediateXPrimitives()
+    provider = seed_ready(
+        Serial206OemInitializationProvider(
+            primitives, state_store=store, generation_provider=lambda: 17
+        )
+    )
+    y = CompositeYAuthority()
+    provider.y_provider = y
+    values = {"command_id": f"{operation}-composite", "idempotency_key": f"{operation}-key"}
+
+    first = (
+        provider.execute_xy_intent(10, 20, values)
+        if operation == "xy"
+        else provider.execute_homexy_intent(values)
+    )
+
+    assert first["ok"] is True
+    assert first["authority_receipt"]["composite_authority"]["terminal"]["y"]["interrupt_epoch"] == 0
+    assert len(store.list_serial206_receipts("x", 20)) == 1
+    assert len(store.list_serial206_receipts("y", 20)) == 1
+
+    y.interrupt_epoch = 1
+    replay = (
+        provider.execute_xy_intent(10, 20, values)
+        if operation == "xy"
+        else provider.execute_homexy_intent(values)
+    )
+    assert replay["ok"] is False
+    assert replay["replayed"] is True
+    assert primitives.dispatches == 1
+
+
+@pytest.mark.parametrize("operation", ["xy", "homexy"])
+def test_xy_composite_replay_repairs_atomic_child_receipts_without_redispatch(tmp_path, operation, monkeypatch):
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    store = OEMRuntimeStore(tmp_path)
+    primitives = ImmediateXPrimitives()
+    provider = seed_ready(
+        Serial206OemInitializationProvider(
+            primitives, state_store=store, generation_provider=lambda: 17
+        )
+    )
+    values = {"command_id": f"{operation}-repair", "idempotency_key": f"{operation}-repair-key"}
+    append_atomic = store.append_serial206_receipts_atomic
+    attempts = 0
+
+    def fail_once(rows):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected atomic receipt failure")
+        return append_atomic(rows)
+
+    monkeypatch.setattr(store, "append_serial206_receipts_atomic", fail_once)
+    first = (
+        provider.execute_xy_intent(10, 20, values)
+        if operation == "xy"
+        else provider.execute_homexy_intent(values)
+    )
+
+    assert first["ok"] is False
+    assert primitives.dispatches == 1
+    assert store.list_serial206_receipts("x", 20) == []
+    assert store.list_serial206_receipts("y", 20) == []
+
+    replay = (
+        provider.execute_xy_intent(10, 20, values)
+        if operation == "xy"
+        else provider.execute_homexy_intent(values)
+    )
+
+    assert replay["ok"] is True
+    assert replay["replayed"] is True
+    assert primitives.dispatches == 1
+    assert len(store.list_serial206_receipts("x", 20)) == 1
+    assert len(store.list_serial206_receipts("y", 20)) == 1
+
+
+@pytest.mark.parametrize("operation", ["xy", "homexy"])
+def test_xy_composites_reject_y_pending_or_stale_board_authority_before_dispatch(tmp_path, operation):
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    primitives = ImmediateXPrimitives()
+    provider = seed_ready(
+        Serial206OemInitializationProvider(primitives, generation_provider=lambda: 17)
+    )
+    y = CompositeYAuthority()
+    y.pending_ticket = {"command_id": "existing-y-pending"}
+    provider.y_provider = y
+
+    result = (
+        provider.execute_xy_intent(10, 20, {"command_id": f"{operation}-blocked"})
+        if operation == "xy"
+        else provider.execute_homexy_intent({"command_id": f"{operation}-blocked"})
+    )
+
+    assert result["ok"] is False
+    assert result["failure"] == f"{operation}_y_authority_not_current"
+    assert primitives.dispatches == 0
 
 
 def test_x_stop_uses_interrupt_lane_and_reused_command_id_still_dispatches(tmp_path, monkeypatch):
@@ -429,5 +616,48 @@ def test_xy_reused_command_id_cannot_replay_different_target(tmp_path):
     replay = provider.execute_xy_intent(11, 20, values)
 
     assert replay["ok"] is False
+    assert replay["failure"] == "xy_replay_current_authority_or_request_invalid"
+
+
+def test_failed_move_xy_replay_revalidates_composite_authority_before_returning_receipt(tmp_path):
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    store = OEMRuntimeStore(tmp_path)
+    primitives = ImmediateXPrimitives()
+
+    def failed_move_xy(_x, _y, **_kwargs):
+        primitives.dispatches += 1
+        return {
+            "ok": False,
+            "failure": "synthetic_terminal_failure",
+            "command_issued": True,
+            "controller_terminal_state_verified": False,
+        }
+
+    primitives.move_xy = failed_move_xy
+    provider = seed_ready(
+        Serial206OemInitializationProvider(
+            primitives,
+            state_store=store,
+            generation_provider=lambda: 17,
+        )
+    )
+    y = CompositeYAuthority()
+    provider.y_provider = y
+    values = {
+        "command_id": "xy-failed-replay-fence",
+        "idempotency_key": "xy-failed-replay-fence-key",
+    }
+
+    first = provider.execute_xy_intent(10, 20, values)
+    assert first["ok"] is False
+    assert first["authority_receipt"]["status"] == "failed"
+    assert primitives.dispatches == 1
+
+    y.interrupt_epoch = 1
+    replay = provider.execute_xy_intent(10, 20, values)
+
+    assert replay["ok"] is False
+    assert replay["replayed"] is True
     assert replay["failure"] == "xy_replay_current_authority_or_request_invalid"
     assert primitives.dispatches == 1

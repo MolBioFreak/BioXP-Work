@@ -213,7 +213,7 @@ def test_transport_status_exposes_persistent_oem_message_state():
 
 
 
-def test_group_mix_uses_per_command_completion_for_composite_oem_mix():
+def test_group_mix_is_one_channel_without_constituent_completion_waits():
     from src.bioxp.pipette.models import PipetteMixCommand
     from src.bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport
 
@@ -242,14 +242,13 @@ def test_group_mix_uses_per_command_completion_for_composite_oem_mix():
     for transport in transports:
         transport._initialized = True
     collection = FourPipetteTransport(transports, sleep=lambda _seconds: None, liquid_mutation_enabled=True)
+    collection.loadTip(200, 2)
 
-    result = collection.mix(
-        PipetteMixCommand(volume_ul=2.0, cycles=2, metadata={"channels": [0, 1, 2, 3]})
-    )
+    result = collection.mix(PipetteMixCommand(volume_ul=2.0, cycles=2))
 
     assert result["ok"] is True
-    assert result["wait_policy"] == "per_command_completion"
-    assert [driver.wait_values for driver in drivers] == [[True], [True], [True], [True]]
+    assert result["wait_policy"] == "oem_composite_sequence_no_constituent_completion_waits"
+    assert [driver.wait_values for driver in drivers] == [[], [], [False], []]
 
 
 

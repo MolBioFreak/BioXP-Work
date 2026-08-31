@@ -641,7 +641,8 @@ class Serial206ProductionPrimitiveAdapter:
             raise RuntimeError("serial-206 X profile unavailable")
         if int(profile.get("board", -1)) != 5 or int(profile.get("motor", -1)) != 0:
             raise RuntimeError("serial-206 X channel identity mismatch")
-        if int(profile.get("axis_min_steps", 0)) != 0 or int(profile.get("axis_max_steps", -1)) != 90263:
+        expected_max, _ = self.tester._machine_config_axis_max("x")
+        if int(profile.get("axis_min_steps", 0)) != 0 or int(profile.get("axis_max_steps", -1)) != int(expected_max):
             raise RuntimeError("serial-206 X limit authority mismatch")
         return profile
 
@@ -688,22 +689,36 @@ class Serial206ProductionPrimitiveAdapter:
         source_method: str,
     ) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "intent": intent,
+                "source_method": source_method,
+                "board": 5,
+                "motor": 0,
+                "parameter": int(parameter),
+                "value": int(value),
+                "source_call_completed": True,
+                "source_noop": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "physical_motion_commanded": False,
+                "physical_effect_verified": False,
+                "failure": None,
+            }
         write = self.tester.motor_set_axis_param(5, int(parameter), int(value), motor=0)
-        readback = self.tester.motor_get_axis_param(5, int(parameter), motor=0)
         acknowledged = bool(
             isinstance(write, Mapping)
-            and write.get("ok") is True
             and self._x_tmcl_success(write.get("ack"))
         )
-        verified = acknowledged and self._x_readback_verified(readback, int(value))
-        if verified:
-            defaults = {4: 1700, 5: 350, 6: 31, 205: 16}
-            if defaults.get(int(parameter)) == int(value):
-                self._x_profile_overrides.pop(int(parameter), None)
-            else:
-                self._x_profile_overrides[int(parameter)] = int(value)
+        defaults = {4: 1700, 5: 350, 6: 31, 205: 16}
+        if defaults.get(int(parameter)) == int(value):
+            self._x_profile_overrides.pop(int(parameter), None)
+        else:
+            self._x_profile_overrides[int(parameter)] = int(value)
         return {
-            "ok": verified,
+            "ok": True,
             "axis": "x",
             "intent": intent,
             "source_method": source_method,
@@ -712,12 +727,14 @@ class Serial206ProductionPrimitiveAdapter:
             "parameter": int(parameter),
             "value": int(value),
             "write": _json_safe(write),
-            "readback": _json_safe(readback),
+            "source_call_completed": True,
+            "source_return_code": write.get("source_return_code") if isinstance(write, Mapping) else None,
             "controller_command_acknowledged": acknowledged,
-            "controller_terminal_state_verified": verified,
+            "controller_terminal_state_verified": acknowledged,
             "physical_motion_commanded": False,
             "physical_effect_verified": False,
-            "failure": None if verified else "x_profile_parameter_readback_mismatch",
+            "failure": None,
+            "controller_evidence_failure": None if acknowledged else "x_profile_parameter_write_not_acknowledged",
         }
 
     def x_set_max_speed(self, value: int = 0) -> dict[str, Any]:
@@ -741,16 +758,21 @@ class Serial206ProductionPrimitiveAdapter:
             parameter=4,
             value=1700,
             intent="restore_original_speed",
-            source_method="ClassControlInterface.restoreOriginalXSpeed",
+            source_method="ClassControlInterface.restoreOriginalSpeed(x)",
         )
 
     def x_set_stall_guard(self, value: int = 0) -> dict[str, Any]:
-        return self._x_profile_parameter(
+        requested = 16 if int(value) == 0 else int(value)
+        effective = requested & 0xFF
+        result = self._x_profile_parameter(
             parameter=205,
-            value=16 if int(value) == 0 else int(value),
+            value=effective,
             intent="set_stall_guard",
             source_method="ClassControlInterface.setStallGuard(x)",
         )
+        result["requested_value"] = requested
+        result["source_byte_value"] = effective
+        return result
 
     def x_terminal_status(self) -> dict[str, Any]:
         rows = {
@@ -838,7 +860,16 @@ class Serial206ProductionPrimitiveAdapter:
             return result
         return {"ok": False, "desync": result, "recovery": self.reference_store.recover_untrusted_authority(f"X desynchronization failed: {reason}")}
 
-    def _x_issue_absolute(self, requested: int, *, source_mode: str, clamp_low: int = 0, acceleration: int | None = None, event_window: Any = None) -> dict[str, Any]:
+    def _x_issue_absolute(
+        self,
+        requested: int,
+        *,
+        source_mode: str,
+        clamp_low: int = 0,
+        acceleration: int | None = None,
+        event_window: Any = None,
+        wait_for_stop: bool = True,
+    ) -> dict[str, Any]:
         preflight = self._x_oem_move_preflight()
         if preflight.get("ok") is not True:
             return {
@@ -848,69 +879,98 @@ class Serial206ProductionPrimitiveAdapter:
                 "command_issued": False,
                 "physical_motion_commanded": False,
             }
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "source_mode": source_mode,
+                "requested_position_steps": int(requested),
+                "source_return_code": 0,
+                "source_call_completed": True,
+                "source_noop": True,
+                "source_noop_reason": "board_null",
+                "command_issued": False,
+                "physical_motion_commanded": False,
+                "controller_command_acknowledged": False,
+            }
         if self.tester.oem_no24v_state():
             raise RuntimeError("Lost 24V power move abs1. moveToAbs()")
         if not bool(self.tester._oem_board_state().get(5, False)):
             return {"ok": False, "failure": "board_not_initialized", "source_return_code": 1, "command_issued": False}
-        before = self.tester.motor_get_position(5, motor=0)
-        before_value = self._x_value(before)
-        if type(before_value) is not int:
-            return {"ok": False, "failure": "x_position_before_unavailable", "command_issued": False, "before": _json_safe(before)}
-        target = max(int(clamp_low), int(requested))
-        result: dict[str, Any] = {"ok": False, "axis": "x", "source_mode": source_mode, "requested_position_steps": int(requested), "target_position_steps": target, "before": _json_safe(before), "before_position_steps": before_value, "preflight": _json_safe(preflight), "command_issued": False, "source_noop": False, "physical_motion_commanded": False, "controller_command_acknowledged": False}
+        acceleration_write = None
         if acceleration is not None:
-            setup = self.tester.motor_set_axis_param(5, 5, int(acceleration), motor=0)
-            result["acceleration_set"] = _json_safe(setup)
-            result["acceleration_setup_verified"] = bool(
-                isinstance(setup, Mapping)
-                and setup.get("ok") is True
-                and isinstance(setup.get("readback"), Mapping)
-                and setup["readback"].get("value") == int(acceleration)
+            acceleration_write = self.tester.motor_set_axis_param(
+                5, 5, int(acceleration), motor=0
             )
-        result["event_window"] = event_window if event_window is not None else self.tester.begin_bus_event_window()
-        move = self.tester.motor_oem_move_absolute(5, target, motor=0, wait_for_stop=False, max_position=90263)
-        result["event_window"] = _json_safe(move.get("event_window")) if isinstance(move, Mapping) and isinstance(move.get("event_window"), Mapping) else result["event_window"]
-        if isinstance(move, Mapping) and move.get("ok") is True and move.get("source_noop") is True:
-            after = self.tester.motor_get_position(5, motor=0)
-            speed = self.tester.motor_get_speed(5, motor=0)
-            after_value = self._x_value(after)
-            speed_value = speed.get("speed") if isinstance(speed, Mapping) else None
-            terminal = bool(
-                self._x_readback_verified(after, after_value)
-                and isinstance(speed, Mapping)
-                and speed.get("ok") is True
-                and self._x_tmcl_success(speed.get("ack"))
-                and type(speed_value) is int
-                and speed_value == 0
-            )
-            result.update({
-                "ok": True,
-                "source_noop": True,
-                "noop_reason": str(move.get("short_circuit") or "transport_source_noop"),
-                "move": _json_safe(move),
-                "target_position_steps": after_value,
-                "after": _json_safe(after),
-                "after_position_steps": after_value,
-                "terminal_speed": _json_safe(speed),
-                "command_issued": False,
-                "physical_motion_commanded": False,
-                "controller_command_acknowledged": False,
-                "controller_terminal_state_verified": terminal,
-                "target_event_128_observed": False,
-                "target_position_verified": terminal,
-                "physical_effect_verified": False,
-                "failure": None,
-            })
-            return result
+        profile = self._x_profile()
+        source_high = int(profile["axis_max_steps"])
+        source_request = max(int(clamp_low), int(requested))
+        target = min(source_request, source_high)
+        primitive_wait = bool(wait_for_stop and event_window is None)
+        move = self.tester.motor_oem_move_absolute(
+            5,
+            source_request,
+            motor=0,
+            wait_for_stop=primitive_wait,
+            max_position=source_high,
+        )
+        source_completed = bool(isinstance(move, Mapping) and move.get("ok") is True)
+        command_issued = bool(isinstance(move, Mapping) and move.get("command_sent") is True)
         command_acknowledged = bool(
             isinstance(move, Mapping)
-            and move.get("ok") is True
-            and self._x_tmcl_success(move.get("ack"))
+            and (
+                self._x_tmcl_success(move.get("ack"))
+                or self._x_tmcl_success(move.get("retry_ack"))
+            )
         )
-        source_completed = isinstance(move, Mapping) and move.get("ok") is True
-        result.update({"move": _json_safe(move), "command_issued": True, "physical_motion_commanded": True, "controller_command_acknowledged": command_acknowledged, "ok": source_completed})
-        if result["ok"] is not True:
-            result["failure"] = "x_move_source_call_failed"
+        before = move.get("before") if isinstance(move, Mapping) else None
+        before_value = self._x_value(before)
+        wait = move.get("wait") if isinstance(move, Mapping) else None
+        terminal = bool(
+            primitive_wait
+            and isinstance(wait, Mapping)
+            and wait.get("ok") is True
+        )
+        result: dict[str, Any] = {
+            "ok": source_completed,
+            "axis": "x",
+            "source_mode": source_mode,
+            "requested_position_steps": int(requested),
+            "source_requested_position_steps": source_request,
+            "target_position_steps": target,
+            "source_axis_max_steps": source_high,
+            "before": _json_safe(before),
+            "before_position_steps": before_value,
+            "preflight": _json_safe(preflight),
+            "move": _json_safe(move),
+            "event_window": _json_safe(
+                move.get("event_window")
+                if isinstance(move, Mapping) and isinstance(move.get("event_window"), Mapping)
+                else event_window
+            ),
+            "wait": _json_safe(wait),
+            "source_call_completed": isinstance(move, Mapping),
+            "source_return_code": move.get("source_return_code") if isinstance(move, Mapping) else None,
+            "source_noop": bool(isinstance(move, Mapping) and move.get("source_noop") is True),
+            "command_issued": command_issued,
+            "physical_motion_commanded": command_issued,
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal,
+            "completion_class": move.get("completion_class") if isinstance(move, Mapping) else None,
+            "pending_motion": bool(command_issued and not primitive_wait),
+            "physical_effect_verified": False,
+            "failure": None if source_completed else "x_move_source_call_failed",
+        }
+        if result["source_noop"]:
+            result["noop_reason"] = str(
+                move.get("short_circuit") or "transport_source_noop"
+            )
+        if acceleration is not None:
+            result["acceleration_write"] = _json_safe(acceleration_write)
+            result["acceleration_command_acknowledged"] = bool(
+                isinstance(acceleration_write, Mapping)
+                and self._x_tmcl_success(acceleration_write.get("ack"))
+            )
         return result
 
     def _x_finalize(self, ticket: Mapping[str, Any], *, timeout_s: float, motion_kind: str, publish: bool = True) -> dict[str, Any]:
@@ -922,62 +982,58 @@ class Serial206ProductionPrimitiveAdapter:
         if result.get("ok") is not True:
             result["physical_effect_ambiguous"] = True
         else:
-            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
-            wait = wait_fn(5, motor=0, timeout_s=float(timeout_s), event_window=result.get("event_window"))
-            wait_events = (
-                list(wait.get("events") or [])
-                if isinstance(wait, Mapping) and isinstance(wait.get("events"), list)
-                else []
-            )
-            trailing_events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
-            events = wait_events + list(trailing_events)
-            after = self.tester.motor_get_position(5, motor=0)
-            speed = self.tester.motor_get_speed(5, motor=0)
-            after_value = self._x_value(after)
-            event_window = result.get("event_window")
-            after_sequence = event_window.get("after_sequence") if isinstance(event_window, Mapping) else None
-            addressed_events = [
-                event for event in events
-                if isinstance(event, Mapping)
-                and event.get("board") == 5
-                and event.get("motor") == 0
-                and type(event.get("event_sequence")) is int
-                and type(after_sequence) is int
-                and event["event_sequence"] > after_sequence
-                and self._x_event_fresh(event, event_window)
-            ]
-            addressed_errors = [event for event in addressed_events if event.get("status") in {13, 14, 130}]
-            target_events = [event for event in addressed_events if event.get("status") == 128]
-            terminal_event = bool(target_events)
-            target_value = int(result["target_position_steps"])
-            position_delta = (after_value - target_value) if type(after_value) is int else None
-            position_verified = bool(
-                isinstance(after, Mapping)
-                and type(position_delta) is int
-                and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
-            )
-            speed_zero = bool(
-                isinstance(speed, Mapping)
-                and type(speed.get("speed")) is int
-                and speed.get("speed") == 0
-            )
+            move = result.get("move")
+            wait = move.get("wait") if isinstance(move, Mapping) else None
+            if not (
+                isinstance(move, Mapping)
+                and move.get("oem_wait_for_stop") is True
+            ):
+                wait_fn = getattr(
+                    self.tester,
+                    "motor_wait_target_reached",
+                    None,
+                ) or getattr(self.tester, "motor_oem_wait_target_reached")
+                wait = wait_fn(
+                    5,
+                    motor=0,
+                    timeout_s=float(timeout_s),
+                    event_window=result.get("event_window"),
+                )
             wait_ok = bool(
                 isinstance(wait, Mapping)
                 and wait.get("ok") is True
                 and wait.get("target_reached") is True
             )
-            timeout_target_equal = False
-            source_completed = bool(wait_ok)
-            failure = None if source_completed else str(
-                wait.get("failure")
-                if isinstance(wait, Mapping) and wait.get("failure")
-                else "x_source_move_completion_not_observed"
+            wait_event = wait.get("event") if isinstance(wait, Mapping) else None
+            target_event = bool(
+                isinstance(wait_event, Mapping)
+                and wait_event.get("status") == 128
             )
-            completion_class = "event_128" if terminal_event and position_verified else "event_128_target_mismatch" if terminal_event else "oem_timeout_target_equal" if timeout_target_equal else None
-            result.update({"wait": _json_safe(wait), "wait_verified": wait_ok, "events": _json_safe(events), "after": _json_safe(after), "after_position_steps": after_value, "target_position_delta_steps": position_delta, "terminal_speed": _json_safe(speed), "terminal_speed_zero": speed_zero, "controller_error_events": _json_safe(addressed_errors), "target_events": _json_safe(target_events), "target_event_128_verified": terminal_event, "target_event_128_observed": terminal_event, "target_position_verified": position_verified, "completion_class": completion_class, "controller_terminal_state_verified": source_completed})
-            result["ok"] = bool(result.get("ok") is True and source_completed)
+            completion_class = (
+                move.get("completion_class")
+                if isinstance(move, Mapping)
+                else None
+            ) or ("event_128" if target_event else None)
+            result.update(
+                {
+                    "wait": _json_safe(wait),
+                    "wait_verified": wait_ok,
+                    "target_event_128_observed": target_event,
+                    "completion_class": completion_class,
+                    "controller_terminal_state_verified": wait_ok,
+                    "pending_motion": False,
+                }
+            )
+            result["ok"] = bool(result.get("ok") is True and wait_ok)
             if not result["ok"]:
-                result["failure"] = str(result.get("failure") or failure or "x_absolute_terminal_evidence_not_accepted")
+                result["failure"] = str(
+                    result.get("failure")
+                    or (
+                        wait.get("failure")
+                        if isinstance(wait, Mapping) and wait.get("failure")
+                        else "x_source_move_completion_not_observed"
+                    )
+                )
         if result.get("ok") is True and result.get("command_issued") is True and publish and self.reference_store is not None:
             metadata = self.reference_store.record_motion("x", motion_kind)
             result["reference_state"] = _json_safe(metadata)
@@ -990,14 +1046,12 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_move_absolute(self, *, position_steps: int, acceleration: int | None = None, wait_for_stop: bool = True, wait_timeout_s: float = 20.0, source_mode: str = "ClassControlInterface.moveX", clamp_low_to_60: bool = True, publish_motion_metadata: bool = True) -> dict[str, Any]:
         reference = self._reference_snapshot(("x",), source_mode)
-        acceleration_write = None
-        if acceleration is not None:
-            acceleration_write = self.tester.motor_set_axis_param(5, 5, int(acceleration), motor=0)
         ticket = self._x_issue_absolute(
             int(position_steps),
             source_mode=source_mode,
             clamp_low=60 if clamp_low_to_60 else 0,
-            acceleration=None,
+            acceleration=acceleration,
+            wait_for_stop=bool(wait_for_stop),
         )
         if not wait_for_stop and ticket.get("command_issued") is True:
             ticket.update({"pending_motion": True, "physical_motion": True, "reference_before": _json_safe(reference)})
@@ -1006,12 +1060,10 @@ class Serial206ProductionPrimitiveAdapter:
             result = self._x_finalize(ticket, timeout_s=wait_timeout_s, motion_kind="absolute", publish=publish_motion_metadata)
         if acceleration is not None:
             restore = self.tester.motor_set_axis_param(5, 5, 350, motor=0)
-            result["acceleration_write"] = _json_safe(acceleration_write)
             result["acceleration_restore"] = _json_safe(restore)
-            result["acceleration_restore_verified"] = bool(
+            result["acceleration_restore_acknowledged"] = bool(
                 isinstance(restore, Mapping)
-                and isinstance(restore.get("readback"), Mapping)
-                and self._x_value(restore["readback"]) == 350
+                and self._x_tmcl_success(restore.get("ack"))
             )
         result["reference_before"] = _json_safe(reference)
         result["physical_motion"] = bool(result.get("command_issued"))
@@ -1194,14 +1246,53 @@ class Serial206ProductionPrimitiveAdapter:
 
 
     def x_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        base = {
+            "ok": True,
+            "axis": "x",
+            "intent": "stop",
+            "source_call_completed": True,
+            "source_return_ok": True,
+            "controller_command_acknowledged": False,
+            "controller_terminal_state_verified": False,
+            "timeout_s_omitted_by_source": float(timeout_s),
+            "physical_motion": False,
+            "physical_effect_verified": False,
+            "failure": None,
+        }
+        if not self.tester._oem_board_present(5):
+            return {**base, "source_noop": "board_null"}
+        if self.tester.oem_no24v_state():
+            raise RuntimeError("Lost 24V power stopMotor 1. stopMotor() axis: X")
+        if not bool(self.tester._oem_board_state().get(5, False)):
+            return {**base, "source_noop": "board_not_initialized"}
         stop = self.tester.motor_oem_board_stop(5, motor=0, axis_name="x")
         source_completed = isinstance(stop, Mapping) and stop.get("source_call_completed") is True
-        source_return_ok = bool(source_completed and stop.get("source_return_code") == 0)
+        # ClassDeckBoard.stopMotor is void: completed caller execution is the
+        # outer source success. The leaf return and second ACK remain evidence.
+        source_return_ok = source_completed
         acknowledged = bool(
             isinstance(stop, Mapping)
             and self._x_tmcl_success(stop.get("second_delivery"))
         )
-        return {"ok": source_return_ok, "axis": "x", "intent": "stop", "stop": _json_safe(stop), "wait": None, "source_call_completed": source_completed, "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None, "controller_command_acknowledged": acknowledged, "controller_terminal_state_verified": False, "timeout_s_omitted_by_source": float(timeout_s), "physical_motion": False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_stop_source_return_failure" if source_completed else "x_stop_source_call_failed"}
+        return {
+            **base,
+            "ok": source_return_ok,
+            "stop": _json_safe(stop),
+            "wait": None,
+            "source_call_completed": source_completed,
+            "source_return_ok": source_return_ok,
+            "source_return_code": (
+                stop.get("source_return_code") if isinstance(stop, Mapping) else None
+            ),
+            "controller_command_acknowledged": acknowledged,
+            "failure": (
+                None
+                if source_return_ok
+                else "x_stop_source_return_failure"
+                if source_completed
+                else "x_stop_source_call_failed"
+            ),
+        }
 
     def x_abort(self, *, reason: str = "forceAbortMotion") -> dict[str, Any]:
         abort = physical_aggregate_stop(
@@ -1231,36 +1322,45 @@ class Serial206ProductionPrimitiveAdapter:
         before = self.tester.motor_get_position(5, motor=0)
         set_home = self.tester.motor_set_home(5, motor=0)
         after = self.tester.motor_get_position(5, motor=0)
+        source_call_completed = bool(
+            isinstance(set_home, Mapping)
+            and set_home.get("source_call_completed") is True
+        )
+        source_return_ok = bool(
+            source_call_completed
+            and set_home.get("source_return_code") == 0
+        )
         acknowledged = bool(
             isinstance(set_home, Mapping)
-            and set_home.get("ok") is True
-            and (
-                self._x_tmcl_success(set_home.get("ack"))
-                or set_home.get("readback_verified") is True
-            )
+            and set_home.get("controller_command_acknowledged") is True
         )
         terminal = bool(acknowledged and self._x_readback_verified(after, 0))
         return {
-            "ok": True,
+            "ok": source_return_ok,
             "axis": "x",
             "intent": "set_home",
             "source_method": "ClassMotor.setHome (SAP1=0); recovery-only; no motion",
-            "source_anchor": "ClassMotor.cs:492-516; ClassHeadBoard.cs:121-124",
+            "source_anchor": "ClassMotor.cs:492-516; ClassDeckBoard.cs:134-137",
             "before": _json_safe(before),
             "set_home": _json_safe(set_home),
             "after": _json_safe(after),
-            "source_call_completed": True,
+            "source_call_completed": source_call_completed,
+            "source_return_ok": source_return_ok,
+            "source_return_code": set_home.get("source_return_code") if isinstance(set_home, Mapping) else None,
             "controller_command_acknowledged": acknowledged,
             "controller_terminal_state_verified": terminal,
             "reference_publication_required": terminal,
             "physical_motion_commanded": False,
             "physical_effect_verified": False,
-            "failure": None,
+            "failure": None if source_return_ok else "x_set_home_source_return_failure",
         }
 
     def x_enable_xy_current_mode(self, *, enabled: bool) -> dict[str, Any]:
         result = self.tester.motor_oem_set_xy_current_mode(bool(enabled))
-        if isinstance(result, Mapping) and result.get("ok") is True:
+        writes = result.get("writes") if isinstance(result, Mapping) else None
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "x" for row in writes
+        ):
             self._x_profile_overrides[6] = 31 if bool(enabled) else 1
         return dict(result) if isinstance(result, Mapping) else {
             "ok": False,
@@ -1270,9 +1370,17 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_enable_xyz_current_mode(self, *, enabled: bool, z_current_up: int = 31) -> dict[str, Any]:
         result = self.tester.motor_oem_set_xyz_current_mode(bool(enabled), z_current_up=int(z_current_up))
-        if isinstance(result, Mapping) and result.get("ok") is True:
+        writes = result.get("writes") if isinstance(result, Mapping) else None
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "x" for row in writes
+        ):
             self._x_profile_overrides[6] = 31 if bool(enabled) else 1
-            self._z_profile_overrides[6] = int(z_current_up) if bool(enabled) else 1
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "z" for row in writes
+        ):
+            self._z_profile_overrides[6] = (
+                int(result.get("z_current_up", z_current_up)) if bool(enabled) else 1
+            )
         return dict(result) if isinstance(result, Mapping) else {
             "ok": False,
             "failure": "enableXYZ_result_not_mapping",
@@ -1283,18 +1391,23 @@ class Serial206ProductionPrimitiveAdapter:
         return self._x_finalize(pending_ticket, timeout_s=float(wait_timeout_s), motion_kind="absolute", publish=True)
 
     def _x_home_result(self, home: Any, *, intent: str, source_method: str) -> dict[str, Any]:
-        position = self.tester.motor_get_position(5, motor=0)
-        speed = self.tester.motor_get_speed(5, motor=0)
         source_return = home.get("source_return_code") if isinstance(home, Mapping) else None
         short_circuit = home.get("source_noop") is True if isinstance(home, Mapping) else False
+        board_null = bool(
+            isinstance(home, Mapping)
+            and home.get("source_noop_reason") == "board_null"
+        )
+        position = None if board_null else self.tester.motor_get_position(5, motor=0)
+        speed = None if board_null else self.tester.motor_get_speed(5, motor=0)
         source_returned = bool(isinstance(home, Mapping) and home.get("ok") is True)
         command_acknowledged = bool(
             isinstance(home, Mapping)
-            and (home.get("controller_command_acknowledged") is True or short_circuit)
+            and home.get("controller_command_acknowledged") is True
         )
         terminal = bool(
             isinstance(home, Mapping)
             and home.get("controller_terminal_state_verified") is True
+            and isinstance(speed, Mapping)
             and type(speed.get("speed")) is int
             and speed.get("speed") == 0
         )
@@ -1304,18 +1417,61 @@ class Serial206ProductionPrimitiveAdapter:
             and home.get("controller_home_proof_verified") is True
             and self._x_value(position) == 0
         )
-        return {"ok": source_returned, "axis": "x", "intent": intent, "source_method": source_method, "home": _json_safe(home), "source_return": source_return, "position": _json_safe(position), "terminal_speed": _json_safe(speed), "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal, "controller_home_proof_verified": home_proof, "reference_publication_required": home_proof, "physical_motion_commanded": not short_circuit, "physical_effect_verified": False, "failure": None if source_returned else "x_home_source_exception"}
+        return {
+            "ok": source_returned,
+            "axis": "x",
+            "intent": intent,
+            "source_method": source_method,
+            "home": _json_safe(home),
+            "source_return": source_return,
+            "position": _json_safe(position),
+            "terminal_speed": _json_safe(speed),
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal,
+            "controller_home_proof_verified": home_proof,
+            "reference_publication_required": home_proof,
+            "physical_motion_commanded": not short_circuit,
+            "physical_effect_verified": False,
+            "failure": None if source_returned else "x_home_source_exception",
+        }
 
     def _x_go_home(self, *, speed: int, rehome: bool, timeout_s: float, intent: str, source_method: str) -> dict[str, Any]:
         self._x_require_motion_preflight()
-        home = self.tester.motor_oem_go_home("x", speed=int(speed), rehome=bool(rehome), timeout_s=max(30.0, float(timeout_s)), require_switch_transition=False)
+        if not self.tester._oem_board_present(5):
+            return self._x_home_result(
+                {
+                    "ok": True,
+                    "source_return_code": 0,
+                    "source_noop": True,
+                    "source_noop_reason": "board_null",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "controller_home_proof_verified": False,
+                },
+                intent=intent,
+                source_method=source_method,
+            )
+        home = self.tester.motor_oem_go_home("x", speed=int(speed), rehome=bool(rehome), timeout_s=30.0, require_switch_transition=False)
         return self._x_home_result(home, intent=intent, source_method=source_method)
 
     def x_startup_home(self, *, timeout_s: float) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "intent": "startup_home",
+                "source_method": "ClassControlInterface.initializeMotors X branch",
+                "source_call_completed": True,
+                "source_noop": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "controller_home_proof_verified": False,
+                "physical_motion_commanded": False,
+                "physical_effect_verified": False,
+                "failure": None,
+            }
         home = self.tester.motor_oem_axis_search_home("x", speed=250, timeout_s=float(timeout_s), max_search_abs_delta=None)
-        if not isinstance(home, Mapping) or home.get("ok") is not True:
-            return self._x_home_result(home, intent="startup_home", source_method="axisSearchHome(x,250)")
         self.__dict__.get("sleep", time.sleep)(0.020)
         set_home = self.tester.motor_set_home(5, motor=0)
         home_evidence = self._x_home_result(home, intent="startup_home", source_method="axisSearchHome(x,250);setHome")
@@ -1323,11 +1479,69 @@ class Serial206ProductionPrimitiveAdapter:
         self.__dict__.get("sleep", time.sleep)(0.040)
         park_ticket = self._x_issue_absolute(6000, source_mode="initializeMotors.x_park_6000", clamp_low=60)
         park = self._x_finalize(park_ticket, timeout_s=float(timeout_s), motion_kind="startup_park", publish=False)
-        ok = bool(home_evidence.get("ok") is True and isinstance(set_home, Mapping) and set_home.get("ok") is True and speed.get("ok") is True and park.get("ok") is True)
-        return {"ok": ok, "axis": "x", "intent": "startup_home", "source_method": "axisSearchHome(250);20ms;setHome;SAP4=1700;40ms;moveX(6000)", "home": _json_safe(home), "home_evidence": _json_safe(home_evidence), "set_home": _json_safe(set_home), "speed_restore": _json_safe(speed), "park": _json_safe(park), "controller_command_acknowledged": ok, "controller_terminal_state_verified": ok, "controller_position_steps": park.get("after_position_steps"), "oem_display_position_steps": 0, "reference_publication_required": ok, "physical_motion_commanded": True, "physical_effect_verified": False, "failure": None if ok else "x_startup_home_sequence_failed"}
+        source_returned = bool(
+            isinstance(home, Mapping)
+            and isinstance(set_home, Mapping)
+            and set_home.get("source_call_completed") is True
+            and speed.get("source_call_completed") is True
+            and park.get("source_call_completed") is True
+        )
+        park_acknowledged = bool(
+            park.get("command_issued") is not True
+            or park.get("controller_command_acknowledged") is True
+        )
+        controller_acknowledged = bool(
+            home_evidence.get("controller_command_acknowledged") is True
+            and isinstance(set_home, Mapping)
+            and set_home.get("controller_command_acknowledged") is True
+            and speed.get("controller_command_acknowledged") is True
+            and park_acknowledged
+        )
+        terminal_verified = bool(
+            home_evidence.get("controller_terminal_state_verified") is True
+            and park.get("controller_terminal_state_verified") is True
+        )
+        home_proof = home_evidence.get("controller_home_proof_verified") is True
+        return {
+            "ok": source_returned,
+            "axis": "x",
+            "intent": "startup_home",
+            "source_method": "axisSearchHome(250);20ms;setHome;SAP4=1700;40ms;moveX(6000)",
+            "home": _json_safe(home),
+            "home_evidence": _json_safe(home_evidence),
+            "set_home": _json_safe(set_home),
+            "speed_restore": _json_safe(speed),
+            "park": _json_safe(park),
+            "controller_command_acknowledged": controller_acknowledged,
+            "controller_terminal_state_verified": terminal_verified,
+            "controller_home_proof_verified": home_proof,
+            "controller_position_steps": park.get("after_position_steps"),
+            "oem_display_position_steps": 0,
+            "reference_publication_required": home_proof,
+            "physical_motion_commanded": bool(
+                home_evidence.get("physical_motion_commanded") is True
+                or park.get("physical_motion_commanded") is True
+            ),
+            "physical_effect_verified": False,
+            "failure": None if source_returned else "x_startup_home_sequence_failed",
+        }
 
     def x_home_axis(self, *, timeout_s: float) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return self._x_home_result(
+                {
+                    "ok": True,
+                    "source_return_code": 0,
+                    "source_noop": True,
+                    "source_noop_reason": "board_null",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "controller_home_proof_verified": False,
+                },
+                intent="diagnostic_home_axis",
+                source_method="ClassControlInterface.HomeAxis(x)->axisSearchHome(250)",
+            )
         home = self.tester.motor_oem_axis_search_home("x", speed=250, timeout_s=float(timeout_s), max_search_abs_delta=None)
         return self._x_home_result(home, intent="diagnostic_home_axis", source_method="ClassControlInterface.HomeAxis(x)->axisSearchHome(250)")
 
@@ -1427,14 +1641,6 @@ class Serial206ProductionPrimitiveAdapter:
         home_proof_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y"))
         reference_publication_required = bool(home_proof_verified and all(self._x_value(positions[axis]) == 0 for axis in ("x", "y")))
         receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": _json_safe(setup), "setup_verified": setup_ok, "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
-        y_provider = getattr(self, "y_provider", None)
-        if reference_publication_required and y_provider is not None:
-            child_publication = y_provider.publish_home_xy_reference(
-                receipt,
-                command_id=f"homexy-{time.time_ns()}",
-            )
-            receipt["y_child_authority"] = _json_safe(child_publication)
-            receipt["y_child_authority_published"] = child_publication.get("ok") is True
         return receipt
 
     def _z_oem_move_preflight(self) -> dict[str, Any]:
@@ -2086,7 +2292,7 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_abort(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
-        abort = self.tester.motor_oem_force_abort_motion(reason="oem.z.abort")
+        abort = self.tester.motor_oem_force_abort_motion(reason="oem.abort_all")
         source_completed = isinstance(abort, Mapping)
         return {
             "ok": source_completed,
@@ -2975,7 +3181,6 @@ class Serial206ProductionPrimitiveAdapter:
                     target_steps=requested["y"],
                     wait_for_stop=True,
                     wait_timeout_s=float(wait_timeout_s),
-                    acceleration_override=None,
                 )
             source_calls_completed = all(
                 isinstance(command, Mapping) and command.get("ok") is True
@@ -4371,7 +4576,11 @@ class Serial206OemInitializationProvider:
                     live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
                 except Exception as exc:
                     live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
-                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_contract_safe(live_status), "switch_masks": {"observed": live_status.get("switch_mask_tuple") if isinstance(live_status, Mapping) else None, "policy": "observed_only_oem_source_omits_x_writes"}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
+                source_profile_fn = getattr(self.primitives, "_x_profile", None)
+                source_profile = source_profile_fn() if callable(source_profile_fn) else {}
+                source_min_steps = source_profile.get("axis_min_steps") if isinstance(source_profile, Mapping) else None
+                source_max_steps = source_profile.get("axis_max_steps") if isinstance(source_profile, Mapping) else None
+                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": int(source_min_steps) if type(source_min_steps) is int else None, "source_max_steps": int(source_max_steps) if type(source_max_steps) is int else None, "source_limit_authority": source_profile.get("axis_max_source") if isinstance(source_profile, Mapping) else None, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_contract_safe(live_status), "switch_masks": {"observed": live_status.get("switch_mask_tuple") if isinstance(live_status, Mapping) else None, "policy": "observed_only_oem_source_omits_x_writes"}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
@@ -4400,9 +4609,13 @@ class Serial206OemInitializationProvider:
             started_at = time.time()
             try:
                 snapshot_active: Mapping[str, Any] | None = None
+                snapshot_lifecycle: dict[str, Any] = {}
                 try:
                     memory_snapshot = self._memory_state if isinstance(self._memory_state, Mapping) else {}
-                    candidate = memory_snapshot.get("x_lifecycle", {}).get("active_receipt")
+                    lifecycle_candidate = memory_snapshot.get("x_lifecycle", {})
+                    if isinstance(lifecycle_candidate, Mapping):
+                        snapshot_lifecycle = copy.deepcopy(dict(lifecycle_candidate))
+                    candidate = snapshot_lifecycle.get("active_receipt")
                     if isinstance(candidate, Mapping):
                         snapshot_active = copy.deepcopy(candidate)
                 except Exception:
@@ -4449,16 +4662,55 @@ class Serial206OemInitializationProvider:
                             "interrupted_command_ids": sorted(interrupted_ids),
                             "result": _json_safe(result),
                         }
+                        prior_state = str(snapshot_lifecycle.get("state") or "unprepared")
+                        prior_reference = str(snapshot_lifecycle.get("reference_state") or "unknown")
+                        prior_board_generation = snapshot_lifecycle.get("board_lifecycle_generation")
+                        stop_acknowledged = bool(
+                            not abort
+                            and result.get("ok") is True
+                            and result.get("controller_command_acknowledged") is True
+                        )
+                        if abort:
+                            next_state = "failed_latched"
+                            next_reference = "desynced"
+                            next_failure = {
+                                "reason": "x_safety_abort_dispatched",
+                                "receipt": _json_safe(receipt),
+                            }
+                        elif not stop_acknowledged:
+                            next_state = "failed_latched"
+                            next_reference = prior_reference
+                            next_failure = {
+                                "reason": "x_stop_controller_acknowledgement_missing",
+                                "receipt": _json_safe(receipt),
+                            }
+                        elif prior_state == "failed_latched":
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = snapshot_lifecycle.get("last_failure")
+                        elif prior_state != "executing":
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = None
+                        elif prior_reference == "referenced":
+                            next_state = "referenced_ready"
+                            next_reference = prior_reference
+                            next_failure = None
+                        elif type(prior_board_generation) is int:
+                            next_state = "prepared_unreferenced"
+                            next_reference = prior_reference
+                            next_failure = None
+                        else:
+                            next_state = "unprepared"
+                            next_reference = prior_reference
+                            next_failure = None
                         lifecycle.update({
-                            "state": "failed_latched",
+                            "state": next_state,
                             "generation": generation,
                             "active_receipt": None,
                             "pending_ticket": None,
-                            "reference_state": "desynced",
-                            "last_failure": {
-                                "reason": f"x_safety_{selected}_dispatched",
-                                "receipt": _json_safe(receipt),
-                            },
+                            "reference_state": next_reference,
+                            "last_failure": next_failure,
                         })
                         lifecycle["receipts"].append(receipt)
                         lifecycle["receipts"] = lifecycle["receipts"][-8:]
@@ -4471,7 +4723,7 @@ class Serial206OemInitializationProvider:
                             "ok": result.get("ok") is True,
                             "axis": "x",
                             "intent": selected,
-                            "state": "failed_latched",
+                            "state": next_state,
                             "source_call_completed": result.get("source_call_completed") is True,
                             "source_return_ok": result.get("source_return_ok") is True,
                             "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
@@ -4671,7 +4923,7 @@ class Serial206OemInitializationProvider:
                 self._save_state(state)
                 try:
                     if selected == "move_absolute":
-                        result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "provider.x.move_absolute"))
+                        result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "ClassControlInterface.moveX"))
                     elif selected == "move_steps":
                         result = self.primitives.x_move_steps(steps=int(values["steps"]), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)))
                     elif selected == "move_to":
@@ -4983,6 +5235,111 @@ class Serial206OemInitializationProvider:
                 "state": lifecycle.get("state"),
             }
 
+    def _xy_authority_snapshot(
+        self,
+        lifecycle: Mapping[str, Any],
+        *,
+        require_referenced: bool,
+        validate: bool = True,
+    ) -> dict[str, Any]:
+        generation = int(self.generation_provider())
+        board_generation_fn = getattr(
+            self.preparation_provider, "current_board_lifecycle_generation", None
+        )
+        current_x_board_generation = (
+            board_generation_fn()
+            if callable(board_generation_fn)
+            else lifecycle.get("board_lifecycle_generation")
+        )
+        y_authority_fn = getattr(self.y_provider, "_authority", None)
+        y_authority = y_authority_fn() if callable(y_authority_fn) else None
+        y_board = y_authority.get("board") if isinstance(y_authority, Mapping) else None
+        y_axes = y_authority.get("axes") if isinstance(y_authority, Mapping) else None
+        y_axis = y_axes.get("y") if isinstance(y_axes, Mapping) else None
+        with self._x_interrupt_state_lock:
+            x_interrupt_epoch = int(self._x_interrupt_epoch)
+            x_interrupt_active = bool(self._x_interrupt_active)
+        snapshot = {
+            "generation": generation,
+            "x": {
+                "lifecycle_state": lifecycle.get("state"),
+                "generation": lifecycle.get("generation"),
+                "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"),
+                "current_board_lifecycle_generation": current_x_board_generation,
+                "pending_ticket": _json_safe(lifecycle.get("pending_ticket")),
+                "active_receipt": _json_safe(lifecycle.get("active_receipt")),
+                "interrupt_epoch": x_interrupt_epoch,
+                "interrupt_active": x_interrupt_active,
+            },
+            "y": {
+                "lifecycle_state": y_axis.get("lifecycle_state") if isinstance(y_axis, Mapping) else None,
+                "ownership_generation": y_axis.get("ownership_generation") if isinstance(y_axis, Mapping) else None,
+                "prepared_board_epoch": y_axis.get("prepared_board_epoch") if isinstance(y_axis, Mapping) else None,
+                "active_board_epoch": y_board.get("active_board_epoch") if isinstance(y_board, Mapping) else None,
+                "board_state": y_board.get("state") if isinstance(y_board, Mapping) else None,
+                "pending_ticket": _json_safe(y_axis.get("pending_ticket")) if isinstance(y_axis, Mapping) else None,
+                "interrupt_epoch": y_axis.get("interrupt_epoch") if isinstance(y_axis, Mapping) else None,
+            },
+        }
+        if not validate:
+            return snapshot
+        allowed_x_states = {"referenced_ready"} if require_referenced else {"prepared_unreferenced", "referenced_ready"}
+        allowed_y_states = {"referenced_ready"} if require_referenced else {"prepared_unreferenced", "referenced_ready"}
+        valid = bool(
+            snapshot["x"]["lifecycle_state"] in allowed_x_states
+            and snapshot["x"]["generation"] == generation
+            and snapshot["x"]["board_lifecycle_generation"] == current_x_board_generation
+            and snapshot["x"]["pending_ticket"] is None
+            and snapshot["x"]["active_receipt"] is None
+            and snapshot["x"]["interrupt_active"] is False
+            and snapshot["y"]["lifecycle_state"] in allowed_y_states
+            and snapshot["y"]["ownership_generation"] == generation
+            and snapshot["y"]["board_state"] == "active"
+            and snapshot["y"]["prepared_board_epoch"] == snapshot["y"]["active_board_epoch"]
+            and snapshot["y"]["pending_ticket"] is None
+            and type(snapshot["y"]["interrupt_epoch"]) is int
+        )
+        return {**snapshot, "ok": valid}
+
+    @staticmethod
+    def _xy_authority_fence_matches(
+        admitted: Mapping[str, Any], current: Mapping[str, Any]
+    ) -> bool:
+        admitted_x = admitted.get("x") if isinstance(admitted.get("x"), Mapping) else {}
+        current_x = current.get("x") if isinstance(current.get("x"), Mapping) else {}
+        admitted_y = admitted.get("y") if isinstance(admitted.get("y"), Mapping) else {}
+        current_y = current.get("y") if isinstance(current.get("y"), Mapping) else {}
+        return bool(
+            admitted.get("generation") == current.get("generation")
+            and admitted_x.get("generation") == current_x.get("generation")
+            and admitted_x.get("board_lifecycle_generation") == current_x.get("board_lifecycle_generation")
+            and admitted_x.get("current_board_lifecycle_generation") == current_x.get("current_board_lifecycle_generation")
+            and admitted_x.get("interrupt_epoch") == current_x.get("interrupt_epoch")
+            and current_x.get("interrupt_active") is False
+            and admitted_y == current_y
+        )
+
+    def _persist_xy_child_receipts(self, receipt: Mapping[str, Any]) -> None:
+        if self.state_store is None or not hasattr(self.state_store, "append_serial206_receipt"):
+            return
+        append_atomic = getattr(self.state_store, "append_serial206_receipts_atomic", None)
+        if not callable(append_atomic):
+            raise RuntimeError("atomic_xy_child_receipt_store_required")
+        command_id = receipt.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            raise RuntimeError("xy_child_receipt_command_id_required")
+        missing: list[tuple[str, dict[str, Any]]] = []
+        if self._durable_serial206_receipt("x", command_id) is None:
+            missing.append(("x", copy.deepcopy(dict(receipt))))
+        if self._durable_serial206_receipt("y", command_id) is None:
+            missing.append(("y", {
+                **copy.deepcopy(dict(receipt)),
+                "stream": "y",
+                "child_axis": "y",
+            }))
+        if missing:
+            append_atomic(tuple(missing))
+
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
         with self._x_interrupt_state_lock:
@@ -5040,15 +5397,32 @@ class Serial206OemInitializationProvider:
                         and existing_receipt.get("target_y") == int(y)
                         and existing_receipt.get("inputs") == safe_inputs
                     )
-                    authority_valid = True
-                    if not request_matches or (
-                        existing_receipt.get("status") == "completed" and not authority_valid
-                    ):
+                    composite = existing_receipt.get("composite_authority")
+                    terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
+                    current_authority = self._xy_authority_snapshot(
+                        lifecycle, require_referenced=True, validate=False
+                    )
+                    authority_valid = bool(
+                        isinstance(terminal_authority, Mapping)
+                        and dict(terminal_authority) == current_authority
+                    )
+                    if not request_matches or not authority_valid:
                         return {
                             "ok": False,
                             "axis": "xy",
                             "state": lifecycle.get("state"),
                             "failure": "xy_replay_current_authority_or_request_invalid",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing_receipt),
+                        }
+                    try:
+                        self._persist_xy_child_receipts(existing_receipt)
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": f"xy_receipt_reconciliation_exception:{type(exc).__name__}:{exc}",
                             "replayed": True,
                             "authority_receipt": _json_safe(existing_receipt),
                         }
@@ -5058,17 +5432,30 @@ class Serial206OemInitializationProvider:
                     return replayed_result
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
-                active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None}
+                admitted_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=True
+                )
+                if admitted_authority.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state"),
+                        "failure": "xy_y_authority_not_current",
+                        "composite_authority": _json_safe(admitted_authority),
+                    }
+                admitted_authority.pop("ok", None)
+                active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
-                with self._x_interrupt_state_lock:
-                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
-                if interrupted:
+                current_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=True, validate=False
+                )
+                if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
                         "ok": False,
-                        "failure": "xy_interrupted",
+                        "failure": "xy_authority_changed_during_command",
                         "primitive_result": _json_safe(result),
                     }
                 source_completed = result.get("ok") is True
@@ -5078,6 +5465,18 @@ class Serial206OemInitializationProvider:
                     "reference_state": prior_reference_state,
                     "last_failure": None if source_completed else _json_safe(result),
                 })
+                terminal_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=True, validate=False
+                )
+                child_receipts = {
+                    axis: {
+                        "axis": axis,
+                        "command_id": command_id,
+                        "parent_intent": "move_xy",
+                        "status": "completed" if result.get("ok") is True else "failed",
+                    }
+                    for axis in ("x", "y")
+                }
                 receipt = {
                     "command_id": command_id,
                     "intent": "move_xy",
@@ -5090,14 +5489,18 @@ class Serial206OemInitializationProvider:
                     "inputs": safe_inputs,
                     "status": "completed" if result.get("ok") is True else "failed",
                     "result": _json_safe(result),
+                    "composite_authority": {
+                        "admitted": _json_safe(admitted_authority),
+                        "terminal": _json_safe(terminal_authority),
+                    },
+                    "child_receipts": child_receipts,
                 }
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
                 terminal_authority_saved = True
-                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
-                    self.state_store.append_serial206_receipt("x", receipt)
-                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+                self._persist_xy_child_receipts(receipt)
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "authority_receipt": _json_safe(receipt)}
             except Exception as exc:
                 if terminal_authority_saved:
                     return {
@@ -5184,10 +5587,17 @@ class Serial206OemInitializationProvider:
                 if existing is None and idempotency_key is not None:
                     existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
                 if isinstance(existing, Mapping):
+                    composite = existing.get("composite_authority")
+                    terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
+                    current_authority = self._xy_authority_snapshot(
+                        lifecycle, require_referenced=False, validate=False
+                    )
                     if (
                         existing.get("intent") != "home_xy"
                         or existing.get("inputs") != safe_inputs
                         or existing.get("generation") != generation
+                        or not isinstance(terminal_authority, Mapping)
+                        or dict(terminal_authority) != current_authority
                     ):
                         return {
                             "ok": False,
@@ -5198,29 +5608,53 @@ class Serial206OemInitializationProvider:
                             "authority_receipt": _json_safe(existing),
                         }
 
+                    try:
+                        self._persist_xy_child_receipts(existing)
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": f"homexy_receipt_reconciliation_exception:{type(exc).__name__}:{exc}",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing),
+                        }
                     replayed_result = dict(existing.get("result") or {})
                     replayed_result.setdefault("ok", existing.get("status") == "completed")
                     replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing)})
                     return replayed_result
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
+                admitted_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=False
+                )
+                if admitted_authority.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state"),
+                        "failure": "homexy_y_authority_not_current",
+                        "composite_authority": _json_safe(admitted_authority),
+                    }
+                admitted_authority.pop("ok", None)
                 live_preflight = {
                     "skipped": True,
                     "reason": "recovered_oem_homexy_has_no_profile_or_reference_preflight",
                     "source_exact": True,
                 }
-                active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None}
+                active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.home_xy()
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "homexy_result_not_mapping"}
                 result["live_preflight"] = _json_safe(live_preflight)
-                with self._x_interrupt_state_lock:
-                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
-                if interrupted or int(self.generation_provider()) != generation:
+                current_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=False, validate=False
+                )
+                if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
                         "ok": False,
-                        "failure": "homexy_interrupted_or_generation_changed",
+                        "failure": "homexy_authority_changed_during_command",
                         "primitive_result": _json_safe(result),
                     }
                 source_noop = bool(
@@ -5239,6 +5673,18 @@ class Serial206OemInitializationProvider:
                     })
                 else:
                     lifecycle.update({"state": "awaiting_operator_observation" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": command_id if verified_success else None, "last_failure": None if verified_success else _json_safe(result)})
+                terminal_authority = self._xy_authority_snapshot(
+                    lifecycle, require_referenced=False, validate=False
+                )
+                child_receipts = {
+                    axis: {
+                        "axis": axis,
+                        "command_id": command_id,
+                        "parent_intent": "home_xy",
+                        "status": "completed" if result.get("ok") is True else "failed",
+                    }
+                    for axis in ("x", "y")
+                }
                 receipt = {
                     "command_id": command_id,
                     "intent": "home_xy",
@@ -5251,14 +5697,18 @@ class Serial206OemInitializationProvider:
                     "inputs": safe_inputs,
                     "status": "completed" if result.get("ok") is True else "failed",
                     "result": _json_safe(result),
+                    "composite_authority": {
+                        "admitted": _json_safe(admitted_authority),
+                        "terminal": _json_safe(terminal_authority),
+                    },
+                    "child_receipts": child_receipts,
                 }
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
                 terminal_authority_saved = True
-                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
-                    self.state_store.append_serial206_receipt("x", receipt)
-                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+                self._persist_xy_child_receipts(receipt)
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "authority_receipt": _json_safe(receipt)}
             except Exception as exc:
                 if terminal_authority_saved:
                     return {
@@ -6338,9 +6788,9 @@ class Serial206OemInitializationProvider:
             allowed_by_state = {
                 "prepare": {"unprepared", "failed_latched"},
 
-                "manual_home": {"prepared_unreferenced", "referenced_ready"},
-                "move_z_home": {"prepared_unreferenced", "referenced_ready"},
-                "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+                "manual_home": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
+                "move_z_home": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
+                "diagnostic_home_axis": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
                 "set_max_speed": {"prepared_unreferenced", "referenced_ready"},
                 "set_max_acc": {"prepared_unreferenced", "referenced_ready"},
                 "set_vmax": {"prepared_unreferenced", "referenced_ready"},
@@ -6738,11 +7188,11 @@ class Serial206OemInitializationProvider:
                 )
                 evidence_verified = bool(
                     result.get("controller_terminal_state_verified") is True
+                    and isinstance(summary, Mapping)
+                    and summary.get("controller_home_proof_verified") is True
                     and (
                         (
                             source_short_circuit
-                            and isinstance(summary, Mapping)
-                            and summary.get("controller_home_proof_verified") is True
                         )
                         or (
                             not source_short_circuit
@@ -8315,6 +8765,14 @@ class Serial206OemInitializationProvider:
             readback = value.get("readback")
             return isinstance(readback, Mapping) and ack_ok(readback.get("ack")) and readback.get("value") == expected
 
+        def source_write_ok(value: Any, expected: int) -> bool:
+            return bool(
+                isinstance(value, Mapping)
+                and value.get("source_call_completed") is True
+                and value.get("source_return_code") == 0
+                and value.get("set_value") == expected
+            )
+
         def wait_ok(value: Any) -> bool:
             return (
                 isinstance(value, Mapping)
@@ -8387,14 +8845,60 @@ class Serial206OemInitializationProvider:
                 )
             return bool(motion_ok and switch_ok and restore_ok), before, final, home_after, home.get("move_home", {}).get("ack")
 
+        def deck_home_evidence(
+            value: Any,
+        ) -> tuple[bool, bool, int | None, int | None, Any, Any]:
+            if not isinstance(value, Mapping) or value.get("startup") is not True:
+                return False, False, None, None, None, None
+            prepare = value.get("prepare")
+            home = value.get("home")
+            if (
+                not isinstance(prepare, Mapping)
+                or prepare.get("ok") is not True
+                or not isinstance(home, Mapping)
+            ):
+                return False, False, None, None, None, None
+            go_home = home.get("go_home")
+            source_ok = bool(
+                home.get("ok") is True
+                and type(home.get("source_return_code")) is int
+            )
+            before = None
+            after = None
+            switch = home.get("home_after")
+            ack = None
+            controller_reference = False
+            if isinstance(go_home, Mapping):
+                before = position(go_home.get("position_before"))
+                after = position(go_home.get("position_after_sethome"))
+                move_home = go_home.get("move_home")
+                ack = move_home.get("ack") if isinstance(move_home, Mapping) else None
+                controller_reference = bool(
+                    go_home.get("controller_home_proof_verified") is True
+                    and after == 0
+                )
+            return source_ok, controller_reference, before, after, switch, ack
+
         before: int | None = None
         after: int | None = None
         switch: Any = None
         ack: Any = None
         controller_reference_agrees = False
         ok = False
-        if spec.key in {"z-home", "x-home", "y-home", "gripper-home"}:
-            ok, before, after, switch, ack = home_evidence(result, gripper=spec.key == "gripper-home")
+        if spec.key in {"x-home", "y-home"}:
+            (
+                ok,
+                controller_reference_agrees,
+                before,
+                after,
+                switch,
+                ack,
+            ) = deck_home_evidence(result)
+        elif spec.key in {"z-home", "gripper-home"}:
+            ok, before, after, switch, ack = home_evidence(
+                result,
+                gripper=spec.key == "gripper-home",
+            )
             controller_reference_agrees = ok
         elif spec.key == "door-home":
             status_before = result.get("status_before") if isinstance(result, Mapping) else None
@@ -8426,7 +8930,27 @@ class Serial206OemInitializationProvider:
                 and write_ok(result.get("set_home"), 0)
             )
             controller_reference_agrees = ok
-        elif spec.key in {"gripper-clear-10000", "x-park-6000"}:
+        elif spec.key == "x-park-6000":
+            before = position(result.get("before"))
+            ack = (
+                result.get("retry_ack")
+                if result.get("ack") is None
+                else result.get("ack")
+            )
+            wait = result.get("wait")
+            ok = bool(
+                result.get("ok") is True
+                and type(result.get("source_return_code")) is int
+                and (
+                    result.get("source_noop") is True
+                    or (
+                        isinstance(wait, Mapping)
+                        and wait.get("ok") is True
+                        and wait.get("target_reached") is True
+                    )
+                )
+            )
+        elif spec.key == "gripper-clear-10000":
             move = result.get("move")
             positions = result.get("position")
             before = position(positions.get("before")) if isinstance(positions, Mapping) else None
@@ -8444,12 +8968,12 @@ class Serial206OemInitializationProvider:
             )
         elif spec.key in {"gripper-current-31", "x-speed-1700", "gripper-idle-current-10"}:
             expected = {"gripper-current-31": 31, "x-speed-1700": 1700, "gripper-idle-current-10": 10}[spec.key]
-            ok = write_ok(result, expected)
+            ok = source_write_ok(result, expected)
             ack = result.get("ack")
         elif spec.key in {"x-set-home", "y-set-home"}:
-            ok = write_ok(result, 0)
+            ok = source_write_ok(result, 0)
             ack = result.get("ack")
-            controller_reference_agrees = ok
+            controller_reference_agrees = ack_ok(ack)
         elif spec.key in {"x-home-settle", "x-speed-settle"}:
             expected = 20 if spec.key == "x-home-settle" else 40
             ok = result.get("settled") is True and result.get("settle_ms") == expected
@@ -8528,6 +9052,9 @@ class Serial206OemInitializationProvider:
             "status": "controller_acknowledged" if ok else "failed",
             "ok": bool(ok),
             "failure": None if ok else "controller_stage_evidence_not_accepted",
+            "source_call_completed": isinstance(raw, Mapping),
+            "source_return_ok": bool(ok),
+            "controller_command_acknowledged": ack_ok(ack),
             "component": spec.component,
             "direction": spec.direction,
             "bound": spec.bound,

@@ -122,6 +122,7 @@ class NovoRouter:
         self._pending: _PendingTransaction | None = None
         self._completion_lock = threading.Lock()
         self._pipette_completions: dict[int, _PipetteCompletion] = {}
+        self._interrupted_pipette_completions: dict[tuple[int, str], _PipetteCompletion] = {}
         self._pipette_completion_taints: dict[int, dict[str, Any]] = {}
         self._stop = threading.Event()
         self._reader: threading.Thread | None = None
@@ -177,8 +178,12 @@ class NovoRouter:
             pending.outcome = "shutdown"
             pending.event.set()
         with self._completion_lock:
-            completions = list(self._pipette_completions.values())
+            completions = [
+                *self._pipette_completions.values(),
+                *self._interrupted_pipette_completions.values(),
+            ]
             self._pipette_completions.clear()
+            self._interrupted_pipette_completions.clear()
             self._pipette_completion_taints.clear()
         for completion in completions:
             completion.event.set()
@@ -614,6 +619,8 @@ class NovoRouter:
         command_family: int | None = None,
         command_name: str | None = None,
         expected_rx_id: int | None = None,
+        replace_owner_token: str | None = None,
+        replacement_reason: str | None = None,
     ) -> str:
         channel = int(channel)
         if channel not in range(4):
@@ -637,8 +644,25 @@ class NovoRouter:
                     f"pipette {channel} completion lifecycle is tainted; router rebind is required"
                 )
             existing = self._pipette_completions.get(channel)
-            if existing is not None and not existing.event.is_set():
-                raise NovoRouterError(f"pipette {channel} completion is already registered")
+            if existing is not None:
+                replacement_authorized = bool(
+                    isinstance(replace_owner_token, str)
+                    and replace_owner_token
+                    and existing.owner_token == replace_owner_token
+                    and command_family == 0
+                    and existing.command_family == 1
+                    and replacement_reason == "interrupted_by_terminate"
+                )
+                if replacement_authorized:
+                    if not existing.event.is_set():
+                        existing.rejected_reason = "interrupted_by_terminate"
+                        existing.event.set()
+                    self._interrupted_pipette_completions[
+                        (channel, existing.owner_token)
+                    ] = existing
+                    self._pipette_completions.pop(channel, None)
+                elif not existing.event.is_set():
+                    raise NovoRouterError(f"pipette {channel} completion is already registered")
             registered_at = self._clock()
             owner_token = uuid.uuid4().hex
             legacy_owner = command_family is None and command_name is None
@@ -683,8 +707,20 @@ class NovoRouter:
         owner_token: str | None = None,
     ) -> dict[str, Any]:
         channel = int(channel)
+        requested_owner = str(owner_token) if owner_token is not None else None
         with self._completion_lock:
             completion = self._pipette_completions.get(channel)
+            archived = False
+            if (
+                requested_owner
+                and (completion is None or completion.owner_token != requested_owner)
+            ):
+                interrupted_completion = self._interrupted_pipette_completions.get(
+                    (channel, requested_owner)
+                )
+                if interrupted_completion is not None:
+                    completion = interrupted_completion
+                    archived = True
         if completion is None:
             return {"ok": False, "channel": channel, "outcome": "completion_not_registered"}
         if owner_token is None or not str(owner_token):
@@ -704,7 +740,12 @@ class NovoRouter:
         remaining_contract = max(0.0, completion.deadline_at - self._clock())
         signaled = completion.event.wait(min(max(0.0, float(timeout_s)), remaining_contract))
         with self._completion_lock:
-            if self._pipette_completions.get(channel) is completion:
+            if archived:
+                self._interrupted_pipette_completions.pop(
+                    (channel, completion.owner_token),
+                    None,
+                )
+            elif self._pipette_completions.get(channel) is completion:
                 self._pipette_completions.pop(channel, None)
         frame = completion.frame
         generation_changed = completion.owner_generation != self._reader_generation

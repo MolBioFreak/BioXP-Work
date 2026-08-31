@@ -449,6 +449,55 @@ def test_pipette_completion_requires_bound_command_owner_and_matching_token():
     assert result["command_family"] == 1
 
 
+def test_terminate_completion_owner_takes_over_exact_active_command_without_taint():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    active_token = router.prepare_pipette_completion(
+        0,
+        60.0,
+        command_family=1,
+        command_name="pipette_aspirate",
+        expected_rx_id=0x501,
+    )
+    router.bind_pipette_completion(
+        0,
+        owner_token=active_token,
+        transaction_id="tx-active-liquid",
+        tx_started_at=router._clock(),
+    )
+
+    terminate_token = router.prepare_pipette_completion(
+        0,
+        8.0,
+        command_family=0,
+        command_name="terminate_pipette",
+        expected_rx_id=0x500,
+        replace_owner_token=active_token,
+        replacement_reason="interrupted_by_terminate",
+    )
+
+    interrupted = router.wait_pipette_completion(
+        0,
+        0.0,
+        owner_token=active_token,
+    )
+    assert interrupted["ok"] is False
+    assert interrupted["outcome"] == "interrupted_by_terminate"
+    assert router.pipette_completion_taint(0) is None
+    assert terminate_token != active_token
+    assert router._pipette_completions[0].owner_token == terminate_token
+
+    with pytest.raises(NovoRouterError, match="already registered"):
+        router.prepare_pipette_completion(
+            0,
+            8.0,
+            command_family=0,
+            command_name="terminate_pipette",
+            expected_rx_id=0x500,
+            replace_owner_token="wrong-owner-token",
+            replacement_reason="interrupted_by_terminate",
+        )
+
+
 def test_completion_timeout_taints_channel_until_router_rebind():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
     token = router.prepare_pipette_completion(

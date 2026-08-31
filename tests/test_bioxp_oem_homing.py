@@ -43,7 +43,7 @@ def _make_tester(monkeypatch):
     monkeypatch.setattr(
         tester,
         "_machine_config_axis_max",
-        lambda axis, fallback: (axis_limits[str(axis)], "immutable_oem_machine_snapshot"),
+        lambda axis: (axis_limits[str(axis)], "immutable_oem_machine_snapshot"),
     )
     monkeypatch.setattr(
         tester,
