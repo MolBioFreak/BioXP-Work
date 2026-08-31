@@ -643,13 +643,263 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
         return {"ok": True, "delivery_attempted": True, "controller_command_acknowledged": True, "controller_completion_verified": True, "semantic_state_committed": True, "ambiguity_state": "none", "script_line": plan.script_line, "source_branch": plan.source_branch, "authority_digest": plan.authority_digest, "plan_digest": plan.plan_digest, "well_source": plan.well_source, "destination_translation": dict(plan.destination_translation), "source_hazards": list(plan.source_hazards), "source_return_disposition": "ignored", "transition_revisions": transition_revisions, "continuation_disposition": plan.steps[-1].operation if len(plan.steps) > (2 if plan.source_branch == "old_well_terminal" else 3) else "noop", "terminal_evidence_truth": True, "provider_results": provider_results}
 
 
-def compile_finite_plate_operation(operation: str, *, source_leaf_available: bool) -> dict[str, Any]:
-    allowed = {"catch_plate", "release_plate", "press_plate", "park_gantry", "waste_sequence"}
+WP8_AUTHORITY_DIGEST = "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
+
+
+def _wp8_child(
+    children: list[dict[str, Any]], operation: str, *, arguments: Mapping[str, Any] | None = None,
+    ignored_return: bool = False, state_mutation: Mapping[str, Any] | None = None,
+    awaited: bool = True, exception_policy: str = "propagate",
+) -> None:
+    order = len(children)
+    children.append({
+        "order": order,
+        "depends_on": [] if order == 0 else [order - 1],
+        "operation": operation,
+        "arguments": dict(arguments or {}),
+        "ignored_return": bool(ignored_return),
+        "state_mutation": dict(state_mutation or {}),
+        "awaited": bool(awaited),
+        "exception_policy": exception_policy,
+    })
+
+
+def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
+    plan = {
+        "schema_version": "bioxp.oem_wp8_operation.v1",
+        "operation": operation,
+        "source_owned": True,
+        "state_update": "source_ordered_partial_residuals",
+        "authority_digest": WP8_AUTHORITY_DIGEST,
+        "children": children,
+        "residual_policy": "retain_completed_children_without_rollback",
+        **metadata,
+    }
+    plan["plan_digest"] = _digest(plan)
+    return plan
+
+
+def compile_finite_plate_operation(
+    operation: str, *, source_leaf_available: bool, **inputs: Any,
+) -> dict[str, Any]:
+    """Compile literal, finite WP8 source children without strengthening OEM semantics."""
+    aliases = {"press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup"}
+    allowed = {"catch_plate", "release_plate", "park_gantry", "waste_sequence", *aliases}
     if operation not in allowed:
         raise ValueError("unknown finite deck operation")
     if not source_leaf_available:
         raise RuntimeError(f"source_authority_missing:{operation}")
-    return {"operation": operation, "state_update": "success_only", "source_owned": True}
+    children: list[dict[str, Any]] = []
+
+    if operation == "park_gantry":
+        return _wp8_plan(operation, children, provider_method="parkGantry")
+    if operation == "waste_sequence":
+        return _wp8_plan(operation, children, provider_method="cleanupWastePrelude")
+
+    if operation == "catch_plate":
+        plate = int(inputs.get("plate", 0))
+        location = int(inputs.get("plate_location", inputs.get("location", 0)))
+        destination = {1: 21, 2: 23, 0: 25}.get(location, location)
+        door_open = bool(inputs.get("thermal_door_open", False))
+        parallel = bool(inputs.get("run_in_parallel", True))
+        if destination in {17, 18, 19, 20}:
+            if door_open:
+                _wp8_child(children, "doorOpen", arguments={"open": False}, ignored_return=True)
+        elif not door_open:
+            _wp8_child(children, "doorOpen", arguments={"open": True}, ignored_return=True)
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": destination, "well": 0, "position_flag": 0}, ignored_return=True)
+        _wp8_child(children, "updateLocation", arguments={"destination": destination, "well": 0}, state_mutation={"current_location": destination, "current_well": 0})
+        if parallel:
+            _wp8_child(children, "LockGripperOperation")
+        _wp8_child(children, "setGripperCurrent", arguments={"current": 31}, state_mutation={"gripper_current": 31})
+        version = int(inputs.get("gripper_version", 0))
+        _wp8_child(children, "setGripperVMax", arguments={"vmax": 900 if version == 0 else 1500})
+        if version == 0:
+            _wp8_child(children, "StopCloseGripper", arguments={"reset_speed": False})
+        wide = destination in {0, 1, 2, 21, 23, 25}
+        _wp8_child(children, "OpenGripperWide" if wide else "OpenGripper", arguments={"recover": True})
+        _wp8_child(children, "led2On", ignored_return=True)
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        _wp8_child(children, "SnapshotImage", arguments={"name": "CatchPlate"}, ignored_return=True)
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
+        _wp8_child(children, "led2Off", ignored_return=True)
+        offset = -30236 if destination == 25 and int(inputs.get("output_plate_location", -1)) in {25, 0} else 0
+        _wp8_child(children, "moveZ", arguments={"location": destination, "z_low_offset": offset})
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
+        if plate == 0:
+            _wp8_child(children, "moveGClosedPlus3000", arguments={"offset": 3000})
+        else:
+            _wp8_child(children, "CloseGripper")
+        if destination == 5:
+            _wp8_child(children, "moveStepsZMinus6000", arguments={"steps": -6000})
+            _wp8_child(children, "moveStepsYMinus800", arguments={"steps": -800})
+            _wp8_child(children, "moveStepsYPlus1600", arguments={"steps": 1600})
+        _wp8_child(children, "LoadGantry", arguments={"plate": plate}, state_mutation={"plate_on_gantry": plate, "pseudo_z_home": 65000 if plate == 3 else 500})
+        _wp8_child(children, "moveZPseudoHome")
+        _wp8_child(children, "updatePlateLocation", arguments={"plate": plate, "location": 29}, state_mutation={"plate": plate, "location": 29})
+        if parallel:
+            _wp8_child(children, "ReleaseLockGripperOperation")
+        return _wp8_plan(
+            operation, children, resolved_location=destination, z_offset=offset,
+            exception_policy="log_and_suppress", finally_children=["ReleaseLockGripperOperation"] if parallel else [],
+        )
+
+    if operation == "release_plate":
+        destination = int(inputs["destination"])
+        parallel = bool(inputs.get("run_in_parallel", True))
+        offset = -30236 if destination == 25 and int(inputs.get("plate_on_gantry", -1)) == 1 and int(inputs.get("output_plate_location", -1)) in {25, 29} else 0
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": destination, "well": 0, "position_flag": 0}, ignored_return=True)
+        _wp8_child(children, "moveZLow", arguments={"location": destination, "z_low_offset": offset})
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 5})
+        if parallel:
+            _wp8_child(children, "LockGripperOperation")
+        _wp8_child(children, "setGripperCurrent", arguments={"current": 31}, state_mutation={"gripper_current": 31})
+        _wp8_child(children, "OpenGripperWide" if destination in {21, 23, 25} else "OpenGripper")
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 200})
+        _wp8_child(children, "setGripperVMax", arguments={"vmax": 900 if int(inputs.get("gripper_version", 0)) == 0 else 1500})
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 200})
+        pressure_target = {21: 22, 23: 24, 25: 26}.get(destination)
+        if bool(inputs.get("press_plate", False)) and pressure_target is not None:
+            _wp8_child(children, "moveZPressApproach", arguments={"pressure_target": pressure_target, "offset": -26000})
+            _wp8_child(children, "CloseGripper")
+            _wp8_child(children, "setZCurrent31", arguments={"current": 31}, state_mutation={"z_current": 31})
+            _wp8_child(children, "moveZPress", arguments={"pressure_target": pressure_target})
+            _wp8_child(children, "setZaxisCurrentmax100", arguments={"percent": 100, "selection": "configured_Z_MOTOR_MAX_CURRENT_DOWN"}, state_mutation={"z_current_selection": "configured_down"})
+        _wp8_child(children, "LoadGantryNull", state_mutation={"plate_on_gantry": None, "pseudo_z_home": 65000})
+        _wp8_child(children, "sendZandGripperHome", arguments={"run_in_parallel": parallel})
+        plate = inputs.get("plate_on_gantry")
+        _wp8_child(children, "updatePlateLocation", arguments={"destination": destination, "tray": inputs.get("current_tray")}, state_mutation={"plate": plate, "location": destination})
+        _wp8_child(children, "updateLocation", arguments={"destination": destination, "well": 0}, state_mutation={"current_location": destination, "current_well": 0})
+        _wp8_child(children, "led2On", ignored_return=True)
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        _wp8_child(children, "SnapshotImage", arguments={"name": "ReleasePlate"}, ignored_return=True)
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
+        _wp8_child(children, "led2Off", ignored_return=True)
+        return _wp8_plan(operation, children, z_offset=offset, pressure_target=pressure_target, exception_policy="log_and_suppress", finally_children=[])
+
+    if operation == "send_z_and_gripper_home":
+        parallel = bool(inputs.get("run_in_parallel", True))
+        delay = 1000 if int(inputs.get("gripper_position", 0)) > int(inputs.get("closed_position", 0)) else 0
+        _wp8_child(children, "getG")
+        if parallel:
+            _wp8_child(children, "startMoveZPseudoHome", awaited=False)
+            _wp8_child(children, "Sleep", arguments={"milliseconds": delay})
+            _wp8_child(children, "startGripperHomeAndUnlock", awaited=False)
+            _wp8_child(children, "waitMoveZOnly")
+        else:
+            _wp8_child(children, "moveZPseudoHome")
+            _wp8_child(children, "sendGripperHome")
+            _wp8_child(children, "ReleaseLockGripperOperation")
+        return _wp8_plan(operation, children, exception_policy="propagate", finally_children=[])
+
+    if operation in {"press_plate", "press_plates"}:
+        plates = list(inputs.get("plates", [inputs.get("plate")]))
+        recognized = [int(p) for p in plates if p in {0, 1, 2}]
+        targets = {0: 24, 1: 22, 2: 27}
+        locations = dict(inputs.get("plate_locations", {}))
+        for plate in recognized:
+            _wp8_child(children, "scriptmoveTo", arguments={"destination": locations.get(plate), "plate": plate}, ignored_return=True)
+            _wp8_child(children, "updateLocation", arguments={"destination": locations.get(plate), "well": 0}, state_mutation={"current_location": locations.get(plate), "current_well": 0})
+            _wp8_child(children, "pressPlate", arguments={"plate": plate, "pressure_target": targets[plate]})
+            _wp8_child(children, "moveZPressApproach", arguments={"pressure_target": targets[plate], "offset": -16000, "wait": False, "current_selection": "configured_down"})
+            _wp8_child(children, "CloseGripper")
+            _wp8_child(children, "waitZ", arguments={"timeout_ms": 15000})
+            _wp8_child(children, "setZCurrent31", arguments={"current": 31}, state_mutation={"z_current": 31})
+            _wp8_child(children, "moveZPress", arguments={"pressure_target": targets[plate]})
+            _wp8_child(children, "setZaxisCurrentmax100", arguments={"percent": 100, "selection": "configured_Z_MOTOR_MAX_CURRENT_DOWN"}, state_mutation={"z_current_selection": "configured_down"})
+            if len(plates) == 1:
+                _wp8_child(children, "sendZandGripperHome", arguments={"run_in_parallel": bool(inputs.get("run_in_parallel", True))})
+            else:
+                _wp8_child(children, "MoveZHome")
+        if len(plates) != 1 and recognized:
+            _wp8_child(children, "backgroundGripperHomeAndUnlock", awaited=False)
+        return _wp8_plan(operation, children, exception_policy="propagate", finally_children=[], parent_return_allows_background_pending=len(plates) != 1 and bool(recognized))
+
+    if operation == "thermal_door":
+        opening = bool(inputs.get("open"))
+        board_test = bool(inputs.get("board_test_mode", False))
+        if opening and int(inputs.get("current_location", 28)) != 28:
+            _wp8_child(children, "parkGantry", arguments={"rehome": bool(inputs.get("script_running", False))}, ignored_return=True)
+        motion = "moveDoorOpen" if opening else "moveDoorClosed"
+        for name in ("setDoorStallThresholdPlus2", "setDoorMaxCurrent", motion, "readDoorSensors"):
+            _wp8_child(children, name, arguments={"open": opening})
+        if not board_test:
+            _wp8_child(children, "HomeAxisD")
+            if opening:
+                for name in ("setDoorStallThresholdPlus2", "setDoorMaxCurrent", motion, "readDoorSensors"):
+                    _wp8_child(children, name, arguments={"open": opening})
+            _wp8_child(children, "updateThermalDoorOpen", arguments={"value": opening}, state_mutation={"thermal_door_open": opening})
+        else:
+            _wp8_child(children, "updateThermalDoorOpen", arguments={"value": opening}, state_mutation={"thermal_door_open": opening})
+        return _wp8_plan(operation, children, sensor_success_predicate="openSensor && !closedSensor" if opening else "!openSensor && closedSensor", null_board_return=True, success_return=False if board_test else True, failure_policy="throw" if board_test else ("home_and_retry_once" if opening else "image_log_and_home_no_retry"), normal_state_update_unconditional=not board_test)
+
+    # ControlLib.cleanup: distinct cleanup waste prelude, then output/reagent cover storage.
+    _wp8_child(children, "waitStop")
+    _wp8_child(children, "checkDoorStatus")
+    _wp8_child(children, "queryTipStatus", ignored_return=True)
+    if bool(inputs.get("tip_exists", False)):
+        _wp8_child(children, "scriptmoveToWaste", ignored_return=True)
+        _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0}, state_mutation={"current_location": 6, "current_well": 0})
+        _wp8_child(children, "ejectAllTipsCleanup", arguments={"first": False, "second": True}, ignored_return=True)
+        _wp8_child(children, "moveZ80000")
+        _wp8_child(children, "moveX79000")
+        _wp8_child(children, "clearTipLoaded", state_mutation={"tip_loaded": False})
+    _wp8_child(children, "sendGripperHome")
+    cover_locations = dict(inputs.get("cover_locations", {}))
+    if int(cover_locations.get(4, -1)) != 18:
+        _wp8_child(children, "storeOutputCover4To18", arguments={"plate": 4, "destination": 18}, ignored_return=True)
+    if int(cover_locations.get(5, -1)) != 20:
+        _wp8_child(children, "storeReagentCover5To20", arguments={"plate": 5, "destination": 20}, ignored_return=True)
+    _wp8_child(children, "doorOpenClose", arguments={"open": False}, ignored_return=True)
+    _wp8_child(children, "parkGantry", arguments={"rehome": False}, ignored_return=True)
+    return _wp8_plan(operation, children, exception_policy="propagate", finally_children=[], source_hazards=["destination != 20 || destination != 18", "raw_il_tautology: destination != 20 || destination != 18"])
+
+
+def execute_finite_plate_operation(
+    plan: Mapping[str, Any], invoke_child: Callable[[Mapping[str, Any]], Any],
+) -> dict[str, Any]:
+    """Run and evidence source children in order, retaining literal partial state."""
+    completed: list[dict[str, Any]] = []
+    residual: dict[str, Any] = {}
+    failed: str | None = None
+    suppressed = False
+    finally_names = set(plan.get("finally_children") or [])
+    children = list(plan.get("children") or [])
+    try:
+        for child in children:
+            if child["operation"] in finally_names:
+                continue
+            try:
+                result = invoke_child(child)
+            except Exception:
+                failed = str(child["operation"])
+                raise
+            completed.append({"order": child["order"], "operation": child["operation"], "result": result})
+            mutation = dict(child.get("state_mutation") or {})
+            if mutation:
+                if set(mutation) == {"plate", "location"}:
+                    residual.setdefault("plate_locations", {})[str(mutation["plate"])] = mutation["location"]
+                else:
+                    residual.update(mutation)
+    except Exception:
+        if plan.get("exception_policy") == "log_and_suppress":
+            suppressed = True
+        else:
+            raise
+    finally:
+        for child in children:
+            if child["operation"] not in finally_names:
+                continue
+            result = invoke_child(child)
+            completed.append({"order": child["order"], "operation": child["operation"], "result": result})
+    return {
+        "ok": failed is None,
+        "exception_suppressed": suppressed,
+        "failed_child": failed,
+        "completed_children": completed,
+        "residual_state": residual,
+        "background_pending": any(not bool(row.get("awaited", True)) for row in children),
+    }
 
 
 def make_deck_command_executor(
