@@ -2602,18 +2602,6 @@ class OperatorCommandStore:
                     self._insert_transition(conn, event_kind="method_recovery", method_id=method_id, state="recovery_required", payload={"reason": "process_owner_loss"})
             conn.execute("UPDATE operator_plane_lane SET active_command_id=NULL,active_attempt_id=NULL,dispatcher_epoch=dispatcher_epoch+1,updated_at=? WHERE singleton=1", (_now(),))
             if active:
-                producer_command_id = str(active[0]["command_id"])
-                semantic = conn.execute("SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
-                before_revision = int(semantic[0])
-                provenance = {
-                    "source_operation": "process_owner_loss", "command_id": producer_command_id,
-                    "before_revision": before_revision, "after_revision": before_revision + 1,
-                    "ambiguity_state": "recovery_required",
-                }
-                conn.execute(
-                    "UPDATE operator_plane_deck_semantic_state SET semantic_state_revision=?,producer_operation='process_owner_loss',producer_command_id=?,transition_provenance_json=?,ambiguity_state='recovery_required',updated_at=? WHERE singleton=1",
-                    (before_revision + 1, producer_command_id, _canonical(provenance), _now()),
-                )
                 conn.execute(
                     "UPDATE operator_plane_deck_commands SET ambiguity_state='recovery_required' WHERE command_id IN ({})".format(",".join("?" for _ in active)),
                     tuple(str(item["command_id"]) for item in active),
@@ -2870,17 +2858,17 @@ class OperatorCommandStore:
         safety = conn.execute(
             "SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1"
         ).fetchone()
-        semantic = conn.execute(
-            "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
+        unresolved = conn.execute(
+            "SELECT 1 FROM operator_plane_deck_commands d "
+            "WHERE d.ambiguity_state='recovery_required' AND NOT EXISTS ("
+            "SELECT 1 FROM operator_plane_idempotency i "
+            "WHERE i.operation_kind='deck_reconciliation' AND i.command_id=d.command_id"
+            ") LIMIT 1"
         ).fetchone()
-        if safety is None or semantic is None:
+        if safety is None:
             return "deck_recovery_state_inconsistent"
         hold = bool(safety["recovery_hold"])
-        ambiguity = str(semantic["ambiguity_state"])
-        if ambiguity not in {"none", "ambiguous", "recovery_required"}:
-            return "deck_recovery_state_inconsistent"
-        semantic_blocked = ambiguity in {"ambiguous", "recovery_required"}
-        if hold != semantic_blocked:
+        if hold != (unresolved is not None):
             return "deck_recovery_state_inconsistent"
         return "deck_recovery_hold" if hold else None
 
@@ -4210,17 +4198,7 @@ class OperatorCommandStore:
                     str(command_id),
                 ),
             )
-            semantic = conn.execute("SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
-            before = int(semantic[0])
-            provenance = {
-                "source_operation": "deck_outcome_unknown", "command_id": str(command_id),
-                "before_revision": before, "after_revision": before + 1,
-                "ambiguity_state": "recovery_required", "reason": str(reason),
-            }
-            conn.execute(
-                "UPDATE operator_plane_deck_semantic_state SET semantic_state_revision=?,producer_operation='deck_outcome_unknown',producer_command_id=?,transition_provenance_json=?,ambiguity_state='recovery_required',updated_at=? WHERE singleton=1",
-                (before + 1, str(command_id), _canonical(provenance), _now()),
-            )
+
 
     def cancel_command(self, command_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         key = str(request["idempotency_key"])

@@ -313,7 +313,13 @@ class DeckMovementExecutor:
         with self._lease:
             yield
 
-    def execute(self, plan: DeckMovementPlan, *, before_first_write: Callable[[DeckMovementPlan], None] | None = None) -> list[Any]:
+    def execute(
+        self,
+        plan: DeckMovementPlan,
+        *,
+        before_first_write: Callable[[DeckMovementPlan], None] | None = None,
+        after_each_child: Callable[[DeckPlanStep], None] | None = None,
+    ) -> list[Any]:
         if plan.blocked_reason:
             raise MovementAuthorityChanged(plan.blocked_reason)
         with self.movement_lease():
@@ -332,6 +338,8 @@ class DeckMovementExecutor:
                 if isinstance(result, Mapping) and result.get("ok") is not True:
                     raise RuntimeError(f"provider_stage_failed:{step.operation}")
                 results.append(result)
+                if after_each_child is not None:
+                    after_each_child(step)
             return results
 
 
