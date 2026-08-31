@@ -40,6 +40,13 @@ from .oem_runtime_store import (
     verify_canonical_runtime_database,
 )
 from .runtime_audit_store import open_runtime_connection
+from .oem_deck_catalog import configured_location_names, public_target_keys
+from .oem_deck_movement import (
+    DeckExecutionFailure,
+    canonical_movable_object_locations,
+    canonical_plate_name,
+    plate_name_for_storage,
+)
 
 COMMAND_SCHEMA = "bioxp.operator_command_request.v1"
 ACTION_REQUEST_SCHEMA = "bioxp.operator_action_request.v2"
@@ -122,6 +129,7 @@ ALLOWED_ACTIONS = frozenset({
     "oem.y.move_absolute",
     "oem.xy.move_absolute",
     "oem.xy.home",
+    "oem.deck.move_to_location",
 })
 INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all", "oem.z.abort",
@@ -355,6 +363,7 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             "plate_on_gantry",
             "location19_y",
         },
+        "oem.deck.move_to_location": {"target", "camera_offset"},
     }
     unknown = sorted(set(inputs) - allowed.get(action_id, set()))
     if unknown:
@@ -420,6 +429,16 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail={"error": "invalid_z_control_operation"})
         if "value" in result and type(result["value"]) is not int:
             raise HTTPException(status_code=422, detail={"error": "invalid_profile_value", "field": "value"})
+        return result
+    if action_id == "oem.deck.move_to_location":
+        target = result.get("target")
+        camera_offset = result.get("camera_offset")
+        if type(target) is not str or target not in public_target_keys():
+            raise HTTPException(status_code=422, detail={"error": "invalid_deck_target"})
+        if type(camera_offset) is not bool:
+            raise HTTPException(status_code=422, detail={"error": "invalid_camera_offset"})
+        if camera_offset and (target.endswith("_BARCODE") or target == "LOC_PARK"):
+            raise HTTPException(status_code=422, detail={"error": "contradictory_input"})
         return result
     if action_id == "oem.xy.move_absolute":
         for key in ("x", "y"):
@@ -560,7 +579,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     axis = AXIS_BY_ACTION.get(action_id)
     if (
         action_id.startswith(("oem.xy.", "oem.xyz."))
-        or action_id == "oem.z.scriptmove_to"
+        or action_id in {"oem.z.scriptmove_to", "oem.deck.move_to_location"}
     ) and isinstance(provider, Mapping):
         epochs: dict[str, int] = {}
         x_authority = provider.get("x_authority")
@@ -925,6 +944,18 @@ class RecoveryResolveRequest(BaseModel):
     operation: str = Field(pattern=r"^(resume_undispatched|cancel_pending)$")
 
 
+class DeckReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: str = Field(pattern=r"^bioxp\.operator_deck_reconciliation_request\.v1$")
+    operator_ack: str = Field(pattern=r"^RECONCILE_DECK$")
+    decision_id: str = Field(min_length=1, max_length=128)
+    approved_by: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+    current_location: str | None = Field(default=None, min_length=1, max_length=80)
+    current_well: StrictInt | None = Field(default=None, ge=0, le=95)
+    approved_home_state: dict[str, Any] | None = None
+
+
 class OperatorCommandStore:
     """SQLite authority for command order and lifecycle projections."""
 
@@ -948,6 +979,7 @@ class OperatorCommandStore:
         self._workers: set[threading.Thread] = set()
         self._authority_write_depth = 0
         self._interrupt_spool_write_depth = 0
+        self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
         self.owner_id = uuid.uuid4().hex
         self._owner_acquired = False
         self._configure_interrupt_spool()
@@ -960,6 +992,29 @@ class OperatorCommandStore:
         self._owner_acquired = self._acquire_owner()
         if self._owner_acquired:
             self._startup_recover()
+
+    def bind_deck_owner_authority_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
+        if not callable(reader):
+            raise TypeError("deck owner authority reader must be callable")
+        self._deck_owner_authority_reader = reader
+
+    def _validate_deck_owner_authority(
+        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
+    ) -> None:
+        supplied = (ownership_generation, board_epoch_4, board_epoch_5)
+        if any(type(value) is not int or value < 0 for value in supplied):
+            raise ValueError("deck owner authority stamps must be nonnegative integers")
+        reader = self._deck_owner_authority_reader
+        if not callable(reader):
+            return
+        current = reader()
+        observed = (
+            current.get("ownership_generation"),
+            current.get("board_epoch_4"),
+            current.get("board_epoch_5"),
+        ) if isinstance(current, Mapping) else (None, None, None)
+        if observed != supplied:
+            raise RuntimeError("deck_owner_authority_changed")
 
     def append_y_interrupt_fallback(self, receipt: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
         """Compatibility wrapper for the original Y-only caller."""
@@ -1356,6 +1411,24 @@ class OperatorCommandStore:
                 "operator_plane_interrupt_history_no_delete_v4",
                 "operator_plane_interrupt_history_coherence_insert_v4",
                 "operator_plane_transitions_authorized_coherent_insert_v4",
+                "operator_plane_deck_commands_authorized_insert_v1",
+                "operator_plane_deck_commands_identity_immutable_v1",
+                "operator_plane_deck_commands_evidence_coherence_v1",
+                "operator_plane_deck_commands_no_delete_v1",
+                "operator_plane_deck_stages_authorized_insert_v1",
+                "operator_plane_deck_stages_identity_immutable_v1",
+                "operator_plane_deck_stages_terminal_immutable_v1",
+                "operator_plane_deck_stages_no_delete_v1",
+                "operator_plane_deck_semantic_state_coherence_v1",
+                "operator_plane_deck_semantic_state_no_delete_v1",
+                "operator_plane_deck_semantic_transitions_coherence_v1",
+                "operator_plane_deck_semantic_transitions_no_update_v1",
+                "operator_plane_deck_semantic_transitions_no_delete_v1",
+                "operator_plane_tip_tray_state_coherence_v1",
+                "operator_plane_tip_tray_state_no_delete_v1",
+                "operator_plane_tip_tray_transitions_coherence_v1",
+                "operator_plane_tip_tray_transitions_no_update_v1",
+                "operator_plane_tip_tray_transitions_no_delete_v1",
             )
             for trigger_name in required_trigger_names:
                 self.connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
@@ -1545,6 +1618,136 @@ class OperatorCommandStore:
                     VALUES(1, 'invalid', strftime('%s','now'));
                 INSERT OR IGNORE INTO operator_plane_board_authority(board_id,state,active_board_epoch,updated_at)
                     VALUES(5, 'faulted', NULL, strftime('%s','now'));
+                COMMIT;
+                """
+            )
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS operator_plane_deck_commands (
+                    command_id TEXT PRIMARY KEY REFERENCES operator_plane_commands(command_id),
+                    target TEXT NOT NULL,
+                    target_label TEXT NOT NULL,
+                    resolved_location_id INTEGER NOT NULL,
+                    destination_catalog_revision TEXT NOT NULL CHECK(length(destination_catalog_revision)=64),
+                    position_table_revision TEXT NOT NULL CHECK(length(position_table_revision)=64),
+                    authority_snapshot_digest TEXT NOT NULL CHECK(length(authority_snapshot_digest)=64),
+                    complete_authority_digest TEXT NOT NULL CHECK(length(complete_authority_digest)=64),
+                    plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
+                    source_branch TEXT NOT NULL,
+                    source_anchors_json TEXT NOT NULL CHECK(json_valid(source_anchors_json)),
+                    source_hazards_json TEXT NOT NULL CHECK(json_valid(source_hazards_json)),
+                    delivery_attempted INTEGER NOT NULL DEFAULT 0 CHECK(delivery_attempted IN (0,1)),
+                    controller_command_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_command_acknowledged IN (0,1)),
+                    controller_completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(controller_completion_verified IN (0,1)),
+                    hardware_postcondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1)),
+                    semantic_state_committed INTEGER NOT NULL DEFAULT 0 CHECK(semantic_state_committed IN (0,1)),
+                    physical_observation_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_observation_verified IN (0,1)),
+                    transition_revision INTEGER,
+                    ambiguity_state TEXT NOT NULL DEFAULT 'none' CHECK(ambiguity_state IN ('none','blocked','ambiguous','recovery_required')),
+                    provider_evidence_json TEXT CHECK(provider_evidence_json IS NULL OR json_valid(provider_evidence_json)),
+                    planned_at REAL NOT NULL,
+                    committed_at REAL,
+                    CHECK(controller_command_acknowledged<=delivery_attempted),
+                    CHECK(controller_completion_verified<=delivery_attempted),
+                    CHECK(hardware_postcondition_verified<=controller_completion_verified),
+                    CHECK(semantic_state_committed<=controller_completion_verified),
+                    CHECK((semantic_state_committed=0 AND transition_revision IS NULL) OR (semantic_state_committed=1 AND transition_revision IS NOT NULL)),
+                    CHECK((semantic_state_committed=0 AND committed_at IS NULL) OR (semantic_state_committed=1 AND committed_at IS NOT NULL))
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS operator_plane_deck_commands_plan_idx
+                    ON operator_plane_deck_commands(plan_digest);
+                CREATE TABLE IF NOT EXISTS operator_plane_deck_stages (
+                    command_id TEXT NOT NULL REFERENCES operator_plane_deck_commands(command_id) ON DELETE RESTRICT,
+                    stage_order INTEGER NOT NULL CHECK(stage_order>=0),
+                    operation TEXT NOT NULL CHECK(length(operation)>0),
+                    source_anchor TEXT NOT NULL CHECK(length(source_anchor)>0),
+                    resources_json TEXT NOT NULL CHECK(json_valid(resources_json) AND json_type(resources_json)='array'),
+                    arguments_json TEXT NOT NULL CHECK(json_valid(arguments_json) AND json_type(arguments_json)='object'),
+                    dependency_order_json TEXT NOT NULL CHECK(json_valid(dependency_order_json) AND json_type(dependency_order_json)='array'),
+                    terminal_evidence_json TEXT CHECK(terminal_evidence_json IS NULL OR json_valid(terminal_evidence_json)),
+                    terminal_state TEXT NOT NULL DEFAULT 'planned' CHECK(terminal_state IN ('planned','completed','failed','ambiguous','stopped','aborted')),
+                    PRIMARY KEY(command_id,stage_order)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS operator_plane_deck_stages_terminal_idx
+                    ON operator_plane_deck_stages(command_id,terminal_state,stage_order);
+                CREATE TABLE IF NOT EXISTS operator_plane_deck_semantic_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    current_location TEXT,
+                    current_well INTEGER CHECK(current_well IS NULL OR current_well BETWEEN 0 AND 95),
+                    current_tray TEXT,
+                    tip_loaded INTEGER CHECK(tip_loaded IS NULL OR tip_loaded IN (0,1)),
+                    tip_dirty INTEGER CHECK(tip_dirty IS NULL OR tip_dirty IN (0,1)),
+                    tip_location INTEGER,
+                    clean_path INTEGER CHECK(clean_path IS NULL OR clean_path IN (0,1)),
+                    plate_on_gantry TEXT,
+                    movable_plate_locations_json TEXT NOT NULL CHECK(json_valid(movable_plate_locations_json)),
+                    pseudo_z_home INTEGER CHECK(pseudo_z_home IN (500,65000)),
+                    semantic_state_revision INTEGER NOT NULL CHECK(semantic_state_revision>=0),
+                    producer_operation TEXT,
+                    producer_command_id TEXT,
+                    ownership_generation INTEGER,
+                    board_epoch_4 INTEGER,
+                    board_epoch_5 INTEGER,
+                    transition_provenance_json TEXT NOT NULL CHECK(json_valid(transition_provenance_json) AND json_type(transition_provenance_json)='object'),
+                    ambiguity_state TEXT NOT NULL DEFAULT 'none' CHECK(ambiguity_state IN ('none','ambiguous','recovery_required')),
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(producer_command_id) REFERENCES operator_plane_commands(command_id) ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS operator_plane_deck_semantic_transitions (
+                    transition_revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command_id TEXT NOT NULL REFERENCES operator_plane_commands(command_id) ON DELETE RESTRICT,
+                    source_operation TEXT NOT NULL CHECK(length(source_operation)>0),
+                    before_revision INTEGER NOT NULL CHECK(before_revision>=0),
+                    after_revision INTEGER NOT NULL CHECK(after_revision=before_revision+1),
+                    transition_json TEXT NOT NULL CHECK(json_valid(transition_json) AND json_type(transition_json)='object'),
+                    created_at REAL NOT NULL,
+                    UNIQUE(command_id,after_revision)
+                );
+                CREATE INDEX IF NOT EXISTS operator_plane_deck_transitions_command_idx
+                    ON operator_plane_deck_semantic_transitions(command_id,transition_revision);
+                CREATE TABLE IF NOT EXISTS operator_plane_tip_tray_state (
+                    tray_id INTEGER PRIMARY KEY CHECK(tray_id BETWEEN 0 AND 4),
+                    occupancy_json TEXT CHECK(occupancy_json IS NULL OR (json_valid(occupancy_json) AND json_type(occupancy_json)='array' AND json_array_length(occupancy_json)=96)),
+                    tip_available INTEGER CHECK(tip_available IS NULL OR tip_available IN (0,1)),
+                    available_count INTEGER CHECK(available_count IS NULL OR available_count BETWEEN 0 AND 24),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
+                    operation_id TEXT,
+                    command_id TEXT,
+                    ownership_generation INTEGER,
+                    board_epoch_4 INTEGER,
+                    board_epoch_5 INTEGER,
+                    produced_at REAL,
+                    provenance_json TEXT CHECK(provenance_json IS NULL OR (json_valid(provenance_json) AND json_type(provenance_json)='object')),
+                    provenance_sha256 TEXT CHECK(provenance_sha256 IS NULL OR length(provenance_sha256)=64),
+                    CHECK((revision=0 AND occupancy_json IS NULL AND tip_available IS NULL AND available_count IS NULL AND operation_id IS NULL AND command_id IS NULL AND ownership_generation IS NULL AND board_epoch_4 IS NULL AND board_epoch_5 IS NULL AND produced_at IS NULL AND provenance_json IS NULL AND provenance_sha256 IS NULL) OR (revision>0 AND occupancy_json IS NOT NULL AND tip_available IS NOT NULL AND operation_id IS NOT NULL AND command_id IS NOT NULL AND ownership_generation IS NOT NULL AND board_epoch_4 IS NOT NULL AND board_epoch_5 IS NOT NULL AND produced_at IS NOT NULL AND provenance_json IS NOT NULL AND provenance_sha256 IS NOT NULL))
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS operator_plane_tip_tray_transitions (
+                    transition_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tray_id INTEGER NOT NULL CHECK(tray_id BETWEEN 0 AND 4),
+                    revision INTEGER NOT NULL CHECK(revision>0),
+                    transition TEXT NOT NULL CHECK(transition IN ('construct','reset','load_all','remove_well','remove_group','remove_all','camera_missing','add_tip','retip')),
+                    occupancy_json TEXT NOT NULL CHECK(json_valid(occupancy_json) AND json_type(occupancy_json)='array' AND json_array_length(occupancy_json)=96),
+                    tip_available INTEGER NOT NULL CHECK(tip_available IN (0,1)),
+                    available_count INTEGER CHECK(available_count IS NULL OR available_count BETWEEN 0 AND 24),
+                    operation_id TEXT NOT NULL CHECK(length(operation_id)>0),
+                    command_id TEXT NOT NULL CHECK(length(command_id)>0),
+                    ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
+                    board_epoch_4 INTEGER NOT NULL CHECK(board_epoch_4>=0),
+                    board_epoch_5 INTEGER NOT NULL CHECK(board_epoch_5>=0),
+                    produced_at REAL NOT NULL,
+                    provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json) AND json_type(provenance_json)='object'),
+                    provenance_sha256 TEXT NOT NULL CHECK(length(provenance_sha256)=64),
+                    UNIQUE(tray_id,revision)
+                );
+                CREATE INDEX IF NOT EXISTS operator_plane_tip_tray_transitions_revision_idx
+                    ON operator_plane_tip_tray_transitions(tray_id,revision);
+                INSERT OR IGNORE INTO operator_plane_tip_tray_state(tray_id)
+                    VALUES(0),(1),(2),(3),(4);
+                INSERT OR IGNORE INTO operator_plane_deck_semantic_state(
+                    singleton,movable_plate_locations_json,pseudo_z_home,semantic_state_revision,
+                    transition_provenance_json,updated_at
+                ) VALUES(1,'{}',65000,0,'{}',strftime('%s','now'));
                 COMMIT;
                 """
             )
@@ -1936,6 +2139,175 @@ class OperatorCommandStore:
                     )
                   ))
                 BEGIN SELECT RAISE(ABORT, 'operator and canonical command authority is incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_authorized_insert_v1
+                BEFORE INSERT ON operator_plane_deck_commands
+                WHEN authority_write_allowed()<>1
+                  OR NOT EXISTS(SELECT 1 FROM operator_plane_commands WHERE command_id=NEW.command_id AND action_id='oem.deck.move_to_location')
+                  OR NEW.source_anchors_json<>canonical_json(NEW.source_anchors_json)
+                  OR json_type(NEW.source_anchors_json)<>'array'
+                  OR NEW.source_hazards_json<>canonical_json(NEW.source_hazards_json)
+                  OR json_type(NEW.source_hazards_json)<>'array'
+                  OR NEW.delivery_attempted<>0
+                  OR NEW.controller_command_acknowledged<>0
+                  OR NEW.controller_completion_verified<>0
+                  OR NEW.hardware_postcondition_verified<>0
+                  OR NEW.semantic_state_committed<>0
+                  OR NEW.physical_observation_verified<>0
+                  OR NEW.transition_revision IS NOT NULL
+                  OR NEW.provider_evidence_json IS NOT NULL
+                  OR NEW.committed_at IS NOT NULL
+                BEGIN SELECT RAISE(ABORT, 'deck plan insert is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_identity_immutable_v1
+                BEFORE UPDATE ON operator_plane_deck_commands
+                WHEN NEW.command_id IS NOT OLD.command_id
+                  OR NEW.target IS NOT OLD.target
+                  OR NEW.target_label IS NOT OLD.target_label
+                  OR NEW.resolved_location_id IS NOT OLD.resolved_location_id
+                  OR NEW.destination_catalog_revision IS NOT OLD.destination_catalog_revision
+                  OR NEW.position_table_revision IS NOT OLD.position_table_revision
+                  OR NEW.authority_snapshot_digest IS NOT OLD.authority_snapshot_digest
+                  OR NEW.complete_authority_digest IS NOT OLD.complete_authority_digest
+                  OR NEW.plan_digest IS NOT OLD.plan_digest
+                  OR NEW.source_branch IS NOT OLD.source_branch
+                  OR NEW.source_anchors_json IS NOT OLD.source_anchors_json
+                  OR NEW.source_hazards_json IS NOT OLD.source_hazards_json
+                  OR NEW.planned_at IS NOT OLD.planned_at
+                BEGIN SELECT RAISE(ABORT, 'deck plan identity is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_evidence_coherence_v1
+                BEFORE UPDATE ON operator_plane_deck_commands
+                WHEN authority_write_allowed()<>1
+                  OR NEW.delivery_attempted<OLD.delivery_attempted
+                  OR NEW.controller_command_acknowledged<OLD.controller_command_acknowledged
+                  OR NEW.controller_completion_verified<OLD.controller_completion_verified
+                  OR NEW.hardware_postcondition_verified<OLD.hardware_postcondition_verified
+                  OR NEW.semantic_state_committed<OLD.semantic_state_committed
+                  OR NEW.physical_observation_verified<OLD.physical_observation_verified
+                  OR (OLD.semantic_state_committed=1 AND (
+                       NEW.transition_revision IS NOT OLD.transition_revision
+                       OR NEW.provider_evidence_json IS NOT OLD.provider_evidence_json
+                       OR NEW.committed_at IS NOT OLD.committed_at))
+                  OR (NEW.provider_evidence_json IS NOT NULL AND NEW.provider_evidence_json<>canonical_json(NEW.provider_evidence_json))
+                BEGIN SELECT RAISE(ABORT, 'deck evidence is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_no_delete_v1
+                BEFORE DELETE ON operator_plane_deck_commands
+                BEGIN SELECT RAISE(ABORT, 'deck plans are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_authorized_insert_v1
+                BEFORE INSERT ON operator_plane_deck_stages
+                WHEN authority_write_allowed()<>1
+                  OR NEW.resources_json<>canonical_json(NEW.resources_json)
+                  OR NEW.arguments_json<>canonical_json(NEW.arguments_json)
+                  OR NEW.dependency_order_json<>canonical_json(NEW.dependency_order_json)
+                  OR NEW.terminal_state<>'planned'
+                  OR NEW.terminal_evidence_json IS NOT NULL
+                  OR NEW.stage_order<>COALESCE((SELECT MAX(stage_order)+1 FROM operator_plane_deck_stages WHERE command_id=NEW.command_id),0)
+                  OR NEW.dependency_order_json<>CASE WHEN NEW.stage_order=0 THEN '[]' ELSE '[' || (NEW.stage_order-1) || ']' END
+                BEGIN SELECT RAISE(ABORT, 'deck stage insert is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_identity_immutable_v1
+                BEFORE UPDATE ON operator_plane_deck_stages
+                WHEN authority_write_allowed()<>1
+                  OR NEW.command_id IS NOT OLD.command_id
+                  OR NEW.stage_order IS NOT OLD.stage_order
+                  OR NEW.operation IS NOT OLD.operation
+                  OR NEW.source_anchor IS NOT OLD.source_anchor
+                  OR NEW.resources_json IS NOT OLD.resources_json
+                  OR NEW.arguments_json IS NOT OLD.arguments_json
+                  OR NEW.dependency_order_json IS NOT OLD.dependency_order_json
+                BEGIN SELECT RAISE(ABORT, 'deck stage identity is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_terminal_immutable_v1
+                BEFORE UPDATE ON operator_plane_deck_stages
+                WHEN OLD.terminal_state<>'planned'
+                  OR NEW.terminal_state='planned'
+                  OR NEW.terminal_evidence_json IS NULL
+                  OR NEW.terminal_evidence_json<>canonical_json(NEW.terminal_evidence_json)
+                BEGIN SELECT RAISE(ABORT, 'deck stage terminal evidence is immutable or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_no_delete_v1
+                BEFORE DELETE ON operator_plane_deck_stages
+                BEGIN SELECT RAISE(ABORT, 'deck stages are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_state_coherence_v1
+                BEFORE UPDATE ON operator_plane_deck_semantic_state
+                WHEN authority_write_allowed()<>1
+                  OR NEW.singleton<>1
+                  OR NEW.semantic_state_revision<>OLD.semantic_state_revision+1
+                  OR NEW.transition_provenance_json<>canonical_json(NEW.transition_provenance_json)
+                  OR NEW.producer_command_id IS NULL
+                  OR NOT EXISTS(SELECT 1 FROM operator_plane_commands WHERE command_id=NEW.producer_command_id)
+                  OR (NEW.tip_loaded=1 AND (NEW.tip_location IS NULL OR NEW.tip_location NOT BETWEEN 0 AND 3))
+                BEGIN SELECT RAISE(ABORT, 'deck semantic state update is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_state_no_delete_v1
+                BEFORE DELETE ON operator_plane_deck_semantic_state
+                BEGIN SELECT RAISE(ABORT, 'deck semantic state cannot be deleted'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_coherence_v1
+                BEFORE INSERT ON operator_plane_deck_semantic_transitions
+                WHEN authority_write_allowed()<>1
+                  OR NEW.after_revision<>NEW.before_revision+1
+                  OR NEW.transition_json<>canonical_json(NEW.transition_json)
+                  OR json_extract(NEW.transition_json,'$.command_id') IS NOT NEW.command_id
+                  OR json_extract(NEW.transition_json,'$.source_operation') IS NOT NEW.source_operation
+                  OR json_extract(NEW.transition_json,'$.before_revision') IS NOT NEW.before_revision
+                  OR json_extract(NEW.transition_json,'$.after_revision') IS NOT NEW.after_revision
+                  OR NOT EXISTS(
+                      SELECT 1 FROM operator_plane_deck_semantic_state
+                      WHERE singleton=1 AND semantic_state_revision=NEW.after_revision
+                        AND producer_command_id=NEW.command_id AND producer_operation=NEW.source_operation
+                  )
+                BEGIN SELECT RAISE(ABORT, 'deck semantic transition is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_no_update_v1
+                BEFORE UPDATE ON operator_plane_deck_semantic_transitions
+                BEGIN SELECT RAISE(ABORT, 'deck semantic transitions are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_no_delete_v1
+                BEFORE DELETE ON operator_plane_deck_semantic_transitions
+                BEGIN SELECT RAISE(ABORT, 'deck semantic transitions are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_state_coherence_v1
+                BEFORE UPDATE ON operator_plane_tip_tray_state
+                WHEN authority_write_allowed()<>1
+                  OR NEW.tray_id IS NOT OLD.tray_id
+                  OR NEW.revision<>OLD.revision+1
+                  OR NEW.occupancy_json IS NULL
+                  OR NEW.occupancy_json<>canonical_json(NEW.occupancy_json)
+                  OR EXISTS(SELECT 1 FROM json_each(NEW.occupancy_json) WHERE type NOT IN ('true','false'))
+                  OR NEW.tip_available IS NULL
+                  OR NEW.operation_id IS NULL OR length(NEW.operation_id)=0
+                  OR NEW.command_id IS NULL OR length(NEW.command_id)=0
+                  OR NEW.ownership_generation IS NULL OR NEW.ownership_generation<0
+                  OR NEW.board_epoch_4 IS NULL OR NEW.board_epoch_4<0
+                  OR NEW.board_epoch_5 IS NULL OR NEW.board_epoch_5<0
+                  OR NEW.produced_at IS NULL
+                  OR NEW.provenance_json IS NULL
+                  OR NEW.provenance_json<>canonical_json(NEW.provenance_json)
+                  OR NEW.provenance_sha256<>sha256_utf8(NEW.provenance_json)
+                BEGIN SELECT RAISE(ABORT, 'tip tray projection update is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_state_no_delete_v1
+                BEFORE DELETE ON operator_plane_tip_tray_state
+                BEGIN SELECT RAISE(ABORT, 'tip tray projection cannot be deleted'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_coherence_v1
+                BEFORE INSERT ON operator_plane_tip_tray_transitions
+                WHEN authority_write_allowed()<>1
+                  OR NEW.occupancy_json<>canonical_json(NEW.occupancy_json)
+                  OR EXISTS(SELECT 1 FROM json_each(NEW.occupancy_json) WHERE type NOT IN ('true','false'))
+                  OR NEW.provenance_json<>canonical_json(NEW.provenance_json)
+                  OR NEW.provenance_sha256<>sha256_utf8(NEW.provenance_json)
+                  OR NOT EXISTS(
+                      SELECT 1 FROM operator_plane_tip_tray_state
+                      WHERE tray_id=NEW.tray_id AND revision=NEW.revision
+                        AND occupancy_json=NEW.occupancy_json
+                        AND tip_available=NEW.tip_available
+                        AND available_count IS NEW.available_count
+                        AND operation_id=NEW.operation_id
+                        AND command_id=NEW.command_id
+                        AND ownership_generation=NEW.ownership_generation
+                        AND board_epoch_4=NEW.board_epoch_4
+                        AND board_epoch_5=NEW.board_epoch_5
+                        AND produced_at=NEW.produced_at
+                        AND provenance_json=NEW.provenance_json
+                        AND provenance_sha256=NEW.provenance_sha256
+                  )
+                BEGIN SELECT RAISE(ABORT, 'tip tray transition insert is unauthorized or incoherent'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_no_update_v1
+                BEFORE UPDATE ON operator_plane_tip_tray_transitions
+                BEGIN SELECT RAISE(ABORT, 'tip tray transitions are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_no_delete_v1
+                BEFORE DELETE ON operator_plane_tip_tray_transitions
+                BEGIN SELECT RAISE(ABORT, 'tip tray transitions are append-only'); END;
                 """
             )
             installed_trigger_names = {
@@ -1967,6 +2339,12 @@ class OperatorCommandStore:
                 "operator_plane_idempotency": "primary key(operation_kind, idempotency_key)",
                 "operator_plane_methods": "method_id text primary key",
                 "operator_plane_commands": "command_id text primary key",
+                "operator_plane_deck_commands": "command_id text primary key references operator_plane_commands(command_id)",
+                "operator_plane_deck_stages": "primary key(command_id,stage_order)",
+                "operator_plane_deck_semantic_state": "singleton integer primary key check(singleton=1)",
+                "operator_plane_deck_semantic_transitions": "transition_revision integer primary key autoincrement",
+                "operator_plane_tip_tray_state": "tray_id integer primary key check(tray_id between 0 and 4)",
+                "operator_plane_tip_tray_transitions": "transition_sequence integer primary key autoincrement",
                 "serial206_movement_methods": "method_id text primary key",
                 "operator_plane_interrupt_history": "record_sha256 text primary key",
             }
@@ -1982,6 +2360,12 @@ class OperatorCommandStore:
                 "operator_plane_idempotency": ("operation_kind","idempotency_key","fingerprint","command_id","method_id","response_json","created_at"),
                 "operator_plane_methods": ("method_id","name","source_json","digest","failure_policy","status","version","ownership_generation","expanded_count","first_stream_sequence","last_stream_sequence","queued_at","updated_at","recovery_outcome_pending"),
                 "operator_plane_commands": ("command_id","stream_sequence","method_id","method_sequence","action_id","requested_json","effective_json","status","version","ownership_generation","dispatch_attempt_id","dispatcher_epoch","dispatch_global_safety_epoch","dispatch_axis_safety_epoch","interrupt_id","interrupt_global_safety_epoch","interrupt_axis_safety_epoch","source_noop","source_noop_reason","controller_acknowledged","remote_acknowledged","physical_effect_verified","terminal_json","queued_at","dispatched_at","finished_at","updated_at"),
+                "operator_plane_deck_commands": ("command_id","target","target_label","resolved_location_id","destination_catalog_revision","position_table_revision","authority_snapshot_digest","complete_authority_digest","plan_digest","source_branch","source_anchors_json","source_hazards_json","delivery_attempted","controller_command_acknowledged","controller_completion_verified","hardware_postcondition_verified","semantic_state_committed","physical_observation_verified","transition_revision","ambiguity_state","provider_evidence_json","planned_at","committed_at"),
+                "operator_plane_deck_stages": ("command_id","stage_order","operation","source_anchor","resources_json","arguments_json","dependency_order_json","terminal_evidence_json","terminal_state"),
+                "operator_plane_deck_semantic_state": ("singleton","current_location","current_well","current_tray","tip_loaded","tip_dirty","tip_location","clean_path","plate_on_gantry","movable_plate_locations_json","pseudo_z_home","semantic_state_revision","producer_operation","producer_command_id","ownership_generation","board_epoch_4","board_epoch_5","transition_provenance_json","ambiguity_state","updated_at"),
+                "operator_plane_deck_semantic_transitions": ("transition_revision","command_id","source_operation","before_revision","after_revision","transition_json","created_at"),
+                "operator_plane_tip_tray_state": ("tray_id","occupancy_json","tip_available","available_count","revision","operation_id","command_id","ownership_generation","board_epoch_4","board_epoch_5","produced_at","provenance_json","provenance_sha256"),
+                "operator_plane_tip_tray_transitions": ("transition_sequence","tray_id","revision","transition","occupancy_json","tip_available","available_count","operation_id","command_id","ownership_generation","board_epoch_4","board_epoch_5","produced_at","provenance_json","provenance_sha256"),
                 "operator_plane_transitions": ("transition_sequence","event_kind","command_id","method_id","state","payload_json","created_at"),
                 "serial206_movement_methods": ("method_id","idempotency_key","action_id","canonical_inputs_sha256","state","state_version","failure_policy","child_count","accepted_at","started_at","finished_at"),
                 "serial206_movement_commands": ("sequence","command_id","idempotency_key","action_id","method_id","method_order","parallel_group","axis_scope","board_scope_json","ownership_generation","expected_board_epochs_json","canonical_inputs_sha256","state","state_version","admitted_interrupt_epochs_json","accepted_at","queued_at","dispatched_at","finished_at","terminal_receipt_id"),
@@ -1996,6 +2380,10 @@ class OperatorCommandStore:
                     raise RuntimeError(f"operator command schema columns are not exact: {table_name}")
             expected_foreign_keys = {
                 "operator_plane_commands": {("method_id","operator_plane_methods","method_id","NO ACTION","NO ACTION","NONE")},
+                "operator_plane_deck_commands": {("command_id","operator_plane_commands","command_id","NO ACTION","NO ACTION","NONE")},
+                "operator_plane_deck_stages": {("command_id","operator_plane_deck_commands","command_id","NO ACTION","RESTRICT","NONE")},
+                "operator_plane_deck_semantic_state": {("producer_command_id","operator_plane_commands","command_id","NO ACTION","RESTRICT","NONE")},
+                "operator_plane_deck_semantic_transitions": {("command_id","operator_plane_commands","command_id","NO ACTION","RESTRICT","NONE")},
                 "serial206_movement_commands": {("method_id","serial206_movement_methods","method_id","NO ACTION","CASCADE","NONE")},
                 "serial206_command_resources": {("command_id","serial206_movement_commands","command_id","NO ACTION","CASCADE","NONE")},
                 "serial206_command_dependencies": {
@@ -2010,6 +2398,21 @@ class OperatorCommandStore:
                 }
                 if actual != expected:
                     raise RuntimeError(f"operator command schema foreign keys are not exact: {table_name}")
+            expected_deck_indexes = {
+                "operator_plane_deck_commands_plan_idx": ("operator_plane_deck_commands", ("plan_digest",)),
+                "operator_plane_deck_stages_terminal_idx": ("operator_plane_deck_stages", ("command_id","terminal_state","stage_order")),
+                "operator_plane_deck_transitions_command_idx": ("operator_plane_deck_semantic_transitions", ("command_id","transition_revision")),
+                "operator_plane_tip_tray_transitions_revision_idx": ("operator_plane_tip_tray_transitions", ("tray_id","revision")),
+            }
+            for index_name, (table_name, expected_columns) in expected_deck_indexes.items():
+                index_row = self.connection.execute(
+                    "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
+                ).fetchone()
+                actual_columns = tuple(
+                    str(row[2]) for row in self.connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+                )
+                if index_row is None or str(index_row[0]) != table_name or actual_columns != expected_columns:
+                    raise RuntimeError(f"operator command schema index attestation failed: {index_name}")
             physical_schema_sha256 = _operator_physical_schema_sha256(self.connection)
             if physical_schema_sha256 != _OPERATOR_PHYSICAL_SCHEMA_SHA256:
                 raise RuntimeError(
@@ -2147,7 +2550,24 @@ class OperatorCommandStore:
                     conn.execute("UPDATE operator_plane_methods SET status='recovery_required',version=version+1,updated_at=? WHERE method_id=? AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted')", (_now(), method_id))
                     self._insert_transition(conn, event_kind="method_recovery", method_id=method_id, state="recovery_required", payload={"reason": "process_owner_loss"})
             conn.execute("UPDATE operator_plane_lane SET active_command_id=NULL,active_attempt_id=NULL,dispatcher_epoch=dispatcher_epoch+1,updated_at=? WHERE singleton=1", (_now(),))
-            conn.execute("UPDATE operator_plane_safety SET recovery_epoch=?,recovery_version=recovery_version+1,recovery_hold=0,updated_at=? WHERE singleton=1", (recovery_epoch, _now()))
+            if active:
+                producer_command_id = str(active[0]["command_id"])
+                semantic = conn.execute("SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+                before_revision = int(semantic[0])
+                provenance = {
+                    "source_operation": "process_owner_loss", "command_id": producer_command_id,
+                    "before_revision": before_revision, "after_revision": before_revision + 1,
+                    "ambiguity_state": "recovery_required",
+                }
+                conn.execute(
+                    "UPDATE operator_plane_deck_semantic_state SET semantic_state_revision=?,producer_operation='process_owner_loss',producer_command_id=?,transition_provenance_json=?,ambiguity_state='recovery_required',updated_at=? WHERE singleton=1",
+                    (before_revision + 1, producer_command_id, _canonical(provenance), _now()),
+                )
+                conn.execute(
+                    "UPDATE operator_plane_deck_commands SET ambiguity_state='recovery_required' WHERE command_id IN ({})".format(",".join("?" for _ in active)),
+                    tuple(str(item["command_id"]) for item in active),
+                )
+            conn.execute("UPDATE operator_plane_safety SET recovery_epoch=?,recovery_version=recovery_version+1,recovery_hold=1,updated_at=? WHERE singleton=1", (recovery_epoch, _now()))
 
     def _capacity(self, conn: sqlite3.Connection) -> tuple[int, int]:
         count = int(conn.execute("SELECT COUNT(*) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
@@ -2308,11 +2728,12 @@ class OperatorCommandStore:
         axis = AXIS_BY_ACTION.get(action_id)
         motor_by_axis = {"y": 0, "z": 1}
         composite_xy = action_id.startswith("oem.xy.")
+        deck_movement = action_id == "oem.deck.move_to_location"
         composite_xyz = action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
-        axis_scope = "xyz" if composite_xyz else "xy" if composite_xy else axis
+        axis_scope = "xyz" if composite_xyz or deck_movement else "xy" if composite_xy else axis
         board_scope = (
             {"4": [0, 1], "5": [0]}
-            if composite_xyz
+            if composite_xyz or deck_movement
             else {"4": [0], "5": [0]}
             if composite_xy
             else {"4": [motor_by_axis[axis]]}
@@ -2320,7 +2741,7 @@ class OperatorCommandStore:
             else {}
         )
         canonical_hash = _digest(dict(inputs))
-        expected_epochs = dict(expected_board_epochs or {}) if axis in motor_by_axis or composite_xy or composite_xyz else {}
+        expected_epochs = dict(expected_board_epochs or {}) if axis in motor_by_axis or composite_xy or composite_xyz or deck_movement else {}
         safety = conn.execute("SELECT x_epoch,y_epoch,z_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
         interrupt_epochs = (
             {"x": int(safety["x_epoch"]), "y": int(safety["y_epoch"]), "z": int(safety["z_epoch"])}
@@ -2359,7 +2780,12 @@ class OperatorCommandStore:
                 accepted_at,
             ),
         )
-        if composite_xyz:
+        if deck_movement:
+            resources = [
+                "axis:x", "axis:y", "axis:z", "axis:g",
+                "motor:4:0", "motor:4:1", "motor:5:0",
+            ]
+        elif composite_xyz:
             resources = ["axis:x", "axis:y", "axis:z", "motor:5:0", "motor:4:0", "motor:4:1"]
         elif composite_xy:
             resources = ["axis:x", "axis:y", "motor:5:0", "motor:4:0"]
@@ -2388,6 +2814,684 @@ class OperatorCommandStore:
                 (int(epochs["5"]), now),
             )
 
+    @staticmethod
+    def _deck_recovery_blocker(conn: sqlite3.Connection) -> str | None:
+        safety = conn.execute(
+            "SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1"
+        ).fetchone()
+        semantic = conn.execute(
+            "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
+        ).fetchone()
+        if safety is None or semantic is None:
+            return "deck_recovery_state_inconsistent"
+        hold = bool(safety["recovery_hold"])
+        ambiguity = str(semantic["ambiguity_state"])
+        if ambiguity not in {"none", "ambiguous", "recovery_required"}:
+            return "deck_recovery_state_inconsistent"
+        semantic_blocked = ambiguity in {"ambiguous", "recovery_required"}
+        if hold != semantic_blocked:
+            return "deck_recovery_state_inconsistent"
+        return "deck_recovery_hold" if hold else None
+
+    def deck_recovery_blocker(self) -> str | None:
+        with self._lock:
+            return self._deck_recovery_blocker(self.connection)
+
+    def tip_tray_state(self, tray_id: int) -> dict[str, Any]:
+        if type(tray_id) is not int or tray_id not in range(5):
+            raise ValueError("tip tray id must be in 0..4")
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM operator_plane_tip_tray_state WHERE tray_id=?",
+                (tray_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("tip tray projection is unavailable")
+        occupancy = _json_load(row["occupancy_json"])
+        provenance = _json_load(row["provenance_json"])
+        return {
+            "schema_version": "bioxp.operator_tip_tray_state.v1",
+            "tray_id": int(row["tray_id"]),
+            "occupancy": occupancy,
+            "tip_available": None if row["tip_available"] is None else bool(row["tip_available"]),
+            "available_count": row["available_count"],
+            "revision": int(row["revision"]),
+            "operation_id": row["operation_id"],
+            "command_id": row["command_id"],
+            "ownership_generation": row["ownership_generation"],
+            "board_epoch_4": row["board_epoch_4"],
+            "board_epoch_5": row["board_epoch_5"],
+            "timestamp": row["produced_at"],
+            "provenance": provenance,
+            "provenance_sha256": row["provenance_sha256"],
+        }
+
+    def publish_tip_tray_transition(
+        self,
+        *,
+        tray_id: int,
+        transition: str,
+        operation_id: str,
+        command_id: str,
+        ownership_generation: int,
+        board_epoch_4: int,
+        board_epoch_5: int,
+        provenance: Mapping[str, Any],
+        well_ids: list[int] | None = None,
+        group_index: int | None = None,
+    ) -> dict[str, Any]:
+        if type(tray_id) is not int or tray_id not in range(5):
+            raise ValueError("tip tray id must be in 0..4")
+        operation = str(transition)
+        allowed = {
+            "construct", "reset", "load_all", "remove_well", "remove_group",
+            "remove_all", "camera_missing", "add_tip", "retip",
+        }
+        if operation not in allowed:
+            raise ValueError("unsupported source tip tray transition")
+        if not isinstance(provenance, Mapping):
+            raise ValueError("tip tray provenance must be an object")
+        if any(type(value) is not int or value < 0 for value in (ownership_generation, board_epoch_4, board_epoch_5)):
+            raise ValueError("tip tray authority stamps must be nonnegative integers")
+        if not str(operation_id).strip() or not str(command_id).strip():
+            raise ValueError("tip tray operation and command identity are required")
+        selected = list(well_ids or [])
+        if any(type(value) is not int or value not in range(96) for value in selected) or len(set(selected)) != len(selected):
+            raise ValueError("tip tray wells must be unique integers in 0..95")
+        if operation == "remove_well" and len(selected) != 1:
+            raise ValueError("remove_well requires exactly one well")
+        if operation in {"camera_missing", "add_tip", "retip"} and not selected:
+            raise ValueError(f"{operation} requires source wells")
+        if operation == "remove_group" and (type(group_index) is not int or group_index not in range(24)):
+            raise ValueError("remove_group requires group_index in 0..23")
+        if operation != "remove_group" and group_index is not None:
+            raise ValueError("group_index is only valid for remove_group")
+
+        with self._transaction() as conn:
+            self._validate_deck_owner_authority(
+                ownership_generation=ownership_generation,
+                board_epoch_4=board_epoch_4,
+                board_epoch_5=board_epoch_5,
+            )
+            current = conn.execute(
+                "SELECT * FROM operator_plane_tip_tray_state WHERE tray_id=?",
+                (tray_id,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("tip tray projection is unavailable")
+            before_revision = int(current["revision"])
+            prior_occupancy = _json_load(current["occupancy_json"])
+            prior_available = None if current["tip_available"] is None else bool(current["tip_available"])
+            if operation in {"construct", "reset", "load_all"}:
+                occupancy = [True] * 96
+                tip_available = True
+                available_count: int | None = 24
+            else:
+                if not isinstance(prior_occupancy, list) or len(prior_occupancy) != 96 or any(type(value) is not bool for value in prior_occupancy):
+                    raise RuntimeError("tip tray occupancy is unavailable")
+                if type(prior_available) is not bool:
+                    raise RuntimeError("tip tray availability latch is unavailable")
+                occupancy = list(prior_occupancy)
+                tip_available = prior_available
+                available_count = None
+                if operation == "remove_well":
+                    occupancy[selected[0]] = False
+                elif operation == "remove_group":
+                    assert group_index is not None
+                    selected = list(range(group_index * 4, group_index * 4 + 4))
+                    for well_id in selected:
+                        occupancy[well_id] = False
+                    available_count = sum(all(occupancy[group * 4:group * 4 + 4]) for group in range(24))
+                    if group_index == 23:
+                        tip_available = False
+                elif operation == "remove_all":
+                    occupancy = [False] * 96
+                    tip_available = False
+                    available_count = 0
+                elif operation == "camera_missing":
+                    for well_id in selected:
+                        occupancy[well_id] = False
+                    available_count = sum(all(occupancy[group * 4:group * 4 + 4]) for group in range(24))
+                    if available_count == 0:
+                        tip_available = False
+                elif operation in {"add_tip", "retip"}:
+                    for well_id in selected:
+                        occupancy[well_id] = True
+            revision = before_revision + 1
+            produced_at = _now()
+            provenance_document = {
+                "schema_version": "bioxp.operator_tip_tray_transition.v1",
+                "tray_id": tray_id,
+                "transition": operation,
+                "operation_id": str(operation_id),
+                "command_id": str(command_id),
+                "before_revision": before_revision,
+                "revision": revision,
+                "well_ids": selected,
+                "group_index": group_index,
+                "ownership_generation": ownership_generation,
+                "board_epoch_4": board_epoch_4,
+                "board_epoch_5": board_epoch_5,
+                "produced_at": produced_at,
+                "source_provenance": dict(provenance),
+            }
+            occupancy_json = _canonical(occupancy)
+            provenance_json = _canonical(provenance_document)
+            provenance_sha256 = hashlib.sha256(provenance_json.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                UPDATE operator_plane_tip_tray_state
+                SET occupancy_json=?,tip_available=?,available_count=?,revision=?,operation_id=?,command_id=?,
+                    ownership_generation=?,board_epoch_4=?,board_epoch_5=?,produced_at=?,provenance_json=?,provenance_sha256=?
+                WHERE tray_id=?
+                """,
+                (
+                    occupancy_json, int(tip_available), available_count, revision,
+                    str(operation_id), str(command_id), ownership_generation, board_epoch_4,
+                    board_epoch_5, produced_at, provenance_json, provenance_sha256, tray_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO operator_plane_tip_tray_transitions(
+                    tray_id,revision,transition,occupancy_json,tip_available,available_count,
+                    operation_id,command_id,ownership_generation,board_epoch_4,board_epoch_5,
+                    produced_at,provenance_json,provenance_sha256
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    tray_id, revision, operation, occupancy_json, int(tip_available), available_count,
+                    str(operation_id), str(command_id), ownership_generation, board_epoch_4,
+                    board_epoch_5, produced_at, provenance_json, provenance_sha256,
+                ),
+            )
+        return self.tip_tray_state(tray_id)
+
+    def deck_semantic_state(self) -> dict[str, Any]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+        assert row is not None
+        provenance = _json_load(row["transition_provenance_json"], {})
+        return {
+            "current_location": row["current_location"],
+            "current_well": row["current_well"],
+            "current_tray": row["current_tray"],
+            "tip_loaded": None if row["tip_loaded"] is None else bool(row["tip_loaded"]),
+            "tip_dirty": None if row["tip_dirty"] is None else bool(row["tip_dirty"]),
+            "tip_location": row["tip_location"],
+            "clean_path": None if row["clean_path"] is None else bool(row["clean_path"]),
+            "plate_on_gantry": canonical_plate_name(row["plate_on_gantry"]),
+            "movable_plate_locations": _json_load(row["movable_plate_locations_json"], {}),
+            "pseudo_z_home": int(row["pseudo_z_home"]),
+            "semantic_state_revision": int(row["semantic_state_revision"]),
+            "producer_operation": row["producer_operation"],
+            "producer_command_id": row["producer_command_id"],
+            "ownership_generation": row["ownership_generation"],
+            "board_epoch_4": row["board_epoch_4"],
+            "board_epoch_5": row["board_epoch_5"],
+            "latch_status": provenance.get("latch_status"),
+            "machine_latch_closed": provenance.get("machine_latch_closed"),
+            "latch_observation_id": provenance.get("latch_observation_id"),
+            "transition_provenance": provenance,
+            "ambiguity_state": str(row["ambiguity_state"]),
+        }
+
+    def bootstrap_deck_semantic_state(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        """Migrate one complete predecessor semantic snapshot before first deck planning."""
+        location = snapshot.get("current_location")
+        well = snapshot.get("current_well")
+        if type(location) is not str or location not in configured_location_names():
+            raise ValueError("deck bootstrap location is not authoritative")
+        if type(well) is not int or not 0 <= well <= 95:
+            raise ValueError("deck bootstrap well is not authoritative")
+        typed = {
+            "tip_loaded": bool, "tip_dirty": bool, "tip_location": int, "clean_path": bool,
+            "pseudo_z_home": int, "ownership_generation": int, "board_epoch_4": int,
+            "board_epoch_5": int, "latch_status": bool, "machine_latch_closed": bool,
+            "latch_observation_id": str, "source_operation": str, "source_command_id": str,
+        }
+        for key, expected in typed.items():
+            if type(snapshot.get(key)) is not expected:
+                raise ValueError(f"deck bootstrap {key} is not authoritative")
+        if snapshot["tip_location"] not in {-1, 0, 1, 2, 3} or (snapshot["tip_loaded"] and snapshot["tip_location"] < 0):
+            raise ValueError("deck bootstrap tip location is not authoritative")
+        if snapshot["pseudo_z_home"] not in {500, 65000}:
+            raise ValueError("deck bootstrap pseudo Z home is not authoritative")
+        if any(snapshot[key] < 0 for key in ("ownership_generation", "board_epoch_4", "board_epoch_5")):
+            raise ValueError("deck bootstrap generations are not authoritative")
+        if not snapshot["latch_observation_id"].strip() or not snapshot["source_operation"].strip() or not snapshot["source_command_id"].strip():
+            raise ValueError("deck bootstrap provenance is not authoritative")
+        try:
+            plate = canonical_plate_name(snapshot.get("plate_on_gantry"))
+        except ValueError as exc:
+            raise ValueError("deck bootstrap plate state is not authoritative") from exc
+        try:
+            movable = canonical_movable_object_locations(snapshot.get("movable_plate_locations"))
+        except ValueError as exc:
+            raise ValueError("deck bootstrap movable plate state is not authoritative") from exc
+
+        with self._transaction() as conn:
+            current = conn.execute(
+                "SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+            assert current is not None
+            if int(current[0]) != 0:
+                return self.deck_semantic_state()
+            command_id = str(uuid.uuid4())
+            now = _now()
+            sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
+            terminal = {
+                "completion_class": "no_io_semantic_state_migration",
+                "delivery_attempted": False,
+                "upstream_source_operation": snapshot["source_operation"],
+                "upstream_source_command_id": snapshot["source_command_id"],
+            }
+            conn.execute(
+                "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (command_id, sequence, None, None, "oem.deck.semantic_state_bootstrap", _canonical(dict(snapshot)), _canonical(dict(snapshot)), "completed", 1, int(snapshot["ownership_generation"]), now, now, now, _canonical(terminal), now),
+            )
+            self._insert_canonical_command(
+                conn,
+                command_id=command_id,
+                idempotency_key=f"deck-bootstrap:{snapshot['source_command_id']}",
+                action_id="oem.deck.semantic_state_bootstrap",
+                inputs=dict(snapshot),
+                ownership_generation=int(snapshot["ownership_generation"]),
+                accepted_at=now,
+            )
+            conn.execute(
+                "UPDATE serial206_movement_commands SET state='completed',state_version=2,dispatched_at=?,finished_at=? WHERE command_id=?",
+                (now, now, command_id),
+            )
+            provenance = {
+                "source_operation": "semantic_state_bootstrap", "command_id": command_id,
+                "upstream_source_operation": snapshot["source_operation"],
+                "upstream_source_command_id": snapshot["source_command_id"],
+                "before_revision": 0, "after_revision": 1,
+                "latch_status": snapshot["latch_status"],
+                "machine_latch_closed": snapshot["machine_latch_closed"],
+                "latch_observation_id": snapshot["latch_observation_id"],
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=1,producer_operation='semantic_state_bootstrap',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                (location, well, snapshot.get("current_tray"), int(snapshot["tip_loaded"]), int(snapshot["tip_dirty"]), int(snapshot["tip_location"]), int(snapshot["clean_path"]), plate_name_for_storage(plate), _canonical(dict(movable)), int(snapshot["pseudo_z_home"]), command_id, int(snapshot["ownership_generation"]), int(snapshot["board_epoch_4"]), int(snapshot["board_epoch_5"]), _canonical(provenance), now),
+            )
+            conn.execute(
+                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,'semantic_state_bootstrap',0,1,?,?)",
+                (command_id, _canonical(provenance), now),
+            )
+            self._insert_transition(conn, event_kind="deck_semantic_state_bootstrapped", command_id=command_id, state="completed", payload=provenance)
+        return self.deck_semantic_state()
+
+    def publish_deck_owner_state(
+        self,
+        *,
+        source_operation: str,
+        source_command_id: str,
+        updates: Mapping[str, Any],
+        ownership_generation: int,
+        board_epoch_4: int,
+        board_epoch_5: int,
+    ) -> dict[str, Any]:
+        """Publish one successful production-owner mutation into canonical SQLite."""
+        allowed = {
+            "pipette_owner": {"tip_loaded", "tip_dirty", "tip_location"},
+            "clean_path_calculation": {"clean_path"},
+            "GantryLoad": {"tip_loaded", "plate_on_gantry", "pseudo_z_home"},
+            "LoadGantry": {"tip_loaded", "plate_on_gantry", "pseudo_z_home"},
+            "plate_operation": {"current_tray", "plate_on_gantry", "movable_plate_locations"},
+        }
+        operation = str(source_operation)
+        values = dict(updates)
+        if operation not in allowed or not values or set(values) - allowed[operation]:
+            raise ValueError("deck semantic producer fields are not permitted")
+        if "tip_loaded" in values and type(values["tip_loaded"]) is not bool:
+            raise ValueError("tip_loaded must be boolean")
+        if "tip_dirty" in values and type(values["tip_dirty"]) is not bool:
+            raise ValueError("tip_dirty must be boolean")
+        if "tip_location" in values and (type(values["tip_location"]) is not int or values["tip_location"] not in {-1, 0, 1, 2, 3}):
+            raise ValueError("tip_location is outside the source domain")
+        if "clean_path" in values and type(values["clean_path"]) is not bool:
+            raise ValueError("clean_path must be boolean")
+        if "plate_on_gantry" in values:
+            values["plate_on_gantry"] = canonical_plate_name(values["plate_on_gantry"])
+        if "pseudo_z_home" in values and values["pseudo_z_home"] not in {500, 65000}:
+            raise ValueError("pseudo Z home must be 500 or 65000")
+        movable = values.get("movable_plate_locations")
+        if movable is not None:
+            try:
+                values["movable_plate_locations"] = canonical_movable_object_locations(movable)
+            except ValueError as exc:
+                raise ValueError("movable plate locations must be complete and authoritative") from exc
+        upstream_id = str(source_command_id)
+        if not upstream_id.strip():
+            raise ValueError("source command identity is required")
+
+        with self._transaction() as conn:
+            self._validate_deck_owner_authority(
+                ownership_generation=ownership_generation,
+                board_epoch_4=board_epoch_4,
+                board_epoch_5=board_epoch_5,
+            )
+            current = conn.execute(
+                "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+            assert current is not None
+            merged = {
+                "current_tray": current["current_tray"],
+                "tip_loaded": None if current["tip_loaded"] is None else bool(current["tip_loaded"]),
+                "tip_dirty": None if current["tip_dirty"] is None else bool(current["tip_dirty"]),
+                "tip_location": current["tip_location"],
+                "clean_path": None if current["clean_path"] is None else bool(current["clean_path"]),
+                "plate_on_gantry": canonical_plate_name(current["plate_on_gantry"]),
+                "movable_plate_locations": _json_load(current["movable_plate_locations_json"], {}),
+                "pseudo_z_home": int(current["pseudo_z_home"]),
+            }
+            merged.update(values)
+            if merged["tip_loaded"] is True and merged["tip_location"] not in {0, 1, 2, 3}:
+                raise ValueError("loaded tip requires a valid tip location")
+            before = int(current["semantic_state_revision"])
+            after = before + 1
+            command_id = str(uuid.uuid4())
+            now = _now()
+            sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
+            request = {"source_operation": operation, "source_command_id": upstream_id, "updates": values}
+            conn.execute(
+                "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (command_id, sequence, None, None, "oem.deck.semantic_state_publication", _canonical(request), _canonical(request), "completed", 1, ownership_generation, now, now, now, _canonical({"delivery_attempted": False, "source_command_id": upstream_id}), now),
+            )
+            self._insert_canonical_command(
+                conn, command_id=command_id, idempotency_key=f"deck-owner:{operation}:{upstream_id}",
+                action_id="oem.deck.semantic_state_publication", inputs=request,
+                ownership_generation=ownership_generation, accepted_at=now,
+            )
+            conn.execute(
+                "UPDATE serial206_movement_commands SET state='completed',state_version=2,dispatched_at=?,finished_at=? WHERE command_id=?",
+                (now, now, command_id),
+            )
+            prior = _json_load(current["transition_provenance_json"], {})
+            provenance = {
+                "source_operation": operation, "command_id": command_id,
+                "upstream_source_command_id": upstream_id, "before_revision": before,
+                "after_revision": after, "updates": values,
+                "latch_status": prior.get("latch_status"),
+                "machine_latch_closed": prior.get("machine_latch_closed"),
+                "latch_observation_id": prior.get("latch_observation_id"),
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
+                (merged["current_tray"], None if merged["tip_loaded"] is None else int(merged["tip_loaded"]), None if merged["tip_dirty"] is None else int(merged["tip_dirty"]), merged["tip_location"], None if merged["clean_path"] is None else int(merged["clean_path"]), plate_name_for_storage(merged["plate_on_gantry"]), _canonical(dict(merged["movable_plate_locations"])), int(merged["pseudo_z_home"]), after, operation, command_id, ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), now),
+            )
+            conn.execute(
+                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,?,?,?,?,?)",
+                (command_id, operation, before, after, _canonical(provenance), now),
+            )
+            self._insert_transition(conn, event_kind="deck_owner_state_published", command_id=command_id, state="completed", payload=provenance)
+        return self.deck_semantic_state()
+
+    def persist_deck_pseudo_home(
+        self, command_id: str, value: int, *, source_operation: str,
+        ownership_generation: int, board_epoch_4: int, board_epoch_5: int,
+    ) -> int:
+        if int(value) not in {500, 65000}:
+            raise ValueError("pseudo Z home must be 500 or 65000")
+        with self._transaction() as conn:
+            self._validate_deck_owner_authority(
+                ownership_generation=ownership_generation,
+                board_epoch_4=board_epoch_4,
+                board_epoch_5=board_epoch_5,
+            )
+            current = conn.execute(
+                "SELECT semantic_state_revision,transition_provenance_json FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+            assert current is not None
+            before = int(current[0])
+            after = before + 1
+            prior_provenance = _json_load(current[1], {})
+            provenance = {
+                "source_operation": str(source_operation), "command_id": str(command_id),
+                "before_revision": before, "after_revision": after, "pseudo_z_home": int(value),
+                "latch_status": prior_provenance.get("latch_status"),
+                "machine_latch_closed": prior_provenance.get("machine_latch_closed"),
+                "latch_observation_id": prior_provenance.get("latch_observation_id"),
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
+                (int(value), after, str(source_operation), str(command_id), ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), _now()),
+            )
+            row = conn.execute(
+                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,?,?,?,?,?) RETURNING transition_revision",
+                (str(command_id), str(source_operation), before, after, _canonical(provenance), _now()),
+            ).fetchone()
+            assert row is not None
+            return int(row[0])
+
+    def persist_deck_plan(self, command_id: str, plan: Any) -> None:
+        anchors = [str(step.source_anchor) for step in plan.steps]
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO operator_plane_deck_commands(
+                    command_id,target,target_label,resolved_location_id,destination_catalog_revision,
+                    position_table_revision,authority_snapshot_digest,complete_authority_digest,
+                    plan_digest,source_branch,source_anchors_json,source_hazards_json,planned_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(command_id), str(plan.target), str(plan.target_label), int(plan.resolved_location_id),
+                    str(plan.catalog_revision), str(plan.position_table_sha256), str(plan.authority_digest),
+                    str(plan.authority_digest), str(plan.plan_digest), str(plan.source_branch),
+                    _canonical(anchors), _canonical(list(plan.source_hazards)), _now(),
+                ),
+            )
+            previous: int | None = None
+            for step in plan.steps:
+                conn.execute(
+                    "INSERT INTO operator_plane_deck_stages(command_id,stage_order,operation,source_anchor,resources_json,arguments_json,dependency_order_json) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        str(command_id), int(step.order), str(step.operation), str(step.source_anchor),
+                        _canonical(list(step.resources)), _canonical(dict(step.arguments or {})),
+                        _canonical([] if previous is None else [previous]),
+                    ),
+                )
+                previous = int(step.order)
+
+    @staticmethod
+    def _deck_stage_evidence(step: Any, result: Mapping[str, Any] | None, *, reason: str | None = None) -> dict[str, Any]:
+        row = dict(result or {})
+        arguments = dict(step.arguments or {})
+        return {
+            "operation": str(step.operation), "source_anchor": str(step.source_anchor),
+            "arguments_digest": _digest(arguments),
+            "delivery_attempted": bool(row.get("delivery_attempted") is True or result is not None),
+            "controller_command_acknowledged": row.get("controller_command_acknowledged") is True,
+            "controller_completion_verified": row.get("controller_completion_verified") is True,
+            "hardware_postcondition_verified": row.get("hardware_postcondition_verified") is True,
+            "provider_evidence": _bounded_json(row, 131072), "reason": reason,
+        }
+
+    def terminalize_deck_stage(self, command_id: str, step: Any, *, state: str, result: Mapping[str, Any] | None = None, reason: str | None = None) -> None:
+        if state not in {"completed", "failed", "ambiguous", "stopped", "aborted"}:
+            raise ValueError(state)
+        evidence = self._deck_stage_evidence(step, result, reason=reason)
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE operator_plane_deck_stages SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
+                (state, _canonical(evidence), str(command_id), int(step.order)),
+            )
+
+    def finalize_deck_stages(self, command_id: str, *, state: str, reason: str) -> None:
+        if state not in {"completed", "failed", "ambiguous", "stopped", "aborted"}:
+            raise ValueError(state)
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM operator_plane_deck_stages WHERE command_id=? AND terminal_state='planned' ORDER BY stage_order",
+                (str(command_id),),
+            ).fetchall()
+            for row in rows:
+                evidence = {
+                    "operation": str(row["operation"]), "source_anchor": str(row["source_anchor"]),
+                    "arguments_digest": _digest(_json_load(row["arguments_json"], {})),
+                    "delivery_attempted": False, "controller_command_acknowledged": False,
+                    "controller_completion_verified": False, "hardware_postcondition_verified": False,
+                    "provider_evidence": {}, "reason": str(reason),
+                }
+                conn.execute(
+                    "UPDATE operator_plane_deck_stages SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
+                    (state, _canonical(evidence), str(command_id), int(row["stage_order"])),
+                )
+
+    @staticmethod
+    def _oem_update_location_current_tray(
+        location: str, movable_plate_locations: Mapping[str, Any], current_tray: Any
+    ) -> Any:
+        """Literal ClassMachineStatus.updateLocation tray mapping (lines 565-653)."""
+        loc = str(location).upper()
+        movable = {str(key).upper(): str(value).upper() for key, value in movable_plate_locations.items()}
+        pool = movable.get("POOL_PLATE")
+        output = movable.get("OUTPUT_PLATE")
+        reagent = movable.get("REAGENT_PLATE")
+        if loc == pool or (pool == "LOC_P_TC" and loc == "LOC_TC") or (pool == "LOC_P_MS" and loc == "LOC_MS"):
+            return "POOL_PLATE"
+        if (
+            loc == output
+            or (output == "LOC_P_TC" and loc == "LOC_TC")
+            or (output == "LOC_P_OC" and loc == "LOC_OC")
+            or (output == "LOC_P_MS" and loc == "LOC_MS")
+        ):
+            return "OUTPUT_PLATE"
+        if loc == reagent or loc == "LOC_RC":
+            return "REAGENT_PLATE"
+        if loc in {"TECANRACK1", "TECANRACK2", "TECANRACK3", "TECANRACK4"}:
+            return "TIP_TRAY"
+        if loc == "LOC_TIP_HOTEL":
+            return "TIP_HOTEL"
+        if loc == movable.get("REAGENT_COVER") or loc in {"LOC_RC_COVER", "LOC_RC_COVER_STORAGE"}:
+            return "REAGENT_COVER"
+        if loc == movable.get("OUTPUT_COVER") or loc in {"LOC_OC_COVER", "LOC_OC_COVER_STORAGE"}:
+            return "OUTPUT_COVER"
+        if loc == movable.get("BIO_SECURITY_COVER"):
+            return "BIO_SECURITY_COVER"
+        return {
+            "LOC_STRIP1": "STRIP_ONE", "LOC_STRIP2": "STRIP_TWO",
+            "LOC_STRIP3": "STRIP_THREE", "LOC_STRIP4": "STRIP_FOUR",
+        }.get(loc, current_tray)
+
+    def commit_deck_success(self, command_id: str, plan: Any, results: list[Mapping[str, Any]]) -> None:
+        if not results or any(row.get("controller_completion_verified") is not True for row in results):
+            raise ValueError("deck semantic state requires verified controller completion")
+        with self._transaction() as conn:
+            result_index = 0
+            for step in plan.steps:
+                result = None
+                if step.operation not in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
+                    result = results[result_index]
+                    result_index += 1
+                evidence = self._deck_stage_evidence(step, result)
+                conn.execute(
+                    "UPDATE operator_plane_deck_stages SET terminal_state='completed',terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
+                    (_canonical(evidence), str(command_id), int(step.order)),
+                )
+            current = conn.execute(
+                "SELECT semantic_state_revision,movable_plate_locations_json,current_tray FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+            assert current is not None
+            before = int(current[0])
+            after = before + 1
+            canonical_location = str(plan.semantic_transition["current_location"])
+            current_tray = self._oem_update_location_current_tray(
+                canonical_location, _json_load(current[1], {}), current[2]
+            )
+            transition = {
+                "source_operation": "updateLocation", "command_id": str(command_id),
+                "target": str(plan.target), "current_location": canonical_location,
+                "current_well": int(plan.semantic_transition["current_well_id"]),
+                "current_tray": current_tray,
+                "before_revision": before, "after_revision": after,
+                "ownership_generation": int(plan.semantic_transition["ownership_generation"]),
+                "board_epoch_by_board": {
+                    "4": int(plan.semantic_transition["board_epoch_4"]),
+                    "5": int(plan.semantic_transition["board_epoch_5"]),
+                },
+                "authority_snapshot_digest": str(plan.semantic_transition["authority_snapshot_digest"]),
+                "position_table_revision": str(plan.semantic_transition["position_table_revision"]),
+                "destination_catalog_revision": str(plan.semantic_transition["destination_catalog_revision"]),
+                "latch_status": bool(plan.semantic_transition["latch_status"]),
+                "machine_latch_closed": bool(plan.semantic_transition["machine_latch_closed"]),
+                "latch_observation_id": str(plan.semantic_transition["latch_observation_id"]),
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                (
+                    canonical_location, int(plan.semantic_transition["current_well_id"]), current_tray,
+                    after, str(command_id),
+                    int(plan.semantic_transition["ownership_generation"]),
+                    int(plan.semantic_transition["board_epoch_4"]),
+                    int(plan.semantic_transition["board_epoch_5"]),
+                    _canonical(transition), _now(),
+                ),
+            )
+            transition_row = conn.execute(
+                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,'updateLocation',?,?,?,?) RETURNING transition_revision",
+                (str(command_id), before, after, _canonical(transition), _now()),
+            ).fetchone()
+            assert transition_row is not None
+            conn.execute(
+                """
+                UPDATE operator_plane_deck_commands
+                SET delivery_attempted=1,controller_command_acknowledged=?,controller_completion_verified=1,
+                    hardware_postcondition_verified=?,semantic_state_committed=1,
+                    transition_revision=?,provider_evidence_json=?,committed_at=?
+                WHERE command_id=?
+                """,
+                (
+                    int(all(row.get("controller_command_acknowledged") is True for row in results)),
+                    int(all(row.get("hardware_postcondition_verified") is True for row in results)),
+                    int(transition_row[0]), _canonical(results), _now(), str(command_id),
+                ),
+            )
+
+    def _deck_command_detail(self, command_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM operator_plane_deck_commands WHERE command_id=?", (str(command_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        stages = self.connection.execute(
+            "SELECT * FROM operator_plane_deck_stages WHERE command_id=? ORDER BY stage_order",
+            (str(command_id),),
+        ).fetchall()
+        return {
+            "target": str(row["target"]), "target_label": str(row["target_label"]),
+            "source_branch": str(row["source_branch"]), "resolved_location_id": int(row["resolved_location_id"]),
+            "destination_catalog_revision": str(row["destination_catalog_revision"]),
+            "position_table_revision": str(row["position_table_revision"]),
+            "authority_snapshot_digest": str(row["authority_snapshot_digest"]),
+            "complete_authority_digest": str(row["complete_authority_digest"]),
+            "plan_digest": str(row["plan_digest"]), "source_anchors": _json_load(row["source_anchors_json"], []),
+            "delivery_attempted": bool(row["delivery_attempted"]),
+            "controller_command_acknowledged": bool(row["controller_command_acknowledged"]),
+            "controller_completion_verified": bool(row["controller_completion_verified"]),
+            "hardware_postcondition_verified": bool(row["hardware_postcondition_verified"]),
+            "semantic_state_committed": bool(row["semantic_state_committed"]),
+            "physical_observation_verified": bool(row["physical_observation_verified"]),
+            "transition_revision": row["transition_revision"], "ambiguity_state": str(row["ambiguity_state"]),
+            "stages": [
+                {
+                    "order": int(stage["stage_order"]), "operation": str(stage["operation"]),
+                    "source_anchor": str(stage["source_anchor"]),
+                    "resources": _json_load(stage["resources_json"], []),
+                    "arguments": _json_load(stage["arguments_json"], {}),
+                    "dependencies": _json_load(stage["dependency_order_json"], []),
+                    "terminal_state": str(stage["terminal_state"]),
+                    "terminal_evidence": _json_load(stage["terminal_evidence_json"], None),
+                }
+                for stage in stages
+            ],
+        }
+
     def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None) -> dict[str, Any]:
         if transition_sequence is None:
             transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?", (str(row["command_id"]),)).fetchone()
@@ -2397,7 +3501,7 @@ class OperatorCommandStore:
             (str(row["command_id"]),),
         ).fetchone()
         terminal = _json_load(row["terminal_json"], None)
-        return {
+        response = {
             "schema_version": RECEIPT_SCHEMA,
             "robot_identity": ROBOT_IDENTITY,
             "command_id": str(row["command_id"]),
@@ -2426,6 +3530,10 @@ class OperatorCommandStore:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        deck_detail = self._deck_command_detail(str(row["command_id"]))
+        if deck_detail is not None:
+            response["deck_movement"] = deck_detail
+        return response
 
     def _method_response(self, row: sqlite3.Row) -> dict[str, Any]:
         transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE method_id=?", (str(row["method_id"]),)).fetchone()
@@ -2465,6 +3573,10 @@ class OperatorCommandStore:
         action_id = str(request.get("action_id") or "")
         if action_id not in ALLOWED_ACTIONS:
             raise HTTPException(status_code=422, detail={"error": "action_not_allowed", "action_id": action_id})
+        if action_id == "oem.deck.move_to_location":
+            blocker = self.deck_recovery_blocker()
+            if blocker is not None:
+                raise HTTPException(status_code=409, detail={"error": blocker})
         inputs = _validate_inputs(action_id, request.get("inputs", {}))
         expected_generation = int(request["expected_ownership_generation"])
         schema_version = str(request.get("schema_version") or COMMAND_SCHEMA)
@@ -2477,6 +3589,15 @@ class OperatorCommandStore:
         }
         observed_board_epochs = _active_board_epochs(state, action_id)
         expected_board_epochs: dict[str, int] = {}
+        if action_id == "oem.deck.move_to_location":
+            if schema_version != ACTION_REQUEST_SCHEMA:
+                raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
+            actual_generation = int(state.get("ownership_generation") or -1)
+            if expected_generation != actual_generation:
+                raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
+            if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
+                raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch", "requested": requested_board_epochs, "observed": observed_board_epochs})
+            expected_board_epochs = dict(requested_board_epochs)
         canonical_request = {
             "schema_version": schema_version,
             "operation_kind": "command",
@@ -2484,7 +3605,7 @@ class OperatorCommandStore:
             "expected_board_epoch_by_board": expected_board_epochs,
             "requested_board_epoch_by_board": requested_board_epochs,
             "observed_board_epoch_by_board": observed_board_epochs,
-            "board_epoch_policy": "observational_not_dispatch_fence",
+            "board_epoch_policy": "required_dispatch_execution_fence",
             "action_id": action_id,
             "inputs": inputs,
         }
@@ -2543,7 +3664,7 @@ class OperatorCommandStore:
                     "action_id": action_id,
                     "requested_board_epoch_by_board": requested_board_epochs,
                     "observed_board_epoch_by_board": observed_board_epochs,
-                    "board_epoch_policy": "observational_not_dispatch_fence",
+                    "board_epoch_policy": "required_dispatch_execution_fence",
                 },
             )
             response = {**row, "schema_version": RECEIPT_SCHEMA, "transition_sequence": transition, "remote_acknowledged": False, "controller_acknowledged": False, "physical_effect_verified": False, "source_noop": False, "source_noop_reason": None, "terminal_evidence": None, "dispatched_at": None, "finished_at": None, "idempotent_replay": False}
@@ -2587,7 +3708,7 @@ class OperatorCommandStore:
             "metadata": {
                 **dict(request.get("metadata") or {}),
                 "requested_board_epoch_by_board": requested_board_epochs,
-                "board_epoch_policy": "observational_not_dispatch_fence",
+                "board_epoch_policy": "required_dispatch_execution_fence",
             },
         }
         digest = _digest(source)
@@ -2847,6 +3968,59 @@ class OperatorCommandStore:
             }
             return {"schema_version": RECOVERY_SCHEMA, "recovery_epoch": int(safety["recovery_epoch"]), "version": int(safety["recovery_version"]), "hold": bool(safety["recovery_hold"]), "outcome_unknown_command_ids": [str(row["command_id"]) for row in unknown], "affected_method_ids": methods, "queued_count": int(queued), "queued_range": queued_range, "dispatcher_epoch": int(lane["dispatcher_epoch"]) if lane is not None else 0, "global_safety_epoch": int(safety["global_epoch"]), "x_safety_epoch": int(safety["x_epoch"]), "y_safety_epoch": int(safety["y_epoch"]), "z_safety_epoch": int(safety["z_epoch"]), "available_resolutions": ["resume_undispatched", "cancel_pending"] if safety["recovery_hold"] else []}
 
+    def mark_deck_recovery_required(
+        self,
+        command_id: str,
+        *,
+        reason: str,
+        controller_command_acknowledged: bool = False,
+        controller_completion_verified: bool = False,
+        hardware_postcondition_verified: bool = False,
+        semantic_state_committed: bool = False,
+        provider_results: list[Mapping[str, Any]] | None = None,
+    ) -> None:
+        with self._transaction() as conn:
+            command = conn.execute("SELECT command_id FROM operator_plane_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if command is None:
+                raise RuntimeError("deck recovery command missing")
+            safety = conn.execute("SELECT recovery_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
+            conn.execute(
+                "UPDATE operator_plane_safety SET recovery_epoch=?,recovery_version=recovery_version+1,recovery_hold=1,updated_at=? WHERE singleton=1",
+                (int(safety[0]) + 1, _now()),
+            )
+            conn.execute(
+                """
+                UPDATE operator_plane_deck_commands
+                SET delivery_attempted=1,
+                    controller_command_acknowledged=MAX(controller_command_acknowledged, ?),
+                    controller_completion_verified=MAX(controller_completion_verified, ?),
+                    hardware_postcondition_verified=MAX(hardware_postcondition_verified, ?),
+                    semantic_state_committed=MAX(semantic_state_committed, ?),
+                    ambiguity_state='recovery_required',
+                    provider_evidence_json=COALESCE(?, provider_evidence_json)
+                WHERE command_id=?
+                """,
+                (
+                    int(controller_command_acknowledged),
+                    int(controller_completion_verified),
+                    int(hardware_postcondition_verified),
+                    int(semantic_state_committed),
+                    _canonical(provider_results) if provider_results else None,
+                    str(command_id),
+                ),
+            )
+            semantic = conn.execute("SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+            before = int(semantic[0])
+            provenance = {
+                "source_operation": "deck_outcome_unknown", "command_id": str(command_id),
+                "before_revision": before, "after_revision": before + 1,
+                "ambiguity_state": "recovery_required", "reason": str(reason),
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET semantic_state_revision=?,producer_operation='deck_outcome_unknown',producer_command_id=?,transition_provenance_json=?,ambiguity_state='recovery_required',updated_at=? WHERE singleton=1",
+                (before + 1, str(command_id), _canonical(provenance), _now()),
+            )
+
     def cancel_command(self, command_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
         key = str(request["idempotency_key"])
         fp = _digest({"operation_kind": "cancel_command", "command_id": command_id, **_without_idempotency(request)})
@@ -2946,6 +4120,7 @@ class OperatorCommandStore:
             if operation == "cancel_pending":
                 conn.execute("UPDATE operator_plane_commands SET status='cancelled',version=version+1,finished_at=?,updated_at=?,terminal_json=? WHERE status='queued'", (_now(), _now(), _canonical({"reason": "recovery_cancel_pending"})))
             affected_methods = sorted({str(row["method_id"]) for row in conn.execute("SELECT method_id FROM operator_plane_commands WHERE command_id IN ({})".format(",".join("?" for _ in unknown)), tuple(unknown)).fetchall() if row["method_id"]} if unknown else set())
+            deck_unknown = self._deck_recovery_blocker(conn) is not None
             for command_id in unknown:
                 acknowledgement = {
                     "schema_version": "bioxp.operator_recovery_acknowledgement.v1",
@@ -2964,12 +4139,211 @@ class OperatorCommandStore:
             else:
                 for method_id in affected_methods:
                     conn.execute("UPDATE operator_plane_methods SET status='running',version=version+1,updated_at=? WHERE method_id=? AND status='recovery_required'", (_now(), method_id))
-            conn.execute("UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
-            transition = self._insert_transition(conn, event_kind="recovery_resolved", state="recovery_resolved", payload={"operation": request["operation"], "acknowledged": unknown})
-            response = {"schema_version": "bioxp.operator_recovery_resolution.v1", "recovery_epoch": int(recovery_epoch), "operation": request["operation"], "acknowledged_command_ids": unknown, "transition_sequence": transition}
+            conn.execute(
+                "UPDATE operator_plane_safety SET recovery_hold=?,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1",
+                (int(deck_unknown), _now()),
+            )
+            transition = self._insert_transition(
+                conn,
+                event_kind="recovery_acknowledged" if deck_unknown else "recovery_resolved",
+                state="recovery_required" if deck_unknown else "recovery_resolved",
+                payload={"operation": request["operation"], "acknowledged": unknown, "outcome_remains": "unknown" if deck_unknown else "resolved"},
+            )
+            response = {
+                "schema_version": "bioxp.operator_recovery_resolution.v1",
+                "recovery_epoch": int(recovery_epoch), "operation": request["operation"],
+                "acknowledged_command_ids": unknown, "transition_sequence": transition,
+                "outcome_remains": "unknown" if deck_unknown else "resolved",
+                "recovery_hold": bool(deck_unknown),
+            }
             self._store_idempotency(conn, kind="recovery_resolve", key=key, fingerprint=fp, response=response)
         self._wake.set()
         return response
+
+    def reconcile_deck_recovery(
+        self,
+        *,
+        command_id: str,
+        current_location: str | None,
+        current_well: int | None,
+        current_authority: Mapping[str, Any],
+        current_position_table_revision: str,
+        current_destination_catalog_revision: str,
+        decision: Mapping[str, Any],
+        approved_home_state: Mapping[str, Any] | None = None,
+        final_authority_reader: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve one ambiguous deck outcome from current server-owned authority."""
+        authority = dict(current_authority)
+        board_epochs = {"4": authority.get("board_epoch_4"), "5": authority.get("board_epoch_5")}
+        if (
+            type(authority.get("ownership_generation")) is not int
+            or int(authority["ownership_generation"]) < 0
+            or any(type(board_epochs[key]) is not int or int(board_epochs[key]) < 0 for key in ("4", "5"))
+            or type(authority.get("machine_state_revision")) is not int
+            or int(authority["machine_state_revision"]) < 1
+            or not isinstance(authority.get("provider_owner_id"), str)
+            or not str(authority["provider_owner_id"]).strip()
+            or type(authority.get("latch_status")) is not bool
+            or type(authority.get("machine_latch_closed")) is not bool
+            or not isinstance(authority.get("latch_observation_id"), str)
+            or not str(authority["latch_observation_id"]).strip()
+            or str(authority.get("position_table_sha256") or "") != str(current_position_table_revision)
+        ):
+            raise ValueError("current provider deck authority is malformed")
+        observation = {
+            "observation_id": authority.get("controller_position_observation_id"),
+            "x": authority.get("current_x"),
+            "y": authority.get("current_y"),
+            "z": authority.get("current_z"),
+            "observed_at": authority.get("captured_at"),
+            "ownership_generation": int(authority["ownership_generation"]),
+            "board_epoch_by_board": {key: int(value) for key, value in board_epochs.items()},
+            "provider_owner_id": str(authority["provider_owner_id"]),
+        }
+        if (
+            not isinstance(observation["observation_id"], str)
+            or not str(observation["observation_id"]).strip()
+            or any(type(observation[axis]) is not int for axis in ("x", "y", "z"))
+            or type(observation["observed_at"]) not in {int, float}
+            or float(observation["observed_at"]) <= 0
+        ):
+            raise ValueError("validated server controller position observation is required")
+        reconciliation_decision = dict(decision)
+        if any(
+            not isinstance(reconciliation_decision.get(key), str)
+            or not str(reconciliation_decision[key]).strip()
+            for key in ("decision_id", "approved_by", "reason")
+        ):
+            raise ValueError("persistable deck reconciliation decision is required")
+        if approved_home_state is None:
+            if str(current_location) not in set(configured_location_names()):
+                raise ValueError("source-compatible canonical deck location is required")
+            if type(current_well) is not int or not 0 <= int(current_well) <= 95:
+                raise ValueError("canonical deck well must be between 0 and 95")
+            if (
+                authority.get("observed_location_id") != current_location
+                or authority.get("observed_well_id") != current_well
+            ):
+                raise ValueError("canonical location and well are not bound to current provider observation")
+        else:
+            home = dict(approved_home_state)
+            if (
+                home.get("state") != "serial206_xyz_referenced_home"
+                or any(not isinstance(home.get(key), str) or not str(home[key]).strip() for key in ("approval_id", "approved_by"))
+                or current_location is not None
+                or current_well is not None
+            ):
+                raise ValueError("approved Serial-206 home state is malformed")
+
+        fence_fields = (
+            "ownership_generation", "provider_owner_id", "board_epoch_4", "board_epoch_5",
+            "position_table_sha256", "machine_state_revision", "latch_status",
+            "machine_latch_closed", "latch_observation_id",
+            "controller_position_observation_id", "current_x", "current_y", "current_z",
+            "observed_location_id", "observed_well_id",
+        )
+        initial_fence = {key: authority.get(key) for key in fence_fields}
+
+        with self._transaction() as conn:
+            safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
+            semantic = conn.execute("SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+            command = conn.execute(
+                "SELECT c.status,c.action_id,c.ownership_generation,d.target,d.position_table_revision,"
+                "d.destination_catalog_revision,d.ambiguity_state,m.expected_board_epochs_json "
+                "FROM operator_plane_commands c JOIN operator_plane_deck_commands d USING(command_id) "
+                "JOIN serial206_movement_commands m USING(command_id) WHERE c.command_id=?",
+                (str(command_id),),
+            ).fetchone()
+            if (
+                command is None
+                or str(command["action_id"]) != "oem.deck.move_to_location"
+                or str(command["status"]) not in {"ambiguous", "interrupted"}
+                or str(command["ambiguity_state"]) != "recovery_required"
+            ):
+                raise ValueError("ambiguous deck command requiring reconciliation was not found")
+            if self._deck_recovery_blocker(conn) != "deck_recovery_hold":
+                raise ValueError("deck recovery hold is not active or coherent")
+            if int(semantic["semantic_state_revision"]) != int(authority["machine_state_revision"]):
+                raise ValueError("deck semantic revision conflict")
+            if (
+                str(command["position_table_revision"]) != str(current_position_table_revision)
+                or str(command["destination_catalog_revision"]) != str(current_destination_catalog_revision)
+            ):
+                raise ValueError("deck catalog or PositionTable revision conflict")
+            admitted_epochs = _json_load(command["expected_board_epochs_json"], {})
+            if (
+                int(command["ownership_generation"]) != int(authority["ownership_generation"])
+                or admitted_epochs != observation["board_epoch_by_board"]
+            ):
+                raise ValueError("deck authority identity conflict")
+            if not callable(final_authority_reader):
+                raise ValueError("final current provider authority fence is required")
+            final_authority = final_authority_reader()
+            if not isinstance(final_authority, Mapping):
+                raise ValueError("final current provider authority is malformed")
+            final_fence = {key: final_authority.get(key) for key in fence_fields}
+            if final_fence != initial_fence:
+                raise ValueError("deck authority changed before reconciliation commit")
+
+            before = int(semantic["semantic_state_revision"])
+            after = before + 1
+            provenance = {
+                "source_operation": "governed_deck_reconciliation",
+                "command_id": str(command_id), "ambiguous_command_id": str(command_id),
+                "ambiguous_target": str(command["target"]),
+                "before_revision": before, "after_revision": after,
+                "current_location": current_location, "current_well": current_well,
+                "authority": {
+                    "ownership_generation": int(authority["ownership_generation"]),
+                    "board_epoch_by_board": observation["board_epoch_by_board"],
+                    "provider_owner_id": str(authority["provider_owner_id"]),
+                    "position_table_revision": str(current_position_table_revision),
+                    "destination_catalog_revision": str(current_destination_catalog_revision),
+                },
+                "controller_position_observation": observation,
+                "reconciliation_decision": reconciliation_decision,
+                "approved_home_state": dict(approved_home_state) if approved_home_state is not None else None,
+                "latch_status": bool(authority["latch_status"]),
+                "machine_latch_closed": bool(authority["machine_latch_closed"]),
+                "latch_observation_id": str(authority["latch_observation_id"]),
+            }
+            conn.execute(
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,semantic_state_revision=?,producer_operation='governed_deck_reconciliation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                (
+                    current_location, current_well, after, str(command_id), int(authority["ownership_generation"]),
+                    int(board_epochs["4"]), int(board_epochs["5"]), _canonical(provenance), _now(),
+                ),
+            )
+            transition_row = conn.execute(
+                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,'governed_deck_reconciliation',?,?,?,?) RETURNING transition_revision",
+                (str(command_id), before, after, _canonical(provenance), _now()),
+            ).fetchone()
+            assert transition_row is not None
+            conn.execute(
+                "UPDATE operator_plane_deck_commands SET ambiguity_state='none',physical_observation_verified=0 WHERE command_id=? AND ambiguity_state='recovery_required'",
+                (str(command_id),),
+            )
+            unresolved = conn.execute(
+                "SELECT 1 FROM operator_plane_deck_commands WHERE ambiguity_state='recovery_required' LIMIT 1"
+            ).fetchone()
+            if unresolved is not None:
+                raise ValueError("another deck ambiguity still requires reconciliation")
+            conn.execute(
+                "UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1",
+                (_now(),),
+            )
+            transition_sequence = self._insert_transition(
+                conn, event_kind="deck_reconciled", command_id=str(command_id), state="reconciled",
+                payload={"semantic_state_revision": after, "decision_id": reconciliation_decision["decision_id"]},
+            )
+            return {
+                "schema_version": "bioxp.operator_deck_reconciliation.v1",
+                "command_id": str(command_id), "semantic_state_revision": after,
+                "transition_revision": int(transition_row[0]), "transition_sequence": transition_sequence,
+                "reconciliation_decision": reconciliation_decision,
+                "controller_position_observation": observation,
+            }
 
     def idempotency_checked(self, operation_kind: str, key: str, fingerprint: str) -> dict[str, Any] | None:
         with self._lock:
@@ -3035,6 +4409,8 @@ class OperatorCommandStore:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
             now = _now()
+            if self._deck_recovery_blocker(conn) is not None:
+                return None
             if lane["owner_id"] != self.owner_id or float(lane["owner_lease_until"] or 0.0) <= now:
                 return None
             queued_rows = conn.execute(
@@ -3044,7 +4420,7 @@ class OperatorCommandStore:
             canonical = None
             for candidate in queued_rows:
                 if self.action_fenced(str(candidate["action_id"])):
-                    continue
+                    return None
                 candidate_canonical = conn.execute(
                     "SELECT * FROM serial206_movement_commands WHERE command_id=?",
                     (candidate["command_id"],),
@@ -3057,7 +4433,7 @@ class OperatorCommandStore:
                         (candidate["method_id"],),
                     ).fetchone()
                     if method is None or str(method["status"]) not in {"queued", "running"}:
-                        continue
+                        return None
                 dependency_pending = conn.execute(
                     """
                     SELECT 1
@@ -3071,7 +4447,7 @@ class OperatorCommandStore:
                     (candidate["command_id"],),
                 ).fetchone()
                 if dependency_pending is not None:
-                    continue
+                    return None
                 resource_busy = conn.execute(
                     """
                     SELECT 1
@@ -3088,7 +4464,7 @@ class OperatorCommandStore:
                     (candidate["command_id"],),
                 ).fetchone()
                 if resource_busy is not None:
-                    continue
+                    return None
                 row = candidate
                 canonical = candidate_canonical
                 break
@@ -3169,6 +4545,7 @@ class OperatorCommandStore:
                 "dispatch_global_safety_epoch": int(claimed["dispatch_global_safety_epoch"]),
                 "dispatch_axis_safety_epoch": int(claimed["dispatch_axis_safety_epoch"]),
                 "ownership_generation": int(claimed["ownership_generation"]),
+                "expected_board_epoch_by_board": _json_load(canonical["expected_board_epochs_json"], {}),
                 "command_version": int(claimed["version"]),
             }
 
@@ -3251,6 +4628,27 @@ class OperatorCommandStore:
             if changed != 1:
                 current = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
                 return self._command_response(current) if current is not None else {"command_id": command_id, "status": "missing"}
+            deck_terminal_state = {
+                "completed": "completed", "failed": "failed", "ambiguous": "ambiguous",
+                "interrupted": "ambiguous", "stopped": "stopped", "aborted": "aborted",
+                "cancelled": "failed", "cleared": "failed",
+            }.get(status, "failed")
+            pending_deck_stages = conn.execute(
+                "SELECT * FROM operator_plane_deck_stages WHERE command_id=? AND terminal_state='planned' ORDER BY stage_order",
+                (command_id,),
+            ).fetchall()
+            for stage in pending_deck_stages:
+                evidence = {
+                    "operation": str(stage["operation"]), "source_anchor": str(stage["source_anchor"]),
+                    "arguments_digest": _digest(_json_load(stage["arguments_json"], {})),
+                    "delivery_attempted": False, "controller_command_acknowledged": False,
+                    "controller_completion_verified": False, "hardware_postcondition_verified": False,
+                    "provider_evidence": {}, "reason": f"command_terminal:{status}",
+                }
+                conn.execute(
+                    "UPDATE operator_plane_deck_stages SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
+                    (deck_terminal_state, _canonical(evidence), command_id, int(stage["stage_order"])),
+                )
             self._update_z_home_authority(
                 conn,
                 command_id=command_id,
@@ -3821,6 +5219,23 @@ class OperatorCommandStore:
             dispatch_one(claimed)
         except Exception:
             try:
+                if str(claimed.get("action_id")) == "oem.deck.move_to_location":
+                    detail = self._deck_command_detail(str(claimed["command_id"]))
+                    if detail is not None and (
+                        detail["delivery_attempted"]
+                        or detail["controller_command_acknowledged"]
+                        or detail["controller_completion_verified"]
+                        or detail["semantic_state_committed"]
+                    ):
+                        self.mark_deck_recovery_required(
+                            str(claimed["command_id"]),
+                            reason="outer_command_terminalization_failed",
+                            controller_command_acknowledged=detail["controller_command_acknowledged"],
+                            controller_completion_verified=detail["controller_completion_verified"],
+                            hardware_postcondition_verified=detail["hardware_postcondition_verified"],
+                            semantic_state_committed=detail["semantic_state_committed"],
+                            provider_results=None if detail["semantic_state_committed"] else [detail],
+                        )
                 self.finish(claimed["command_id"], status="ambiguous", payload={"error": "dispatcher_exception", "outcome_unknown": True}, claimed=claimed)
             except Exception:
                 pass
@@ -3958,6 +5373,98 @@ class OperatorCommandPlane:
 
         if self.store.action_fenced(action_id):
             self.store.finish(command_id, status="interrupted", payload={"reason": "interrupt_fence_won_before_provider"}, claimed=claimed)
+            return
+        if action_id == "oem.deck.move_to_location":
+            executor = getattr(self.app.state, "oem_deck_command_executor", None)
+            if not callable(executor):
+                self.store.finish(command_id, status="failed", payload={"error": "canonical_deck_executor_unavailable", "delivery_attempted": False}, claimed=claimed)
+                return
+            try:
+                response = executor(
+                    command_id=command_id,
+                    target=str(effective["target"]),
+                    camera_offset=bool(effective["camera_offset"]),
+                    expected_ownership_generation=int(claimed["ownership_generation"]),
+                    expected_board_epoch_by_board=dict(claimed["expected_board_epoch_by_board"]),
+                )
+            except DeckExecutionFailure as exc:
+                delivery_attempted = exc.delivery_attempted
+                controller_acknowledged = bool(exc.controller_command_acknowledged)
+                if delivery_attempted:
+                    mark_recovery = getattr(self.store, "mark_deck_recovery_required", None)
+                    if callable(mark_recovery):
+                        mark_recovery(
+                            command_id,
+                            reason=str(exc)[:500],
+                            controller_command_acknowledged=controller_acknowledged,
+                            controller_completion_verified=bool(exc.controller_completion_verified),
+                            hardware_postcondition_verified=bool(exc.hardware_postcondition_verified),
+                            provider_results=exc.provider_results,
+                        )
+                self.store.finish(
+                    command_id,
+                    status="ambiguous" if delivery_attempted else "failed",
+                    payload={
+                        "error": f"deck_executor_exception:{type(exc).__name__}",
+                        "detail": str(exc)[:500],
+                        "delivery_attempted": delivery_attempted,
+                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                    },
+                    controller_acknowledged=controller_acknowledged,
+                    claimed=claimed,
+                )
+                return
+            except Exception as exc:
+                self.store.finish(
+                    command_id,
+                    status="failed",
+                    payload={
+                        "error": f"deck_executor_exception:{type(exc).__name__}",
+                        "detail": str(exc)[:500],
+                        "delivery_attempted": False,
+                    },
+                    claimed=claimed,
+                )
+                return
+            ok = isinstance(response, Mapping) and response.get("ok") is True
+            delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
+            completed = bool(ok and response.get("controller_completion_verified") is True and response.get("semantic_state_committed") is True)
+            terminal_status = "completed" if completed else ("ambiguous" if delivery_attempted else "failed")
+            terminal_payload = {
+                "response": _bounded_json(response, 131072),
+                "completion_class": "deck_terminal" if completed else "deck_incomplete",
+                "delivery_attempted": delivery_attempted,
+                **({"outcome_unknown": True} if terminal_status == "ambiguous" else {}),
+            }
+            if terminal_status == "ambiguous":
+                mark_recovery = getattr(self.store, "mark_deck_recovery_required", None)
+                if callable(mark_recovery):
+                    mark_recovery(
+                        command_id,
+                        reason=str(response.get("error") if isinstance(response, Mapping) else "deck_outcome_unknown"),
+                        controller_command_acknowledged=bool(
+                            isinstance(response, Mapping)
+                            and response.get("controller_command_acknowledged") is True
+                        ),
+                        controller_completion_verified=bool(
+                            isinstance(response, Mapping)
+                            and response.get("controller_completion_verified") is True
+                        ),
+                        hardware_postcondition_verified=bool(
+                            isinstance(response, Mapping)
+                            and response.get("hardware_postcondition_verified") is True
+                        ),
+                        provider_results=[dict(response)] if isinstance(response, Mapping) else None,
+                    )
+            self.store.finish(
+                command_id,
+                status=terminal_status,
+                payload=terminal_payload,
+                remote_acknowledged=ok,
+                controller_acknowledged=bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
+                claimed=claimed,
+                full_response=response,
+            )
             return
         target = self._action_target(action_id)
         token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id, "idempotency_key": f"dispatch:{claimed['dispatch_attempt_id']}", "expected_ownership_generation": claimed["ownership_generation"], "action_id": action_id})
@@ -4109,6 +5616,70 @@ class OperatorCommandPlane:
         async def resolve_recovery(recovery_epoch: int, request: RecoveryResolveRequest) -> dict[str, Any]:
             return await asyncio.to_thread(self.store.resolve_recovery, recovery_epoch, request.model_dump())
 
+        @router.post("/recovery/deck/{command_id}/reconcile")
+        async def reconcile_deck_recovery(command_id: str, request: DeckReconciliationRequest) -> dict[str, Any]:
+            payload = request.model_dump()
+            current_location = payload["current_location"]
+            current_well = payload["current_well"]
+            approved_home_state = payload["approved_home_state"]
+            if approved_home_state is None:
+                if current_location is None or current_well is None:
+                    raise HTTPException(status_code=422, detail={"error": "canonical_location_and_well_required"})
+            elif current_location is not None or current_well is not None:
+                raise HTTPException(status_code=422, detail={"error": "reconciliation_dispositions_are_mutually_exclusive"})
+            provider = getattr(self.app.state, "oem_deck_provider", None)
+            table_provider = getattr(self.app.state, "oem_deck_position_table_provider", None)
+            snapshot_reader = getattr(provider, "deck_reconciliation_snapshot", None)
+            lease_factory = getattr(provider, "movement_lease", None)
+            if not callable(snapshot_reader) or not callable(lease_factory) or not callable(table_provider):
+                raise HTTPException(status_code=503, detail={"error": "deck_reconciliation_provider_truth_unavailable"})
+            state = self._state()
+            generation = state.get("ownership_generation")
+            if type(generation) is not int or generation < 0:
+                raise HTTPException(status_code=503, detail={"error": "deck_reconciliation_generation_unavailable"})
+            try:
+                from .oem_deck_catalog import DeckCatalog
+
+                table = table_provider()
+                if approved_home_state is None:
+                    table.resolve(location_id=str(current_location))
+                catalog_revision = DeckCatalog.from_position_table(table).revision
+
+                def final_authority_reader() -> Mapping[str, Any]:
+                    current = snapshot_reader(expected_generation=generation)
+                    if not isinstance(current, Mapping):
+                        raise ValueError("final provider reconciliation snapshot is not a mapping")
+                    return current
+
+                with lease_factory():
+                    authority = snapshot_reader(expected_generation=generation)
+                    if not isinstance(authority, Mapping):
+                        raise ValueError("provider reconciliation snapshot is not a mapping")
+                    return await asyncio.to_thread(
+                        self.store.reconcile_deck_recovery,
+                        command_id=command_id,
+                        current_location=current_location,
+                        current_well=current_well,
+                        current_authority=dict(authority),
+                        current_position_table_revision=str(table.digest),
+                        current_destination_catalog_revision=str(catalog_revision),
+                        decision={
+                            "decision_id": payload["decision_id"],
+                            "approved_by": payload["approved_by"],
+                            "reason": payload["reason"],
+                            "operator_ack": payload["operator_ack"],
+                        },
+                        approved_home_state=approved_home_state,
+                        final_authority_reader=final_authority_reader,
+                    )
+            except HTTPException:
+                raise
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "deck_reconciliation_rejected", "reason": str(exc)[:500]},
+                ) from exc
+
         @router.get("/idempotency/{operation_kind}/{idempotency_key}")
         async def idempotency(operation_kind: str, idempotency_key: str) -> dict[str, Any]:
             value = await asyncio.to_thread(self.store.idempotency, operation_kind, idempotency_key)
@@ -4167,7 +5738,7 @@ class OperatorCommandPlane:
                 "observed_ownership_generation": actual_generation,
                 "requested_board_epoch_by_board": requested_epochs,
                 "observed_board_epoch_by_board": actual_epochs,
-                "board_epoch_policy": "observational_not_dispatch_fence",
+                "board_epoch_policy": "required_dispatch_execution_fence",
             },
         }
         return await asyncio.to_thread(

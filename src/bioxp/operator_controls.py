@@ -1391,9 +1391,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     add_semantic_alias(
         action_id="oem.z.set_clean_path",
         path="/motion/oem/z/path_clean_mode",
-        label="Set OEM clean-path mode",
-        description="Persist m_controlLib.cleanPath under the current provider generation; subsequent live scriptmoveTo planning reads this state instead of caller payload.",
-        source_anchor="ClassControlInterface.scriptmoveTo:3875-3903",
+        label="Validate and publish OEM clean-path expectation",
+        description="Validate the compatibility Boolean against current authoritative tray-0 tip availability, then publish independently derived !tipAvailable(0); mismatch or stale source state fails closed.",
+        source_anchor="ControlLib.cleanPath:413-423; ClassMachineStatus.tipAvailable:489-492",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
@@ -1681,6 +1681,34 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         dispatch["meta.initialize_motion"] = initialize_motion_route
     actions.extend(meta)
     actions = [row for row in actions if not str(row.get("action_id", "")).startswith("oem.y.internal.")]
+    from .oem_deck_catalog import public_target_keys
+    actions.append({
+        "action_id": "oem.deck.move_to_location",
+        "label": "OEM Deck Move to Location",
+        "subsystem": "motion",
+        "category": "deck",
+        "kind": "canonical_method",
+        "safety_class": "motion",
+        "description": "Finite source-shaped Serial-206 named deck movement through the durable global worker.",
+        "source_anchor": "ClassControlInterface.btnLOC1_Click",
+        "informational_method": "INTERNAL",
+        "informational_path": None,
+        "required_provider_capability": "initialize_motors",
+        "provider_available": True,
+        "available": True,
+        "enabled": True,
+        "disabled_reason": None,
+        "dependencies": [],
+        "requires_confirmation": False,
+        "timeout_seconds": 360.0,
+        "inputs": [
+            {"name": "target", "required": True, "type": "string", "enum": sorted(public_target_keys())},
+            {"name": "camera_offset", "required": True, "type": "boolean"},
+        ],
+        "stages": [],
+        "required_board_epochs": [4, 5],
+        "raw_coordinate_inputs": False,
+    })
     return actions, dispatch
 
 
@@ -1866,6 +1894,8 @@ def install_operator_control_plane(
     lifecycle_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     serial206_initialization_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     pipette_status_provider: Callable[[], Mapping[str, Any]] | None = None,
+    oem_deck_provider: Callable[[], Any] | None = None,
+    oem_deck_position_table_provider: Callable[[], Any] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -1965,6 +1995,122 @@ def install_operator_control_plane(
     )
     app.state.operator_command_plane = command_plane
     app.state.operator_receipt_store = store
+    if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
+        from .oem_deck_movement import make_deck_command_executor
+        installed_deck_provider = oem_deck_provider()
+        semantic_binder = getattr(installed_deck_provider, "bind_deck_semantic_state_reader", None)
+        if callable(semantic_binder):
+            semantic_binder(command_plane.store.deck_semantic_state)
+        semantic_publisher_binder = getattr(installed_deck_provider, "bind_deck_semantic_state_publisher", None)
+        if callable(semantic_publisher_binder):
+            semantic_publisher_binder(command_plane.store.publish_deck_owner_state)
+        tip_tray_reader_binder = getattr(installed_deck_provider, "bind_tip_tray_state_reader", None)
+        if callable(tip_tray_reader_binder):
+            tip_tray_reader_binder(command_plane.store.tip_tray_state)
+        tip_tray_publisher_binder = getattr(installed_deck_provider, "bind_tip_tray_state_publisher", None)
+        if callable(tip_tray_publisher_binder):
+            tip_tray_publisher_binder(command_plane.store.publish_tip_tray_transition)
+        bootstrap_reader = getattr(installed_deck_provider, "deck_semantic_bootstrap_snapshot", None)
+        if (
+            callable(bootstrap_reader)
+            and command_plane.store.deck_semantic_state()["semantic_state_revision"] == 0
+        ):
+            try:
+                bootstrap_snapshot = bootstrap_reader(
+                    expected_generation=int(machine_state().get("ownership_generation") or 0)
+                )
+                if not isinstance(bootstrap_snapshot, Mapping):
+                    raise TypeError("deck semantic bootstrap snapshot must be a mapping")
+                command_plane.store.bootstrap_deck_semantic_state(bootstrap_snapshot)
+            except (KeyError, RuntimeError, TypeError, ValueError):
+                # An incomplete predecessor snapshot remains fail-closed; the
+                # catalog reports canonical authority unavailable.
+                pass
+        app.state.oem_deck_provider = installed_deck_provider
+        app.state.oem_deck_position_table_provider = oem_deck_position_table_provider
+        app.state.oem_deck_command_executor = make_deck_command_executor(
+            provider_getter=oem_deck_provider,
+            position_table_provider=oem_deck_position_table_provider,
+            command_store=command_plane.store,
+        )
+
+    def deck_contract(state: Mapping[str, Any]) -> dict[str, Any]:
+        disabled_reason: str | None = None
+        recovery_disabled_reason: str | None = None
+        try:
+            recovery_disabled_reason = command_plane.store.deck_recovery_blocker()
+        except Exception:
+            recovery_disabled_reason = "deck_recovery_state_inconsistent"
+        if not callable(getattr(app.state, "oem_deck_command_executor", None)):
+            disabled_reason = "canonical_deck_executor_unavailable"
+        if disabled_reason is None and (oem_deck_provider is None or oem_deck_position_table_provider is None):
+            disabled_reason = "canonical_deck_binding_unavailable"
+        provider = oem_deck_provider() if disabled_reason is None and oem_deck_provider is not None else None
+        required_provider_methods = (
+            "movement_lease", "force_to_high_home", "deck_authority_snapshot",
+            "moveTo", "moveZCamera", "parkGantry",
+        )
+        if disabled_reason is None and provider is None:
+            disabled_reason = "canonical_deck_provider_incomplete"
+        if disabled_reason is None:
+            missing_method = next(
+                (name for name in required_provider_methods if not callable(getattr(provider, name, None))),
+                None,
+            )
+            if missing_method is not None:
+                disabled_reason = f"canonical_deck_provider_incomplete:{missing_method}"
+        table = None
+        catalog = None
+        snapshot = None
+        if disabled_reason is None:
+            try:
+                from .oem_deck_catalog import DeckCatalog
+                table = oem_deck_position_table_provider()  # type: ignore[misc]
+                catalog = DeckCatalog.from_position_table(table)
+                snapshot_reader = getattr(provider, "deck_authority_snapshot")
+                snapshot = snapshot_reader(
+                    expected_generation=int(state.get("ownership_generation") or 0)
+                )
+            except Exception as exc:
+                disabled_reason = f"canonical_deck_authority_unavailable:{type(exc).__name__}"
+        options = []
+        if catalog is not None:
+            source_anchor_by_branch = {
+                "ordinary": ["ClassControlInterface.btnLOC1_Click:1932-1959", "ClassControlInterface.moveTo:3691-3716"],
+                "barcode": ["ClassControlInterface.btnLOC1_Click:1932-1959", "CAMERA_OFFSET"],
+                "park": ["ClassControlInterface.btnLOC1_Click:1932-1959", "ControlLib.parkGantry:7071-7122"],
+            }
+            options = [
+                {
+                    "target": row["target"],
+                    "label": row["panel_label"],
+                    "aliases": list(row["aliases"]),
+                    "location_id": int(row["location_id"]),
+                    "branch_kind": row["branch"],
+                    "camera_offset_option": row["branch"] == "ordinary",
+                    "source_anchors": source_anchor_by_branch[row["branch"]],
+                }
+                for row in catalog.rows()
+            ]
+        disabled_reason = recovery_disabled_reason or disabled_reason
+        options = [
+            {**row, "enabled": disabled_reason is None, "disabled_reason": disabled_reason}
+            for row in options
+        ]
+        board_epochs = (
+            {"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
+            if isinstance(snapshot, Mapping) else {}
+        )
+        return {
+            "enabled": disabled_reason is None,
+            "disabled_reason": disabled_reason,
+            "required_boards": [4, 5],
+            "expected_board_epoch_by_board": board_epochs,
+            "required_references": ["x", "y", "z", "g"],
+            "position_table_revision": table.digest if table is not None else None,
+            "destination_catalog_revision": catalog.revision if catalog is not None else None,
+            "destination_options": options,
+        }
     app.include_router(command_plane.router)
 
     def replay_authority_fingerprint(state: Mapping[str, Any]) -> str:
@@ -2133,7 +2279,17 @@ def install_operator_control_plane(
         y_rows = [row for row in compact if str(row.get("action_id", "")).startswith("oem.y.")]
         y_axis["active_command"] = next((row for row in y_rows if not row["terminal"]), None)
         y_axis["latest_compact_receipt"] = y_rows[0] if y_rows else None
-        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
+        deck_state = command_plane.store.deck_semantic_state()
+        deck_authority = deck_contract(state)
+        deck = {
+            "current_location": deck_state.get("current_location"),
+            "current_well": deck_state.get("current_well"),
+            "semantic_state_revision": int(deck_state.get("semantic_state_revision") or 0),
+            "position_table_revision": deck_authority.get("position_table_revision"),
+            "destination_catalog_revision": deck_authority.get("destination_catalog_revision"),
+            "ambiguity_state": str(deck_state.get("ambiguity_state") or "none"),
+        }
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
     @router.get("/v2/dashboard")
     async def operator_dashboard_v2() -> dict[str, Any]:
@@ -2145,7 +2301,31 @@ def install_operator_control_plane(
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
         dashboard = _v2_dashboard(state, await asyncio.to_thread(command_plane.store.queue), await asyncio.to_thread(command_plane.store.list_commands, limit=25))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if command_plane.is_canonical(str(action["action_id"]))]}
+        action_rows = []
+        for action in actions:
+            if not command_plane.is_canonical(str(action["action_id"])):
+                continue
+            if action["action_id"] == "oem.deck.move_to_location":
+                assessment = deck_contract(state)
+            else:
+                assessment = assessed_action(action, state)
+            action_rows.append({
+                "action_id": str(action["action_id"]),
+                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2",
+                "interrupt": str(action["safety_class"]) == "stop",
+                "enabled": bool(assessment.get("enabled")),
+                "disabled_reason": assessment.get("disabled_reason"),
+                **({
+                    "required_boards": assessment["required_boards"],
+                    "expected_board_epoch_by_board": assessment["expected_board_epoch_by_board"],
+                    "required_references": assessment["required_references"],
+                    "position_table_revision": assessment["position_table_revision"],
+                    "destination_catalog_revision": assessment["destination_catalog_revision"],
+                    "destination_options": assessment["destination_options"],
+                } if action["action_id"] == "oem.deck.move_to_location" else {}),
+            })
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
@@ -2201,7 +2381,7 @@ def install_operator_control_plane(
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
-        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("raw_return_layers") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
+        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("raw_return_layers") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or []), "deck_movement": dict(row["deck_movement"]) if isinstance(row.get("deck_movement"), Mapping) else None}
 
     async def _v2_method_receipt(method: Mapping[str, Any]) -> dict[str, Any]:
         raw_status = str(method.get("status") or "queued")

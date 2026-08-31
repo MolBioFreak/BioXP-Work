@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
+import json
+import re
 from typing import Any, Iterable, Mapping
 
 from ..oem_config import find_oem_machine_config_bundle
@@ -11,6 +14,36 @@ OEM_Y_INCREMENT = 2132
 OEM_PSEUDO_Z_HOME_HIGH = 500
 OEM_PSEUDO_Z_HOME_LOW = 65000
 OEM_SCRIPT_TIP_ADJUST_EXEMPT_LOCATION_IDS = {"TECANRACK1", "TECANRACK2", "TECANRACK3", "TECANRACK4", "WASTE_BIN", "LOC_TROUGH"}
+OEM_LOCATION_NAMES = frozenset({
+    "LOC_MS", "LOC_OC", "LOC_TC", "LOC_RC", "LOC_BSCS", "LOC_BSC", "WASTE_BIN",
+    "TECANRACK1", "TECANRACK2", "TECANRACK3", "TECANRACK4", "LOC_STRIP1", "LOC_STRIP2",
+    "LOC_STRIP3", "LOC_STRIP4", "LOC_TIP_HOTEL", "LOC_TROUGH", "LOC_OC_COVER",
+    "LOC_OC_COVER_STORAGE", "LOC_RC_COVER", "LOC_RC_COVER_STORAGE", "LOC_P_OC", "LOC_P_OC_PRESS",
+    "LOC_P_TC", "LOC_P_TC_PRESS", "LOC_P_MS", "LOC_P_MS_PRESS", "LOC_P_RC_PRESS", "LOC_PARK",
+    "LOC_GANTRY", "LOC_CHECK_POINT", "CAMERA_OFFSET", "UNKNOWN",
+})
+
+
+def well_id_from_label(value: str | int) -> int:
+    if type(value) is int:
+        well_id = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        well_id = int(value.strip())
+    elif isinstance(value, str):
+        match = re.fullmatch(r"([A-Ha-h])(1[0-2]|[1-9])", value.strip())
+        if match is None:
+            raise ValueError("well must be A1..H12 or canonical integer 0..95")
+        well_id = (ord(match.group(1).upper()) - ord("A")) * 12 + int(match.group(2)) - 1
+    else:
+        raise ValueError("well must be A1..H12 or canonical integer 0..95")
+    if not 0 <= well_id <= 95:
+        raise ValueError("well ID must be in 0..95")
+    return well_id
+
+
+def well_label_from_id(value: int) -> str:
+    well_id = well_id_from_label(value)
+    return f"{chr(ord('A') + well_id // 12)}{well_id % 12 + 1}"
 
 
 @dataclass(frozen=True)
@@ -61,12 +94,25 @@ class PositionTarget:
 class PositionTable:
     """OEM PositionTable resolver/planner using ClassControlInterface formulas."""
 
-    def __init__(self, targets: Iterable[PositionTarget], *, source: str = "inline") -> None:
+    def __init__(self, targets: Iterable[PositionTarget], *, source: str = "inline", source_sha256: str | None = None, adjustment_ledger: Iterable[Mapping[str, Any]] = ()) -> None:
         self.source = source
         self._targets = tuple(targets)
+        self.source_sha256 = source_sha256
+        self.adjustment_ledger = tuple(dict(row) for row in adjustment_ledger)
         self._by_key: dict[tuple[str, str | None, str | None], PositionTarget] = {}
         for target in self._targets:
-            self._by_key[self._key(target.location_id, target.well_id, target.plate_name)] = target
+            key = self._key(target.location_id, target.well_id, target.plate_name)
+            if key in self._by_key:
+                raise ValueError(f"duplicate canonical PositionTable row: {target.location_id}")
+            self._by_key[key] = target
+        canonical = {
+            "schema_version": "bioxp.oem_position_table.v2",
+            "source": self.source,
+            "source_sha256": self.source_sha256,
+            "rows": [target.to_payload() for target in self._targets],
+            "adjustment_ledger": list(self.adjustment_ledger),
+        }
+        self.digest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
     @staticmethod
     def _clean(value: Any) -> str | None:
@@ -83,19 +129,40 @@ class PositionTable:
         return (location.upper(), None if well_id is None else str(well_id).strip().upper(), None if plate_name is None else str(plate_name).strip().lower())
 
     @classmethod
-    def from_rows(cls, rows: Iterable[Mapping[str, Any]], *, source: str = "inline-position-row") -> "PositionTable":
+    def from_rows(cls, rows: Iterable[Mapping[str, Any]], *, source: str = "inline-position-row", source_sha256: str | None = None) -> "PositionTable":
         targets: list[PositionTarget] = []
+        adjustments: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for row in rows:
             location_id = row.get("locationID") or row.get("location_id") or row.get("location") or row.get("name")
+            canonical_location = str(location_id or "").strip().upper()
+            if canonical_location not in OEM_LOCATION_NAMES:
+                raise ValueError(f"unknown OEM PositionTable location: {canonical_location or '<missing>'}")
+            if canonical_location in seen:
+                raise ValueError(f"duplicate canonical PositionTable row: {canonical_location}")
+            seen.add(canonical_location)
             well_id = row.get("wellID") or row.get("well_id") or row.get("well")
             plate_name = row.get("plateName") or row.get("plate_name") or row.get("plate")
             x = int(float(row.get("x", 0) or 0)); y = int(float(row.get("y", 0) or 0))
             z_low = int(float(row.get("zLow", row.get("z_low", 0)) or 0)) if row.get("zLow", row.get("z_low")) is not None else None
-            z_delta = int(float(row.get("zDelta", row.get("z_delta", 0)) or 0)) if row.get("zDelta", row.get("z_delta")) is not None else None
-            z_high = row.get("zHigh", row.get("z_high"))
-            if z_high is None and z_low is not None and z_delta is not None:
-                z_high = z_low - z_delta
-            z_high_int = int(float(z_high)) if z_high is not None else None
+            z_delta = int(float(row.get("zDelta", row.get("z_delta", 0)) or 0)) if row.get("zDelta", row.get("z_delta")) is not None else 0
+            z_high_raw = row.get("zHigh", row.get("z_high", 0))
+            z_high_int = int(float(z_high_raw or 0))
+            if canonical_location.startswith("TECAN"):
+                before = {"zHigh": z_high_int, "zDelta": z_delta}
+                z_delta = 53000
+                z_high_int = int(z_low or 0) - z_delta
+                adjustments.append({"location_id": canonical_location, "kind": "tecan_z_derivation", "before": before, "after": {"zHigh": z_high_int, "zDelta": z_delta}, "source_anchor": "ClassBioXPSettings.PositionTable loader"})
+            elif z_delta == 0:
+                z_delta = int(z_low or 0) - z_high_int
+                adjustments.append({"location_id": canonical_location, "kind": "derive_z_delta", "after": z_delta, "source_anchor": "ClassBioXPSettings.PositionTable loader"})
+            elif z_high_int == 0:
+                z_high_int = int(z_low or 0) - z_delta
+                adjustments.append({"location_id": canonical_location, "kind": "derive_z_high", "after": z_high_int, "source_anchor": "ClassBioXPSettings.PositionTable loader"})
+            if z_high_int < 5000:
+                if z_high_int != 0:
+                    adjustments.append({"location_id": canonical_location, "kind": "z_high_below_5000_to_zero", "before": z_high_int, "after": 0, "source_anchor": "ClassBioXPSettings.PositionTable loader"})
+                z_high_int = 0
             inc_factor = int(float(row.get("inc_factor", row.get("incFactor", 0)) or 0))
             coords = {
                 "x": x,
@@ -106,16 +173,59 @@ class PositionTable:
                 "z": int(z_high_int if z_high_int is not None else (z_low if z_low is not None else 0)),
             }
             offsets = {"x": int(float(row.get("xOffset", row.get("x_offset", 0)) or 0)), "y": int(float(row.get("yOffset", row.get("y_offset", 0)) or 0)), "z": int(float(row.get("zOffset", row.get("z_offset", 0)) or 0))}
-            targets.append(PositionTarget(location_id=str(location_id).strip().upper(), well_id=None if well_id is None else str(well_id).strip().upper(), plate_name=None if plate_name is None else str(plate_name).strip().lower(), base_coordinates=coords, offsets=offsets, z_low=z_low, z_high=z_high_int, z_delta=z_delta, inc_factor=inc_factor, source_anchor=str(row.get("source") or row.get("source_anchor") or source)))
-        return cls(targets, source=source)
+            targets.append(PositionTarget(location_id=canonical_location, well_id=None if well_id is None else str(well_id).strip().upper(), plate_name=None if plate_name is None else str(plate_name).strip().lower(), base_coordinates=coords, offsets=offsets, z_low=z_low, z_high=z_high_int, z_delta=z_delta, inc_factor=inc_factor, source_anchor=str(row.get("source") or row.get("source_anchor") or source)))
+
+        by_location = {target.location_id: index for index, target in enumerate(targets)}
+
+        def repair_xy(target_name: str, source_name: str, kind: str, *, x_only: bool = False) -> None:
+            target_index = by_location.get(target_name)
+            source_index = by_location.get(source_name)
+            if target_index is None or source_index is None:
+                return
+            target = targets[target_index]
+            source_target = targets[source_index]
+            before = dict(target.base_coordinates)
+            if x_only:
+                if before["x"] == source_target.base_coordinates["x"]:
+                    return
+                after = {**before, "x": int(source_target.base_coordinates["x"])}
+            else:
+                if before["x"] != 0 and before["y"] != 0:
+                    return
+                after = {
+                    **before,
+                    "x": int(source_target.base_coordinates["x"]),
+                    "y": int(source_target.base_coordinates["y"]),
+                }
+            targets[target_index] = replace(target, base_coordinates=after)
+            adjustments.append({
+                "location_id": target_name,
+                "kind": kind,
+                "before": before,
+                "after": after,
+                "source_anchor": "ClassBioXPSettings.cs:3477-3508",
+            })
+
+        # Preserve the source post-load repair order exactly.
+        repair_xy("LOC_P_OC", "LOC_P_MS", "align_output_plate_x", x_only=True)
+        repair_xy("LOC_P_MS_PRESS", "LOC_P_MS", "repair_ms_press_xy")
+        repair_xy("LOC_P_OC_PRESS", "LOC_P_OC", "repair_oc_press_xy")
+        repair_xy("LOC_P_TC_PRESS", "LOC_P_TC", "repair_tc_press_xy")
+        return cls(targets, source=source, source_sha256=source_sha256, adjustment_ledger=adjustments)
 
     @classmethod
     def from_bound_machine_config(cls, root_dir: str | OemMachineSnapshot | None = None) -> "PositionTable":
         if isinstance(root_dir, OemMachineSnapshot):
-            return cls.from_rows(root_dir.position_table, source="immutable_oem_machine_snapshot.PositionTable")
+            config_record = root_dir.records.get("GenBotApp/config.xml")
+            source_sha256 = getattr(config_record, "sha256", None)
+            return cls.from_rows(
+                root_dir.position_table,
+                source="immutable_oem_machine_snapshot.PositionTable",
+                source_sha256=str(source_sha256) if source_sha256 else None,
+            )
         if root_dir is None:
             snapshot = get_active_oem_machine_snapshot()
-            return cls.from_rows(snapshot.position_table, source="immutable_oem_machine_snapshot.PositionTable")
+            return cls.from_bound_machine_config(snapshot)
         bundle = find_oem_machine_config_bundle(root_dir)
         if not isinstance(bundle, dict) or bundle.get("ok") is not True:
             raise RuntimeError(f"OEM machine config not bound: {bundle}")
@@ -124,6 +234,9 @@ class PositionTable:
 
     def rows(self) -> list[dict[str, Any]]:
         return [target.to_payload() for target in self._targets]
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {"schema_version": "bioxp.oem_position_table.v2", "source": self.source, "source_sha256": self.source_sha256, "position_table_sha256": self.digest, "rows": self.rows(), "adjustment_ledger": [dict(row) for row in self.adjustment_ledger]}
 
     def resolve_nearest(self, *, x: int, y: int) -> tuple[str, int]:
         """Resolve the immutable position-table entry nearest to a live position.

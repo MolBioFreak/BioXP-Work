@@ -63,18 +63,216 @@
       "size": 28160
     }
   ],
+  "canonical_named_deck_action": {
+    "action_id": "oem.deck.move_to_location",
+    "claim_boundary": "Static exact-source closure for the canonical named deck action; no controller or physical claim.",
+    "linux_provider_methods": [
+      "movement_lease",
+      "force_to_high_home",
+      "deck_authority_snapshot",
+      "moveTo",
+      "moveZCamera",
+      "parkGantry"
+    ],
+    "source_hazard_ids": [
+      "ROUTE_ALWAYS_TRUE_LOCATION_TEST",
+      "VISION_INVALID_IL_REGIONS"
+    ],
+    "source_method_ids": [
+      "ClassControlInterface.btnLOC1_Click@1770",
+      "ClassControlInterface.moveTo@3663",
+      "ClassControlInterface.moveTo@3691",
+      "ClassControlInterface.scriptmoveTo@3718",
+      "ClassControlInterface.scriptmoveTo@3734",
+      "ClassControlInterface.moveTo@4463",
+      "ClassControlInterface.getMidPoint@5254",
+      "ControlLib.movExecution@6706",
+      "ControlLib.parkGantry@7071",
+      "ControlLib.pressPlates@5154",
+      "ControlLib.releasePlate@8116",
+      "ControlLib.catchPlate@8262",
+      "ClassMachineStatus.updateLocation@494",
+      "ClassMachineStatus.updatePlateLocation@691",
+      "ClassMachineStatus.LoadGantry@957"
+    ]
+  },
   "claim_boundary": "Static source/binary/configuration registry only; no deployment, transport, controller, or physical parity claim.",
   "counts": {
     "binaries": 8,
-    "known_hazards": 17,
+    "known_hazards": 18,
     "live_machine_records": 19,
-    "methods_and_members": 394,
+    "methods_and_members": 401,
     "ordered_call_sequences": 3,
     "required_branch_outcomes": 7,
     "required_call_edges": 76,
-    "sources": 32
+    "sources": 33
   },
   "created_date": "2026-07-23",
+  "finite_destination_denominator": {
+    "configured_position_table_row_count": 29,
+    "distinct_location_id_count": 24,
+    "entries": [
+      {
+        "canonical_request_key": "LOC_MS",
+        "location_id": 0,
+        "panel_label": "LOC_MS",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_OC",
+        "location_id": 1,
+        "panel_label": "LOC_OC",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "TECANRACK2",
+        "location_id": 8,
+        "panel_label": "TIP TRAY 2",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "TECANRACK4",
+        "location_id": 10,
+        "panel_label": "TIP TRAY_4",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_P_MS",
+        "location_id": 25,
+        "panel_label": "LOC_MS_PLATE",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_P_OC",
+        "location_id": 21,
+        "panel_label": "LOC_OC_PLATE",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_OC_COVER",
+        "location_id": 17,
+        "panel_label": "LOC_OC_COVER",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_TC",
+        "location_id": 2,
+        "panel_label": "LOC_TC",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_TC_BARCODE",
+        "location_id": 2,
+        "panel_label": "LOC_TC_BARCODE",
+        "source_branch": "barcode"
+      },
+      {
+        "canonical_request_key": "LOC_RC",
+        "location_id": 3,
+        "panel_label": "LOC_RC",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_RC_BARCODE",
+        "location_id": 3,
+        "panel_label": "LOC_RC_BARCODE",
+        "source_branch": "barcode"
+      },
+      {
+        "canonical_request_key": "TECANRACK1",
+        "location_id": 7,
+        "panel_label": "TIP TRAY 1",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "TECANRACK3",
+        "location_id": 9,
+        "panel_label": "TIP TRAY_3",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_P_TC",
+        "location_id": 23,
+        "panel_label": "LOC_TC_PLATE",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_BSC",
+        "location_id": 5,
+        "panel_label": "LOC_TC_COVER",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_RC_COVER",
+        "location_id": 19,
+        "panel_label": "LOC_RC_COVER",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_STRIP1",
+        "location_id": 11,
+        "panel_label": "STRIP 1",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_STRIP2",
+        "location_id": 12,
+        "panel_label": "STRIP 2",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_STRIP3",
+        "location_id": 13,
+        "panel_label": "STRIP 3",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_STRIP4",
+        "location_id": 14,
+        "panel_label": "STRIP 4",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_OC_COVER_STORAGE",
+        "location_id": 18,
+        "panel_label": "LOC_OC_COVER_S",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_RC_COVER_STORAGE",
+        "location_id": 20,
+        "panel_label": "LOC_RC_COVER_S",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_TROUGH",
+        "location_id": 16,
+        "panel_label": "LOC_TROUGH1",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_BSCS",
+        "location_id": 4,
+        "panel_label": "LOC_BSCS",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "WASTE_BIN",
+        "location_id": 6,
+        "panel_label": "Waste Bin",
+        "source_branch": "ordinary"
+      },
+      {
+        "canonical_request_key": "LOC_PARK",
+        "location_id": 28,
+        "panel_label": "Park",
+        "source_branch": "park"
+      }
+    ],
+    "enum_value_count": 47,
+    "panel_label_count": 26,
+    "source_anchor": "ClassControlInterface.btnLOC1_Click@1770:1770-1965; serial-206 config.xml PositionTable lines 30-60"
+  },
   "known_hazards": [
     {
       "detail": "Projected (ID & 7) cannot equal 259/260; coherent later mask uses ID & 0x107.",
@@ -155,10 +353,16 @@
       "source_ref": "ControlLib.cs:10688-11022"
     },
     {
-      "detail": "Unsafe enum/cast regions are projection evidence, not recompilable authority.",
-      "disposition": "mandatory_binary_disposition_before_executable_port",
-      "hazard_id": "VISION_INVALID_IL_REGIONS",
-      "source_ref": "ControlLib.cs:3665-3671,3780-3782,3827,3852-3858,3893-3899,7073-7078"
+      "detail": "Pinned raw IL resolves the TC/RC barcode offset movement and ControlLib.parkGantry(false) contracts despite unsafe-enum/cast artifacts in the decompiled projection.",
+      "disposition": "resolved_for_barcode_offsets_and_park_only",
+      "hazard_id": "BARCODE_PARK_INVALID_IL_RESOLVED_FROM_PINNED_BINARY",
+      "source_ref": "BioXPControlLib.dll sha256 163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed; tokens 0x060000CB,0x0600011E,0x0600012E,0x06000351"
+    },
+    {
+      "detail": "Unsafe enum/cast regions in unrelated cover and vision inspection methods remain projection evidence, not recompilable authority. The barcode/Park raw-IL resolution does not close this global vision hazard.",
+      "disposition": "unresolved_outside_governing_barcode_offset_scope",
+      "hazard_id": "VISION_INVALID_IL_REGIONS_UNRELATED",
+      "source_ref": "ControlLib.cs:3665-3671,3780-3782,3827,3852-3858,3893-3899"
     },
     {
       "detail": "CameraControlParameter.Gain is loaded from the selected profile but AdjustCamera does not apply it.",
@@ -7207,6 +7411,317 @@
       "source_id": "winusb",
       "start_line": 637,
       "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "private void btnLOC1_Click(object sender, RoutedEventArgs e)",
+      "decompiler_warning_lines": [
+        1772,
+        1773,
+        1774,
+        1775,
+        1776,
+        1777,
+        1778,
+        1779,
+        1780,
+        1781,
+        1782,
+        1783,
+        1784,
+        1785,
+        1786,
+        1787,
+        1788,
+        1789,
+        1790,
+        1791,
+        1792,
+        1793,
+        1794,
+        1795,
+        1796,
+        1797,
+        1798,
+        1799,
+        1800,
+        1801,
+        1802,
+        1803,
+        1804,
+        1805,
+        1806
+      ],
+      "end_line": 1965,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassControlInterface.btnLOC1_Click@1770",
+      "name": "btnLOC1_Click",
+      "source_id": "cci",
+      "start_line": 1770,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public int[] movExecution(int scriptLine, InterfaceScript moveToOptions)",
+      "decompiler_warning_lines": [
+        6708,
+        6709,
+        6710,
+        6711,
+        6712,
+        6713,
+        6714,
+        6715,
+        6716,
+        6717,
+        6718,
+        6719,
+        6720,
+        6721,
+        6722,
+        6723,
+        6724,
+        6725,
+        6726,
+        6727,
+        6728,
+        6729,
+        6730,
+        6731,
+        6732,
+        6733,
+        6734,
+        6735,
+        6736,
+        6737,
+        6738,
+        6739,
+        6740,
+        6741,
+        6742,
+        6743,
+        6744,
+        6745,
+        6746,
+        6747,
+        6748,
+        6749,
+        6750,
+        6751,
+        6752,
+        6753,
+        6754,
+        6755,
+        6756,
+        6757,
+        6758,
+        6759,
+        6760,
+        6761,
+        6762,
+        6763,
+        6764,
+        6765,
+        6766,
+        6767,
+        6768,
+        6769,
+        6770,
+        6771,
+        6772,
+        6773,
+        6774,
+        6775,
+        6776,
+        6777,
+        6778,
+        6779,
+        6780,
+        6781,
+        6782,
+        6783,
+        6784,
+        6785,
+        6786,
+        6787,
+        6788,
+        6789,
+        6790,
+        6791,
+        6792,
+        6793,
+        6794,
+        6795,
+        6796,
+        6797,
+        6798,
+        6799,
+        6800,
+        6801,
+        6802,
+        6803,
+        6804,
+        6805,
+        6806,
+        6807,
+        6808,
+        6809,
+        6810,
+        6811
+      ],
+      "end_line": 6994,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.movExecution@6706",
+      "name": "movExecution",
+      "source_id": "control",
+      "start_line": 6706,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "public void pressPlates(plateName[] plates, bool runInParallel = true)",
+      "decompiler_warning_lines": [
+        5156,
+        5157,
+        5158
+      ],
+      "end_line": 5191,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.pressPlates@5154",
+      "name": "pressPlates",
+      "source_id": "control",
+      "start_line": 5154,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPControlLib.dll",
+      "declaration": "private void updatePlateLocation(locationID location, plateName plate)",
+      "decompiler_warning_lines": [
+        7126,
+        7127
+      ],
+      "end_line": 7129,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ControlLib.updatePlateLocation@7124",
+      "name": "updatePlateLocation",
+      "source_id": "control",
+      "start_line": 7124,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "public virtual void updateLocation(locationID loc, wellID well)",
+      "decompiler_warning_lines": [
+        496,
+        497,
+        498,
+        499,
+        500,
+        501,
+        502,
+        503,
+        504,
+        505,
+        506,
+        507,
+        508,
+        509,
+        510,
+        511,
+        512,
+        513,
+        514,
+        515,
+        516,
+        517,
+        518,
+        519,
+        520,
+        521,
+        522,
+        523,
+        524,
+        525,
+        526,
+        527,
+        528,
+        529,
+        530,
+        531,
+        532,
+        533,
+        534,
+        535,
+        536,
+        537,
+        538,
+        539,
+        540,
+        541,
+        542,
+        543,
+        544,
+        545,
+        546,
+        547,
+        548,
+        549,
+        550,
+        551,
+        552,
+        553,
+        554,
+        555,
+        556,
+        557,
+        558,
+        559,
+        560,
+        561,
+        562
+      ],
+      "end_line": 653,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassMachineStatus.updateLocation@494",
+      "name": "updateLocation",
+      "source_id": "machinestatus",
+      "start_line": 494,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "public void updatePlateLocation(locationID location, plateName plate)",
+      "decompiler_warning_lines": [
+        693,
+        694,
+        695
+      ],
+      "end_line": 702,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassMachineStatus.updatePlateLocation@691",
+      "name": "updatePlateLocation",
+      "source_id": "machinestatus",
+      "start_line": 691,
+      "status": "present_hash_locked_and_line_bounded"
+    },
+    {
+      "binary_id": "BioXPCommonLib.dll",
+      "declaration": "public void LoadGantry(plateName? plate)",
+      "decompiler_warning_lines": [],
+      "end_line": 961,
+      "kind": "method",
+      "literal_sleeps": [],
+      "method_id": "ClassMachineStatus.LoadGantry@957",
+      "name": "LoadGantry",
+      "source_id": "machinestatus",
+      "start_line": 957,
+      "status": "present_hash_locked_and_line_bounded"
     }
   ],
   "ordered_call_sequences": [
@@ -7452,6 +7967,84 @@
       ]
     }
   ],
+  "raw_il_resolutions": {
+    "barcode_and_park": {
+      "binary_id": "BioXPControlLib.dll",
+      "binary_sha256": "163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed",
+      "linux_naming": {
+        "disposition": "provider_name_only_not_oem_source_name",
+        "linux_provider_method": "moveZCamera",
+        "oem_source_method": "moveZ"
+      },
+      "method_tokens": {
+        "btnLOC1_Click": "0x060000CB",
+        "moveTo_offset": "0x0600011E",
+        "moveZ": "0x0600012E",
+        "parkGantry": "0x06000351"
+      },
+      "scope": "Barcode movement offsets and parkGantry(false) only; vision algorithms are excluded by the governing specification.",
+      "source_confirmation": {
+        "limits": {
+          "lower_clamp": false,
+          "upper_clamp": "XHighLimit-50 / YHighLimit-50",
+          "x_high": 90263,
+          "x_low": 0,
+          "y_high": 102956,
+          "y_low": 0
+        },
+        "park": {
+          "already_parked": "authoritative-current-location no-I/O success",
+          "cleared_tip_child_order": [
+            "moveZ(80000)",
+            "moveX(79000)",
+            "set TipLoaded=false"
+          ],
+          "discarded_returns": [
+            "waste scriptmoveTo",
+            "ejectAllTips",
+            "queryTipStatus",
+            "moveZ",
+            "moveX",
+            "final scriptmoveTo"
+          ],
+          "entry": "ControlLib.parkGantry(false)",
+          "final_call": "scriptmoveTo(current location/well, Park=28, column=0, row=0, positionflag=2, runInParallel=true)",
+          "loaded_tip_child_order": [
+            "scriptmoveTo(Waste, runInParallel=false)",
+            "ejectAllTips(true,true)",
+            "queryTipStatus(all)",
+            "sleep(100ms-equivalent)",
+            "re-read TipExist"
+          ],
+          "manual_removal_linux_governance": "explicit failure/recovery outcome; no false canonical location commit",
+          "manual_removal_source_return": "early terminal when TipExist remains true",
+          "rehome_true_block": "skipped because caller passes false",
+          "source_location_update": "final successful scriptmoveTo owns the source-shaped location update"
+        },
+        "rc": {
+          "child_order": [
+            "moveTo",
+            "moveZ"
+          ],
+          "location_id": 3,
+          "x": "-23930 + CameraXOffset",
+          "y": "7582 + CameraYOffset",
+          "z": "CameraZOffset"
+        },
+        "tc": {
+          "child_order": [
+            "moveTo",
+            "moveZ"
+          ],
+          "location_id": 2,
+          "x": "-11847 + CameraXOffset",
+          "y": "7582 + CameraYOffset",
+          "z": "trunc_i4(-1350.5511600000034 + CameraZOffset)"
+        }
+      },
+      "source_status": "exact raw IL confirmed from pinned binary"
+    }
+  },
   "required_branch_outcomes": [
     {
       "branch_id": "environment_can_ready_admission",
@@ -9106,6 +9699,17 @@
       "role": "novo_usb_bulk_transport",
       "sha256": "d4423e07690f5029692fcb2ae13c11dd990f2c23e0ca1f12a1bf1059d08a07ec",
       "source_id": "winusb"
+    },
+    {
+      "absolute_path": "/home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/BioXP_SSD_Backup/decompiled_src_bioxpcommon/BioXPCommonLib/ClassMachineStatus.cs",
+      "binary_id": "BioXPCommonLib.dll",
+      "binary_map_status": "canonical_evidence_lock",
+      "binary_mapping_evidence": "evidence_lock_decompile_binary_map: /home/dalab/Desktop/ROBOT/BioXP 3200 Development Work/reports/bioxp_historical_run_forensics_20260717/derived/oem_runtime_parity_spec_20260719/OEM_EVIDENCE_LOCK.json",
+      "line_count": 1428,
+      "relative_path": "decompiled_src_bioxpcommon/BioXPCommonLib/ClassMachineStatus.cs",
+      "role": "semantic_machine_state_authority",
+      "sha256": "c3f400f9563caf3497ae00202228eab19018466efde9ea45efc92c7bbfb9c32b",
+      "source_id": "machinestatus"
     }
   ],
   "status_legend": {

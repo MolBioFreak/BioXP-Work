@@ -401,6 +401,10 @@ class BioXpTester:
         # source-equivalent deck voltage query and force-abort boundary; it is
         # deliberately not refreshed or cleared by timers or board activation.
         self._oem_24v_dropped = False
+        # OEM ClassControlInterface.m_latchStatus starts true and only latches
+        # false at source unlock/caught-plate solenoid-write boundaries.
+        self._oem_latch_status = True
+        self._oem_latch_status_generation = 0
         self._usb_sniff_ledger_path = None
         self._usb_sniff_ledger_run_id = None
         self._usb_sniff_ledger_seq = 0
@@ -1659,13 +1663,32 @@ class BioXpTester:
             max_reads=18,
             strict_match=True,
         )
+        ok = self._tmcl_success(ack)
         return {
             "board": int(self.BOARD_DECK),
             "cmd": 14,
             "type": int(io_type),
             "value_set": int(value),
             "ack": ack,
-            "ok": self._tmcl_success(ack),
+            "ok": ok,
+        }
+
+    def _mark_oem_latch_unlocked(self):
+        if getattr(self, "_oem_latch_status", True) is not False:
+            self._oem_latch_status_generation = int(
+                getattr(self, "_oem_latch_status_generation", 0)
+            ) + 1
+        self._oem_latch_status = False
+
+    def read_oem_latch_status(self):
+        value = getattr(self, "_oem_latch_status", None)
+        generation = getattr(self, "_oem_latch_status_generation", None)
+        if type(value) is not bool or type(generation) is not int:
+            return {"ok": False, "failure": "oem_latch_status_unavailable"}
+        return {
+            "ok": True,
+            "value": value,
+            "observation_id": f"oem-m_latchStatus:{generation}:{int(value)}",
         }
 
     def deck_io_query_matrix(self, io_types=(0, 1, 2, 3, 4, 5, 6, 7)):
@@ -2087,6 +2110,8 @@ class BioXpTester:
             max_reads=20,
             strict_match=True,
         )
+        if not bool(locked) and self._tmcl_success(ack):
+            self._mark_oem_latch_unlocked()
         # Reinforce with two non-blocking writes.
         for _ in range(2):
             self.send_tmcl(
@@ -6993,7 +7018,8 @@ class BioXpTester:
         if caught_plate and not bool(development_machine):
             x_home = caught_plate_x_home()
             solenoid = self.deck_io_set_type(2, 0)
-            self._oem_latch_status = False
+            if solenoid.get("ok") is True:
+                self._mark_oem_latch_unlocked()
             recovery = {
                 "x_home": x_home,
                 "solenoid": solenoid,

@@ -1013,3 +1013,36 @@ The registry is accepted only when automated validation proves:
 - Serial-206 configuration selection: closed-world and hash-locked.
 
 The remaining work is implementation, semantic equivalence testing, controller validation, interlock validation, and separately authorized physical acceptance—not source discovery.
+
+
+## 9. Canonical named deck action source closure
+
+This WP0/WP3 addendum binds `oem.deck.move_to_location` and provider methods `movement_lease`, `force_to_high_home`, `deck_authority_snapshot`, `moveTo`, `moveZCamera`, and `parkGantry` to the exact recovered source denominator. It is static evidence only and makes no controller or physical claim.
+
+| Method | Exact source range | Source SHA-256 | Captured binary | Binary SHA-256 |
+|---|---|---|---|---|
+| `btnLOC1_Click` | `ClassControlInterface.cs:1770-1965` | `86093e5270c82ea2e45cb4de449076372ca79d9485ba6de9565d5eb255811e6e` | `BioXPControlLib.dll` | `163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed` |
+| `movExecution` | `ControlLib.cs:6706-6994` | `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2` | `BioXPControlLib.dll` | `163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed` |
+| `pressPlates` | `ControlLib.cs:5154-5191` | `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2` | `BioXPControlLib.dll` | `163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed` |
+| `updatePlateLocation` wrapper | `ControlLib.cs:7124-7129` | `f69b3529dcb9723c705ac55ecb3f035010cc294d3891de096c165bb20116f6c2` | `BioXPControlLib.dll` | `163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed` |
+| `ClassMachineStatus.updateLocation` | `ClassMachineStatus.cs:494-653` | `c3f400f9563caf3497ae00202228eab19018466efde9ea45efc92c7bbfb9c32b` | `BioXPCommonLib.dll` | `c0e430426a5af34c4fcadf067d2598aa98392569fd0175661d6478f18833382e` |
+| `ClassMachineStatus.updatePlateLocation` | `ClassMachineStatus.cs:691-702` | `c3f400f9563caf3497ae00202228eab19018466efde9ea45efc92c7bbfb9c32b` | `BioXPCommonLib.dll` | `c0e430426a5af34c4fcadf067d2598aa98392569fd0175661d6478f18833382e` |
+| `ClassMachineStatus.LoadGantry` | `ClassMachineStatus.cs:957-961` | `c3f400f9563caf3497ae00202228eab19018466efde9ea45efc92c7bbfb9c32b` | `BioXPCommonLib.dll` | `c0e430426a5af34c4fcadf067d2598aa98392569fd0175661d6478f18833382e` |
+
+The JSON registry additionally binds the already line-locked location `moveTo` overloads, both `scriptmoveTo` overloads, primitive `moveTo`, `getMidPoint`, `parkGantry`, `releasePlate`, and `catchPlate`. Its finite destination denominator is 26 panel labels, 24 distinct configured destination IDs, and 29 Serial-206 PositionTable rows. `ROUTE_ALWAYS_TRUE_LOCATION_TEST` remains retained/deferred pending raw-IL resolution.
+
+## 14. Pinned raw-IL disposition for barcode offsets and Park
+
+The authoritative binary is `BioXPControlLib.dll`, SHA-256 `163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed`. Exact tokens are `btnLOC1_Click=0x060000CB`, offset `moveTo=0x0600011E`, Z `moveZ=0x0600012E`, and `parkGantry=0x06000351`.
+
+Raw IL confirms these source contracts:
+
+- TC uses location 2, X `-11847 + CameraXOffset`, Y `7582 + CameraYOffset`, and Z `trunc_i4(-1350.5511600000034 + CameraZOffset)`.
+- RC uses location 3, X `-23930 + CameraXOffset`, Y `7582 + CameraYOffset`, and Z `CameraZOffset`.
+- Both barcode branches call source `moveTo` before source `moveZ`, apply only the source upper clamp to `XHighLimit-50` / `YHighLimit-50`, and do not apply a lower clamp.
+- `moveZCamera` is only the Linux provider method name; the OEM source method is `moveZ`.
+- `ControlLib.parkGantry(false)` preserves the already-Park no-op, loaded-tip waste/eject/query/wait/re-read branch, manual-removal early terminal, cleared-tip Z 80000 then X 79000 branch, skipped `rehome=true` block, and final `scriptmoveTo(current location/well, Park=28, 0, 0, positionflag=2, runInParallel=true)` source location update.
+
+The source manual-removal early return is represented on Linux as an explicit governance failure/recovery outcome with no false canonical location commit. Source child order and discarded-return facts remain recorded in receipts.
+
+This resolution is intentionally narrow. Unrelated cover and vision algorithms remain unresolved outside the governing barcode-offset scope; **vision algorithms remain unresolved**, and the global vision hazard is not closed.

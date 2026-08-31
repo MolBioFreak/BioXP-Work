@@ -8,6 +8,7 @@ authority-bearing ledgers are persisted as one atomic state document.
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import json
 import math
@@ -22,6 +23,11 @@ from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
+from .oem_deck_movement import (
+    OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
+    canonical_movable_object_locations,
+    canonical_plate_name,
+)
 from .oem_serial206_initialization_contract import (
     OEM_INITIALIZE_MOTORS_STAGE_KEYS,
     SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA,
@@ -2342,6 +2348,19 @@ class Serial206ProductionPrimitiveAdapter:
             "controller_evidence": result.get("controller_evidence"),
         }
 
+    def eject_all_tips_for_oem_park(self) -> Any:
+        """Execute source ``ejectAllTips(true,true)`` for parkGantry."""
+        return self._run_audited_pipette(
+            "eject_all_tips_for_oem_park",
+            lambda transport: transport.eject_all_tips(
+                check_missing_tip=True,
+                wait=True,
+                channels=None,
+            ),
+            requested_inputs={"check_missing_tip": True, "wait": True, "channels": None},
+            lifecycle_stage_id="serial206.eject_all_tips_for_oem_park",
+        )
+
     def eject_all_tips(self) -> Any:
         if self._last_tip_channels is None:
             return {"ok": False, "failure": "exact_tip_query_required_before_eject"}
@@ -2432,6 +2451,46 @@ class Serial206ProductionPrimitiveAdapter:
             self.tester.motor_get_position(profile["board"], motor=profile.get("motor", 0))
         )
 
+    def deck_io_query_type(self, io_type: int) -> Mapping[str, Any]:
+        query = getattr(self.tester, "deck_io_query_type", None)
+        if not callable(query):
+            raise RuntimeError("deck_latch_sensor_reader_not_bound")
+        result = query(int(io_type))
+        if not isinstance(result, Mapping):
+            raise RuntimeError("deck_latch_sensor_observation_malformed")
+        return result
+
+    def read_oem_latch_status(self) -> Mapping[str, Any]:
+        reader = getattr(self.tester, "read_oem_latch_status", None)
+        if not callable(reader):
+            raise RuntimeError("oem_host_latch_status_reader_not_bound")
+        result = reader()
+        if not isinstance(result, Mapping):
+            raise RuntimeError("oem_host_latch_status_observation_malformed")
+        return result
+
+    def read_deck_semantic_observation(self) -> dict[str, Any]:
+        """Observe only exact canonical-well-zero PositionTable coordinates."""
+        coordinates = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
+        observation_id = hashlib.sha256(
+            json.dumps(coordinates, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        matches = [
+            row for row in load_bound_oem_position_table().rows()
+            if int(row["base_coordinates"]["x"]) == coordinates["x"]
+            and int(row["base_coordinates"]["y"]) == coordinates["y"]
+        ]
+        if not matches:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable")
+        if len(matches) != 1:
+            raise RuntimeError("deck_reconciliation_semantic_location_ambiguous")
+        return {
+            "location_id": str(matches[0]["location_id"]),
+            "well_id": 0,
+            **coordinates,
+            "controller_position_observation_id": observation_id,
+        }
+
     def _prepare_path_axis(
         self,
         axis: str,
@@ -2476,6 +2535,50 @@ class Serial206ProductionPrimitiveAdapter:
             )
         return self.oem_move_axis_absolute(axis_key, int(position), wait_for_stop=True)
 
+    def _oem_controller_child_evidence(self, result: Any) -> dict[str, bool]:
+        """Normalize only explicit production ACK/terminal evidence for one child."""
+        if not isinstance(result, Mapping):
+            return {"command_required": True, "acknowledged": False, "terminal": False}
+        source_noop = result.get("source_noop") is True
+        before = result.get("before")
+        requested = result.get("effective_position", result.get("requested_position"))
+        noop_terminal = bool(
+            source_noop
+            and isinstance(before, Mapping)
+            and type(before.get("position")) is int
+            and type(requested) is int
+            and before.get("position") == requested
+        )
+        acknowledged = result.get("controller_command_acknowledged") is True
+        if not source_noop and not acknowledged:
+            acknowledged = self._x_tmcl_success(result.get("ack")) or self._x_tmcl_success(
+                result.get("retry_ack")
+            )
+        terminal = bool(
+            result.get("controller_terminal_state_verified") is True
+            or result.get("controller_completion_verified") is True
+            or result.get("completion_verified") is True
+        )
+        wait = result.get("wait")
+        completion_class = result.get("completion_class")
+        if not terminal and isinstance(wait, Mapping) and wait.get("ok") is True:
+            terminal = completion_class == "event_128"
+        if not terminal and completion_class == "oem_timeout_target_equal":
+            timeout_position = result.get("timeout_position")
+            terminal = bool(
+                isinstance(timeout_position, Mapping)
+                and type(timeout_position.get("position")) is int
+                and type(result.get("requested_position")) is int
+                and timeout_position.get("position") == result.get("requested_position")
+            )
+        if source_noop:
+            terminal = noop_terminal
+        return {
+            "command_required": not source_noop,
+            "acknowledged": bool(acknowledged),
+            "terminal": bool(terminal),
+        }
+
     def oem_move_axis_absolute(
         self,
         axis: str,
@@ -2492,11 +2595,15 @@ class Serial206ProductionPrimitiveAdapter:
             wait_for_stop=bool(wait_for_stop),
             max_position=profile.get("axis_max_steps"),
         )
+        evidence = self._oem_controller_child_evidence(move)
         return {
             "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
             "axis": str(axis).lower(),
             "target": int(position),
             "move": _json_safe(move),
+            "controller_command_acknowledged": evidence["acknowledged"],
+            "controller_terminal_state_verified": evidence["terminal"],
+            "controller_command_required": evidence["command_required"],
             "source_anchor": "ClassHeadBoard.moveToAbs; ClassControlInterface.moveX/moveY",
         }
 
@@ -2534,6 +2641,7 @@ class Serial206ProductionPrimitiveAdapter:
             wait_for_stop=bool(wait_for_stop),
             max_position=profile.get("axis_max_steps"),
         )
+        evidence = self._oem_controller_child_evidence(move)
         return {
             "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
             "axis": "z",
@@ -2543,6 +2651,9 @@ class Serial206ProductionPrimitiveAdapter:
             "motor_current": int(motor_current),
             "current_set": _json_safe(current_set),
             "move": _json_safe(move),
+            "controller_command_acknowledged": evidence["acknowledged"],
+            "controller_terminal_state_verified": evidence["terminal"],
+            "controller_command_required": evidence["command_required"],
             "source_anchor": "ClassControlInterface.moveZ:4254-4265",
         }
 
@@ -2724,9 +2835,13 @@ class Serial206ProductionPrimitiveAdapter:
                     profile["board"], 5, 350 if axis == "x" else 400,
                     motor=profile.get("motor", 0),
                 )
+            evidence = self._oem_controller_child_evidence(move)
             return {"ok": isinstance(move, Mapping) and move.get("ok") is True,
                     "axis": axis, "target": effective, "set_acc": _json_safe(set_acc),
-                    "move": _json_safe(move), "restore_acc": _json_safe(restore)}
+                    "move": _json_safe(move), "restore_acc": _json_safe(restore),
+                    "controller_command_acknowledged": evidence["acknowledged"],
+                    "controller_terminal_state_verified": evidence["terminal"],
+                    "controller_command_required": evidence["command_required"]}
 
         def run_pair(
             first: Callable[[], dict[str, Any]],
@@ -2917,6 +3032,13 @@ class Serial206ProductionPrimitiveAdapter:
         interruption = interrupted("complete", branch)
         if interruption is not None:
             return {**interruption, "restore_acc": _json_safe(restore)}
+        child_evidence = [self._oem_controller_child_evidence(row) for row in results]
+        commanded = [row for row in child_evidence if row["command_required"]]
+        controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
+        controller_completion_verified = bool(child_evidence) and all(
+            row["terminal"] and (row["acknowledged"] or not row["command_required"])
+            for row in child_evidence
+        )
         return {
             "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
             "source_return_code": 0,
@@ -2925,6 +3047,10 @@ class Serial206ProductionPrimitiveAdapter:
             "before": current,
             "pseudo_z_home": pseudo,
             "operations": _json_safe(results),
+            "controller_child_evidence": _json_safe(child_evidence),
+            "controller_command_acknowledged": controller_acknowledged,
+            "controller_completion_verified": controller_completion_verified,
+            "controller_terminal_state_verified": controller_completion_verified,
             "restore_acc": _json_safe(restore),
             "source_anchor": "ClassControlInterface.moveTo:4463-4620",
         }
@@ -3661,6 +3787,11 @@ class Serial206OemInitializationProvider:
             sleep = time.sleep
         self.sleep = sleep
         self._lock = _MutationPriorityRLock()
+        self._deck_movement_lock = threading.Lock()
+        self._deck_owner_id = "serial206-oem-initialization-provider"
+        self._deck_semantic_state_reader: Callable[[], Mapping[str, Any]] | None = None
+        self._tip_tray_state_reader: Callable[[int], Mapping[str, Any]] | None = None
+        self._tip_tray_state_publisher: Callable[..., Mapping[str, Any]] | None = None
         self._x_interrupt_state_lock = threading.Lock()
         self._x_interrupt_dispatch_lock = threading.Lock()
         self._x_interrupt_epoch = 0
@@ -3678,6 +3809,360 @@ class Serial206OemInitializationProvider:
         """Give one Z command priority over status readers for its full composition."""
         with self._lock.mutation():
             yield
+
+    @contextmanager
+    def movement_lease(self):
+        """Own the single source-ordered OEM deck movement stream."""
+        with self._deck_movement_lock:
+            yield
+
+    def bind_deck_semantic_state_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
+        if not callable(reader):
+            raise TypeError("deck semantic state reader must be callable")
+        self._deck_semantic_state_reader = reader
+
+    def bind_tip_tray_state_reader(self, reader: Callable[[int], Mapping[str, Any]]) -> None:
+        if not callable(reader):
+            raise TypeError("tip tray state reader must be callable")
+        self._tip_tray_state_reader = reader
+
+    def bind_tip_tray_state_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        if not callable(publisher):
+            raise TypeError("tip tray state publisher must be callable")
+        self._tip_tray_state_publisher = publisher
+
+    def publish_tip_tray_transition(
+        self,
+        *,
+        tray_id: int,
+        transition: str,
+        operation_id: str,
+        command_id: str,
+        provenance: Mapping[str, Any],
+        well_ids: list[int] | None = None,
+        group_index: int | None = None,
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_tip_tray_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError("tip_tray_state_publisher_not_bound")
+        published = publisher(
+            tray_id=tray_id,
+            transition=transition,
+            operation_id=operation_id,
+            command_id=command_id,
+            provenance=provenance,
+            well_ids=well_ids,
+            group_index=group_index,
+            **self.deck_owner_authority_stamps(),
+        )
+        if not isinstance(published, Mapping):
+            raise RuntimeError("tip tray publisher returned malformed state")
+        return dict(published)
+
+    def bind_deck_semantic_state_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        if not callable(publisher):
+            raise TypeError("deck semantic state publisher must be callable")
+        self._deck_semantic_state_publisher = publisher
+        owner = getattr(publisher, "__self__", None)
+        binder = getattr(owner, "bind_deck_owner_authority_reader", None)
+        if callable(binder):
+            binder(self.deck_owner_authority_stamps)
+
+    def deck_owner_authority_stamps(self) -> dict[str, int]:
+        ownership_generation = int(self.generation_provider())
+        with self._lock:
+            state = self._load_state()
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board = projection.get("board") if isinstance(projection, Mapping) else None
+        board_epoch_4 = board.get("active_board_epoch") if isinstance(board, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_board_epochs_not_authoritative")
+        return {
+            "ownership_generation": ownership_generation,
+            "board_epoch_4": board_epoch_4,
+            "board_epoch_5": board_epoch_5,
+        }
+
+    def _publish_deck_owner_state(
+        self, *, source_operation: str, source_command_id: str, updates: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError("deck_semantic_state_publisher_not_bound")
+        authority = self.deck_owner_authority_stamps()
+        result = publisher(
+            source_operation=source_operation,
+            source_command_id=source_command_id,
+            updates=dict(updates),
+            **authority,
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("deck semantic state publisher returned malformed state")
+        return {str(key): value for key, value in result.items()}
+
+    def publish_pipette_owner_state(
+        self, *, tip_loaded: bool, tip_dirty: bool, tip_location: int, source_command_id: str
+    ) -> dict[str, Any]:
+        return self._publish_deck_owner_state(
+            source_operation="pipette_owner", source_command_id=source_command_id,
+            updates={"tip_loaded": tip_loaded, "tip_dirty": tip_dirty, "tip_location": tip_location},
+        )
+
+    def query_and_publish_pipette_state(self, *, source_command_id: str) -> dict[str, Any]:
+        query = getattr(self.primitives, "query_all_pipette_tip_states", None)
+        if not callable(query):
+            raise RuntimeError("pipette owner query is unavailable")
+        observed = query()
+        if not isinstance(observed, Mapping) or observed.get("ok") is not True:
+            raise RuntimeError("pipette owner query failed")
+        reader = getattr(self, "_deck_semantic_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        semantic = reader()
+        if not isinstance(semantic, Mapping):
+            raise RuntimeError("deck semantic state is malformed")
+        loaded = observed.get("tip_exists")
+        if type(loaded) is not bool:
+            raise RuntimeError("pipette owner query is malformed")
+        tip_location = semantic["tip_location"] if loaded else -1
+        tip_dirty = semantic["tip_dirty"] if loaded else False
+        if loaded and (
+            type(tip_location) is not int or tip_location not in {0, 1, 2, 3}
+            or type(tip_dirty) is not bool
+        ):
+            raise RuntimeError("loaded_tip_authoritative_location_unavailable")
+        published = self.publish_pipette_owner_state(
+            tip_loaded=loaded, tip_dirty=tip_dirty, tip_location=tip_location,
+            source_command_id=source_command_id,
+        )
+        return {
+            "ok": True,
+            "observation": dict(observed),
+            "semantic_state": published,
+        }
+
+    def _clean_path_from_tip_tray_authority(
+        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
+    ) -> bool:
+        reader = getattr(self, "_tip_tray_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        tray_zero = reader(0)
+        if not isinstance(tray_zero, Mapping):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        if (
+            type(tray_zero.get("tip_available")) is not bool
+            or type(tray_zero.get("operation_id")) is not str
+            or not tray_zero["operation_id"].strip()
+            or type(tray_zero.get("command_id")) is not str
+            or not tray_zero["command_id"].strip()
+        ):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        authority = {
+            "ownership_generation": ownership_generation,
+            "board_epoch_4": board_epoch_4,
+            "board_epoch_5": board_epoch_5,
+        }
+        if any(tray_zero.get(key) != value for key, value in authority.items()):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        return not tray_zero["tip_available"]
+
+    def _derived_clean_path_from_tray_zero(self, *, expected_clean_path: bool) -> bool:
+        if type(expected_clean_path) is not bool:
+            raise TypeError("clean_path expectation must be boolean")
+        authority = self.deck_owner_authority_stamps()
+        clean_path = self._clean_path_from_tip_tray_authority(**authority)
+        if expected_clean_path is not clean_path:
+            raise ValueError("clean_path expectation does not match OEM tray-0 authority")
+        return clean_path
+
+    def publish_clean_path_state(
+        self, *, expected_clean_path: bool, source_command_id: str
+    ) -> dict[str, Any]:
+        """Publish OEM ``!tipAvailable(0)``; caller input is expectation only.
+
+        ControlLib.cleanPath:413-423 reads ClassMachineStatus.tipAvailable(0).
+        The tray observation must be a current-generation source-owner record;
+        no request Boolean can create or overwrite that authority.
+        """
+        clean_path = self._derived_clean_path_from_tray_zero(
+            expected_clean_path=expected_clean_path
+        )
+        return self._publish_deck_owner_state(
+            source_operation="clean_path_calculation", source_command_id=source_command_id,
+            updates={"clean_path": clean_path},
+        )
+
+    def publish_plate_operation_state(
+        self, *, current_tray: Any, plate_on_gantry: Any,
+        movable_plate_locations: Mapping[str, Any], source_command_id: str,
+    ) -> dict[str, Any]:
+        return self._publish_deck_owner_state(
+            source_operation="plate_operation", source_command_id=source_command_id,
+            updates={
+                "current_tray": current_tray, "plate_on_gantry": plate_on_gantry,
+                "movable_plate_locations": dict(movable_plate_locations),
+            },
+        )
+
+    def deck_semantic_bootstrap_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Project one complete predecessor SQLite state for canonical migration."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        observed_generation = int(self.generation_provider())
+        if int(expected_generation) != observed_generation:
+            raise RuntimeError("ownership_generation_changed")
+        with self._lock:
+            state = self._load_state()
+            machine = dict(state.get("machine_status") or {})
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        location = machine.get("current_location")
+        if type(location) is int:
+            location = LOCATION_ID_TO_NAME.get(location)
+        if type(location) is not str or type(machine.get("current_well")) is not int:
+            raise RuntimeError("deck_bootstrap_semantic_location_unavailable")
+        board4_projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
+        board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_bootstrap_board_epochs_unavailable")
+        tip_loaded = machine.get("tip_loaded")
+        tip_dirty = machine.get("tip_dirty")
+        clean_path = machine.get("clean_path")
+        if type(tip_loaded) is not bool or type(tip_dirty) is not bool or type(clean_path) is not bool:
+            raise RuntimeError("deck_bootstrap_branch_state_unavailable")
+        tip_location = machine.get("tip_location", -1 if tip_loaded is False else None)
+        latch_status = machine.get("latch_status")
+        machine_latch_closed = machine.get("latch_closed", machine.get("machine_latch_closed"))
+        latch_observation_id = machine.get("latch_observation_id")
+        if (
+            type(tip_location) is not int
+            or type(latch_status) is not bool
+            or type(machine_latch_closed) is not bool
+            or type(latch_observation_id) is not str
+            or not latch_observation_id.strip()
+        ):
+            raise RuntimeError("deck_bootstrap_latch_or_tip_state_unavailable")
+        pseudo_z_home = machine.get("psudo_z_home_steps", machine.get("pseudo_z_home", 65000))
+        predecessor = {
+            "current_location": location, "current_well": int(machine["current_well"]),
+            "current_tray": machine.get("current_tray"), "tip_loaded": tip_loaded,
+            "tip_dirty": tip_dirty, "tip_location": tip_location, "clean_path": clean_path,
+            "plate_on_gantry": machine.get("plate_on_gantry"),
+            "movable_plate_locations": canonical_movable_object_locations(
+                machine.get("movable_plate_locations")
+            ),
+            "pseudo_z_home": pseudo_z_home, "ownership_generation": observed_generation,
+            "board_epoch_4": board_epoch_4, "board_epoch_5": board_epoch_5,
+            "latch_status": latch_status, "machine_latch_closed": machine_latch_closed,
+        }
+        predecessor_digest = hashlib.sha256(
+            json.dumps(predecessor, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        predecessor.update({
+            "latch_observation_id": latch_observation_id,
+            "source_operation": "migrate_oem_runtime_machine_status",
+            "source_command_id": f"legacy-runtime-state:{predecessor_digest}",
+        })
+        return predecessor
+
+    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False) -> dict[str, Any]:
+        reader = self._deck_semantic_state_reader
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        try:
+            semantic = reader()
+        except Exception as exc:
+            raise RuntimeError(f"deck_semantic_state_reader_failed:{type(exc).__name__}") from exc
+        if not isinstance(semantic, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+        ambiguity_state = semantic.get("ambiguity_state")
+        if ambiguity_state != "none" and not (
+            allow_recovery and ambiguity_state in {"ambiguous", "recovery_required"}
+        ):
+            raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+        location = semantic.get("current_location")
+        well = semantic.get("current_well")
+        revision = semantic.get("semantic_state_revision")
+        provenance = semantic.get("transition_provenance")
+        if type(location) is not str or type(well) is not int or not 0 <= well <= 95 or type(revision) is not int or revision < 1:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
+        if not isinstance(provenance, Mapping) or not str(provenance.get("source_operation") or "") or not str(provenance.get("command_id") or ""):
+            raise RuntimeError("deck_semantic_state_not_authoritative:provenance")
+        if (
+            semantic.get("producer_operation") != provenance.get("source_operation")
+            or semantic.get("producer_command_id") != provenance.get("command_id")
+        ):
+            raise RuntimeError("deck_semantic_state_not_authoritative:producer_provenance")
+        branch_types = {
+            "tip_loaded": bool,
+            "tip_dirty": bool,
+            "tip_location": int,
+            "clean_path": bool,
+            "pseudo_z_home": int,
+            "ownership_generation": int,
+            "board_epoch_4": int,
+            "board_epoch_5": int,
+            "latch_status": bool,
+            "machine_latch_closed": bool,
+            "latch_observation_id": str,
+        }
+        for key, expected_type in branch_types.items():
+            if type(semantic.get(key)) is not expected_type:
+                raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
+        if not semantic["latch_observation_id"].strip():
+            raise RuntimeError("deck_semantic_state_not_authoritative:latch_observation_id")
+        tip_location = int(semantic["tip_location"])
+        if tip_location not in {-1, 0, 1, 2, 3} or (semantic["tip_loaded"] is True and tip_location < 0):
+            raise RuntimeError("deck_semantic_state_not_authoritative:tip_location")
+        if int(semantic["pseudo_z_home"]) not in {500, 65000}:
+            raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
+        if any(int(semantic[key]) < 0 for key in ("ownership_generation", "board_epoch_4", "board_epoch_5")):
+            raise RuntimeError("deck_semantic_state_not_authoritative:generation_epochs")
+        try:
+            plate = canonical_plate_name(semantic.get("plate_on_gantry"))
+        except ValueError as exc:
+            raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry")
+        try:
+            load_bound_oem_position_table().resolve(location_id=location)
+        except Exception as exc:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location") from exc
+        provenance_digest = hashlib.sha256(
+            json.dumps(dict(provenance), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "current_location": location,
+            "current_well": well,
+            "semantic_state_revision": revision,
+            "transition_provenance": dict(provenance),
+            "transition_provenance_digest": provenance_digest,
+            "tip_loaded": bool(semantic["tip_loaded"]),
+            "tip_dirty": bool(semantic["tip_dirty"]),
+            "tip_location": tip_location,
+            "clean_path": bool(semantic["clean_path"]),
+            "plate_on_gantry": plate,
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "ownership_generation": int(semantic["ownership_generation"]),
+            "board_epoch_4": int(semantic["board_epoch_4"]),
+            "board_epoch_5": int(semantic["board_epoch_5"]),
+            "latch_status": bool(semantic["latch_status"]),
+            "machine_latch_closed": bool(semantic["machine_latch_closed"]),
+            "latch_observation_id": str(semantic["latch_observation_id"]),
+            "ambiguity_state": str(ambiguity_state),
+        }
 
     @staticmethod
     def _new_z_lifecycle() -> dict[str, Any]:
@@ -3735,6 +4220,8 @@ class Serial206OemInitializationProvider:
                 "tip_location": -1,
                 "clean_path": False,
                 "plate_on_gantry": None,
+                "current_tray": None,
+                "movable_plate_locations": copy.deepcopy(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS),
                 "psudo_z_home_steps": 65000,
                 "current_location": None,
                 "current_well": None,
@@ -3817,6 +4304,8 @@ class Serial206OemInitializationProvider:
         upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
         machine = upgraded.get("machine_status")
         if isinstance(machine, dict):
+            machine.pop("source_tip_trays", None)
+            machine.pop("tip_tray_availability", None)
             pseudo_home_missing = "psudo_z_home_steps" not in machine
             for key, value in defaults["machine_status"].items():
                 machine.setdefault(key, copy.deepcopy(value))
@@ -5793,89 +6282,216 @@ class Serial206OemInitializationProvider:
             "authority": "provider_receipt_terminal_state",
         }
 
-    def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
-        """Return provider-owned live ``scriptmoveTo`` branch authority."""
-        observed_generation = int(self.generation_provider())
-        if int(expected_generation) != observed_generation:
-            return {
-                "ok": False,
-                "blockers": ["ownership_generation_changed"],
-                "expected_generation": int(expected_generation),
-                "observed_generation": observed_generation,
-            }
-        with self._lock:
-            state = self._load_state()
-            z = state["z_lifecycle"]
-            machine = dict(state.get("machine_status") or {})
-        if z.get("state") != "referenced_ready" or z.get("reference_state") != "referenced":
-            return {"ok": False, "blockers": ["z_reference_not_ready"]}
-        machine = self._establish_machine_status_baseline(machine)
-        if type(machine.get("tip_loaded")) is not bool or type(machine.get("tip_dirty")) is not bool:
-            return {"ok": False, "blockers": ["tip_state_not_authoritative"]}
-        if type(machine.get("clean_path")) is not bool:
-            return {"ok": False, "blockers": ["clean_path_not_authoritative"]}
-        if machine.get("current_location") is None or machine.get("current_well") is None:
-            return {"ok": False, "blockers": ["current_location_not_authoritative"]}
-        pseudo = machine.get("psudo_z_home_steps")
-        if type(pseudo) is not int or pseudo not in {500, 65000}:
-            return {"ok": False, "blockers": ["pseudo_z_home_not_authoritative"]}
-        tip_location = machine.get("tip_location", -1)
-        if type(tip_location) is not int:
-            return {"ok": False, "blockers": ["tip_location_not_authoritative"]}
-        if machine["tip_loaded"] is True and tip_location < 0:
-            return {"ok": False, "blockers": ["loaded_tip_location_not_authoritative"]}
-        read_position = getattr(self.primitives, "_read_axis_position", None)
-        if not callable(read_position):
-            return {"ok": False, "blockers": ["controller_position_reader_not_bound"]}
-        try:
-            coordinates = {axis: read_position(axis) for axis in ("x", "y", "z")}
-        except Exception as exc:
-            return {"ok": False, "blockers": [f"controller_position_read_failed:{type(exc).__name__}:{exc}"]}
-        if any(type(value) is not int for value in coordinates.values()):
-            return {"ok": False, "blockers": ["controller_position_not_strict_integer"]}
-        if self.reference_store is None:
-            return {"ok": False, "blockers": ["reference_store_not_bound"]}
-        references = self.reference_store.snapshot(("g",))
-        g_row = (references.get("rows") or {}).get("g") if isinstance(references, Mapping) else None
-        gripper_confirmed = bool(
-            isinstance(references, Mapping)
-            and references.get("ok") is True
-            and isinstance(g_row, Mapping)
-            and g_row.get("state") == "referenced"
+    def _fresh_deck_latch_observation(self) -> dict[str, Any]:
+        """Read independent host m_latchStatus and fresh type-3 sensor evidence."""
+        query = getattr(self.primitives, "deck_io_query_type", None)
+        if not callable(query):
+            query = getattr(self.primitives, "query_latch", None)
+        if not callable(query):
+            raise RuntimeError("deck_latch_observation_reader_not_bound")
+        observed = query(3) if getattr(query, "__name__", "") == "deck_io_query_type" else query()
+        if not isinstance(observed, Mapping) or observed.get("ok") is not True:
+            raise RuntimeError("deck_latch_observation_failed")
+        value = observed.get("value")
+        if type(value) is not int or value not in {0, 1}:
+            raise RuntimeError("deck_latch_observation_malformed")
+        host_reader = getattr(self.primitives, "read_oem_latch_status", None)
+        if not callable(host_reader):
+            raise RuntimeError("oem_host_latch_status_reader_not_bound")
+        host = host_reader()
+        host_value = host.get("value") if isinstance(host, Mapping) else None
+        host_observation_id = host.get("observation_id") if isinstance(host, Mapping) else None
+        if (
+            not isinstance(host, Mapping) or host.get("ok") is not True
+            or type(host_value) is not bool
+            or type(host_observation_id) is not str or not host_observation_id.strip()
+        ):
+            raise RuntimeError("oem_host_latch_status_observation_failed")
+        sensor_canonical = json.dumps(
+            dict(observed), sort_keys=True, separators=(",", ":"), default=str
+        )
+        sensor_observation_id = "type3:" + hashlib.sha256(
+            sensor_canonical.encode("utf-8")
+        ).hexdigest()
+        compound = json.dumps(
+            {"host": host_observation_id, "sensor": sensor_observation_id},
+            sort_keys=True, separators=(",", ":"),
         )
         return {
+            "latch_status": host_value,
+            "machine_latch_closed": value == 1,
+            "latch_observation_id": (
+                f"deck-latch:host={host_observation_id};sensor={sensor_observation_id};compound="
+                + hashlib.sha256(compound.encode("utf-8")).hexdigest()
+            ),
+        }
+
+    def deck_authority_snapshot(
+        self, *, expected_generation: int, _allow_recovery: bool = False
+    ) -> dict[str, Any]:
+        """Return one complete current-generation named-movement authority snapshot."""
+        observed_generation = int(self.generation_provider())
+        if int(expected_generation) != observed_generation:
+            raise RuntimeError("ownership_generation_changed")
+        semantic = self._canonical_deck_semantic_state(allow_recovery=_allow_recovery)
+        clean_path = self._clean_path_from_tip_tray_authority(
+            ownership_generation=int(semantic["ownership_generation"]),
+            board_epoch_4=int(semantic["board_epoch_4"]),
+            board_epoch_5=int(semantic["board_epoch_5"]),
+        )
+        table = load_bound_oem_position_table()
+        with self._lock:
+            state = self._load_state()
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        board4_projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
+        board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_board_epochs_not_authoritative")
+        if not isinstance(board4, Mapping) or board4.get("state") != "active":
+            raise RuntimeError("deck_board4_not_active")
+
+        if self.reference_store is None:
+            raise RuntimeError("deck_reference_store_not_bound")
+        references = self.reference_store.snapshot(("x", "y", "z", "g"))
+        rows = references.get("rows") if isinstance(references, Mapping) else None
+        if not isinstance(rows, Mapping):
+            raise RuntimeError("deck_reference_snapshot_not_authoritative")
+        reference_versions: dict[str, int] = {}
+        for axis in ("x", "y", "z", "g"):
+            row = rows.get(axis)
+            version = row.get("state_version") if isinstance(row, Mapping) else None
+            if not isinstance(row, Mapping) or row.get("state") != "referenced" or type(version) is not int:
+                raise RuntimeError(f"deck_reference_not_authoritative:{axis}")
+            reference_versions[axis] = int(version)
+
+        coordinates = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
+        if any(type(value) is not int for value in coordinates.values()):
+            raise RuntimeError("deck_controller_positions_not_authoritative")
+        latch = self._fresh_deck_latch_observation()
+        if (
+            int(semantic["ownership_generation"]) != observed_generation
+            or int(semantic["board_epoch_4"]) != int(board_epoch_4)
+            or int(semantic["board_epoch_5"]) != int(board_epoch_5)
+        ):
+            raise RuntimeError("deck_semantic_generation_epochs_stale")
+        position_observation_id = hashlib.sha256(
+            json.dumps(coordinates, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        y_interrupt_epoch = int(getattr(self.y_provider, "interrupt_epoch", 0) or 0)
+        safety_epochs = {
+            "global": max(self._x_interrupt_epoch, y_interrupt_epoch, self._z_interrupt_epoch),
+            "x": int(self._x_interrupt_epoch),
+            "y": y_interrupt_epoch,
+            "z": int(self._z_interrupt_epoch),
+        }
+        return {
+            "ownership_generation": observed_generation,
+            "provider_owner_id": self._deck_owner_id,
+            "board_epoch_4": int(board_epoch_4),
+            "board_epoch_5": int(board_epoch_5),
+            "position_table_sha256": table.digest,
+            "machine_state_revision": int(semantic["semantic_state_revision"]),
+            "semantic_state_provenance_digest": str(semantic["transition_provenance_digest"]),
+            "reference_versions": reference_versions,
+            "safety_epochs": safety_epochs,
+            "latch_observation_id": str(latch["latch_observation_id"]),
+            "controller_position_observation_id": position_observation_id,
+            "captured_at": time.time(),
+            "current_x": int(coordinates["x"]),
+            "current_y": int(coordinates["y"]),
+            "current_z": int(coordinates["z"]),
+            "current_location_id": str(semantic["current_location"]),
+            "current_well_id": int(semantic["current_well"]),
+            "tip_loaded": bool(semantic["tip_loaded"]),
+            "tip_dirty": bool(semantic["tip_dirty"]),
+            "tip_location": int(semantic["tip_location"]),
+            "clean_path": clean_path,
+            "plate_on_gantry": semantic["plate_on_gantry"],
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "device_type": "BIOXP",
+            "latch_status": bool(latch["latch_status"]),
+            "machine_latch_closed": bool(latch["machine_latch_closed"]),
+        }
+
+    def deck_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Bind exact semantic observation to current controller coordinates; never infer nearest."""
+        snapshot = self.deck_authority_snapshot(
+            expected_generation=expected_generation, _allow_recovery=True
+        )
+        reader = getattr(self.primitives, "read_deck_semantic_observation", None)
+        if not callable(reader):
+            raise RuntimeError("deck_reconciliation_semantic_observation_unavailable")
+        observed = reader()
+        if not isinstance(observed, Mapping):
+            raise RuntimeError("deck_reconciliation_semantic_observation_malformed")
+        location = observed.get("location_id")
+        well = observed.get("well_id")
+        if type(location) is not str:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable")
+        try:
+            load_bound_oem_position_table().resolve(location_id=location)
+        except Exception as exc:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable") from exc
+        if type(well) is not int or not 0 <= well <= 95:
+            raise RuntimeError("deck_reconciliation_semantic_well_unavailable")
+        if (
+            observed.get("controller_position_observation_id")
+            != snapshot["controller_position_observation_id"]
+            or any(observed.get(axis) != snapshot[f"current_{axis}"] for axis in ("x", "y", "z"))
+        ):
+            raise RuntimeError("deck_reconciliation_semantic_observation_not_bound_to_current_coordinates")
+        return {
+            **snapshot,
+            "observed_location_id": location,
+            "observed_well_id": well,
+        }
+
+    def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
+        """Return branch authority derived from one canonical deck snapshot."""
+        try:
+            snapshot = self.deck_authority_snapshot(expected_generation=expected_generation)
+        except RuntimeError as exc:
+            return {"ok": False, "blockers": [str(exc)]}
+        return {
             "ok": True,
-            "generation": observed_generation,
-            "board_lifecycle_generation": z.get("board_lifecycle_generation"),
-            "current_x": coordinates["x"],
-            "current_y": coordinates["y"],
-            "current_z": coordinates["z"],
-            "current_loc": machine["current_location"],
-            "current_well": machine["current_well"],
-            "tip_loaded": machine["tip_loaded"],
-            "tip_dirty": machine["tip_dirty"],
-            "clean_path": machine["clean_path"],
-            "tip_location": tip_location,
-            "gripper_confirmed": gripper_confirmed,
-            "plate_on_gantry": machine.get("plate_on_gantry"),
-            "pseudo_z_home": pseudo,
-            "source": "provider_controller_reference_store",
+            "generation": int(snapshot["ownership_generation"]),
+            "board_lifecycle_generation": int(snapshot["board_epoch_5"]),
+            "current_x": int(snapshot["current_x"]),
+            "current_y": int(snapshot["current_y"]),
+            "current_z": int(snapshot["current_z"]),
+            "current_loc": str(snapshot["current_location_id"]),
+            "current_well": int(snapshot["current_well_id"]),
+            "tip_loaded": bool(snapshot["tip_loaded"]),
+            "tip_dirty": bool(snapshot["tip_dirty"]),
+            "clean_path": bool(snapshot["clean_path"]),
+            "tip_location": int(snapshot["tip_location"]),
+            "gripper_confirmed": True,
+            "plate_on_gantry": snapshot["plate_on_gantry"],
+            "pseudo_z_home": int(snapshot["pseudo_z_home"]),
+            "authority_snapshot_digest": hashlib.sha256(
+                json.dumps(
+                    {key: value for key, value in snapshot.items() if key != "captured_at"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source": "lease_bound_canonical_deck_authority_snapshot",
         }
 
     def _establish_machine_status_baseline(self, machine: Mapping[str, Any]) -> dict[str, Any]:
-        """Resolve operator-plane machine status from controller truth.
+        """Fill non-semantic observations without inventing machine authority.
 
-        The OEM full startup pipeline is the only OEM writer of
-        ``tip_loaded``/``tip_dirty``/``current_location``/``current_well``, and
-        that pipeline is gated behind physical pipette stages. The operator
-        activate/prepare flow never runs it, so the path authority could never
-        be satisfied. Mirror the OEM MachineStatus.updateLocation semantics:
-        derive the current location from live controller positions against the
-        immutable OEM position table, and query the pipette transport for tip
-        state. Fail-closed: unresolved or unqueryable fields stay unset and the
-        authority gate remains closed. Authoritative fields already present
-        (written by the startup pipeline or a prior path execution) are never
-        overwritten.
+        Tip state may be established by the pipette owner.  Semantic location and
+        well may only come from the durable deck semantic-state contract or an
+        already persisted exact producer; controller coordinates are telemetry
+        and must never be converted to a nearest authoritative location.
         """
         resolved = dict(machine)
         # Tip state from the pipette transport (OEM queryTipStatus equivalent).
@@ -5897,23 +6513,20 @@ class Serial206OemInitializationProvider:
                         resolved["tip_dirty"] = False
                     # A loaded tip with unknown dirty state stays unset and the
                     # authority gate remains closed (fail-closed).
-        # Current location from live controller position + immutable table
-        # (OEM updateLocation-equivalent for the operator plane).
         if resolved.get("current_location") is None or resolved.get("current_well") is None:
             read_position = getattr(self.primitives, "_read_axis_position", None)
             if callable(read_position):
                 try:
-                    x = read_position("x")
-                    y = read_position("y")
-                    if type(x) is int and type(y) is int:
-                        table = load_bound_oem_position_table()
-                        location_id, well_id = table.resolve_nearest(x=x, y=y)
-                        resolved["current_location"] = location_id
-                        resolved["current_well"] = well_id
+                    coordinates = {axis: read_position(axis) for axis in ("x", "y", "z")}
                 except Exception:
-                    # Position readback or table resolution failure keeps the
-                    # location unset; the authority gate stays closed.
-                    pass
+                    coordinates = {}
+                if all(type(coordinates.get(axis)) is int for axis in ("x", "y", "z")):
+                    resolved["controller_position_observation"] = {
+                        "x": coordinates["x"],
+                        "y": coordinates["y"],
+                        "z": coordinates["z"],
+                        "source": "controller_register_readback_telemetry_only",
+                    }
         if resolved != dict(machine):
             with self._lock:
                 state = self._load_state()
@@ -6428,6 +7041,17 @@ class Serial206OemInitializationProvider:
                         "serial206.z.board_generation_invalidation",
                     )
                     self._save_state(state)
+            derived_clean_path: bool | None = None
+            if intent == "set_clean_path":
+                clean_path_expectation = values.get("enabled")
+                if type(clean_path_expectation) is not bool:
+                    return {"ok": False, "blockers": ["clean_path expectation must be boolean"]}
+                try:
+                    derived_clean_path = self._derived_clean_path_from_tray_zero(
+                        expected_clean_path=clean_path_expectation
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    return {"ok": False, "blockers": [str(exc)]}
             safe_inputs = _json_safe(values)
             existing = next(
                 (
@@ -6727,10 +7351,11 @@ class Serial206OemInitializationProvider:
                 elif intent == "restore_original_speed":
                     result = self.primitives.z_restore_original_speed()
                 elif intent == "set_clean_path":
+                    assert derived_clean_path is not None
                     result = {
                         "ok": True,
                         "source_state": "m_controlLib.cleanPath",
-                        "clean_path": bool(values["enabled"]),
+                        "clean_path": derived_clean_path,
                         "controller_command_acknowledged": True,
                         "controller_terminal_state_verified": True,
                         "motion_commanded": False,
@@ -7085,7 +7710,7 @@ class Serial206OemInitializationProvider:
                     z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
             elif ok and intent == "set_clean_path":
                 machine_status = state.setdefault("machine_status", {})
-                machine_status["clean_path"] = bool(values["enabled"])
+                machine_status["clean_path"] = result["clean_path"]
                 result["clean_path_persisted"] = True
                 z.update({"state": previous_state, "last_failure": None})
             elif ok and intent in {
@@ -7113,6 +7738,17 @@ class Serial206OemInitializationProvider:
                     )
                 raise
             self._persist_z_receipt(durable_receipt)
+            if ok and intent == "set_clean_path" and callable(
+                getattr(self, "_deck_semantic_state_publisher", None)
+            ):
+                self.publish_clean_path_state(
+                    expected_clean_path=bool(values["enabled"]),
+                    source_command_id=str(
+                        receipt.get("command_id")
+                        or receipt.get("receipt_id")
+                        or f"cleanPath:{time.time_ns()}"
+                    ),
+                )
             if (
                 x_recovery_receipt is not None
                 and self.state_store is not None
@@ -7530,15 +8166,21 @@ class Serial206OemInitializationProvider:
             "initialize_motion_missing_primitives": list(primitive_status.get("initialize_motion_missing_primitives") or []),
         }
 
-    def gantry_load(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
+    def gantry_load(
+        self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None,
+        source_operation: str = "GantryLoad",
+    ) -> dict[str, Any]:
         """Persist the exact DefaultParameters.GantryLoad-derived pseudo-home state."""
+        if source_operation not in {"GantryLoad", "LoadGantry"}:
+            raise ValueError("unsupported gantry-load source operation")
         if tip_loaded is not None and type(tip_loaded) is not bool:
             raise ValueError("tip_loaded must be bool or None")
+        canonical_plate = canonical_plate_name(plate_on_gantry)
         if tip_loaded is True:
             pseudo_home = 500
-        elif plate_on_gantry is None or plate_on_gantry == "":
+        elif canonical_plate is None:
             pseudo_home = 65000
-        elif str(plate_on_gantry).upper() == "BIO_SECURITY_COVER":
+        elif canonical_plate == 3:
             pseudo_home = 65000
         else:
             pseudo_home = 500
@@ -7546,18 +8188,344 @@ class Serial206OemInitializationProvider:
             state = self._load_state()
             machine = state["machine_status"]
             machine["tip_loaded"] = tip_loaded
-            machine["plate_on_gantry"] = plate_on_gantry
+            machine["plate_on_gantry"] = canonical_plate
             machine["psudo_z_home_steps"] = pseudo_home
             self._save_state(state)
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if callable(publisher):
+            updates = {"plate_on_gantry": canonical_plate, "pseudo_z_home": pseudo_home}
+            if tip_loaded is not None:
+                updates["tip_loaded"] = tip_loaded
+            self._publish_deck_owner_state(
+                source_operation=source_operation,
+                source_command_id=f"{source_operation}:{time.time_ns()}",
+                updates=updates,
+            )
         return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
 
-    def force_to_high_home(self) -> dict[str, Any]:
-        """Persist DefaultParameters.ForceToHighHome()."""
+    def load_gantry(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
+        return self.gantry_load(
+            tip_loaded=tip_loaded, plate_on_gantry=plate_on_gantry,
+            source_operation="LoadGantry",
+        )
+
+    def force_to_high_home(self, *, command_id: str | None = None) -> dict[str, Any]:
+        """Persist DefaultParameters.ForceToHighHome() before latch evaluation."""
         with self._lock:
             state = self._load_state()
             state["machine_status"]["psudo_z_home_steps"] = 500
+            if command_id is not None:
+                state["machine_status"]["pseudo_home_command_id"] = str(command_id)
             self._save_state(state)
-        return {"ok": True, "psudo_z_home_steps": 500, "source_anchor": "DefaultParameters.ForceToHighHome:81-84"}
+        return {
+            "ok": True,
+            "psudo_z_home_steps": 500,
+            "command_id": command_id,
+            "source_anchor": "DefaultParameters.ForceToHighHome:81-84",
+        }
+
+    def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+        if authority_snapshot is None:
+            return self._canonical_deck_semantic_state()
+        if not isinstance(authority_snapshot, Mapping):
+            raise RuntimeError("deck_execution_authority_not_authoritative")
+        required_types = {
+            "tip_loaded": bool,
+            "tip_dirty": bool,
+            "tip_location": int,
+            "clean_path": bool,
+            "pseudo_z_home": int,
+            "ownership_generation": int,
+            "board_epoch_4": int,
+            "board_epoch_5": int,
+            "current_location_id": str,
+            "current_well_id": int,
+            "machine_state_revision": int,
+            "semantic_state_provenance_digest": str,
+        }
+        for key, expected_type in required_types.items():
+            if type(authority_snapshot.get(key)) is not expected_type:
+                raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
+        pseudo_home = int(authority_snapshot["pseudo_z_home"])
+        if pseudo_home not in {500, 65000}:
+            raise RuntimeError("deck_execution_authority_not_authoritative:pseudo_z_home")
+        result = dict(authority_snapshot)
+        try:
+            result["plate_on_gantry"] = canonical_plate_name(authority_snapshot.get("plate_on_gantry"))
+        except ValueError as exc:
+            raise RuntimeError("deck_execution_authority_not_authoritative:plate_on_gantry") from exc
+        return result
+
+    def moveTo(
+        self,
+        *,
+        location_id: int,
+        camera_offset: bool = False,
+        authority_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute the finite diagnostic offset overload through OEM primitives."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        if type(location_id) is not int or location_id not in LOCATION_ID_TO_NAME:
+            raise ValueError("unknown finite OEM location ordinal")
+        if type(camera_offset) is not bool:
+            raise ValueError("camera_offset must be bool")
+        table = load_bound_oem_position_table()
+        target_name = LOCATION_ID_TO_NAME[location_id]
+        target = table.resolve(location_id=target_name)
+        camera = table.resolve(location_id="CAMERA_OFFSET") if camera_offset else None
+        if camera is not None and location_id in {2, 3}:
+            source_x = {2: -11847, 3: -23930}[location_id]
+            offset_x = source_x + int(camera.base_coordinates["x"])
+            offset_y = 7582 + int(camera.base_coordinates["y"])
+        else:
+            offset_x = int(camera.base_coordinates["x"]) if camera is not None else 0
+            offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
+        semantics = self._deck_execution_semantics(authority_snapshot)
+        pseudo_home = int(semantics["pseudo_z_home"])
+        if authority_snapshot is not None:
+            gripper_confirmed = True
+        else:
+            references = self.reference_store.snapshot(("g",)) if self.reference_store is not None else {}
+            g_row = (references.get("rows") or {}).get("g") if isinstance(references, Mapping) else None
+            gripper_confirmed = bool(isinstance(g_row, Mapping) and g_row.get("state") == "referenced")
+        location19 = table.resolve(location_id="LOC_RC_COVER")
+        coordinates = target.oem_offset_move_coordinates(
+            offset_x=offset_x,
+            offset_y=offset_y,
+            x_high_limit=90263,
+            y_high_limit=102956,
+        )
+        primitive = getattr(self.primitives, "oem_move_to", None)
+        if not callable(primitive):
+            raise RuntimeError("source_authority_missing:oem_move_to")
+        result = primitive(
+            coordinates["x"], coordinates["y"], int(pseudo_home),
+            pseudo_home_steps=int(pseudo_home), run_in_parallel=True,
+            gripper_confirmed=gripper_confirmed,
+            tip_loaded=bool(semantics["tip_loaded"]),
+            plate_on_gantry=semantics.get("plate_on_gantry"),
+            location19_y=int(location19.base_coordinates["y"]),
+        )
+        ok = isinstance(result, Mapping) and result.get("ok") is True
+        return {
+            "ok": ok,
+            "provider_command_id": result.get("command_id") if isinstance(result, Mapping) else None,
+            "controller_command_acknowledged": bool(
+                isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True
+            ),
+            "controller_completion_verified": bool(
+                isinstance(result, Mapping)
+                and (result.get("controller_completion_verified") is True
+                     or result.get("controller_terminal_state_verified") is True)
+            ),
+            "hardware_postcondition_verified": bool(
+                isinstance(result, Mapping) and result.get("hardware_postcondition_verified") is True
+            ),
+            "source_anchor": "ClassControlInterface.btnLOC1_Click:1932-1959->moveTo:3691-3716",
+            "primitive_result": _json_safe(result),
+        }
+
+    @staticmethod
+    def _deck_primitive_receipt(result: Any, *, source_anchor: str) -> dict[str, Any]:
+        row = result if isinstance(result, Mapping) else {}
+        return {
+            "ok": row.get("ok") is True,
+            "provider_command_id": row.get("command_id"),
+            "controller_command_acknowledged": row.get("controller_command_acknowledged") is True,
+            "controller_completion_verified": (
+                row.get("controller_completion_verified") is True
+                or row.get("controller_terminal_state_verified") is True
+            ),
+            "hardware_postcondition_verified": row.get("hardware_postcondition_verified") is True,
+            "source_anchor": source_anchor,
+            "primitive_result": _json_safe(result),
+        }
+
+    def moveZCamera(
+        self,
+        *,
+        location_id: int,
+        authority_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute the source-owned barcode Z continuation; callers provide no coordinates."""
+        if location_id not in {2, 3}:
+            raise ValueError("barcode Z is only defined for LOC_TC or LOC_RC")
+        table = load_bound_oem_position_table()
+        camera = table.resolve(location_id="CAMERA_OFFSET")
+        camera_z = int(camera.z_low if camera.z_low is not None else camera.base_coordinates.get("z", 0))
+        target_z = int(-1350.5511600000034 + camera_z) if location_id == 2 else camera_z
+        semantics = self._deck_execution_semantics(authority_snapshot)
+        pseudo_home = int(semantics["pseudo_z_home"])
+        primitive = getattr(self.primitives, "oem_move_z", None)
+        if not callable(primitive):
+            raise RuntimeError("source_authority_missing:oem_move_z")
+        result = primitive(target_z, pseudo_home_steps=pseudo_home, motor_current=31, wait_for_stop=True)
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.btnLOC1_Click:1932-1945->moveZ:4254-4266"
+        )
+
+    def parkGantry(
+        self,
+        *,
+        authority_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute raw-IL ``ControlLib.parkGantry(false)`` with governed early return."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        semantics = self._deck_execution_semantics(authority_snapshot)
+        current_location_name = str(semantics["current_location_id"])
+        if current_location_name == "LOC_PARK":
+            return {
+                "ok": True,
+                "source_noop": True,
+                "delivery_attempted": False,
+                "controller_command_acknowledged": False,
+                "controller_completion_verified": False,
+                "hardware_postcondition_verified": False,
+                "source_children": [],
+                "source_anchor": "ControlLib.parkGantry:7073-7076",
+            }
+        name_to_id = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+        if current_location_name not in name_to_id:
+            raise RuntimeError("park_current_location_not_authoritative")
+
+        table = load_bound_oem_position_table()
+        pseudo_home = int(semantics["pseudo_z_home"])
+        source_children: list[dict[str, Any]] = []
+        controller_rows: list[Mapping[str, Any]] = []
+
+        def record(operation: str, result: Any, *, discarded_return: bool) -> Mapping[str, Any]:
+            row = result if isinstance(result, Mapping) else {}
+            source_children.append({
+                "operation": operation,
+                "discarded_return": discarded_return,
+                "result": _json_safe(result),
+            })
+            if row.get("ok") is not True:
+                raise RuntimeError(f"park_source_child_failed:{operation}")
+            return row
+
+        if semantics["tip_loaded"] is True:
+            waste = table.resolve(location_id="WASTE_BIN")
+            waste_coordinates = waste.oem_offset_move_coordinates(
+                x_high_limit=90263,
+                y_high_limit=102956,
+            )
+            move_to = getattr(self.primitives, "oem_move_to", None)
+            eject = getattr(self.primitives, "eject_all_tips_for_oem_park", None)
+            query = getattr(self.primitives, "query_all_pipette_tip_states", None)
+            move_axis = getattr(self.primitives, "oem_initialize_motion_move_absolute", None)
+            if not all(callable(method) for method in (move_to, eject, query, move_axis)):
+                raise RuntimeError("source_authority_missing:park_tip_cleanup")
+            moved = record(
+                "moveTo(6,0,0,false)",
+                move_to(
+                    waste_coordinates["x"], waste_coordinates["y"], pseudo_home,
+                    pseudo_home_steps=pseudo_home,
+                    run_in_parallel=False,
+                    gripper_confirmed=True,
+                    tip_loaded=True,
+                    plate_on_gantry=semantics.get("plate_on_gantry"),
+                    location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                ),
+                discarded_return=True,
+            )
+            controller_rows.append(moved)
+            record("ejectAllTips(true,true)", eject(), discarded_return=False)
+            queried = record("queryTipStatus(-1)", query(), discarded_return=True)
+            self.sleep(0.100)
+            source_children.append({
+                "operation": "Thread.Sleep(100)", "discarded_return": False,
+                "result": {"ok": True, "milliseconds": 100},
+            })
+            if type(queried.get("tip_exists")) is not bool:
+                raise RuntimeError("park_tip_state_not_authoritative")
+            if queried["tip_exists"] is True:
+                return {
+                    "ok": False,
+                    "delivery_attempted": True,
+                    "controller_command_acknowledged": all(
+                        row.get("controller_command_acknowledged") is True for row in controller_rows
+                    ),
+                    "controller_completion_verified": False,
+                    "hardware_postcondition_verified": False,
+                    "governance_outcome": "manual_tip_removal_required",
+                    "source_pause_scripts": True,
+                    "source_error_event": "Please manually remove tips on Pipettes",
+                    "semantic_location_commit_allowed": False,
+                    "source_children": source_children,
+                    "source_anchor": "ControlLib.parkGantry:7077-7092",
+                }
+            z_row = record(
+                "moveZ(80000,31,true,true)",
+                move_axis("z", 80000, timeout_s=45.0, pseudo_home_steps=pseudo_home),
+                discarded_return=False,
+            )
+            controller_rows.append(z_row)
+            x_row = record(
+                "moveX(79000,true,true)",
+                move_axis("x", 79000, timeout_s=45.0),
+                discarded_return=False,
+            )
+            controller_rows.append(x_row)
+            publisher = getattr(self, "_deck_semantic_state_publisher", None)
+            if not callable(publisher):
+                raise RuntimeError("deck_semantic_state_publisher_not_bound")
+            published_tip_state = publisher(
+                source_operation="pipette_owner",
+                source_command_id=f"parkGantry:{time.time_ns()}",
+                updates={"tip_loaded": False, "tip_dirty": False, "tip_location": -1},
+                ownership_generation=int(semantics["ownership_generation"]),
+                board_epoch_4=int(semantics["board_epoch_4"]),
+                board_epoch_5=int(semantics["board_epoch_5"]),
+            )
+            if not isinstance(published_tip_state, Mapping):
+                raise RuntimeError("deck semantic state publisher returned malformed state")
+
+        script_move = getattr(self.primitives, "oem_initialize_motion_scriptmove_to_waste", None)
+        if not callable(script_move):
+            raise RuntimeError("source_authority_missing:scriptmoveTo")
+        final_row = record(
+            "scriptmoveTo(current,well,28,0,0,2,true)",
+            script_move(
+                current_location=name_to_id[current_location_name],
+                current_well=int(semantics["current_well_id"]),
+                target_location=28,
+                target_well=0,
+                position_flag=2,
+                tip_loaded=False,
+                tip_dirty=False,
+                timeout_s=60.0,
+                pseudo_home_steps=pseudo_home,
+                plate_on_gantry=semantics.get("plate_on_gantry"),
+                location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+            ),
+            discarded_return=True,
+        )
+        controller_rows.append(final_row)
+        acknowledged = bool(controller_rows) and all(
+            row.get("controller_command_acknowledged") is True for row in controller_rows
+        )
+        completed = bool(controller_rows) and all(
+            row.get("controller_completion_verified") is True
+            or row.get("controller_terminal_state_verified") is True
+            for row in controller_rows
+        )
+        postcondition = completed and all(
+            row.get("hardware_postcondition_verified") is True for row in controller_rows
+        )
+        return {
+            "ok": acknowledged and completed,
+            "provider_command_id": final_row.get("command_id"),
+            "controller_command_acknowledged": acknowledged,
+            "controller_completion_verified": completed,
+            "hardware_postcondition_verified": postcondition,
+            "source_noop": False,
+            "source_children": source_children,
+            "source_location_update": {"current_location": 28, "current_well": 0},
+            "source_anchor": "ControlLib.parkGantry:7071-7122; MethodDef=0x06000351",
+        }
 
     @staticmethod
     def _commissioning_blockers(

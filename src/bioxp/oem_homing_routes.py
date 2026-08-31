@@ -575,19 +575,15 @@ def _execute_oem_steps_live(
 async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = None, motion_executor: Any | None = None) -> dict[str, Any]:
     """Guarded OEM scriptmoveTo executor handoff.
 
-    Default mode is preview-only and commands no motion. Live mode requires the
-    explicit OEM_PATH_EXECUTE ack plus a non-empty reason, then executes the
-    planned OEM steps through the existing guarded motion primitives. The route
-    still reports physical_motion=false because controller execution is not
-    independent physical proof.
+    This compatibility route is preview-only. Provider execution is owned by the
+    canonical durable deck command plane.
     """
     payload = payload or {}
     mode = str(payload.get("mode") or "dry_run").strip().lower()
     if mode not in {"dry_run", "preview", "live"}:
         raise HTTPException(status_code=400, detail=f"unsupported scriptmove_execute mode: {mode}")
-    live_enabled = mode == "live"
-    if live_enabled and payload.get("operator_ack") != "OEM_PATH_EXECUTE":
-        raise HTTPException(status_code=409, detail="operator_ack OEM_PATH_EXECUTE required for live OEM path execution")
+    requested_live = mode == "live"
+    live_enabled = False
     reason = str(payload.get("reason") or payload.get("operator_note") or "").strip()
     if live_enabled and not reason:
         raise HTTPException(status_code=409, detail="live OEM path execution requires a non-empty reason/operator_note")
@@ -615,7 +611,7 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
                     "authority": _plain_response(path_authority),
                 },
             )
-        loc19 = load_bound_oem_position_table().resolve(location_id="LOC19")
+        loc19 = load_bound_oem_position_table().resolve(location_id="LOC_RC_COVER")
         planning_payload.update({
             "current_loc": path_authority.get("current_loc"),
             "current_well": path_authority.get("current_well"),
@@ -666,7 +662,7 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
     base = {
         "ok": True,
         "schema_version": "bioxp.oem_scriptmove_execution.v1",
-        "mode": "live" if live_enabled else "dry_run",
+        "mode": "dry_run",
         "plan": plan,
         "execution_steps": execution_steps,
         "opened_usb": False,
@@ -678,6 +674,7 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
         "reason": reason or None,
         "path_planning_authority": _plain_response(path_authority),
         "live_motion_note": "Controller execution is not independent physical proof; supervised operator/camera observation is still required.",
+        "legacy_live_execution_retired": requested_live,
     }
     if not live_enabled:
         base["executor_status"] = "preview_only"
@@ -743,13 +740,7 @@ async def _execute_oem_scriptmove_path_impl(payload: dict[str, Any] | None = Non
 
 @router.post("/motion/oem/pathing/scriptmove_execute")
 async def execute_oem_scriptmove_path(payload: OemScriptMoveExecuteRequest) -> dict[str, Any]:
-    if payload.mode == "live":
-        from .operator_controls import current_operator_dispatch_context
-        if current_operator_dispatch_context() is None:
-            raise HTTPException(
-                status_code=409,
-                detail={"error": "legacy_scriptmove_execute_requires_canonical_action", "canonical_action_id": "oem.z.scriptmove_to", "replacement": "/operator/v2/actions/oem.z.scriptmove_to"},
-            )
+    """Retired direct route; live requests are rendered as zero-I/O previews."""
     return await _execute_oem_scriptmove_path_impl(payload.model_dump(exclude_none=True))
 
 

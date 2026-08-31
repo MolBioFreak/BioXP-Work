@@ -66,6 +66,7 @@ from .release_identity import (
 )
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .oem_compat.position_table import load_bound_oem_position_table
 from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -965,6 +966,8 @@ async def lifespan(app: FastAPI):
             lifecycle_state_provider=lifecycle_state.projection,
             serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
             pipette_status_provider=_operator_pipette_status,
+            oem_deck_provider=lambda: _serial206_oem_initialization_provider,
+            oem_deck_position_table_provider=load_bound_oem_position_table,
         )
         operator_store = app.state.operator_receipt_store
         command_plane = app.state.operator_command_plane
@@ -8352,29 +8355,17 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
 
 @app.post("/motion/oem/move_to")
 async def motion_oem_move_to(req: OemMoveToRequest):
-    if current_operator_dispatch_context() is None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "canonical_xz_method_requires_v2_route",
-                "replacement_method_action_id": "oem.xyz.move_to",
-                "replacement_route": "/operator/v2/methods",
-                "required_schema": "bioxp.operator_method_request.v1",
-                "physical_motion_commanded": False,
-            },
-        )
-    _require_motion_route_ready()
-    return await _run_blocking(
-        "serial-206 provider moveTo",
-        lambda: _execute_serial206_motion_intent(
-            "move_to",
-            {
-                **req.model_dump(exclude={"operator_ack", "timeout_s"}),
-                "wait_timeout_s": float(req.timeout_s),
-            },
-        ),
-        timeout_s=min(max(float(req.timeout_s) + 30.0, 45.0), 180.0),
-    )
+    """Preview-only legacy raw move route; canonical deck worker owns execution."""
+    return {
+        "ok": True,
+        "schema_version": "bioxp.oem_move_to_preview.v1",
+        "executor_status": "preview_only",
+        "requested": req.model_dump(exclude={"operator_ack"}),
+        "opened_usb": False,
+        "motion_commanded": False,
+        "physical_motion": False,
+        "legacy_live_execution_retired": True,
+    }
 
 
 def _serial206_stage_approvals(
