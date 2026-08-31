@@ -111,10 +111,22 @@ def import_image(
     receipt_backup = transaction / "old-receipt"
     old_store = store.exists()
     old_receipt = receipt_output.exists()
+    runtime_identity: tuple[int, int, int] | None = None
+    published_runtime_root: Path | None = None
     try:
         if old_store:
             _need(store.is_dir() and not store.is_symlink(), "existing store is not a safe directory")
             store_root = store.resolve(strict=True)
+            runtime_root = store / "containers"
+            _need(not runtime_root.is_symlink(), "existing container runtime root is symlinked")
+            if runtime_root.exists():
+                _need(runtime_root.is_dir(), "existing container runtime root is not a directory")
+                runtime_info = runtime_root.stat()
+                runtime_identity = (
+                    runtime_info.st_uid,
+                    runtime_info.st_gid,
+                    stat.S_IMODE(runtime_info.st_mode),
+                )
 
             def ignore_mutable_runtime(source: str, names: list[str]) -> set[str]:
                 return {"containers"} if Path(source).resolve(strict=True) == store_root and "containers" in names else set()
@@ -148,7 +160,14 @@ def import_image(
                 shutil.rmtree(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(bundle, destination)
+        if runtime_identity is not None:
+            published_runtime_root = staged_store / "containers"
+            published_runtime_root.mkdir(mode=0o700)
         _seal_tree(staged_store)
+        if runtime_identity is not None:
+            assert published_runtime_root is not None
+            os.chown(published_runtime_root, runtime_identity[0], runtime_identity[1])
+            os.chmod(published_runtime_root, runtime_identity[2])
         receipt = inspector.inspect_image(staged_store, image_id, source_manifest, inspected_at, verifier_source)
         staged_receipt.write_bytes(inspector.canonical_bytes(receipt))
         os.chmod(staged_receipt, 0o444)

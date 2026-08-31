@@ -183,8 +183,11 @@ def test_importer_excludes_mutable_container_runtime_tree(tmp_path: Path):
     store = tmp_path / "store"
     store.mkdir()
     (store / "old-authority").write_bytes(b"old\n")
-    runtime_device = store / "containers" / "active" / "ROOT" / "dev" / "snd" / "seq"
+    runtime_root = store / "containers"
+    runtime_device = runtime_root / "active" / "ROOT" / "dev" / "snd" / "seq"
     runtime_device.parent.mkdir(parents=True)
+    os.chmod(runtime_root, 0o700)
+    runtime_identity = runtime_root.stat()
     os.mkfifo(runtime_device)
     receipt_path = tmp_path / "image-inspection.json"
 
@@ -194,7 +197,15 @@ def test_importer_excludes_mutable_container_runtime_tree(tmp_path: Path):
     )
 
     assert (store / "old-authority").read_bytes() == b"old\n"
-    assert not (store / "containers").exists()
+    published_runtime = store / "containers"
+    assert published_runtime.is_dir() and not published_runtime.is_symlink()
+    assert not list(published_runtime.iterdir())
+    published_identity = published_runtime.stat()
+    assert (published_identity.st_uid, published_identity.st_gid) == (
+        runtime_identity.st_uid,
+        runtime_identity.st_gid,
+    )
+    assert stat.S_IMODE(published_identity.st_mode) == stat.S_IMODE(runtime_identity.st_mode)
     assert inspector.verify_receipt(receipt, store, manifest_path, image_id, INSPECTOR_PATH) == receipt
     assert not list(tmp_path.glob(".bioxp-import-*"))
 
