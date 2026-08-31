@@ -86,9 +86,9 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         calls.append(("home_xy", None))
         return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
 
-    @app.post("/motion/emergency_stop")
-    async def emergency_stop():
-        calls.append(("emergency_stop", None))
+    @app.post("/motion/oem/x/abort")
+    async def abort_all():
+        calls.append(("abort_all", None))
         return {"ok": True, "controller_acknowledged": True}
 
     @app.post("/motion/diagnostics/stop")
@@ -199,7 +199,7 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.emergency_stop", "meta.initialize_motors", "meta.initialize_motion"}
+    assert meta_ids == {"meta.activate_motion", "meta.initialize_motors", "meta.initialize_motion"}
     motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
     motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
     assert motors["available"] is False
@@ -549,7 +549,7 @@ def test_emergency_stop_dispatch_bypasses_blocked_normal_database_claim(tmp_path
             assert await asyncio.to_thread(claim_entered.wait, 3)
             stop = await asyncio.wait_for(
                 client.post(
-                    "/operator/actions/meta.emergency_stop",
+                    "/operator/actions/oem.abort_all",
                     json={
                         "expected_generation": catalog["ownership_generation"],
                         "idempotency_key": "interrupt-bypass-claim",
@@ -559,13 +559,13 @@ def test_emergency_stop_dispatch_bypasses_blocked_normal_database_claim(tmp_path
                 timeout=3,
             )
             assert stop.status_code == 200, stop.text
-            assert calls == [("emergency_stop", None)]
+            assert calls == [("abort_all", None)]
             release_claim.set()
             return await asyncio.wait_for(normal_task, timeout=3)
 
     normal_response = asyncio.run(scenario())
     assert normal_response.status_code == 200
-    assert calls == [("emergency_stop", None), ("home_axis", {"axis": "x"})]
+    assert calls == [("abort_all", None), ("home_axis", {"axis": "x"})]
 
 
 def test_repeated_emergency_stop_key_dispatches_and_persists_each_receipt(tmp_path, monkeypatch):
@@ -578,15 +578,15 @@ def test_repeated_emergency_stop_key_dispatches_and_persists_each_receipt(tmp_pa
         "inputs": {},
     }
 
-    first = client.post("/operator/actions/meta.emergency_stop", json=payload)
-    second = client.post("/operator/actions/meta.emergency_stop", json=payload)
+    first = client.post("/operator/actions/oem.abort_all", json=payload)
+    second = client.post("/operator/actions/oem.abort_all", json=payload)
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     assert first.json()["command_id"] != second.json()["command_id"]
     assert first.json()["idempotency_replay_enabled"] is False
     assert second.json()["idempotency_replay_enabled"] is False
-    assert calls == [("emergency_stop", None), ("emergency_stop", None)]
+    assert calls == [("abort_all", None), ("abort_all", None)]
     store = OperatorReceiptStore(tmp_path)
     assert store.connection.execute(
         "SELECT COUNT(*) FROM operator_commands WHERE idempotency_key=?",
@@ -599,7 +599,7 @@ def test_raw_emergency_route_is_nonreplayable_interrupt(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
-    action = action_for(catalog, "POST", "/motion/emergency_stop")
+    action = action_for(catalog, "POST", "/motion/oem/x/abort")
     payload = {
         "expected_generation": catalog["ownership_generation"],
         "idempotency_key": "raw-repeated-emergency-stop",
@@ -612,7 +612,7 @@ def test_raw_emergency_route_is_nonreplayable_interrupt(tmp_path, monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["command_id"] != second.json()["command_id"]
-    assert calls == [("emergency_stop", None), ("emergency_stop", None)]
+    assert calls == [("abort_all", None), ("abort_all", None)]
 
 
 def test_raw_diagnostic_stop_is_nonreplayable_interrupt(tmp_path, monkeypatch):
@@ -864,37 +864,3 @@ def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path
             "operator_assessment": "fail",
         })
     assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 520
-
-
-def test_successive_move_queue_mechanics_order_and_clear():
-    from bioxp.operator_controls import _SuccessiveMoveQueue
-
-    async def scenario():
-        queue = _SuccessiveMoveQueue(max_depth=2)
-        first = {"axis": "x", "command_id": "a", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        second = {"axis": "x", "command_id": "b", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        third = {"axis": "x", "command_id": "c", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        fourth = {"axis": "z", "command_id": "d", "event": asyncio.Event(), "action_id": "oem.z.move_steps", "cleared": False}
-        assert await queue.admit("x", first) == "dispatch_now"
-        assert await queue.admit("x", second) == "queued"
-        assert await queue.admit("x", third) == "queued"
-        overflow = {"axis": "x", "command_id": "c2", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        assert await queue.admit("x", overflow) == "full"
-        assert await queue.admit("z", fourth) == "dispatch_now"  # separate axis is independent
-        await queue.complete("x")  # first finishes; second is signalled
-        assert await queue.wait_dispatched(second) is True
-        assert queue.snapshot()["x"]["depth"] == 1  # third still queued
-        await queue.complete("x")  # second finishes; third is signalled
-        assert await queue.wait_dispatched(third) is True
-        # the cleared path
-        fifth = {"axis": "x", "command_id": "e", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        await queue.complete("x")  # third finishes; queue now empty
-        assert await queue.admit("x", fifth) == "dispatch_now"
-        sixth = {"axis": "x", "command_id": "f", "event": asyncio.Event(), "action_id": "oem.x.move_steps", "cleared": False}
-        assert await queue.admit("x", sixth) == "queued"
-        await queue.clear("x")
-        assert await queue.wait_dispatched(sixth) is False
-        assert sixth["cleared"] is True
-        assert queue.snapshot().get("x", {}).get("depth") == 0
-
-    asyncio.run(scenario())

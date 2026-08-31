@@ -76,6 +76,10 @@ class _ZPrimitiveSpy:
             "ok": True,
             "controller_command_acknowledged": True,
             "controller_terminal_state_verified": True,
+            "home_summary": {
+                "controller_home_proof_verified": True,
+                "short_circuit": None,
+            },
         }
 
     def z_clear_profile_overrides(self):

@@ -50,7 +50,7 @@ def test_usb_homing_profiles_use_bound_machine_axis_limits_for_xyg(monkeypatch):
     z = tester._motion_oem_axis_profile("z", startup=True)
 
     assert x["home_search_max_abs_delta"] == 90263
-    assert x["home_search_max_abs_delta_source"] == "serial206_release_envelope"
+    assert x["home_search_max_abs_delta_source"] == "immutable_oem_machine_snapshot"
     assert y["home_search_max_abs_delta"] == 102956
     assert y["home_search_max_abs_delta_source"] == "immutable_oem_machine_snapshot"
     assert g["home_search_max_abs_delta"] == 15000

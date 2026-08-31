@@ -2,7 +2,7 @@ import struct
 import time
 import math
 from enum import IntEnum
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 try:
     import can  # type: ignore
@@ -357,6 +357,7 @@ class BioXpCanDriver:
         ack_mode: str = "command",
         command_name: str | None = None,
         wait_for_completion: bool = True,
+        interrupt_completion_owner_token: str | None = None,
     ) -> dict[str, Any]:
         """
         Broadcast a single 8-byte CAN packet and optionally require a response.
@@ -388,17 +389,26 @@ class BioXpCanDriver:
             function = int(board_id) & 0x7
             try:
                 initialization = command_name in {"pipette_initialize", "pipette_initiate_group"}
-                provenance = transact_can(
-                    msg,
-                    channel=int(self.pipette_id),
-                    expected_function=function,
-                    timeout_s=timeout_s,
-                    matcher_name=command_name or f"pipette_function_{function}",
-                    initialization=initialization,
-                    completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
-                    allow_multipart=ack_mode == "query",
-                    wait_for_completion=wait_for_completion,
-                )
+                transact_kwargs = {
+                    "channel": int(self.pipette_id),
+                    "expected_function": function,
+                    "timeout_s": timeout_s,
+                    "matcher_name": command_name or f"pipette_function_{function}",
+                    "initialization": initialization,
+                    "completion_timeout_s": 10.0 if command_name == "pipette_initiate_group" else 60.0,
+                    "allow_multipart": ack_mode == "query",
+                    "wait_for_completion": wait_for_completion,
+                }
+                if interrupt_completion_owner_token is not None:
+                    transact_kwargs.update({
+                        "replace_completion_owner_token": interrupt_completion_owner_token,
+                        "completion_replacement_reason": "interrupted_by_terminate",
+                    })
+                provenance = transact_can(msg, **transact_kwargs)
+                if isinstance(provenance, Mapping):
+                    completion_owner_token = provenance.get("completion_owner_token")
+                    if isinstance(completion_owner_token, str) and completion_owner_token:
+                        self._pipette_completion_owner_token = completion_owner_token
             except Exception as exc:
                 return {**base, "tx_ok": False, "error": str(exc), "provenance": None}
             frames = list(provenance.get("frames", []))
@@ -539,9 +549,12 @@ class BioXpCanDriver:
         ack_mode: str = "command",
         command_name: str | None = None,
         wait_for_completion: bool = True,
+        interrupt_completion_owner_token: str | None = None,
     ) -> dict[str, Any]:
         encoded = str(ascii_command).encode('ascii')
         if len(encoded) > 8:
+            if interrupt_completion_owner_token is not None:
+                raise ValueError("completion-owner takeover is valid only for a single-frame TR command")
             ids = self.pipette_can_ids()
             chunks = [encoded[index:index + 8] for index in range(0, len(encoded), 8)]
             tx_ids = [
@@ -651,6 +664,7 @@ class BioXpCanDriver:
                 ack_mode=ack_mode,
                 command_name=command_name or str(ascii_command),
                 wait_for_completion=wait_for_completion,
+                interrupt_completion_owner_token=interrupt_completion_owner_token,
             ),
             "ascii_command": str(ascii_command),
             "length": len(encoded),
@@ -664,6 +678,7 @@ class BioXpCanDriver:
         ack_mode: str = "command",
         command_name: str | None = None,
         wait_for_completion: bool = True,
+        interrupt_completion_owner_token: str | None = None,
     ) -> dict[str, Any]:
         ids = self.pipette_can_ids()
         if address not in ids:
@@ -677,6 +692,7 @@ class BioXpCanDriver:
             ack_mode=ack_mode,
             command_name=command_name or f"pipette:{ascii_command}",
             wait_for_completion=wait_for_completion,
+            interrupt_completion_owner_token=interrupt_completion_owner_token,
         )
 
     def process_pipette_message(
@@ -860,20 +876,44 @@ class BioXpCanDriver:
             result["outcome"] = "oem_error"
         return result
 
-    def _wait_owned_pipette_completion(self, timeout_s: float) -> dict[str, Any]:
+    def current_pipette_completion_owner_token(self) -> str | None:
+        return self._pipette_completion_owner_token
+
+    def _wait_owned_pipette_completion(
+        self,
+        timeout_s: float,
+        *,
+        owner_token: str | None = None,
+    ) -> dict[str, Any]:
         wait = getattr(self.bus, "wait_pipette_completion", None)
         if not callable(wait):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "completion_wait_unavailable"}
-        raw = wait(int(self.pipette_id), float(timeout_s))
+        selected_owner_token = owner_token or self._pipette_completion_owner_token
+        try:
+            raw = wait(
+                int(self.pipette_id),
+                float(timeout_s),
+                owner_token=selected_owner_token,
+            )
+        except TypeError:
+            if selected_owner_token is not None:
+                raise
+            raw = wait(int(self.pipette_id), float(timeout_s))
+        owner_matches_current = selected_owner_token == self._pipette_completion_owner_token
+        if owner_matches_current:
+            self._pipette_completion_owner_token = None
         if not isinstance(raw, dict):
             return {"ok": False, "channel": int(self.pipette_id), "outcome": "invalid_completion_result", "result": repr(raw)}
-        return self._enrich_pipette_completion(raw)
+        enriched = self._enrich_pipette_completion(raw)
+        enriched["completion_owner_token"] = selected_owner_token
+        enriched["completion_owner_matches_current"] = owner_matches_current
+        return enriched
 
     def wait_pipette_initialization_completion(self, timeout_s: float):
         return self._wait_owned_pipette_completion(timeout_s)
 
-    def wait_pipette_command_completion(self, timeout_s: float):
-        return self._wait_owned_pipette_completion(timeout_s)
+    def wait_pipette_command_completion(self, timeout_s: float, *, owner_token: str | None = None):
+        return self._wait_owned_pipette_completion(timeout_s, owner_token=owner_token)
 
     def pipette_initiate_group(self):
         result = self._send_pipette_command(
@@ -1015,15 +1055,30 @@ class BioXpCanDriver:
             wait_for_completion=wait_for_completion,
         )
 
-    def terminate_pipette(self):
-        return self._send_pipette_command("TR", address="control", command_name="terminate_pipette")
+    def terminate_pipette(self, *, wait_for_completion: bool = True):
+        interrupted_owner_token = getattr(self, "_pipette_completion_owner_token", None)
+        return self._send_pipette_command(
+            "TR",
+            address="control",
+            command_name="terminate_pipette",
+            wait_for_completion=wait_for_completion,
+            interrupt_completion_owner_token=(
+                interrupted_owner_token
+                if isinstance(interrupted_owner_token, str) and interrupted_owner_token
+                else None
+            ),
+        )
 
-    def set_top_speed(self, velocity: float):
+    def set_top_speed(self, velocity: float, *, wait_for_completion: bool = True):
         value = float(velocity)
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError("pipette top speed must be a finite positive number")
         encoded = format(value, "g")
-        result = self._send_pipette_command(f"V{encoded},1R", command_name="set_top_speed")
+        result = self._send_pipette_command(
+            f"V{encoded},1R",
+            command_name="set_top_speed",
+            wait_for_completion=wait_for_completion,
+        )
         result["effective_top_speed"] = value
         return result
 
@@ -1180,7 +1235,9 @@ class BioXpCanDriver:
         if selected_type not in {0, 1, 2}:
             raise ValueError("OEM dispense type must be 0, 1, or 2")
         formatted_vol = self._format_pipette_volume(volume_ul)
-        ascii_command = f"D{formatted_vol},{selected_type}R"
+        # ClassPipette always transmits literal type 1. ``dispenseType`` only
+        # selects which host-side level account is decremented.
+        ascii_command = f"D{formatted_vol},1R"
         result = self._send_pipette_command(
             ascii_command,
             command_name="dispense",
@@ -1207,21 +1264,22 @@ class BioXpCanDriver:
             aspirate = self.aspirate(
                 volume_ul,
                 tip_pressure_profile=tip_pressure_profile,
-                wait_for_completion=wait_for_completion,
+                wait_for_completion=False,
             )
             self._sleep(1.500)
             dispense = self.dispense(
                 volume_ul,
                 tip_pressure_profile=tip_pressure_profile,
                 blow_out=False,
-                wait_for_completion=wait_for_completion,
+                dispense_type=0,
+                wait_for_completion=False,
             )
             self._sleep(1.500)
             rows.append({"cycle": cycle, "aspirate": aspirate, "dispense": dispense})
         final_aspirate = self.aspirate(
             volume_ul,
             tip_pressure_profile=tip_pressure_profile,
-            wait_for_completion=wait_for_completion,
+            wait_for_completion=False,
         )
         self._sleep(1.500)
         rows.append({"cycle": cycles, "aspirate": final_aspirate, "dispense": None})

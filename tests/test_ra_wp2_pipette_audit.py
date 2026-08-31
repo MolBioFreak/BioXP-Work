@@ -2,16 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import sqlite3
 
 import pytest
 
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.pipette.audit import PipetteAuditIntegrityError, normalize_pipette_result
 from bioxp.pipette.receipts import PipetteReceiptError
 from bioxp.pipette.models import PipetteAspirateCommand, PipetteTransportUnavailableError
 from bioxp.pipette.receipts import PipetteReceiptStore
 from bioxp.services.pipette_service import _run_transport_call
+
+
+@pytest.fixture(autouse=True)
+def _canonical_runtime_state(tmp_path, monkeypatch):
+    runtime = OEMRuntimeStore(tmp_path)
+    runtime.close()
+    pipette_receipts_module = importlib.import_module(PipetteReceiptStore.__module__)
+    monkeypatch.setattr(pipette_receipts_module, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+    monkeypatch.setattr(pipette_receipts_module, "current_authority_identity", lambda: {
+        "evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64,
+    })
 
 
 def _claim(store: PipetteReceiptStore):
@@ -243,13 +261,15 @@ def test_receipt_persists_pressure_samples_as_chunk_metadata(tmp_path):
             "ok": True,
             "outcome": "completion",
             "channel": 1,
+            "pressure_units": "PSI",
             "pressure_samples": [
-                {"sample_sequence": 0, "controller_time": 10.0, "value": 1.0},
-                {"sample_sequence": 1, "controller_time": 10.1, "value": 2.0},
+                {"channel": 1, "sample_sequence": 0, "controller_time": 10.0, "value": 1.0},
+                {"channel": 1, "sample_sequence": 1, "controller_time": 10.1, "value": 2.0},
             ],
         },
         command_id=claim["command_id"],
         pipette_operation_id=claim["pipette_operation_id"],
+        expected_status=claim["status"],
     )
     stream_count = store.connection.execute("SELECT COUNT(*) FROM pipette_pressure_streams").fetchone()[0]
     chunk_count = store.connection.execute("SELECT COUNT(*) FROM pipette_pressure_chunks").fetchone()[0]
@@ -272,6 +292,7 @@ def test_invalid_typed_result_keeps_claim_nonterminal(tmp_path):
             },
             command_id=claim["command_id"],
             pipette_operation_id=claim["pipette_operation_id"],
+            expected_status=claim["status"],
         )
     status = store.connection.execute(
         "SELECT status FROM operator_commands WHERE command_id=?", (claim["command_id"],)
@@ -307,7 +328,8 @@ def test_service_finalizes_admission_failure_after_claim(tmp_path):
                 operation_name="aspirate",
                 command=command,
                 receipt_store=store,
-            )
+                runtime_binding={"idempotency_key": "wp2-admission-failure"},
+                )
         )
 
     assert transport_called is False

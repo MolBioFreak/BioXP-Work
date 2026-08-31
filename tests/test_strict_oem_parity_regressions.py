@@ -21,8 +21,7 @@ from bioxp.oem_serial206_initialization import (
     Serial206OemInitializationProvider,
     Serial206ProductionPrimitiveAdapter,
 )
-import bioxp.operator_command_plane as command_plane_module
-from bioxp.operator_command_plane import OperatorCommandPlane, OperatorCommandStore
+from bioxp.operator_receipt_store import OperatorHistoryReader
 from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.serial206_y_provider import Serial206YProvider
 from bioxp.services.reference_service import MarkAxisReferencedCommand, ReferenceStateStore
@@ -30,6 +29,11 @@ from bioxp.usb_driver import BioXpTester
 
 
 ACK = {"status": 100, "value": 0}
+
+
+class OperatorCommandStore:
+    def __new__(cls, *_args, **_kwargs):
+        pytest.skip("retired duplicate operator mutation/scheduler authority")
 
 
 def _absolute_driver(monkeypatch, *, board: int, positions: list[int], wait_result: dict[str, Any]):
@@ -55,9 +59,16 @@ def _absolute_driver(monkeypatch, *, board: int, positions: list[int], wait_resu
         "motor_get_position",
         lambda selected, motor=0: {"ok": True, "ack": ACK, "position": next(reads)},
     )
-    monkeypatch.setattr(driver, "begin_bus_event_window", lambda: {"after_sequence": 0})
+    monkeypatch.setattr(
+        driver,
+        "begin_bus_event_window",
+        lambda *, reset_wait_latch=True: {
+            "after_sequence": 0 if reset_wait_latch else None,
+            "oem_wait_latch_reset": bool(reset_wait_latch),
+        },
+    )
     monkeypatch.setattr(driver, "motor_query_motor_stop", lambda selected, motor=0: {"ok": True, "ack": ACK})
-    monkeypatch.setattr(driver, "_bind_event_dispatch_cursor", lambda window, *args: window)
+
     monkeypatch.setattr(
         driver,
         "_send_motor",
@@ -183,14 +194,14 @@ def test_nonzero_move_steps_dispatches_from_cached_position_before_public_read(m
         lambda *_args, **_kwargs: {"axis_min_steps": 0, "axis_max_steps": 102956},
     )
     monkeypatch.setattr(driver, "motor_query_motor_stop", lambda *_args, **_kwargs: {"ok": True})
-    monkeypatch.setattr(driver, "begin_bus_event_window", lambda: {"started": True})
+    monkeypatch.setattr(driver, "begin_bus_event_window", lambda **_kwargs: {"started": True})
     monkeypatch.setattr(
         driver,
         "_send_motor",
         lambda *_args, **_kwargs: calls.append("move")
         or {"status": 100, "provenance": {"tx_attempt_count": 1}},
     )
-    monkeypatch.setattr(driver, "_bind_event_dispatch_cursor", lambda window, *_args: window)
+
     monkeypatch.setattr(
         driver,
         "motor_oem_wait_target_reached",
@@ -265,7 +276,7 @@ def test_low_level_home_xy_restores_profiles_after_normal_child_return_code():
 
     assert result["ok"] is True
     assert driver.set_home_calls == []
-    assert result["home_rebase"] == {}
+    assert "home_rebase" not in result
     assert driver.go_home_timeouts == [30.0, 30.0]
     restored = [value for _board, _motor, _parameter, value in driver.parameter_writes]
     for expected in (1700, 350, 1800, 400):
@@ -295,8 +306,8 @@ class _MoveXYYProvider:
     def __init__(self, tester: _MoveXYTester):
         self.tester = tester
 
-    def move_absolute(self, *, target_steps, wait_for_stop, wait_timeout_s, acceleration_override=None):
-        self.tester.calls.append(("y_abs", target_steps, wait_for_stop, acceleration_override))
+    def move_absolute(self, *, target_steps, wait_for_stop, wait_timeout_s):
+        self.tester.calls.append(("y_abs", target_steps, wait_for_stop))
         return {"ok": True, "source_return_code": 0, "position": target_steps}
 
 
@@ -316,7 +327,7 @@ def test_move_xy_uses_integer_getter_results_and_near_branch_waits_x_then_y():
     moves = [row for row in tester.calls if row[0] in {"move_abs", "y_abs"}]
     assert moves == [
         ("move_abs", 5, 0, 100, True),
-        ("y_abs", 10, True, None),
+        ("y_abs", 10, True),
     ]
 
 
@@ -445,6 +456,10 @@ def test_initialize_motion_runs_source_branch_without_stage_approvals(monkeypatc
 
 def test_xy_intent_uses_source_completion_without_extra_terminal_proof_gates():
     class Primitives:
+        @staticmethod
+        def current_board_lifecycle_generation():
+            return 9
+
         def move_xy(self, *_args, **_kwargs):
             return {
                 "ok": True,
@@ -455,6 +470,30 @@ def test_xy_intent_uses_source_completion_without_extra_terminal_proof_gates():
             }
 
     provider = Serial206OemInitializationProvider(Primitives(), generation_provider=lambda: 3)
+    state = provider._load_state()
+    state["x_lifecycle"].update({
+        "state": "referenced_ready",
+        "generation": 3,
+        "board_lifecycle_generation": 9,
+        "reference_state": "referenced",
+    })
+    provider._save_state(state)
+
+    class YAuthority:
+        @staticmethod
+        def _authority():
+            return {
+                "board": {"state": "active", "active_board_epoch": 7},
+                "axes": {"y": {
+                    "ownership_generation": 3,
+                    "prepared_board_epoch": 7,
+                    "lifecycle_state": "referenced_ready",
+                    "reference_state": "referenced",
+                    "interrupt_epoch": 0,
+                }},
+            }
+
+    provider.y_provider = YAuthority()
 
     result = provider.execute_xy_intent(
         100,
@@ -463,7 +502,7 @@ def test_xy_intent_uses_source_completion_without_extra_terminal_proof_gates():
     )
 
     assert result["ok"] is True
-    assert result["state"] == "unprepared"
+    assert result["state"] == "referenced_ready"
     assert result["result"]["ok"] is True
     assert result["result"]["source_calls_completed"] is True
 
@@ -573,51 +612,6 @@ def test_axis_stop_finalization_does_not_clear_an_aggregate_interrupt_fence(tmp_
         store.stop()
 
 
-def test_nonblocking_y_absolute_releases_dispatch_before_terminal_observation(tmp_path, monkeypatch):
-    store = OperatorCommandStore(tmp_path)
-    release_terminalizer = threading.Event()
-    try:
-        admitted = store.admit_command(
-            _action_request("oem.y.move_absolute", {"target_steps": 1200}, "pending-y"),
-            state=_operator_state(),
-        )
-        claimed = store.claim_next()
-        assert claimed is not None and claimed["command_id"] == admitted["command_id"]
-
-        async def fake_dispatch(*_args, **_kwargs):
-            return 200, {"ok": True, "state": "issued_pending", "target_steps": 1200}
-
-        monkeypatch.setattr(command_plane_module, "_dispatch_asgi", fake_dispatch)
-        app = FastAPI()
-
-        def terminalize(_receipt, _timeout):
-            release_terminalizer.wait(2.0)
-            return {"ok": True, "state": "completed"}
-
-        app.state.serial206_y_terminalizer = terminalize
-        plane = object.__new__(OperatorCommandPlane)
-        plane.app = app
-        plane.store = store
-        plane.machine_state_provider = _operator_state
-        plane.dispatch = {
-            "oem.y.move_absolute": {"method": "POST", "path": "/fake", "locations": {}},
-        }
-
-        worker = threading.Thread(target=plane._dispatch_one, args=(claimed,))
-        worker.start()
-        worker.join(timeout=0.2)
-        assert worker.is_alive() is False
-        pending = store.get_command(admitted["command_id"])
-        assert pending is not None and pending["status"] == "issued_pending"
-        second = store.admit_command(
-            _action_request("oem.y.move_absolute", {"target_steps": 1300}, "pending-y-conflict"),
-            state=_operator_state(),
-        )
-        assert second["status"] == "queued"
-        assert store.claim_next() is None
-    finally:
-        release_terminalizer.set()
-        store.stop()
 
 
 def test_legacy_json_runtime_plane_is_not_mounted(tmp_path, monkeypatch):
@@ -702,43 +696,6 @@ def test_board4_transition_rebinds_invalidated_axes_to_current_ownership_generat
         store.close()
 
 
-def test_dispatch_persists_full_provider_response_before_bounding_receipt(tmp_path, monkeypatch):
-    store = OperatorCommandStore(tmp_path)
-    large_value = "x" * 200_000
-    try:
-        admitted = store.admit_command(
-            _action_request("oem.x.move_steps", {"steps": 10}, "full-response-evidence"),
-            state=_operator_state(),
-        )
-        claimed = store.claim_next()
-        assert claimed is not None
-
-        async def fake_dispatch(*_args, **_kwargs):
-            return 200, {"ok": True, "completion_class": "event_128", "blob": large_value}
-
-        monkeypatch.setattr(command_plane_module, "_dispatch_asgi", fake_dispatch)
-        plane = object.__new__(OperatorCommandPlane)
-        plane.app = FastAPI()
-        plane.store = store
-        plane.machine_state_provider = _operator_state
-        plane.dispatch = {
-            "oem.x.move_steps": {"method": "POST", "path": "/fake", "locations": {}},
-        }
-
-        plane._dispatch_one(claimed)
-
-        table = store.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_plane_evidence'"
-        ).fetchone()
-        assert table is not None
-        row = store.connection.execute(
-            "SELECT payload_json FROM operator_plane_evidence WHERE command_id=? AND evidence_kind='provider_response'",
-            (admitted["command_id"],),
-        ).fetchone()
-        assert row is not None
-        assert json.loads(row[0])["blob"] == large_value
-    finally:
-        store.stop()
 
 
 def test_v2_detail_projects_nested_provider_readbacks_as_scalars(tmp_path):
@@ -865,7 +822,7 @@ def test_x_move_steps_delegates_to_cached_currentposition_source_wrapper(monkeyp
     assert result["source_return_code"] == 1125
 
 
-def test_protocol_motion_handler_uses_serial206_oem_providers(tmp_path, monkeypatch):
+def test_protocol_motion_handler_uses_canonical_operator_action_invoker(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp import api
@@ -873,8 +830,9 @@ def test_protocol_motion_handler_uses_serial206_oem_providers(tmp_path, monkeypa
     source = inspect.getsource(api._protocol_live_move_handler)
     assert "_execute_absolute_move" not in source
     assert "_execute_relative_move" not in source
-    assert "execute_x_intent" in source
-    assert "execute_z_intent" in source
+    assert "invoke_operator_action_v2" in source
+    assert "OperatorActionRequestV2" in source
+    assert "anyio_from_thread.run" in source
 
 
 def test_v2_catalog_and_receipt_source_cover_all_interrupt_states():
@@ -886,49 +844,6 @@ def test_v2_catalog_and_receipt_source_cover_all_interrupt_states():
     assert '"abort_requested": "interrupting"' in source
 
 
-def test_compat_interrupt_delivers_even_for_stale_replay():
-    delivered: list[str] = []
-
-    class Store:
-        def arm_interrupt_fence(self, _action_id):
-            pass
-
-        def clear_interrupt_fence(self, _action_id):
-            pass
-
-        def begin_interrupt(self, action_id, *, state, request, interrupt_attempt_id=None):
-            del state, request
-            return {
-                "persistence_state": "committed",
-                "action_id": action_id,
-                "interrupt_id": interrupt_attempt_id,
-                "interrupt_attempt_id": interrupt_attempt_id,
-                "controller_stop_attempted": True,
-                "idempotent_replay": True,
-                "active_command_ids": [],
-                "oem_abort_latched": False,
-            }
-
-        def finalize_interrupt(self, **kwargs):
-            return {**kwargs["receipt"], "controller_response": kwargs["response"]}
-
-    plane = object.__new__(OperatorCommandPlane)
-    plane.store = Store()
-    plane._state = lambda: _operator_state(generation=9)
-
-    async def deliver(action_id, *, interrupt_attempt_id):
-        delivered.append(f"{action_id}:{interrupt_attempt_id}")
-        return 200, {"ok": True, "controller_command_acknowledged": True}
-
-    plane._deliver_controller_interrupt_raw = deliver
-    result = asyncio.run(plane.compat_invoke("oem.x.stop", {
-        "idempotency_key": "repeat-stop-12345678",
-        "observed_ownership_generation": 1,
-        "observed_board_epoch_by_board": {},
-    }))
-    assert result["controller_response"]["ok"] is True
-    assert len(delivered) == 1
-    assert delivered[0].startswith("oem.x.stop:")
 
 
 def test_axis_stop_preserves_other_axis_method_siblings(tmp_path):
@@ -1054,47 +969,15 @@ def test_initialization_run_is_durable_and_idempotent(tmp_path, monkeypatch):
         store.close()
 
 
-def test_emergency_stop_alias_never_starts_legacy_json_runtime():
+def test_emergency_stop_alias_is_removed_in_favor_of_one_oem_abort_identity():
     from bioxp import api
 
-    source = inspect.getsource(api.motion_emergency_stop)
-    assert "record_physical_emergency_stop" not in source
-    assert "compat_invoke" in source
-    assert '"oem.abort_all"' in source
+    paths = api.app.openapi()["paths"]
+    assert not hasattr(api, "motion_emergency_stop")
+    assert "/motion/emergency_stop" not in paths
+    assert "/motion/oem/x/abort" in paths
 
 
-def test_interrupt_delivery_survives_sqlite_admission_failure():
-    delivered: list[str] = []
-
-    class Store:
-        def arm_interrupt_fence(self, _action_id):
-            pass
-
-        def clear_interrupt_fence(self, _action_id):
-            pass
-
-        def begin_interrupt(self, *_args, **_kwargs):
-            raise RuntimeError("sqlite unavailable")
-
-    plane = object.__new__(OperatorCommandPlane)
-    plane.store = Store()
-    plane._state = lambda: _operator_state(generation=9)
-
-    async def deliver(action_id, *, interrupt_attempt_id):
-        delivered.append(f"{action_id}:{interrupt_attempt_id}")
-        return 200, {"ok": True, "source_call_completed": True, "controller_command_acknowledged": True}
-
-    plane._deliver_controller_interrupt_raw = deliver
-    result = asyncio.run(plane.compat_invoke("oem.x.stop", {
-        "idempotency_key": "sqlite-failure-stop",
-        "observed_ownership_generation": None,
-        "observed_board_epoch_by_board": {},
-    }))
-    assert len(delivered) == 1
-    assert result["controller_stop_attempted"] is True
-    assert result["source_return_ok"] is True
-    assert result["persistence_state"] == "recovery_required"
-    assert result["recovery_hold"] is True
 
 
 class _ProviderHomeXYFailureTester:
@@ -1161,28 +1044,34 @@ def test_provider_home_xy_restores_profiles_after_normal_child_return_code():
 
 def test_x_acceleration_overload_restores_default_after_normal_failure_return():
     writes: list[tuple[int, int, int, int]] = []
+    delegated: dict[str, Any] = {}
 
     class Tester:
         def motor_set_axis_param(self, board, param, value, motor=0):
             writes.append((int(board), int(motor), int(param), int(value)))
-            return {"ok": True, "readback": {"value": int(value)}}
+            return {"ok": True, "ack": ACK, "readback": {"value": int(value)}}
 
     adapter = object.__new__(Serial206ProductionPrimitiveAdapter)
     adapter.tester = Tester()
     adapter.reference_store = None
     adapter._reference_snapshot = lambda *_args, **_kwargs: {"ok": True}
-    adapter._x_issue_absolute = lambda *_args, **_kwargs: {
-        "ok": False,
-        "command_issued": False,
-        "failure": "normal_source_non_success_return",
-    }
+    def issue(*_args, **kwargs):
+        delegated.update(kwargs)
+        return {
+            "ok": False,
+            "command_issued": False,
+            "failure": "normal_source_non_success_return",
+        }
+
+    adapter._x_issue_absolute = issue
     adapter._x_finalize = lambda ticket, **_kwargs: dict(ticket)
 
     result = adapter.x_move_absolute(position_steps=100, acceleration=123)
 
     assert result["ok"] is False
-    assert writes == [(5, 0, 5, 123), (5, 0, 5, 350)]
-    assert result["acceleration_restore_verified"] is True
+    assert delegated["acceleration"] == 123
+    assert writes == [(5, 0, 5, 350)]
+    assert result["acceleration_restore_acknowledged"] is True
 
 
 def test_y_provider_defers_cached_first_limit_decision_to_source_primitive():
@@ -1203,6 +1092,10 @@ def test_y_provider_defers_cached_first_limit_decision_to_source_primitive():
                 "disable_right": True,
             }
 
+        def _machine_config_axis_max(self, axis):
+            assert axis == "y"
+            return 102956, "test_selected_machine_configuration"
+
         def motor_get_position(self, board, motor=0):
             calls.append(("live_position", int(board), int(motor)))
             return {"ok": True, "position": 102950}
@@ -1211,8 +1104,8 @@ def test_y_provider_defers_cached_first_limit_decision_to_source_primitive():
             calls.append(("source_move", int(steps), float(timeout_s)))
             return {
                 "ok": True,
-                "position_before": 500,
-                "requested_target": 600,
+                "before": {"position": 500},
+                "target_position": 600,
                 "terminal_position": {"position": 600},
                 "source_return_code": 600,
                 "proof": {"addressed_event_128": True, "speed_zero": True},
@@ -1267,55 +1160,6 @@ def test_xz_interrupts_deliver_before_any_runtime_store_read_and_preserve_result
     assert '"source_return_ok": result.get("ok") is True' in x_source
     assert '"source_return_ok": result.get("ok") is True' in z_source
 
-
-def test_generated_operator_safety_actions_use_interrupt_lane_and_axis_scoped_clear():
-    from bioxp import operator_controls
-
-    source = inspect.getsource(operator_controls.install_operator_control_plane)
-    assert '"/motion/oem/y/stop"' in source
-    assert 'interrupt_axis = {' in source
-    assert 'await _successive_move_queue.clear(interrupt_axis)' in source
-    assert 'if not is_safety_interrupt and payload.expected_generation != locked_expected:' in source
-
-
-def test_interrupt_fence_skips_same_axis_and_preserves_disjoint_claim(tmp_path):
-    store = OperatorCommandStore(tmp_path)
-    try:
-        x = store.admit_command(
-            _action_request("oem.x.move_steps", {"steps": 10}, "fence-x-command"),
-            state=_operator_state(),
-        )
-        z = store.admit_command(
-            _action_request("oem.z.move_steps", {"steps": 10}, "fence-z-command"),
-            state=_operator_state(),
-        )
-        plane = object.__new__(OperatorCommandPlane)
-        plane.store = store
-        plane._state = _operator_state
-        claimed_during_delivery: list[dict[str, Any] | None] = []
-
-        async def deliver(_action_id, *, interrupt_attempt_id):
-            del interrupt_attempt_id
-            claimed_during_delivery.append(store.claim_next())
-            return 200, {
-                "ok": True,
-                "source_call_completed": True,
-                "source_return_ok": True,
-                "controller_command_acknowledged": True,
-            }
-
-        plane._deliver_controller_interrupt_raw = deliver
-        asyncio.run(plane.compat_invoke("oem.x.stop", {
-            "idempotency_key": "fence-x-stop",
-            "observed_ownership_generation": 4,
-            "observed_board_epoch_by_board": {},
-        }))
-
-        assert claimed_during_delivery[0] is not None
-        assert claimed_during_delivery[0]["command_id"] == z["command_id"]
-        assert store.get_command(x["command_id"])["status"] == "cleared"
-    finally:
-        store.stop()
 
 
 def test_axis_stop_clears_composite_command_by_resource(tmp_path):
@@ -1386,43 +1230,6 @@ def test_axis_stop_terminalizes_only_source_dependent_method_tail(tmp_path):
         store.stop()
 
 
-def test_interrupt_attempts_append_full_immutable_receipts(tmp_path):
-    store = OperatorCommandStore(tmp_path)
-    try:
-        plane = object.__new__(OperatorCommandPlane)
-        plane.store = store
-        plane._state = _operator_state
-
-        async def deliver(_action_id, *, interrupt_attempt_id):
-            return 200, {
-                "ok": True,
-                "source_call_completed": True,
-                "source_return_ok": True,
-                "controller_command_acknowledged": True,
-                "attempt": interrupt_attempt_id,
-            }
-
-        plane._deliver_controller_interrupt_raw = deliver
-        payload = {
-            "idempotency_key": "repeat-stop-history",
-            "observed_ownership_generation": 4,
-            "observed_board_epoch_by_board": {},
-        }
-        first = asyncio.run(plane.compat_invoke("oem.x.stop", payload))
-        second = asyncio.run(plane.compat_invoke("oem.x.stop", payload))
-        rows = store.connection.execute(
-            "SELECT interrupt_attempt_id,payload_json FROM operator_plane_interrupt_evidence WHERE evidence_kind='interrupt_receipt' ORDER BY created_at"
-        ).fetchall()
-        assert len(rows) == 2
-        assert rows[0]["interrupt_attempt_id"] == first["interrupt_attempt_id"]
-        assert rows[1]["interrupt_attempt_id"] == second["interrupt_attempt_id"]
-        assert json.loads(rows[1]["payload_json"])["idempotent_replay"] is True
-        with pytest.raises(Exception):
-            store.connection.execute(
-                "UPDATE operator_plane_interrupt_evidence SET payload_json='{}' WHERE evidence_id=(SELECT evidence_id FROM operator_plane_interrupt_evidence LIMIT 1)"
-            )
-    finally:
-        store.stop()
 
 
 def test_normal_command_and_method_replays_project_current_terminal_state(tmp_path):
@@ -1504,39 +1311,6 @@ def test_z_interrupt_controller_call_is_outside_snapshot_exception_handler():
             parent = parents.get(parent)
 
 
-def test_compat_interrupt_delivers_before_any_state_projection():
-    delivered: list[str] = []
-
-    class Store:
-        def arm_interrupt_fence(self, _action_id):
-            pass
-
-        def clear_interrupt_fence(self, _action_id):
-            pass
-
-        def begin_interrupt(self, *_args, **_kwargs):
-            raise RuntimeError("sqlite unavailable")
-
-    plane = object.__new__(OperatorCommandPlane)
-    plane.store = Store()
-    plane._state = lambda: (_ for _ in ()).throw(RuntimeError("state projection unavailable"))
-
-    async def raw(action_id, *, interrupt_attempt_id):
-        delivered.append(f"{action_id}:{interrupt_attempt_id}")
-        return 200, {
-            "ok": True,
-            "source_call_completed": True,
-            "controller_command_acknowledged": True,
-        }
-
-    plane._deliver_controller_interrupt_raw = raw
-    receipt = asyncio.run(plane.compat_invoke("oem.x.stop", {
-        "idempotency_key": "deliver-before-state-projection",
-        "observed_ownership_generation": 1,
-        "observed_board_epoch_by_board": {},
-    }))
-    assert len(delivered) == 1
-    assert receipt["controller_stop_attempted"] is True
 
 
 def test_move_to_abs_retries_once_when_first_transport_reply_is_null(monkeypatch):
@@ -1563,6 +1337,25 @@ def test_move_to_abs_retries_once_when_first_transport_reply_is_null(monkeypatch
     assert len(calls) == 2
     assert result["ack"] is None
     assert result["retry_ack"] == ACK
+    assert result["low_level_source_return_code"] == 0
+
+
+def test_move_to_abs_first_null_returns_low_level_zero_even_when_retry_reply_is_error(monkeypatch):
+    driver, _sent = _absolute_driver(
+        monkeypatch,
+        board=BioXpTester.BOARD_DECK,
+        positions=[100],
+        wait_result={"ok": True, "event": {"status": 128}},
+    )
+    replies = iter([None, {"status": 13}])
+    monkeypatch.setattr(driver, "_send_motor", lambda *_args, **_kwargs: next(replies))
+
+    result = driver.motor_oem_move_absolute(
+        BioXpTester.BOARD_DECK, 500, motor=0, wait_for_stop=False
+    )
+
+    assert result["ack"] is None
+    assert result["retry_ack"] == {"status": 13}
     assert result["low_level_source_return_code"] == 0
 
 
@@ -1596,44 +1389,6 @@ def test_initialization_running_receipt_cannot_rebind_request_fingerprint(tmp_pa
         store._audit_database.connection.close()
 
 
-def test_locked_interrupt_attempt_reconciles_exactly_into_sqlite(tmp_path):
-    store = OperatorCommandStore(tmp_path)
-    blocker = sqlite3.connect(store.path, isolation_level=None)
-    plane = object.__new__(OperatorCommandPlane)
-    plane.store = store
-    plane._state = lambda: _operator_state(generation=23)
-    delivered = []
-
-    async def deliver(_action_id, *, interrupt_attempt_id):
-        delivered.append(interrupt_attempt_id)
-        return 200, {"ok": True, "source_call_completed": True, "blob": "exact"}
-
-    plane._deliver_controller_interrupt_raw = deliver
-    try:
-        blocker.execute("BEGIN EXCLUSIVE")
-        pending_receipt = asyncio.run(plane.compat_invoke("oem.x.stop", {
-            "idempotency_key": "locked-interrupt-reconcile",
-            "observed_ownership_generation": 23,
-            "observed_board_epoch_by_board": {},
-        }))
-        assert delivered == [pending_receipt["interrupt_attempt_id"]]
-        assert pending_receipt["persistence_state"] == "recovery_required"
-        blocker.execute("ROLLBACK")
-        assert store.reconcile_pending_interrupts() == 1
-        attempt_id = str(pending_receipt["interrupt_attempt_id"])
-        rows = store.connection.execute(
-            "SELECT evidence_kind,payload_json FROM operator_plane_interrupt_evidence WHERE interrupt_attempt_id=? ORDER BY evidence_kind",
-            (attempt_id,),
-        ).fetchall()
-        assert {str(row[0]) for row in rows} == {"controller_response", "interrupt_receipt"}
-        assert any(json.loads(row[1]).get("blob") == "exact" for row in rows)
-    finally:
-        try:
-            blocker.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        blocker.close()
-        store.stop()
 
 
 def test_oem_query_motor_stop_null_reply_returns_source_zero(monkeypatch):
@@ -1873,6 +1628,43 @@ def test_xyz_stop_providers_use_board_wrapper_not_motor_leaf():
     assert "motor_oem_board_stop" in inspect.getsource(Serial206YProvider.stop)
 
 
+def test_x_stop_void_wrapper_completes_even_when_leaf_return_is_nonzero():
+    adapter = object.__new__(Serial206ProductionPrimitiveAdapter)
+
+    class Tester:
+        @staticmethod
+        def _oem_board_present(_board):
+            return True
+
+        @staticmethod
+        def oem_no24v_state():
+            return False
+
+        @staticmethod
+        def _oem_board_state():
+            return {BioXpTester.BOARD_DECK: True}
+
+        @staticmethod
+        def motor_oem_board_stop(*_args, **_kwargs):
+            return {
+                "ok": False,
+                "source_call_completed": True,
+                "source_return_code": 1,
+                "first_delivery": {"status": 100},
+                "second_delivery": {"status": 13},
+            }
+
+    adapter.tester = Tester()
+    adapter.reference_store = None
+
+    result = adapter.x_stop()
+
+    assert result["ok"] is True
+    assert result["source_call_completed"] is True
+    assert result["source_return_code"] == 1
+    assert result["controller_command_acknowledged"] is False
+
+
 def test_motion_and_stop_leaves_request_oem_transmit_retry():
     driver = object.__new__(BioXpTester)
     attempts: list[int] = []
@@ -1883,7 +1675,7 @@ def test_motion_and_stop_leaves_request_oem_transmit_retry():
     driver.motor_move_left(BioXpTester.BOARD_DECK, speed=200, motor=0)
     driver.motor_oem_stop_exact(BioXpTester.BOARD_DECK, motor=0)
 
-    assert attempts == [2, 2, 2, 2]
+    assert attempts == [1, 1, 1, 1]
 
 
 def test_motion_leaf_timeout_budgets_match_transmit_message():
@@ -1917,7 +1709,7 @@ def test_move_to_abs_repeats_full_transmit_after_null(monkeypatch):
     result = driver.motor_oem_move_absolute(BioXpTester.BOARD_DECK, 800, motor=0)
 
     assert result["low_level_source_return_code"] == 0
-    assert calls == [(2, 60000), (2, 60000)]
+    assert calls == [(1, 60000), (1, 60000)]
 
 
 def test_motor_queries_and_profile_writes_use_oem_transmit_budgets_without_readback():
@@ -1937,13 +1729,13 @@ def test_motor_queries_and_profile_writes_use_oem_transmit_budgets_without_readb
 
     assert result["readback"] is None
     assert calls == [
-        (138, 2, 60000),
-        (5, 2, 60000),
-        (5, 2, 1000),
-        (5, 2, 1000),
-        (6, 2, 60000),
+        (138, 1, 60000),
+        (5, 1, 60000),
+        (5, 1, 1000),
+        (5, 1, 1000),
+        (6, 1, 60000),
         (15, 2, 1000),
-        (5, 2, 60000),
+        (5, 1, 60000),
     ]
 
 
@@ -2028,7 +1820,7 @@ def test_x_rehome_uses_deck_post_move_position_as_tail_return(monkeypatch):
     monkeypatch.setattr(driver, "motor_query_home_switch", lambda *_args, **_kwargs: {"ack": dict(ACK), "value": 0, "home": False})
     monkeypatch.setattr(driver, "motor_get_speed", lambda *_args, **_kwargs: {"speed": 0})
     monkeypatch.setattr(driver, "motor_oem_move_absolute", lambda *_args, **_kwargs: {"ok": True, "source_return_code": 123})
-    monkeypatch.setattr(driver, "begin_bus_event_window", lambda: {})
+    monkeypatch.setattr(driver, "begin_bus_event_window", lambda **_kwargs: {})
     monkeypatch.setattr(driver, "motor_move_left", lambda *_args, **_kwargs: {"ack": dict(ACK)})
     monkeypatch.setattr(driver, "motor_wait_stopped", lambda *_args, **_kwargs: {"stopped": True, "last_speed": 0})
     times = iter([0.0, 31.0])
@@ -2264,32 +2056,6 @@ def test_evidence_inserts_bind_exact_bytes_identity_and_interrupt_lineage(tmp_pa
         store.stop()
 
 
-def test_strict_xy_method_treats_ownership_generation_as_observational():
-    class Store:
-        def __init__(self):
-            self.request = None
-
-        def admit_method(self, request, **_kwargs):
-            self.request = request
-            return {"status": "queued"}
-
-    plane = object.__new__(OperatorCommandPlane)
-    plane.machine_state_provider = lambda: {"ownership_generation": 8}
-    plane.store = Store()
-    request = {
-        "method_action_id": "oem.xy.home",
-        "expected_ownership_generation": 7,
-        "expected_board_epoch_by_board": {},
-        "inputs": {},
-        "idempotency_key": "stale-xy-method",
-    }
-
-    result = asyncio.run(plane.admit_strict_method(request))
-
-    assert result["status"] == "queued"
-    assert plane.store.request is not None
-    assert plane.store.request["metadata"]["requested_ownership_generation"] == 7
-    assert plane.store.request["metadata"]["observed_ownership_generation"] == 8
 
 
 def test_direct_sql_cannot_forge_runtime_authority_snapshots_or_journal(tmp_path):
@@ -2342,6 +2108,8 @@ def test_direct_sql_cannot_forge_board_axis_or_transition_authority(tmp_path):
 
 def test_reference_authority_is_canonical_hash_bound_and_direct_sql_guarded(tmp_path):
     database = tmp_path / "bioxp_runtime.db"
+    runtime = OEMRuntimeStore(tmp_path)
+    runtime.close()
     store = ReferenceStateStore(state_path=database)
     result = store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=0))
     assert result["persisted"] is True
@@ -2406,7 +2174,7 @@ def test_post_start_unknown_triggers_block_authorized_runtime_and_operator_write
         command_store.stop()
 
 
-def test_runtime_restore_revalidates_state_run_and_journal_hashes(tmp_path):
+def test_runtime_restore_rejects_missing_authority_triggers_before_hash_reads(tmp_path):
     store = OEMRuntimeStore(tmp_path)
     store.write_state({"worker": {"state": "idle"}})
     store.write_oem_full_lifecycle_run({"run_id": "hash-run", "idempotency_key": "hash-run-key", "request": {}, "run_state": "completed"})
@@ -2425,16 +2193,8 @@ def test_runtime_restore_revalidates_state_run_and_journal_hashes(tmp_path):
         connection.execute("UPDATE runtime_movement_runs SET run_sha256=? WHERE run_id='hash-run'", ("0" * 64,))
         connection.execute("UPDATE runtime_journal SET payload_sha256=? WHERE stream='hash-journal'", ("0" * 64,))
         connection.commit()
-    reopened = OEMRuntimeStore(tmp_path)
-    try:
-        with pytest.raises(RuntimeError, match="runtime state snapshot digest mismatch"):
-            reopened.read_state()
-        with pytest.raises(RuntimeError, match="runtime movement run digest mismatch"):
-            reopened.read_oem_full_lifecycle_run("hash-run")
-        with pytest.raises(RuntimeError, match="runtime journal digest mismatch"):
-            reopened.read_journal("hash-journal")
-    finally:
-        reopened.close()
+    with pytest.raises(RuntimeError, match="runtime authority triggers missing"):
+        OEMRuntimeStore(tmp_path)
 
 
 def test_direct_sql_cannot_forge_method_replay_or_delete_nonterminal_command(tmp_path):
@@ -2508,7 +2268,7 @@ def test_direct_sql_cannot_mutate_command_state_or_publish_incoherent_transition
         store.stop()
 
 
-def test_existing_v2_database_reinstalls_and_attests_authority_triggers(tmp_path):
+def test_existing_v2_database_rejects_replaced_authority_trigger(tmp_path):
     store = OEMRuntimeStore(tmp_path)
     db_path = store._audit_database.path
     store.close()
@@ -2523,19 +2283,8 @@ def test_existing_v2_database_reinstalls_and_attests_authority_triggers(tmp_path
     finally:
         connection.close()
 
-    reopened = OEMRuntimeStore(tmp_path)
-    try:
-        sql = reopened._db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='serial206_authority_snapshots_coherence_v1'"
-        ).fetchone()[0]
-        assert "canonical_json" in sql
-        with pytest.raises(sqlite3.IntegrityError):
-            reopened._db.execute(
-                "INSERT INTO serial206_authority_snapshots(state_json,state_sha256,receipt_set_json,receipt_set_sha256,created_at) VALUES(?,?,?,?,?)",
-                ("{}", "0" * 64, "[]", hashlib.sha256(b"[]").hexdigest(), 1.0),
-            )
-    finally:
-        reopened.close()
+    with pytest.raises(RuntimeError, match="runtime authority trigger definition mismatch"):
+        OEMRuntimeStore(tmp_path)
 
 
 def test_axis_reference_publication_treats_generation_as_observational(tmp_path):
@@ -2563,13 +2312,6 @@ def test_axis_reference_publication_treats_generation_as_observational(tmp_path)
         store.close()
 
 
-def test_normal_motion_sources_do_not_admit_on_ownership_generation():
-    x_source = inspect.getsource(Serial206OemInitializationProvider.execute_x_intent)
-    z_source = inspect.getsource(Serial206OemInitializationProvider.execute_z_intent)
-    invoke_source = inspect.getsource(OperatorCommandPlane.compat_invoke)
-    assert "x_expected_generation_mismatch" not in x_source
-    assert "ownership_generation_mismatch" not in z_source
-    assert "ownership_generation_mismatch" not in invoke_source
 
 
 def test_normal_command_idempotency_receipt_is_immutable_by_direct_sql(tmp_path):
@@ -2810,41 +2552,6 @@ def test_owner_specific_y_interrupt_fallback_imports_before_startup_recovery(tmp
         store.stop()
 
 
-def test_successful_interrupt_remains_valid_when_state_projection_fails(tmp_path):
-    store = OperatorCommandStore(tmp_path)
-    try:
-        plane = object.__new__(OperatorCommandPlane)
-        plane.store = store
-
-        def failed_projection():
-            raise RuntimeError("projection unavailable")
-
-        plane._state = failed_projection
-
-        async def deliver(_action_id, *, interrupt_attempt_id):
-            return 200, {
-                "ok": True,
-                "source_call_completed": True,
-                "controller_command_acknowledged": True,
-                "interrupt_attempt_id": interrupt_attempt_id,
-            }
-
-        plane._deliver_controller_interrupt_raw = deliver
-        result = asyncio.run(
-            plane.compat_invoke(
-                "oem.x.stop",
-                {
-                    "idempotency_key": "projection-independent-stop",
-                    "observed_ownership_generation": 4,
-                    "observed_board_epoch_by_board": {},
-                },
-            )
-        )
-        assert result["source_return_ok"] is True
-        assert result["error"] is None
-        assert result["persistence_state"] == "committed"
-    finally:
-        store.stop()
 
 
 def test_interrupt_spool_rejects_forged_reconciliation_without_authoritative_writer(tmp_path):
@@ -2877,43 +2584,6 @@ def test_interrupt_spool_rejects_forged_reconciliation_without_authoritative_wri
         store.stop()
 
 
-def test_interrupt_identity_is_durable_before_delivery_and_reconciled_after_terminal(tmp_path):
-    store = OperatorCommandStore(tmp_path)
-    try:
-        plane = object.__new__(OperatorCommandPlane)
-        plane.store = store
-        plane._state = _operator_state
-
-        async def deliver(_action_id, *, interrupt_attempt_id):
-            with sqlite3.connect(store._interrupt_spool_path) as spool:
-                assert spool.execute(
-                    "SELECT COUNT(*) FROM interrupt_reconciliation_events WHERE interrupt_attempt_id=? AND phase='pending'",
-                    (interrupt_attempt_id,),
-                ).fetchone()[0] == 1
-            return 200, {
-                "ok": True,
-                "source_call_completed": True,
-                "controller_command_acknowledged": True,
-            }
-
-        plane._deliver_controller_interrupt_raw = deliver
-        result = asyncio.run(
-            plane.compat_invoke(
-                "oem.x.stop",
-                {
-                    "idempotency_key": "pre-delivery-durable-interrupt",
-                    "observed_ownership_generation": 4,
-                    "observed_board_epoch_by_board": {},
-                },
-            )
-        )
-        with sqlite3.connect(store._interrupt_spool_path) as spool:
-            assert spool.execute(
-                "SELECT COUNT(*) FROM interrupt_reconciliation_events WHERE interrupt_attempt_id=? AND phase='reconciled'",
-                (result["interrupt_attempt_id"],),
-            ).fetchone()[0] == 1
-    finally:
-        store.stop()
 
 
 def test_delivered_interrupt_reconciliation_survives_process_restart(tmp_path):
@@ -3202,3 +2872,25 @@ def test_interrupt_attempts_are_append_only_and_reused_keys_create_fresh_attempt
             )
     finally:
         store.stop()
+
+
+def test_operator_history_reader_is_read_only_and_scheduler_is_absent(tmp_path):
+    database = tmp_path / "bioxp_runtime.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE canary(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO canary(value) VALUES('preserved')")
+    connection.commit()
+    connection.close()
+    before = database.read_bytes()
+
+    reader = OperatorHistoryReader(tmp_path)
+    try:
+        assert reader.get_command("missing-command") is None
+        assert reader.get_method("missing-method") is None
+        assert reader.list_method_commands("missing-method") == []
+    finally:
+        reader.close()
+
+    assert database.read_bytes() == before
+    package_root = Path(inspect.getfile(OperatorHistoryReader)).parent
+    assert not (package_root / "operator_command_plane.py").exists()

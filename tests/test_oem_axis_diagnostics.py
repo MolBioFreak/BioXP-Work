@@ -359,7 +359,15 @@ def test_cancelled_maintenance_reconnect_cannot_construct_a_second_owner(monkeyp
     monkeypatch.setattr(api, "_tester", None)
     monkeypatch.setattr(api, "_pipette_transport", None)
     monkeypatch.setattr(api, "BioXpTester", construct)
-    monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: {"tester": shared_usb})
+    monkeypatch.setattr(
+        api,
+        "build_default_pipette_transport",
+        lambda *, shared_usb, error_callback=None, forceabort=None: {
+            "tester": shared_usb,
+            "error_callback": error_callback,
+            "forceabort": forceabort,
+        },
+    )
 
     request = cast(Any, SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))
 

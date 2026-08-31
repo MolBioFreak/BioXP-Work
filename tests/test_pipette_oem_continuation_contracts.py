@@ -152,13 +152,15 @@ def test_eject_all_tips_retries_remaining_tips_like_oem_verify_eject():
 
 
 
-def test_initialization_accepts_router_immediate_ack_before_delayed_completion():
+def test_initialization_accepts_owned_router_ack_before_delayed_completion():
     class Bus:
         def transact_can(self, message, **kwargs):
             del message, kwargs
             return {
                 "ok": False,
                 "outcome": "ack",
+                "completion_deferred": True,
+                "completion_owner_token": "owned-init-completion",
                 "frames": [
                     {
                         "arbitration_id": 0x500,
@@ -184,6 +186,7 @@ def test_initialization_accepts_router_immediate_ack_before_delayed_completion()
         [ord("W"), ord("R")],
         require_ack=True,
         command_name="pipette_initialize",
+        wait_for_completion=False,
     )
 
     assert result["ok"] is True
@@ -213,7 +216,7 @@ def test_transport_status_exposes_persistent_oem_message_state():
 
 
 
-def test_group_mix_uses_per_command_completion_for_composite_oem_mix():
+def test_group_mix_is_one_channel_without_constituent_completion_waits():
     from src.bioxp.pipette.models import PipetteMixCommand
     from src.bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport
 
@@ -242,14 +245,13 @@ def test_group_mix_uses_per_command_completion_for_composite_oem_mix():
     for transport in transports:
         transport._initialized = True
     collection = FourPipetteTransport(transports, sleep=lambda _seconds: None, liquid_mutation_enabled=True)
+    collection.loadTip(200, 2)
 
-    result = collection.mix(
-        PipetteMixCommand(volume_ul=2.0, cycles=2, metadata={"channels": [0, 1, 2, 3]})
-    )
+    result = collection.mix(PipetteMixCommand(volume_ul=2.0, cycles=2))
 
     assert result["ok"] is True
-    assert result["wait_policy"] == "per_command_completion"
-    assert [driver.wait_values for driver in drivers] == [[True], [True], [True], [True]]
+    assert result["wait_policy"] == "oem_composite_sequence_no_constituent_completion_waits"
+    assert [driver.wait_values for driver in drivers] == [[], [], [False], []]
 
 
 
@@ -261,7 +263,12 @@ def test_aspirate_air_matches_oem_no_tip_precondition_and_tracks_rear_air():
             assert volume == 5.0
             assert air_type == 1
             assert wait_for_completion is True
-            return {"ok": True, "outcome": "completion"}
+            return {
+                "ok": True,
+                "outcome": "completion",
+                "controller_acknowledged": True,
+                "completion_verified": True,
+            }
 
     transport = CanPipetteTransport(driver_factory=Driver, pipette_id=0)
     transport._initialized = True

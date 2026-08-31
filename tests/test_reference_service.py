@@ -8,11 +8,18 @@ import types
 import pytest
 from fastapi import HTTPException
 
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
 from src.bioxp.services.reference_service import (
     MarkAxisDesyncedCommand,
     MarkAxisReferencedCommand,
     ReferenceStateStore,
 )
+
+
+@pytest.fixture(autouse=True)
+def _canonical_runtime_state(tmp_path):
+    runtime = OEMRuntimeStore(tmp_path)
+    runtime.close()
 
 
 def load_api(monkeypatch):

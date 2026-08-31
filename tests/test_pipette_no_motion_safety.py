@@ -8,10 +8,12 @@ import pytest
 from src.bioxp.can_driver import BioXpCanDriver, process_pipette_message
 from src.bioxp.novo_router import NovoFrame, NovoRouter
 from src.bioxp.pipette.models import (
+    PipetteAspirateCommand,
     PipetteDiagnosticCommand,
     PipetteHeartbeatCommand,
     PipetteInitCommand,
     PipetteTerminateCommand,
+    PipetteValidationError,
 )
 from src.bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport, PipetteCommandError
 
@@ -59,15 +61,19 @@ def test_closed_production_owner_rejects_every_command_before_driver_io(invoke):
     assert exc.value.details["physical_effect_verified"] is False
 
 
-def test_collection_selection_requires_explicit_channels_or_selection_mode():
-    collection = FourPipetteTransport([_NoDriverCallsTransport() for _ in range(4)], liquid_mutation_enabled=True)
+def test_liquid_overload_selection_is_typed_and_not_read_from_metadata():
+    standard = PipetteAspirateCommand(
+        volume_ul=1.0,
+        metadata={"channels": [1, 3], "speed": 5.0},
+    )
+    assert standard.channels is None
+    assert standard.speed is None
 
-    with pytest.raises(PipetteCommandError, match="selection"):
-        collection._channels_from_metadata(None)
-
-    assert collection._channels_from_metadata({"channels": [1, 3]}) == [1, 3]
-    with pytest.raises(PipetteCommandError, match="unresolved"):
-        collection._channels_from_metadata({"selection_mode": "tip_location"})
+    explicit = PipetteAspirateCommand(volume_ul=1.0, channels=(1, 3), speed=5.0)
+    assert explicit.channels == (1, 3)
+    assert explicit.speed == 5.0
+    with pytest.raises(PipetteValidationError, match="both channels and speed"):
+        PipetteAspirateCommand(volume_ul=1.0, channels=(1, 3))
 
 
 def test_cached_tip_selection_requires_semantic_hardware_readback():
@@ -513,7 +519,7 @@ def test_completion_before_ack_uses_oem_channel_state_without_taint():
 
     assert result["ok"] is True
     assert result["outcome"] == "completion"
-    assert not hasattr(router, "pipette_completion_taint")
+    assert router.pipette_completion_taint(0) is None
 
 
 def test_completion_success_does_not_invent_controller_acknowledgement():

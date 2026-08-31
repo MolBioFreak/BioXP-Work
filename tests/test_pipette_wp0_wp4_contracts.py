@@ -403,16 +403,16 @@ def test_multipart_matcher_requires_explicit_opt_in_and_generation_fences_comple
     assert enabled(multipart).matched is True
 
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    router.prepare_pipette_completion(2, 10.0)
+    token = router.prepare_pipette_completion(2, 10.0)
     router._reader_generation += 1
-    result = router.wait_pipette_completion(2, 0.0)
+    result = router.wait_pipette_completion(2, 0.0, owner_token=token)
     assert result["ok"] is False
     assert result["generation_changed"] is True
 
 
 def test_generation_matched_pipette_completion_uses_channel_family_and_exact_dlc():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    router.prepare_pipette_completion(
+    token = router.prepare_pipette_completion(
         1,
         10.0,
         command_family=1,
@@ -422,6 +422,7 @@ def test_generation_matched_pipette_completion_uses_channel_family_and_exact_dlc
     started = router._clock()
     router.bind_pipette_completion(
         1,
+        owner_token=token,
         transaction_id="tx",
         tx_started_at=started,
     )
@@ -441,17 +442,66 @@ def test_generation_matched_pipette_completion_uses_channel_family_and_exact_dlc
         received_at=started + 0.02,
         classification="pipette_report",
     ))
-    result = router.wait_pipette_completion(1, 0.0)
+    result = router.wait_pipette_completion(1, 0.0, owner_token=token)
     assert result["ok"] is True
     assert result["generation_changed"] is False
     assert result["transaction_id"] == "tx"
     assert result["command_name"] == "pipette_aspirate"
-    assert "owner_token" not in result
+    assert result["owner_token"] == token
 
 
-def test_completion_timeout_allows_oem_style_replacement_without_taint():
+def test_terminate_completion_owner_takes_over_exact_active_command_without_taint():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
-    router.prepare_pipette_completion(
+    active_token = router.prepare_pipette_completion(
+        0,
+        60.0,
+        command_family=1,
+        command_name="pipette_aspirate",
+        expected_rx_id=0x501,
+    )
+    router.bind_pipette_completion(
+        0,
+        owner_token=active_token,
+        transaction_id="tx-active-liquid",
+        tx_started_at=router._clock(),
+    )
+
+    terminate_token = router.prepare_pipette_completion(
+        0,
+        8.0,
+        command_family=0,
+        command_name="terminate_pipette",
+        expected_rx_id=0x500,
+        replace_owner_token=active_token,
+        replacement_reason="interrupted_by_terminate",
+    )
+
+    interrupted = router.wait_pipette_completion(
+        0,
+        0.0,
+        owner_token=active_token,
+    )
+    assert interrupted["ok"] is False
+    assert interrupted["outcome"] == "interrupted_by_terminate"
+    assert router.pipette_completion_taint(0) is None
+    assert terminate_token != active_token
+    assert router._pipette_completions[0].owner_token == terminate_token
+
+    with pytest.raises(NovoRouterError, match="already registered"):
+        router.prepare_pipette_completion(
+            0,
+            8.0,
+            command_family=0,
+            command_name="terminate_pipette",
+            expected_rx_id=0x500,
+            replace_owner_token="wrong-owner-token",
+            replacement_reason="interrupted_by_terminate",
+        )
+
+
+def test_completion_timeout_taints_channel_until_router_rebind():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    token = router.prepare_pipette_completion(
         1,
         10.0,
         command_family=1,
@@ -459,17 +509,23 @@ def test_completion_timeout_allows_oem_style_replacement_without_taint():
     )
     router.bind_pipette_completion(
         1,
+        owner_token=token,
         transaction_id="tx-timeout",
         tx_started_at=router._clock(),
     )
 
-    timeout = router.wait_pipette_completion(1, 0.0)
+    timeout = router.wait_pipette_completion(1, 0.0, owner_token=token)
     assert timeout["ok"] is False
     assert timeout["outcome"] == "timeout"
-    assert not hasattr(router, "pipette_completion_taint")
+    taint = router.pipette_completion_taint(1)
+    assert taint is not None
+    assert taint["reason"] == "completion_timeout"
+    with pytest.raises(NovoRouterError, match="router rebind is required"):
+        router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
+
+    router.shutdown()
+    assert router.pipette_completion_taint(1) is None
     router.prepare_pipette_completion(1, 10.0, command_family=1, command_name="next")
-    with router._completion_lock:
-        assert router._pipette_completions[1].command_name == "next"
 
 
 def test_api_init_rejects_unmapped_pressure_profile_before_readiness_gate():

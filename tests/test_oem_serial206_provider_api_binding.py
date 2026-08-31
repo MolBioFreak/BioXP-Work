@@ -126,7 +126,7 @@ def test_z_mutations_are_rejected_outside_operator_dispatch_context(monkeypatch)
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", PartialProvider())
     with pytest.raises(HTTPException) as exc:
         api._execute_provider_z_intent("move_steps", {"steps": 10})
-    assert exc.value.status_code == 410
+    assert exc.value.status_code == 409
     assert exc.value.detail["error"] == "direct_z_mutation_retired"
 
 

@@ -32,7 +32,7 @@ def test_gv1_startup_profile_is_idle_safe_until_home_window(monkeypatch):
     monkeypatch.setattr(
         tester,
         "_machine_config_axis_max",
-        lambda axis, fallback: (15000, "immutable_oem_machine_snapshot"),
+        lambda axis: (15000, "immutable_oem_machine_snapshot"),
     )
 
     profile = tester._motion_oem_axis_profile("g", startup=True)

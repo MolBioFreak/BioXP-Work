@@ -14,6 +14,7 @@ import os
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -42,7 +43,6 @@ NONREPLAYABLE_INTERRUPT_ACTIONS = frozenset({
     "meta.emergency_stop",
     "oem.y.stop",
     "oem.z.stop",
-    "oem.z.abort",
     "oem.x.stop",
     "oem.abort_all",
 })
@@ -872,6 +872,7 @@ class OperatorReceiptStore:
                 response_summary_json,evidence_relpath,evidence_sha256,evidence_bytes,updated_at
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(command_id) DO UPDATE SET
+                sequence=(SELECT COALESCE(MAX(sequence),0)+1 FROM operator_commands),
                 idempotency_replay_enabled=excluded.idempotency_replay_enabled,
                 status=excluded.status,
                 finished_at=excluded.finished_at,
@@ -1820,13 +1821,25 @@ class OperatorReceiptStore:
                     receipt[key] = detail[key]
         return receipt
 
-    def list(self, limit: int = 100, *, include_evidence: bool = False) -> list[dict[str, Any]]:
+    def list(
+        self,
+        limit: int = 100,
+        *,
+        include_evidence: bool = False,
+        before_sequence: int | None = None,
+    ) -> list[dict[str, Any]]:
         selected_limit = max(1, min(int(limit), 200))
         with self.lock:
-            rows = self.connection.execute(
-                "SELECT * FROM operator_commands ORDER BY updated_at DESC, sequence DESC LIMIT ?",
-                (selected_limit,),
-            ).fetchall()
+            if before_sequence is None:
+                rows = self.connection.execute(
+                    "SELECT * FROM operator_commands ORDER BY sequence DESC LIMIT ?",
+                    (selected_limit,),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    "SELECT * FROM operator_commands WHERE sequence<? ORDER BY sequence DESC LIMIT ?",
+                    (int(before_sequence), selected_limit),
+                ).fetchall()
             return [self._row_receipt(row, include_evidence=include_evidence) for row in rows]
 
     def by_command(self, command_id: str, *, include_evidence: bool = True) -> dict[str, Any] | None:
@@ -1846,4 +1859,255 @@ class OperatorReceiptStore:
                 """,
                 (key,),
             ).fetchone()
-            return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
+        return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
+
+
+_LEGACY_COMMAND_COLUMNS = frozenset({
+    "command_id", "stream_sequence", "method_id", "method_sequence", "action_id",
+    "requested_json", "effective_json", "status", "version", "ownership_generation",
+    "queued_at", "dispatched_at", "finished_at", "source_noop", "source_noop_reason",
+    "remote_acknowledged", "controller_acknowledged", "physical_effect_verified", "terminal_json",
+})
+_LEGACY_METHOD_COLUMNS = frozenset({
+    "method_id", "name", "digest", "failure_policy", "status", "version",
+    "ownership_generation", "expanded_count", "first_stream_sequence",
+    "last_stream_sequence", "queued_at", "updated_at",
+})
+_LEGACY_NONTERMINAL_COMMAND_STATES = frozenset({
+    "queued", "dispatched", "issued_pending", "stop_requested", "abort_requested",
+})
+_LEGACY_NONTERMINAL_METHOD_STATES = frozenset({
+    "queued", "running", "pause_requested", "paused", "cancel_requested",
+    "stopping", "aborting", "recovery_required",
+})
+
+
+class OperatorHistoryReader:
+    """Read-only projection over the retired operator-plane tables."""
+
+    def __init__(self, root: str | Path | None = None) -> None:
+        self.root = runtime_state_root(root)
+        self.path = self.root / "bioxp_runtime.db"
+        self.lock = threading.RLock()
+        self.connection: sqlite3.Connection | None = None
+        if self.path.is_file():
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=2.0,
+                isolation_level=None, check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            self.connection = connection
+
+    def _table_columns(self, table: str) -> set[str] | None:
+        if self.connection is None:
+            return None
+        exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if exists is None:
+            return None
+        return {str(row["name"]) for row in self.connection.execute(f'PRAGMA table_info("{table}")')}
+
+    def _require_schema(self, table: str, required: frozenset[str]) -> bool:
+        columns = self._table_columns(table)
+        if columns is None:
+            return False
+        missing = sorted(required - columns)
+        if missing:
+            raise RuntimeError(
+                f"unsupported legacy operator history schema: {table} missing {','.join(missing)}"
+            )
+        return True
+
+    @staticmethod
+    def _load_json(value: Any, default: Any) -> Any:
+        if value is None:
+            return default
+        try:
+            return json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("unsupported legacy operator history schema: invalid JSON") from exc
+
+    def _canonical_command(self, command_id: str) -> sqlite3.Row | None:
+        if self.connection is None:
+            return None
+        columns = self._table_columns("serial206_movement_commands")
+        if columns is None:
+            return None
+        required = {
+            "command_id", "sequence", "state", "state_version",
+            "expected_board_epochs_json", "terminal_receipt_id",
+        }
+        if not required.issubset(columns):
+            raise RuntimeError("unsupported legacy operator history schema: serial206_movement_commands")
+        return self.connection.execute(
+            "SELECT sequence,state,state_version,expected_board_epochs_json,terminal_receipt_id "
+            "FROM serial206_movement_commands WHERE command_id=?", (command_id,),
+        ).fetchone()
+
+    def _command_projection(self, row: sqlite3.Row) -> dict[str, Any]:
+        command_id = str(row["command_id"])
+        canonical = self._canonical_command(command_id)
+        stored_status = str(canonical["state"]) if canonical is not None else str(row["status"])
+        nonterminal = stored_status in _LEGACY_NONTERMINAL_COMMAND_STATES
+        terminal = self._load_json(row["terminal_json"], None)
+        transition_sequence = None
+        transition_columns = self._table_columns("operator_plane_transitions")
+        if transition_columns is not None:
+            if not {"transition_sequence", "command_id"}.issubset(transition_columns):
+                raise RuntimeError("unsupported legacy operator history schema: operator_plane_transitions")
+            selected = self.connection.execute(
+                "SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            transition_sequence = selected[0] if selected and selected[0] is not None else None
+        return {
+            "schema_version": "bioxp.operator_command_receipt.v1",
+            "source": "legacy_operator_plane",
+            "command_id": command_id,
+            "method_id": row["method_id"],
+            "method_sequence": row["method_sequence"],
+            "stream_sequence": int(row["stream_sequence"]),
+            "action_id": str(row["action_id"]),
+            "status": "ambiguous" if nonterminal else stored_status,
+            "stored_status": stored_status,
+            "recovery_required": nonterminal,
+            "automatic_retry": False,
+            "physical_outcome": "ambiguous" if nonterminal else None,
+            "ownership_generation": int(row["ownership_generation"]),
+            "requested_inputs": self._load_json(row["requested_json"], {}),
+            "effective_inputs": self._load_json(row["effective_json"], {}),
+            "accepted_at": float(row["queued_at"]),
+            "queued_at": float(row["queued_at"]),
+            "dispatched_at": row["dispatched_at"],
+            "finished_at": row["finished_at"],
+            "source_noop": bool(row["source_noop"]),
+            "source_noop_reason": row["source_noop_reason"],
+            "remote_acknowledged": bool(row["remote_acknowledged"]),
+            "controller_acknowledged": bool(row["controller_acknowledged"]),
+            "physical_effect_verified": bool(row["physical_effect_verified"]),
+            "terminal_evidence": terminal,
+            "sequence": int(canonical["sequence"]) if canonical is not None else int(row["stream_sequence"]),
+            "state_version": int(canonical["state_version"]) if canonical is not None else int(row["version"]),
+            "expected_board_epoch_by_board": self._load_json(canonical["expected_board_epochs_json"], {}) if canonical is not None else {},
+            "terminal_receipt_id": canonical["terminal_receipt_id"] if canonical is not None else None,
+            "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
+            "transition_sequence": transition_sequence,
+        }
+
+    def get_command(self, command_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
+                return None
+            row = self.connection.execute(
+                "SELECT * FROM operator_plane_commands WHERE command_id=?", (str(command_id),)
+            ).fetchone()
+            return None if row is None else self._command_projection(row)
+
+    def list_commands(
+        self, *, limit: int = 100, before_sequence: int | None = None,
+        exclude_command_ids: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 200)
+        excluded = {str(value) for value in (exclude_command_ids or set())}
+        with self.lock:
+            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
+                return []
+            clauses: list[str] = []
+            parameters: list[Any] = []
+            if before_sequence is not None:
+                clauses.append("stream_sequence<?")
+                parameters.append(int(before_sequence))
+            if excluded:
+                clauses.append(f"command_id NOT IN ({','.join('?' for _ in excluded)})")
+                parameters.extend(sorted(excluded))
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            parameters.append(bounded)
+            rows = self.connection.execute(
+                f"SELECT * FROM operator_plane_commands{where} ORDER BY stream_sequence DESC LIMIT ?",
+                tuple(parameters),
+            ).fetchall()
+            return [self._command_projection(row) for row in rows]
+
+    def command_detail_v2(self, command_id: str) -> dict[str, Any] | None:
+        projection = self.get_command(command_id)
+        if projection is None or self.connection is None:
+            return projection
+        with self.lock:
+            transitions: list[dict[str, Any]] = []
+            columns = self._table_columns("operator_plane_transitions")
+            if columns is not None:
+                required = {"transition_sequence", "command_id", "state", "payload_json", "created_at"}
+                if not required.issubset(columns):
+                    raise RuntimeError("unsupported legacy operator history schema: operator_plane_transitions")
+                rows = self.connection.execute(
+                    "SELECT transition_sequence,state,payload_json,created_at FROM operator_plane_transitions "
+                    "WHERE command_id=? ORDER BY transition_sequence LIMIT 200", (str(command_id),),
+                ).fetchall()
+                previous = None
+                for row in rows:
+                    transitions.append({
+                        "transition_id": str(row["transition_sequence"]), "from_status": previous,
+                        "to_status": str(row["state"]), "at": float(row["created_at"]),
+                        "reason": (self._load_json(row["payload_json"], {}) or {}).get("reason"),
+                    })
+                    previous = str(row["state"])
+            terminal = projection.get("terminal_evidence")
+            response = terminal.get("response") if isinstance(terminal, Mapping) else None
+            response = dict(response) if isinstance(response, Mapping) else (dict(terminal) if isinstance(terminal, Mapping) else {})
+            projection.update({
+                "canonical_inputs": dict(projection.get("requested_inputs") or {}),
+                "requested_values": dict(projection.get("requested_inputs") or {}),
+                "effective_values": dict(projection.get("effective_inputs") or {}),
+                "observed_values": dict(terminal.get("observed_values") or {}) if isinstance(terminal, Mapping) else {},
+                "raw_return_layers": dict(response.get("raw_return_layers") or {}),
+                "controller_evidence": dict(response.get("controller_evidence") or {}),
+                "transport_artifacts": list(terminal.get("transport_artifacts") or []) if isinstance(terminal, Mapping) else [],
+                "child_receipts": list(terminal.get("child_receipts") or []) if isinstance(terminal, Mapping) else [],
+                "transitions": transitions,
+            })
+            return projection
+
+    def get_method(self, method_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            if self.connection is None or not self._require_schema("operator_plane_methods", _LEGACY_METHOD_COLUMNS):
+                return None
+            row = self.connection.execute(
+                "SELECT * FROM operator_plane_methods WHERE method_id=?", (str(method_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            stored_status = str(row["status"])
+            nonterminal = stored_status in _LEGACY_NONTERMINAL_METHOD_STATES
+            return {
+                "schema_version": "bioxp.operator_method_receipt.v1",
+                "source": "legacy_operator_plane",
+                "method_id": str(row["method_id"]), "name": str(row["name"]),
+                "method_digest": str(row["digest"]),
+                "status": "ambiguous" if nonterminal else stored_status,
+                "stored_status": stored_status, "recovery_required": nonterminal,
+                "automatic_retry": False, "version": int(row["version"]),
+                "ownership_generation": int(row["ownership_generation"]),
+                "expanded_count": int(row["expanded_count"]),
+                "first_stream_sequence": row["first_stream_sequence"],
+                "last_stream_sequence": row["last_stream_sequence"],
+                "queued_at": float(row["queued_at"]), "updated_at": float(row["updated_at"]),
+                "failure_policy": str(row["failure_policy"]),
+            }
+
+    def list_method_commands(self, method_id: str) -> list[dict[str, Any]]:
+        with self.lock:
+            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
+                return []
+            rows = self.connection.execute(
+                "SELECT * FROM operator_plane_commands WHERE method_id=? "
+                "ORDER BY method_sequence,stream_sequence", (str(method_id),),
+            ).fetchall()
+            return [self._command_projection(row) for row in rows]
+
+    def close(self) -> None:
+        with self.lock:
+            if self.connection is not None:
+                self.connection.close()
+                self.connection = None

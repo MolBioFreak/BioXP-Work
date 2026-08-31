@@ -201,12 +201,12 @@ class NovoUsbCanBus:
         router: NovoRouter,
         response: dict[str, Any],
         channel: int,
-        completion_registered: bool,
+        completion_owner_token: str | None,
         completion_timeout_s: float,
         wait_for_completion: bool,
     ) -> dict[str, Any]:
-        if not completion_registered:
-            query_response_correlated = bool(
+        if completion_owner_token is None:
+            query_verified = bool(
                 response.get("ok")
                 and response.get("outcome") in {"completion", "multipart_completion"}
             )
@@ -214,14 +214,14 @@ class NovoUsbCanBus:
                 **response,
                 "completion_received": False,
                 "completion_deferred": False,
-                "query_response_correlated": query_response_correlated,
-                "semantic_query_response_verified": False,
+                "semantic_query_response_verified": query_verified,
             }
         immediate_ack = bool(response.get("outcome") == "ack" and response.get("ack_received"))
         if not immediate_ack:
             completion = router.wait_pipette_completion(
                 int(channel),
                 0.0,
+                owner_token=completion_owner_token,
             )
             return {
                 **response,
@@ -244,6 +244,7 @@ class NovoUsbCanBus:
         completion = router.wait_pipette_completion(
             int(channel),
             float(completion_timeout_s),
+            owner_token=completion_owner_token,
         )
         return {
             **response,
@@ -268,6 +269,8 @@ class NovoUsbCanBus:
         completion_timeout_s: float = 60.0,
         allow_multipart: bool = False,
         wait_for_completion: bool = True,
+        replace_completion_owner_token: str | None = None,
+        completion_replacement_reason: str | None = None,
     ) -> dict[str, Any]:
         router = self._current_router()
         tx_id = int(getattr(msg, "arbitration_id"))
@@ -285,14 +288,16 @@ class NovoUsbCanBus:
             raise NovoUsbCanError(
                 f"pipette TX tuple does not derive expected RX ID: tx=0x{tx_id:03x} expected=0x{derived_rx_id:03x}"
             )
-        completion_registered = int(expected_function) in {0, 1}
-        if completion_registered:
-            router.prepare_pipette_completion(
+        completion_owner_token: str | None = None
+        if int(expected_function) in {0, 1}:
+            completion_owner_token = router.prepare_pipette_completion(
                 int(channel),
                 float(completion_timeout_s),
                 command_family=int(expected_function),
                 command_name=str(matcher_name),
                 expected_rx_id=expected_rx_id,
+                replace_owner_token=replace_completion_owner_token,
+                replacement_reason=completion_replacement_reason,
             )
         try:
             response = router.transact(
@@ -300,7 +305,7 @@ class NovoUsbCanBus:
                 matcher=router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
-                    initialization=completion_registered,
+                    initialization=completion_owner_token is not None,
                     allow_multipart=bool(allow_multipart),
                 ),
                 matcher_name=matcher_name,
@@ -313,24 +318,25 @@ class NovoUsbCanBus:
                     "tx_dlc": tx_dlc,
                     "tx_data": tx_data[:tx_dlc],
                     "expected_rx_id": expected_rx_id,
-                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if completion_registered else None,
-                    "completion_deferred": bool(completion_registered and not wait_for_completion),
-                    "completion_registered": completion_registered,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if completion_owner_token is not None else None,
+                    "completion_deferred": bool(completion_owner_token is not None and not wait_for_completion),
+                    "completion_owner_token": completion_owner_token,
                 },
             )
             return self._finish_pipette_response(
                 router=router,
                 response=response,
                 channel=int(channel),
-                completion_registered=completion_registered,
+                completion_owner_token=completion_owner_token,
                 completion_timeout_s=float(completion_timeout_s),
                 wait_for_completion=bool(wait_for_completion),
             )
         except Exception:
-            if completion_registered:
+            if completion_owner_token is not None:
                 router.wait_pipette_completion(
                     int(channel),
                     0.0,
+                    owner_token=completion_owner_token,
                 )
             raise
 
@@ -374,9 +380,9 @@ class NovoUsbCanBus:
             raise NovoUsbCanError(
                 f"pipette final TX tuple does not derive expected RX ID: expected=0x{derived_rx_id:03x}"
             )
-        completion_registered = int(expected_function) in {0, 1}
-        if completion_registered:
-            router.prepare_pipette_completion(
+        completion_owner_token: str | None = None
+        if int(expected_function) in {0, 1}:
+            completion_owner_token = router.prepare_pipette_completion(
                 int(channel),
                 float(completion_timeout_s),
                 command_family=int(expected_function),
@@ -389,7 +395,7 @@ class NovoUsbCanBus:
                 matcher=router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
-                    initialization=completion_registered,
+                    initialization=completion_owner_token is not None,
                     allow_multipart=bool(allow_multipart),
                 ),
                 matcher_name=matcher_name,
@@ -400,24 +406,25 @@ class NovoUsbCanBus:
                     "command_family": int(expected_function),
                     "expected_rx_id": expected_rx_id,
                     "tx_frames": tx_frames,
-                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if completion_registered else None,
-                    "completion_deferred": bool(completion_registered and not wait_for_completion),
-                    "completion_registered": completion_registered,
+                    "completion_timeout_ms": int(round(float(completion_timeout_s) * 1000.0)) if completion_owner_token is not None else None,
+                    "completion_deferred": bool(completion_owner_token is not None and not wait_for_completion),
+                    "completion_owner_token": completion_owner_token,
                 },
             )
             return self._finish_pipette_response(
                 router=router,
                 response=response,
                 channel=int(channel),
-                completion_registered=completion_registered,
+                completion_owner_token=completion_owner_token,
                 completion_timeout_s=float(completion_timeout_s),
                 wait_for_completion=bool(wait_for_completion),
             )
         except Exception:
-            if completion_registered:
+            if completion_owner_token is not None:
                 router.wait_pipette_completion(
                     int(channel),
                     0.0,
+                    owner_token=completion_owner_token,
                 )
             raise
 
@@ -425,10 +432,13 @@ class NovoUsbCanBus:
         self,
         channel: int,
         timeout_s: float,
+        *,
+        owner_token: str | None = None,
     ) -> dict[str, Any]:
         return self._current_router().wait_pipette_completion(
             int(channel),
             float(timeout_s),
+            owner_token=owner_token,
         )
 
     def shutdown(self) -> None:

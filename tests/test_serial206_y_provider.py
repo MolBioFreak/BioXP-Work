@@ -23,6 +23,10 @@ class FakeYTester:
             "axis_max_steps": 102956,
         }
 
+    def _machine_config_axis_max(self, axis):
+        assert axis == "y"
+        return 102956, "test_selected_machine_configuration"
+
     def motor_oem_require_no_motion_profile(self, axis):
         self.calls.append(("prepare", axis))
         return {"ok": True, "profile": {"axis": axis}}
@@ -80,10 +84,17 @@ class FakeYTester:
             "ok": True, "axis": axis,
             "home": {
                 "ok": True,
-                "home_after": {"ok": True, "value": 1, "ack": {"status": 100}},
+                "home_after": {"ok": True, "home": True, "value": 1, "ack": {"status": 100}},
                 "stop": {"ok": True, "first_delivery": {"status": 100}, "second_delivery": {"status": 100}},
                 "wait": {"stopped": True, "last_speed": 0, "last_ack": {"status": 100}},
-                "set_home": {"ok": True, "ack": {"status": 100}, "readback": {"value": 0, "ack": {"status": 100}}},
+                "set_home": {
+                    "ok": True,
+                    "source_call_completed": True,
+                    "source_return_code": 0,
+                    "controller_command_acknowledged": True,
+                    "ack": {"status": 100},
+                    "readback": {"value": 0, "ack": {"status": 100}},
+                },
                 "position_after_sethome": {"ok": True, "position": 0, "ack": {"status": 100}},
                 "switch_transition": False,
             },
@@ -112,6 +123,9 @@ class FakeYTester:
         self.position = 0
         return {
             "ok": True,
+            "source_call_completed": True,
+            "source_return_code": 0,
+            "controller_command_acknowledged": True,
             "ack": {"status": 100},
             "readback": {"ok": True, "value": 0, "ack": {"status": 100}},
         }
@@ -143,20 +157,65 @@ def test_relative_move_reconciles_observed_discrepancy_without_latch(tmp_path):
     result = provider.move_steps(100, command_id="y-relative-1")
     assert result["ok"] is True
     assert result["completion_class"] == "event_128"
+    assert result["requested_target"] == 1100
+    assert result["position_after"]["position"] == 1100
+    assert result["terminal_speed_zero"] is True
     assert result["physical_effect_verified"] is False
     axis = provider.state_store.board4_authority_projection()["axes"]["y"]
     assert axis["lifecycle_state"] == "prepared_unreferenced"
     assert axis["reference_state"] == "unreferenced"
 
 
-def test_absolute_move_clamps_controller_target_and_starts_pending_by_default(tmp_path):
+def test_relative_move_rejects_board_wrapper_minus_one_even_when_public_read_succeeds(tmp_path):
+    provider = make_provider(tmp_path)
+    provider.tester.motor_y_move_relative_strict = lambda *_args, **_kwargs: {
+        "ok": True,
+        "target_position": 1100,
+        "board_wrapper_return": -1,
+        "public_wrapper_return": 1098,
+        "terminal_position": {"ok": True, "position": 1098, "ack": {"status": 100}},
+        "terminal_speed": {"ok": True, "speed": 0, "ack": {"status": 100}},
+        "completion_class": "timeout",
+    }
+
+    result = provider.move_steps(100, command_id="y-relative-failed-board-wrapper")
+
+    assert result["ok"] is False
+    assert result["board_wrapper_return"] == -1
+    assert result["public_wrapper_return"] == 1098
+    assert result["requested_target"] == 1100
+    assert result["position_after"]["position"] == 1098
+
+
+def test_absolute_move_clamps_controller_target_and_waits_for_oem_completion_by_default(tmp_path):
     provider = make_provider(tmp_path)
     result = provider.move_absolute(-5, command_id="y-absolute-1")
     assert result["ok"] is True
-    assert result["state"] == "issued_pending"
+    assert result["state"] == "completed"
     assert result["caller_requested_target"] == -5
     assert result["board_effective_target"] == 0
-    assert provider.tester.calls[-1] == ("absolute", 4, 0, False, 102956)
+    assert provider.tester.calls[-1] == ("absolute", 4, 0, True, 102956)
+
+
+def test_absolute_move_preserves_timeout_equal_completion_and_terminal_discrepancy(tmp_path):
+    provider = make_provider(tmp_path)
+    provider.tester.motor_oem_move_absolute = lambda *_args, **_kwargs: {
+        "ok": True,
+        "before": {"ok": True, "position": 1000, "ack": {"status": 100}},
+        "wire_position": 1200,
+        "command_sent": True,
+        "ack": {"status": 100},
+        "completion_class": "oem_timeout_target_equal",
+        "timeout_position": {"ok": True, "position": 1200, "ack": {"status": 100}},
+    }
+
+    result = provider.move_absolute(1200, command_id="y-absolute-timeout-equal")
+
+    assert result["ok"] is True
+    assert result["completion_class"] == "oem_timeout_target_equal"
+    assert result["controller_completion_verified"] is False
+    assert result["position_after"]["position"] == 1200
+    assert result["discrepancy"]["discrepancy_steps"] == 0
 
 
 def test_home_modes_use_distinct_source_speed_and_publish_reference_without_transition(tmp_path):
@@ -173,6 +232,46 @@ def test_home_modes_use_distinct_source_speed_and_publish_reference_without_tran
     assert provider.tester.calls[-1] == ("home", "y", 500, False, False)
 
 
+def test_already_home_y_accepts_current_generation_zero_terminal_proof_without_inapplicable_steps(tmp_path):
+    provider = make_provider(tmp_path)
+    authority = provider._current_authority(allow_unprepared=True)
+    board_epoch = authority["board"]["active_board_epoch"]
+    production_go_home = {
+        "ok": True,
+        "axis": "y",
+        "board": 4,
+        "motor": 0,
+        "board_lifecycle_generation": board_epoch,
+        "source_noop": True,
+        "source_return_code": 0,
+        "controller_command_acknowledged": False,
+        "controller_terminal_state_verified": True,
+        "controller_home_proof_verified": True,
+        "position_before": {"ok": True, "position": 0, "ack": {"status": 100}},
+        "position_after": {"ok": True, "position": 0, "ack": {"status": 100}},
+        "speed_before": {"ok": True, "speed": 0, "ack": {"status": 100}},
+        "home_before": {"ok": True, "value": 1, "ack": {"status": 100}},
+        "home_after": {"ok": True, "value": 1, "ack": {"status": 100}},
+        "home_decision": {
+            "source_short_circuit": "MotorHome_and_CurrentPosition_zero",
+        },
+    }
+    provider.tester.motor_oem_home_axis = lambda *_args, **_kwargs: {
+        "axis": "y",
+        "startup": False,
+        "prepare": {"ok": True},
+        "home": production_go_home,
+        "restore_current": None,
+    }
+
+    result = provider.home("manual_panel", command_id="y-already-home-current")
+
+    assert result["ok"] is True
+    assert result["controller_home_proof_verified"] is True
+    assert result["home_proof"]["already_home_current_generation"] is True
+    assert result["reference_published"] is True
+
+
 def test_set_home_is_explicit_no_motion_and_does_not_claim_home_reference(tmp_path):
     provider = make_provider(tmp_path)
     result = provider.set_home("SET_HOME_CURRENT_POSITION", command_id="y-set-home-1")
@@ -182,7 +281,7 @@ def test_set_home_is_explicit_no_motion_and_does_not_claim_home_reference(tmp_pa
     assert provider.tester.calls[-1] == ("set_home", 4, 0)
 
 
-def test_home_xy_publishes_only_the_y_child_reference_from_complete_proof(tmp_path):
+def test_home_xy_primitive_does_not_publish_a_y_reference_before_parent_observation(tmp_path):
     provider = make_provider(tmp_path)
     result = provider.publish_home_xy_reference(
         {
@@ -192,11 +291,26 @@ def test_home_xy_publishes_only_the_y_child_reference_from_complete_proof(tmp_pa
         },
         command_id="homexy-1",
     )
-    assert result["ok"] is True
-    assert result["reference_published"] is True
+    assert result["ok"] is False
+    assert result["reference_published"] is False
     axes = provider.state_store.board4_authority_projection()["axes"]
-    assert axes["y"]["reference_state"] == "referenced"
+    assert axes["y"]["reference_state"] == "unreferenced"
     assert axes["z"]["reference_state"] == "unreferenced"
+
+
+def test_y_stop_is_oem_noop_when_board_is_present_but_uninitialized(tmp_path):
+    provider = make_provider(tmp_path)
+    provider.tester._oem_board_present = lambda _board: True
+    provider.tester._oem_board_state = lambda: {4: False}
+    provider.tester.motor_oem_board_stop = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("uninitialized OEM board must not deliver stop")
+    )
+
+    result = provider.stop(command_id="y-stop-uninitialized")
+
+    assert result["ok"] is True
+    assert result["source_noop"] is True
+    assert result["source_noop_reason"] == "board_not_initialized"
 
 
 def test_move_xy_reconciles_y_observation_without_touching_z_authority(tmp_path):

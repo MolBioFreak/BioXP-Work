@@ -362,12 +362,11 @@ def test_catalog_exposes_only_stable_robot_owned_z_semantic_actions(tmp_path, mo
         "oem.z.lower_pipette",
         "oem.z.lift_pipette",
         "oem.z.self_test",
-        "oem.z.abort",
         "oem.z.resume_after_abort",
     } <= set(by_id)
-    assert by_id["oem.z.abort"]["inputs"] == []
+    assert "oem.z.abort" not in by_id
+    assert "oem.abort_all" in by_id
     assert by_id["oem.z.diagnostic_home_axis"]["inputs"] == []
-    assert by_id["oem.z.abort"]["requires_confirmation"] is False
 
 
 def test_dashboard_normalizes_cache_only_axis_temperature_and_pipette_analytics():

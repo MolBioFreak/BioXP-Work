@@ -242,7 +242,15 @@ def test_remote_reconnect_bootstraps_intentionally_unbound_runtime(monkeypatch):
             created.append(alt)
 
     monkeypatch.setattr(api, "BioXpTester", FakeTester)
-    monkeypatch.setattr(api, "build_default_pipette_transport", lambda *, shared_usb: {"tester": shared_usb})
+    monkeypatch.setattr(
+        api,
+        "build_default_pipette_transport",
+        lambda *, shared_usb, error_callback=None, forceabort=None: {
+            "tester": shared_usb,
+            "error_callback": error_callback,
+            "forceabort": forceabort,
+        },
+    )
     monkeypatch.setattr(api, "_tester", None)
     monkeypatch.setattr(api, "_tester_quarantine", None)
     monkeypatch.setattr(api, "_pipette_transport", None)

@@ -130,6 +130,6 @@ def test_homexy_fails_closed_without_provider_before_tester_access(monkeypatch, 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(api.motion_oem_home_xy(request))
 
-    assert raised.value.status_code == 503
-    assert raised.value.detail["error"] == "serial206_homexy_provider_unavailable"
+    assert raised.value.status_code == 409
+    assert raised.value.detail["error"] == "canonical_xz_method_requires_v2_route"
     assert raised.value.detail["physical_motion_commanded"] is False

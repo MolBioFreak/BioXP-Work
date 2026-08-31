@@ -2,11 +2,26 @@ from __future__ import annotations
 
 import pytest
 
+from src.bioxp.oem_runtime_store import OEMRuntimeStore
+import src.bioxp.pipette.receipts as pipette_receipts_module
 from src.bioxp.pipette.application import (
     PipetteApplicationPlanner,
     PipettePhysicalMutationBlocked,
 )
 from src.bioxp.pipette.receipts import PipetteReceiptStore
+
+
+@pytest.fixture(autouse=True)
+def _verified_pipette_authority(monkeypatch):
+    monkeypatch.setattr(pipette_receipts_module, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+    monkeypatch.setattr(pipette_receipts_module, "current_authority_identity", lambda: {
+        "evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64,
+    })
 
 
 def _bound_dependencies():
@@ -124,6 +139,8 @@ def test_receipt_store_uses_durable_oem_root_and_never_infers_completion(monkeyp
     root = tmp_path / "oem-runtime"
     monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(root))
+    runtime = OEMRuntimeStore(root)
+    runtime.close()
 
     store = PipetteReceiptStore()
 
@@ -136,14 +153,19 @@ def test_application_plan_api_exposes_typed_no_motion_contract(monkeypatch, tmp_
 
     monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
     monkeypatch.delenv("BIOXP_PIPETTE_RECEIPT_ROOT", raising=False)
-    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path / "api-runtime"))
-    from src.bioxp.api import app
+    runtime_root = tmp_path / "api-runtime"
+    monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(runtime_root))
+    runtime = OEMRuntimeStore(runtime_root)
+    runtime.close()
+    import src.bioxp.api as api
+    monkeypatch.setattr(api, "_pipette_receipts", PipetteReceiptStore(runtime_root))
 
-    client = TestClient(app)
+    client = TestClient(api.app)
     status = client.get("/liquid/application/status")
     plan = client.post(
         "/liquid/application/plan",
         json={"operation": "detect_fluid", "fluid_class": "RC"},
+        headers={"Idempotency-Key": "test-application-plan-detect-fluid"},
     )
 
     assert status.status_code == 200

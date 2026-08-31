@@ -178,7 +178,7 @@ def test_mutating_transaction_requires_dlc0_ack_before_deferred_completion():
         assert result["immediate_ack_received"] is True
         assert result["completion_received"] is False
         assert result["completion_deferred"] is True
-        assert "completion_owner_token" not in result
+        assert isinstance(result["completion_owner_token"], str)
     finally:
         shared.close()
 

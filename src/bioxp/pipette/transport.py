@@ -366,8 +366,17 @@ class CanPipetteTransport:
             return result
         return None
 
-    def _require_tip_loaded(self, driver: Any) -> dict[str, Any] | None:
-        tip_status = self._safe_query_tip_status(driver, required=True)
+    def _require_tip_loaded(
+        self,
+        driver: Any,
+        *,
+        query_hardware: bool = True,
+    ) -> dict[str, Any] | None:
+        tip_status = (
+            self._safe_query_tip_status(driver, required=True)
+            if query_hardware
+            else self._last_tip_status
+        )
         if tip_status is not None and tip_status.get("tip_loaded") is not True:
             raise PipetteTipStateError(
                 "Hardware tip-status query does not report a loaded tip.",
@@ -481,10 +490,16 @@ class CanPipetteTransport:
             hardware_truth_level="hardware_query",
         )
 
-    def aspirate(self, command: PipetteAspirateCommand, *, wait_for_completion: bool = True) -> dict[str, Any]:
+    def aspirate(
+        self,
+        command: PipetteAspirateCommand,
+        *,
+        wait_for_completion: bool = True,
+        verify_tip: bool = True,
+    ) -> dict[str, Any]:
         self._require_initialized()
         driver = self._get_driver()
-        tip_status = self._require_tip_loaded(driver)
+        tip_status = self._require_tip_loaded(driver, query_hardware=verify_tip)
         driver_result = self._assert_driver_result(
             "aspirate",
             driver.aspirate(
@@ -517,11 +532,19 @@ class CanPipetteTransport:
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
 
-    def dispense(self, command: PipetteDispenseCommand, *, wait_for_completion: bool = True) -> dict[str, Any]:
+    def dispense(
+        self,
+        command: PipetteDispenseCommand,
+        *,
+        wait_for_completion: bool = True,
+        verify_tip: bool = True,
+    ) -> dict[str, Any]:
         self._require_initialized()
         driver = self._get_driver()
-        tip_status = self._require_tip_loaded(driver)
-        dispense_type = int(command.metadata.get("dispense_type", 0)) if isinstance(command.metadata, Mapping) else 0
+        tip_status = self._require_tip_loaded(driver, query_hardware=verify_tip)
+        # Both recovered collection Dispense overloads call the child with
+        # host-accounting type 0. The child still transmits literal D...,1R.
+        dispense_type = 0
         driver_result = self._assert_driver_result(
             "dispense",
             driver.dispense(
@@ -561,10 +584,17 @@ class CanPipetteTransport:
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
 
-    def mix(self, command: PipetteMixCommand, *, wait_for_completion: bool = True) -> dict[str, Any]:
+    def mix(
+        self,
+        command: PipetteMixCommand,
+        *,
+        wait_for_completion: bool = True,
+        verify_tip: bool = True,
+    ) -> dict[str, Any]:
         self._require_initialized()
         driver = self._get_driver()
-        tip_status = self._require_tip_loaded(driver)
+        # OEM ClassPipette.Mix does not issue QueryTipStatus.
+        tip_status = None
         mix_fn = getattr(driver, "mix", None)
         if not callable(mix_fn):
             raise PipetteCommandError(
@@ -602,10 +632,15 @@ class CanPipetteTransport:
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
 
-    def dispense_all(self, *, wait_for_completion: bool = True) -> dict[str, Any]:
+    def dispense_all(
+        self,
+        *,
+        wait_for_completion: bool = True,
+        verify_tip: bool = True,
+    ) -> dict[str, Any]:
         self._require_initialized()
         driver = self._get_driver()
-        tip_status = self._require_tip_loaded(driver)
+        tip_status = self._require_tip_loaded(driver, query_hardware=verify_tip)
         result = self._assert_driver_result("dispense_all", driver.dispense_all(wait_for_completion=wait_for_completion))
         previous_level = self._liquid_level_ul
         evidence = self._driver_evidence(result)
@@ -700,36 +735,68 @@ class CanPipetteTransport:
             hardware_truth_level="acknowledged_command_with_tip_readback",
         )
 
-    def wait_for_completion(self, timeout_s: float) -> dict[str, Any]:
+    def current_completion_owner_token(self) -> str | None:
+        driver = self._get_driver()
+        current = getattr(driver, "current_pipette_completion_owner_token", None)
+        if callable(current):
+            token = current()
+        else:
+            token = getattr(driver, "_pipette_completion_owner_token", None)
+        return token if isinstance(token, str) and token else None
+
+    def wait_for_completion(
+        self,
+        timeout_s: float,
+        *,
+        owner_token: str | None = None,
+    ) -> dict[str, Any]:
         driver = self._get_driver()
         wait_fn = getattr(driver, "wait_pipette_command_completion", None)
         if not callable(wait_fn):
             return {"ok": False, "outcome": "completion_wait_unavailable", "channel": self._pipette_id}
-        result = wait_fn(float(timeout_s))
+        try:
+            result = wait_fn(float(timeout_s), owner_token=owner_token)
+        except TypeError:
+            if owner_token is not None:
+                raise
+            result = wait_fn(float(timeout_s))
         if isinstance(result, dict):
             self._last_transaction = result
             return result
         return {"ok": False, "outcome": "invalid_completion_result", "result": repr(result), "channel": self._pipette_id}
 
-    def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
+    def terminate(
+        self,
+        command: PipetteTerminateCommand | None = None,
+        *,
+        wait_for_completion: bool = True,
+    ) -> dict[str, Any]:
         del command
         driver = self._get_driver()
-        result = self._assert_driver_result("terminate", driver.terminate_pipette())
-        self._initialized = False
+        result = self._assert_driver_result(
+            "terminate",
+            driver.terminate_pipette(wait_for_completion=wait_for_completion),
+        )
         self._last_command = "terminate"
         return self._status_payload(
             command="terminate",
             driver_result=result,
-            initialized=False,
+            initialized=self._initialized,
             **self._driver_evidence(result),
             physical_effect_verified=False,
             hardware_truth_level="controller_acknowledged",
         )
 
-    def set_top_speed(self, velocity: float) -> dict[str, Any]:
+    def set_top_speed(self, velocity: float, *, wait_for_completion: bool = True) -> dict[str, Any]:
         driver = self._get_driver()
         value = float(velocity)
-        result = self._assert_driver_result("set_top_speed", driver.set_top_speed(value))
+        try:
+            raw = driver.set_top_speed(value, wait_for_completion=wait_for_completion)
+        except TypeError:
+            if wait_for_completion is not True:
+                raise
+            raw = driver.set_top_speed(value)
+        result = self._assert_driver_result("set_top_speed", raw)
         self._top_speed = float(value)
         self._last_command = "set_top_speed"
         return self._status_payload(
@@ -877,16 +944,19 @@ class FourPipetteTransport:
         sleep: Callable[[float], None] = time.sleep,
         liquid_mutation_enabled: bool = False,
         error_callback: Callable[[int, int], None] | None = None,
+        forceabort: Callable[[], bool] | None = None,
     ) -> None:
         if len(transports) != 4:
             raise ValueError("OEM production pipette collection requires exactly four channels")
         self._transports = list(transports)
         self._sleep = sleep
         self._transaction_lock = threading.RLock()
+        self._interrupt_epoch = 0
         self._last_group_transaction: dict[str, Any] | None = None
         self._tip_type = 201  # OEM enum value UNKNOWN
         self._tip_location = -1
         self._allow_to_stop = True
+        self._forceabort = forceabort or (lambda: False)
         self._liquid_mutation_enabled = bool(liquid_mutation_enabled)
         self._fluid_detection_timestamps: dict[int, float | None] = {channel: None for channel in self.CHANNELS}
         self._last_error: dict[str, Any] | None = None
@@ -1561,19 +1631,71 @@ class FourPipetteTransport:
             "oem_source_anchor": "ClassPipette.getData:211-261",
         }
 
+    @staticmethod
+    def _completion_owner_token(transport: Any) -> str | None:
+        current = getattr(transport, "current_completion_owner_token", None)
+        if callable(current):
+            token = current()
+        else:
+            driver_getter = getattr(transport, "_get_driver", None)
+            driver = driver_getter() if callable(driver_getter) else None
+            token = getattr(driver, "_pipette_completion_owner_token", None)
+        return token if isinstance(token, str) and token else None
+
+    @staticmethod
+    def _wait_channel_completion(
+        transport: Any,
+        timeout_s: float,
+        *,
+        owner_token: str | None,
+    ) -> dict[str, Any]:
+        wait = getattr(transport, "wait_for_completion")
+        try:
+            return wait(float(timeout_s), owner_token=owner_token)
+        except TypeError:
+            if owner_token is not None:
+                raise
+            return wait(float(timeout_s))
+
     def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
         self._require_physical_command_admission("terminate")
         with self._transaction_lock:
-            rows = [{"channel": channel, "result": transport.terminate(command)} for channel, transport in enumerate(self._transports)]
-            self._allow_to_stop = True
-            self._last_error = None if all(row["result"].get("ok") for row in rows) else {"operation": "terminate", "channels": rows}
-            return {
-                "ok": all(row["result"].get("ok") for row in rows),
-                "channels": rows,
-                "allow_to_stop": self._allow_to_stop,
-                "physical_effect_verified": False,
-                "oem_source_anchor": "ClassPipetteCollection.terminatecommands: TR",
-            }
+            self._interrupt_epoch += 1
+            interrupt_epoch = self._interrupt_epoch
+            rows = []
+            for channel, transport in enumerate(self._transports):
+                result = transport.terminate(command, wait_for_completion=False)
+                rows.append({
+                    "channel": channel,
+                    "result": result,
+                    "completion_owner_token": self._completion_owner_token(transport),
+                })
+        deadline = time.monotonic() + 8.0
+        for row in rows:
+            channel = int(row["channel"])
+            completion = self._wait_channel_completion(
+                self._transports[channel],
+                max(0.0, deadline - time.monotonic()),
+                owner_token=row.get("completion_owner_token"),
+            )
+            row["completion"] = completion
+        self._allow_to_stop = True
+        ok = all(
+            row["result"].get("ok") is True
+            and row.get("completion", {}).get("ok") is True
+            for row in rows
+        )
+        self._last_error = None if ok else {"operation": "terminate", "channels": rows}
+        return {
+            "ok": ok,
+            "channels": rows,
+            "timeout_ms": 8_000,
+            "wait_policy": "shared_deadline_after_all_four_TR_sends",
+            "interrupt_epoch": interrupt_epoch,
+            "allow_to_stop": self._allow_to_stop,
+            "physical_effect_verified": False,
+            "oem_source_anchor": "ClassPipetteCollection.terminatecommands:1325-1334",
+        }
 
     def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]:
         self._require_physical_command_admission("heartbeat")
@@ -1582,25 +1704,6 @@ class FourPipetteTransport:
 
     def disable_heartbeat(self) -> dict[str, Any]:
         return self.heartbeat(PipetteHeartbeatCommand(enabled=False))
-
-    def _channels_from_metadata(self, metadata: Mapping[str, Any] | None) -> list[int]:
-        raw = metadata.get("channels") if isinstance(metadata, Mapping) else None
-        if raw is not None:
-            return self._selected_channels(list(raw))
-        if not isinstance(metadata, Mapping) or metadata.get("selection_mode") != "tip_location":
-            raise PipetteCommandError(
-                "Pipette channel selection requires explicit channels or selection_mode='tip_location'.",
-                details={
-                    "selection_required": True,
-                    "allowed_selection_modes": ["explicit_channels", "tip_location"],
-                },
-            )
-        if self._tip_location == -1:
-            raise PipetteCommandError(
-                "Pipette TipLocation is unresolved; explicit channels are required.",
-                details={"selection_mode": "tip_location", "tip_location": -1},
-            )
-        return self._selected_channels([self._tip_location])
 
     def _require_physical_command_admission(self, operation: str) -> None:
         if not self._liquid_mutation_enabled:
@@ -1626,92 +1729,218 @@ class FourPipetteTransport:
         *,
         timeout_ms: int,
         defer_completion: bool = True,
+        pre_send_delay_s: float = 0.0,
+        post_send_delay_s: float = 0.0,
+        timeout_failure_sleep_s: float = 0.0,
+        check_forceabort_after_wait: bool = False,
     ) -> dict[str, Any]:
         self._require_liquid_mutation(operation)
-        with self._transaction_lock:
-            self._allow_to_stop = False
-            rows: list[dict[str, Any]] = []
-            try:
-                for position, channel in enumerate(channels):
+        self._allow_to_stop = False
+        rows: list[dict[str, Any]] = []
+        operation_interrupt_epoch = self._interrupt_epoch
+        try:
+            # Hold the transaction lock only while registering/sending the group.
+            # Completion waits must remain interruptible by terminatecommands().
+            with self._transaction_lock:
+                operation_interrupt_epoch = self._interrupt_epoch
+                for channel in channels:
+                    if pre_send_delay_s:
+                        self._sleep(float(pre_send_delay_s))
                     result = callback(channel, self._transports[channel], defer_completion)
-                    rows.append({"channel": channel, "result": result})
-                    if position + 1 < len(channels):
-                        self._sleep(0.010)
-            except Exception as exc:
-                self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
-                raise
+                    rows.append({
+                        "channel": channel,
+                        "result": result,
+                        "completion_owner_token": self._completion_owner_token(self._transports[channel]),
+                    })
+                    if post_send_delay_s:
+                        self._sleep(float(post_send_delay_s))
+        except Exception as exc:
+            self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
+            raise
 
-            completion_rows: list[dict[str, Any]] = []
-            if defer_completion:
-                deadline = time.monotonic() + max(0.0, int(timeout_ms) / 1000.0)
-                for row in rows:
-                    channel = int(row["channel"])
-                    remaining = max(0.0, deadline - time.monotonic())
-                    completion = self._transports[channel].wait_for_completion(remaining)
-                    row["completion"] = completion
-                    completion_rows.append({"channel": channel, "result": completion})
-                    if isinstance(completion, Mapping) and completion.get("ok") is True:
+        completion_rows: list[dict[str, Any]] = []
+        if defer_completion:
+            deadline = time.monotonic() + max(0.0, int(timeout_ms) / 1000.0)
+            for row in rows:
+                channel = int(row["channel"])
+                remaining = max(0.0, deadline - time.monotonic())
+                completion = self._wait_channel_completion(
+                    self._transports[channel],
+                    remaining,
+                    owner_token=row.get("completion_owner_token"),
+                )
+                row["completion"] = completion
+                completion_rows.append({"channel": channel, "result": completion})
+                with self._transaction_lock:
+                    interrupted = self._interrupt_epoch != operation_interrupt_epoch
+                    row["interrupted_by_terminate"] = interrupted
+                    if isinstance(completion, Mapping) and completion.get("ok") is True and not interrupted:
                         state = self._transports[channel].apply_completed_effect(operation, row["result"])
                         row["result"].update(state)
                         row["result"]["completion_verified"] = True
                     else:
+                        row["result"]["completion_verified"] = False
                         row["result"]["state_reconciled"] = False
                         row["result"]["state_reconciliation_source"] = None
+            if timeout_failure_sleep_s and any(
+                row.get("completion", {}).get("ok") is not True for row in rows
+            ):
+                self._sleep(float(timeout_failure_sleep_s))
+        if check_forceabort_after_wait and self._forceabort():
+            raise PipetteCommandError("Stopped by user or force abort")
 
-            ok = all(
-                row["result"].get("ok") is True
-                and (not defer_completion or row.get("completion", {}).get("ok") is True)
-                for row in rows
-            )
-            self._last_group_transaction = {
-                "ok": ok,
-                "operation": operation,
-                "channels": rows,
-                "channel_count": len(channels),
-                "timeout_ms": int(timeout_ms),
-                "allow_to_stop": self._allow_to_stop,
-                "liquid_mutation_enabled": self._liquid_mutation_enabled,
-                "delivery_verified": all(
-                    row["result"].get("delivery_verified") is True for row in rows
-                ),
-                "controller_acknowledged": all(
-                    row["result"].get("controller_acknowledged") is True for row in rows
-                ),
-                "completion_verified": all(
-                    row["result"].get("completion_verified") is True for row in rows
-                ),
-                "state_reconciled": all(
-                    row["result"].get("state_reconciled") is True for row in rows
-                ),
-                "physical_effect_verified": False,
-                "send_order": list(channels),
-                "completion_order": [row["channel"] for row in completion_rows],
-                "wait_policy": "shared_deadline_after_all_selected_channel_sends" if defer_completion else "per_command_completion",
-            }
-            return dict(self._last_group_transaction)
+        with self._transaction_lock:
+            interrupted_by_terminate = self._interrupt_epoch != operation_interrupt_epoch
+        if interrupted_by_terminate:
+            for row in rows:
+                row["interrupted_by_terminate"] = True
+                row["result"]["completion_verified"] = False
+                row["result"]["state_reconciled"] = False
+                row["result"]["state_reconciliation_source"] = None
 
-    def _liquid_timeout_ms(self, volume_ul: float, channels: list[int]) -> int:
-        speeds = [max(1.0, float(self._transports[channel]._top_speed)) for channel in channels]
-        effective_speed = min(speeds)
-        return 5 * int(float(volume_ul) / effective_speed * 1000.0) + 4000
+        ok = not interrupted_by_terminate and all(
+            row["result"].get("ok") is True
+            and (not defer_completion or row.get("completion", {}).get("ok") is True)
+            for row in rows
+        )
+        self._last_group_transaction = {
+            "ok": ok,
+            "operation": operation,
+            "channels": rows,
+            "channel_count": len(channels),
+            "timeout_ms": int(timeout_ms),
+            "allow_to_stop": self._allow_to_stop,
+            "liquid_mutation_enabled": self._liquid_mutation_enabled,
+            "delivery_verified": all(row["result"].get("delivery_verified") is True for row in rows),
+            "controller_acknowledged": all(row["result"].get("controller_acknowledged") is True for row in rows),
+            "completion_verified": bool(
+                defer_completion
+                and not interrupted_by_terminate
+                and all(row.get("completion", {}).get("ok") is True for row in rows)
+            ),
+            "state_reconciled": all(row["result"].get("state_reconciled") is True for row in rows),
+            "interrupted_by_terminate": interrupted_by_terminate,
+            "operation_interrupt_epoch": operation_interrupt_epoch,
+            "terminal_interrupt_epoch": self._interrupt_epoch,
+            "physical_effect_verified": False,
+            "send_order": list(channels),
+            "completion_order": [row["channel"] for row in completion_rows],
+            "wait_policy": "shared_deadline_after_all_selected_channel_sends" if defer_completion else "oem_composite_sequence_no_constituent_completion_waits",
+        }
+        return dict(self._last_group_transaction)
 
-    def dispense_all(self, channels: list[int] | None = None) -> dict[str, Any]:
-        selected = self._selected_channels(channels)
-        self._require_liquid_mutation("dispense all")
+    @staticmethod
+    def _oem_timeout_ms(volume_ul: float, speed: float, offset_ms: int) -> int:
+        return 5 * int(float(volume_ul) / float(speed) * 1000.0) + int(offset_ms)
+
+    @staticmethod
+    def _oem_standard_dispense_timeout_ms(volume_ul: float, speed: float) -> int:
+        return int(5.0 * float(volume_ul) / float(speed) * 1000.0) + 5_000
+
+    @staticmethod
+    def _oem_explicit_dispense_timeout_ms(volume_ul: float, speed: float) -> int:
+        return 5 * int(float(volume_ul) / float(speed) * 1000.0) + 4_000
+
+    def _tip_location_channels(self) -> list[int]:
+        return list(self.CHANNELS) if self._tip_location == -1 else [self._tip_location]
+
+    def _verify_standard_tip_selection(self, selected: list[int]) -> dict[str, Any]:
         before = self.query_tip_status_all()
         loaded = set(before["channels_with_tips"])
         if any(channel not in loaded for channel in selected):
             raise PipetteTipStateError(
-                "DispenseAll requires a hardware-confirmed loaded tip on every selected channel.",
+                "Standard OEM liquid operation requires a hardware-confirmed loaded tip on every selected channel.",
                 details={"selected_channels": selected, "loaded_channels": sorted(loaded)},
             )
+        return before
+
+    def _prepare_explicit_speed_overload(
+        self,
+        channels: tuple[int, ...] | list[int],
+        speed: float,
+    ) -> tuple[list[int], dict[str, Any]]:
+        selected = self._selected_channels(list(channels))
+        rows: list[dict[str, Any]] = []
+        for channel in selected:
+            transport = self._transports[channel]
+            try:
+                result = transport.set_top_speed(float(speed), wait_for_completion=False)
+            except TypeError:
+                result = transport.set_top_speed(float(speed))
+            rows.append({
+                "channel": channel,
+                "result": result,
+                "completion_owner_token": self._completion_owner_token(transport),
+            })
+            self._sleep(0.010)
+        deadline = time.monotonic() + 7.0
+        for row in rows:
+            channel = int(row["channel"])
+            row["completion"] = self._wait_channel_completion(
+                self._transports[channel],
+                max(0.0, deadline - time.monotonic()),
+                owner_token=row.get("completion_owner_token"),
+            )
+        self._sleep(0.010)
+        speed_phase = {
+            "ok": all(
+                row["result"].get("ok") is True
+                and row.get("completion", {}).get("ok") is True
+                for row in rows
+            ),
+            "channels": rows,
+            "timeout_ms": 7_000,
+            "post_wait_delay_ms": 10,
+            "wait_policy": "shared_deadline_after_all_selected_speed_sends",
+        }
+        if speed_phase["ok"] is not True:
+            raise PipetteCommandError(
+                "OEM explicit-overload speed-setting phase did not complete.",
+                details={"speed_phase": speed_phase},
+            )
+        return selected, speed_phase
+
+    def _liquid_timeout_ms(self, volume_ul: float, channels: list[int]) -> int:
+        speeds = [float(self._transports[channel]._top_speed) for channel in channels]
+        return self._oem_timeout_ms(volume_ul, min(speeds), 4_000)
+
+    def dispense_all(self, channels: list[int] | None = None) -> dict[str, Any]:
+        self._require_liquid_mutation("dispense all")
+        if self._forceabort():
+            raise PipetteCommandError("Stopped by user or force abort")
+        before = None
+        if channels is None:
+            selected = self._tip_location_channels()
+            before = self._verify_standard_tip_selection(selected)
+            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            level_channel = speed_channel
+        else:
+            selected = self._selected_channels(channels)
+            speed_channel = selected[0]
+            level_channel = 0
+        source_return = float(self._transports[0]._liquid_level_ul)
+        timeout_ms = self._oem_timeout_ms(
+            self._transports[level_channel]._liquid_level_ul,
+            self._transports[speed_channel]._top_speed,
+            4_000,
+        )
         result = self._run_group_liquid_operation(
             "dispense_all",
             selected,
-            lambda _channel, transport, defer: transport.dispense_all(wait_for_completion=not defer),
-            timeout_ms=4_000,
+            lambda _channel, transport, defer: transport.dispense_all(
+                wait_for_completion=not defer,
+                verify_tip=False,
+            ),
+            timeout_ms=timeout_ms,
+            pre_send_delay_s=0.030,
+            check_forceabort_after_wait=True,
         )
-        return {**result, "planned_wire_command": "A0R", "before_tip_status": before}
+        return {
+            **result,
+            "planned_wire_command": "A0R",
+            "before_tip_status": before,
+            "source_return": source_return,
+        }
 
     def aspirate_air(self, volume_ul: float, channels: list[int] | None = None, *, front_air: bool = True) -> dict[str, Any]:
         selected = self._selected_channels(channels)
@@ -1744,6 +1973,8 @@ class FourPipetteTransport:
 
     def mix_all(self, count: int, vol: float, vigorous: int = 100) -> dict[str, Any]:
         self._require_physical_command_admission("mix_all")
+        if self._forceabort():
+            raise PipetteCommandError("Stopped by user or force abort")
         cycles = int(count)
         if cycles < 1:
             raise ValueError("count must be at least one")
@@ -1782,6 +2013,8 @@ class FourPipetteTransport:
             return result
 
     def detect_fluid(self, *, dry_run: bool = False) -> dict[str, Any]:
+        if self._forceabort():
+            raise PipetteCommandError("Stopped by user or force abort")
         if dry_run:
             return {
                 "ok": False,
@@ -2142,35 +2375,103 @@ class FourPipetteTransport:
         )
 
     def aspirate(self, command: PipetteAspirateCommand) -> dict[str, Any]:
-        selected = self._channels_from_metadata(command.metadata)
+        before = None
+        speed_phase = None
+        if command.speed is None:
+            selected = self._tip_location_channels()
+            before = self._verify_standard_tip_selection(selected)
+            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            speed = float(self._transports[speed_channel]._top_speed)
+        else:
+            selected, speed_phase = self._prepare_explicit_speed_overload(
+                command.channels or (),
+                command.speed,
+            )
+            speed = float(command.speed)
+        timeout_ms = self._oem_timeout_ms(command.volume_ul, speed, 4_000)
         result = self._run_group_liquid_operation(
             "aspirate",
             selected,
-            lambda _channel, transport, defer: transport.aspirate(command, wait_for_completion=not defer),
-            timeout_ms=self._liquid_timeout_ms(command.volume_ul, selected),
+            lambda _channel, transport, defer: transport.aspirate(
+                command,
+                wait_for_completion=not defer,
+                verify_tip=False,
+            ),
+            timeout_ms=timeout_ms,
+            post_send_delay_s=0.010,
+            timeout_failure_sleep_s=1.0,
         )
-        return {**result, "requested": command.to_payload(), "pressure_profile": command.pressure_profile}
+        return {
+            **result,
+            "requested": command.to_payload(),
+            "pressure_profile": command.pressure_profile,
+            "before_tip_status": before,
+            "speed_phase": speed_phase,
+            "overload": "explicit_channels_speed" if command.speed is not None else "standard_tip_location",
+        }
 
     def dispense(self, command: PipetteDispenseCommand) -> dict[str, Any]:
-        selected = self._channels_from_metadata(command.metadata)
+        before = None
+        speed_phase = None
+        if command.speed is None:
+            selected = self._tip_location_channels()
+            before = self._verify_standard_tip_selection(selected)
+            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            speed = float(self._transports[speed_channel]._top_speed)
+            timeout_ms = self._oem_standard_dispense_timeout_ms(command.volume_ul, speed)
+        else:
+            selected, speed_phase = self._prepare_explicit_speed_overload(
+                command.channels or (),
+                command.speed,
+            )
+            speed = float(command.speed)
+            timeout_ms = self._oem_explicit_dispense_timeout_ms(command.volume_ul, speed)
         result = self._run_group_liquid_operation(
             "dispense",
             selected,
-            lambda _channel, transport, defer: transport.dispense(command, wait_for_completion=not defer),
-            timeout_ms=self._liquid_timeout_ms(command.volume_ul, selected),
+            lambda _channel, transport, defer: transport.dispense(
+                command,
+                wait_for_completion=not defer,
+                verify_tip=False,
+            ),
+            timeout_ms=timeout_ms,
+            pre_send_delay_s=0.005 if command.volume_ul <= 5.0 else 0.0,
+            post_send_delay_s=0.010,
+            timeout_failure_sleep_s=1.0,
         )
-        return {**result, "requested": command.to_payload(), "pressure_profile": command.pressure_profile}
+        return {
+            **result,
+            "requested": command.to_payload(),
+            "pressure_profile": command.pressure_profile,
+            "before_tip_status": before,
+            "speed_phase": speed_phase,
+            "source_return": 0,
+            "overload": "explicit_channels_speed" if command.speed is not None else "standard_tip_location",
+        }
 
     def mix(self, command: PipetteMixCommand) -> dict[str, Any]:
-        selected = self._channels_from_metadata(command.metadata)
+        if self._tip_location == -1:
+            raise PipetteCommandError("OEM one-channel Mix requires a resolved TipLocation")
+        selected = [self._tip_location]
+        sequence_wait_ms = int(command.cycles) * 3_000 - 1_500
+        timeout_ms = sequence_wait_ms + self._liquid_timeout_ms(command.volume_ul, selected)
         result = self._run_group_liquid_operation(
             "mix",
             selected,
-            lambda _channel, transport, defer: transport.mix(command, wait_for_completion=not defer),
-            timeout_ms=self._liquid_timeout_ms(command.volume_ul, selected),
+            lambda _channel, transport, _defer: transport.mix(
+                command,
+                wait_for_completion=False,
+                verify_tip=False,
+            ),
+            timeout_ms=timeout_ms,
             defer_completion=False,
         )
-        return {**result, "requested": command.to_payload(), "pressure_profile": command.pressure_profile}
+        return {
+            **result,
+            "requested": command.to_payload(),
+            "pressure_profile": command.pressure_profile,
+            "sequence_wait_ms": sequence_wait_ms,
+        }
 
     def close(self) -> None:
         for transport in self._transports:
@@ -2181,6 +2482,7 @@ def build_default_pipette_transport(
     *,
     shared_usb: Any | None = None,
     error_callback: Callable[[int, int], None] | None = None,
+    forceabort: Callable[[], bool] | None = None,
 ) -> FourPipetteTransport:
     transport = os.environ.get("BIOXP_PIPETTE_TRANSPORT", "novo_usb").strip().lower().replace("-", "_")
     response_timeout_s = 60.0
@@ -2212,6 +2514,10 @@ def build_default_pipette_transport(
                     "shared_bioxp_usb_runtime": shared_usb is not None,
                 },
             ))
-        return FourPipetteTransport(transports, error_callback=error_callback)
+        return FourPipetteTransport(
+            transports,
+            error_callback=error_callback,
+            forceabort=forceabort,
+        )
 
     raise ValueError(f"Unsupported BIOXP_PIPETTE_TRANSPORT={transport!r}; expected novo_usb or socketcan")

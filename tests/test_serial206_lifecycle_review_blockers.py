@@ -22,6 +22,8 @@ ACK = {"status": 100, "value": 0}
 def _write(value: int) -> dict:
     return {
         "ok": True,
+        "source_call_completed": True,
+        "source_return_code": 0,
         "ack": dict(ACK),
         "set_value": value,
         "readback": {"ack": dict(ACK), "value": value},
@@ -68,6 +70,36 @@ def _axis_home(axis: str) -> dict:
     }
 
 
+def _deck_axis_home(axis: str) -> dict:
+    return {
+        "axis": axis,
+        "startup": True,
+        "prepare": {"ok": True},
+        "home": {
+            "ok": True,
+            "source_return_code": 0,
+            "go_home": {
+                "position_before": _position(1200),
+                "position_after_sethome": _position(0),
+                "controller_home_proof_verified": True,
+                "move_home": {"ack": dict(ACK)},
+            },
+        },
+    }
+
+
+def _x_park() -> dict:
+    return {
+        "ok": True,
+        "source_call_completed": True,
+        "source_return_code": 0,
+        "source_noop": False,
+        "before": _position(0),
+        "ack": dict(ACK),
+        "wait": {"ok": True, "target_reached": True},
+    }
+
+
 def _gripper_home() -> dict:
     row = _axis_home("g")
     row["restore_current"] = None
@@ -101,8 +133,10 @@ def _door_home() -> dict:
 
 
 def _raw_for(stage: str) -> dict:
-    if stage in {"z-home", "x-home", "y-home"}:
+    if stage == "z-home":
         return _axis_home(stage[0])
+    if stage in {"x-home", "y-home"}:
+        return _deck_axis_home(stage[0])
     if stage == "gripper-home":
         return _gripper_home()
     if stage == "door-home":
@@ -116,7 +150,7 @@ def _raw_for(stage: str) -> dict:
     if stage == "x-speed-1700":
         return _write(1700)
     if stage == "x-park-6000":
-        return _move(0, 6000)
+        return _x_park()
     if stage in {"x-home-settle", "x-speed-settle"}:
         return {"settled": True, "settle_ms": 20 if stage == "x-home-settle" else 40}
     if stage == "door-closed-predicate":

@@ -21,10 +21,11 @@ from contextlib import asynccontextmanager
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Literal, Mapping, Optional, Protocol, cast
+from typing import Any, Awaitable, Callable, Literal, Mapping, Optional, Protocol, cast
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from anyio import from_thread as anyio_from_thread
 
 from .camera_provider import CameraError, CameraFrame, CameraProvider
 from .oem_config import harmonized_motion_config
@@ -65,7 +66,11 @@ from .release_identity import (
     publish_runtime_release_receipt,
 )
 from .serial206_y_provider import Serial206YProvider
-from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .operator_controls import (
+    OperatorActionRequestV2,
+    current_operator_dispatch_context,
+    install_operator_control_plane,
+)
 from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -967,9 +972,7 @@ async def lifespan(app: FastAPI):
             pipette_status_provider=_operator_pipette_status,
         )
         operator_store = app.state.operator_receipt_store
-        command_plane = app.state.operator_command_plane
         operator_store.converge_startup_state()
-        command_plane.start()
         _operator_control_plane_installed = True
     release_start_task = None
     if app.state.release_identity.get("verified") is True:
@@ -1012,12 +1015,12 @@ async def lifespan(app: FastAPI):
                     await _stop_owned_camera_session(reason="lifespan shutdown")
                 except Exception as exc:
                     shutdown_errors.append(f"camera shutdown: {exc}")
-                command_plane = getattr(app.state, "operator_command_plane", None)
-                if command_plane is not None:
+                history_reader = getattr(app.state, "operator_history_reader", None)
+                if history_reader is not None:
                     try:
-                        command_plane.stop()
+                        history_reader.close()
                     except Exception as exc:
-                        shutdown_errors.append(f"operator command plane shutdown: {exc}")
+                        shutdown_errors.append(f"operator history reader shutdown: {exc}")
                 cleanup_errors = list(shutdown_errors)
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
@@ -1142,72 +1145,10 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     operator_command_id = str(context["operator_command_id"])
     expected_generation = int(context["expected_ownership_generation"])
     idempotency_key = str(context["idempotency_key"])
-    automatic_prerequisites: list[dict[str, Any]] = []
-
-    def execute_stage(stage: str, stage_inputs: Mapping[str, Any], key_suffix: str) -> dict[str, Any]:
-        payload = dict(stage_inputs)
-        payload["command_id"] = f"{operator_command_id}:{key_suffix}"
-        stage_result = execute(
-            stage,
-            inputs=payload,
-            expected_generation=expected_generation,
-            idempotency_key=f"{idempotency_key}:{key_suffix}",
-        )
-        return stage_result if isinstance(stage_result, dict) else {
-            "ok": False,
-            "failure": "serial206_z_provider_returned_non_object",
-        }
-
-    # Exact manual moves preserve the OEM button contract. They must fail closed
-    # in an invalid Z state instead of inserting an unrequested prepare or home.
-    auto_prepare_intents = {
-        "manual_home", "move_z_home", "diagnostic_home_axis",
-        "clear", "path_execute",
-        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
-    }
-    auto_home_intents = {
-        "clear", "path_execute",
-        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
-    }
     command_lease = getattr(provider, "z_command_lease", None)
     if not callable(command_lease):
         raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
     with command_lease():
-        projection_reader = getattr(provider, "z_projection", None)
-        projection = projection_reader() if callable(projection_reader) else {}
-        z_state = str(projection.get("state") or "unknown") if isinstance(projection, Mapping) else "unknown"
-
-        if intent in auto_prepare_intents and z_state in {"unprepared", "failed_latched"}:
-            preparation = execute_stage("prepare", {}, "auto_prepare")
-            automatic_prerequisites.append({"stage": "auto_prepare", "result": preparation})
-            if preparation.get("ok") is not True:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "z_automatic_prerequisite_failed",
-                        "failed_stage": "auto_prepare",
-                        "requested_intent": intent,
-                        "requested_motion_dispatched": False,
-                        "prerequisite": preparation,
-                    },
-                )
-            z_state = str(preparation.get("z_state") or "prepared_unreferenced")
-
-        if intent in auto_home_intents and z_state == "prepared_unreferenced":
-            homing = execute_stage("manual_home", {"timeout_s": 8.0}, "auto_home")
-            automatic_prerequisites.append({"stage": "auto_home", "result": homing})
-            if homing.get("ok") is not True:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "z_automatic_prerequisite_failed",
-                        "failed_stage": "auto_home",
-                        "requested_intent": intent,
-                        "requested_motion_dispatched": False,
-                        "prerequisite": homing,
-                    },
-                )
-
         provider_inputs = dict(inputs or {})
         provider_inputs["command_id"] = operator_command_id
         result = execute(
@@ -1218,13 +1159,11 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
         )
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise HTTPException(status_code=409, detail=result)
-        if automatic_prerequisites:
-            result = {**result, "automatic_prerequisites": automatic_prerequisites}
         return result
 
 
 def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Dispatch one typed X intent under the operator-owned generation context."""
+    """Dispatch one typed X intent through the retained OEM provider."""
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
@@ -1927,7 +1866,7 @@ class OemXMoveAbsoluteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     position_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
-    acceleration: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
+    acceleration: StrictInt | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
 
 
 class OemXReconcileRequest(BaseModel):
@@ -1945,7 +1884,7 @@ class OemXSetHomeRequest(BaseModel):
 class OemXProfileValueRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    value: StrictInt = Field(default=0, ge=0, le=2_147_483_647)
+    value: StrictInt = Field(default=0, ge=-(2**31), le=2**31 - 1)
 
 
 class OemXCurrentModeRequest(BaseModel):
@@ -2526,7 +2465,15 @@ class PipetteAspirateRequest(BaseModel):
     tip_id: Optional[str] = Field(None, max_length=120)
     air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
     operator: Optional[str] = Field(None, max_length=120)
+    channels: Optional[list[int]] = None
+    speed: Optional[float] = Field(None, gt=0.0, le=10000.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_explicit_overload(self):
+        if (self.channels is None) != (self.speed is None):
+            raise ValueError("explicit-channel Aspirate requires both channels and speed")
+        return self
 
 
 class PipetteDispenseRequest(BaseModel):
@@ -2539,7 +2486,16 @@ class PipetteDispenseRequest(BaseModel):
     tip_id: Optional[str] = Field(None, max_length=120)
     air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
     operator: Optional[str] = Field(None, max_length=120)
+    dispense_type: int = Field(0, ge=0, le=0)
+    channels: Optional[list[int]] = None
+    speed: Optional[float] = Field(None, gt=0.0, le=10000.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_explicit_overload(self):
+        if (self.channels is None) != (self.speed is None):
+            raise ValueError("explicit-channel Dispense requires both channels and speed")
+        return self
 
 
 class PipetteMixRequest(BaseModel):
@@ -6301,6 +6257,11 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _pipette_forceabort_latched(tester: Any) -> bool:
+    retained_oem_latch = getattr(tester, "oem_no24v_state", None)
+    return bool(retained_oem_latch()) if callable(retained_oem_latch) else False
+
+
 async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) -> dict[str, Any]:
     """Construct the managed USB owner from the OEM startup/reconnect boundary.
 
@@ -6323,6 +6284,7 @@ async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) 
         transport = build_default_pipette_transport(
             shared_usb=candidate,
             error_callback=_persist_pipette_runtime_error,
+            forceabort=lambda owner=candidate: _pipette_forceabort_latched(owner),
         )
         _tester = candidate
         _pipette_transport = transport
@@ -6402,6 +6364,7 @@ async def reconnect_runtime():
             return build_default_pipette_transport(
                 shared_usb=tester,
                 error_callback=_persist_pipette_runtime_error,
+                forceabort=lambda owner=tester: _pipette_forceabort_latched(owner),
             )
 
         try:
@@ -6694,23 +6657,6 @@ async def motion_oem_prepare_without_motion():
         else _maintenance_state_payload()
     )
     return response
-
-
-@app.post("/motion/emergency_stop")
-async def motion_emergency_stop():
-    """Compatibility alias for the canonical SQLite-backed OEM abort lane."""
-    command_plane = getattr(app.state, "operator_command_plane", None)
-    if command_plane is None:
-        raise HTTPException(status_code=503, detail={"error": "operator_command_plane_unavailable"})
-    return await command_plane.compat_invoke(
-        "oem.abort_all",
-        {
-            "idempotency_key": f"legacy-emergency-stop-{uuid.uuid4().hex}",
-            "reason": "legacy_motion_emergency_stop_alias",
-            "observed_ownership_generation": None,
-            "observed_board_epoch_by_board": {},
-        },
-    )
 
 
 @app.get("/motion/power/status")
@@ -7541,7 +7487,7 @@ async def motion_oem_y_move_steps(req: OemYMoveStepsRequest):
 async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
     return await _run_blocking(
         "serial-206 Y moveY absolute",
-        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
+        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=True),
         timeout_s=30.0,
     )
 
@@ -7876,12 +7822,12 @@ async def motion_oem_z_stop():
 
 @app.post("/motion/oem/z/abort")
 async def motion_oem_z_abort():
-    return await _run_safety_interrupt_blocking(
-        "serial-206 Z abort",
-        lambda _tester: _execute_provider_z_intent(
-            "abort", {"timeout_s": 3.0}
-        ),
-        timeout_s=10.0,
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "retired_duplicate_abort_identity",
+            "replacement_action_id": "oem.abort_all",
+        },
     )
 
 
@@ -9714,11 +9660,7 @@ def _protocol_live_move_handler(action, state):
     if raw_axis is None:
         raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
     axis = AxisName(str(raw_axis).strip().lower())
-    wait_timeout_s = float(params.get("wait_timeout_s") or params.get("timeout_s") or 30.0)
     acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
-    provider = _serial206_oem_initialization_provider
-    if provider is None:
-        raise RuntimeError("serial206 OEM provider unavailable")
     command_id = f"protocol-{axis.value}-{uuid.uuid4().hex}"
     position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
     steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
@@ -9726,35 +9668,40 @@ def _protocol_live_move_handler(action, state):
         raise ValueError(f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps")
     is_absolute = position_steps is not None
     move_value = int(position_steps) if position_steps is not None else int(steps)  # type: ignore[arg-type]
-    if axis.value == "x":
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True, "source_mode": "protocol.x.move_absolute"})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_x_intent(selected, values)
-    elif axis.value == "y":
-        y_provider = provider.y_provider
-        if y_provider is None:
-            raise RuntimeError("serial206 Y provider unavailable")
-        result = y_provider.move_absolute(move_value, wait_for_stop=True, wait_timeout_s=wait_timeout_s, command_id=command_id) if is_absolute else y_provider.move_steps(move_value, wait_timeout_s=wait_timeout_s, command_id=command_id)
-    else:
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_z_intent(
-            selected,
-            inputs=values,
-            expected_generation=int(provider.generation_provider()),
-            idempotency_key=command_id,
-        )
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
-        raise RuntimeError(f"Protocol move failed: {result}")
-    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute" if position_steps is not None else "relative", "move": dict(result)}
+    action_id = f"oem.{axis.value}.{'move_absolute' if is_absolute else 'move_steps'}"
+    input_name = (
+        "target_steps"
+        if axis is AxisName.Y and is_absolute
+        else "position_steps"
+        if is_absolute
+        else "steps"
+    )
+    inputs: dict[str, Any] = {input_name: move_value}
+    if acc is not None and axis in {AxisName.X, AxisName.Z} and is_absolute:
+        inputs["acceleration"] = int(acc)
+    invoker = getattr(app.state, "invoke_operator_action_v2", None)
+    if not callable(invoker):
+        raise RuntimeError("canonical operator action invoker unavailable")
+    typed_invoker = cast(
+        Callable[[str, OperatorActionRequestV2], Awaitable[dict[str, Any]]],
+        invoker,
+    )
+    request = OperatorActionRequestV2(
+        schema_version="bioxp.operator_action_request.v2",
+        idempotency_key=command_id,
+        expected_ownership_generation=int(hardware_state.ownership_epoch),
+        expected_board_epoch_by_board={},
+        inputs=inputs,
+    )
+    receipt = anyio_from_thread.run(typed_invoker, action_id, request)
+    if not isinstance(receipt, Mapping) or receipt.get("status") != "completed":
+        raise RuntimeError(f"Protocol move failed: {receipt}")
+    return {
+        "ok": True,
+        "protocol_action_id": action.action_id,
+        "move_mode": "absolute" if is_absolute else "relative",
+        "operator_receipt": dict(receipt),
+    }
 
 
 def _protocol_live_pipette_handler(action, state):

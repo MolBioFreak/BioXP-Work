@@ -18,9 +18,6 @@ class Serial206YProvider:
     board = 4
     motor = 0
     min_steps = 0
-    max_steps = 102956
-    relative_min_target = 20
-    relative_max_target = 102936
     normal_speed = 1800
     normal_acc = 400
     startup_home_speed = 250
@@ -64,7 +61,18 @@ class Serial206YProvider:
             raise RuntimeError("serial-206 Y board/motor profile mismatch")
         if int(profile.get("axis_min_steps", -1)) != self.min_steps:
             raise RuntimeError("serial-206 Y minimum profile mismatch")
-        if int(profile.get("axis_max_steps", -1)) != self.max_steps:
+        max_reader = getattr(self.tester, "_machine_config_axis_max", None)
+        if not callable(max_reader):
+            raise RuntimeError("serial-206 Y machine maximum authority is not bound")
+        selected_max_result = max_reader("y")
+        if (
+            not isinstance(selected_max_result, tuple)
+            or len(selected_max_result) != 2
+        ):
+            raise RuntimeError("serial-206 Y machine maximum authority is invalid")
+        selected_max = int(selected_max_result[0])
+        selected_max_source = str(selected_max_result[1])
+        if int(profile.get("axis_max_steps", -1)) != selected_max:
             raise RuntimeError("serial-206 Y selected-machine maximum is not authoritative")
         if int(profile.get("speed", -1)) != self.normal_speed:
             raise RuntimeError("serial-206 Y normal speed profile mismatch")
@@ -77,7 +85,8 @@ class Serial206YProvider:
         if profile.get("disable_right") is not True:
             raise RuntimeError("serial-206 Y right-switch disable profile mismatch")
         profile["source_mode"] = "ClassControlInterface.initializeMotorsWithoutMotion"
-        profile["selected_machine_max_authority"] = "102956"
+        profile["selected_machine_max_authority"] = str(selected_max_source)
+        profile["selected_machine_max_steps"] = int(selected_max)
         profile["home_speed"] = self.startup_home_speed if startup else self.manual_home_speed
         return profile
 
@@ -215,9 +224,11 @@ class Serial206YProvider:
         if callable(primitive):
             result = primitive(requested_steps, timeout_s=float(wait_timeout_s))
             result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_relative_result_not_mapping", "raw": result}
-            before_value = result.get("position_before")
-            target = result.get("requested_target")
-            before = {"position": before_value} if type(before_value) is int else None
+            before = result.get("before") if isinstance(result.get("before"), Mapping) else None
+            before_value = self._position_value(before)
+            target = result.get("target_position")
+            if type(target) is not int and type(before_value) is int:
+                target = before_value + requested_steps
         else:
             before = self._position()
             before_value = self._position_value(before)
@@ -232,8 +243,16 @@ class Serial206YProvider:
         observation = self._record_observation(command_id=command_id, target=int(target), observed=after_value) if type(target) is int else None
         proof = result.get("proof") if isinstance(result.get("proof"), Mapping) else {}
         completion_class = str(result.get("completion_class") or ("event_128" if proof.get("addressed_event_128") else "unknown"))
+        terminal_speed = result.get("terminal_speed") if isinstance(result.get("terminal_speed"), Mapping) else None
+        terminal_speed_zero = bool(
+            isinstance(terminal_speed, Mapping)
+            and type(terminal_speed.get("speed")) is int
+            and terminal_speed.get("speed") == 0
+        ) or bool(proof.get("speed_zero"))
+        board_wrapper_return = result.get("board_wrapper_return", result.get("raw_return"))
+        source_ok = bool(result.get("ok") is True and board_wrapper_return != -1)
         return {
-            "ok": bool(result.get("ok") is True),
+            "ok": source_ok,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -247,11 +266,12 @@ class Serial206YProvider:
             "motor_command_reply_valid": isinstance(result.get("ack"), Mapping),
             "motor_command_status_code": (result.get("ack") or {}).get("status") if isinstance(result.get("ack"), Mapping) else None,
             "motor_command_raw_return": result.get("source_return_code"),
-            "board_wrapper_return": result.get("board_wrapper_return", result.get("raw_return")),
-            "public_wrapper_return": after_value,
+            "board_wrapper_return": board_wrapper_return,
+            "public_wrapper_return": result.get("public_wrapper_return", after_value),
             "completion_class": completion_class,
-            "controller_completion_verified": bool(proof.get("addressed_event_128") or result.get("completion_verified")),
-            "terminal_speed_zero": bool(proof.get("speed_zero")),
+            "controller_completion_verified": completion_class == "event_128",
+            "terminal_speed": terminal_speed,
+            "terminal_speed_zero": terminal_speed_zero,
             "coordinate_truth_available": after_value is not None,
             "physical_effect_verified": False,
             "discrepancy": observation,
@@ -264,17 +284,13 @@ class Serial206YProvider:
         self,
         target_steps: int,
         *,
-        wait_for_stop: bool = False,
+        wait_for_stop: bool = True,
         wait_timeout_s: float = 20.0,
         command_id: str | None = None,
     ) -> dict[str, Any]:
         command_id = command_id or f"y-absolute-{uuid.uuid4().hex}"
         profile = self.profile()
         authority = self._current_authority(allow_unprepared=True)
-        before = self._position()
-        before_value = self._position_value(before)
-        if before_value is None:
-            return {"ok": False, "axis": self.axis, "command_id": command_id, "failure": "y_position_readback_invalid", "position_before": before}
         caller_target = int(target_steps)
         effective_target = max(self.min_steps, caller_target)
         primitive = getattr(self.tester, "motor_oem_move_absolute", None)
@@ -283,9 +299,11 @@ class Serial206YProvider:
             effective_target,
             motor=self.motor,
             wait_for_stop=bool(wait_for_stop),
-            max_position=self.max_steps,
+            max_position=int(profile["axis_max_steps"]),
         ) if callable(primitive) else {"ok": False, "failure": "y_absolute_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_absolute_result_not_mapping", "raw": result}
+        before = result.get("before") if isinstance(result.get("before"), Mapping) else None
+        before_value = self._position_value(before)
         if result.get("source_noop") is True:
             observed = result.get("effective_position", before_value)
             return {
@@ -309,12 +327,35 @@ class Serial206YProvider:
                 "authority_observation": authority,
             }
         state = "completed" if wait_for_stop else "issued_pending"
-        after = result.get("terminal_position") if wait_for_stop and isinstance(result.get("terminal_position"), Mapping) else None
+        completion_class = str(result.get("completion_class") or state)
+        if wait_for_stop:
+            after = (
+                result.get("terminal_position")
+                if isinstance(result.get("terminal_position"), Mapping)
+                else result.get("timeout_position")
+                if isinstance(result.get("timeout_position"), Mapping)
+                else self._position()
+            )
+        else:
+            after = None
         after_value = self._position_value(after)
         observation = self._record_observation(command_id=command_id, target=effective_target, observed=after_value) if wait_for_stop else None
         proof = result.get("proof") if isinstance(result.get("proof"), Mapping) else {}
+        source_completed = bool(
+            result.get("ok") is True
+            and (
+                not wait_for_stop
+                or completion_class in {"event_128", "oem_timeout_target_equal"}
+            )
+        )
+        terminal_speed = result.get("terminal_speed") if isinstance(result.get("terminal_speed"), Mapping) else None
+        terminal_speed_zero = bool(
+            isinstance(terminal_speed, Mapping)
+            and type(terminal_speed.get("speed")) is int
+            and terminal_speed.get("speed") == 0
+        ) or bool(proof.get("speed_zero"))
         return {
-            "ok": bool(result.get("ok") is True),
+            "ok": source_completed,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -332,9 +373,10 @@ class Serial206YProvider:
             "board_wrapper_return": result.get("board_wrapper_return", result.get("raw_return")),
             "public_wrapper_return_kind": "void",
             "position_after": after,
-            "completion_class": str(result.get("completion_class") or ("event_128" if proof.get("addressed_event_128") else state)),
-            "controller_completion_verified": bool(proof.get("addressed_event_128") or result.get("completion_verified")),
-            "terminal_speed_zero": bool(proof.get("speed_zero")),
+            "completion_class": completion_class,
+            "controller_completion_verified": completion_class == "event_128",
+            "terminal_speed": terminal_speed,
+            "terminal_speed_zero": terminal_speed_zero,
             "coordinate_truth_available": after_value is not None,
             "physical_effect_verified": False,
             "discrepancy": observation,
@@ -477,36 +519,62 @@ class Serial206YProvider:
             current = current.get(key)
         return current if isinstance(current, Mapping) else None
 
-    def _home_proof(self, result: Mapping[str, Any]) -> dict[str, bool]:
+    def _home_proof(self, result: Mapping[str, Any], authority: Mapping[str, Any]) -> dict[str, bool]:
         home = result.get("home") if isinstance(result.get("home"), Mapping) else result
+        go_home = self._mapping_at(home, "go_home") or home
         home_after = (
             self._mapping_at(home, "home_after")
-            or self._mapping_at(home, "home_after_stop")
-            or self._mapping_at(home, "home_after_sethome")
+            or self._mapping_at(go_home, "home_after")
         )
-        stop = self._mapping_at(home, "stop") or {}
-        wait = self._mapping_at(home, "wait") or {}
-        set_home = self._mapping_at(home, "set_home") or {}
-        zero = self._mapping_at(home, "position_after_sethome") or self._mapping_at(home, "position_after_set_home") or {}
-        home_decision = self._mapping_at(home, "home_decision") or {}
+        stop = self._mapping_at(go_home, "stop") or {}
+        wait = self._mapping_at(go_home, "wait") or {}
+        set_home = self._mapping_at(go_home, "set_home") or {}
+        zero = self._mapping_at(go_home, "position_after_sethome") or {}
+        already_position = (
+            self._mapping_at(go_home, "position_after")
+            or self._mapping_at(go_home, "position_before")
+            or {}
+        )
+        already_speed = self._mapping_at(go_home, "speed_before") or {}
+        axis_authority = authority.get("axis") if isinstance(authority.get("axis"), Mapping) else {}
+        board_authority = authority.get("board") if isinstance(authority.get("board"), Mapping) else {}
+        home_decision_raw = self._mapping_at(go_home, "home_decision")
+        home_decision = (
+            dict(home_decision_raw) if isinstance(home_decision_raw, Mapping) else {}
+        )
+        short_circuit_home = bool(
+            go_home.get("source_noop") is True
+            and home_decision.get("source_short_circuit")
+            == "MotorHome_and_CurrentPosition_zero"
+        )
+        home_before = self._mapping_at(go_home, "home_before") or {}
+        already_home = bool(
+            short_circuit_home
+            and go_home.get("controller_home_proof_verified") is True
+            and isinstance(home_before.get("ack"), Mapping)
+            and home_before["ack"].get("status") == 100
+            and home_before.get("value") == 1
+            and already_position.get("position") == 0
+            and already_speed.get("speed") == 0
+            and axis_authority.get("ownership_generation") == int(self.generation_provider())
+            and type(go_home.get("board_lifecycle_generation")) is int
+            and go_home.get("board_lifecycle_generation") == board_authority.get("active_board_epoch")
+        )
         zero_readback = bool(zero.get("position") == 0)
         set_home_valid = bool(
-            (
-                set_home.get("ok") is True
-                and isinstance(set_home.get("readback"), Mapping)
-                and set_home["readback"].get("value") == 0
-            )
-            or (
-                home_decision.get("set_home_verified") is True
-                and zero_readback
-            )
+            set_home.get("controller_command_acknowledged") is True
+            and zero_readback
         )
         return {
-            "home_predicate_active": bool(home_after and home_after.get("value") == 1),
-            "stop_complete": bool(stop.get("ok") is True and isinstance(stop.get("first_delivery"), Mapping) and isinstance(stop.get("second_delivery"), Mapping)),
-            "speed_zero": bool(wait.get("stopped") is True and wait.get("last_speed") == 0),
-            "set_home_valid": set_home_valid,
-            "zero_readback": zero_readback,
+            "home_predicate_active": bool(
+                already_home or (home_after and home_after.get("home") is True)
+            ),
+            "stop_complete": already_home or bool(stop.get("ok") is True and isinstance(stop.get("first_delivery"), Mapping) and isinstance(stop.get("second_delivery"), Mapping)),
+            "speed_zero": already_home or bool(wait.get("stopped") is True and wait.get("last_speed") == 0),
+            "set_home_valid": already_home or set_home_valid,
+            "zero_readback": already_home or zero_readback,
+            "already_home_current_generation": already_home,
+            "stop_wait_set_home_inapplicable": already_home,
         }
 
     def home(self, mode: str, *, command_id: str | None = None, wait_timeout_s: float = 30.0) -> dict[str, Any]:
@@ -553,8 +621,14 @@ class Serial206YProvider:
         source_home_raw = result.get("home")
         source_home = dict(source_home_raw) if isinstance(source_home_raw, Mapping) else {}
         source_home_ok = bool(result.get("ok") is True or source_home.get("ok") is True)
-        proof = self._home_proof(result)
-        proof_ok = all(proof.values())
+        proof = self._home_proof(result, authority)
+        proof_ok = all(
+            proof[key]
+            for key in (
+                "home_predicate_active", "stop_complete", "speed_zero",
+                "set_home_valid", "zero_readback",
+            )
+        )
         reference = None
         reference_published = False
         if proof_ok:
@@ -568,7 +642,7 @@ class Serial206YProvider:
                 )
                 reference_published = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
         return {
-            "ok": bool(source_home_ok and proof_ok and reference_published),
+            "ok": source_home_ok,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -579,11 +653,15 @@ class Serial206YProvider:
             "startup": bool(startup),
             "home_proof": proof,
             "reference_published": reference_published,
+            "source_call_completed": isinstance(result, Mapping),
+            "source_return_ok": source_home_ok,
+            "controller_home_proof_verified": proof_ok,
             "physical_effect_verified": False,
             "result": result,
             "reference": reference,
             "profile": profile,
             "authority_observation": authority,
+            "failure": None if source_home_ok else "y_home_source_return_failure",
         }
 
     def record_move_xy_observation(self, result: Mapping[str, Any], *, command_id: str) -> dict[str, Any]:
@@ -617,53 +695,38 @@ class Serial206YProvider:
         }
 
     def publish_home_xy_reference(self, result: Mapping[str, Any], *, command_id: str) -> dict[str, Any]:
-        child = result.get("home", {}).get("y") if isinstance(result.get("home"), Mapping) else None
-        position = result.get("positions", {}).get("y") if isinstance(result.get("positions"), Mapping) else None
-        proof_ok = bool(
-            isinstance(child, Mapping)
-            and child.get("ok") is True
-            and child.get("controller_home_proof_verified") is True
-            and isinstance(position, Mapping)
-            and position.get("position") == 0
-            and isinstance(position.get("ack"), Mapping)
-            and position["ack"].get("status") == 100
-        )
-        if not proof_ok:
-            return {
-                "ok": False,
-                "axis": self.axis,
-                "command_id": command_id,
-                "failure": "homexy_y_child_proof_incomplete",
-                "reference_published": False,
-            }
-        publisher = getattr(self.state_store, "publish_axis_reference", None)
-        reference = publisher(
-            self.axis,
-            position_steps=0,
-            ownership_generation=int(self.generation_provider()),
-            receipt_id=command_id,
-        ) if callable(publisher) else None
-        published = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
+        del result
         return {
-            "ok": published,
+            "ok": False,
             "axis": self.axis,
             "command_id": command_id,
             "physical_motion": False,
-            "reference_published": published,
-            "reference": reference,
+            "reference_published": False,
+            "failure": "homexy_reference_owned_by_parent_observation",
         }
 
     def set_home(self, operator_ack: str, *, command_id: str | None = None) -> dict[str, Any]:
         command_id = command_id or f"y-set-home-{uuid.uuid4().hex}"
         primitive = getattr(self.tester, "motor_set_home", None)
-        source_call_completed = callable(primitive)
-        result = primitive(self.board, motor=self.motor) if source_call_completed else {"ok": False, "failure": "y_set_home_primitive_not_bound"}
+        if callable(primitive):
+            result = primitive(self.board, motor=self.motor)
+        else:
+            result = {"ok": False, "failure": "y_set_home_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_set_home_result_not_mapping", "raw": result}
+        source_call_completed = bool(
+            callable(primitive)
+            and isinstance(result, Mapping)
+            and result.get("source_call_completed") is True
+        )
+        source_return_ok = bool(
+            source_call_completed
+            and result.get("source_return_code") == 0
+        )
         readback = self._position()
         readback_value = self._position_value(readback)
         readback_ok = bool(readback_value == 0)
         return {
-            "ok": source_call_completed,
+            "ok": source_return_ok,
             "schema": self.schema,
             "axis": self.axis,
             "board": self.board,
@@ -672,16 +735,39 @@ class Serial206YProvider:
             "operator_ack": operator_ack,
             "physical_motion": False,
             "source_call_completed": source_call_completed,
-            "controller_set_home_acknowledged": bool(result.get("ok") is True),
+            "source_return_ok": source_return_ok,
+            "controller_set_home_acknowledged": bool(
+                result.get("controller_command_acknowledged") is True
+            ),
             "zero_readback": readback_ok,
             "reference_published": False,
             "position_after": readback,
             "result": result,
-            "failure": None if source_call_completed else "y_set_home_primitive_not_bound",
+            "failure": None if source_return_ok else "y_set_home_source_return_failure",
         }
 
     def stop(self, *, command_id: str | None = None, timeout_s: float = 3.0) -> dict[str, Any]:
         command_id = command_id or f"y-stop-{uuid.uuid4().hex}"
+        present = getattr(self.tester, "_oem_board_present", None)
+        board_state = getattr(self.tester, "_oem_board_state", None)
+        if callable(present) and present(self.board):
+            initialized = bool(board_state().get(self.board, False)) if callable(board_state) else True
+            if not initialized:
+                return {
+                    "ok": True,
+                    "schema": self.schema,
+                    "axis": self.axis,
+                    "board": self.board,
+                    "motor": self.motor,
+                    "command_id": command_id,
+                    "source_call_completed": True,
+                    "source_return_code": 0,
+                    "source_noop": True,
+                    "source_noop_reason": "board_not_initialized",
+                    "controller_command_acknowledged": False,
+                    "physical_effect_verified": False,
+                    "failure": None,
+                }
         primitive = getattr(self.tester, "motor_oem_board_stop", None)
         result = primitive(self.board, motor=self.motor, axis_name="y") if callable(primitive) else {"ok": False, "failure": "y_stop_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_stop_result_not_mapping", "raw": result}

@@ -143,6 +143,22 @@ class FakeMotionDriver:
         status = self.stop_status[axis]
         return {"board": board_id, "motor": motor, "ack": None if status is None else {"status": status}, "ok": status == 100}
 
+    def motor_oem_board_stop(self, board_id: int, *, motor: int, axis_name: str):
+        raw = self.motor_stop(board_id, motor=motor)
+        acknowledged = raw.get("ok") is True
+        return {
+            "source_call_completed": True,
+            "source_return_code": 0,
+            "double_stop_acknowledged": acknowledged,
+            "controller_command_acknowledged": acknowledged,
+            "axis": axis_name,
+            "raw": raw,
+        }
+
+    def motor_oem_force_abort_motion(self, *, reason: str):
+        self.calls.append(("force_abort", reason))
+        return {"ok": True, "reason": reason, "controller_terminal_state_verified": True}
+
     def motor_wait_stopped(self, board_id: int, *, motor: int, timeout_s: float, require_seen_nonzero: bool):
         axis = next(name for name, row in self.MOTOR_FUNCTION_PRESETS.items() if row == {"board": board_id, "motor": motor})
         self.calls.append(("wait_stopped", axis, board_id, motor, timeout_s, require_seen_nonzero))
@@ -315,7 +331,7 @@ def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero
     assert [row["component"] for row in result["components"]] == ["x", "y", "z", "g", "door"]
     assert [call[1] for call in driver.calls if call[0] == "stop"] == ["x", "y", "z", "g", "door"]
     first_wait = next(index for index, call in enumerate(driver.calls) if call[0] == "wait_stopped")
-    assert all(call[0] == "stop" for call in driver.calls[:first_wait])
+    assert [call[0] for call in driver.calls[:first_wait]] == ["stop"] * 5 + ["force_abort"]
     assert all(row["stop_acknowledged"] is True and row["zero_speed_verified"] is True for row in result["components"])
 
 
@@ -423,8 +439,8 @@ def test_catalog_binds_source_grounded_prepare_and_physical_emergency_meta_actio
     async def prepare():
         return {"ok": True, "physical_motion": False}
 
-    @app.post("/motion/emergency_stop")
-    async def emergency():
+    @app.post("/motion/oem/x/abort")
+    async def aggregate_abort():
         return {"ok": True, "physical_effect_verified": True}
 
     @app.post("/motion/power/enable")
@@ -437,9 +453,9 @@ def test_catalog_binds_source_grounded_prepare_and_physical_emergency_meta_actio
     assert by_id["meta.activate_motion"]["informational_path"] == "/motion/oem/prepare_without_motion"
     assert by_id["meta.activate_motion"]["provider_available"] is True
     assert dispatch["meta.activate_motion"]["path"] == "/motion/oem/prepare_without_motion"
-    assert by_id["meta.emergency_stop"]["informational_path"] == "/motion/emergency_stop"
-    assert by_id["meta.emergency_stop"]["provider_available"] is True
-    assert dispatch["meta.emergency_stop"]["path"] == "/motion/emergency_stop"
+    assert by_id["oem.abort_all"]["informational_path"] == "/motion/oem/x/abort"
+    assert by_id["oem.abort_all"]["provider_available"] is True
+    assert dispatch["oem.abort_all"]["path"] == "/motion/oem/x/abort"
     compatibility = next(row for row in actions if row.get("informational_path") == "/motion/power/enable" and row["kind"] == "primitive")
     assert compatibility["enabled"] is True
     assert compatibility["provider_available"] is True

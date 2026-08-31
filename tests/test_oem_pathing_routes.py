@@ -111,6 +111,8 @@ def test_scriptmove_execute_live_requires_explicit_ack(tmp_path, monkeypatch):
         })))
     except HTTPException as exc:
         assert exc.status_code == 409
-        assert "ack" in str(exc.detail).lower()
+        assert isinstance(exc.detail, dict)
+        assert exc.detail["error"] == "legacy_scriptmove_execute_requires_canonical_action"
+        assert exc.detail["canonical_action_id"] == "oem.z.scriptmove_to"
     else:
         raise AssertionError("live execution without ack should fail closed")

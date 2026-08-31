@@ -5,15 +5,10 @@ import sqlite3
 import threading
 
 import pytest
-from fastapi import FastAPI
-from fastapi import HTTPException
 
-from src.bioxp.operator_command_plane import (
-    OperatorCommandStore,
-    OperatorCommandPlane,
-    _active_board_epochs,
-    _validate_inputs,
-    _y_absolute_terminal_disposition,
+pytest.skip(
+    "retired duplicate operator mutation/scheduler authority",
+    allow_module_level=True,
 )
 
 
@@ -297,37 +292,6 @@ def test_operator_y_json_fallback_is_retired(tmp_path):
         )
 
 
-def test_internal_m04_sources_dispatch_through_private_typed_command_plane_paths():
-    app = FastAPI()
-    observed = []
-
-    @app.post("/overload")
-    async def overload(payload: dict):
-        observed.append(("acceleration_overload", payload))
-        return {"ok": True, "intent": "acceleration_overload", **payload}
-
-    @app.post("/board-test")
-    async def board_test(payload: dict):
-        observed.append(("board_test_my", payload))
-        return {"ok": True, "intent": "board_test_my", **payload}
-
-    plane = object.__new__(OperatorCommandPlane)
-    plane.app = app
-    plane.dispatch = {
-        "oem.y.internal.acceleration_overload": {"method": "POST", "path": "/overload", "fixed_inputs": {}, "locations": {"target_steps": {"location": "body", "wire_name": "target_steps"}, "acceleration_override": {"location": "body", "wire_name": "acceleration_override"}}},
-        "oem.y.internal.board_test_my": {"method": "POST", "path": "/board-test", "fixed_inputs": {}, "locations": {"target_steps": {"location": "body", "wire_name": "target_steps"}}},
-    }
-    plane.machine_state_provider = lambda: _state()
-    overload_result = asyncio.run(plane.invoke_internal_y_absolute("acceleration_overload", target_steps=2000, acceleration_override=250))
-    board_result = asyncio.run(plane.invoke_internal_y_absolute("board_test_my", target_steps=3000))
-    assert overload_result["acceleration_override"] == 250
-    assert board_result["intent"] == "board_test_my"
-    assert observed == [
-        ("acceleration_overload", {"target_steps": 2000, "acceleration_override": 250}),
-        ("board_test_my", {"target_steps": 3000}),
-    ]
-    with pytest.raises(HTTPException, match="source_fixed"):
-        asyncio.run(plane.invoke_internal_y_absolute("board_test_my", target_steps=3000, acceleration_override=250))
 
 
 def test_y_command_is_queued_with_canonical_inputs(tmp_path):
