@@ -10,12 +10,19 @@ import time
 
 from bioxp import operator_command_plane
 from bioxp.operator_command_plane import ACTION_REQUEST_SCHEMA, OperatorCommandStore
+from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.oem_deck_catalog import DeckCatalog, configured_location_names
 from bioxp.oem_deck_movement import (
     DeckAuthoritySnapshot, DeckExecutionFailure, NamedLocationIntent,
     compile_named_location, make_deck_command_executor,
 )
 from bioxp.oem_compat.position_table import PositionTable
+
+
+def _operator_store(root):
+    runtime_owner = OEMRuntimeStore(root)
+    runtime_owner.close()
+    return OperatorCommandStore(root)
 
 
 def _state() -> dict:
@@ -37,7 +44,7 @@ def _request(key: str = "deck-command-1") -> dict:
 
 
 def _ambiguous_deck_store(tmp_path):
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     admitted = store.admit_command(_request("deck-recovery-ambiguous"), state=_state())
     table = _stage_table()
     authority = DeckAuthoritySnapshot(
@@ -66,7 +73,7 @@ def _ambiguous_deck_store(tmp_path):
 
 
 def test_one_durable_deck_recovery_predicate_blocks_all_cross_table_states(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     producer = store.admit_command(_request("predicate-producer"), state=_state())
 
     def set_state(*, hold: bool, ambiguity: str) -> None:
@@ -120,7 +127,7 @@ def test_one_durable_deck_recovery_predicate_blocks_all_cross_table_states(tmp_p
 
 
 def test_deck_command_admission_is_async_fifo_idempotent_and_fenced(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     first = store.admit_command(_request(), state=_state())
     replay = store.admit_command(_request(), state=_state())
     second = store.admit_command(_request("deck-command-2"), state=_state())
@@ -135,7 +142,7 @@ def test_deck_command_admission_is_async_fifo_idempotent_and_fenced(tmp_path) ->
 def test_no_provider_io_admission_latency_and_capacity_acceptance_record(tmp_path, monkeypatch, capsys) -> None:
     sample_count = 32
     monkeypatch.setattr(operator_command_plane, "COMMAND_CAPACITY", sample_count)
-    store = OperatorCommandStore(tmp_path / "count")
+    store = _operator_store(tmp_path / "count")
     latencies_ms = []
     request = None
     for index in range(sample_count):
@@ -164,7 +171,7 @@ def test_no_provider_io_admission_latency_and_capacity_acceptance_record(tmp_pat
 
     monkeypatch.setattr(operator_command_plane, "COMMAND_CAPACITY", 1024)
     monkeypatch.setattr(operator_command_plane, "COMMAND_BYTES_CAPACITY", 1)
-    byte_store = OperatorCommandStore(tmp_path / "bytes")
+    byte_store = _operator_store(tmp_path / "bytes")
     with pytest.raises(HTTPException) as bytes_rejected:
         byte_store.admit_command({**request, "idempotency_key": "bytes-rejected"}, state=_state())
     assert bytes_rejected.value.detail["error"] == "capacity_exceeded"
@@ -173,7 +180,7 @@ def test_no_provider_io_admission_latency_and_capacity_acceptance_record(tmp_pat
 
 
 def test_active_deck_command_exclusively_owns_all_normal_movement_resources(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     deck = store.admit_command(_request("deck-global-resource-owner"), state=_state())
     axis = store.admit_command(
         {
@@ -206,7 +213,7 @@ def test_active_deck_command_exclusively_owns_all_normal_movement_resources(tmp_
 
 
 def test_blocked_earliest_movement_cannot_be_overtaken_by_later_nonconflicting_axis(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     active_x = store.admit_command(
         {
             "schema_version": ACTION_REQUEST_SCHEMA, "idempotency_key": "fifo-active-x",
@@ -232,7 +239,7 @@ def test_blocked_earliest_movement_cannot_be_overtaken_by_later_nonconflicting_a
 
 
 def test_deck_input_schema_rejects_raw_fields_and_contradictory_barcode(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     with pytest.raises(HTTPException) as raw:
         store.admit_command({**_request(), "inputs": {"target": "LOC_OC", "camera_offset": False, "x": 1}}, state=_state())
     assert raw.value.status_code == 422
@@ -243,7 +250,7 @@ def test_deck_input_schema_rejects_raw_fields_and_contradictory_barcode(tmp_path
 
 
 def test_existing_store_persists_deck_plan_children_and_success_only_semantic_transition(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     admitted = store.admit_command(_request(), state=_state())
     table = PositionTable.from_rows([
         {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
@@ -293,7 +300,7 @@ def test_existing_store_persists_deck_plan_children_and_success_only_semantic_tr
 
 
 def test_barcode_success_commits_resolved_oem_location_not_panel_target(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     admitted = store.admit_command(
         {**_request("deck-barcode-success"), "inputs": {"target": "LOC_TC_BARCODE", "camera_offset": False}},
         state=_state(),
@@ -337,7 +344,7 @@ def test_explicit_no_io_stage_evidence_preserves_delivery_false() -> None:
 
 
 def test_deck_schema_is_exact_and_rejects_direct_sql_rebinding(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     conn = store.connection
     expected_columns = {
         "operator_plane_deck_commands": (
@@ -472,7 +479,7 @@ def _stage_table():
 
 
 def test_already_parked_no_io_branch_still_commits_caller_update_location(tmp_path):
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     admitted = store.admit_command(
         {**_request("already-parked"), "inputs": {"target": "LOC_PARK", "camera_offset": False}}, state=_state()
     )
@@ -493,7 +500,7 @@ def test_already_parked_no_io_branch_still_commits_caller_update_location(tmp_pa
 
 @pytest.mark.parametrize(("mode", "expected"), [("missing", "failed"), ("ambiguous", "ambiguous")])
 def test_real_store_executor_terminalizes_pre_io_and_post_io_stage_evidence(tmp_path, mode, expected):
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     admitted = store.admit_command(_request(f"stage-{mode}"), state=_state())
     table = _stage_table(); provider = _StageProvider(table, mode=mode)
     if mode == "missing":
@@ -517,14 +524,14 @@ def test_real_store_executor_terminalizes_pre_io_and_post_io_stage_evidence(tmp_
 
 
 def test_restart_and_ambiguous_recovery_hold_blocks_new_deck_admission_and_dispatch(tmp_path):
-    first = OperatorCommandStore(tmp_path)
+    first = _operator_store(tmp_path)
     admitted = first.admit_command(_request("restart-active"), state=_state())
     assert first._acquire_owner() is True
     assert first.claim_next()["command_id"] == admitted["command_id"]
     first.connection.execute("UPDATE operator_plane_lane SET owner_lease_until=0 WHERE singleton=1")
     first.connection.close()
 
-    recovered = OperatorCommandStore(tmp_path)
+    recovered = _operator_store(tmp_path)
     assert recovered.recovery()["hold"] is True
     assert recovered.claim_next() is None
     with pytest.raises(HTTPException) as blocked:

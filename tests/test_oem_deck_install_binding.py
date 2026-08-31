@@ -10,6 +10,7 @@ import pytest
 
 from bioxp import operator_controls
 from bioxp.operator_command_plane import OperatorCommandStore
+from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.oem_deck_catalog import DeckCatalog
 from bioxp.oem_serial206_initialization import (
     SERIAL206_INITIALIZE_MOTION_STAGE_SPECS,
@@ -18,6 +19,18 @@ from bioxp.oem_serial206_initialization import (
 )
 from bioxp import oem_serial206_initialization
 from bioxp.oem_compat.position_table import PositionTable
+
+
+def _operator_store(root):
+    runtime_owner = OEMRuntimeStore(root)
+    runtime_owner.close()
+    return OperatorCommandStore(root)
+
+
+@pytest.fixture(autouse=True)
+def _prepare_canonical_runtime(tmp_path):
+    runtime_owner = OEMRuntimeStore(tmp_path / "canonical-oem-runtime")
+    runtime_owner.close()
 
 
 def _complete_oem_movable_locations() -> dict[str, str]:
@@ -465,7 +478,7 @@ class FakeDeckPrimitives:
     def read_oem_latch_status(self):
         return {"ok": True, "value": True, "observation_id": "fake-host-latch:0:1"}
 
-    def query_all_pipette_tip_states(self):
+    def query_all_pipette_tip_states(self, *, lifecycle_stage_id: str):
         return {"ok": True, "tip_exists": True, "channels_with_tips": [0]}
 
     def oem_move_to(self, x, y, z, **kwargs):
@@ -537,7 +550,7 @@ def test_fresh_runtime_has_exact_oem_constructor_movable_defaults() -> None:
     ],
 )
 def test_bootstrap_rejects_incomplete_unknown_or_duplicate_movable_maps(tmp_path, movable) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     snapshot = {
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
@@ -575,7 +588,7 @@ def test_plate_name_domain_matches_exact_oem_ordinals_and_canonicalizes_cover_br
 
 @pytest.mark.parametrize("plate", ["UNKNOWN_PLATE", "4", -1, 22, True, False])
 def test_bootstrap_rejects_plate_on_gantry_outside_exact_oem_domain(tmp_path, plate) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     snapshot = {
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
@@ -591,7 +604,7 @@ def test_bootstrap_rejects_plate_on_gantry_outside_exact_oem_domain(tmp_path, pl
 
 
 def test_bootstrap_and_plate_producer_publish_only_canonical_plate_ordinals(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     snapshot = {
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
@@ -636,7 +649,7 @@ def test_sqlite_plate_cover_round_trip_feeds_exact_clearance_ordinals_to_movemen
         {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
         for index, name in enumerate(configured_location_names())
     ])
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     snapshot = {
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
@@ -920,8 +933,8 @@ class _ParkPrimitives:
         self.calls.append(("ejectAllTips", True, True))
         return self._completed("park-eject")
 
-    def query_all_pipette_tip_states(self):
-        self.calls.append(("queryTipStatus", -1))
+    def query_all_pipette_tip_states(self, *, lifecycle_stage_id: str):
+        self.calls.append(("queryTipStatus", lifecycle_stage_id))
         return {"ok": True, "tip_exists": self.tips_remain, "channels_with_tips": [0] if self.tips_remain else []}
 
     def oem_initialize_motion_move_absolute(self, axis, position, **kwargs):
@@ -1050,7 +1063,7 @@ def test_park_gantry_manual_tip_removal_is_governance_failure_without_final_move
 
 
 def test_fresh_store_tip_tray_authority_is_nullable_until_source_producer(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
 
     state = store.tip_tray_state(0)
 
@@ -1074,7 +1087,7 @@ def test_fresh_store_tip_tray_authority_is_nullable_until_source_producer(tmp_pa
 
 
 def test_tip_tray_source_transitions_preserve_occupancy_and_literal_latch_semantics(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     common = {
         "tray_id": 0, "operation_id": "tray-op-1", "command_id": "tray-cmd-1",
         "ownership_generation": 7, "board_epoch_4": 10, "board_epoch_5": 11,
@@ -1133,7 +1146,7 @@ def test_provider_tip_tray_publisher_uses_current_owner_authority() -> None:
 def test_tip_tray_sql_projection_and_history_are_guarded(tmp_path) -> None:
     import sqlite3
 
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.publish_tip_tray_transition(
         tray_id=0, transition="reset", operation_id="tray-op-guard",
         command_id="tray-cmd-guard", ownership_generation=7,
@@ -1206,7 +1219,7 @@ def test_initialize_motion_pipette_query_never_establishes_tip_tray_authority() 
 
 
 def test_clean_path_is_derived_from_current_tray_zero_availability_and_expectation_mismatch_is_atomic(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.bootstrap_deck_semantic_state({
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": False,
@@ -1258,7 +1271,7 @@ def test_clean_path_is_derived_from_current_tray_zero_availability_and_expectati
 
 
 def test_clean_path_rejects_missing_or_stale_tray_zero_authority_without_publication(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     state = Serial206OemInitializationProvider._new_state()
     state["x_lifecycle"]["board_lifecycle_generation"] = 11
     runtime = FakeRuntimeStore(state)
@@ -1283,7 +1296,7 @@ def test_clean_path_rejects_missing_or_stale_tray_zero_authority_without_publica
 
 
 def test_production_state_owners_publish_canonical_sqlite_mutations(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.bootstrap_deck_semantic_state({
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": 2, "clean_path": True,
@@ -1423,7 +1436,7 @@ def test_serial206_provider_uses_bound_canonical_deck_state_over_stale_local_sta
     with pytest.raises(RuntimeError, match="deck_semantic_state_reader_not_bound"):
         provider.deck_authority_snapshot(expected_generation=7)
 
-    store = OperatorCommandStore(tmp_path / "canonical-store")
+    store = _operator_store(tmp_path / "canonical-store")
     request = {
         "schema_version": ACTION_REQUEST_SCHEMA, "idempotency_key": "canonical-provider-snapshot-1",
         "expected_ownership_generation": 7, "expected_board_epoch_by_board": {"4": 10, "5": 11},
@@ -1654,7 +1667,7 @@ def _current_owner_provider(store, *, generation_state=None, tip_exists=True):
         "generation": 7, "board_lifecycle_generation": 11,
     })
     primitives = FakeDeckPrimitives()
-    primitives.query_all_pipette_tip_states = lambda: {
+    primitives.query_all_pipette_tip_states = lambda *, lifecycle_stage_id: {
         "ok": True, "tip_exists": tip_exists,
         "channels_with_tips": [0] if tip_exists else [],
     }
@@ -1669,7 +1682,7 @@ def _current_owner_provider(store, *, generation_state=None, tip_exists=True):
 
 
 def test_initialize_motion_real_tip_query_publishes_current_authority_atomically(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.bootstrap_deck_semantic_state({
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": 2, "clean_path": True,
@@ -1694,7 +1707,7 @@ def test_initialize_motion_real_tip_query_publishes_current_authority_atomically
 
 
 def test_owner_publication_generation_drift_in_sqlite_transaction_inserts_nothing(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.bootstrap_deck_semantic_state({
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
@@ -1730,7 +1743,7 @@ def test_wp6_success_derives_current_tray_from_oem_update_location_mapping(tmp_p
         {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
         for index, name in enumerate(configured_location_names())
     ])
-    store = OperatorCommandStore(tmp_path)
+    store = _operator_store(tmp_path)
     store.bootstrap_deck_semantic_state({
         "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
         "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
