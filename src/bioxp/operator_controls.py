@@ -2443,6 +2443,7 @@ def install_operator_control_plane(
                     )
                 if existing.get("authority_fingerprint") != current_authority_fingerprint:
                     raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
+                verify_replay_source_identity(existing)
                 return existing
             command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
             started = time.time()

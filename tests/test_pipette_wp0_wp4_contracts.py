@@ -494,6 +494,54 @@ def test_wrong_owner_token_cannot_consume_or_taint_current_completion():
     assert router.pipette_completion_taint(1) is None
 
 
+def test_signaled_completion_owner_remains_registered_until_collection():
+    router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
+    token = router.prepare_pipette_completion(
+        1,
+        10.0,
+        command_family=1,
+        command_name="pipette_aspirate",
+        expected_rx_id=0x509,
+    )
+    started = router._clock()
+    router.bind_pipette_completion(
+        1,
+        owner_token=token,
+        transaction_id="tx-signaled-owner",
+        tx_started_at=started,
+    )
+    router._dispatch(NovoFrame(
+        arbitration_id=0x509,
+        dlc=0,
+        data=b"",
+        raw=b"ack",
+        received_at=started + 0.01,
+        classification="pipette_report",
+    ))
+    router._dispatch(NovoFrame(
+        arbitration_id=0x509,
+        dlc=2,
+        data=bytes((0x20, 0)),
+        raw=b"completion",
+        received_at=started + 0.02,
+        classification="pipette_report",
+    ))
+
+    with pytest.raises(NovoRouterError, match="already registered"):
+        router.prepare_pipette_completion(
+            1,
+            10.0,
+            command_family=1,
+            command_name="pipette_dispense",
+            expected_rx_id=0x509,
+        )
+
+    rightful = router.wait_pipette_completion(1, 0.0, owner_token=token)
+    assert rightful["ok"] is True
+    assert rightful["transaction_id"] == "tx-signaled-owner"
+    assert router.pipette_completion_taint(1) is None
+
+
 def test_terminate_completion_owner_takes_over_exact_active_command_without_taint():
     router = NovoRouter(ep_in=object(), ep_out=object(), decode=lambda raw: raw)
     active_token = router.prepare_pipette_completion(

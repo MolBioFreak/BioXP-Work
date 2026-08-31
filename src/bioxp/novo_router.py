@@ -686,7 +686,7 @@ class NovoRouter:
                         (channel, existing.owner_token)
                     ] = existing
                     self._pipette_completions.pop(channel, None)
-                elif not existing.event.is_set():
+                else:
                     raise NovoRouterError(f"pipette {channel} completion is already registered")
             registered_at = self._clock()
             legacy_owner = command_family is None and command_name is None

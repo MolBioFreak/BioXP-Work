@@ -423,6 +423,49 @@ def test_idempotent_replay_ignores_mutable_authority_fingerprint_without_redispa
     assert calls == [("home_axis", {"axis": "x"})]
 
 
+def test_post_lock_idempotency_race_rejects_stale_release_identity(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/test/home_axis")
+    payload = {
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "post-lock-stale-release-race-123",
+        "inputs": {"body": {"axis": "x"}},
+    }
+
+    first = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+    assert first.status_code == 200
+
+    store = app.state.operator_receipt_store
+    original_by_idempotency = store.by_idempotency
+    lookup_count = 0
+    lookup_lock = threading.Lock()
+
+    def miss_then_find(*args, **kwargs):
+        nonlocal lookup_count
+        with lookup_lock:
+            lookup_count += 1
+            current_lookup = lookup_count
+        if current_lookup == 1:
+            return None
+        return original_by_idempotency(*args, **kwargs)
+
+    monkeypatch.setattr(store, "by_idempotency", miss_then_find)
+    monkeypatch.setattr(operator_controls, "current_release_identity", lambda: {
+        "verified": True,
+        "release_id": "replacement-test-release",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64},
+    })
+
+    replay = client.post(f"/operator/actions/{action['action_id']}", json=payload)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == "idempotency receipt release_id is stale"
+    assert lookup_count == 2
+    assert calls == [("home_axis", {"axis": "x"})]
+
+
 def test_idempotent_replay_is_bound_to_ownership_generation(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
