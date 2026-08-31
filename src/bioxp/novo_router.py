@@ -677,11 +677,11 @@ class NovoRouter:
                     and command_family == 0
                     and existing.command_family == 1
                     and replacement_reason == "interrupted_by_terminate"
+                    and not existing.event.is_set()
                 )
                 if replacement_authorized:
-                    if not existing.event.is_set():
-                        existing.rejected_reason = "interrupted_by_terminate"
-                        existing.event.set()
+                    existing.rejected_reason = "interrupted_by_terminate"
+                    existing.event.set()
                     self._interrupted_pipette_completions[
                         (channel, existing.owner_token)
                     ] = existing
