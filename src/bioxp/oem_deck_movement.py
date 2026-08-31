@@ -4,6 +4,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import threading
 from typing import Any, Callable, Iterator, Mapping
 
@@ -160,6 +161,8 @@ class DeckAuthoritySnapshot:
     semantic_state_provenance_digest: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.captured_at) not in {int, float} or not math.isfinite(float(self.captured_at)):
+            raise ValueError("captured_at must be finite")
         if set(self.reference_versions) != {"x", "y", "z", "g"}:
             raise ValueError("reference versions must contain x,y,z,g")
         if set(self.safety_epochs) != {"global", "x", "y", "z"}:
@@ -173,7 +176,6 @@ class DeckAuthoritySnapshot:
     @property
     def digest(self) -> str:
         authoritative = asdict(self)
-        authoritative.pop("captured_at", None)
         return _digest({"schema_version": "bioxp.oem_deck_authority.v1", **authoritative})
 
 
@@ -236,16 +238,21 @@ def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, ta
         ))
     else:
         steps.append(DeckPlanStep(3, "moveTo", "ClassControlInterface.btnLOC1_Click:ordinary", ("x", "y", "z"), {"location_id": destination.location_id, "camera_offset": bool(intent.camera_offset)}))
+    pinned_binary_resolution = (
+        "BARCODE_PARK_INVALID_IL_RESOLVED_FROM_PINNED_BINARY:"
+        "BioXPControlLib.dll:sha256=163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed:"
+        "tokens=0x060000CB,0x0600011E,0x0600012E,0x06000351"
+    )
     source_hazards = {
         "ordinary": (
             "ordinary:ROUTE_ALWAYS_TRUE_LOCATION_TEST:retain_decompiled_predicate_pending_raw_il",
         ),
         "barcode": (
             "barcode:ROUTE_ALWAYS_TRUE_LOCATION_TEST:retain_decompiled_predicate_pending_raw_il",
-            "barcode:VISION_INVALID_IL_REGIONS:binary_disposition_required_before_live_parity_claim",
+            f"barcode:{pinned_binary_resolution}",
         ),
         "park": (
-            "park:VISION_INVALID_IL_REGIONS:binary_disposition_required_before_live_parity_claim",
+            f"park:{pinned_binary_resolution}",
         ),
     }[destination.branch]
     return DeckMovementPlan(
@@ -906,38 +913,38 @@ def make_deck_command_executor(
                         ) from exc
                 assert isinstance(result, Mapping)
                 results.append({str(key): value for key, value in result.items()})
-            controller_ack = bool(results) and all(
+            all_source_noop = bool(results) and all(row.get("source_noop") is True for row in results)
+            controller_ack = bool(results) and not all_source_noop and all(
                 row.get("source_noop") is True
                 or row.get("controller_command_acknowledged") is True
                 for row in results
             )
-            controller_complete = bool(results) and all(_controller_terminal_truth(row) for row in results)
-            postcondition = controller_complete and all(
+            source_terminal_complete = bool(results) and all(_controller_terminal_truth(row) for row in results)
+            controller_complete = source_terminal_complete and not all_source_noop
+            postcondition = controller_complete and not all_source_noop and all(
                 row.get("source_noop") is True
                 or row.get("hardware_postcondition_verified") is True
                 for row in results
             )
             semantic_committed = False
-            if controller_complete:
-                all_source_noop = all(row.get("source_noop") is True for row in results)
-                if not all_source_noop:
-                    commit = getattr(command_store, "commit_deck_success", None)
-                    if callable(commit):
-                        try:
-                            commit(command_id, plan, results)
-                        except Exception as exc:
-                            raise DeckExecutionFailure(
-                                f"semantic_commit_failed:{type(exc).__name__}",
-                                delivery_attempted=True,
-                                controller_command_acknowledged=controller_ack,
-                                controller_completion_verified=True,
-                                hardware_postcondition_verified=postcondition,
-                                provider_results=results,
-                            ) from exc
+            if source_terminal_complete:
+                commit = getattr(command_store, "commit_deck_success", None)
+                if callable(commit):
+                    try:
+                        commit(command_id, plan, results)
+                    except Exception as exc:
+                        raise DeckExecutionFailure(
+                            f"semantic_commit_failed:{type(exc).__name__}",
+                            delivery_attempted=not all(row.get("source_noop") is True for row in results),
+                            controller_command_acknowledged=controller_ack,
+                            controller_completion_verified=controller_complete,
+                            hardware_postcondition_verified=postcondition,
+                            provider_results=results,
+                        ) from exc
                 semantic_committed = True
             destination = catalog.resolve(plan.target)
             return {
-                "ok": controller_complete and semantic_committed,
+                "ok": source_terminal_complete and semantic_committed,
                 "admitted": True,
                 "delivery_attempted": any(
                     row.get("source_noop") is not True

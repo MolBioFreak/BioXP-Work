@@ -1649,9 +1649,7 @@ class OperatorCommandStore:
                     planned_at REAL NOT NULL,
                     committed_at REAL,
                     CHECK(controller_command_acknowledged<=delivery_attempted),
-                    CHECK(controller_completion_verified<=delivery_attempted),
                     CHECK(hardware_postcondition_verified<=controller_completion_verified),
-                    CHECK(semantic_state_committed<=controller_completion_verified),
                     CHECK((semantic_state_committed=0 AND transition_revision IS NULL) OR (semantic_state_committed=1 AND transition_revision IS NOT NULL)),
                     CHECK((semantic_state_committed=0 AND committed_at IS NULL) OR (semantic_state_committed=1 AND committed_at IS NOT NULL))
                 ) WITHOUT ROWID;
@@ -3386,7 +3384,11 @@ class OperatorCommandStore:
         return {
             "operation": str(step.operation), "source_anchor": str(step.source_anchor),
             "arguments_digest": _digest(arguments),
-            "delivery_attempted": bool(row.get("delivery_attempted") is True or result is not None),
+            "delivery_attempted": (
+                row["delivery_attempted"]
+                if type(row.get("delivery_attempted")) is bool
+                else result is not None
+            ),
             "controller_command_acknowledged": row.get("controller_command_acknowledged") is True,
             "controller_completion_verified": row.get("controller_completion_verified") is True,
             "hardware_postcondition_verified": row.get("hardware_postcondition_verified") is True,
@@ -3461,7 +3463,11 @@ class OperatorCommandStore:
         }.get(loc, current_tray)
 
     def commit_deck_success(self, command_id: str, plan: Any, results: list[Mapping[str, Any]]) -> None:
-        if not results or any(row.get("controller_completion_verified") is not True for row in results):
+        if not results or any(
+            row.get("source_noop") is not True
+            and row.get("controller_completion_verified") is not True
+            for row in results
+        ):
             raise ValueError("deck semantic state requires verified controller completion")
         with self._transaction() as conn:
             result_index = 0
@@ -3522,14 +3528,16 @@ class OperatorCommandStore:
             conn.execute(
                 """
                 UPDATE operator_plane_deck_commands
-                SET delivery_attempted=1,controller_command_acknowledged=?,controller_completion_verified=1,
+                SET delivery_attempted=?,controller_command_acknowledged=?,controller_completion_verified=?,
                     hardware_postcondition_verified=?,semantic_state_committed=1,
                     transition_revision=?,provider_evidence_json=?,committed_at=?
                 WHERE command_id=?
                 """,
                 (
-                    int(all(row.get("controller_command_acknowledged") is True for row in results)),
-                    int(all(row.get("hardware_postcondition_verified") is True for row in results)),
+                    int(any(row.get("source_noop") is not True and row.get("delivery_attempted") is not False for row in results)),
+                    int(any(row.get("source_noop") is not True for row in results) and all(row.get("source_noop") is True or row.get("controller_command_acknowledged") is True for row in results)),
+                    int(any(row.get("source_noop") is not True for row in results) and all(row.get("source_noop") is True or row.get("controller_completion_verified") is True for row in results)),
+                    int(any(row.get("source_noop") is not True for row in results) and all(row.get("source_noop") is True or row.get("hardware_postcondition_verified") is True for row in results)),
                     int(transition_row[0]), _canonical(results), _now(), str(command_id),
                 ),
             )

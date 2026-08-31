@@ -5,7 +5,10 @@ from contextlib import contextmanager
 import json
 import pytest
 import sqlite3
+import statistics
+import time
 
+from bioxp import operator_command_plane
 from bioxp.operator_command_plane import ACTION_REQUEST_SCHEMA, OperatorCommandStore
 from bioxp.oem_deck_catalog import DeckCatalog, configured_location_names
 from bioxp.oem_deck_movement import (
@@ -127,6 +130,46 @@ def test_deck_command_admission_is_async_fifo_idempotent_and_fenced(tmp_path) ->
         store.admit_command({**_request("deck-command-3"), "expected_board_epoch_by_board": {"4": 9, "5": 11}}, state=_state())
     assert stale.value.status_code == 409
     store.stop()
+
+
+def test_no_provider_io_admission_latency_and_capacity_acceptance_record(tmp_path, monkeypatch, capsys) -> None:
+    sample_count = 32
+    monkeypatch.setattr(operator_command_plane, "COMMAND_CAPACITY", sample_count)
+    store = OperatorCommandStore(tmp_path / "count")
+    latencies_ms = []
+    request = None
+    for index in range(sample_count):
+        request = {
+            "schema_version": ACTION_REQUEST_SCHEMA, "idempotency_key": f"latency-{index}",
+            "expected_ownership_generation": 7, "expected_board_epoch_by_board": {},
+            "action_id": "oem.x.move_steps", "inputs": {"steps": 1},
+        }
+        started = time.perf_counter_ns()
+        store.admit_command(request, state=_state())
+        latencies_ms.append((time.perf_counter_ns() - started) / 1_000_000)
+    ordered = sorted(latencies_ms)
+    evidence = {
+        "sample_count": sample_count, "sequential_submissions": sample_count,
+        "p50_ms": statistics.median(ordered),
+        "p95_ms": ordered[max(0, int(sample_count * 0.95) - 1)],
+        "max_ms": max(ordered), "baseline_max_ms": 100.0,
+    }
+    print(json.dumps(evidence, sort_keys=True))
+    assert evidence["max_ms"] < evidence["baseline_max_ms"]
+    assert request is not None
+    with pytest.raises(HTTPException) as count_rejected:
+        store.admit_command({**request, "idempotency_key": "count-rejected"}, state=_state())
+    assert count_rejected.value.detail["error"] == "capacity_exceeded"
+    store.stop()
+
+    monkeypatch.setattr(operator_command_plane, "COMMAND_CAPACITY", 1024)
+    monkeypatch.setattr(operator_command_plane, "COMMAND_BYTES_CAPACITY", 1)
+    byte_store = OperatorCommandStore(tmp_path / "bytes")
+    with pytest.raises(HTTPException) as bytes_rejected:
+        byte_store.admit_command({**request, "idempotency_key": "bytes-rejected"}, state=_state())
+    assert bytes_rejected.value.detail["error"] == "capacity_exceeded"
+    byte_store.stop()
+    assert capsys.readouterr().out
 
 
 def test_active_deck_command_exclusively_owns_all_normal_movement_resources(tmp_path) -> None:
@@ -285,6 +328,14 @@ def test_barcode_success_commits_resolved_oem_location_not_panel_target(tmp_path
     store.stop()
 
 
+def test_explicit_no_io_stage_evidence_preserves_delivery_false() -> None:
+    step = type("Step", (), {"operation": "check_latch_status", "source_anchor": "source", "arguments": None})()
+    evidence = OperatorCommandStore._deck_stage_evidence(
+        step, {"value": True, "delivery_attempted": False, "physical_motion_commanded": False}
+    )
+    assert evidence["delivery_attempted"] is False
+
+
 def test_deck_schema_is_exact_and_rejects_direct_sql_rebinding(tmp_path) -> None:
     store = OperatorCommandStore(tmp_path)
     conn = store.connection
@@ -398,11 +449,46 @@ class _StageProvider:
         return {"ok": True, "controller_command_acknowledged": True, "controller_completion_verified": True, "hardware_postcondition_verified": True}
 
 
+class _NoopParkProvider(_StageProvider):
+    def deck_authority_snapshot(self, *, expected_generation):
+        snapshot = super().deck_authority_snapshot(expected_generation=expected_generation)
+        snapshot.update({"current_location_id": "LOC_PARK", "current_well_id": 4})
+        return snapshot
+
+    def parkGantry(self, **kwargs):
+        self.calls += 1
+        return {
+            "ok": True, "source_noop": True, "delivery_attempted": False,
+            "controller_command_acknowledged": False, "controller_completion_verified": False,
+            "hardware_postcondition_verified": False,
+        }
+
+
 def _stage_table():
     return PositionTable.from_rows([
         {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
         for index, name in enumerate(configured_location_names())
     ])
+
+
+def test_already_parked_no_io_branch_still_commits_caller_update_location(tmp_path):
+    store = OperatorCommandStore(tmp_path)
+    admitted = store.admit_command(
+        {**_request("already-parked"), "inputs": {"target": "LOC_PARK", "camera_offset": False}}, state=_state()
+    )
+    table = _stage_table(); provider = _NoopParkProvider(table, mode="noop")
+    executor = make_deck_command_executor(provider_getter=lambda: provider, position_table_provider=lambda: table, command_store=store)
+    response = executor(
+        command_id=admitted["command_id"], target="LOC_PARK", camera_offset=False,
+        expected_ownership_generation=7, expected_board_epoch_by_board={"4": 10, "5": 11},
+    )
+    semantic = store.deck_semantic_state()
+    assert response["ok"] is True and response["delivery_attempted"] is False
+    assert response["controller_command_acknowledged"] is False
+    assert response["controller_completion_verified"] is False
+    assert response["hardware_postcondition_verified"] is False
+    assert semantic["current_location"] == "LOC_PARK" and semantic["current_well"] == 0
+    store.stop()
 
 
 @pytest.mark.parametrize(("mode", "expected"), [("missing", "failed"), ("ambiguous", "ambiguous")])

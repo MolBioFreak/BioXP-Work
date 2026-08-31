@@ -125,6 +125,17 @@ def test_named_location_plans_have_branch_hazards_bound_into_digest() -> None:
         assert all(item.startswith(f"{branch}:") for item in plan.source_hazards)
         without_hazards = dataclasses.replace(plan, source_hazards=())
         assert plan.plan_digest != without_hazards.plan_digest
+    resolution = (
+        "BARCODE_PARK_INVALID_IL_RESOLVED_FROM_PINNED_BINARY:"
+        "BioXPControlLib.dll:sha256=163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed:"
+        "tokens=0x060000CB,0x0600011E,0x0600012E,0x06000351"
+    )
+    assert plans["barcode"].source_hazards == (
+        "barcode:ROUTE_ALWAYS_TRUE_LOCATION_TEST:retain_decompiled_predicate_pending_raw_il",
+        f"barcode:{resolution}",
+    )
+    assert plans["park"].source_hazards == (f"park:{resolution}",)
+    assert all("binary_disposition_required" not in hazard for plan in plans.values() for hazard in plan.source_hazards)
 
 
 def test_preview_only_ordinal_19_uses_loc_rc_cover_and_remains_zero_io() -> None:

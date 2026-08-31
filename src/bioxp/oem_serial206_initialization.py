@@ -372,6 +372,38 @@ def _json_contract_safe(value: Any) -> Any:
     return projected
 
 
+def _aggregate_executed_controller_evidence(execution: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate explicit controller evidence from executed physical leaf receipts."""
+    leaves: list[Mapping[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if "controller_command_acknowledged" in value:
+                leaves.append(value)
+                return
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(execution.get("execution_results", []))
+    acknowledged = bool(leaves) and all(row.get("controller_command_acknowledged") is True for row in leaves)
+    completed = bool(leaves) and all(
+        row.get("controller_completion_verified") is True
+        or row.get("controller_terminal_state_verified") is True
+        for row in leaves
+    )
+    return {
+        "controller_command_acknowledged": acknowledged,
+        "controller_completion_verified": completed,
+        "hardware_postcondition_verified": completed and all(
+            row.get("hardware_postcondition_verified") is True for row in leaves
+        ),
+        "required_executed_child_count": len(leaves),
+    }
+
+
 class Serial206ProductionPrimitiveAdapter:
     """Source-bound production primitives for both OEM initialization methods."""
 
@@ -3746,8 +3778,13 @@ class Serial206ProductionPrimitiveAdapter:
             acc=None,
             pseudo_z_home_steps=int(pseudo_home_steps),
         )
+        controller_evidence = _aggregate_executed_controller_evidence(execution)
+        acknowledged = controller_evidence["controller_command_acknowledged"]
+        completed = controller_evidence["controller_completion_verified"]
+        postcondition = controller_evidence["hardware_postcondition_verified"]
         return {
-            "ok": execution.get("ok") is True,
+            "ok": execution.get("ok") is True and acknowledged and completed,
+            **controller_evidence,
             "plan": _json_safe(plan),
             "execution": _json_safe(execution),
             "position_table_source": table.source,
@@ -8469,6 +8506,27 @@ class Serial206OemInitializationProvider:
                 discarded_return=False,
             )
             controller_rows.append(x_row)
+            cleanup_rows = (z_row, x_row)
+            cleanup_acknowledged = all(
+                row.get("controller_command_acknowledged") is True for row in cleanup_rows
+            )
+            cleanup_completed = all(
+                row.get("controller_completion_verified") is True
+                or row.get("controller_terminal_state_verified") is True
+                for row in cleanup_rows
+            )
+            if not cleanup_acknowledged or not cleanup_completed:
+                return {
+                    "ok": False,
+                    "delivery_attempted": True,
+                    "controller_command_acknowledged": cleanup_acknowledged,
+                    "controller_completion_verified": cleanup_completed,
+                    "hardware_postcondition_verified": False,
+                    "governance_outcome": "park_tip_cleanup_terminal_proof_missing",
+                    "semantic_location_commit_allowed": False,
+                    "source_children": source_children,
+                    "source_anchor": "ControlLib.parkGantry:7093-7112",
+                }
             publisher = getattr(self, "_deck_semantic_state_publisher", None)
             if not callable(publisher):
                 raise RuntimeError("deck_semantic_state_publisher_not_bound")

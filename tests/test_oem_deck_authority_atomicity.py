@@ -44,10 +44,16 @@ def test_authority_drift_before_first_write_yields_zero_provider_io() -> None:
     assert provider.writes == 0
 
 
-def test_authority_digest_ignores_capture_timestamp_but_detects_authority_drift() -> None:
+def test_authority_digest_binds_capture_timestamp_and_detects_authority_drift() -> None:
     _table, authority = fixtures()
-    assert replace(authority, captured_at=2.0).digest == authority.digest
+    assert replace(authority, captured_at=2.0).digest != authority.digest
     assert replace(authority, machine_state_revision=2).digest != authority.digest
+
+
+def test_authority_snapshot_rejects_non_finite_capture_timestamp() -> None:
+    _table, authority = fixtures()
+    with pytest.raises(ValueError, match="captured_at"):
+        replace(authority, captured_at=float("nan"))
 
 
 def test_successful_unlock_latches_host_status_false_and_lock_cannot_reset_it() -> None:

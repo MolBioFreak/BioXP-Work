@@ -16,6 +16,7 @@ from bioxp.oem_serial206_initialization import (
     Serial206OemInitializationProvider,
     Serial206ProductionPrimitiveAdapter,
 )
+from bioxp import oem_serial206_initialization
 from bioxp.oem_compat.position_table import PositionTable
 
 
@@ -897,9 +898,10 @@ def test_barcode_uses_raw_il_offsets_high_clamp_and_source_child_order(
 
 
 class _ParkPrimitives:
-    def __init__(self, *, tips_remain: bool = False) -> None:
+    def __init__(self, *, tips_remain: bool = False, incomplete_axis: str | None = None) -> None:
         self.calls = []
         self.tips_remain = tips_remain
+        self.incomplete_axis = incomplete_axis
 
     @staticmethod
     def _completed(command_id):
@@ -924,7 +926,10 @@ class _ParkPrimitives:
 
     def oem_initialize_motion_move_absolute(self, axis, position, **kwargs):
         self.calls.append((f"move{axis.upper()}", position, kwargs))
-        return self._completed(f"park-{axis}")
+        result = self._completed(f"park-{axis}")
+        if axis == self.incomplete_axis:
+            result["controller_terminal_state_verified"] = False
+        return result
 
     def oem_initialize_motion_scriptmove_to_waste(self, **kwargs):
         self.calls.append(("scriptmoveTo", kwargs))
@@ -992,6 +997,40 @@ def test_park_gantry_already_parked_is_authoritative_no_io_noop() -> None:
     assert result["ok"] is True and result["source_noop"] is True
     assert result["controller_completion_verified"] is False
     assert primitives.calls == []
+
+
+def test_park_gantry_does_not_publish_tip_state_without_terminal_z_x_proof(monkeypatch) -> None:
+    _install_park_table(monkeypatch)
+    primitives = _ParkPrimitives(incomplete_axis="z")
+    provider = Serial206OemInitializationProvider(primitives, generation_provider=lambda: 7, sleep=lambda _s: None)
+    published = []
+    provider.bind_deck_semantic_state_publisher(lambda **kwargs: published.append(kwargs))
+
+    result = provider.parkGantry(authority_snapshot=_park_authority(tip_loaded=True))
+
+    assert result["ok"] is False
+    assert result["governance_outcome"] == "park_tip_cleanup_terminal_proof_missing"
+    assert published == []
+    assert all(call[0] != "scriptmoveTo" for call in primitives.calls)
+
+
+def test_scriptmove_production_evidence_aggregates_required_nested_children() -> None:
+    execution = {
+        "ok": True,
+        "execution_results": [
+            {"op": "moveZ", "results": [{"result": _ParkPrimitives._completed("z")}]},
+            {"op": "moveX", "results": [{"result": _ParkPrimitives._completed("x")}]},
+        ],
+    }
+    evidence = oem_serial206_initialization._aggregate_executed_controller_evidence(execution)
+    assert evidence == {
+        "controller_command_acknowledged": True,
+        "controller_completion_verified": True,
+        "hardware_postcondition_verified": True,
+        "required_executed_child_count": 2,
+    }
+    execution["execution_results"][1]["results"][0]["result"]["controller_terminal_state_verified"] = False
+    assert oem_serial206_initialization._aggregate_executed_controller_evidence(execution)["controller_completion_verified"] is False
 
 
 def test_park_gantry_manual_tip_removal_is_governance_failure_without_final_move(monkeypatch) -> None:
