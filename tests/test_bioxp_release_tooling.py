@@ -175,6 +175,30 @@ def test_importer_publishes_verified_full_id_and_receipt_together(tmp_path: Path
     assert not list(tmp_path.glob(".bioxp-import-*"))
 
 
+def test_importer_excludes_mutable_container_runtime_tree(tmp_path: Path):
+    importer = load("bioxp_udocker_image_import_runtime_exclusion", IMPORTER_PATH)
+    inspector = load("bioxp_udocker_image_inspector_runtime_exclusion", INSPECTOR_PATH)
+    _, manifest_path, manifest = source_packet(tmp_path)
+    bundle, image_id = image_bundle(tmp_path, manifest_path, manifest)
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "old-authority").write_bytes(b"old\n")
+    runtime_device = store / "containers" / "active" / "ROOT" / "dev" / "snd" / "seq"
+    runtime_device.parent.mkdir(parents=True)
+    os.mkfifo(runtime_device)
+    receipt_path = tmp_path / "image-inspection.json"
+
+    receipt = importer.import_image(
+        bundle, store, image_id, manifest_path, receipt_path,
+        "2026-08-27T12:00:00Z", INSPECTOR_PATH, os.getuid(),
+    )
+
+    assert (store / "old-authority").read_bytes() == b"old\n"
+    assert not (store / "containers").exists()
+    assert inspector.verify_receipt(receipt, store, manifest_path, image_id, INSPECTOR_PATH) == receipt
+    assert not list(tmp_path.glob(".bioxp-import-*"))
+
+
 def test_sealer_recomputes_every_digest_and_is_canonical(tmp_path: Path):
     inspector = load("bioxp_udocker_image_inspector_seal", INSPECTOR_PATH)
     sealer = load("bioxp_release_seal", SEALER_PATH)

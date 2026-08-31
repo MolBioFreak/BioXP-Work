@@ -114,7 +114,12 @@ def import_image(
     try:
         if old_store:
             _need(store.is_dir() and not store.is_symlink(), "existing store is not a safe directory")
-            shutil.copytree(store, staged_store)
+            store_root = store.resolve(strict=True)
+
+            def ignore_mutable_runtime(source: str, names: list[str]) -> set[str]:
+                return {"containers"} if Path(source).resolve(strict=True) == store_root and "containers" in names else set()
+
+            shutil.copytree(store, staged_store, ignore=ignore_mutable_runtime)
             _make_staging_writable(staged_store)
         else:
             staged_store.mkdir()
