@@ -213,6 +213,7 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("GET", "/motion/axis/{axis}/status")) == 1
     assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
+    assert primitive_routes.count(("POST", "/motion/oem/move_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
     assert meta_ids == {"meta.activate_motion", "meta.initialize_motors", "meta.initialize_motion"}
     motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
@@ -846,6 +847,21 @@ def test_home_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatc
     assert calls == [("home_xy", None)]
     receipt = response.json()
     assert receipt["stage_receipts"] == []
+
+
+def test_move_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    catalog = client.get("/operator/control-catalog").json()
+    action = action_for(catalog, "POST", "/motion/oem/move_xy")
+    assert action["action_id"] == "oem.xy.move_absolute"
+    response = client.post(f"/operator/actions/{action['action_id']}", json={
+        "expected_generation": catalog["ownership_generation"],
+        "idempotency_key": "move-xy-canonical-1234",
+        "inputs": {"x": 123, "y": 456},
+    })
+    assert response.status_code == 200, response.text
+    assert calls == [("move_xy", {"x": 123, "y": 456, "timeout_s": 120.0})]
 
 
 def test_generic_assessment_rejects_provider_owned_z_manual_home_receipt(tmp_path, monkeypatch):
