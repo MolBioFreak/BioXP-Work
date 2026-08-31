@@ -147,7 +147,7 @@ def _runtime_unavailable(component: str) -> dict[str, Any]:
 
 def _retire_legacy_live_z_queue(name: str, req: RuntimeCommandRequest) -> None:
     replacements = {
-        OEMCommandName.ABORT_JOB.value: "/operator/actions/oem.z.abort",
+        OEMCommandName.ABORT_JOB.value: "/operator/actions/oem.abort_all",
         OEMCommandName.WAKE_FROM_PAUSE.value: "/operator/v2/actions/oem.z.resume_after_abort",
     }
     replacement = replacements.get(str(name))
@@ -428,7 +428,7 @@ def runtime_commands_enqueue(req: GenericCommandRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if selected in {OEMCommandName.ABORT_JOB, OEMCommandName.WAKE_FROM_PAUSE}:
         replacement = (
-            "/operator/actions/oem.z.abort"
+            "/operator/actions/oem.abort_all"
             if selected == OEMCommandName.ABORT_JOB
             else "/operator/v2/actions/oem.z.resume_after_abort"
         )
@@ -481,7 +481,7 @@ def runtime_command_abortjob(req: RuntimeCommandRequest):
         status_code=410,
         detail={
             "error": "runtime_command_abortjob_retired",
-            "replacement": "/operator/actions/oem.z.abort",
+            "replacement": "/operator/actions/oem.abort_all",
             "provider_called": False,
             "queue_called": False,
         },

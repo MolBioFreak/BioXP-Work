@@ -734,6 +734,7 @@ class NovoRouter:
     ) -> dict[str, Any]:
         channel = int(channel)
         requested_owner = str(owner_token) if owner_token is not None else None
+        owner_mismatch = False
         with self._completion_lock:
             completion = self._pipette_completions.get(channel)
             archived = False
@@ -747,6 +748,16 @@ class NovoRouter:
                 if interrupted_completion is not None:
                     completion = interrupted_completion
                     archived = True
+                else:
+                    owner_mismatch = completion is not None
+        if owner_mismatch:
+            return {
+                "ok": False,
+                "channel": channel,
+                "outcome": "completion_owner_token_mismatch",
+                "requested_owner_token": requested_owner,
+                "owner_token": completion.owner_token if completion is not None else None,
+            }
         if completion is None:
             return {"ok": False, "channel": channel, "outcome": "completion_not_registered"}
 
