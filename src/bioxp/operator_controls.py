@@ -1088,11 +1088,13 @@ _SERIAL206_PROVIDER_CAPABILITIES = {
 
 _PRIVATE_METHOD_ACTION_IDS = frozenset({
     "meta.home_xy",
-    "oem.xy.home",
     "oem.xy.home_xy",
-    "oem.xy.move_absolute",
     "oem.xy.move_xy",
     "oem.xyz.move_to",
+})
+_CANONICAL_COMPOSITE_ACTION_IDS = frozenset({
+    "oem.xy.home",
+    "oem.xy.move_absolute",
 })
 
 
@@ -1225,12 +1227,19 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "inputs": visible_inputs,
             "required_provider_capability": required_provider_capability,
         }
-        actions.append(alias)
-        dispatch[action_id] = {
+        target = {
             **dict(route),
             "fixed_inputs": fixed,
             "inputs": {row["name"] for row in visible_inputs},
         }
+        if action_id in _CANONICAL_COMPOSITE_ACTION_IDS:
+            generated_action_id = str(provider["action_id"])
+            provider.update(alias)
+            dispatch.pop(generated_action_id, None)
+            dispatch[action_id] = target
+            return
+        actions.append(alias)
+        dispatch[action_id] = target
 
     x_semantic_actions = (
         ("oem.x.status", "/motion/oem/x/status", "X axis controller status", "Provider-owned X terminal telemetry and durable receipt projection. SAP12/SAP13 are observed because recovered OEM X initialization writes neither register.", "ClassMotor GAP1/GAP3/GAP4/GAP5/GAP6/GAP9/GAP10/GAP12/GAP13/GAP205"),
@@ -1801,17 +1810,11 @@ def install_operator_control_plane(
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
-    private_method_by_id = {
-        str(row["action_id"]): row
-        for row in actions
-        if str(row.get("action_id", "")) in _PRIVATE_METHOD_ACTION_IDS
-    }
     actions = [
         row
         for row in actions
         if str(row.get("action_id", "")) not in _PRIVATE_METHOD_ACTION_IDS
     ]
-    command_plane_actions = [*actions, *private_method_by_id.values()]
     by_id = {row["action_id"]: row for row in actions}
     store = OperatorReceiptStore()
     invoke_lock = asyncio.Lock()

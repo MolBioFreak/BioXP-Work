@@ -86,6 +86,11 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         calls.append(("home_xy", None))
         return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
 
+    @app.post("/motion/oem/move_xy")
+    async def move_xy(x: int, y: int, timeout_s: float = 120.0):
+        calls.append(("move_xy", {"x": x, "y": y, "timeout_s": timeout_s}))
+        return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
+
     @app.post("/motion/oem/x/abort")
     async def abort_all():
         calls.append(("abort_all", None))
@@ -157,7 +162,14 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     serial206_state = {
         "bound": True,
         "initialize_motors_live_available": True,
-        "x_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
+        "x_authority": {
+            "state": "referenced",
+            "reference_state": "referenced",
+            "lifecycle": {
+                "state": "referenced_ready",
+                "board_lifecycle_generation_fresh": True,
+            },
+        },
         "z_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
     }
     install_operator_control_plane(
@@ -194,6 +206,9 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
     assert catalog["schema_name"] == "bioxp.operator_control_catalog"
+    action_ids = {row["action_id"] for row in catalog["actions"]}
+    assert {"oem.xy.move_absolute", "oem.xy.home"} <= action_ids
+    assert {"oem.xy.move_xy", "oem.xy.home_xy"}.isdisjoint(action_ids)
     primitive_routes = [(row["informational_method"], row["informational_path"]) for row in catalog["actions"] if row["kind"] == "primitive"]
     assert primitive_routes.count(("GET", "/motion/axis/{axis}/status")) == 1
     assert primitive_routes.count(("POST", "/motion/test/home_axis")) == 1
