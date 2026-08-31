@@ -3298,6 +3298,87 @@ class OperatorCommandStore:
                 )
                 previous = int(step.order)
 
+    def persist_mov_execution_plan(self, command_id: str, plan: Any) -> None:
+        """Persist the WP7 plan and every child before its first provider TX."""
+        self.persist_deck_plan(command_id, plan)
+
+    def terminalize_mov_execution_stage(
+        self,
+        command_id: str,
+        step: Any,
+        *,
+        state: str,
+        result: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+        source_return_disposition: str | None = None,
+    ) -> None:
+        evidence = dict(result or {})
+        if source_return_disposition is not None:
+            evidence["source_return_disposition"] = source_return_disposition
+        if getattr(step, "source_children", ()):
+            evidence["source_children"] = [
+                {"operation": child.operation, "arguments": dict(child.arguments or {})}
+                for child in step.source_children
+            ]
+            evidence["join"] = getattr(step, "join", None)
+        self.terminalize_deck_stage(command_id, step, state=state, result=evidence, reason=reason)
+
+    def publish_mov_execution_transition(self, command_id: str, transition: Mapping[str, Any]) -> int:
+        """Publish one source-ordered WP7 semantic child as its own revision."""
+        with self._transaction() as conn:
+            current = conn.execute(
+                "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("deck semantic state unavailable")
+            before = int(current["semantic_state_revision"])
+            after = before + 1
+            locations = _json_load(current["movable_plate_locations_json"], {})
+            current_location = current["current_location"]
+            current_well = current["current_well"]
+            source_operation = "continuation"
+            if "current_location" in transition:
+                source_operation = "updateLocation"
+                current_location = str(transition["current_location"])
+                current_well = int(transition["current_well"])
+            elif "plate_name" in transition and "plate_location" in transition:
+                source_operation = "updatePlateLocation"
+                locations[str(transition["plate_name"])] = str(transition["plate_location"])
+            elif "plate_pierced" in transition:
+                source_operation = "continuation:plate_pierced"
+            elif "well_pierced" in transition:
+                source_operation = "continuation:well_pierced"
+            provenance = {
+                "source_operation": source_operation,
+                "command_id": str(command_id),
+                "before_revision": before,
+                "after_revision": after,
+                "transition": dict(transition),
+            }
+            conn.execute(
+                """
+                UPDATE operator_plane_deck_semantic_state
+                SET current_location=?,current_well=?,movable_plate_locations_json=?,
+                    semantic_state_revision=?,producer_operation=?,producer_command_id=?,
+                    transition_provenance_json=?,ambiguity_state='none',updated_at=?
+                WHERE singleton=1
+                """,
+                (
+                    current_location, current_well, _canonical(locations), after,
+                    source_operation, str(command_id), _canonical(provenance), _now(),
+                ),
+            )
+            row = conn.execute(
+                """
+                INSERT INTO operator_plane_deck_semantic_transitions(
+                    command_id,source_operation,before_revision,after_revision,transition_json,created_at
+                ) VALUES(?,?,?,?,?,?) RETURNING transition_revision
+                """,
+                (str(command_id), source_operation, before, after, _canonical(provenance), _now()),
+            ).fetchone()
+            assert row is not None
+            return int(row[0])
+
     @staticmethod
     def _deck_stage_evidence(step: Any, result: Mapping[str, Any] | None, *, reason: str | None = None) -> dict[str, Any]:
         row = dict(result or {})

@@ -65,12 +65,12 @@ OEM_PLATE_NAME_ORDINALS: dict[str, int] = {
     "OLIGO_QUANTITATION_PLATE": 13,
     "GENE_QUANTITATION_PLATE": 14,
     "REF_QUANTITATION_PLATE": 15,
-    "ELUTION_PLATE": 16,
+    "WASTE_BIN": 16,
     "ACCUMULATION_PLATE": 17,
     "TIP_HOTEL": 18,
     "TFF_REAGENT_BLOCK": 19,
     "VOLUME_CALCULATION": 20,
-    "WASTE_BIN": 21,
+    "ELUTION_PLATE": 21,
 }
 _OEM_PLATE_ORDINALS = frozenset(OEM_PLATE_NAME_ORDINALS.values())
 _OEM_PLATE_NAMES_BY_ORDINAL = {value: key for key, value in OEM_PLATE_NAME_ORDINALS.items()}
@@ -328,12 +328,312 @@ class DeckMovementExecutor:
             return results
 
 
-def compile_mov_execution(*, current_plate_location: int, destination: int, well: str | int, plate_name: str | None = None) -> dict[str, Any]:
-    well_id = well_id_from_label(well)
-    resolved = {23: 2, 21: 1, 25: 0}.get(destination, destination)
-    if plate_name is not None and current_plate_location < 0:
+@dataclass(frozen=True)
+class ClassMoveToIntent:
+    """Caller-owned ClassMoveTo input; all machine state is deliberately absent."""
+
+    script_line: int
+    plate_name: int | None = None
+    location_id: int | None = None
+    well: str | int | None = None
+    material: str | None = None
+    continuation: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.script_line) is not int:
+            raise ValueError("script_line must be an integer")
+        if (self.plate_name is None) == (self.location_id is None):
+            raise ValueError("exactly one destination is required")
+        if self.plate_name is not None:
+            object.__setattr__(self, "plate_name", canonical_plate_name(self.plate_name))
+        if self.location_id is not None and self.location_id not in {6, 16}:
+            raise ValueError("unexpected plate")
+        if self.material is not None and type(self.material) is not str:
+            raise ValueError("material must be text")
+        if self.continuation is not None and type(self.continuation) is not str:
+            raise ValueError("continuation must be text")
+
+
+@dataclass(frozen=True)
+class MovExecutionChild:
+    operation: str
+    arguments: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class MovExecutionStep:
+    order: int
+    operation: str
+    source_anchor: str
+    arguments: Mapping[str, Any]
+    source_children: tuple[MovExecutionChild, ...] = ()
+    join: str | None = None
+    semantic_transition: Mapping[str, Any] | None = None
+
+    @property
+    def resources(self) -> tuple[str, ...]:
+        return ("x", "y", "z", "g") if self.operation == "scriptmoveTo" else ()
+
+
+@dataclass(frozen=True)
+class MovExecutionPlan:
+    script_line: int
+    source_branch: str
+    authority_digest: str
+    destination: int
+    plate_name: int
+    well_id: int
+    well_source: str
+    steps: tuple[MovExecutionStep, ...]
+    source_hazards: tuple[str, ...]
+    machine_state_updates: Mapping[str, Any]
+    destination_translation: Mapping[str, Any]
+    schema_version: str = "bioxp.oem_mov_execution_plan.v1"
+
+    @property
+    def plan_digest(self) -> str:
+        return _digest(asdict(self))
+
+    # Adapter properties let WP7 reuse the existing immutable deck tables.
+    @property
+    def target(self) -> str:
+        return f"movExecution:{self.plate_name}"
+
+    @property
+    def target_label(self) -> str:
+        return self.target
+
+    @property
+    def resolved_location_id(self) -> int:
+        return self.destination
+
+    @property
+    def catalog_revision(self) -> str:
+        return _digest({"source": "movExecution", "token": "0x0600034C"})
+
+    @property
+    def position_table_sha256(self) -> str:
+        return self.authority_digest if len(self.authority_digest) == 64 else _digest(self.authority_digest)
+
+
+_STATION_TRANSLATIONS = {23: 2, 21: 1, 25: 0}
+_R_PUNCH_PLATES = frozenset({0, 1, 2, 7, 8, 9, 10})
+
+
+def _state_value(state: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in state:
+            return state[name]
+    return default
+
+
+def _plate_location(state: Mapping[str, Any], plate: int) -> int:
+    locations = _state_value(state, "plate_locations", "movable_plate_locations")
+    if not isinstance(locations, Mapping):
         raise ValueError("source_authority_missing:plate_location")
-    return {"schema_version": "bioxp.oem_mov_execution_plan.v1", "current_plate_location": current_plate_location, "destination": resolved, "well_id": well_id, "plate_name": plate_name, "source_operation": "movExecution->scriptmoveTo"}
+    value = locations.get(plate, locations.get(str(plate)))
+    if type(value) is not int or value < 0:
+        raise ValueError("source_authority_missing:plate_location")
+    return value
+
+
+def _pierced(state: Mapping[str, Any], plate: int, well: int | None = None) -> bool:
+    key = "well_pierced" if well is not None else "plate_pierced"
+    values = state.get(key, {})
+    if not isinstance(values, Mapping):
+        return False
+    lookup: Any = (plate, well) if well is not None else plate
+    return bool(values.get(lookup, values.get(str(lookup), False)))
+
+
+def _continuation_step(
+    code: str | None, *, plate: int, destination: int, well: int, state: Mapping[str, Any], order: int
+) -> MovExecutionStep | None:
+    column, row = well % 12, well // 12
+    if code == "r" and plate in _R_PUNCH_PLATES and not _pierced(state, plate):
+        return MovExecutionStep(order, "rPunchFoil", "movExecution:r", {"plate_name": plate}, semantic_transition={"plate_pierced": plate})
+    if code == "w" and int(_state_value(state, "trough_version", "TroughVersion", default=0)) <= 0:
+        base_y = int(_state_value(state, "base_y", default=0))
+        z_low = int(_state_value(state, "z_low", default=0))
+        actions = (
+            ("moveY", base_y + 600), ("moveZ", z_low),
+            ("moveY", base_y - 600), ("moveZ", z_low - 4000),
+            ("moveY", base_y + 600), ("moveZ", z_low - 10000),
+            ("MoveZHome", None),
+        )
+        return MovExecutionStep(order, "troughOscillation", "movExecution:w", {"actions": actions})
+    if code == "h" and not _pierced(state, 2):
+        return MovExecutionStep(order, "hokeypokey", "movExecution:h", {"destination": destination, "column": column, "row": row}, semantic_transition={"plate_pierced": 2})
+    if code == "d" and not _pierced(state, plate, well):
+        return MovExecutionStep(order, "pierceCurrentWell", "movExecution:d", {"destination": destination, "column": column, "row": row, "positionflag": -1}, semantic_transition={"well_pierced": [plate, well]})
+    if code == "t" and plate == 0:
+        return MovExecutionStep(order, "CirclePunch", "movExecution:t", {"plate_name": 0}, semantic_transition={"plate_pierced": 0})
+    return None
+
+
+def compile_mov_execution(
+    intent: ClassMoveToIntent | None = None,
+    machine_state: Mapping[str, Any] | None = None,
+    *,
+    get_next_well: Callable[[int, str, float], int] | None = None,
+    movement_children: tuple[str, ...] = (),
+    # Frozen compatibility-only preview signature. It never reaches execution.
+    current_plate_location: int | None = None,
+    destination: int | None = None,
+    well: str | int | None = None,
+    plate_name: str | None = None,
+) -> MovExecutionPlan | dict[str, Any]:
+    """Compile movExecution from immutable caller intent and server-owned state."""
+    if intent is None:
+        if current_plate_location is None or destination is None or well is None:
+            raise TypeError("intent and machine_state are required")
+        well_id = well_id_from_label(well)
+        resolved = _STATION_TRANSLATIONS.get(destination, destination)
+        if plate_name is not None and current_plate_location < 0:
+            raise ValueError("source_authority_missing:plate_location")
+        return {"schema_version": "bioxp.oem_mov_execution_plan.v1", "current_plate_location": current_plate_location, "destination": resolved, "well_id": well_id, "plate_name": plate_name, "source_operation": "movExecution->scriptmoveTo"}
+    if machine_state is None:
+        raise ValueError("source_authority_missing:machine_state")
+
+    requested_plate = intent.plate_name
+    synthetic = intent.location_id is not None
+    plate = requested_plate if requested_plate is not None else (21 if intent.location_id == 6 else 11)
+    assert plate is not None
+    save_tip = bool(_state_value(machine_state, "save_tip", "m_savetip", default=False))
+    old_well = bool(_state_value(machine_state, "old_well", "m_oldWell", default=False))
+    forced_old = save_tip and requested_plate == 21
+    if forced_old:
+        old_well = True
+
+    authority_digest = str(machine_state.get("authority_digest") or _digest(dict(machine_state)))
+    machine_updates: dict[str, Any] = {"save_tip": False, "old_well": True} if forced_old else {}
+    children = tuple(MovExecutionChild(name) for name in movement_children)
+    if children and tuple(child.operation for child in children) != ("moveX", "moveY"):
+        raise ValueError("parallel movement children must be moveX,moveY")
+
+    if old_well:
+        old_text = str(_state_value(machine_state, "old_well_text", "m_oldWellText", default=""))
+        if len(old_text) < 2 or not old_text[0].isalpha() or not old_text[1:].isdigit():
+            raise ValueError("source_authority_missing:old_well")
+        numeric_enum_value = int(old_text[1:])
+        old_location = _state_value(machine_state, "old_location", "m_old_location")
+        if type(old_location) is not int:
+            raise ValueError("source_authority_missing:old_location")
+        steps = (
+            MovExecutionStep(0, "scriptmoveTo", "movExecution:oldWell", {"destination": old_location, "column": numeric_enum_value, "row": ord(old_text[0].upper()) - 65, "positionflag": 1, "runInParallel": True}, children, "Task.WaitAll" if children else None),
+            MovExecutionStep(1, "updateLocation", "movExecution:oldWell:updateLocation", {"location_id": old_location, "well_id": numeric_enum_value}, semantic_transition={"current_location": old_location, "current_well": numeric_enum_value}),
+        )
+        return MovExecutionPlan(intent.script_line, "old_well_terminal", authority_digest, old_location, plate, numeric_enum_value, "old_well_numeric_enum_parse", steps, ("confirmed_oem_old_well_numeric_enum_parse",), machine_updates, {"kind": "old_well", "translated": False})
+
+    if intent.well is not None:
+        well_id, well_source = well_id_from_label(intent.well), "explicit"
+    elif intent.material is not None:
+        if get_next_well is None:
+            raise ValueError("source_authority_missing:getNextWell")
+        well_id, well_source = get_next_well(2, intent.material, 0.0), "material"
+        if well_id == 96:
+            raise ValueError("Unknow well")
+        if type(well_id) is not int or not 0 <= well_id <= 95:
+            raise ValueError("source_authority_missing:getNextWell")
+    else:
+        well_id, well_source = 0, "default"
+
+    if synthetic:
+        resolved_destination = int(intent.location_id)
+        translation = {"kind": "direct", "source": intent.location_id, "resolved": resolved_destination, "synthetic_plate": plate}
+    else:
+        current = _plate_location(machine_state, plate)
+        resolved_destination = _STATION_TRANSLATIONS.get(current, current)
+        translation = {"kind": "plate", "source": current, "resolved": resolved_destination, "synthetic_plate": None}
+    column, row = well_id % 12, well_id // 12
+    steps_list = [
+        MovExecutionStep(0, "scriptmoveTo", "movExecution:scriptmoveTo", {"destination": resolved_destination, "column": column, "row": row, "positionflag": 1, "runInParallel": True}, children, "Task.WaitAll" if children else None),
+        MovExecutionStep(1, "updateLocation", "movExecution:updateLocation", {"location_id": resolved_destination, "well_id": well_id}, semantic_transition={"current_location": resolved_destination, "current_well": well_id}),
+        MovExecutionStep(2, "updatePlateLocation", "movExecution:updatePlateLocation", {"plate_name": plate, "location_id": resolved_destination}, semantic_transition={"plate_name": plate, "plate_location": resolved_destination}),
+    ]
+    continuation_step = _continuation_step(intent.continuation, plate=plate, destination=resolved_destination, well=well_id, state=machine_state, order=3)
+    if continuation_step is not None:
+        steps_list.append(continuation_step)
+    return MovExecutionPlan(intent.script_line, "normal", authority_digest, resolved_destination, plate, well_id, well_source, tuple(steps_list), (), machine_updates, translation)
+
+
+def _mov_terminal_truth(result: Any) -> bool:
+    return isinstance(result, Mapping) and result.get("ok") is True and result.get("controller_command_acknowledged") is True and result.get("controller_completion_verified") is True
+
+
+def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: Any, command_store: Any) -> dict[str, Any]:
+    """Execute one precompiled movExecution plan without replaying ambiguous I/O."""
+    persist = getattr(command_store, "persist_mov_execution_plan", None)
+    if not callable(persist):
+        raise RuntimeError("mov_execution_plan_store_unavailable")
+    terminalize = getattr(command_store, "terminalize_mov_execution_stage", None)
+    publish = getattr(command_store, "publish_mov_execution_transition", None)
+    lease_factory = getattr(provider, "movement_lease", None)
+    lease = lease_factory() if callable(lease_factory) else nullcontext()
+    with lease:
+        persist(command_id, plan)
+        provider_results: list[Mapping[str, Any]] = []
+        transition_revisions: list[Any] = []
+        for step in plan.steps:
+            method = getattr(provider, step.operation, None)
+            special = step.operation in {"troughOscillation", "pierceCurrentWell"}
+            if not callable(method) and not special:
+                if callable(terminalize):
+                    terminalize(command_id, step, state="failed", reason=f"source_authority_missing:{step.operation}")
+                return {"ok": False, "delivery_attempted": bool(provider_results), "ambiguity_state": "failed", "semantic_state_committed": False}
+            try:
+                if step.operation == "troughOscillation":
+                    child_results: list[Mapping[str, Any]] = []
+                    for operation, value in step.arguments["actions"]:
+                        child_method = getattr(provider, operation, None)
+                        if not callable(child_method):
+                            raise RuntimeError(f"source_authority_missing:{operation}")
+                        child = child_method() if value is None else child_method(value)
+                        if not _mov_terminal_truth(child):
+                            raise DeckExecutionFailure(
+                                f"provider_terminal_proof_missing:{operation}", delivery_attempted=True
+                            )
+                        child_results.append(dict(child))
+                    result = {
+                        "ok": True,
+                        "delivery_attempted": True,
+                        "controller_command_acknowledged": True,
+                        "controller_completion_verified": True,
+                        "source_children": child_results,
+                    }
+                elif step.operation == "pierceCurrentWell":
+                    move = getattr(provider, "scriptmoveTo", None)
+                    if not callable(move):
+                        raise RuntimeError("source_authority_missing:scriptmoveTo")
+                    result = move(**dict(step.arguments))
+                    if not _mov_terminal_truth(result):
+                        raise DeckExecutionFailure(
+                            "provider_terminal_proof_missing:scriptmoveTo", delivery_attempted=True
+                        )
+                else:
+                    assert callable(method)
+                    result = method(**dict(step.arguments))
+            except Exception as exc:
+                if callable(terminalize):
+                    terminalize(command_id, step, state="ambiguous" if step.order == 0 else "failed", reason=f"provider_stage_exception:{type(exc).__name__}")
+                return {"ok": False, "delivery_attempted": step.order == 0 or bool(provider_results), "ambiguity_state": "ambiguous" if step.order == 0 else "recovery_required", "semantic_state_committed": False}
+            result_map = dict(result) if isinstance(result, Mapping) else {"source_return": result}
+            result_map["source_return_disposition"] = "ignored"
+            if step.order == 0 and not _mov_terminal_truth(result):
+                if callable(terminalize):
+                    terminalize(command_id, step, state="ambiguous", result=result_map, reason="provider_terminal_proof_missing")
+                return {"ok": False, "delivery_attempted": True, "controller_command_acknowledged": bool(result_map.get("controller_command_acknowledged")), "controller_completion_verified": False, "semantic_state_committed": False, "ambiguity_state": "ambiguous", "source_return_disposition": "ignored", "provider_results": [result_map]}
+            provider_results.append(result_map)
+            if callable(terminalize):
+                terminalize(command_id, step, state="completed", result=result_map, source_return_disposition="ignored")
+            if step.semantic_transition is not None:
+                if not callable(publish):
+                    return {"ok": False, "delivery_attempted": True, "controller_command_acknowledged": True, "controller_completion_verified": True, "semantic_state_committed": False, "ambiguity_state": "recovery_required", "provider_results": provider_results}
+                try:
+                    transition_revisions.append(publish(command_id, dict(step.semantic_transition)))
+                except Exception:
+                    return {"ok": False, "delivery_attempted": True, "controller_command_acknowledged": True, "controller_completion_verified": True, "semantic_state_committed": False, "ambiguity_state": "recovery_required", "provider_results": provider_results}
+        return {"ok": True, "delivery_attempted": True, "controller_command_acknowledged": True, "controller_completion_verified": True, "semantic_state_committed": True, "ambiguity_state": "none", "script_line": plan.script_line, "source_branch": plan.source_branch, "authority_digest": plan.authority_digest, "plan_digest": plan.plan_digest, "well_source": plan.well_source, "destination_translation": dict(plan.destination_translation), "source_hazards": list(plan.source_hazards), "source_return_disposition": "ignored", "transition_revisions": transition_revisions, "continuation_disposition": plan.steps[-1].operation if len(plan.steps) > (2 if plan.source_branch == "old_well_terminal" else 3) else "noop", "terminal_evidence_truth": True, "provider_results": provider_results}
 
 
 def compile_finite_plate_operation(operation: str, *, source_leaf_available: bool) -> dict[str, Any]:
