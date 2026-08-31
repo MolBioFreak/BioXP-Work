@@ -675,6 +675,18 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
         "residual_policy": "retain_completed_children_without_rollback",
         **metadata,
     }
+    policy = str(plan.get("exception_policy") or "propagate")
+    finally_names = set(plan.get("finally_children") or [])
+    for child in children:
+        if child["operation"] in finally_names:
+            child["exception_policy"] = "finally"
+        elif child.get("exception_policy") == "propagate":
+            child["exception_policy"] = policy
+        mutation = dict(child.get("state_mutation") or {})
+        child["state_transition_timing"] = (
+            "terminal_source_point" if child["operation"] == "updatePlateLocation"
+            else "immediate_after_source_call" if mutation else "none"
+        )
     plan["plan_digest"] = _digest(plan)
     return plan
 
@@ -692,8 +704,10 @@ def compile_finite_plate_operation(
     children: list[dict[str, Any]] = []
 
     if operation == "park_gantry":
+        _wp8_child(children, "parkGantry", arguments={"rehome": bool(inputs.get("rehome", False))}, ignored_return=True)
         return _wp8_plan(operation, children, provider_method="parkGantry")
     if operation == "waste_sequence":
+        _wp8_child(children, "cleanupWastePrelude")
         return _wp8_plan(operation, children, provider_method="cleanupWastePrelude")
 
     if operation == "catch_plate":
@@ -900,6 +914,80 @@ def execute_finite_plate_operation(
         "residual_state": residual,
         "background_pending": any(not bool(row.get("awaited", True)) for row in children),
     }
+
+
+def make_wp8_operation_executor(
+    *, provider_getter: Callable[[], Any], command_store: Any,
+) -> Callable[..., dict[str, Any]]:
+    """Bind finite WP8 plans to the provider lease and append-only child ledger."""
+    def execute(*, command_id: str, plan: Mapping[str, Any]) -> dict[str, Any]:
+        provider = provider_getter()
+        if provider is None:
+            raise RuntimeError("canonical_deck_provider_unavailable")
+        required = (
+            getattr(command_store, "persist_wp8_plan", None),
+            getattr(command_store, "terminalize_wp8_child", None),
+            getattr(command_store, "persist_wp8_state_mutation", None),
+        )
+        if not all(callable(method) for method in required):
+            raise RuntimeError("wp8_durable_store_not_bound")
+        lease_factory = getattr(provider, "movement_lease", None)
+        lease = lease_factory() if callable(lease_factory) else nullcontext()
+        with lease:
+            stamp_reader = getattr(provider, "deck_owner_authority_stamps", None)
+            stamps = dict(stamp_reader()) if callable(stamp_reader) else {}
+            command_store.persist_wp8_plan(command_id, plan, authority_stamps=stamps)
+
+            def invoke(child: Mapping[str, Any]) -> Any:
+                order = int(child["order"])
+                dispatch = getattr(provider, "execute_wp8_child", None)
+                direct = getattr(provider, str(child["operation"]), None)
+                try:
+                    if callable(dispatch):
+                        result = dispatch(child)
+                    elif callable(direct):
+                        result = direct(**dict(child.get("arguments") or {}))
+                    else:
+                        raise RuntimeError(f"source_authority_missing:{child['operation']}")
+                except Exception as exc:
+                    command_store.terminalize_wp8_child(
+                        command_id, order, state="ambiguous",
+                        result={"exception_type": type(exc).__name__, "exception": str(exc)},
+                    )
+                    raise
+                if not bool(child.get("awaited", True)):
+                    background = dict(result) if isinstance(result, Mapping) else {"source_return": result}
+                    background.setdefault("background_task_id", _digest({
+                        "command_id": str(command_id), "child_order": order,
+                        "operation": str(child["operation"]), "plan_digest": str(plan["plan_digest"]),
+                    }))
+                    background.setdefault("background_task_state", "running_unawaited")
+                    result = background
+                command_store.terminalize_wp8_child(command_id, order, state="completed", result=result)
+                mutation = dict(child.get("state_mutation") or {})
+                if mutation:
+                    command_store.persist_wp8_state_mutation(
+                        command_id, order, mutation, authority_stamps=stamps,
+                    )
+                return result
+
+            try:
+                result = execute_finite_plate_operation(plan, invoke)
+            except Exception as exc:
+                failure = {
+                    "ok": False, "exception_suppressed": False,
+                    "exception_type": type(exc).__name__, "exception": str(exc),
+                    "background_pending": any(not bool(row.get("awaited", True)) for row in plan.get("children", [])),
+                }
+                finalize = getattr(command_store, "finalize_wp8_operation", None)
+                if callable(finalize):
+                    finalize(command_id, failure)
+                raise
+            finalize = getattr(command_store, "finalize_wp8_operation", None)
+            if callable(finalize):
+                finalize(command_id, result)
+            return result
+    return execute
 
 
 def make_deck_command_executor(

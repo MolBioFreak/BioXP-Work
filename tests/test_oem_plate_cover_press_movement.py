@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import json
+import sqlite3
+
 import pytest
 
 from bioxp import oem_deck_movement
+from bioxp.operator_command_plane import OperatorCommandStore
 
 
 def ops(plan):
@@ -150,3 +155,67 @@ def test_executor_suppresses_catch_failure_runs_finally_and_retains_completed() 
 def test_absent_controller_leaf_fails_closed_explicitly() -> None:
     with pytest.raises(RuntimeError, match="source_authority_missing:press_plate"):
         oem_deck_movement.compile_finite_plate_operation("press_plate", source_leaf_available=False)
+
+
+class _ProductionWp8Fake:
+    def __init__(self, fail_at=None):
+        self.calls = []
+        self.fail_at = fail_at
+
+    def movement_lease(self):
+        return nullcontext()
+
+    def deck_owner_authority_stamps(self):
+        return {"ownership_generation": 7, "board_epoch_4": 11, "board_epoch_5": 12}
+
+    def execute_wp8_child(self, child):
+        self.calls.append(child["operation"])
+        if child["operation"] == self.fail_at:
+            raise RuntimeError("injected provider failure")
+        return {"ok": True, "provider_call": child["operation"]}
+
+
+def test_production_executor_calls_provider_and_terminalizes_every_child(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_OPERATOR_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_RUNTIME_STATE_ROOT", raising=False)
+    store = OperatorCommandStore(tmp_path)
+    provider = _ProductionWp8Fake()
+    plan = oem_deck_movement.compile_finite_plate_operation(
+        "send_z_and_gripper_home", source_leaf_available=True, run_in_parallel=False,
+        gripper_position=0, closed_position=3000,
+    )
+    result = oem_deck_movement.make_wp8_operation_executor(
+        provider_getter=lambda: provider, command_store=store,
+    )(command_id="wp8-production-success", plan=plan)
+    evidence = store.wp8_operation_evidence("wp8-production-success")
+    assert result["ok"] is True
+    assert provider.calls == ops(plan)
+    assert [row["terminal_state"] for row in evidence["children"]] == ["completed"] * len(plan["children"])
+    assert all(json.loads(row["terminal_evidence_json"])["result"]["provider_call"] == row["operation"] for row in evidence["children"])
+    store.connection.close()
+
+
+def test_production_executor_retains_terminal_rows_and_residual_after_failure(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("BIOXP_OEM_RUNTIME_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_OPERATOR_STATE_ROOT", raising=False)
+    monkeypatch.delenv("BIOXP_RUNTIME_STATE_ROOT", raising=False)
+    store = OperatorCommandStore(tmp_path)
+    provider = _ProductionWp8Fake(fail_at="moveZ")
+    plan = oem_deck_movement.compile_finite_plate_operation(
+        "catch_plate", source_leaf_available=True, plate=1, plate_location=1,
+        thermal_door_open=False, gripper_version=1, run_in_parallel=True,
+    )
+    result = oem_deck_movement.make_wp8_operation_executor(
+        provider_getter=lambda: provider, command_store=store,
+    )(command_id="wp8-production-failure", plan=plan)
+    evidence = store.wp8_operation_evidence("wp8-production-failure")
+    by_op = {row["operation"]: row for row in evidence["children"]}
+    assert result["exception_suppressed"] is True
+    assert by_op["updateLocation"]["terminal_state"] == "completed"
+    assert by_op["moveZ"]["terminal_state"] == "ambiguous"
+    assert by_op["updatePlateLocation"]["terminal_state"] == "planned"
+    assert json.loads(evidence["state_transitions"][0]["transition_json"])["current_location"] == 21
+    with pytest.raises(sqlite3.DatabaseError):
+        store.connection.execute("DELETE FROM operator_plane_wp8_children WHERE command_id=?", ("wp8-production-failure",))
+    store.connection.close()

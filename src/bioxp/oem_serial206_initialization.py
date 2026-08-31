@@ -27,6 +27,7 @@ from .oem_deck_movement import (
     OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
     canonical_movable_object_locations,
     canonical_plate_name,
+    plate_name_for_storage,
 )
 from .oem_serial206_initialization_contract import (
     OEM_INITIALIZE_MOTORS_STAGE_KEYS,
@@ -8402,9 +8403,61 @@ class Serial206OemInitializationProvider:
             result, source_anchor="ClassControlInterface.btnLOC1_Click:1932-1945->moveZ:4254-4266"
         )
 
+    def execute_wp8_child(self, child: Mapping[str, Any]) -> Any:
+        """Execute one pre-persisted finite WP8 child through source-owned primitives."""
+        operation = str(child.get("operation") or "")
+        arguments = dict(child.get("arguments") or {})
+        if not operation:
+            raise ValueError("wp8 child operation is required")
+        primitive = getattr(self.primitives, operation, None)
+        if callable(primitive):
+            return primitive(**arguments)
+        if operation == "Sleep":
+            return self.primitives.sleep(int(arguments["milliseconds"]))
+        if operation in {"LoadGantry", "LoadGantryNull"}:
+            plate = None if operation == "LoadGantryNull" else arguments.get("plate")
+            return self.load_gantry(plate_on_gantry=plate)
+        if operation == "parkGantry":
+            return self.parkGantry(rehome=bool(arguments.get("rehome", False)))
+        if operation == "updateLocation":
+            from .oem_compat.pathing import LOCATION_ID_TO_NAME
+            destination = int(arguments["destination"])
+            publisher = getattr(self, "_deck_semantic_state_publisher", None)
+            if not callable(publisher) or destination not in LOCATION_ID_TO_NAME:
+                raise RuntimeError("source_authority_missing:updateLocation")
+            return publisher(
+                source_operation="updateLocation",
+                source_command_id=f"wp8:updateLocation:{time.time_ns()}",
+                updates={"current_location": LOCATION_ID_TO_NAME[destination], "current_well": int(arguments.get("well", 0))},
+                **self.deck_owner_authority_stamps(),
+            )
+        if operation == "updatePlateLocation":
+            plate = canonical_plate_name(arguments.get("plate"))
+            location = int(arguments["location"])
+            if plate is None:
+                raise RuntimeError("source_authority_missing:updatePlateLocation:plate")
+            state = self._canonical_deck_semantic_state()
+            movable = dict(state.get("movable_plate_locations") or {})
+            from .oem_compat.pathing import LOCATION_ID_TO_NAME
+            name = plate_name_for_storage(plate)
+            if name is None or location not in LOCATION_ID_TO_NAME:
+                raise RuntimeError("source_authority_missing:updatePlateLocation:location")
+            movable[name] = LOCATION_ID_TO_NAME[location]
+            publisher = getattr(self, "_deck_semantic_state_publisher", None)
+            if not callable(publisher):
+                raise RuntimeError("source_authority_missing:updatePlateLocation")
+            return publisher(
+                source_operation="updatePlateLocation",
+                source_command_id=f"wp8:updatePlateLocation:{time.time_ns()}",
+                updates={"movable_plate_locations": movable},
+                **self.deck_owner_authority_stamps(),
+            )
+        raise RuntimeError(f"source_authority_missing:{operation}")
+
     def parkGantry(
         self,
         *,
+        rehome: bool = False,
         authority_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute raw-IL ``ControlLib.parkGantry(false)`` with governed early return."""

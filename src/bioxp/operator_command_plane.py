@@ -1669,6 +1669,36 @@ class OperatorCommandStore:
                 ) WITHOUT ROWID;
                 CREATE INDEX IF NOT EXISTS operator_plane_deck_stages_terminal_idx
                     ON operator_plane_deck_stages(command_id,terminal_state,stage_order);
+                CREATE TABLE IF NOT EXISTS operator_plane_wp8_operations (
+                    command_id TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
+                    authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64),
+                    authority_stamps_json TEXT NOT NULL CHECK(json_valid(authority_stamps_json)),
+                    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)),
+                    terminal_result_json TEXT CHECK(terminal_result_json IS NULL OR json_valid(terminal_result_json)),
+                    created_at REAL NOT NULL,
+                    finished_at REAL
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS operator_plane_wp8_children (
+                    command_id TEXT NOT NULL REFERENCES operator_plane_wp8_operations(command_id) ON DELETE RESTRICT,
+                    child_order INTEGER NOT NULL CHECK(child_order>=0), operation TEXT NOT NULL,
+                    dependency_order_json TEXT NOT NULL CHECK(json_valid(dependency_order_json)),
+                    arguments_json TEXT NOT NULL CHECK(json_valid(arguments_json)),
+                    ignored_return INTEGER NOT NULL CHECK(ignored_return IN (0,1)),
+                    awaited INTEGER NOT NULL CHECK(awaited IN (0,1)), exception_policy TEXT NOT NULL,
+                    state_mutation_json TEXT NOT NULL CHECK(json_valid(state_mutation_json)),
+                    terminal_state TEXT NOT NULL DEFAULT 'planned' CHECK(terminal_state IN ('planned','completed','failed','ambiguous')),
+                    terminal_evidence_json TEXT CHECK(terminal_evidence_json IS NULL OR json_valid(terminal_evidence_json)),
+                    PRIMARY KEY(command_id,child_order)
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS operator_plane_wp8_state_transitions (
+                    command_id TEXT NOT NULL, child_order INTEGER NOT NULL,
+                    transition_json TEXT NOT NULL CHECK(json_valid(transition_json)),
+                    authority_stamps_json TEXT NOT NULL CHECK(json_valid(authority_stamps_json)), created_at REAL NOT NULL,
+                    PRIMARY KEY(command_id,child_order),
+                    FOREIGN KEY(command_id,child_order) REFERENCES operator_plane_wp8_children(command_id,child_order) ON DELETE RESTRICT
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS operator_plane_deck_semantic_state (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     current_location TEXT,
@@ -1746,6 +1776,29 @@ class OperatorCommandStore:
                     singleton,movable_plate_locations_json,pseudo_z_home,semantic_state_revision,
                     transition_provenance_json,updated_at
                 ) VALUES(1,'{}',65000,0,'{}',strftime('%s','now'));
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_guard_insert
+                BEFORE INSERT ON operator_plane_wp8_operations WHEN authority_write_allowed()<>1
+                BEGIN SELECT RAISE(ABORT,'wp8 writer is not authoritative'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_no_delete
+                BEFORE DELETE ON operator_plane_wp8_operations BEGIN SELECT RAISE(ABORT,'wp8 plan is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_identity_immutable
+                BEFORE UPDATE ON operator_plane_wp8_operations WHEN authority_write_allowed()<>1 OR NEW.command_id IS NOT OLD.command_id OR NEW.operation IS NOT OLD.operation OR NEW.plan_digest IS NOT OLD.plan_digest OR NEW.authority_digest IS NOT OLD.authority_digest OR NEW.authority_stamps_json IS NOT OLD.authority_stamps_json OR NEW.plan_json IS NOT OLD.plan_json
+                BEGIN SELECT RAISE(ABORT,'wp8 plan identity is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_guard_insert
+                BEFORE INSERT ON operator_plane_wp8_children WHEN authority_write_allowed()<>1 OR NEW.child_order<>(SELECT COUNT(*) FROM operator_plane_wp8_children WHERE command_id=NEW.command_id) OR NEW.dependency_order_json<>CASE WHEN NEW.child_order=0 THEN '[]' ELSE '['||(NEW.child_order-1)||']' END
+                BEGIN SELECT RAISE(ABORT,'wp8 child order is not authoritative'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_terminal_immutable
+                BEFORE UPDATE ON operator_plane_wp8_children WHEN authority_write_allowed()<>1 OR OLD.terminal_state<>'planned' OR NEW.command_id IS NOT OLD.command_id OR NEW.child_order IS NOT OLD.child_order OR NEW.operation IS NOT OLD.operation OR NEW.dependency_order_json IS NOT OLD.dependency_order_json OR NEW.arguments_json IS NOT OLD.arguments_json OR NEW.ignored_return IS NOT OLD.ignored_return OR NEW.awaited IS NOT OLD.awaited OR NEW.exception_policy IS NOT OLD.exception_policy OR NEW.state_mutation_json IS NOT OLD.state_mutation_json
+                BEGIN SELECT RAISE(ABORT,'wp8 child evidence is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_no_delete
+                BEFORE DELETE ON operator_plane_wp8_children BEGIN SELECT RAISE(ABORT,'wp8 children are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_guard_insert
+                BEFORE INSERT ON operator_plane_wp8_state_transitions WHEN authority_write_allowed()<>1 OR NOT EXISTS(SELECT 1 FROM operator_plane_wp8_children c WHERE c.command_id=NEW.command_id AND c.child_order=NEW.child_order AND c.terminal_state='completed' AND c.state_mutation_json=NEW.transition_json)
+                BEGIN SELECT RAISE(ABORT,'wp8 state transition is not terminal-child-owned'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_no_update
+                BEFORE UPDATE ON operator_plane_wp8_state_transitions BEGIN SELECT RAISE(ABORT,'wp8 state transitions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_no_delete
+                BEFORE DELETE ON operator_plane_wp8_state_transitions BEGIN SELECT RAISE(ABORT,'wp8 state transitions are immutable'); END;
                 COMMIT;
                 """
             )
@@ -3265,6 +3318,65 @@ class OperatorCommandStore:
             ).fetchone()
             assert row is not None
             return int(row[0])
+
+    def persist_wp8_plan(
+        self, command_id: str, plan: Mapping[str, Any], *, authority_stamps: Mapping[str, Any],
+    ) -> None:
+        children = list(plan.get("children") or [])
+        if str(plan.get("plan_digest") or "") != _digest({key: value for key, value in plan.items() if key != "plan_digest"}):
+            raise ValueError("wp8 plan digest mismatch")
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO operator_plane_wp8_operations(command_id,operation,plan_digest,authority_digest,authority_stamps_json,plan_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (str(command_id), str(plan["operation"]), str(plan["plan_digest"]), str(plan["authority_digest"]), _canonical(dict(authority_stamps)), _canonical(dict(plan)), _now()),
+            )
+            for expected, child in enumerate(children):
+                if int(child.get("order", -1)) != expected or list(child.get("depends_on") or []) != ([] if expected == 0 else [expected - 1]):
+                    raise ValueError("wp8 child order or dependency mismatch")
+                conn.execute(
+                    "INSERT INTO operator_plane_wp8_children(command_id,child_order,operation,dependency_order_json,arguments_json,ignored_return,awaited,exception_policy,state_mutation_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(command_id), expected, str(child["operation"]), _canonical(list(child["depends_on"])), _canonical(dict(child.get("arguments") or {})), int(bool(child.get("ignored_return"))), int(bool(child.get("awaited", True))), str(child.get("exception_policy") or "propagate"), _canonical(dict(child.get("state_mutation") or {}))),
+                )
+
+    def terminalize_wp8_child(self, command_id: str, child_order: int, *, state: str, result: Any) -> None:
+        if state not in {"completed", "failed", "ambiguous"}:
+            raise ValueError("invalid WP8 terminal state")
+        evidence = {"result": _bounded_json(result, 131072), "terminalized_at": _now()}
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE operator_plane_wp8_children SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND child_order=? AND terminal_state='planned'",
+                (state, _canonical(evidence), str(command_id), int(child_order)),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("wp8 child already terminal or absent")
+
+    def persist_wp8_state_mutation(self, command_id: str, child_order: int, mutation: Mapping[str, Any], *, authority_stamps: Mapping[str, Any]) -> None:
+        with self._transaction() as conn:
+            row = conn.execute("SELECT terminal_state,state_mutation_json FROM operator_plane_wp8_children WHERE command_id=? AND child_order=?", (str(command_id), int(child_order))).fetchone()
+            encoded = _canonical(dict(mutation))
+            if row is None or str(row["terminal_state"]) != "completed" or str(row["state_mutation_json"]) != encoded:
+                raise RuntimeError("wp8 state transition is not terminal-child-owned")
+            conn.execute(
+                "INSERT INTO operator_plane_wp8_state_transitions(command_id,child_order,transition_json,authority_stamps_json,created_at) VALUES(?,?,?,?,?)",
+                (str(command_id), int(child_order), encoded, _canonical(dict(authority_stamps)), _now()),
+            )
+
+    def finalize_wp8_operation(self, command_id: str, result: Mapping[str, Any]) -> None:
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE operator_plane_wp8_operations SET terminal_result_json=?,finished_at=? WHERE command_id=? AND terminal_result_json IS NULL",
+                (_canonical(dict(result)), _now(), str(command_id)),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("wp8 operation already terminal or absent")
+
+    def wp8_operation_evidence(self, command_id: str) -> dict[str, Any]:
+        operation = self.connection.execute("SELECT * FROM operator_plane_wp8_operations WHERE command_id=?", (str(command_id),)).fetchone()
+        if operation is None:
+            raise KeyError(command_id)
+        children = self.connection.execute("SELECT * FROM operator_plane_wp8_children WHERE command_id=? ORDER BY child_order", (str(command_id),)).fetchall()
+        transitions = self.connection.execute("SELECT * FROM operator_plane_wp8_state_transitions WHERE command_id=? ORDER BY child_order", (str(command_id),)).fetchall()
+        return {"operation": dict(operation), "children": [dict(row) for row in children], "state_transitions": [dict(row) for row in transitions]}
 
     def persist_deck_plan(self, command_id: str, plan: Any) -> None:
         anchors = [str(step.source_anchor) for step in plan.steps]
