@@ -37,6 +37,12 @@ class OptionalNestedBody(BaseModel):
     stage_approval: StageApproval | None = None
 
 
+class RecoveryBody(BaseModel):
+    run_homing: bool = False
+    operator_ack: str
+    operator_reason: str
+
+
 def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_ROOT", str(tmp_path))
     monkeypatch.setattr(operator_controls, "current_release_identity", lambda: {
@@ -68,6 +74,16 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
             return override
         return {"ok": True, "controller_acknowledged": True, "stages": [{"stage_id": "home", "status": "passed"}]}
 
+    @app.post("/motion/oem/prepare_without_motion")
+    async def prepare_without_motion():
+        calls.append(("prepare_without_motion", None))
+        return {"ok": True, "physical_motion": False, "homing_performed": False}
+
+    @app.post("/motion/arm/strict_startup")
+    async def recover_motion_non_homing(body: RecoveryBody):
+        calls.append(("recover_motion_non_homing", body.model_dump()))
+        return {"ok": True, "physical_motion": False, "homing_performed": False}
+
     @app.post("/motion/oem/x/move_steps")
     async def x_move_steps(steps: int, wait_timeout_s: float = 5.0):
         base = getattr(app.state, "operator_test_x_position", 0)
@@ -81,6 +97,11 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
             return override
         return {"ok": True, "controller_acknowledged": True, "status": "completed", "physical_effect_verified": False}
 
+    @app.post("/motion/oem/manual/home")
+    async def manual_home(axis: str):
+        calls.append(("manual_home", {"axis": axis}))
+        return {"ok": True, "controller_acknowledged": True, "physical_effect_verified": False}
+
     @app.post("/motion/oem/home_xy")
     async def home_xy():
         calls.append(("home_xy", None))
@@ -90,6 +111,11 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
     async def move_xy(x: int, y: int, timeout_s: float = 120.0):
         calls.append(("move_xy", {"x": x, "y": y, "timeout_s": timeout_s}))
         return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
+
+    @app.post("/motion/oem/x/internal/enable_xy")
+    async def enable_xy_internal():
+        calls.append(("enable_xy_internal", None))
+        return {"ok": True}
 
     @app.post("/motion/oem/x/abort")
     async def abort_all():
@@ -215,7 +241,12 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     assert primitive_routes.count(("POST", "/motion/oem/home_xy")) == 1
     assert primitive_routes.count(("POST", "/motion/oem/move_xy")) == 1
     meta_ids = {row["action_id"] for row in catalog["actions"] if row["kind"] == "meta"}
-    assert meta_ids == {"meta.activate_motion", "meta.initialize_motors", "meta.initialize_motion"}
+    assert meta_ids == {
+        "meta.activate_motion",
+        "meta.recover_motion_non_homing",
+        "meta.initialize_motors",
+        "meta.initialize_motion",
+    }
     motors = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motors")
     motion = next(row for row in catalog["actions"] if row["action_id"] == "meta.initialize_motion")
     assert motors["available"] is False
@@ -230,6 +261,214 @@ def test_catalog_has_every_exact_route_once_and_distinct_meta_actions(tmp_path, 
     )
     optional_nested = action_for(catalog, "POST", "/motion/optional-nested")
     assert next(row for row in optional_nested["inputs"] if row["name"] == "stage_approval")["default"] is None
+
+
+def test_v2_catalog_entrypoints_publish_the_same_canonical_action_set(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+
+    direct = client.get("/operator/v2/control-catalog")
+    negotiated = client.get(
+        "/operator/control-catalog",
+        params={"schema_version": "bioxp.operator_control_catalog.v2"},
+    )
+
+    assert direct.status_code == 200
+    assert negotiated.status_code == 200
+    direct_ids = [row["action_id"] for row in direct.json()["actions"]]
+    negotiated_ids = [row["action_id"] for row in negotiated.json()["actions"]]
+    assert negotiated_ids == direct_ids
+
+
+def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+
+    catalog = client.get("/operator/v2/control-catalog").json()
+    by_id = {row["action_id"]: row for row in catalog["actions"]}
+    assert list(row["action_id"] for row in catalog["actions"]).count("meta.activate_motion") == 1
+    assert list(row["action_id"] for row in catalog["actions"]).count("meta.recover_motion_non_homing") == 1
+    assert "oem.xy.enable" not in by_id
+    assert by_id["meta.activate_motion"]["enabled"] is True
+    assert by_id["meta.recover_motion_non_homing"]["enabled"] is False
+    assert by_id["meta.recover_motion_non_homing"]["disabled_reason"] == "Non-homing recovery is not currently required."
+
+    generation = catalog["dashboard"]["ownership_generation"]
+    activation = client.post(
+        "/operator/v2/actions/meta.activate_motion",
+        json={
+            "schema_version": "bioxp.operator_action_request.v2",
+            "expected_ownership_generation": generation,
+            "expected_board_epoch_by_board": {},
+            "idempotency_key": "activate-motion-v2-123456",
+            "inputs": {},
+        },
+    )
+    assert activation.status_code == 200, activation.text
+    assert calls == [("prepare_without_motion", None)]
+
+    app.state.operator_test_maintenance.update({
+        "motion_blocked": True,
+        "recovery_required": True,
+        "block_reason": "injected maintenance transition",
+    })
+    recovery_catalog = client.get("/operator/v2/control-catalog").json()
+    recovery_action = next(
+        row for row in recovery_catalog["actions"]
+        if row["action_id"] == "meta.recover_motion_non_homing"
+    )
+    assert recovery_action["enabled"] is True
+    recovery = client.post(
+        "/operator/v2/actions/meta.recover_motion_non_homing",
+        json={
+            "schema_version": "bioxp.operator_action_request.v2",
+            "expected_ownership_generation": generation,
+            "expected_board_epoch_by_board": {},
+            "idempotency_key": "recover-motion-v2-123456",
+            "inputs": {},
+        },
+    )
+    assert recovery.status_code == 200, recovery.text
+    assert calls[-1] == (
+        "recover_motion_non_homing",
+        {
+            "run_homing": False,
+            "operator_ack": "RECOVER_MOTION",
+            "operator_reason": "operator control invocation",
+        },
+    )
+
+
+def test_v2_failed_receipt_preserves_bounded_home_z_provider_detail(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+
+    async def rejected_home(*_args, **_kwargs):
+        return 409, {
+            "detail": {
+                "result": {
+                    "failure": "z_manual_home_evidence_not_verified",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "physical_effect_verified": False,
+                    "home": {
+                        "home": {
+                            "axis": "z",
+                            "board": 4,
+                            "motor": 1,
+                            "failure": "board_not_initialized",
+                            "source_return_code": 1,
+                            "physical_effect_verified": False,
+                        },
+                    },
+                },
+                "z_lifecycle": {
+                    "state": "failed_latched",
+                    "reference_state": "desynced",
+                },
+            },
+        }
+
+    monkeypatch.setattr(operator_controls, "_dispatch_asgi", rejected_home)
+    catalog = client.get("/operator/v2/control-catalog").json()
+    response = client.post(
+        "/operator/v2/actions/oem.z.manual_home",
+        json={
+            "schema_version": "bioxp.operator_action_request.v2",
+            "expected_ownership_generation": catalog["dashboard"]["ownership_generation"],
+            "expected_board_epoch_by_board": {},
+            "idempotency_key": "home-z-provider-detail-v2",
+            "inputs": {},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    expected_error = {
+        "code": "robot route returned HTTP 409",
+        "message": "robot route returned HTTP 409",
+        "retryable": False,
+        "detail": {
+            "provider_failure": "z_manual_home_evidence_not_verified",
+            "failure": "board_not_initialized",
+            "axis": "z",
+            "board": 4,
+            "motor": 1,
+            "source_return_code": 1,
+            "controller_acknowledged": False,
+            "controller_terminal_state_verified": False,
+            "physical_effect_verified": False,
+            "lifecycle_state": "failed_latched",
+            "reference_state": "desynced",
+        },
+    }
+    assert response.json()["error"] == expected_error
+    command_id = response.json()["command_id"]
+    polled = client.get(f"/operator/v2/actions/receipts/{command_id}")
+    assert polled.status_code == 200, polled.text
+    assert polled.json()["error"] == expected_error
+
+
+def test_v2_canonical_discovery_is_semantic_instead_of_a_handwritten_allowlist():
+    assert not hasattr(operator_controls, "ALLOWED_ACTIONS")
+    assert operator_controls._is_v2_canonical_action({
+        "action_id": "oem.future.literal_oem_capability",
+        "kind": "semantic",
+        "category": "future-oem",
+    }) is True
+    assert operator_controls._is_v2_canonical_action({
+        "action_id": "meta.future_recovery",
+        "kind": "meta",
+        "category": "recovery",
+    }) is True
+    assert operator_controls._is_v2_canonical_action({
+        "action_id": "meta.internal_initialization",
+        "kind": "meta",
+        "category": "initialization",
+    }) is False
+    for action in (
+        {
+            "action_id": "oem.xy.enable",
+            "kind": "semantic",
+            "category": "motion",
+            "informational_path": "/motion/oem/x/internal/enable_xy",
+        },
+        {
+            "action_id": "oem.y.internal.set_sg_threshold",
+            "kind": "semantic",
+            "category": "motion",
+            "informational_path": "/motion/oem/y/internal/set_sg_threshold",
+        },
+        {
+            "action_id": "oem.xy.home_xy",
+            "kind": "semantic",
+            "category": "motion",
+            "informational_path": "/motion/oem/home_xy",
+        },
+    ):
+        assert operator_controls._is_v2_canonical_action(action) is False
+
+
+def test_v2_canonical_discovery_deduplicates_generic_routes_without_hiding_fixed_only_capabilities():
+    actions = [
+        {"action_id": "oem.z.control", "informational_path": "/motion/oem/z/control"},
+        {"action_id": "oem.z.set_max_speed", "informational_path": "/motion/oem/z/control"},
+        {"action_id": "oem.z.restore_original_speed", "informational_path": "/motion/oem/z/control"},
+        {"action_id": "oem.x.home", "informational_path": "/motion/oem/manual/home"},
+        {"action_id": "oem.y.home", "informational_path": "/motion/oem/manual/home"},
+    ]
+    dispatch = {
+        "oem.z.control": {"fixed_inputs": {}},
+        "oem.z.set_max_speed": {"fixed_inputs": {"operation": "set_max_speed"}},
+        "oem.z.restore_original_speed": {"fixed_inputs": {"operation": "restore_original_speed"}},
+        "oem.x.home": {"fixed_inputs": {"axis": "x"}},
+        "oem.y.home": {"fixed_inputs": {"axis": "y"}},
+    }
+
+    assert operator_controls._v2_canonical_action_ids(actions, dispatch) == frozenset({
+        "oem.z.control",
+        "oem.x.home",
+        "oem.y.home",
+    })
 
 
 def test_operator_ack_is_not_user_input_and_is_supplied_internally(tmp_path, monkeypatch):

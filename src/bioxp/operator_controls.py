@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from contextvars import ContextVar
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
@@ -40,16 +40,51 @@ from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPEC
 CATALOG_SCHEMA = "bioxp.operator_control_catalog.v1"
 RECEIPT_SCHEMA = "bioxp.operator_action_receipt.v1"
 HISTORY_SCHEMA = "bioxp.operator_action_history.v1"
-ALLOWED_ACTIONS = frozenset({
-    "oem.z.manual_home", "oem.z.clear", "oem.z.move_steps", "oem.z.move_absolute",
-    "oem.x.manual_panel_home", "oem.x.move_steps", "oem.x.move_absolute",
-    "oem.y.manual_panel_home", "oem.y.move_steps", "oem.y.move_absolute",
-    "oem.xy.move_absolute", "oem.xy.home",
-})
 INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all",
 })
-CANONICAL_ACTIONS = ALLOWED_ACTIONS | INTERRUPT_ACTIONS
+_CANONICAL_META_CATEGORIES = frozenset({"activation", "recovery"})
+
+
+def _is_v2_canonical_action(action: Mapping[str, Any]) -> bool:
+    action_id = str(action.get("action_id") or "")
+    if action_id.startswith("oem."):
+        informational_path = str(action.get("informational_path") or "")
+        return (
+            action_id not in _PRIVATE_METHOD_ACTION_IDS
+            and "/internal/" not in informational_path
+        )
+    return (
+        str(action.get("kind") or "") == "meta"
+        and str(action.get("category") or "") in _CANONICAL_META_CATEGORIES
+    )
+
+
+def _v2_canonical_action_ids(
+    actions: Sequence[Mapping[str, Any]],
+    dispatch: Mapping[str, Mapping[str, Any]],
+) -> frozenset[str]:
+    by_route: dict[str, list[str]] = {}
+    for action in actions:
+        if not _is_v2_canonical_action(action):
+            continue
+        action_id = str(action.get("action_id") or "")
+        route = str(action.get("informational_path") or f"@{action_id}")
+        by_route.setdefault(route, []).append(action_id)
+
+    selected: set[str] = set()
+    for route, action_ids in by_route.items():
+        generic_ids = [
+            action_id
+            for action_id in action_ids
+            if not dict(dispatch.get(action_id, {}).get("fixed_inputs") or {})
+        ]
+        if len(generic_ids) > 1:
+            raise RuntimeError(f"duplicate generic V2 action authority for route {route}")
+        selected.update(generic_ids or action_ids)
+    return frozenset(selected)
+
+
 _DISPATCH_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "bioxp_operator_dispatch_context", default=None
 )
@@ -258,6 +293,7 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 
 _NO_MOTION_PREPARATION_PATHS = {
     "/motion/oem/prepare_without_motion",
+    "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a
     # movement/homing action.  It must remain available to repair a stale Z
     # coordinate while the physical-motion arm is deliberately disarmed.
@@ -601,6 +637,8 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     requires_transport = (method != "GET" or safety in {"stop", "emergency"}) and path not in _TRANSPORT_BOOTSTRAP_PATHS
     ownership_value = machine_state.get("ownership")
     ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
+    maintenance_value = machine_state.get("maintenance")
+    maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
     transport_live = bool(
         ownership.get("transport") == "owned"
         and ownership.get("usb") == "service"
@@ -608,6 +646,13 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     )
     if requires_transport:
         dependencies.append(_dependency("transport_live", "Robot transport live", transport_live, "Robot transport is unavailable."))
+    if action_id == "meta.recover_motion_non_homing":
+        dependencies.append(_dependency(
+            "recovery_required",
+            "Non-homing recovery required",
+            maintenance.get("recovery_required") is True,
+            "Non-homing recovery is not currently required.",
+        ))
 
     if (
         str(values.get("axis") or "").lower() == "z"
@@ -1580,6 +1625,10 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         (row for row in actions if row["informational_path"] == "/motion/oem/prepare_without_motion" and row["informational_method"] == "POST"),
         None,
     )
+    recovery_provider = next(
+        (row for row in actions if row["informational_path"] == "/motion/arm/strict_startup" and row["informational_method"] == "POST"),
+        None,
+    )
 
     home_xy_provider = next(
         (row for row in actions if row["informational_path"] == "/motion/oem/home_xy" and row["informational_method"] == "POST"),
@@ -1594,6 +1643,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         None,
     )
     prepare_bound = prepare_provider is not None and prepare_provider.get("provider_available") is True
+    recovery_bound = recovery_provider is not None and recovery_provider.get("provider_available") is True
 
     home_xy_bound = home_xy_provider is not None and home_xy_provider.get("provider_available") is True
     initialize_motors_bound = initialize_motors_provider is not None and initialize_motors_provider.get("provider_available") is True
@@ -1621,6 +1671,29 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
             "stages": ["serial-206 authority", "24 V/door/latch query", "cmd64=0 boards 4/5/6/7", "cmd64=1 boards 4/5/6/7", "mint board generation", "initializeMotorsWithoutMotion", "exact parameter readback"],
+        },
+        {
+            "action_id": "meta.recover_motion_non_homing",
+            "label": "OEM Non-homing Motion Recovery",
+            "subsystem": "meta",
+            "category": "recovery",
+            "kind": "meta",
+            "safety_class": "service",
+            "description": "Run the existing robot-owned strict startup recovery with homing disabled. This action is available only while the maintenance latch requires recovery.",
+            "source_anchor": "Motion strict startup; run_homing=false",
+            "informational_method": "POST",
+            "informational_path": "/motion/arm/strict_startup",
+            "provider_available": recovery_bound,
+            "provider_unavailable_reason": None if recovery_bound else "Robot-owned non-homing recovery provider is not bound.",
+            "available": recovery_bound,
+            "unavailable_reason": None if recovery_bound else "Robot-owned non-homing recovery provider is not bound.",
+            "enabled": recovery_bound,
+            "disabled_reason": None if recovery_bound else "Robot-owned non-homing recovery provider is not bound.",
+            "dependencies": [],
+            "requires_confirmation": False,
+            "timeout_seconds": 90.0,
+            "inputs": [],
+            "stages": ["strict startup", "no homing", "maintenance latch completion"],
         },
 
         {
@@ -1698,6 +1771,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     # Meta actions dispatch to exact bound provider routes; no synthesized sequence.
     home_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/home_xy"), None)
     prepare_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/prepare_without_motion"), None)
+    recovery_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/arm/strict_startup"), None)
 
     initialize_motors_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/initialization/initialize_motors"), None)
     initialize_motion_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/initialization/initialize_motion"), None)
@@ -1705,6 +1779,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         dispatch["meta.home_xy"] = home_route
     if prepare_route:
         dispatch["meta.activate_motion"] = prepare_route
+    if recovery_route:
+        dispatch["meta.recover_motion_non_homing"] = {
+            **dict(recovery_route),
+            "fixed_inputs": {"run_homing": False},
+            "inputs": set(),
+        }
 
     if initialize_motors_route:
         dispatch["meta.initialize_motors"] = initialize_motors_route
@@ -1816,6 +1896,7 @@ def install_operator_control_plane(
         if str(row.get("action_id", "")) not in _PRIVATE_METHOD_ACTION_IDS
     ]
     by_id = {row["action_id"]: row for row in actions}
+    v2_canonical_action_ids = _v2_canonical_action_ids(actions, dispatch)
     store = OperatorReceiptStore()
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
@@ -1954,6 +2035,61 @@ def install_operator_control_plane(
         except (OemFullLifecycleError, OSError, ValueError, KeyError):
             return {"registry_sha256": "unavailable", "evidence_lock_sha256": "unavailable", "source_authority_verified": False}
 
+    def _v2_bounded_failure_detail(row: Mapping[str, Any]) -> dict[str, Any] | None:
+        response = row.get("response")
+        body = response.get("body") if isinstance(response, Mapping) else None
+        detail = body.get("detail") if isinstance(body, Mapping) else None
+        result = detail.get("result") if isinstance(detail, Mapping) else None
+        home_container = result.get("home") if isinstance(result, Mapping) else None
+        home = home_container.get("home") if isinstance(home_container, Mapping) else None
+        lifecycle = detail.get("z_lifecycle") if isinstance(detail, Mapping) else None
+        if not isinstance(detail, Mapping):
+            return None
+        if not isinstance(result, Mapping):
+            return None
+        if not isinstance(home, Mapping):
+            return None
+        if not isinstance(lifecycle, Mapping):
+            return None
+        provider_failure = result.get("failure")
+        failure = home.get("failure")
+        axis = home.get("axis")
+        board = home.get("board")
+        motor = home.get("motor")
+        source_return_code = home.get("source_return_code")
+        controller_acknowledged = result.get("controller_command_acknowledged")
+        controller_terminal_state_verified = result.get("controller_terminal_state_verified")
+        physical_effect_verified = result.get("physical_effect_verified")
+        lifecycle_state = lifecycle.get("state")
+        reference_state = lifecycle.get("reference_state")
+        if not (
+            isinstance(provider_failure, str) and 0 < len(provider_failure) <= 160
+            and isinstance(failure, str) and 0 < len(failure) <= 160
+            and isinstance(axis, str) and 0 < len(axis) <= 16
+            and type(board) is int and 0 <= board <= 255
+            and type(motor) is int and 0 <= motor <= 255
+            and type(source_return_code) is int and -(2 ** 31) <= source_return_code < 2 ** 31
+            and type(controller_acknowledged) is bool
+            and type(controller_terminal_state_verified) is bool
+            and type(physical_effect_verified) is bool
+            and isinstance(lifecycle_state, str) and 0 < len(lifecycle_state) <= 160
+            and isinstance(reference_state, str) and 0 < len(reference_state) <= 160
+        ):
+            return None
+        return {
+            "provider_failure": provider_failure,
+            "failure": failure,
+            "axis": axis,
+            "board": board,
+            "motor": motor,
+            "source_return_code": source_return_code,
+            "controller_acknowledged": controller_acknowledged,
+            "controller_terminal_state_verified": controller_terminal_state_verified,
+            "physical_effect_verified": physical_effect_verified,
+            "lifecycle_state": lifecycle_state,
+            "reference_state": reference_state,
+        }
+
     def _v2_compact_receipt(row: Mapping[str, Any]) -> dict[str, Any]:
         raw_status = str(row.get("status") or "queued")
         status = {
@@ -1983,6 +2119,9 @@ def install_operator_control_plane(
         error = None
         if status in {"failed", "rejected", "ambiguous"}:
             error = {"code": str(row.get("error") or row.get("reason") or raw_status), "message": str(row.get("error") or row.get("reason") or raw_status), "retryable": status == "ambiguous"}
+            failure_detail = _v2_bounded_failure_detail(row)
+            if failure_detail is not None:
+                error["detail"] = failure_detail
         return {
             "schema_version": "bioxp.operator_action_receipt.v2",
             "command_id": str(row.get("command_id") or "unknown"),
@@ -2069,7 +2208,7 @@ def install_operator_control_plane(
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
         dashboard = _v2_dashboard(state, {}, await asyncio.to_thread(store.list, 25))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if str(action["action_id"]) in CANONICAL_ACTIONS]}
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if str(action["action_id"]) in v2_canonical_action_ids]}
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
@@ -2078,13 +2217,27 @@ def install_operator_control_plane(
                 raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
             direct_receipt = await invoke_action(action_id, payload)
             return _v2_compact_receipt(direct_receipt)
-        if action_id.startswith(("oem.z.", "oem.x.", "oem.y.", "oem.xy.")) and isinstance(payload, OperatorActionRequestV2):
+        action = by_id.get(action_id)
+        if (
+            isinstance(payload, OperatorActionRequestV2)
+            and action is not None
+            and action_id not in INTERRUPT_ACTIONS
+            and action_id in v2_canonical_action_ids
+        ):
             direct_payload = InvokeRequest(
                 expected_generation=int(payload.expected_ownership_generation),
                 idempotency_key=payload.idempotency_key,
                 inputs=dict(payload.inputs),
             )
             direct_receipt = await invoke_action(action_id, direct_payload)
+            if str(direct_receipt.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
+                detailed_receipt = await asyncio.to_thread(
+                    store.by_command,
+                    str(direct_receipt.get("command_id") or ""),
+                    include_evidence=True,
+                )
+                if detailed_receipt is not None:
+                    direct_receipt = detailed_receipt
             return _v2_compact_receipt(direct_receipt)
         raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
 
@@ -2107,6 +2260,18 @@ def install_operator_control_plane(
             command_id,
             include_evidence=detail,
         )
+        if (
+            row is not None
+            and not detail
+            and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}
+        ):
+            detailed_row = await asyncio.to_thread(
+                store.by_command,
+                command_id,
+                include_evidence=True,
+            )
+            if detailed_row is not None:
+                row = detailed_row
         if row is None:
             row = await asyncio.to_thread(
                 legacy_command_store.command_detail_v2 if detail else legacy_command_store.get_command,
@@ -2169,7 +2334,7 @@ def install_operator_control_plane(
                         "disabled_reason": assessed_action(action, state).get("disabled_reason"),
                     }
                     for action in actions
-                    if str(action["action_id"]) in by_id
+                    if str(action["action_id"]) in v2_canonical_action_ids
                 ],
             }
         return {
