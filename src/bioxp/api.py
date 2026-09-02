@@ -66,6 +66,7 @@ from .release_identity import (
 )
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .operator_command_plane import COMMAND_TERMINAL
 from .oem_compat.position_table import load_bound_oem_position_table
 from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
@@ -2737,6 +2738,12 @@ class ProtocolCompileRequest(BaseModel):
 
 class ProtocolExecuteRequest(ProtocolCompileRequest):
     dry_run: bool = True
+    idempotency_key: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Caller-stable execution identity required for dry_run=false; raw value is not persisted.",
+    )
     live_execution: Optional[dict[str, Any]] = Field(
         None,
         description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
@@ -9699,53 +9706,48 @@ def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
 
 
 def _protocol_live_move_handler(action, state):
+    from .oem_deck_movement import ClassMoveToIntent
+
     _require_motion_route_ready()
     params = dict(action.params or {})
-    raw_axis = params.get("axis") or params.get("axis_name")
-    if raw_axis is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
-    axis = AxisName(str(raw_axis).strip().lower())
-    wait_timeout_s = float(params.get("wait_timeout_s") or params.get("timeout_s") or 30.0)
-    acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
-    provider = _serial206_oem_initialization_provider
-    if provider is None:
-        raise RuntimeError("serial206 OEM provider unavailable")
-    command_id = f"protocol-{axis.value}-{uuid.uuid4().hex}"
-    position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
-    steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
-    if position_steps is None and steps is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps")
-    is_absolute = position_steps is not None
-    move_value = int(position_steps) if position_steps is not None else int(steps)  # type: ignore[arg-type]
-    if axis.value == "x":
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True, "source_mode": "protocol.x.move_absolute"})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_x_intent(selected, values)
-    elif axis.value == "y":
-        y_provider = provider.y_provider
-        if y_provider is None:
-            raise RuntimeError("serial206 Y provider unavailable")
-        result = y_provider.move_absolute(move_value, wait_for_stop=True, wait_timeout_s=wait_timeout_s, command_id=command_id) if is_absolute else y_provider.move_steps(move_value, wait_timeout_s=wait_timeout_s, command_id=command_id)
-    else:
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_z_intent(
-            selected,
-            inputs=values,
-            expected_generation=int(provider.generation_provider()),
-            idempotency_key=command_id,
-        )
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
-        raise RuntimeError(f"Protocol move failed: {result}")
-    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute" if position_steps is not None else "relative", "move": dict(result)}
+    allowed_fields = {
+        "script_line",
+        "plate_name",
+        "location_id",
+        "well",
+        "material",
+        "continuation",
+    }
+    try:
+        if not set(params).issubset(allowed_fields):
+            raise ValueError("unsupported ClassMoveTo field")
+        location_id = params.get("location_id")
+        if location_id is not None and type(location_id) is not int:
+            raise ValueError("location_id must be an integer")
+        well = params.get("well")
+        if well is not None and type(well) not in {str, int}:
+            raise ValueError("well must be text or an integer")
+        intent = ClassMoveToIntent(**params)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "canonical_deck_queue_required",
+                "hardware_motion_commanded": False,
+            },
+        ) from None
+    admitter = getattr(app.state, "oem_mov_execution_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
 
 
 def _protocol_live_pipette_handler(action, state):
@@ -9847,9 +9849,126 @@ def _protocol_live_pipette_handler(action, state):
     }
 
 
+def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) -> dict[str, Any]:
+    plane = getattr(app.state, "operator_command_plane", None)
+    store = getattr(plane, "store", None)
+    getter = getattr(store, "get_command", None)
+    if not callable(getter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = getter(command_id)
+        if isinstance(row, Mapping):
+            status = str(row.get("status") or "")
+            if status == "completed":
+                return dict(row)
+            if status in COMMAND_TERMINAL:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "canonical_deck_command_failed", "command": dict(row)},
+                )
+        time.sleep(0.05)
+    raise HTTPException(
+        status_code=504,
+        detail={"error": "canonical_deck_command_timeout", "command_id": command_id},
+    )
+
+
+def _protocol_live_plate_move_handler(action, state):
+    from .oem_deck_movement import require_serial206_machine_target, translate_oem_plate_move
+
+    params = dict(action.params or {})
+    plate_token = params.get("plate_id", params.get("cover_id"))
+    intent = translate_oem_plate_move(
+        str(plate_token), str(params.get("target_location")), params.get("move_mode"),
+    )
+    position_table_provider = getattr(app.state, "oem_deck_position_table_provider", None)
+    if not callable(position_table_provider):
+        raise HTTPException(status_code=503, detail={"error": "serial206_position_table_unavailable"})
+    require_serial206_machine_target(int(intent["destination"]), position_table_provider())
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "move_plate",
+        inputs=intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_plate_prepare_handler(action, state):
+    from .oem_deck_movement import OEM_SCRIPT_PLATE_TOKENS
+
+    tokens = list((action.params or {}).get("plate_ids") or [])
+    allowed = {"PL_POOL", "PL_OUTPUT", "PL_REAGENT"}
+    plates = [OEM_SCRIPT_PLATE_TOKENS[token] for token in tokens if token in allowed]
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "press_plates", inputs={"plates": plates},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_thermal_door_handler(action, state):
+    mode = str((action.params or {}).get("door_command") or "")
+    if mode not in {"DO", "DC"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "unsupported_oem_thermal_door_command", "hardware_motion_commanded": False},
+        )
+    opening = mode == "DO"
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "thermal_door", inputs={"open": opening},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    door = _wait_protocol_deck_command(command_id)
+    pipette = None
+    if str(door.get("status") or "") != "completed":
+        return {"ok": False, "door": door, "pipette": pipette}
+    if opening:
+        pipette_action = action.__class__(
+            action_id=f"{action.action_id}-pipette-init",
+            stage_id=action.stage_id,
+            kind=ProtocolActionKind.PIPETTE_INIT,
+            params={},
+            description="OEM TCD DO pipette initialization",
+            required_capability=action.required_capability,
+            metadata=dict(action.metadata or {}),
+        )
+        pipette = _protocol_live_pipette_handler(pipette_action, state)
+    return {
+        "ok": not opening or (isinstance(pipette, Mapping) and pipette.get("ok") is True),
+        "door": door,
+        "pipette": pipette,
+    }
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
+        ProtocolActionKind.PLATE_MOVE: _protocol_live_plate_move_handler,
+        ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
+        ProtocolActionKind.PLATE_PREPARE: _protocol_live_plate_prepare_handler,
+        ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,

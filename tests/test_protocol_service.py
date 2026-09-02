@@ -1,4 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -145,6 +149,7 @@ def _live_protocol_payload(**live_overrides):
     live_execution.update(live_overrides)
     return {
         "source_type": "native",
+        "idempotency_key": "operator-live-execution-7-2",
         "document": {
             "protocol_id": "live-gated-protocol",
             "stages": [
@@ -224,3 +229,466 @@ def test_live_protocol_execution_persists_contract_preflight_artifact_and_uses_h
     preflight_path = Path(bundle["artifacts"]["preflight_path"])
     assert preflight_path.exists()
     assert preflight_path.read_text(encoding="utf-8").count("snapshot://deck-before-live-run") == 1
+
+
+def test_live_protocol_retry_replays_one_completed_job_with_stable_runtime_identity(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+
+    def move_handler(action, state):
+        subcommand_key = f"protocol:{state.job_id}:{action.action_id}"
+        calls.append({"job_id": state.job_id, "subcommand_key": subcommand_key})
+        return {"ok": True, "subcommand_key": subcommand_key}
+
+    first = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+    second = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+
+    assert first == second
+    assert first["job_id"] == first["execution"]["runtime_state"]["job_id"]
+    assert calls == [
+        {
+            "job_id": first["job_id"],
+            "subcommand_key": f"protocol:{first['job_id']}:move-x",
+        }
+    ]
+
+
+def test_live_protocol_terminal_failure_persists_and_replays_without_second_handler(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+    failure_evidence = {
+        "ok": False,
+        "failure_code": "controller-rejected",
+        "receipt": {"sequence": 17, "detail": ["stable", "evidence"]},
+    }
+
+    def move_handler(action, state):
+        calls.append((state.job_id, action.action_id))
+        return failure_evidence
+
+    first = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+    persisted = store.load(first["job_id"])
+    second = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+
+    assert first == persisted == second
+    assert first["status"] == "failed"
+    runtime_state = first["execution"]["runtime_state"]
+    assert runtime_state["completed"] is False
+    assert runtime_state["stage_states"]["move-stage"]["status"] == "failed"
+    assert runtime_state["action_results"] == [
+        {
+            "stage_id": "move-stage",
+            "action_id": "move-x",
+            "kind": "move",
+            **failure_evidence,
+            "dry_run": False,
+        }
+    ]
+    assert calls == [(first["job_id"], "move-x")]
+
+    conflicting = _live_protocol_payload()
+    conflicting["document"]["stages"][0]["actions"][0]["steps"] = 99
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            conflicting,
+            dry_run=False,
+            store=store,
+            handlers={"move": move_handler},
+        )
+    assert exc_info.value.to_payload()["idempotency_conflict"] is True
+    assert calls == [(first["job_id"], "move-x")]
+
+
+def test_live_protocol_concurrent_same_key_creators_share_one_completed_job(tmp_path) -> None:
+    attempted_lock = threading.Event()
+    handler_entered = threading.Event()
+    start = threading.Barrier(2)
+    calls = []
+    attempts = 0
+    attempts_guard = threading.Lock()
+
+    class OverlapStore(ProtocolOperatorBundleStore):
+        def live_creation_lock(self, job_id):
+            nonlocal attempts
+            with attempts_guard:
+                attempts += 1
+                if attempts == 2:
+                    attempted_lock.set()
+            return super().live_creation_lock(job_id)
+
+    store = OverlapStore(tmp_path)
+
+    def move_handler(action, state):
+        calls.append((state.job_id, action.action_id))
+        handler_entered.set()
+        assert attempted_lock.wait(timeout=5), "second creator did not overlap the first handler"
+        return {"ok": True}
+
+    def create():
+        start.wait(timeout=5)
+        return create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": move_handler},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(create) for _ in range(2)]
+        assert handler_entered.wait(timeout=5), "neither creator reached the handler"
+        first, second = (future.result(timeout=10) for future in futures)
+
+    assert len(calls) == 1
+    assert first == second
+    assert first["status"] == second["status"] == "completed"
+    assert first["job_id"] == second["job_id"]
+    assert first["job_id"] == first["execution"]["runtime_state"]["job_id"]
+
+
+def test_live_protocol_conflicting_same_key_rejects_before_second_handler(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+
+    def move_handler(action, state):
+        calls.append((state.job_id, action.params["steps"]))
+        return {"ok": True}
+
+    create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": move_handler},
+    )
+    conflicting = _live_protocol_payload()
+    conflicting["document"]["stages"][0]["actions"][0]["steps"] = 5
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            conflicting,
+            dry_run=False,
+            store=store,
+            handlers={"move": move_handler},
+        )
+
+    assert exc_info.value.to_payload()["idempotency_conflict"] is True
+    assert len(calls) == 1
+
+
+def test_live_protocol_missing_idempotency_key_rejects_before_handler(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+    payload = _live_protocol_payload()
+    payload.pop("idempotency_key")
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            payload,
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: calls.append("called")},
+        )
+
+    assert exc_info.value.to_payload()["missing_contract_fields"] == ["idempotency_key"]
+    assert calls == []
+
+
+def test_live_protocol_orphan_reservation_fails_closed_without_reinvoking_handler(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    retry_calls = []
+
+    def interrupted_handler(*_args):
+        raise RuntimeError("simulated interruption after reservation")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": interrupted_handler},
+        )
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: retry_calls.append("called")},
+        )
+
+    assert exc_info.value.to_payload()["idempotency_recovery_required"] is True
+    assert retry_calls == []
+
+
+def test_live_protocol_root_directory_durability_precedes_handler_and_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    failed_store = ProtocolOperatorBundleStore(tmp_path / "failed")
+    failed_calls = []
+    failed_events = []
+    real_fsync = protocol_service.os.fsync
+    failed_root = failed_store.root.stat()
+
+    def fail_root_fsync(fd):
+        target = protocol_service.os.fstat(fd)
+        if (target.st_dev, target.st_ino) == (failed_root.st_dev, failed_root.st_ino):
+            failed_events.append("root-fsync")
+            raise OSError("injected root fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(protocol_service.os, "fsync", fail_root_fsync)
+
+    with pytest.raises(OSError, match="injected root fsync failure"):
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=failed_store,
+            handlers={"move": lambda *_args: failed_calls.append("handler")},
+        )
+
+    assert failed_events == ["root-fsync"]
+    assert failed_calls == []
+
+    successful_store = ProtocolOperatorBundleStore(tmp_path / "successful")
+    successful_events = []
+    successful_root = successful_store.root.stat()
+
+    def track_root_fsync(fd):
+        target = protocol_service.os.fstat(fd)
+        if (target.st_dev, target.st_ino) == (successful_root.st_dev, successful_root.st_ino):
+            successful_events.append("root-fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(protocol_service.os, "fsync", track_root_fsync)
+    create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=successful_store,
+        handlers={"move": lambda *_args: successful_events.append("handler") or {"ok": True}},
+    )
+
+    assert successful_events == ["root-fsync", "handler"]
+
+
+@pytest.mark.parametrize("failing_fsync_call", [2, 3], ids=["reservation-file", "reservation-directory"])
+def test_live_protocol_reservation_durability_failure_rejects_before_handler(
+    tmp_path, monkeypatch, failing_fsync_call
+) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+    real_fsync = protocol_service.os.fsync
+    fsync_calls = 0
+
+    def fault_injected_fsync(fd):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == failing_fsync_call:
+            raise OSError(f"injected fsync failure {failing_fsync_call}")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(protocol_service.os, "fsync", fault_injected_fsync)
+
+    with pytest.raises(OSError, match="injected fsync failure"):
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: calls.append("called")},
+        )
+
+    assert calls == []
+
+
+def _seed_replay_artifacts(tmp_path):
+    store = ProtocolOperatorBundleStore(tmp_path)
+    calls = []
+    bundle = create_protocol_job(
+        _live_protocol_payload(),
+        dry_run=False,
+        store=store,
+        handlers={"move": lambda *_args: calls.append("initial") or {"ok": True}},
+    )
+    reservation_path = tmp_path / bundle["job_id"] / "idempotency-reservation.json"
+    bundle_path = tmp_path / bundle["job_id"] / "bundle.json"
+    reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
+    persisted_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    persisted_bundle["execution"]["idempotency_binding"] = {
+        "idempotency_key_digest": reservation["idempotency_key_digest"],
+        "request_fingerprint": reservation["request_fingerprint"],
+    }
+    bundle_path.write_text(json.dumps(persisted_bundle, indent=2, sort_keys=True), encoding="utf-8")
+    calls.clear()
+    return store, calls, reservation_path, bundle_path, reservation, persisted_bundle
+
+
+def test_live_protocol_bundle_persists_digest_and_fingerprint_without_raw_key(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    payload = _live_protocol_payload()
+
+    bundle = create_protocol_job(
+        payload,
+        dry_run=False,
+        store=store,
+        handlers={"move": lambda *_args: {"ok": True}},
+    )
+
+    reservation = store.load_live_reservation(bundle["job_id"])
+    assert reservation is not None
+    assert bundle["execution"]["idempotency_binding"] == {
+        "idempotency_key_digest": reservation["idempotency_key_digest"],
+        "request_fingerprint": reservation["request_fingerprint"],
+    }
+    assert payload["idempotency_key"] not in json.dumps(bundle, sort_keys=True)
+
+
+def test_live_flat_protocol_excludes_raw_key_from_metadata_and_fingerprint(tmp_path) -> None:
+    store = ProtocolOperatorBundleStore(tmp_path)
+    raw_keys = ["flat-private-key-alpha", "flat-private-key-beta"]
+    bundles = []
+    reservations = []
+
+    for raw_key in raw_keys:
+        nested = _live_protocol_payload()
+        document = nested.pop("document")
+        nested["idempotency_key"] = raw_key
+        flat_payload = {
+            **nested,
+            **document,
+            "flat_metadata_marker": {"retained": ["exact", 7]},
+        }
+        bundle = create_protocol_job(
+            flat_payload,
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: {"ok": True}},
+        )
+        bundles.append(bundle)
+        reservations.append(store.load_live_reservation(bundle["job_id"]))
+
+    for raw_key, bundle, reservation in zip(raw_keys, bundles, reservations):
+        assert reservation is not None
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        assert reservation["idempotency_key_digest"] == digest
+        assert bundle["job_id"] == f"protocol-live-{digest}"
+        assert "idempotency_key" not in bundle["protocol"]["document"]["metadata"]
+        assert bundle["protocol"]["document"]["metadata"]["flat_metadata_marker"] == {
+            "retained": ["exact", 7]
+        }
+        for artifact_path in (tmp_path / bundle["job_id"]).glob("*.json"):
+            assert raw_key not in artifact_path.read_text(encoding="utf-8")
+
+    assert reservations[0]["request_fingerprint"] == reservations[1]["request_fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("schema_version", "wrong.reservation.schema"),
+        ("job_id", "wrong-job"),
+        ("idempotency_key_digest", "0" * 64),
+        ("request_fingerprint", "f" * 64),
+    ],
+)
+def test_live_protocol_replay_rejects_mismatched_reservation_artifact_before_handler(
+    tmp_path, field, bad_value
+) -> None:
+    store, calls, reservation_path, _bundle_path, reservation, _bundle = _seed_replay_artifacts(tmp_path)
+    reservation[field] = bad_value
+    reservation_path.write_text(json.dumps(reservation, indent=2, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: calls.append("replayed")},
+        )
+
+    assert exc_info.value.to_payload()["idempotency_recovery_required"] is True
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "corrupt_json",
+        "malformed_payload",
+        "schema_version",
+        "job_id",
+        "runtime_job_id",
+        "runtime_protocol_id",
+        "runtime_dry_run",
+        "live_mode",
+        "missing_binding",
+        "binding_digest",
+        "binding_fingerprint",
+        "protocol_fingerprint",
+        "live_contract_fingerprint",
+        "noncompleted_status",
+        "runtime_not_completed",
+    ],
+)
+def test_live_protocol_replay_rejects_invalid_bundle_artifact_before_handler(tmp_path, defect) -> None:
+    store, calls, _reservation_path, bundle_path, _reservation, bundle = _seed_replay_artifacts(tmp_path)
+    if defect == "corrupt_json":
+        bundle_path.write_text("{not-json", encoding="utf-8")
+    elif defect == "malformed_payload":
+        bundle_path.write_text("[]", encoding="utf-8")
+    else:
+        if defect == "schema_version":
+            bundle["schema_version"] = "wrong.bundle.schema"
+        elif defect == "job_id":
+            bundle["job_id"] = "wrong-job"
+        elif defect == "runtime_job_id":
+            bundle["execution"]["runtime_state"]["job_id"] = "wrong-runtime-job"
+        elif defect == "runtime_protocol_id":
+            bundle["execution"]["runtime_state"]["protocol_id"] = "wrong-runtime-protocol"
+        elif defect == "runtime_dry_run":
+            bundle["execution"]["runtime_state"]["dry_run"] = 0
+        elif defect == "live_mode":
+            bundle["execution"]["dry_run"] = True
+        elif defect == "missing_binding":
+            bundle["execution"].pop("idempotency_binding")
+        elif defect == "binding_digest":
+            bundle["execution"]["idempotency_binding"]["idempotency_key_digest"] = "0" * 64
+        elif defect == "binding_fingerprint":
+            bundle["execution"]["idempotency_binding"]["request_fingerprint"] = "f" * 64
+        elif defect == "protocol_fingerprint":
+            bundle["protocol"]["document"]["stages"][0]["actions"][0]["params"]["steps"] = 99
+        elif defect == "live_contract_fingerprint":
+            bundle["execution"]["live_contract"]["operator_id"] = "different-operator"
+        elif defect == "noncompleted_status":
+            bundle["status"] = "awaiting_review"
+        elif defect == "runtime_not_completed":
+            bundle["execution"]["runtime_state"]["completed"] = False
+        bundle_path.write_text(json.dumps(bundle, indent=2, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ProtocolLiveContractError) as exc_info:
+        create_protocol_job(
+            _live_protocol_payload(),
+            dry_run=False,
+            store=store,
+            handlers={"move": lambda *_args: calls.append("replayed")},
+        )
+
+    assert exc_info.value.to_payload()["idempotency_recovery_required"] is True
+    assert calls == []

@@ -42,10 +42,19 @@ from .oem_runtime_store import (
 from .runtime_audit_store import open_runtime_connection
 from .oem_deck_catalog import configured_location_names, public_target_keys
 from .oem_deck_movement import (
+    ClassMoveToIntent,
+    MovExecutionPlan,
     DeckExecutionFailure,
+    FINITE_PLATE_OPERATIONS,
+    WP8_OPERATION_INTENT_KEYS,
     canonical_movable_object_locations,
     canonical_plate_name,
+    bind_mov_execution_script_plan,
+    compile_finite_plate_operation,
+    compile_mov_execution,
+    execute_mov_execution,
     plate_name_for_storage,
+    require_serial206_machine_target,
 )
 
 COMMAND_SCHEMA = "bioxp.operator_command_request.v1"
@@ -134,7 +143,8 @@ ALLOWED_ACTIONS = frozenset({
 INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all", "oem.z.abort",
 })
-CANONICAL_ACTIONS = ALLOWED_ACTIONS | INTERRUPT_ACTIONS
+INTERNAL_ACTIONS = frozenset({"oem.deck._mov_execution", "oem.deck._finite_operation"})
+CANONICAL_ACTIONS = ALLOWED_ACTIONS | INTERRUPT_ACTIONS | INTERNAL_ACTIONS
 XZ_NORMAL_ACTIONS = frozenset({
     "oem.x.prepare",
     "oem.x.diagnostic_home_axis",
@@ -364,6 +374,10 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             "location19_y",
         },
         "oem.deck.move_to_location": {"target", "camera_offset"},
+        "oem.deck._mov_execution": {
+            "script_line", "plate_name", "location_id", "well", "material", "continuation",
+        },
+        "oem.deck._finite_operation": {"operation", "operation_inputs"},
     }
     unknown = sorted(set(inputs) - allowed.get(action_id, set()))
     if unknown:
@@ -439,6 +453,39 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail={"error": "invalid_camera_offset"})
         if camera_offset and (target.endswith("_BARCODE") or target == "LOC_PARK"):
             raise HTTPException(status_code=422, detail={"error": "contradictory_input"})
+        return result
+    if action_id == "oem.deck._mov_execution":
+        script_line = result.get("script_line")
+        if type(script_line) is not int or script_line < 0:
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_script_line"})
+        plate_name = result.get("plate_name")
+        location_id = result.get("location_id")
+        if (plate_name is None) == (location_id is None):
+            raise HTTPException(status_code=422, detail={"error": "mov_execution_destination_selector_required"})
+        if plate_name is not None and (type(plate_name) is not int or not 0 <= plate_name <= 21):
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_plate"})
+        if location_id is not None and (type(location_id) is not int or location_id not in {6, 16}):
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_direct_location"})
+        if result.get("well") is not None and type(result.get("well")) not in {str, int}:
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_well"})
+        if result.get("material") is not None and type(result.get("material")) is not str:
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_material"})
+        if result.get("continuation") is not None and (
+            type(result.get("continuation")) is not str or len(result["continuation"]) != 1
+        ):
+            raise HTTPException(status_code=422, detail={"error": "invalid_mov_execution_continuation"})
+        return result
+    if action_id == "oem.deck._finite_operation":
+        operation = result.get("operation")
+        operation_inputs = result.get("operation_inputs")
+        if type(operation) is not str or operation not in FINITE_PLATE_OPERATIONS:
+            raise HTTPException(status_code=422, detail={"error": "invalid_finite_deck_operation"})
+        if not isinstance(operation_inputs, Mapping):
+            raise HTTPException(status_code=422, detail={"error": "invalid_finite_deck_operation_inputs"})
+        encoded = _canonical(dict(operation_inputs))
+        if len(encoded.encode("utf-8")) > _MAX_INPUT_BYTES:
+            raise HTTPException(status_code=422, detail={"error": "finite_deck_operation_inputs_too_large"})
+        result["operation_inputs"] = dict(operation_inputs)
         return result
     if action_id == "oem.xy.move_absolute":
         for key in ("x", "y"):
@@ -579,7 +626,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     axis = AXIS_BY_ACTION.get(action_id)
     if (
         action_id.startswith(("oem.xy.", "oem.xyz."))
-        or action_id in {"oem.z.scriptmove_to", "oem.deck.move_to_location"}
+        or action_id in {"oem.z.scriptmove_to", "oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
     ) and isinstance(provider, Mapping):
         epochs: dict[str, int] = {}
         x_authority = provider.get("x_authority")
@@ -978,6 +1025,7 @@ class OperatorCommandStore:
         self._worker_lock = threading.Lock()
         self._workers: set[threading.Thread] = set()
         self._authority_write_depth = 0
+        self._internal_admission = threading.local()
         self._interrupt_spool_write_depth = 0
         self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
         self.owner_id = uuid.uuid4().hex
@@ -987,6 +1035,7 @@ class OperatorCommandStore:
         self.connection.row_factory = sqlite3.Row
         self._configure()
         verify_canonical_runtime_database(self.connection)
+        self._configure_delivery_ledgers()
         self._authority_schema_version = int(self.connection.execute("PRAGMA schema_version").fetchone()[0])
         self._import_interrupt_fallback()
         self._owner_acquired = self._acquire_owner()
@@ -1351,6 +1400,27 @@ class OperatorCommandStore:
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=2000")
         self.connection.execute("PRAGMA wal_autocheckpoint=256")
+
+    def _configure_delivery_ledgers(self) -> None:
+        self.connection.executescript("""
+        CREATE TABLE IF NOT EXISTS operator_plane_delivery_attempts (
+          attempt_sequence INTEGER PRIMARY KEY AUTOINCREMENT, command_id TEXT NOT NULL,
+          work_kind TEXT NOT NULL, work_identity TEXT NOT NULL, dispatch_attempt_id TEXT NOT NULL,
+          plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64), owner_id TEXT NOT NULL,
+          ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
+          board_epoch_4 INTEGER NOT NULL CHECK(board_epoch_4>=0), board_epoch_5 INTEGER NOT NULL CHECK(board_epoch_5>=0), created_at REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS operator_plane_delivery_attempts_command_idx ON operator_plane_delivery_attempts(command_id,attempt_sequence);
+        CREATE TABLE IF NOT EXISTS operator_plane_wp8_background_tasks (
+          command_id TEXT NOT NULL, child_order INTEGER NOT NULL CHECK(child_order>=0), task_id TEXT NOT NULL UNIQUE,
+          task_kind TEXT NOT NULL, plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64), dispatch_attempt_id TEXT NOT NULL,
+          authority_stamps_json TEXT NOT NULL CHECK(json_valid(authority_stamps_json)),
+          state TEXT NOT NULL CHECK(state IN ('created','running','completed','failed','ambiguous','interrupted')),
+          evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)), created_at REAL NOT NULL, updated_at REAL NOT NULL,
+          PRIMARY KEY(command_id,child_order)) WITHOUT ROWID;
+        CREATE TRIGGER IF NOT EXISTS operator_plane_delivery_attempts_no_update BEFORE UPDATE ON operator_plane_delivery_attempts BEGIN SELECT RAISE(ABORT,'delivery attempts are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS operator_plane_delivery_attempts_no_delete BEFORE DELETE ON operator_plane_delivery_attempts BEGIN SELECT RAISE(ABORT,'delivery attempts are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_background_tasks_no_delete BEFORE DELETE ON operator_plane_wp8_background_tasks BEGIN SELECT RAISE(ABORT,'wp8 background tasks are durable'); END;
+        """)
 
     def _schema(self) -> None:
         with self._lock:
@@ -2492,6 +2562,20 @@ class OperatorCommandStore:
     def _transaction(self, *, timeout_ms: int = 2000):
         with self._lock:
             self.connection.execute(f"PRAGMA busy_timeout={int(timeout_ms)}")
+            if self.connection.in_transaction:
+                savepoint = f"operator_nested_{uuid.uuid4().hex}"
+                self.connection.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    with self._authority_write():
+                        yield self.connection
+                    self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except Exception:
+                    self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    raise
+                finally:
+                    self.connection.execute("PRAGMA busy_timeout=2000")
+                return
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
                 with self._authority_write():
@@ -2578,35 +2662,245 @@ class OperatorCommandStore:
 
     def _startup_recover(self) -> None:
         with self._transaction() as conn:
-            row = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
+            safety = conn.execute(
+                "SELECT * FROM operator_plane_safety WHERE singleton=1"
+            ).fetchone()
             active = conn.execute(
-                "SELECT command_id,method_id,status FROM operator_plane_commands WHERE status IN ('dispatched','issued_pending','stop_requested','abort_requested')"
+                """
+                SELECT c.command_id,c.method_id,c.status,c.action_id,c.dispatch_attempt_id,
+                       c.ownership_generation,d.command_id AS deck_plan_id,d.delivery_attempted,
+                       w.command_id AS wp8_plan_id,
+                       d.plan_digest,d.semantic_state_committed,d.provider_evidence_json,
+                       EXISTS(SELECT 1 FROM operator_plane_delivery_attempts a WHERE a.command_id=c.command_id) AS has_delivery_attempt,
+                       EXISTS(SELECT 1 FROM operator_plane_wp8_background_tasks t WHERE t.command_id=c.command_id AND t.state IN ('created','running','ambiguous')) AS has_unsettled_task
+                FROM operator_plane_commands AS c
+                LEFT JOIN operator_plane_deck_commands AS d ON d.command_id=c.command_id
+                LEFT JOIN operator_plane_wp8_operations AS w ON w.command_id=c.command_id
+                WHERE c.status IN ('dispatched','issued_pending','stop_requested','abort_requested')
+                   OR (
+                       c.status='completed'
+                       AND EXISTS(
+                           SELECT 1 FROM operator_plane_wp8_background_tasks pending
+                           WHERE pending.command_id=c.command_id
+                             AND pending.state IN ('created','running','ambiguous')
+                       )
+                   )
+                """
             ).fetchall()
-            lane = conn.execute("SELECT active_command_id,active_attempt_id FROM operator_plane_lane WHERE singleton=1").fetchone()
-            if not active and (lane is None or (lane["active_command_id"] is None and lane["active_attempt_id"] is None)):
+            lane = conn.execute(
+                "SELECT active_command_id,active_attempt_id FROM operator_plane_lane WHERE singleton=1"
+            ).fetchone()
+            if not active and (
+                lane is None
+                or (lane["active_command_id"] is None and lane["active_attempt_id"] is None)
+            ):
                 return
-            recovery_epoch = int(row["recovery_epoch"]) + 1
-            if active:
-                for item in active:
-                    command_id = str(item["command_id"])
-                    conn.execute(
-                        "UPDATE operator_plane_commands SET status='interrupted',version=version+1,finished_at=?,updated_at=?,terminal_json=? WHERE command_id=?",
-                        (_now(), _now(), _canonical({"reason": "process_owner_loss", "outcome_unknown": True}), command_id),
-                    )
-                    conn.execute("UPDATE serial206_movement_commands SET state='ambiguous',state_version=state_version+1,finished_at=? WHERE command_id=? AND state IN ('dispatched','issued_pending','interrupting')", (_now(), command_id))
-                    conn.execute("UPDATE operator_plane_z_home_authority SET state='invalid',authority_version=authority_version+1,invalidation_reason='process_owner_loss',updated_at=? WHERE singleton=1", (_now(),))
-                    self._insert_transition(conn, event_kind="command_recovery", command_id=command_id, method_id=item["method_id"], state="interrupted", payload={"reason": "process_owner_loss"})
-                method_ids = {str(item["method_id"]) for item in active if item["method_id"]}
-                for method_id in method_ids:
-                    conn.execute("UPDATE operator_plane_methods SET status='recovery_required',version=version+1,updated_at=? WHERE method_id=? AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted')", (_now(), method_id))
-                    self._insert_transition(conn, event_kind="method_recovery", method_id=method_id, state="recovery_required", payload={"reason": "process_owner_loss"})
-            conn.execute("UPDATE operator_plane_lane SET active_command_id=NULL,active_attempt_id=NULL,dispatcher_epoch=dispatcher_epoch+1,updated_at=? WHERE singleton=1", (_now(),))
-            if active:
-                conn.execute(
-                    "UPDATE operator_plane_deck_commands SET ambiguity_state='recovery_required' WHERE command_id IN ({})".format(",".join("?" for _ in active)),
-                    tuple(str(item["command_id"]) for item in active),
+            deck_actions = {
+                "oem.deck.move_to_location",
+                "oem.deck._mov_execution",
+                "oem.deck._finite_operation",
+            }
+            uncertain: list[sqlite3.Row] = []
+            pre_io: list[sqlite3.Row] = []
+            ledger_by_command: dict[str, dict[str, Any]] = {}
+            for item in active:
+                command_id = str(item["command_id"])
+                wp7_stages = [dict(row) for row in conn.execute(
+                    "SELECT stage_order,operation,terminal_state,terminal_evidence_json FROM operator_plane_deck_stages WHERE command_id=? ORDER BY stage_order",
+                    (command_id,),
+                ).fetchall()]
+                wp8_children = [dict(row) for row in conn.execute(
+                    "SELECT child_order,operation,state_mutation_json,terminal_state,terminal_evidence_json FROM operator_plane_wp8_children WHERE command_id=? ORDER BY child_order",
+                    (command_id,),
+                ).fetchall()]
+                background_tasks = [dict(row) for row in conn.execute(
+                    "SELECT child_order,task_id,task_kind,plan_digest,dispatch_attempt_id,authority_stamps_json,state,evidence_json FROM operator_plane_wp8_background_tasks WHERE command_id=? ORDER BY child_order",
+                    (command_id,),
+                ).fetchall()]
+                dispatch_attempts = [dict(row) for row in conn.execute(
+                    "SELECT attempt_sequence,work_kind,work_identity,dispatch_attempt_id,plan_digest,owner_id,ownership_generation,board_epoch_4,board_epoch_5 FROM operator_plane_delivery_attempts WHERE command_id=? ORDER BY attempt_sequence",
+                    (command_id,),
+                ).fetchall()]
+                semantic = conn.execute(
+                    "SELECT ownership_generation,board_epoch_4,board_epoch_5 FROM operator_plane_deck_semantic_state WHERE singleton=1"
+                ).fetchone()
+                contradictions: list[str] = []
+                for attempt in dispatch_attempts:
+                    if (
+                        str(attempt["dispatch_attempt_id"]) != str(item["dispatch_attempt_id"] or "")
+                        or int(attempt["ownership_generation"]) != int(item["ownership_generation"])
+                        or semantic is None
+                        or int(attempt["board_epoch_4"]) != int(semantic["board_epoch_4"])
+                        or int(attempt["board_epoch_5"]) != int(semantic["board_epoch_5"])
+                    ):
+                        contradictions.append("dispatch_attempt_identity_mismatch")
+                        break
+                completed_wp7 = any(str(row["terminal_state"]) == "completed" for row in wp7_stages)
+                completed_wp8 = any(str(row["terminal_state"]) == "completed" for row in wp8_children)
+                missing_wp8_publication = any(
+                    str(row["terminal_state"]) == "completed"
+                    and _json_load(row["state_mutation_json"], {})
+                    and conn.execute(
+                        "SELECT 1 FROM operator_plane_wp8_state_transitions WHERE command_id=? AND child_order=?",
+                        (command_id, int(row["child_order"])),
+                    ).fetchone() is None
+                    for row in wp8_children
                 )
-            conn.execute("UPDATE operator_plane_safety SET recovery_epoch=?,recovery_version=recovery_version+1,recovery_hold=1,updated_at=? WHERE singleton=1", (recovery_epoch, _now()))
+                provider_evidence = _json_load(item["provider_evidence_json"], {}) if item["deck_plan_id"] else {}
+                provider_claims_completion = bool(
+                    provider_evidence.get("controller_completion_verified") is True
+                    or any(
+                        _json_load(row["terminal_evidence_json"], {}).get("provider_evidence", {}).get("controller_completion_verified") is True
+                        for row in wp7_stages
+                    )
+                )
+                if missing_wp8_publication:
+                    contradictions.append("wp8_child_completion_without_state_mutation")
+                if (completed_wp7 or completed_wp8 or provider_claims_completion) and not bool(item["semantic_state_committed"]):
+                    contradictions.append("provider_completion_without_coherent_publication")
+                contradictions = list(dict.fromkeys(contradictions))
+                ledger = {
+                    "wp7_stages": wp7_stages,
+                    "wp8_children": wp8_children,
+                    "background_tasks": background_tasks,
+                    "delivery_marker": {
+                        "delivery_attempted": bool(item["delivery_attempted"]),
+                        "dispatch_attempt_id": item["dispatch_attempt_id"],
+                    },
+                    "dispatch_attempts": dispatch_attempts,
+                    "provider_evidence": provider_evidence,
+                    "contradictions": contradictions,
+                }
+                ledger_by_command[command_id] = ledger
+                durable_activity = bool(
+                    dispatch_attempts or background_tasks
+                    or any(str(row["terminal_state"]) != "planned" for row in wp7_stages)
+                    or any(str(row["terminal_state"]) != "planned" for row in wp8_children)
+                    or provider_claims_completion or contradictions
+                )
+                if (
+                    str(item["action_id"]) in deck_actions
+                    and int(item["delivery_attempted"] or 0) == 0
+                    and int(item["has_delivery_attempt"] or 0) == 0
+                    and int(item["has_unsettled_task"] or 0) == 0
+                    and not durable_activity
+                ):
+                    pre_io.append(item)
+                else:
+                    uncertain.append(item)
+            for item in pre_io:
+                command_id = str(item["command_id"])
+                reason = (
+                    "process_owner_loss_before_deck_plan"
+                    if (
+                        item["deck_plan_id"] is None
+                        and item["wp8_plan_id"] is None
+                    )
+                    else "process_owner_loss_before_first_tx"
+                )
+                evidence = {
+                    "reason": reason,
+                    "outcome_unknown": False,
+                    "delivery_attempted": False,
+                }
+                conn.execute(
+                    "UPDATE operator_plane_commands SET status='failed',version=version+1,"
+                    "finished_at=?,updated_at=?,terminal_json=? WHERE command_id=?",
+                    (_now(), _now(), _canonical(evidence), command_id),
+                )
+                conn.execute(
+                    "UPDATE serial206_movement_commands SET state='failed',"
+                    "state_version=state_version+1,finished_at=? WHERE command_id=? "
+                    "AND state IN ('dispatched','issued_pending','interrupting')",
+                    (_now(), command_id),
+                )
+                self._insert_transition(
+                    conn,
+                    event_kind="command_recovery",
+                    command_id=command_id,
+                    method_id=item["method_id"],
+                    state="failed",
+                    payload=evidence,
+                )
+            if uncertain:
+                recovery_epoch = int(safety["recovery_epoch"]) + 1
+                for item in uncertain:
+                    command_id = str(item["command_id"])
+                    completed_parent = str(item["status"]) == "completed"
+                    evidence = {
+                        "reason": (
+                            "completed_parent_pending_background_process_owner_loss"
+                            if completed_parent else "process_owner_loss"
+                        ),
+                        "outcome_unknown": True,
+                        "delivery_attempted": True,
+                        "ledger_reconciliation": ledger_by_command[command_id],
+                    }
+                    if not completed_parent:
+                        conn.execute(
+                            "UPDATE operator_plane_commands SET status='interrupted',version=version+1,"
+                            "finished_at=?,updated_at=?,terminal_json=? WHERE command_id=?",
+                            (_now(), _now(), _canonical(evidence), command_id),
+                        )
+                        conn.execute(
+                            "UPDATE serial206_movement_commands SET state='ambiguous',"
+                            "state_version=state_version+1,finished_at=? WHERE command_id=? "
+                            "AND state IN ('dispatched','issued_pending','interrupting')",
+                            (_now(), command_id),
+                        )
+                    conn.execute(
+                        "UPDATE operator_plane_z_home_authority SET state='invalid',"
+                        "authority_version=authority_version+1,"
+                        "invalidation_reason='process_owner_loss',updated_at=? WHERE singleton=1",
+                        (_now(),),
+                    )
+                    self._insert_transition(
+                        conn,
+                        event_kind="command_recovery",
+                        command_id=command_id,
+                        method_id=item["method_id"],
+                        state="recovery_required" if completed_parent else "interrupted",
+                        payload=evidence,
+                    )
+                    conn.execute(
+                        "UPDATE operator_plane_wp8_background_tasks SET state='interrupted',evidence_json=?,updated_at=? WHERE command_id=? AND state IN ('created','running','ambiguous')",
+                        (_canonical(evidence), _now(), command_id),
+                    )
+                method_ids = {
+                    str(item["method_id"]) for item in uncertain if item["method_id"]
+                }
+                for method_id in method_ids:
+                    conn.execute(
+                        "UPDATE operator_plane_methods SET status='recovery_required',"
+                        "version=version+1,updated_at=? WHERE method_id=? "
+                        "AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted')",
+                        (_now(), method_id),
+                    )
+                    self._insert_transition(
+                        conn,
+                        event_kind="method_recovery",
+                        method_id=method_id,
+                        state="recovery_required",
+                        payload={"reason": "process_owner_loss"},
+                    )
+                conn.execute(
+                    "UPDATE operator_plane_deck_commands SET ambiguity_state='recovery_required' "
+                    "WHERE command_id IN ({})".format(
+                        ",".join("?" for _ in uncertain)
+                    ),
+                    tuple(str(item["command_id"]) for item in uncertain),
+                )
+                conn.execute(
+                    "UPDATE operator_plane_safety SET recovery_epoch=?,"
+                    "recovery_version=recovery_version+1,recovery_hold=1,updated_at=? "
+                    "WHERE singleton=1",
+                    (recovery_epoch, _now()),
+                )
+            conn.execute(
+                "UPDATE operator_plane_lane SET active_command_id=NULL,active_attempt_id=NULL,"
+                "dispatcher_epoch=dispatcher_epoch+1,updated_at=? WHERE singleton=1",
+                (_now(),),
+            )
 
     def _capacity(self, conn: sqlite3.Connection) -> tuple[int, int]:
         count = int(conn.execute("SELECT COUNT(*) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
@@ -2767,7 +3061,7 @@ class OperatorCommandStore:
         axis = AXIS_BY_ACTION.get(action_id)
         motor_by_axis = {"y": 0, "z": 1}
         composite_xy = action_id.startswith("oem.xy.")
-        deck_movement = action_id == "oem.deck.move_to_location"
+        deck_movement = action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
         composite_xyz = action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
         axis_scope = "xyz" if composite_xyz or deck_movement else "xy" if composite_xy else axis
         board_scope = (
@@ -2859,16 +3153,19 @@ class OperatorCommandStore:
             "SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1"
         ).fetchone()
         unresolved = conn.execute(
-            "SELECT 1 FROM operator_plane_deck_commands d "
-            "WHERE d.ambiguity_state='recovery_required' AND NOT EXISTS ("
-            "SELECT 1 FROM operator_plane_idempotency i "
-            "WHERE i.operation_kind='deck_reconciliation' AND i.command_id=d.command_id"
-            ") LIMIT 1"
+            "SELECT 1 FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
+            "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck._mov_execution','oem.deck._finite_operation') "
+            "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
+            "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) LIMIT 1"
+        ).fetchone()
+        semantic = conn.execute(
+            "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
         ).fetchone()
         if safety is None:
             return "deck_recovery_state_inconsistent"
         hold = bool(safety["recovery_hold"])
-        if hold != (unresolved is not None):
+        legacy_semantic_unresolved = semantic is not None and str(semantic[0]) in {"ambiguous", "recovery_required"}
+        if hold != (unresolved is not None or legacy_semantic_unresolved):
             return "deck_recovery_state_inconsistent"
         return "deck_recovery_hold" if hold else None
 
@@ -3064,6 +3361,12 @@ class OperatorCommandStore:
             "plate_on_gantry": canonical_plate_name(row["plate_on_gantry"]),
             "movable_plate_locations": _json_load(row["movable_plate_locations_json"], {}),
             "pseudo_z_home": int(row["pseudo_z_home"]),
+            "save_tip": bool(row["save_tip"]),
+            "old_well": bool(row["old_well"]),
+            "old_well_text": str(row["old_well_text"]),
+            "old_location": row["old_location"],
+            "plate_pierced": _json_load(row["plate_pierced_json"], {}),
+            "well_pierced": _json_load(row["well_pierced_json"], {}),
             "semantic_state_revision": int(row["semantic_state_revision"]),
             "producer_operation": row["producer_operation"],
             "producer_command_id": row["producer_command_id"],
@@ -3326,17 +3629,317 @@ class OperatorCommandStore:
                     (str(command_id), expected, str(child["operation"]), _canonical(list(child["depends_on"])), _canonical(dict(child.get("arguments") or {})), int(bool(child.get("ignored_return"))), int(bool(child.get("awaited", True))), str(child.get("exception_policy") or "propagate"), _canonical(dict(child.get("state_mutation") or {}))),
                 )
 
-    def terminalize_wp8_child(self, command_id: str, child_order: int, *, state: str, result: Any) -> None:
+    def record_delivery_attempt(
+        self, command_id: str, *, work_kind: str, work_identity: str,
+        plan_digest: str, authority_stamps: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._transaction() as conn:
+            command = conn.execute(
+                "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,"
+                "s.board_epoch_4,s.board_epoch_5 "
+                "FROM operator_plane_commands AS c "
+                "JOIN serial206_movement_commands AS m ON m.command_id=c.command_id "
+                "JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1 "
+                "WHERE c.command_id=? AND c.status='dispatched' AND m.state='dispatched'",
+                (str(command_id),),
+            ).fetchone()
+            lane = conn.execute("SELECT owner_id,owner_lease_until FROM operator_plane_lane WHERE singleton=1").fetchone()
+            if command is None or not command["dispatch_attempt_id"] or lane is None or lane["owner_id"] != self.owner_id or float(lane["owner_lease_until"] or 0) <= _now():
+                raise RuntimeError("delivery attempt dispatch authority is stale")
+            supplied = dict(authority_stamps or {
+                "ownership_generation": int(command["ownership_generation"]),
+                "board_epoch_4": int(command["board_epoch_4"]),
+                "board_epoch_5": int(command["board_epoch_5"]),
+            })
+            generation = int(supplied.get("ownership_generation", -1))
+            if generation != int(command["ownership_generation"]):
+                raise RuntimeError("delivery attempt ownership generation mismatch")
+            expected_epochs = _json_load(command["expected_board_epochs_json"], {})
+            if (
+                int(supplied.get("board_epoch_4", -1)) != int(command["board_epoch_4"])
+                or int(supplied.get("board_epoch_5", -1)) != int(command["board_epoch_5"])
+                or expected_epochs != {
+                    "4": int(command["board_epoch_4"]),
+                    "5": int(command["board_epoch_5"]),
+                }
+            ):
+                raise RuntimeError("delivery attempt board epoch mismatch")
+            row = conn.execute("INSERT INTO operator_plane_delivery_attempts(command_id,work_kind,work_identity,dispatch_attempt_id,plan_digest,owner_id,ownership_generation,board_epoch_4,board_epoch_5,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING attempt_sequence", (str(command_id), str(work_kind), str(work_identity), str(command["dispatch_attempt_id"]), str(plan_digest), self.owner_id, generation, int(supplied["board_epoch_4"]), int(supplied["board_epoch_5"]), _now())).fetchone()
+            assert row is not None
+            return {"attempt_sequence": int(row[0]), "dispatch_attempt_id": str(command["dispatch_attempt_id"])}
+
+    def has_delivery_attempt(self, command_id: str) -> bool:
+        return self.connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM operator_plane_delivery_attempts WHERE command_id=?)",
+            (str(command_id),),
+        ).fetchone()[0] == 1
+
+    def create_wp8_background_task(self, command_id: str, child_order: int, *, task_id: str, task_kind: str, plan_digest: str, authority_stamps: Mapping[str, Any]) -> dict[str, Any]:
+        with self._transaction() as conn:
+            command = conn.execute(
+                """
+                SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,
+                       lane.owner_id,lane.owner_lease_until,
+                       semantic.ownership_generation AS current_ownership,
+                       semantic.board_epoch_4,semantic.board_epoch_5
+                FROM operator_plane_commands AS c
+                JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
+                JOIN operator_plane_lane AS lane ON lane.singleton=1
+                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
+                WHERE c.command_id=? AND c.status='dispatched'
+                """,
+                (str(command_id),),
+            ).fetchone()
+            supplied = dict(authority_stamps)
+            expected_epochs = _json_load(
+                command["expected_board_epochs_json"], {},
+            ) if command is not None else {}
+            if (
+                command is None
+                or not command["dispatch_attempt_id"]
+                or str(command["state"]) != "dispatched"
+                or str(command["owner_id"] or "") != self.owner_id
+                or float(command["owner_lease_until"] or 0.0) <= _now()
+                or int(command["ownership_generation"]) != int(command["current_ownership"])
+                or int(supplied.get("ownership_generation", -1)) != int(command["current_ownership"])
+                or int(supplied.get("board_epoch_4", -1)) != int(command["board_epoch_4"])
+                or int(supplied.get("board_epoch_5", -1)) != int(command["board_epoch_5"])
+                or expected_epochs != {
+                    "4": int(command["board_epoch_4"]),
+                    "5": int(command["board_epoch_5"]),
+                }
+            ):
+                raise RuntimeError("wp8 background task dispatch authority is stale")
+            marker = self.record_delivery_attempt(
+                str(command_id),
+                work_kind="wp8_background_task",
+                work_identity=f"child:{int(child_order)}:{str(task_kind)}",
+                plan_digest=str(plan_digest), authority_stamps=supplied,
+            )
+            now = _now()
+            conn.execute(
+                "INSERT INTO operator_plane_wp8_background_tasks("
+                "command_id,child_order,task_id,task_kind,plan_digest,dispatch_attempt_id,"
+                "delivery_attempt_sequence,authority_stamps_json,state,evidence_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,'created','{}',?,?)",
+                (
+                    str(command_id), int(child_order), str(task_id), str(task_kind),
+                    str(plan_digest), str(command["dispatch_attempt_id"]),
+                    int(marker["attempt_sequence"]), _canonical(supplied), now, now,
+                ),
+            )
+            return marker
+
+    def mark_wp8_background_task(self, command_id: str, child_order: int, *, state: str, evidence: Mapping[str, Any]) -> None:
+        if state not in {"running", "completed", "failed", "ambiguous", "interrupted"}:
+            raise ValueError("invalid WP8 background task state")
+        with self._transaction() as conn:
+            changed = conn.execute("UPDATE operator_plane_wp8_background_tasks SET state=?,evidence_json=?,updated_at=? WHERE command_id=? AND child_order=? AND state IN ('created','running')", (state, _canonical(dict(evidence)), _now(), str(command_id), int(child_order))).rowcount
+            if changed != 1:
+                current = conn.execute(
+                    "SELECT state FROM operator_plane_wp8_background_tasks WHERE command_id=? AND child_order=?",
+                    (str(command_id), int(child_order)),
+                ).fetchone()
+                if state != "running" or current is None or str(current["state"]) not in {"completed", "failed"}:
+                    raise RuntimeError("wp8 background task state is stale")
+
+    def settle_wp8_background_task(self, task_id: str, *, state: str, evidence: Mapping[str, Any]) -> None:
+        if state not in {"completed", "failed", "ambiguous"}:
+            raise ValueError("invalid WP8 background terminal state")
+        with self._transaction() as conn:
+            now = _now()
+            changed = conn.execute(
+                """
+                UPDATE operator_plane_wp8_background_tasks
+                SET state=?,evidence_json=?,updated_at=?
+                WHERE task_id=? AND state IN ('created','running')
+                  AND EXISTS (
+                    SELECT 1 FROM operator_plane_delivery_attempts AS attempt
+                    JOIN operator_plane_commands AS command ON command.command_id=attempt.command_id
+                    JOIN serial206_movement_commands AS movement ON movement.command_id=command.command_id
+                    JOIN operator_plane_lane AS lane ON lane.singleton=1
+                    JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
+                    WHERE attempt.attempt_sequence=operator_plane_wp8_background_tasks.delivery_attempt_sequence
+                      AND attempt.command_id=operator_plane_wp8_background_tasks.command_id
+                      AND attempt.dispatch_attempt_id=operator_plane_wp8_background_tasks.dispatch_attempt_id
+                      AND attempt.plan_digest=operator_plane_wp8_background_tasks.plan_digest
+                      AND attempt.owner_id=? AND lane.owner_id=attempt.owner_id
+                      AND lane.owner_lease_until>?
+                      AND command.status IN ('dispatched','issued_pending')
+                      AND movement.state IN ('dispatched','issued_pending')
+                      AND command.dispatch_attempt_id=attempt.dispatch_attempt_id
+                      AND command.ownership_generation=attempt.ownership_generation
+                      AND semantic.ownership_generation=attempt.ownership_generation
+                      AND semantic.board_epoch_4=attempt.board_epoch_4
+                      AND semantic.board_epoch_5=attempt.board_epoch_5
+                      AND CAST(json_extract(movement.expected_board_epochs_json,'$.4') AS INTEGER)=attempt.board_epoch_4
+                      AND CAST(json_extract(movement.expected_board_epochs_json,'$.5') AS INTEGER)=attempt.board_epoch_5
+                  )
+                """,
+                (state, _canonical(dict(evidence)), now, str(task_id), self.owner_id, now),
+            ).rowcount
+            if changed != 1:
+                current = conn.execute(
+                    "SELECT state FROM operator_plane_wp8_background_tasks WHERE task_id=?",
+                    (str(task_id),),
+                ).fetchone()
+                if current is not None and str(current["state"]) == state:
+                    return
+                raise RuntimeError("wp8 background task terminal authority is stale")
+            owner = conn.execute(
+                "SELECT t.command_id,c.status FROM operator_plane_wp8_background_tasks AS t "
+                "JOIN operator_plane_commands AS c ON c.command_id=t.command_id WHERE t.task_id=?",
+                (str(task_id),),
+            ).fetchone()
+            if owner is not None and str(owner["status"]) == "issued_pending":
+                self.resolve_wp8_parent_after_background(str(owner["command_id"]))
+
+    def resolve_wp8_parent_after_background(
+        self,
+        command_id: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Keep the parent pending until every durable background task is terminal."""
+        with self._transaction() as conn:
+            command = conn.execute(
+                "SELECT * FROM operator_plane_commands WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+            if command is None:
+                return {"command_id": str(command_id), "status": "missing"}
+            if str(command["status"]) in COMMAND_TERMINAL:
+                return self._command_response(command)
+            tasks = conn.execute(
+                "SELECT state FROM operator_plane_wp8_background_tasks "
+                "WHERE command_id=? ORDER BY child_order",
+                (str(command_id),),
+            ).fetchall()
+            if not tasks:
+                raise RuntimeError("wp8_background_parent_has_no_durable_tasks")
+            states = [str(row["state"]) for row in tasks]
+            parent_payload = dict(
+                payload if payload is not None else _json_load(command["terminal_json"], {})
+            )
+            if any(state in {"created", "running"} for state in states):
+                if str(command["status"]) == "dispatched":
+                    return self.mark_dispatched(
+                        str(command_id),
+                        payload={**parent_payload, "background_terminal_state": "pending"},
+                    )
+                return self._command_response(command)
+
+            background_terminal_state = (
+                "ambiguous"
+                if any(state in {"ambiguous", "interrupted"} for state in states)
+                else ("failed" if any(state == "failed" for state in states) else "completed")
+            )
+            raw_response = parent_payload.get("response")
+            operation_result = dict(raw_response) if isinstance(raw_response, Mapping) else {}
+            operation_result.update({
+                "background_pending": False,
+                "background_terminal_state": background_terminal_state,
+            })
+            if background_terminal_state != "completed":
+                operation_result.update({"ok": False, "outcome_unknown": True})
+            operation = conn.execute(
+                "SELECT terminal_result_json FROM operator_plane_wp8_operations WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+            if operation is not None and operation["terminal_result_json"] is None:
+                self.finalize_wp8_operation(str(command_id), operation_result)
+            terminal_payload = {
+                **parent_payload,
+                "response": operation_result,
+                "background_terminal_state": background_terminal_state,
+            }
+            if background_terminal_state != "completed":
+                self.mark_deck_recovery_required(
+                    str(command_id),
+                    reason=f"wp8_background_task_{background_terminal_state}",
+                    controller_command_acknowledged=False,
+                    controller_completion_verified=False,
+                    hardware_postcondition_verified=False,
+                    provider_results=None,
+                )
+                return self.finish(
+                    str(command_id), status="ambiguous", payload=terminal_payload,
+                )
+            return self.finish(
+                str(command_id), status="completed", payload=terminal_payload,
+            )
+
+    def assert_wp8_background_tasks_settled(self, command_id: str) -> None:
+        row = self.connection.execute("SELECT state FROM operator_plane_wp8_background_tasks WHERE command_id=? AND state NOT IN ('completed','failed') LIMIT 1", (str(command_id),)).fetchone()
+        if row is not None:
+            raise RuntimeError(f"wp8_background_task_unsettled:{row['state']}")
+
+    def terminalize_wp8_child(
+        self, command_id: str, child_order: int, *, state: str, result: Any,
+        dispatch_attempt_id: str | None = None,
+    ) -> None:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 terminal state")
         evidence = {"result": _bounded_json(result, 131072), "terminalized_at": _now()}
         with self._transaction() as conn:
-            changed = conn.execute(
-                "UPDATE operator_plane_wp8_children SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND child_order=? AND terminal_state='planned'",
-                (state, _canonical(evidence), str(command_id), int(child_order)),
-            ).rowcount
+            active = conn.execute(
+                """
+                SELECT c.dispatch_attempt_id,c.ownership_generation,
+                       m.state,m.expected_board_epochs_json,
+                       lane.owner_id,lane.owner_lease_until,
+                       semantic.ownership_generation AS current_ownership,
+                       semantic.board_epoch_4,semantic.board_epoch_5
+                FROM operator_plane_commands AS c
+                JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
+                JOIN operator_plane_lane AS lane ON lane.singleton=1
+                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
+                WHERE c.command_id=? AND c.status='dispatched'
+                """,
+                (str(command_id),),
+            ).fetchone()
+            expected_epochs = _json_load(
+                active["expected_board_epochs_json"], {},
+            ) if active is not None else {}
+            if (
+                active is None
+                or str(active["state"]) != "dispatched"
+                or str(active["owner_id"] or "") != self.owner_id
+                or float(active["owner_lease_until"] or 0.0) <= _now()
+                or int(active["ownership_generation"]) != int(active["current_ownership"])
+                or expected_epochs != {
+                    "4": int(active["board_epoch_4"]),
+                    "5": int(active["board_epoch_5"]),
+                }
+                or (
+                    dispatch_attempt_id is not None
+                    and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
+                )
+            ):
+                raise RuntimeError("wp8 child completion authority is stale")
+            with self._authority_write():
+                changed = conn.execute(
+                    "UPDATE operator_plane_wp8_children SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND child_order=? AND terminal_state='planned'",
+                    (state, _canonical(evidence), str(command_id), int(child_order)),
+                ).rowcount
             if changed != 1:
                 raise RuntimeError("wp8 child already terminal or absent")
+
+    def complete_wp8_child(
+        self, command_id: str, child_order: int, *, result: Any,
+        state_mutation: Mapping[str, Any], authority_stamps: Mapping[str, Any],
+        dispatch_attempt_id: str | None = None,
+    ) -> None:
+        """CAS-complete one WP8 child and publish its mutation in one transaction."""
+        with self._transaction():
+            self.terminalize_wp8_child(
+                command_id, child_order, state="completed", result=result,
+                dispatch_attempt_id=dispatch_attempt_id,
+            )
+            if state_mutation:
+                self.persist_wp8_state_mutation(
+                    command_id, child_order, state_mutation,
+                    authority_stamps=authority_stamps,
+                )
 
     def persist_wp8_state_mutation(self, command_id: str, child_order: int, mutation: Mapping[str, Any], *, authority_stamps: Mapping[str, Any]) -> None:
         with self._transaction() as conn:
@@ -3398,7 +4001,21 @@ class OperatorCommandStore:
 
     def persist_mov_execution_plan(self, command_id: str, plan: Any) -> None:
         """Persist the WP7 plan and every child before its first provider TX."""
-        self.persist_deck_plan(command_id, plan)
+        with self._transaction() as conn:
+            self.persist_deck_plan(command_id, plan)
+            for step in plan.steps:
+                for child_order, child in enumerate(getattr(step, "source_children", ())):
+                    conn.execute(
+                        """
+                        INSERT INTO operator_plane_mov_execution_children(
+                            command_id,stage_order,child_order,operation,arguments_json,join_kind
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        (
+                            str(command_id), int(step.order), int(child_order), str(child.operation),
+                            _canonical(dict(child.arguments or {})), getattr(step, "join", None),
+                        ),
+                    )
 
     def terminalize_mov_execution_stage(
         self,
@@ -3409,43 +4026,187 @@ class OperatorCommandStore:
         result: Mapping[str, Any] | None = None,
         reason: str | None = None,
         source_return_disposition: str | None = None,
+        dispatch_attempt_id: str | None = None,
     ) -> None:
+        if state not in {"completed", "failed", "ambiguous", "stopped", "aborted"}:
+            raise ValueError(state)
         evidence = dict(result or {})
         if source_return_disposition is not None:
             evidence["source_return_disposition"] = source_return_disposition
-        if getattr(step, "source_children", ()):
+        children: tuple[Any, ...] = tuple(getattr(step, "source_children", ()))
+        if children:
             evidence["source_children"] = [
                 {"operation": child.operation, "arguments": dict(child.arguments or {})}
-                for child in step.source_children
+                for child in children
             ]
             evidence["join"] = getattr(step, "join", None)
-        self.terminalize_deck_stage(command_id, step, state=state, result=evidence, reason=reason)
+        stage_evidence = self._deck_stage_evidence(step, evidence, reason=reason)
+        with self._transaction() as conn:
+            active = conn.execute(
+                """
+                SELECT c.dispatch_attempt_id,c.ownership_generation,
+                       m.state,m.expected_board_epochs_json,
+                       lane.owner_id,lane.owner_lease_until,
+                       semantic.ownership_generation AS current_ownership,
+                       semantic.board_epoch_4,semantic.board_epoch_5
+                FROM operator_plane_commands AS c
+                JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
+                JOIN operator_plane_lane AS lane ON lane.singleton=1
+                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
+                WHERE c.command_id=? AND c.status='dispatched'
+                """,
+                (str(command_id),),
+            ).fetchone()
+            expected_epochs = _json_load(
+                active["expected_board_epochs_json"], {},
+            ) if active is not None else {}
+            if (
+                active is None
+                or str(active["state"]) != "dispatched"
+                or str(active["owner_id"] or "") != self.owner_id
+                or float(active["owner_lease_until"] or 0.0) <= _now()
+                or int(active["ownership_generation"]) != int(active["current_ownership"])
+                or expected_epochs != {
+                    "4": int(active["board_epoch_4"]),
+                    "5": int(active["board_epoch_5"]),
+                }
+                or (
+                    dispatch_attempt_id is not None
+                    and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
+                )
+            ):
+                raise RuntimeError("movExecution stage completion authority is stale")
+            with self._authority_write():
+                changed = conn.execute(
+                    "UPDATE operator_plane_deck_stages SET terminal_state=?,terminal_evidence_json=? "
+                    "WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
+                    (state, _canonical(stage_evidence), str(command_id), int(step.order)),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("movExecution stage is already terminal or absent")
+                if children:
+                    changed_children = conn.execute(
+                        """
+                        UPDATE operator_plane_mov_execution_children
+                        SET terminal_state=?,terminal_evidence_json=?
+                        WHERE command_id=? AND stage_order=? AND terminal_state='planned'
+                        """,
+                        (str(state), _canonical(evidence), str(command_id), int(step.order)),
+                    ).rowcount
+                    if changed_children != len(children):
+                        raise RuntimeError("movExecution child completion identity is stale")
+
+    def complete_mov_execution_stage(
+        self, command_id: str, step: Any, *, result: Mapping[str, Any],
+        semantic_transition: Mapping[str, Any],
+        source_return_disposition: str | None = None,
+        dispatch_attempt_id: str | None = None,
+    ) -> int:
+        """CAS-complete one WP7 stage and publish semantics in one transaction."""
+        with self._transaction():
+            self.terminalize_mov_execution_stage(
+                command_id, step, state="completed", result=result,
+                source_return_disposition=source_return_disposition,
+                dispatch_attempt_id=dispatch_attempt_id,
+            )
+            return self.publish_mov_execution_transition(command_id, semantic_transition)
 
     def publish_mov_execution_transition(self, command_id: str, transition: Mapping[str, Any]) -> int:
         """Publish one source-ordered WP7 semantic child as its own revision."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
         with self._transaction() as conn:
             current = conn.execute(
                 "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
             if current is None:
                 raise RuntimeError("deck semantic state unavailable")
+            command = conn.execute(
+                """
+                SELECT c.ownership_generation,c.status,c.dispatch_attempt_id,
+                       lane.owner_id,lane.owner_lease_until,
+                       deck.ambiguity_state
+                FROM operator_plane_commands AS c
+                JOIN operator_plane_lane AS lane ON lane.singleton=1
+                JOIN operator_plane_deck_commands AS deck ON deck.command_id=c.command_id
+                WHERE c.command_id=? AND c.action_id='oem.deck._mov_execution'
+                """,
+                (str(command_id),),
+            ).fetchone()
+            if command is None:
+                raise RuntimeError("movExecution command authority unavailable")
+            if (
+                str(command["status"]) not in {"dispatched", "issued_pending"}
+                or str(command["dispatch_attempt_id"] or "") == ""
+                or str(command["owner_id"] or "") != self.owner_id
+                or float(command["owner_lease_until"] or 0.0) <= _now()
+                or str(command["ambiguity_state"]) != "none"
+            ):
+                raise RuntimeError("movExecution dispatch authority is stale")
             before = int(current["semantic_state_revision"])
             after = before + 1
             locations = _json_load(current["movable_plate_locations_json"], {})
-            current_location = current["current_location"]
-            current_well = current["current_well"]
-            source_operation = "continuation"
+            pierced_plates = _json_load(current["plate_pierced_json"], {})
+            pierced_wells = _json_load(current["well_pierced_json"], {})
+            values = {
+                "current_location": current["current_location"],
+                "current_well": current["current_well"],
+                "save_tip": int(current["save_tip"]),
+                "old_well": int(current["old_well"]),
+                "old_well_text": current["old_well_text"],
+                "old_location": current["old_location"],
+            }
+            source_operation = "movExecution_state"
             if "current_location" in transition:
+                location_id = transition["current_location"]
+                well_id = transition.get("current_well")
+                if type(location_id) is not int or location_id not in LOCATION_ID_TO_NAME:
+                    raise ValueError("movExecution current location is not authoritative")
+                if type(well_id) is not int:
+                    raise ValueError("movExecution current well is not authoritative")
                 source_operation = "updateLocation"
-                current_location = str(transition["current_location"])
-                current_well = int(transition["current_well"])
+                values["current_location"] = LOCATION_ID_TO_NAME[location_id]
+                values["current_well"] = well_id
             elif "plate_name" in transition and "plate_location" in transition:
+                plate = canonical_plate_name(transition["plate_name"])
+                location_id = transition["plate_location"]
+                if plate is None or type(location_id) is not int or location_id not in LOCATION_ID_TO_NAME:
+                    raise ValueError("movExecution plate location is not authoritative")
                 source_operation = "updatePlateLocation"
-                locations[str(transition["plate_name"])] = str(transition["plate_location"])
+                locations[plate_name_for_storage(plate)] = LOCATION_ID_TO_NAME[location_id]
             elif "plate_pierced" in transition:
+                plate = canonical_plate_name(transition["plate_pierced"])
+                if plate is None:
+                    raise ValueError("movExecution pierced plate is not authoritative")
                 source_operation = "continuation:plate_pierced"
+                pierced_plates[str(plate)] = True
             elif "well_pierced" in transition:
+                key = transition["well_pierced"]
+                if (
+                    not isinstance(key, (list, tuple))
+                    or len(key) != 3
+                    or type(key[1]) is not int
+                    or key[2] not in {0, 1, "strip"}
+                ):
+                    raise ValueError("movExecution pierced well is not authoritative")
+                plate = canonical_plate_name(key[0])
+                if plate is None or (key[2] == "strip") != (plate in {7, 8, 9, 10}):
+                    raise ValueError("movExecution pierced well plate is not authoritative")
                 source_operation = "continuation:well_pierced"
+                pierced_wells[f"{plate}:{int(key[1])}:{key[2]}"] = True
+            else:
+                allowed = {"save_tip", "old_well", "old_well_text", "old_location"}
+                if not transition or set(transition) - allowed:
+                    raise ValueError("movExecution state transition is not permitted")
+                if "save_tip" in transition and type(transition["save_tip"]) is not bool:
+                    raise ValueError("movExecution save_tip must be boolean")
+                if "old_well" in transition and type(transition["old_well"]) is not bool:
+                    raise ValueError("movExecution old_well must be boolean")
+                if "old_well_text" in transition and type(transition["old_well_text"]) is not str:
+                    raise ValueError("movExecution old_well_text must be text")
+                if "old_location" in transition and type(transition["old_location"]) is not int:
+                    raise ValueError("movExecution old_location must be integer")
+                values.update(dict(transition))
             provenance = {
                 "source_operation": source_operation,
                 "command_id": str(command_id),
@@ -3453,19 +4214,25 @@ class OperatorCommandStore:
                 "after_revision": after,
                 "transition": dict(transition),
             }
-            conn.execute(
-                """
-                UPDATE operator_plane_deck_semantic_state
-                SET current_location=?,current_well=?,movable_plate_locations_json=?,
-                    semantic_state_revision=?,producer_operation=?,producer_command_id=?,
-                    transition_provenance_json=?,ambiguity_state='none',updated_at=?
-                WHERE singleton=1
-                """,
-                (
-                    current_location, current_well, _canonical(locations), after,
-                    source_operation, str(command_id), _canonical(provenance), _now(),
-                ),
-            )
+            with self._authority_write():
+                conn.execute(
+                    """
+                    UPDATE operator_plane_deck_semantic_state
+                    SET current_location=?,current_well=?,movable_plate_locations_json=?,
+                        save_tip=?,old_well=?,old_well_text=?,old_location=?,
+                        plate_pierced_json=?,well_pierced_json=?,
+                        semantic_state_revision=?,producer_operation=?,producer_command_id=?,
+                        transition_provenance_json=?,ambiguity_state='none',updated_at=?
+                    WHERE singleton=1
+                    """,
+                    (
+                        values["current_location"], values["current_well"], _canonical(locations),
+                        int(bool(values["save_tip"])), int(bool(values["old_well"])),
+                        str(values["old_well_text"]), values["old_location"],
+                        _canonical(pierced_plates), _canonical(pierced_wells), after,
+                        source_operation, str(command_id), _canonical(provenance), _now(),
+                    ),
+                )
             row = conn.execute(
                 """
                 INSERT INTO operator_plane_deck_semantic_transitions(
@@ -3475,6 +4242,10 @@ class OperatorCommandStore:
                 (str(command_id), source_operation, before, after, _canonical(provenance), _now()),
             ).fetchone()
             assert row is not None
+            self._insert_transition(
+                conn, event_kind="mov_execution_semantic_transition", command_id=str(command_id),
+                state="confirmed", payload=provenance,
+            )
             return int(row[0])
 
     @staticmethod
@@ -3760,9 +4531,10 @@ class OperatorCommandStore:
         assessment: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         action_id = str(request.get("action_id") or "")
-        if action_id not in ALLOWED_ACTIONS:
+        internal = action_id in INTERNAL_ACTIONS and getattr(self._internal_admission, "depth", 0) > 0
+        if action_id not in ALLOWED_ACTIONS and not internal:
             raise HTTPException(status_code=422, detail={"error": "action_not_allowed", "action_id": action_id})
-        if action_id == "oem.deck.move_to_location":
+        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
             blocker = self.deck_recovery_blocker()
             if blocker is not None:
                 raise HTTPException(status_code=409, detail={"error": blocker})
@@ -3778,7 +4550,7 @@ class OperatorCommandStore:
         }
         observed_board_epochs = _active_board_epochs(state, action_id)
         expected_board_epochs: dict[str, int] = {}
-        if action_id == "oem.deck.move_to_location":
+        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
             actual_generation = int(state.get("ownership_generation") or -1)
@@ -3860,6 +4632,95 @@ class OperatorCommandStore:
             self._store_idempotency(conn, kind="command", key=key, fingerprint=fingerprint, response=response, command_id=command_id)
         self._wake.set()
         return response
+
+    def admit_internal_mov_execution(
+        self,
+        intent: ClassMoveToIntent,
+        *,
+        state: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Admit one source-shaped ClassMoveTo from trusted workflow code only."""
+        if not isinstance(intent, ClassMoveToIntent):
+            raise TypeError("ClassMoveToIntent is required")
+        inputs = {
+            "script_line": intent.script_line,
+            "plate_name": intent.plate_name,
+            "location_id": intent.location_id,
+            "well": intent.well,
+            "material": intent.material,
+            "continuation": intent.continuation,
+        }
+        epochs = _active_board_epochs(state, "oem.deck._mov_execution")
+        if set(epochs) != {"4", "5"}:
+            raise RuntimeError("mov_execution_board_authority_unavailable")
+        request = {
+            "schema_version": ACTION_REQUEST_SCHEMA,
+            "action_id": "oem.deck._mov_execution",
+            "idempotency_key": idempotency_key or f"movExecution:{uuid.uuid4()}",
+            "expected_ownership_generation": int(state.get("ownership_generation") or -1),
+            "expected_board_epoch_by_board": epochs,
+            "inputs": inputs,
+        }
+        depth = int(getattr(self._internal_admission, "depth", 0))
+        self._internal_admission.depth = depth + 1
+        try:
+            return self.admit_command(request, state=state, assessment=None)
+        finally:
+            self._internal_admission.depth = depth
+
+    def admit_internal_wp8_operation(
+        self,
+        operation: str,
+        *,
+        inputs: Mapping[str, Any],
+        state: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Admit one finite source-owned deck operation from trusted workflow code."""
+        allowed_intent_keys = WP8_OPERATION_INTENT_KEYS.get(operation)
+        if allowed_intent_keys is None:
+            raise HTTPException(status_code=422, detail={"error": "finite_operation_not_supported", "operation": operation})
+        override_keys = sorted(set(inputs) - set(allowed_intent_keys))
+        if override_keys:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "workflow_state_override_forbidden",
+                    "operation": operation,
+                    "keys": override_keys,
+                },
+            )
+        destination = inputs.get("destination")
+        if type(destination) is int:
+            from .oem_compat.position_table import load_bound_oem_position_table
+            require_serial206_machine_target(destination, load_bound_oem_position_table())
+        validated = _validate_inputs(
+            "oem.deck._finite_operation",
+            {"operation": operation, "operation_inputs": dict(inputs)},
+        )
+        epoch_state = (
+            state
+            if isinstance(state.get("serial206_initialization_provider"), Mapping)
+            else {**dict(state), "serial206_initialization_provider": dict(state)}
+        )
+        epochs = _active_board_epochs(epoch_state, "oem.deck._finite_operation")
+        if set(epochs) != {"4", "5"}:
+            raise RuntimeError("finite_deck_operation_board_authority_unavailable")
+        request = {
+            "schema_version": ACTION_REQUEST_SCHEMA,
+            "action_id": "oem.deck._finite_operation",
+            "idempotency_key": idempotency_key or f"finiteDeckOperation:{uuid.uuid4()}",
+            "expected_ownership_generation": int(state.get("ownership_generation") or -1),
+            "expected_board_epoch_by_board": epochs,
+            "inputs": validated,
+        }
+        depth = int(getattr(self._internal_admission, "depth", 0))
+        self._internal_admission.depth = depth + 1
+        try:
+            return self.admit_command(request, state=epoch_state, assessment=None)
+        finally:
+            self._internal_admission.depth = depth
 
     def admit_method(
         self,
@@ -4428,15 +5289,40 @@ class OperatorCommandStore:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             semantic = conn.execute("SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
             command = conn.execute(
-                "SELECT c.status,c.action_id,c.ownership_generation,d.target,d.position_table_revision,"
-                "d.destination_catalog_revision,d.ambiguity_state,m.expected_board_epochs_json "
+                "SELECT c.status,c.action_id,c.ownership_generation,c.stream_sequence,c.dispatch_attempt_id,"
+                "d.target,d.position_table_revision,d.destination_catalog_revision,d.authority_snapshot_digest,"
+                "d.plan_digest,d.ambiguity_state,m.expected_board_epochs_json "
                 "FROM operator_plane_commands c JOIN operator_plane_deck_commands d USING(command_id) "
                 "JOIN serial206_movement_commands m USING(command_id) WHERE c.command_id=?",
                 (str(command_id),),
             ).fetchone()
+            decision_identity = None if command is None else {
+                "decision_id": str(reconciliation_decision["decision_id"]),
+                "approved_by": str(reconciliation_decision["approved_by"]),
+                "reason": str(reconciliation_decision["reason"]),
+                "command_id": str(command_id),
+                "stream_sequence": int(command["stream_sequence"]),
+                "dispatch_attempt_id": command["dispatch_attempt_id"],
+                "recovery_epoch": int(safety["recovery_epoch"]),
+                "plan_digest": str(command["plan_digest"]),
+                "authority_snapshot_digest": str(command["authority_snapshot_digest"]),
+                "position_table_revision": str(command["position_table_revision"]),
+                "destination_catalog_revision": str(command["destination_catalog_revision"]),
+                "controller_observation_id": str(observation["observation_id"]),
+                "current_location": current_location,
+                "current_well": current_well,
+            }
+            existing_decision = conn.execute(
+                "SELECT decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE decision_id=?",
+                (str(reconciliation_decision["decision_id"]),),
+            ).fetchone()
+            if existing_decision is not None:
+                if decision_identity is None or str(existing_decision["decision_json"]) != _canonical(decision_identity):
+                    raise ValueError("deck recovery decision_id identity conflict")
+                return _json_load(existing_decision["receipt_json"], {})
             if (
                 command is None
-                or str(command["action_id"]) != "oem.deck.move_to_location"
+                or str(command["action_id"]) not in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
                 or str(command["status"]) not in {"ambiguous", "interrupted"}
                 or str(command["ambiguity_state"]) != "recovery_required"
             ):
@@ -4487,24 +5373,23 @@ class OperatorCommandStore:
                 "machine_latch_closed": bool(authority["machine_latch_closed"]),
                 "latch_observation_id": str(authority["latch_observation_id"]),
             }
-            conn.execute(
-                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,semantic_state_revision=?,producer_operation='governed_deck_reconciliation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
-                (
-                    current_location, current_well, after, str(command_id), int(authority["ownership_generation"]),
-                    int(board_epochs["4"]), int(board_epochs["5"]), _canonical(provenance), _now(),
-                ),
-            )
+            with self._authority_write():
+                conn.execute(
+                    "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,semantic_state_revision=?,producer_operation='governed_deck_reconciliation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                    (
+                        current_location, current_well, after, str(command_id), int(authority["ownership_generation"]),
+                        int(board_epochs["4"]), int(board_epochs["5"]), _canonical(provenance), _now(),
+                    ),
+                )
             transition_row = conn.execute(
                 "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,'governed_deck_reconciliation',?,?,?,?) RETURNING transition_revision",
                 (str(command_id), before, after, _canonical(provenance), _now()),
             ).fetchone()
             assert transition_row is not None
-            conn.execute(
-                "UPDATE operator_plane_deck_commands SET ambiguity_state='none',physical_observation_verified=0 WHERE command_id=? AND ambiguity_state='recovery_required'",
-                (str(command_id),),
-            )
             unresolved = conn.execute(
-                "SELECT 1 FROM operator_plane_deck_commands WHERE ambiguity_state='recovery_required' LIMIT 1"
+                "SELECT 1 FROM operator_plane_deck_commands d WHERE d.ambiguity_state='recovery_required' "
+                "AND d.command_id<>? AND NOT EXISTS(SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=d.command_id) LIMIT 1",
+                (str(command_id),),
             ).fetchone()
             if unresolved is not None:
                 raise ValueError("another deck ambiguity still requires reconciliation")
@@ -4516,13 +5401,28 @@ class OperatorCommandStore:
                 conn, event_kind="deck_reconciled", command_id=str(command_id), state="reconciled",
                 payload={"semantic_state_revision": after, "decision_id": reconciliation_decision["decision_id"]},
             )
-            return {
+            receipt = {
                 "schema_version": "bioxp.operator_deck_reconciliation.v1",
                 "command_id": str(command_id), "semantic_state_revision": after,
                 "transition_revision": int(transition_row[0]), "transition_sequence": transition_sequence,
                 "reconciliation_decision": reconciliation_decision,
                 "controller_position_observation": observation,
             }
+            if decision_identity is None or decision_identity["dispatch_attempt_id"] is None:
+                raise ValueError("deck recovery decision dispatch identity is unavailable")
+            with self._authority_write():
+                conn.execute(
+                    "INSERT INTO operator_plane_deck_recovery_decisions(decision_id,command_id,stream_sequence,dispatch_attempt_id,recovery_epoch,plan_digest,authority_snapshot_digest,position_table_revision,destination_catalog_revision,controller_observation_id,decision_json,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        decision_identity["decision_id"], str(command_id), decision_identity["stream_sequence"],
+                        decision_identity["dispatch_attempt_id"], decision_identity["recovery_epoch"],
+                        decision_identity["plan_digest"], decision_identity["authority_snapshot_digest"],
+                        decision_identity["position_table_revision"], decision_identity["destination_catalog_revision"],
+                        decision_identity["controller_observation_id"], _canonical(decision_identity),
+                        _canonical(receipt), _now(),
+                    ),
+                )
+            return receipt
 
     def idempotency_checked(self, operation_kind: str, key: str, fingerprint: str) -> dict[str, Any] | None:
         with self._lock:
@@ -5215,6 +6115,8 @@ class OperatorCommandStore:
 
     @staticmethod
     def _axes_for_action(action_id: str) -> set[str]:
+        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+            return {"x", "y", "z"}
         if action_id in {"oem.xy.move_absolute", "oem.xy.home"}:
             return {"x", "y"}
         axis = AXIS_BY_ACTION.get(action_id)
@@ -5242,6 +6144,35 @@ class OperatorCommandStore:
         if self._priority_fence.is_set():
             return True
         return any(self._axis_priority_fences[axis].is_set() for axis in self._axes_for_action(action_id))
+
+    def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> None:
+        """Fence every provider child against STOP/Abort and authority drift."""
+        del boundary
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT o.status,o.action_id,c.state,c.ownership_generation,c.expected_board_epochs_json,
+                       s.ownership_generation AS current_ownership,
+                       s.board_epoch_4,s.board_epoch_5
+                FROM operator_plane_commands AS o
+                JOIN serial206_movement_commands AS c ON c.command_id=o.command_id
+                JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1
+                WHERE o.command_id=? AND o.action_id IN ('oem.deck._mov_execution','oem.deck._finite_operation')
+                """,
+                (str(command_id),),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("deck_execution_command_authority_missing")
+        if str(row["status"]) != "dispatched" or str(row["state"]) != "dispatched":
+            raise RuntimeError("deck_execution_interrupted")
+        if self.action_fenced(str(row["action_id"])):
+            raise RuntimeError("deck_execution_interrupt_fence_active")
+        expected = _json_load(row["expected_board_epochs_json"], {})
+        observed = {"4": int(row["board_epoch_4"]), "5": int(row["board_epoch_5"])}
+        if expected != observed:
+            raise RuntimeError("deck_execution_board_epoch_changed")
+        if int(row["ownership_generation"]) != int(row["current_ownership"]):
+            raise RuntimeError("deck_execution_ownership_generation_changed")
 
     def queue_pending_interrupt_reconciliation(self, record: Mapping[str, Any]) -> None:
         pending = dict(record)
@@ -5552,6 +6483,177 @@ class OperatorCommandPlane:
 
         if self.store.action_fenced(action_id):
             self.store.finish(command_id, status="interrupted", payload={"reason": "interrupt_fence_won_before_provider"}, claimed=claimed)
+            return
+        if action_id == "oem.deck._finite_operation":
+            provider = getattr(self.app.state, "oem_deck_provider", None)
+            executor = getattr(self.app.state, "oem_wp8_operation_executor", None)
+            if provider is None or not callable(executor):
+                self.store.finish(command_id, status="failed", payload={"error": "wp8_operation_provider_unavailable", "delivery_attempted": False}, claimed=claimed)
+                return
+            delivery_attempted = False
+            wp8_response: dict[str, Any] = {}
+            try:
+                operation = str(effective["operation"])
+                operation_inputs = dict(effective["operation_inputs"])
+                snapshot_reader = getattr(provider, "wp8_operation_machine_state", None)
+                if not callable(snapshot_reader):
+                    raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
+                machine_inputs = snapshot_reader(operation, operation_inputs)
+                if not isinstance(machine_inputs, Mapping):
+                    raise RuntimeError("wp8_operation_machine_state_invalid")
+                plan = compile_finite_plate_operation(
+                    operation,
+                    source_leaf_available=callable(getattr(provider, "execute_wp8_child", None)),
+                    **dict(machine_inputs),
+                    **operation_inputs,
+                )
+                raw_response = executor(command_id=command_id, plan=plan)
+                if not isinstance(raw_response, Mapping):
+                    raise RuntimeError("wp8_operation_executor_returned_invalid_payload")
+                wp8_response = dict(raw_response)
+                delivery_attempted = bool(wp8_response.get("delivery_attempted"))
+            except Exception as exc:
+                try:
+                    evidence = self.store.wp8_operation_evidence(command_id)
+                    delivery_attempted = any(
+                        str(row.get("terminal_state")) != "planned"
+                        for row in evidence.get("children", [])
+                    ) or self.store.has_delivery_attempt(command_id)
+                except Exception:
+                    delivery_attempted = self.store.has_delivery_attempt(command_id)
+                if delivery_attempted:
+                    self.store.mark_deck_recovery_required(
+                        command_id, reason=str(exc)[:500],
+                        controller_command_acknowledged=False,
+                        controller_completion_verified=False,
+                        hardware_postcondition_verified=False,
+                        provider_results=None,
+                    )
+                self.store.finish(
+                    command_id,
+                    status="ambiguous" if delivery_attempted else "failed",
+                    payload={
+                        "error": f"wp8_operation_exception:{type(exc).__name__}",
+                        "detail": str(exc)[:500],
+                        "delivery_attempted": delivery_attempted,
+                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                    },
+                    claimed=claimed,
+                )
+                return
+            ok = wp8_response.get("ok") is True
+            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            terminal_payload = {
+                "response": _bounded_json(wp8_response, 131072),
+                "delivery_attempted": delivery_attempted,
+                **({"outcome_unknown": True} if terminal_status == "ambiguous" else {}),
+            }
+            if terminal_status == "completed" and wp8_response.get("background_pending") is True:
+                self.store.resolve_wp8_parent_after_background(
+                    command_id, payload=terminal_payload,
+                )
+                return
+            if terminal_status == "ambiguous":
+                self.store.mark_deck_recovery_required(
+                    command_id,
+                    reason=str(wp8_response.get("failed_child") or "wp8_operation_outcome_unknown")[:500],
+                    controller_command_acknowledged=False,
+                    controller_completion_verified=False,
+                    hardware_postcondition_verified=False,
+                    provider_results=None,
+                )
+            self.store.finish(
+                command_id,
+                status=terminal_status,
+                payload=terminal_payload,
+                claimed=claimed,
+            )
+            return
+        if action_id == "oem.deck._mov_execution":
+            provider = getattr(self.app.state, "oem_deck_provider", None)
+            if provider is None:
+                self.store.finish(command_id, status="failed", payload={"error": "mov_execution_provider_unavailable", "delivery_attempted": False}, claimed=claimed)
+                return
+            try:
+                intent = ClassMoveToIntent(
+                    script_line=int(effective["script_line"]),
+                    plate_name=effective.get("plate_name"),
+                    location_id=effective.get("location_id"),
+                    well=effective.get("well"),
+                    material=effective.get("material"),
+                    continuation=effective.get("continuation"),
+                )
+                machine_state = provider.mov_execution_machine_state()
+                plan = compile_mov_execution(
+                    intent, machine_state,
+                    get_next_well=provider.get_next_well,
+                )
+                if not isinstance(plan, MovExecutionPlan):
+                    raise RuntimeError("mov_execution_compile_failed")
+                preview = provider.preview_scriptmove_to(plan.steps[0].arguments)
+                plan = bind_mov_execution_script_plan(plan, dict(preview["plan"]))
+            except Exception as exc:
+                self.store.finish(
+                    command_id, status="failed",
+                    payload={
+                        "error": f"mov_execution_compile_exception:{type(exc).__name__}",
+                        "detail": str(exc)[:500],
+                        "delivery_attempted": False,
+                    },
+                    claimed=claimed,
+                )
+                return
+            try:
+                mov_response = execute_mov_execution(
+                    command_id, plan, provider=provider, command_store=self.store,
+                )
+            except Exception as exc:
+                stage_rows = self.store.connection.execute(
+                    "SELECT terminal_state FROM operator_plane_deck_stages WHERE command_id=?",
+                    (command_id,),
+                ).fetchall()
+                delivery_attempted = (
+                    any(str(row["terminal_state"]) in {"completed", "ambiguous"} for row in stage_rows)
+                    or self.store.has_delivery_attempt(command_id)
+                )
+                if delivery_attempted:
+                    self.store.mark_deck_recovery_required(
+                        command_id, reason=str(exc)[:500], controller_command_acknowledged=False,
+                        controller_completion_verified=False, hardware_postcondition_verified=False,
+                        provider_results=None,
+                    )
+                self.store.finish(
+                    command_id, status="ambiguous" if delivery_attempted else "failed",
+                    payload={
+                        "error": f"mov_execution_exception:{type(exc).__name__}",
+                        "detail": str(exc)[:500],
+                        "delivery_attempted": delivery_attempted,
+                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                    },
+                    claimed=claimed,
+                )
+                return
+            if not isinstance(mov_response, Mapping):
+                self.store.finish(command_id, status="failed", payload={"error": "mov_execution_invalid_response", "delivery_attempted": False}, claimed=claimed)
+                return
+            response = dict(mov_response)
+            ok = isinstance(response, Mapping) and response.get("ok") is True
+            delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
+            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            if terminal_status == "ambiguous":
+                self.store.mark_deck_recovery_required(
+                    command_id, reason=str(response.get("reason") or "mov_execution_outcome_unknown")[:500],
+                    controller_command_acknowledged=bool(response.get("controller_command_acknowledged")),
+                    controller_completion_verified=bool(response.get("controller_completion_verified")),
+                    hardware_postcondition_verified=False,
+                    provider_results=response.get("provider_results") if isinstance(response.get("provider_results"), list) else None,
+                )
+            self.store.finish(
+                command_id, status=terminal_status,
+                payload={"response": _bounded_json(response, 131072), "delivery_attempted": delivery_attempted, **({"outcome_unknown": True} if terminal_status == "ambiguous" else {})},
+                controller_acknowledged=bool(response.get("controller_command_acknowledged")),
+                claimed=claimed,
+            )
             return
         if action_id == "oem.deck.move_to_location":
             executor = getattr(self.app.state, "oem_deck_command_executor", None)

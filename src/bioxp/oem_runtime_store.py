@@ -20,6 +20,29 @@ from pathlib import Path
 from typing import Any
 
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
+from .oem_deck_schema_v6 import (
+    DECK_SCHEMA_V5_INDEXES,
+    DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS,
+    DECK_SCHEMA_V5_TABLES,
+    DECK_SCHEMA_V5_TRIGGER_SQL_SHA256,
+    DECK_SCHEMA_V5_TRIGGERS,
+    DECK_SCHEMA_V6_EXTRA_SQL,
+    DECK_SCHEMA_V6_INDEXES,
+    DECK_SCHEMA_V6_SUPPORT_INDEXES,
+    DECK_SCHEMA_V6_SUPPORT_SQL,
+    DECK_SCHEMA_V6_SUPPORT_TABLES,
+    DECK_SCHEMA_V6_SUPPORT_TRIGGERS,
+    DECK_SCHEMA_V6_TABLE_SQL,
+    DECK_SCHEMA_V6_TABLE_COLUMNS,
+    DECK_SCHEMA_V6_TRIGGER_SQL,
+    DECK_SCHEMA_V6_TRIGGERS,
+    DECK_SCHEMA_V6_TABLES,
+    apply_deck_schema_v6,
+    migrate_deck_schema_v5_to_v6,
+    verify_deck_schema_v5,
+    verify_deck_schema_v6,
+    _statements as _deck_schema_statements,
+)
 from .runtime_audit_store import (
     RuntimeAuditDatabase,
     RuntimeMigrationIdentity,
@@ -42,6 +65,7 @@ SERIAL206_SCHEMA_VERSION = 2
 REPORT_IDENTITY_SCHEMA_VERSION = 3
 RUNTIME_RELEASE_SCHEMA_VERSION = 4
 OPERATOR_COMMAND_PLANE_SCHEMA_VERSION = 5
+OEM_DECK_SCHEMA_VERSION = 6
 _ACCEPTED_LEGACY_SERIAL206_MIGRATION_DIGESTS = frozenset({
     "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c",
 })
@@ -74,6 +98,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     3: "c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317",
     4: "c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317",
     5: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
+    6: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2156,6 +2181,85 @@ def operator_command_plane_migration_identity() -> RuntimeMigrationIdentity:
     )
 
 
+def _operator_global_trigger_sources() -> dict[str, str]:
+    expected = set(DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS)
+    sources: dict[str, str] = {}
+    for statement in _deck_schema_statements(DECK_SCHEMA_V6_TRIGGER_SQL):
+        normalized = normalize_sql_definition(statement)
+        for name in expected - set(sources):
+            prefix = f"CREATETRIGGERIFNOTEXISTS{name.upper()}"
+            if normalized.startswith(prefix):
+                sources[name] = statement
+                break
+    return sources
+
+
+def _reinstall_operator_global_triggers(connection: sqlite3.Connection) -> None:
+    sources = _operator_global_trigger_sources()
+    if set(sources) != set(DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS):
+        raise RuntimeError("authoritative operator global trigger manifest is incomplete")
+    for name in sorted(sources):
+        connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        connection.execute(sources[name])
+
+
+def _verify_operator_global_triggers(connection: sqlite3.Connection) -> None:
+    sources = _operator_global_trigger_sources()
+    expected = {
+        name: normalize_sql_definition(source).replace("IFNOTEXISTS", "", 1)
+        for name, source in sources.items()
+    }
+    actual = {
+        str(row[0]): normalize_sql_definition(row[1])
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (%s)"
+            % ",".join("?" for _ in expected),
+            tuple(sorted(expected)),
+        )
+    }
+    if actual != expected:
+        raise RuntimeError("canonical v5 normalized SQL for operator global triggers is not exact")
+
+
+def oem_deck_schema_v6_migration_identity() -> RuntimeMigrationIdentity:
+    accepted_manifests = repr((
+        sorted(DECK_SCHEMA_V5_TABLES),
+        sorted(DECK_SCHEMA_V5_INDEXES),
+        sorted(DECK_SCHEMA_V5_TRIGGERS),
+        sorted(DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS),
+        sorted(DECK_SCHEMA_V5_TRIGGER_SQL_SHA256.items()),
+        sorted(DECK_SCHEMA_V6_TABLES),
+        sorted(DECK_SCHEMA_V6_INDEXES),
+        sorted(DECK_SCHEMA_V6_TRIGGERS),
+        sorted(DECK_SCHEMA_V6_SUPPORT_TABLES),
+        sorted(DECK_SCHEMA_V6_SUPPORT_INDEXES),
+        sorted(DECK_SCHEMA_V6_SUPPORT_TRIGGERS),
+        sorted((name, tuple(columns)) for name, columns in DECK_SCHEMA_V6_TABLE_COLUMNS.items()),
+        sorted(
+            (name, normalize_sql_definition(sql).replace("IFNOTEXISTS", "", 1))
+            for name, sql in _operator_global_trigger_sources().items()
+        ),
+    ))
+    ddl_source = "\n".join(
+        (
+            accepted_manifests,
+            DECK_SCHEMA_V6_SUPPORT_SQL,
+            DECK_SCHEMA_V6_TABLE_SQL,
+            DECK_SCHEMA_V6_TRIGGER_SQL,
+            DECK_SCHEMA_V6_EXTRA_SQL,
+            inspect.getsource(verify_deck_schema_v5),
+            inspect.getsource(migrate_deck_schema_v5_to_v6),
+            inspect.getsource(apply_deck_schema_v6),
+            inspect.getsource(verify_deck_schema_v6),
+        )
+    ).encode("utf-8")
+    return RuntimeMigrationIdentity(
+        version=OEM_DECK_SCHEMA_VERSION,
+        name="oem_deck_schema_v6",
+        ddl_sha256=hashlib.sha256(ddl_source).hexdigest(),
+    )
+
+
 def normalize_sql_definition(value: str | None) -> str:
     """Normalize SQLite syntax while preserving every quoted literal byte."""
     text = "" if value is None else str(value).strip()
@@ -2549,6 +2653,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         report_identity_migration_identity(),
         runtime_release_migration_identity(),
         operator_command_plane_migration_identity(),
+        oem_deck_schema_v6_migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -2906,6 +3011,8 @@ def canonical_runtime_schema_manifest() -> dict[tuple[str, str], str]:
             expected.execute(statement)
         _apply_runtime_release_start(expected)
         _apply_operator_command_plane_schema_v1(expected)
+        apply_deck_schema_v6(expected)
+        _reinstall_operator_global_triggers(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
             for row in expected.execute(
@@ -2936,6 +3043,7 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
     _verify_report_identity_metadata_v1(connection)
     _verify_runtime_release_start(connection)
     _verify_operator_command_plane_schema_v1(connection)
+    verify_deck_schema_v6(connection)
     expected_manifest = canonical_runtime_schema_manifest()
     actual_manifest = {
         (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
@@ -2972,11 +3080,25 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
             ):
                 compatibility_objects_are_bound = False
                 break
+        additive_v6_lineage = (
+            not missing
+            and not unexpected
+            and mismatched == [("table", "operator_plane_deck_semantic_state")]
+        )
         if not (
-            legacy_compatibility
-            and compatibility_objects_are_bound
-            and not missing
-            and mismatched == [("table", "operator_plane_interrupt_history")]
+            additive_v6_lineage
+            or (
+                legacy_compatibility
+                and compatibility_objects_are_bound
+                and not missing
+                and mismatched in (
+                    [("table", "operator_plane_interrupt_history")],
+                    [
+                        ("table", "operator_plane_deck_semantic_state"),
+                        ("table", "operator_plane_interrupt_history"),
+                    ],
+                )
+            )
         ):
             raise RuntimeError(
                 f"canonical runtime schema manifest mismatch: missing={missing},unexpected={unexpected},mismatched={mismatched}"
@@ -2984,8 +3106,8 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
     identity = connection.execute(
         "SELECT schema_version FROM runtime_store_identity WHERE identity_id=1"
     ).fetchone()
-    if identity is None or int(identity[0]) != OPERATOR_COMMAND_PLANE_SCHEMA_VERSION:
-        raise RuntimeError("runtime store identity does not attest canonical schema v5")
+    if identity is None or int(identity[0]) != OEM_DECK_SCHEMA_VERSION:
+        raise RuntimeError("runtime store identity does not attest canonical schema v6")
 
 
 def _verified_sqlite_backup(connection: sqlite3.Connection, root: Path) -> str:
@@ -3108,7 +3230,7 @@ def _migrate_runtime_release_start(
 ) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if assert_migration_slot(connection, identity):
-        if version != identity.version:
+        if version < identity.version:
             raise RuntimeError("runtime release migration ledger and PRAGMA user_version disagree")
         _verify_runtime_release_start(connection)
         return
@@ -3163,7 +3285,7 @@ def _migrate_operator_command_plane_schema_v1(
 ) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if assert_migration_slot(connection, identity):
-        if version != identity.version:
+        if version < identity.version:
             raise RuntimeError("operator command-plane migration ledger and PRAGMA user_version disagree")
         _verify_operator_command_plane_schema_v1(connection)
         return
@@ -3201,6 +3323,70 @@ def _migrate_operator_command_plane_schema_v1(
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
+
+def _migrate_oem_deck_schema_v6(
+    connection: sqlite3.Connection,
+    root: Path,
+    identity: RuntimeMigrationIdentity,
+) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if assert_migration_slot(connection, identity):
+        if version < identity.version:
+            raise RuntimeError("OEM deck migration ledger and PRAGMA user_version disagree")
+        verify_deck_schema_v6(connection)
+        return
+    if version >= identity.version:
+        raise RuntimeError("OEM deck migration version is occupied without exact ledger identity")
+    if version != OPERATOR_COMMAND_PLANE_SCHEMA_VERSION:
+        raise RuntimeError("OEM deck migration requires the exact canonical v1-v5 prefix")
+    occupied = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+        + ",".join("?" for _ in DECK_SCHEMA_V6_TABLES)
+        + ") LIMIT 1",
+        tuple(sorted(DECK_SCHEMA_V6_TABLES)),
+    ).fetchone()
+    migrate_legacy_v5 = occupied is not None
+    active = connection.execute(
+        "SELECT 1 FROM operator_plane_commands WHERE status IN "
+        "('queued','dispatched','issued_pending','stop_requested','abort_requested') LIMIT 1"
+    ).fetchone()
+    if active is not None:
+        raise RuntimeError("OEM deck migration requires quiesced operator mutation admission")
+    backup_sha256 = _verified_sqlite_backup(connection, root)
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if migrate_legacy_v5:
+            _verify_operator_command_plane_schema_v1(connection)
+            _verify_operator_global_triggers(connection)
+            verify_deck_schema_v5(connection)
+            migrate_deck_schema_v5_to_v6(connection)
+        else:
+            apply_deck_schema_v6(connection)
+        _reinstall_operator_global_triggers(connection)
+        _verify_operator_global_triggers(connection)
+        verify_deck_schema_v6(connection)
+        finished_at = time.time()
+        _record_runtime_migration(
+            connection,
+            identity=identity,
+            backup_sha256=backup_sha256,
+            source_digests={},
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (identity.version, finished_at),
+        )
+        connection.execute(f"PRAGMA user_version={identity.version}")
+        verify_deck_schema_v6(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
@@ -3283,7 +3469,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
             if (
                 expected_physical_sha256 is not None
                 and physical_schema_sha256 != expected_physical_sha256
-                and ledger_head == OPERATOR_COMMAND_PLANE_SCHEMA_VERSION
+                and ledger_head >= OPERATOR_COMMAND_PLANE_SCHEMA_VERSION
             ):
                 _verified_sqlite_backup(connection, selected_root)
                 connection.execute("BEGIN IMMEDIATE")
@@ -3314,12 +3500,21 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
     if _assert_runtime_migration_slot(connection, serial_identity):
         if version < serial_identity.version or version > registry[-1].version:
             raise RuntimeError("runtime migration ledger and PRAGMA user_version disagree")
-        _verify_v2_schema(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _reinstall_runtime_authority_triggers(connection)
+            _verify_v2_schema(connection)
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         report_identity = registry[2]
         _migrate_report_identity_metadata_v1(connection, selected_root, report_identity)
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) < OPERATOR_COMMAND_PLANE_SCHEMA_VERSION:
             _migrate_runtime_release_start(connection, selected_root, registry[3])
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
+        _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3448,6 +3643,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_report_identity_metadata_v1(connection, selected_root, registry[2])
         _migrate_runtime_release_start(connection, selected_root, registry[3])
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
+        _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:

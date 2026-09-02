@@ -25,8 +25,12 @@ from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
 from .oem_deck_movement import (
     OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
+    WP8_COMPILED_CHILD_OPERATIONS,
+    WP8_OPERATION_INTENT_KEYS,
     canonical_movable_object_locations,
     canonical_plate_name,
+    compile_finite_plate_operation,
+    execute_finite_plate_operation,
     plate_name_for_storage,
 )
 from .oem_serial206_initialization_contract import (
@@ -38,6 +42,40 @@ from .oem_serial206_initialization_contract import (
 from .oem_parity_config import load_oem_parity_config
 from .pipette.models import PipetteInitCommand
 from .services.reference_service import MarkAxisDesyncedCommand, MarkAxisReferencedCommand
+
+
+@dataclass(frozen=True)
+class Wp8GripperLockToken:
+    command_id: str
+    acquiring_identity: str
+    plan_digest: str
+    dispatch_attempt_id: str
+    ownership_generation: int
+    board_epoch_4: int
+    board_epoch_5: int
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "acquiring_identity": self.acquiring_identity,
+            "plan_digest": self.plan_digest,
+            "dispatch_attempt_id": self.dispatch_attempt_id,
+            "ownership_generation": self.ownership_generation,
+            "board_epoch_4": self.board_epoch_4,
+            "board_epoch_5": self.board_epoch_5,
+        }
+
+    @classmethod
+    def from_receipt(cls, value: Mapping[str, Any]) -> "Wp8GripperLockToken":
+        return cls(
+            command_id=str(value["command_id"]),
+            acquiring_identity=str(value["acquiring_identity"]),
+            plan_digest=str(value["plan_digest"]),
+            dispatch_attempt_id=str(value["dispatch_attempt_id"]),
+            ownership_generation=int(value["ownership_generation"]),
+            board_epoch_4=int(value["board_epoch_4"]),
+            board_epoch_5=int(value["board_epoch_5"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -3793,9 +3831,164 @@ class Serial206ProductionPrimitiveAdapter:
             "source_anchor": "ClassControlInterface.scriptmoveTo:3734-4014; ControlLib.initializeMotion:8812",
         }
 
+    def oem_preview_scriptmove_to(
+        self,
+        *,
+        current_location: int,
+        target_location: int,
+        column: int = 0,
+        row: int = 0,
+        well: int | None = None,
+        position_flag: int = 1,
+        run_in_parallel: bool = True,
+        tip_loaded: bool,
+        tip_dirty: bool,
+        tip_location: int,
+        clean_path: bool,
+        pseudo_home_steps: int,
+        plate_on_gantry: int | str | None,
+        location19_y: int | None = None,
+    ) -> dict[str, Any]:
+        table = load_bound_oem_position_table()
+        parity = load_oem_parity_config(None)
+        if parity.blockers:
+            raise RuntimeError("immutable_oem_machine_snapshot_not_bound")
+        state = OemMachineState.from_query(
+            current_location_id=str(int(current_location)),
+            current_well_id="0",
+            current_x=self._read_axis_position("x"),
+            current_y=self._read_axis_position("y"),
+            current_z=self._read_axis_position("z"),
+            tip_loaded=bool(tip_loaded),
+            tip_dirty=bool(tip_dirty),
+            tip_location=int(tip_location),
+            clean_path=bool(clean_path),
+            device_type="BIOXP",
+            gripper_confirmed=False,
+            pseudo_z_home=int(pseudo_home_steps),
+            plate_on_gantry=plate_on_gantry,
+            location19_y=location19_y,
+        )
+        planner = OemPathPlanner(
+            table,
+            x_high_limit=int(parity.values.get("XHigh", 90263)),
+            y_high_limit=int(parity.values.get("YHigh", 102956)),
+        )
+        plan = planner.plan_script_move_to(
+            current_loc=int(current_location),
+            location_id=int(target_location),
+            column=int(column),
+            row=int(row),
+            well=None if well is None else int(well),
+            positionflag=int(position_flag),
+            state=state,
+            run_in_parallel=bool(run_in_parallel),
+        )
+        return {
+            "plan": _json_safe(plan),
+            "machine_state": state.to_payload(),
+            "position_table_source": table.source,
+        }
+
+    def oem_scriptmove_to(self, *, timeout_s: float = 60.0, expected_plan_digest: str | None = None, source_plan: Mapping[str, Any] | None = None, **arguments: Any) -> dict[str, Any]:
+        preview = self.oem_preview_scriptmove_to(**arguments)
+        plan = dict(preview["plan"])
+        plan_digest = hashlib.sha256(
+            json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        if expected_plan_digest is not None and plan_digest != str(expected_plan_digest):
+            raise RuntimeError("scriptmoveTo_plan_authority_changed_before_first_tx")
+        if source_plan is not None:
+            supplied_digest = hashlib.sha256(
+                json.dumps(dict(source_plan), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest()
+            if supplied_digest != plan_digest:
+                raise RuntimeError("scriptmoveTo_persisted_plan_mismatch")
+        execution = _execute_oem_steps_live(
+            list(plan.get("steps") or []), self, wait_timeout_s=float(timeout_s), speed=None,
+            acc=None, pseudo_z_home_steps=int(arguments["pseudo_home_steps"]),
+        )
+        evidence = _aggregate_executed_controller_evidence(execution)
+        return {
+            "ok": execution.get("ok") is True
+            and evidence["controller_command_acknowledged"]
+            and evidence["controller_completion_verified"],
+            **evidence,
+            "delivery_attempted": True,
+            "plan_digest": plan_digest,
+            "plan": plan,
+            "execution": _json_safe(execution),
+            "source_anchor": "ClassControlInterface.scriptmoveTo:3734-4014",
+        }
+
 
 class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
+
+    _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "CloseGripper": "wp8_close_gripper",
+        "HomeAxisD": "wp8_home_axis_d",
+        "LoadGantry": "wp8_load_gantry",
+        "LoadGantryNull": "wp8_load_gantry",
+        "LockGripperOperation": "wp8_lock_gripper",
+        "MoveZHome": "wp8_move_z_home",
+        "OpenGripper": "wp8_open_gripper",
+        "OpenGripperWide": "wp8_open_gripper",
+        "ReleaseLockGripperOperation": "wp8_release_gripper_lock",
+        "Sleep": "wp8_sleep",
+        "SnapshotImage": "wp8_snapshot_image",
+        "StopCloseGripper": "wp8_stop_close_gripper",
+        "backgroundGripperHomeAndUnlock": "wp8_start_gripper_home_and_unlock",
+        "catchPlate": "wp8_catch_plate",
+        "checkDoorStatus": "wp8_check_door_status",
+        "cleanupWastePrelude": "wp8_cleanup_waste_prelude",
+        "clearTipLoaded": "wp8_clear_tip_loaded",
+        "doorOpen": "wp8_door_open",
+        "ejectAllTipsCleanup": "wp8_eject_all_tips_cleanup",
+        "getG": "wp8_get_g",
+        "led2Off": "wp8_led2",
+        "led2On": "wp8_led2",
+        "moveDoorClosed": "wp8_move_door",
+        "moveDoorOpen": "wp8_move_door",
+        "moveGClosedPlus3000": "wp8_move_g_closed_plus",
+        "moveStepsYMinus800": "wp8_move_y_steps",
+        "moveStepsYPlus1600": "wp8_move_y_steps",
+        "moveStepsZMinus6000": "wp8_move_z_steps",
+        "moveX79000": "wp8_move_axis_absolute",
+        "moveZ": "wp8_move_z_to_location",
+        "moveZ80000": "wp8_move_axis_absolute",
+        "moveZLow": "wp8_move_z_to_location",
+        "moveZPress": "wp8_move_z_to_location",
+        "moveZPressApproach": "wp8_move_z_to_location",
+        "moveZPseudoHome": "wp8_move_z_pseudo_home",
+        "parkGantry": "wp8_park_gantry",
+        "queryTipStatus": "wp8_query_tip_status",
+        "readDoorSensors": "wp8_read_door_sensors",
+        "releasePlate": "wp8_release_plate",
+        "scriptmoveTo": "wp8_scriptmove_to",
+        "scriptmoveToWaste": "wp8_scriptmove_to_waste",
+        "sendGripperHome": "wp8_send_gripper_home",
+        "sendZandGripperHome": "wp8_send_z_and_gripper_home",
+        "setDoorMaxCurrent": "wp8_set_door_max_current",
+        "setDoorStallThreshold": "wp8_set_door_stall_threshold",
+        "setDoorStallThresholdPlus2": "wp8_set_door_stall_threshold",
+        "setGripperCurrent": "wp8_set_gripper_current",
+        "setGripperVMax": "wp8_set_gripper_vmax",
+        "setZCurrent31": "wp8_set_z_current",
+        "setZaxisCurrentmax100": "wp8_restore_z_current",
+        "startGripperHomeAndUnlock": "wp8_start_gripper_home_and_unlock",
+        "startMoveZPseudoHome": "wp8_start_move_z_pseudo_home",
+        "updateLocation": "wp8_update_location",
+        "updatePlateLocation": "wp8_update_plate_location",
+        "updateThermalDoorOpen": "wp8_update_thermal_door_open",
+        "waitMoveZOnly": "wp8_wait_move_z_only",
+        "waitStop": "wp8_wait_stop",
+        "waitZ": "wp8_wait_z",
+    }
+
+    @classmethod
+    def wp8_child_binding_inventory(cls) -> tuple[str, ...]:
+        return tuple(sorted(cls._WP8_CHILD_BINDINGS))
 
     source_mode = "ClassControlInterface.initializeMotors:3348-3421"
     schema = "bioxp.serial206_oem_initialization.v2"
@@ -3826,6 +4019,13 @@ class Serial206OemInitializationProvider:
         self.sleep = sleep
         self._lock = _MutationPriorityRLock()
         self._deck_movement_lock = threading.Lock()
+        self._wp8_gripper_lock = threading.Lock()
+        self._wp8_gripper_lock_owner: Wp8GripperLockToken | None = None
+        self._wp8_task_lock = threading.Lock()
+        self._wp8_tasks: dict[str, dict[str, Any]] = {}
+        self._wp8_background_task_settler: Callable[..., None] | None = None
+        self._wp8_stop_event = threading.Event()
+        self._wp8_stop_event.set()
         self._deck_owner_id = "serial206-oem-initialization-provider"
         self._deck_semantic_state_reader: Callable[[], Mapping[str, Any]] | None = None
         self._tip_tray_state_reader: Callable[[int], Mapping[str, Any]] | None = None
@@ -3957,7 +4157,9 @@ class Serial206OemInitializationProvider:
         query = getattr(self.primitives, "query_all_pipette_tip_states", None)
         if not callable(query):
             raise RuntimeError("pipette owner query is unavailable")
-        observed = query()
+        observed = query(
+            lifecycle_stage_id=f"serial206.state_owner.{source_command_id}",
+        )
         if not isinstance(observed, Mapping) or observed.get("ok") is not True:
             raise RuntimeError("pipette owner query failed")
         reader = getattr(self, "_deck_semantic_state_reader", None)
@@ -6537,7 +6739,9 @@ class Serial206OemInitializationProvider:
             tip_query = getattr(self.primitives, "query_all_pipette_tip_states", None)
             if callable(tip_query):
                 try:
-                    tip = tip_query()
+                    tip = tip_query(
+                        lifecycle_stage_id="serial206.initialize_motion.tip_baseline",
+                    )
                 except Exception:
                     tip = None
                 if (
@@ -8403,56 +8607,1251 @@ class Serial206OemInitializationProvider:
             result, source_anchor="ClassControlInterface.btnLOC1_Click:1932-1945->moveZ:4254-4266"
         )
 
-    def execute_wp8_child(self, child: Mapping[str, Any]) -> Any:
+    def mov_execution_machine_state(self) -> dict[str, Any]:
+        """Return server-owned ClassMoveTo state without caller aliases."""
+        from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        semantic = self._canonical_deck_semantic_state()
+        name_to_location = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+        current_name = str(semantic["current_location"])
+        if current_name not in name_to_location:
+            raise RuntimeError("mov_execution_current_location_unavailable")
+        plate_locations: dict[int, int] = {}
+        for name, location_name in dict(semantic.get("movable_plate_locations") or {}).items():
+            ordinal = OEM_PLATE_NAME_ORDINALS.get(str(name))
+            location_id = name_to_location.get(str(location_name))
+            if ordinal is not None and location_id is not None:
+                plate_locations[int(ordinal)] = int(location_id)
+        table = load_bound_oem_position_table()
+        table_rows: dict[str, Any] = {}
+        for row in table.rows():
+            name = str(row.get("location_id") or "")
+            location_id = name_to_location.get(name)
+            if location_id is not None:
+                table_rows[str(location_id)] = row
+        with self._lock:
+            legacy = dict(self._load_state().get("machine_status") or {})
+        authority = {
+            "semantic_state_revision": int(semantic["semantic_state_revision"]),
+            "ownership_generation": int(semantic["ownership_generation"]),
+            "board_epoch_4": int(semantic["board_epoch_4"]),
+            "board_epoch_5": int(semantic["board_epoch_5"]),
+            "position_table_revision": table.digest,
+        }
+        return {
+            **authority,
+            "authority_digest": hashlib.sha256(
+                json.dumps(authority, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest(),
+            "current_location": int(name_to_location[current_name]),
+            "current_well": int(semantic["current_well"]),
+            "plate_locations": plate_locations,
+            "tip_loaded": bool(semantic["tip_loaded"]),
+            "tip_dirty": bool(semantic["tip_dirty"]),
+            "tip_location": int(semantic["tip_location"]),
+            "clean_path": bool(semantic["clean_path"]),
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "plate_on_gantry": semantic.get("plate_on_gantry"),
+            "thermal_door_open": legacy.get("thermal_door_open"),
+            "gripper_version": legacy.get("GripperVersion", legacy.get("gripper_version")),
+            "board_test_mode": legacy.get("BoardTestMode", legacy.get("board_test_mode")),
+            "save_tip": bool(semantic.get("save_tip", legacy.get("m_savetip", False))),
+            "old_well": bool(semantic.get("old_well", legacy.get("m_oldWell", False))),
+            "old_well_text": str(semantic.get("old_well_text", legacy.get("m_oldWellText", ""))),
+            "old_location": (
+                int(semantic["old_location"])
+                if type(semantic.get("old_location")) is int
+                else int(name_to_location[current_name])
+            ),
+            "plate_pierced": dict(semantic.get("plate_pierced") or {}),
+            "well_pierced": dict(semantic.get("well_pierced") or {}),
+            "strip_pierced": dict(semantic.get("well_pierced") or {}),
+            "trough_version": int(legacy.get("TroughVersion", legacy.get("trough_version", 0))),
+            "position_table_by_location": table_rows,
+            "scriptmove_parallel_children": (),
+        }
+
+    def wp8_operation_machine_state(
+        self, operation: str, intent_inputs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build finite-operation branch inputs only from robot-owned state/config."""
+        from .oem_initialization import build_machine_calibration_manifest
+
+        if operation not in WP8_OPERATION_INTENT_KEYS:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        state = dict(self.mov_execution_machine_state())
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        if manifest.get("ok") is not True:
+            raise RuntimeError("wp8_machine_calibration_unavailable")
+
+        def calibrated(section: str, name: str) -> int:
+            row = dict(dict(manifest.get(section) or {}).get(name) or {})
+            value = row.get("value")
+            if type(value) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(value)
+
+        position_reply = self.primitives.tester.motor_get_position(4, motor=2)
+        gripper_position = None
+        if isinstance(position_reply, Mapping):
+            for key in ("position", "value", "actual_position"):
+                if type(position_reply.get(key)) is int:
+                    gripper_position = int(position_reply[key])
+                    break
+        if gripper_position is None:
+            raise RuntimeError("wp8_gripper_position_unavailable")
+
+        plate_locations = {
+            int(key): int(value) for key, value in dict(state.get("plate_locations") or {}).items()
+            if type(key) is int and type(value) is int
+        }
+        plate = intent_inputs.get("plate")
+        snapshot: dict[str, Any] = {
+            "gripper_position": gripper_position,
+            "closed_position": calibrated("gripper", "GripperClosePOS"),
+            "plate_on_gantry": state.get("plate_on_gantry"),
+            "tip_exists": bool(state.get("tip_loaded")),
+            "door_is_open": bool(state.get("thermal_door_open")),
+            "thermal_door_open": bool(state.get("thermal_door_open")),
+            "cover_locations": {key: plate_locations[key] for key in (4, 5) if key in plate_locations},
+            "locations": plate_locations,
+            "current_tray": state.get("plate_on_gantry"),
+            "output_plate_location": plate_locations.get(3),
+            "gripper_version": int(state.get("gripper_version", 1)),
+            "door_open_position": calibrated("thermal_door", "TCDoorOpen"),
+            "door_threshold": calibrated("thermal_door", "TCDoorStallGuardThreshold"),
+            "door_max_current": calibrated("thermal_door", "TC_DOOR_MAX_CURRENT"),
+            "board_test_mode": bool(state.get("board_test_mode", False)),
+            "position_table_by_location": state.get("position_table_by_location"),
+        }
+        if type(plate) is int:
+            snapshot["plate_location"] = plate_locations.get(int(plate))
+        return snapshot
+
+    def get_next_well(self, plate_name: int, material: str, offset: float) -> int:
+        method = getattr(self.primitives, "getNextWell", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:getNextWell")
+        result = method(int(plate_name), str(material), float(offset))
+        if type(result) is not int:
+            raise RuntimeError("source_authority_missing:getNextWell_return")
+        return int(result)
+
+    @staticmethod
+    def _scriptmove_argument_names(
+        arguments: Mapping[str, Any],
+    ) -> tuple[int, int, int | None, int, int, bool, str | None, Mapping[str, Any] | None]:
+        row = dict(arguments)
+        destination = int(row.pop("destination"))
+        column = int(row.pop("column", 0))
+        well = row.pop("well", None)
+        if well is not None:
+            well = int(well)
+        line = int(row.pop("row", 0))
+        position_flag = int(row.pop("positionflag", row.pop("position_flag", 1)))
+        run_parallel = bool(row.pop("runInParallel", row.pop("run_in_parallel", True)))
+        expected_digest = row.pop("expected_script_plan_digest", None)
+        source_plan = row.pop("source_plan", None)
+        if row:
+            raise ValueError(f"unexpected scriptmoveTo provider arguments: {sorted(row)}")
+        return destination, column, well, line, position_flag, run_parallel, expected_digest, source_plan
+
+    def preview_scriptmove_to(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        destination, column, well, row, position_flag, run_parallel, _expected, _source = self._scriptmove_argument_names(arguments)
+        state = self.mov_execution_machine_state()
+        return self.primitives.oem_preview_scriptmove_to(
+            current_location=int(state["current_location"]), target_location=destination,
+            column=column, row=row, well=well, position_flag=position_flag,
+            run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
+            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
+            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+        )
+
+    def scriptmoveTo(self, **arguments: Any) -> dict[str, Any]:
+        destination, column, well, row, position_flag, run_parallel, expected_digest, source_plan = self._scriptmove_argument_names(arguments)
+        state = self.mov_execution_machine_state()
+        return self.primitives.oem_scriptmove_to(
+            current_location=int(state["current_location"]), target_location=destination,
+            column=column, row=row, well=well, position_flag=position_flag,
+            run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
+            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
+            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            expected_plan_digest=None if expected_digest is None else str(expected_digest),
+            source_plan=source_plan if isinstance(source_plan, Mapping) else None,
+        )
+
+    def updateLocation(self, *, location_id: int, well_id: int) -> dict[str, Any]:
+        return {
+            "ok": True, "delivery_attempted": False, "semantic_update_ready": True,
+            "location_id": int(location_id), "well_id": int(well_id),
+            "source_anchor": "ClassMachineStatus.updateLocation:565-653",
+        }
+
+    def updatePlateLocation(self, *, plate_name: int, location_id: int) -> dict[str, Any]:
+        return {
+            "ok": True, "delivery_attempted": False, "semantic_update_ready": True,
+            "plate_name": int(plate_name), "location_id": int(location_id),
+            "source_anchor": "ClassMachineStatus.updatePlateLocation",
+        }
+
+    def _mov_named_leaf(self, operation: str, **arguments: Any) -> dict[str, Any]:
+        method = getattr(self.primitives, operation, None)
+        if not callable(method):
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        return self._deck_primitive_receipt(
+            method(**arguments), source_anchor=f"ControlLib.movExecution:{operation}",
+        )
+
+    def rPunchFoil(self, *, plate_name: int, location_id: int) -> dict[str, Any]:
+        return self._mov_named_leaf(
+            "rPunchFoil", plate_name=int(plate_name), location_id=int(location_id),
+        )
+
+    def hokeypokey(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
+        return self._mov_named_leaf("hokeypokey", destination=int(destination), column=int(column), row=int(row))
+
+    def CirclePunch(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
+        return self._mov_named_leaf(
+            "CirclePunch", destination=int(destination), column=int(column), row=int(row),
+        )
+
+    def _mov_axis_leaf(self, operation: str, value: int) -> dict[str, Any]:
+        key = "y" if operation == "moveY" else "z"
+        state = self.mov_execution_machine_state()
+        execution = _execute_oem_steps_live(
+            [{"op": operation, key: int(value)}], self.primitives, wait_timeout_s=60.0,
+            speed=None, acc=None, pseudo_z_home_steps=int(state["pseudo_z_home"]),
+        )
+        evidence = _aggregate_executed_controller_evidence(execution)
+        return {
+            "ok": execution.get("ok") is True
+            and evidence["controller_command_acknowledged"]
+            and evidence["controller_completion_verified"],
+            **evidence, "delivery_attempted": True, "execution": _json_safe(execution),
+        }
+
+    def moveY(self, value: int) -> dict[str, Any]:
+        return self._mov_axis_leaf("moveY", int(value))
+
+    def moveZ(self, value: int) -> dict[str, Any]:
+        return self._mov_axis_leaf("moveZ", int(value))
+
+    def MoveZHome(self) -> dict[str, Any]:
+        method = getattr(self.primitives, "z_move_z_home", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:MoveZHome")
+        return self._deck_primitive_receipt(
+            method(timeout_s=30.0), source_anchor="ControlLib.movExecution:w:MoveZHome",
+        )
+
+    @staticmethod
+    def _wp8_scalar(result: Any) -> int | None:
+        if not isinstance(result, Mapping):
+            return None
+        for key in ("position", "value", "actual_position"):
+            if type(result.get(key)) is int:
+                return int(result[key])
+        return None
+
+    @staticmethod
+    def _wp8_identity(command_id: str, child_order: int, plan_digest: str) -> str:
+        return f"{command_id}:{child_order}:{plan_digest}"
+
+    def _wp8_calibration(self) -> tuple[int, dict[str, int]]:
+        from .oem_initialization import build_machine_calibration_manifest
+
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        if manifest.get("ok") is not True:
+            raise RuntimeError("wp8_machine_calibration_unavailable")
+
+        def value(section: str, name: str) -> int:
+            row = dict(dict(manifest.get(section) or {}).get(name) or {})
+            raw = row.get("value")
+            if type(raw) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(raw)
+
+        state = self.mov_execution_machine_state()
+        version = int(state.get("gripper_version", 1))
+        origin = value("gripper", "originOffsetG")
+        if version == 0:
+            positions = {
+                "stop": 53000 + origin,
+                "close": 54500 + origin,
+                "open": 58500 + origin,
+                "wide": 59500 + origin,
+            }
+        else:
+            positions = {
+                "stop": value("gripper", "GripperClosePOS"),
+                "close": value("gripper", "GripperClosePOS"),
+                "open": value("gripper", "GripperOpenPOS"),
+                "wide": value("gripper", "GripperOpenWide"),
+            }
+        return version, positions
+
+    def _wp8_set_axis_parameter(
+        self, *, board: int, motor: int, parameter: int, value: int, source_anchor: str,
+    ) -> dict[str, Any]:
+        write = self.primitives.tester.motor_set_axis_param(
+            int(board), int(parameter), int(value), motor=int(motor),
+        )
+        readback = self.primitives.tester.motor_get_axis_param(
+            int(board), int(parameter), motor=int(motor),
+        )
+        acknowledged = bool(isinstance(write, Mapping) and write.get("ok") is True)
+        verified = acknowledged and self._wp8_scalar(readback) == int(value)
+        return {
+            "ok": verified,
+            "delivery_attempted": True,
+            "controller_command_acknowledged": acknowledged,
+            "controller_completion_verified": verified,
+            "board": int(board),
+            "motor": int(motor),
+            "parameter": int(parameter),
+            "value": int(value),
+            "write": _json_safe(write),
+            "readback": _json_safe(readback),
+            "source_anchor": source_anchor,
+        }
+
+    def _wp8_move_gripper(self, target: int, *, source_anchor: str) -> dict[str, Any]:
+        result = self.primitives.tester.motor_oem_move_absolute(
+            4, int(target), motor=2, wait_for_stop=True,
+        )
+        receipt = self._deck_primitive_receipt(result, source_anchor=source_anchor)
+        return {**receipt, "delivery_attempted": True, "target": int(target)}
+
+    def wp8_sleep(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation
+        return self.primitives.sleep(int(arguments["milliseconds"]))
+
+    def wp8_load_gantry(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        plate = None if operation == "LoadGantryNull" else arguments.get("plate")
+        return self.load_gantry(plate_on_gantry=plate)
+
+    def wp8_move_z_home(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation, arguments
+        return self.MoveZHome()
+
+    def wp8_park_gantry(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation
+        return self.parkGantry(rehome=bool(arguments.get("rehome", False)))
+
+    def wp8_scriptmove_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation
+        return self.scriptmoveTo(**dict(arguments))
+
+    def wp8_get_g(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        del operation, arguments
+        raw = self.primitives.tester.motor_get_position(4, motor=2)
+        position = self._wp8_scalar(raw)
+        if position is None:
+            raise RuntimeError("wp8_gripper_position_unavailable")
+        return {
+            "ok": True,
+            "delivery_attempted": False,
+            "position": position,
+            "controller_command_acknowledged": False,
+            "controller_completion_verified": True,
+            "readback": _json_safe(raw),
+            "source_anchor": "ClassControlInterface.getG",
+        }
+
+    def wp8_set_gripper_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_set_axis_parameter(
+            board=4, motor=2, parameter=6, value=int(arguments["current"]),
+            source_anchor="ClassControlInterface.setGripperCurrent",
+        )
+
+    def wp8_set_gripper_vmax(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_set_axis_parameter(
+            board=4, motor=2, parameter=4, value=int(arguments["vmax"]),
+            source_anchor="ClassControlInterface.setGripperVMax",
+        )
+
+    def wp8_open_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = self.wp8_set_gripper_vmax(
+            operation, {"vmax": 100 if version == 0 else 1500},
+        )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.OpenGripper:setStallGuardThreshold",
+            )
+        target = positions["wide" if operation == "OpenGripperWide" else "open"]
+        move = self._wp8_move_gripper(
+            target,
+            source_anchor="ClassControlInterface.OpenGripper",
+        )
+        ok = current["ok"] and speed["ok"] and (stall is None or stall["ok"]) and move["ok"]
+        return {
+            **move, "ok": ok, "recover": bool(arguments.get("recover", False)),
+            "wide": operation == "OpenGripperWide", "current": current,
+            "speed": speed, "stall": stall,
+        }
+
+    def wp8_close_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = self.wp8_set_gripper_vmax(
+            operation, {"vmax": 100 if version == 0 else 1500},
+        )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.CloseGripper:setStallGuardThreshold",
+            )
+        move = self._wp8_move_gripper(
+            positions["close"], source_anchor="ClassControlInterface.CloseGripper",
+        )
+        return {
+            **move,
+            "ok": current["ok"] and speed["ok"] and (stall is None or stall["ok"]) and move["ok"],
+            "current": current, "speed": speed, "stall": stall,
+        }
+
+    def wp8_stop_close_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = None
+        if bool(arguments.get("reset_speed", True)) or version != 0:
+            speed = self.wp8_set_gripper_vmax(
+                operation, {"vmax": 100 if version == 0 else 1500},
+            )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.StopCloseGripper:setStallGuardThreshold",
+            )
+        move = self._wp8_move_gripper(
+            positions["stop"], source_anchor="ClassControlInterface.StopCloseGripper",
+        )
+        idle = self.wp8_set_gripper_current(operation, {"current": 10}) if version == 1 else None
+        return {
+            **move,
+            "ok": current["ok"] and (speed is None or speed["ok"])
+            and (stall is None or stall["ok"]) and move["ok"]
+            and (idle is None or idle["ok"]),
+            "current": current, "speed": speed, "stall": stall, "idle_current": idle,
+        }
+
+    def wp8_move_g_closed_plus(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        _version, positions = self._wp8_calibration()
+        method = getattr(self.primitives, "oem_move_axis_absolute", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:oem_move_axis_absolute")
+        result = method(
+            "g", positions["close"] + int(arguments["offset"]), wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveG",
+        )
+
+    def wp8_send_gripper_home(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        version, _positions = self._wp8_calibration()
+        result = self.primitives.tester.motor_oem_home_axis(
+            "g", speed=600 if version == 0 else 200, timeout_s=30.0,
+            startup=False, restore_idle_current=version == 1, oem_exact_current=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.sendGripperHome",
+        )
+
+    def wp8_lock_gripper(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, dispatch_attempt_id: str,
+        ownership_generation: int, board_epoch_4: int, board_epoch_5: int,
+        acquiring_identity: str | None = None, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        token = Wp8GripperLockToken(
+            command_id=str(command_id),
+            acquiring_identity=(
+                str(acquiring_identity)
+                if acquiring_identity is not None
+                else f"child:{int(child_order)}:{str(operation)}"
+            ),
+            plan_digest=str(plan_digest), dispatch_attempt_id=str(dispatch_attempt_id),
+            ownership_generation=int(ownership_generation),
+            board_epoch_4=int(board_epoch_4), board_epoch_5=int(board_epoch_5),
+        )
+        self._wp8_gripper_lock.acquire()
+        with self._wp8_task_lock:
+            self._wp8_gripper_lock_owner = token
+        return {"ok": True, "delivery_attempted": False, "lock_token": token.receipt()}
+
+    def wp8_release_gripper_lock(
+        self, operation: str, arguments: Mapping[str, Any], *, lock_token: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        supplied = Wp8GripperLockToken.from_receipt(lock_token)
+        with self._wp8_task_lock:
+            owner = self._wp8_gripper_lock_owner
+            if owner is None:
+                return {"ok": True, "delivery_attempted": False, "source_noop": True}
+            if owner != supplied:
+                raise RuntimeError("wp8_gripper_lock_wrong_owner")
+            self._wp8_gripper_lock_owner = None
+        self._wp8_gripper_lock.release()
+        return {"ok": True, "delivery_attempted": False, "released_lock_token": supplied.receipt()}
+
+    def bind_wp8_background_task_settler(self, settler: Callable[..., None]) -> None:
+        if not callable(settler):
+            raise TypeError("WP8 background task settler must be callable")
+        self._wp8_background_task_settler = settler
+
+    def _wp8_start_task(
+        self, *, task_id: str, target: Callable[[], Any], task_kind: str,
+        command_id: str, child_order: int, plan_digest: str,
+    ) -> dict[str, Any]:
+        authority = self.deck_owner_authority_stamps()
+        row: dict[str, Any] = {
+            "state": "created", "kind": task_kind, "result": None, "error": None,
+            "command_id": command_id, "child_order": int(child_order),
+            "plan_digest": plan_digest,
+            "ownership_generation": authority.get("ownership_generation"),
+            "board_epoch_4": authority.get("board_epoch_4"),
+            "board_epoch_5": authority.get("board_epoch_5"),
+        }
+
+        def run() -> None:
+            row["state"] = "running"
+            try:
+                row["result"] = target()
+                if isinstance(row["result"], Mapping) and row["result"].get("ok") is False:
+                    row["error"] = {"type": "NestedOperationFailure", "message": "background operation returned ok=false"}
+                    row["state"] = "failed"
+                else:
+                    row["state"] = "completed"
+            except Exception as exc:
+                row["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                row["state"] = "failed"
+            finally:
+                settler = getattr(self, "_wp8_background_task_settler", None)
+                if callable(settler):
+                    settler(
+                        task_id,
+                        state=str(row["state"]),
+                        evidence={"result": row["result"], "error": row["error"]},
+                    )
+
+        thread = threading.Thread(target=run, name=task_id, daemon=True)
+        row["thread"] = thread
+        with self._wp8_task_lock:
+            if task_id in self._wp8_tasks:
+                raise RuntimeError("wp8_background_task_identity_conflict")
+            self._wp8_tasks[task_id] = row
+        thread.start()
+        return {
+            "ok": True, "delivery_attempted": False,
+            "background_task_id": task_id,
+            "background_task_state": "running_unawaited",
+        }
+
+    def wp8_start_move_z_pseudo_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":z-home"
+        return self._wp8_start_task(
+            task_id=task_id,
+            task_kind="move_z_pseudo_home",
+            target=lambda: self.wp8_move_z_pseudo_home(operation, {}),
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_start_gripper_home_and_unlock(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":gripper-home"
+        with self._wp8_task_lock:
+            lock_token = self._wp8_gripper_lock_owner
+        if lock_token is None:
+            raise RuntimeError("wp8_gripper_lock_owner_missing")
+
+        def work() -> dict[str, Any]:
+            home: Mapping[str, Any] | None = None
+            try:
+                home = self.wp8_send_gripper_home(operation, {})
+            finally:
+                released = self.wp8_release_gripper_lock(
+                    operation, {}, lock_token=lock_token.receipt(),
+                )
+            return {"ok": home.get("ok") is True and released.get("ok") is True, "home": home, "released": released}
+
+        return self._wp8_start_task(
+            task_id=task_id, task_kind="gripper_home_and_unlock", target=work,
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_wait_move_z_only(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        with self._wp8_task_lock:
+            matches = [
+                (task_id, row) for task_id, row in self._wp8_tasks.items()
+                if row.get("kind") == "move_z_pseudo_home"
+                and row.get("command_id") == command_id
+                and row.get("plan_digest") == plan_digest
+            ]
+        if len(matches) != 1:
+            raise RuntimeError("wp8_z_background_task_unavailable")
+        task_id, row = matches[0]
+        if row is None or not isinstance(row.get("thread"), threading.Thread):
+            raise RuntimeError("wp8_z_background_task_unavailable")
+        timeout_ms = int(arguments.get("timeout_ms", 30000))
+        if timeout_ms <= 0 or timeout_ms > 500000:
+            raise ValueError("wp8_z_background_task_timeout_invalid")
+        row["thread"].join(timeout=float(timeout_ms) / 1000.0)
+        if row["thread"].is_alive():
+            raise RuntimeError("wp8_z_background_task_timeout")
+        if row.get("state") != "completed":
+            raise RuntimeError(f"wp8_z_background_task_failed:{row.get('error')}")
+        return {"ok": True, "delivery_attempted": False, "background_task_id": task_id, "result": row.get("result")}
+
+    def wp8_move_z_to_location(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        table = load_bound_oem_position_table()
+        location = int(arguments.get("location", arguments.get("pressure_target")))
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        if location not in LOCATION_ID_TO_NAME:
+            raise RuntimeError(f"source_authority_missing:location:{location}")
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[location])
+        if row.z_low is None:
+            raise RuntimeError(f"source_authority_missing:zLow:{location}")
+        target = int(row.z_low) + int(arguments.get("z_low_offset", arguments.get("offset", 0)))
+        state = self.mov_execution_machine_state()
+        wait = bool(arguments.get("wait", True))
+        result = self.primitives.oem_move_z(
+            target, pseudo_home_steps=int(state["pseudo_z_home"]),
+            motor_current=31, wait_for_stop=wait,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.{operation}",
+        )
+
+    def wp8_move_z_pseudo_home(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        state = self.mov_execution_machine_state()
+        target = int(state["pseudo_z_home"])
+        result = self.primitives.oem_move_z(
+            target, pseudo_home_steps=target, motor_current=31, wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.{operation}",
+        )
+
+    def wp8_move_z_steps(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        result = self.primitives.z_move_steps(
+            steps=int(arguments["steps"]), wait_timeout_s=20.0,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveSteps:z",
+        )
+
+    def wp8_move_y_steps(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        owner = getattr(self.primitives, "y_provider", None)
+        method = getattr(owner, "move_steps", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:y_move_steps")
+        result = method(
+            int(arguments["steps"]), wait_timeout_s=20.0,
+            command_id=self._wp8_identity(command_id, child_order, plan_digest),
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveSteps:y",
+        )
+
+    def wp8_move_axis_absolute(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        axis, target, timeout = ("x", 79000, 45.0) if operation == "moveX79000" else ("z", 80000, 30.0)
+        state = self.mov_execution_machine_state()
+        result = self.primitives.oem_initialize_motion_move_absolute(
+            axis, target, timeout_s=timeout,
+            pseudo_home_steps=int(state["pseudo_z_home"]),
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.cleanup:{operation}",
+        )
+
+    def wp8_wait_z(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        result = self.primitives.motor_wait_stopped(
+            4, motor=1, timeout_s=float(arguments["timeout_ms"]) / 1000.0,
+        )
+        stopped = bool(isinstance(result, Mapping) and (result.get("stopped") is True or result.get("ok") is True))
+        return {
+            "ok": stopped, "delivery_attempted": False,
+            "controller_command_acknowledged": False,
+            "controller_completion_verified": stopped,
+            "wait": _json_safe(result),
+            "source_anchor": "ClassControlInterface.waitForMotor",
+        }
+
+    def wp8_set_z_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._deck_primitive_receipt(
+            self.primitives.z_set_current_max(int(arguments["current"])),
+            source_anchor="ClassControlInterface.setZaxisCurrentmax",
+        )
+
+    def wp8_restore_z_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self._deck_primitive_receipt(
+            self.primitives.z_set_current_max(None),
+            source_anchor="ClassControlInterface.setZaxisCurrentmax:100",
+        )
+
+    def _wp8_publish_semantic(
+        self, *, operation: str, command_id: str, child_order: int,
+        plan_digest: str, updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        result = publisher(
+            source_operation=operation,
+            source_command_id=self._wp8_identity(command_id, child_order, plan_digest),
+            updates=dict(updates),
+            **self.deck_owner_authority_stamps(),
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError(f"source_authority_invalid:{operation}")
+        return {"ok": True, "delivery_attempted": False, "published": dict(result)}
+
+    def wp8_update_location(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        destination = int(arguments["destination"])
+        if destination not in LOCATION_ID_TO_NAME:
+            raise RuntimeError("source_authority_missing:updateLocation")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={
+                "current_location": LOCATION_ID_TO_NAME[destination],
+                "current_well": int(arguments.get("well", 0)),
+            },
+        )
+
+    def wp8_update_plate_location(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        plate = canonical_plate_name(arguments.get("plate"))
+        location = int(arguments["location"])
+        name = plate_name_for_storage(plate) if plate is not None else None
+        if name is None or location not in LOCATION_ID_TO_NAME:
+            raise RuntimeError("source_authority_missing:updatePlateLocation")
+        state = self._canonical_deck_semantic_state()
+        movable = dict(state.get("movable_plate_locations") or {})
+        movable[name] = LOCATION_ID_TO_NAME[location]
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={"movable_plate_locations": movable},
+        )
+
+    def wp8_update_thermal_door_open(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        if type(arguments.get("value")) is not bool:
+            raise RuntimeError("source_authority_missing:updateThermalDoorOpen:value")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={"thermal_door_open": bool(arguments["value"])},
+        )
+
+    def wp8_clear_tip_loaded(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"tip_loaded": False},
+        )
+
+    def _wp8_door_config(self) -> dict[str, int]:
+        from .oem_initialization import build_machine_calibration_manifest
+
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        rows = dict(manifest.get("thermal_door") or {})
+
+        def value(name: str) -> int:
+            raw = dict(rows.get(name) or {}).get("value")
+            if type(raw) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(raw)
+
+        return {
+            "open": value("TCDoorOpen"),
+            "threshold": value("TCDoorStallGuardThreshold"),
+            "max_current": value("TC_DOOR_MAX_CURRENT"),
+        }
+
+    def wp8_set_door_stall_threshold(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        config = self._wp8_door_config()
+        value = config["threshold"] + (2 if operation == "setDoorStallThresholdPlus2" else 0)
+        return self._wp8_set_axis_parameter(
+            board=6, motor=0, parameter=205, value=value,
+            source_anchor="ClassControlInterface.open/closeThermalDoor:setStallGuardThreshold",
+        )
+
+    def wp8_set_door_max_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self._wp8_set_axis_parameter(
+            board=6, motor=0, parameter=6,
+            value=self._wp8_door_config()["max_current"],
+            source_anchor="ClassControlInterface.open/closeThermalDoor:setMaxCurrent",
+        )
+
+    def wp8_move_door(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        target = self._wp8_door_config()["open"] if operation == "moveDoorOpen" else 0
+        result = self.primitives.tester.motor_oem_move_absolute(
+            6, target, motor=0, wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ClassControlInterface.{operation}",
+        )
+
+    def wp8_read_door_sensors(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        raw = self.primitives.motor_thermal_door_status()
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("thermal_door_sensor_result_malformed")
+        opened = raw.get("opened")
+        closed = raw.get("closed")
+        if type(opened) is not bool or type(closed) is not bool:
+            raise RuntimeError("thermal_door_sensor_result_incomplete")
+        return {
+            "ok": True, "delivery_attempted": False,
+            "door_open": opened and not closed,
+            "door_closed": closed and not opened,
+            "opened_sensor": opened, "closed_sensor": closed,
+            "sensor_result": _json_safe(raw),
+            "source_anchor": "ClassControlInterface.confirmAxis:tcDoorOpened/tcDoorClosed",
+        }
+
+    def wp8_home_axis_d(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        result = self.primitives.motor_oem_door_search_home(startup=False, timeout_s=30.0)
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.HomeAxis:d",
+        )
+
+    @staticmethod
+    def _wp8_io_value(result: Any) -> int:
+        if not isinstance(result, Mapping) or type(result.get("value")) is not int:
+            raise RuntimeError("deck_io_observation_invalid")
+        return int(result["value"])
+
+    def wp8_check_door_status(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        self.sleep(0.5)
+        door = self.primitives.deck_io_query_type(1)
+        latch = self.primitives.deck_io_query_type(3)
+        door_value = self._wp8_io_value(door)
+        latch_value = self._wp8_io_value(latch)
+        solenoid_on = None
+        if latch_value == 1:
+            solenoid_on = self.primitives.tester.deck_io_set_type(2, 1)
+            self.sleep(0.8)
+            door = self.primitives.deck_io_query_type(1)
+            latch = self.primitives.deck_io_query_type(3)
+            door_value = self._wp8_io_value(door)
+            latch_value = self._wp8_io_value(latch)
+        voltage = self.primitives.deck_io_query_type(0)
+        voltage_value = self._wp8_io_value(voltage)
+        solenoid_off = None
+        door_ok = voltage_value == 0
+        if voltage_value != 0:
+            solenoid_off = self.primitives.tester.deck_io_set_type(2, 0)
+            self.sleep(0.3)
+        return {
+            "ok": True, "door_ok": door_ok,
+            "delivery_attempted": solenoid_on is not None or solenoid_off is not None,
+            "door_sensor": door_value, "latch_sensor": latch_value,
+            "voltage_24v": voltage_value,
+            "enclosure_door_closed": door_value == 1 if door_ok else False,
+            "latch_closed": latch_value == 1,
+            "solenoid_on": _json_safe(solenoid_on),
+            "solenoid_off": _json_safe(solenoid_off),
+            "source_anchor": "ControlLib.checkDoorStatus:8670-8726",
+        }
+
+    def wp8_led2(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        owner = getattr(self.primitives, "wp8_led2_set", None)
+        if not callable(owner):
+            return {
+                "ok": True, "delivery_attempted": False,
+                "source_noop": "m_ledControl_null",
+                "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
+            }
+        result = owner(operation == "led2On")
+        row = dict(result) if isinstance(result, Mapping) else {}
+        return {
+            **row, "ok": row.get("ok") is True, "delivery_attempted": True,
+            "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
+        }
+
+    def wp8_snapshot_image(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        condition = str(arguments.get("name") or "")
+        owner = getattr(self.primitives, "wp8_snapshot_image", None)
+        if not callable(owner):
+            return {
+                "ok": True, "delivery_attempted": False,
+                "source_noop": "m_frameGrabber_null", "condition": condition,
+                "source_anchor": "ControlLib.SnapshotImage:8951-8994",
+            }
+        try:
+            result = owner(
+                condition=condition,
+                artifact_id=self._wp8_identity(command_id, child_order, plan_digest),
+            )
+        except Exception as exc:
+            return {
+                "ok": True, "delivery_attempted": True,
+                "exception_suppressed": True,
+                "exception_type": type(exc).__name__, "exception": str(exc),
+                "source_anchor": "ControlLib.SnapshotImage:8979-8993",
+            }
+        return {
+            "ok": True, "delivery_attempted": True,
+            "result": _json_safe(result),
+            "source_anchor": "ControlLib.SnapshotImage:8951-8994",
+        }
+
+    def _wp8_run_pipette(
+        self, *, operation_name: str, operation: Callable[[Any], Any],
+        requested_inputs: Mapping[str, Any], command_id: str, child_order: int,
+        plan_digest: str,
+    ) -> Any:
+        runner = getattr(self.primitives, "pipette_audit_runner", None)
+        if not callable(runner):
+            raise RuntimeError("pipette_audit_runner_not_bound")
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        return runner(
+            operation_name, operation,
+            requested_inputs=dict(requested_inputs),
+            lifecycle_stage_id=f"serial206.wp8.{operation_name}",
+            lifecycle_attempt_id=command_id,
+            lifecycle_idempotency_key=identity,
+        )
+
+    def wp8_query_tip_status(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        raw = self._wp8_run_pipette(
+            operation_name="query_all_pipette_tip_states",
+            operation=lambda transport: transport.query_tip_status_all(),
+            requested_inputs={}, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+        )
+        rows = raw.get("channels") if isinstance(raw, Mapping) else None
+        if not isinstance(rows, list) or len(rows) != 4:
+            raise RuntimeError("wp8_tip_status_invalid")
+        loaded = [
+            index for index, row in enumerate(rows)
+            if isinstance(row, Mapping) and row.get("tip_loaded") is True
+        ]
+        if any(not isinstance(row, Mapping) or type(row.get("tip_loaded")) is not bool for row in rows):
+            raise RuntimeError("wp8_tip_status_invalid")
+        return {
+            "ok": True, "delivery_attempted": True,
+            "tip_exists": bool(loaded), "channels_with_tips": loaded,
+            "controller_evidence": _json_safe(raw),
+        }
+
+    def wp8_eject_all_tips_cleanup(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        if arguments.get("first") is not False or arguments.get("second") is not True:
+            raise RuntimeError("wp8_cleanup_eject_arguments_invalid")
+        raw = self._wp8_run_pipette(
+            operation_name="eject_all_tips_cleanup",
+            operation=lambda transport: transport.eject_all_tips(
+                check_missing_tip=False, wait=True, channels=None,
+            ),
+            requested_inputs={"check_missing_tip": False, "wait": True, "channels": None},
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+        return {
+            "ok": bool(isinstance(raw, Mapping) and raw.get("ok") is True),
+            "delivery_attempted": True, "controller_evidence": _json_safe(raw),
+        }
+
+    def wp8_scriptmove_to_waste(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self.scriptmoveTo(
+            destination=6, well=0, position_flag=1, run_in_parallel=True,
+        )
+
+    def wp8_wait_stop(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        signaled = self._wp8_stop_event.wait(500.0)
+        if signaled:
+            self._wp8_stop_event.clear()
+        return {
+            "ok": True, "delivery_attempted": False, "signaled": signaled,
+            "timeout_ms": 500000,
+            "source_anchor": "ControlLib.cleanup:oStopEvent.WaitOne(500000)",
+        }
+
+    def _wp8_execute_nested_plan(
+        self, *, plan: Mapping[str, Any], command_id: str,
+        owner_identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        digest = str(plan["plan_digest"])
+
+        def invoke(child: Mapping[str, Any]) -> Any:
+            result = self.execute_wp8_child(
+                {**dict(child), "_delivery_identity": dict(owner_identity)},
+                command_id=command_id,
+                child_order=int(child["order"]), plan_digest=digest,
+            )
+            if isinstance(result, Mapping) and result.get("ok") is not True:
+                raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
+            return result
+
+        result = execute_finite_plate_operation(plan, invoke)
+        return {
+            **dict(result),
+            "source_children": list(result.get("completed_children") or []),
+            "source_plan_digest": digest,
+        }
+
+    def _wp8_compile_and_execute(
+        self, *, operation: str, inputs: Mapping[str, Any], command_id: str,
+        owner_identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        machine = self.wp8_operation_machine_state(operation, inputs)
+        plan = compile_finite_plate_operation(
+            operation, source_leaf_available=True,
+            **{**machine, **dict(inputs)},
+        )
+        return self._wp8_execute_nested_plan(
+            plan=plan, command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def wp8_catch_plate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="catch_plate", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_release_plate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="release_plate", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_send_z_and_gripper_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="send_z_and_gripper_home", inputs=arguments,
+            command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def wp8_door_open(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="thermal_door", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_cleanup_waste_prelude(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        machine = self.wp8_operation_machine_state("cleanup", {})
+        full_plan = compile_finite_plate_operation(
+            "cleanup", source_leaf_available=True, **machine,
+        )
+        children: list[dict[str, Any]] = []
+        for child in full_plan["children"]:
+            children.append(dict(child))
+            if child["operation"] == "sendGripperHome":
+                break
+        plan = {**dict(full_plan), "children": children}
+        return self._wp8_execute_nested_plan(
+            plan=plan, command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def execute_wp8_child(
+        self,
+        child: Mapping[str, Any],
+        *,
+        command_id: str,
+        child_order: int,
+        plan_digest: str,
+    ) -> Any:
         """Execute one pre-persisted finite WP8 child through source-owned primitives."""
         operation = str(child.get("operation") or "")
         arguments = dict(child.get("arguments") or {})
+        delivery_identity = dict(child.get("_delivery_identity") or {})
         if not operation:
             raise ValueError("wp8 child operation is required")
-        primitive = getattr(self.primitives, operation, None)
-        if callable(primitive):
-            return primitive(**arguments)
-        if operation == "Sleep":
-            return self.primitives.sleep(int(arguments["milliseconds"]))
-        if operation in {"LoadGantry", "LoadGantryNull"}:
-            plate = None if operation == "LoadGantryNull" else arguments.get("plate")
-            return self.load_gantry(plate_on_gantry=plate)
-        if operation == "parkGantry":
-            return self.parkGantry(rehome=bool(arguments.get("rehome", False)))
-        if operation == "updateLocation":
-            from .oem_compat.pathing import LOCATION_ID_TO_NAME
-            destination = int(arguments["destination"])
-            publisher = getattr(self, "_deck_semantic_state_publisher", None)
-            if not callable(publisher) or destination not in LOCATION_ID_TO_NAME:
-                raise RuntimeError("source_authority_missing:updateLocation")
-            return publisher(
-                source_operation="updateLocation",
-                source_command_id=f"wp8:updateLocation:{time.time_ns()}",
-                updates={"current_location": LOCATION_ID_TO_NAME[destination], "current_well": int(arguments.get("well", 0))},
-                **self.deck_owner_authority_stamps(),
-            )
-        if operation == "updatePlateLocation":
-            plate = canonical_plate_name(arguments.get("plate"))
-            location = int(arguments["location"])
-            if plate is None:
-                raise RuntimeError("source_authority_missing:updatePlateLocation:plate")
-            state = self._canonical_deck_semantic_state()
-            movable = dict(state.get("movable_plate_locations") or {})
-            from .oem_compat.pathing import LOCATION_ID_TO_NAME
-            name = plate_name_for_storage(plate)
-            if name is None or location not in LOCATION_ID_TO_NAME:
-                raise RuntimeError("source_authority_missing:updatePlateLocation:location")
-            movable[name] = LOCATION_ID_TO_NAME[location]
-            publisher = getattr(self, "_deck_semantic_state_publisher", None)
-            if not callable(publisher):
-                raise RuntimeError("source_authority_missing:updatePlateLocation")
-            return publisher(
-                source_operation="updatePlateLocation",
-                source_command_id=f"wp8:updatePlateLocation:{time.time_ns()}",
-                updates={"movable_plate_locations": movable},
-                **self.deck_owner_authority_stamps(),
-            )
-        raise RuntimeError(f"source_authority_missing:{operation}")
+        if not command_id or child_order != int(child.get("order", -1)) or not plan_digest:
+            raise ValueError("wp8 child durable identity is invalid")
+        from .oem_deck_movement import (
+            compiled_wp8_machine_targets,
+            validate_compiled_wp8_machine_targets,
+        )
+        if compiled_wp8_machine_targets(child):
+            validate_compiled_wp8_machine_targets(child, load_bound_oem_position_table())
+        if operation not in WP8_COMPILED_CHILD_OPERATIONS:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        binding_name = self._WP8_CHILD_BINDINGS.get(operation)
+        if binding_name is None:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        handler = getattr(self, binding_name, None)
+        if not callable(handler):
+            raise RuntimeError(f"source_authority_missing:{operation}:{binding_name}")
+        handler_identity = {
+            "dispatch_attempt_id": str(delivery_identity.get("dispatch_attempt_id") or ""),
+            "ownership_generation": int(delivery_identity.get("ownership_generation", -1)),
+            "board_epoch_4": int(delivery_identity.get("board_epoch_4", -1)),
+            "board_epoch_5": int(delivery_identity.get("board_epoch_5", -1)),
+        }
+        owner_identity = {
+            **handler_identity,
+            "work_identity": str(
+                delivery_identity.get("work_identity")
+                or f"child:{int(child_order)}:{operation}"
+            ),
+            "plan_digest": str(delivery_identity.get("plan_digest") or plan_digest),
+        }
+        handler_identity["acquiring_identity"] = owner_identity["work_identity"]
+        handler_identity["owner_identity"] = owner_identity
+        owner_plan_digest = owner_identity["plan_digest"]
+        if operation == "ReleaseLockGripperOperation":
+            with self._wp8_task_lock:
+                owner = self._wp8_gripper_lock_owner
+            if owner is None:
+                return {"ok": True, "delivery_attempted": False, "source_noop": True}
+            if (
+                owner.command_id != str(command_id)
+                or owner.acquiring_identity != owner_identity["work_identity"]
+                or owner.plan_digest != owner_plan_digest
+                or owner.dispatch_attempt_id != handler_identity["dispatch_attempt_id"]
+                or owner.ownership_generation != handler_identity["ownership_generation"]
+                or owner.board_epoch_4 != handler_identity["board_epoch_4"]
+                or owner.board_epoch_5 != handler_identity["board_epoch_5"]
+            ):
+                raise RuntimeError("wp8_gripper_lock_wrong_owner")
+            handler_identity["lock_token"] = owner.receipt()
+        return handler(
+            operation,
+            arguments,
+            command_id=command_id,
+            child_order=child_order,
+            plan_digest=owner_plan_digest,
+            **handler_identity,
+        )
 
     def parkGantry(
         self,
@@ -8523,7 +9922,12 @@ class Serial206OemInitializationProvider:
             )
             controller_rows.append(moved)
             record("ejectAllTips(true,true)", eject(), discarded_return=False)
-            queried = record("queryTipStatus(-1)", query(), discarded_return=True)
+            assert callable(query)
+            queried = record(
+                "queryTipStatus(-1)",
+                query(lifecycle_stage_id="serial206.park_gantry.query_tip_status"),
+                discarded_return=True,
+            )
             self.sleep(0.100)
             source_children.append({
                 "operation": "Thread.Sleep(100)", "discarded_return": False,

@@ -14,7 +14,7 @@ from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.oem_deck_catalog import DeckCatalog, configured_location_names
 from bioxp.oem_deck_movement import (
     DeckAuthoritySnapshot, DeckExecutionFailure, NamedLocationIntent,
-    compile_named_location, make_deck_command_executor,
+    OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS, compile_named_location, make_deck_command_executor,
 )
 from bioxp.oem_compat.position_table import PositionTable
 
@@ -45,6 +45,18 @@ def _request(key: str = "deck-command-1") -> dict:
 
 def _ambiguous_deck_store(tmp_path):
     store = _operator_store(tmp_path)
+    store.bootstrap_deck_semantic_state({
+        "current_location": "LOC_MS", "current_well": 0, "current_tray": None,
+        "tip_loaded": False, "tip_dirty": False, "tip_location": -1, "clean_path": True,
+        "plate_on_gantry": None,
+        "movable_plate_locations": dict(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS),
+        "pseudo_z_home": 500,
+        "ownership_generation": 7, "board_epoch_4": 10, "board_epoch_5": 11,
+        "latch_status": True, "machine_latch_closed": True,
+        "latch_observation_id": "latch-bootstrap",
+        "source_operation": "migrated_successful_semantic_state",
+        "source_command_id": "bootstrap-source",
+    })
     admitted = store.admit_command(_request("deck-recovery-ambiguous"), state=_state())
     table = _stage_table()
     authority = DeckAuthoritySnapshot(
@@ -485,6 +497,8 @@ def test_already_parked_no_io_branch_still_commits_caller_update_location(tmp_pa
     )
     table = _stage_table(); provider = _NoopParkProvider(table, mode="noop")
     executor = make_deck_command_executor(provider_getter=lambda: provider, position_table_provider=lambda: table, command_store=store)
+    assert store._acquire_owner() is True
+    claimed = store.claim_next(); assert claimed is not None
     response = executor(
         command_id=admitted["command_id"], target="LOC_PARK", camera_offset=False,
         expected_ownership_generation=7, expected_board_epoch_by_board={"4": 10, "5": 11},
@@ -528,6 +542,23 @@ def test_restart_and_ambiguous_recovery_hold_blocks_new_deck_admission_and_dispa
     admitted = first.admit_command(_request("restart-active"), state=_state())
     assert first._acquire_owner() is True
     assert first.claim_next()["command_id"] == admitted["command_id"]
+    table = _stage_table()
+    authority = DeckAuthoritySnapshot(
+        7, "provider-owner", 10, 11, table.digest, 3,
+        {"x": 1, "y": 1, "z": 1, "g": 1},
+        {"global": 0, "x": 0, "y": 0, "z": 0},
+        "latch-restart", "position-restart", 1.0, 0, 0, 65000,
+        "LOC_MS", 0, False, False, -1, True, None, 500, "BIOXP", True, True,
+    )
+    plan = compile_named_location(
+        NamedLocationIntent("LOC_OC"), DeckCatalog.from_position_table(table), table, authority,
+    )
+    first.persist_deck_plan(admitted["command_id"], plan)
+    with first._authority_write():
+        first.connection.execute(
+            "UPDATE operator_plane_deck_commands SET delivery_attempted=1 WHERE command_id=?",
+            (admitted["command_id"],),
+        )
     first.connection.execute("UPDATE operator_plane_lane SET owner_lease_until=0 WHERE singleton=1")
     first.connection.close()
 
@@ -558,7 +589,7 @@ def test_unknown_outcome_acknowledgement_preserves_deck_hold_and_blocks_admissio
 
     assert result["outcome_remains"] == "unknown"
     assert store.recovery()["hold"] is True
-    assert store.deck_semantic_state()["ambiguity_state"] == "recovery_required"
+    assert store.deck_semantic_state()["ambiguity_state"] == "none"
     with pytest.raises(HTTPException) as blocked:
         store.admit_command(_request("still-blocked-after-ack"), state=_state())
     assert blocked.value.detail["error"] == "deck_recovery_hold"
@@ -602,6 +633,7 @@ def test_governed_deck_reconciliation_is_atomic_and_clears_hold_only_with_exact_
             "current_authority": {
                 **common["current_authority"], "controller_position_observation_id": "",
             },
+            "final_authority_reader": lambda: dict(common["current_authority"]),
         })
     assert store.deck_semantic_state() == before
     assert store.recovery() == recovery_before

@@ -33,7 +33,7 @@ def test_plain_runtime_connection_defers_substantive_ddl_to_migration_owner(tmp_
 def test_fresh_runtime_database_has_serial206_v2_authority(tmp_path):
     store = OEMRuntimeStore(tmp_path)
 
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
     tables = {
         row[0]
         for row in store._db.execute(
@@ -120,14 +120,14 @@ def test_existing_v1_operator_rows_are_preserved_and_migrated(tmp_path):
 
     store = OEMRuntimeStore(tmp_path)
 
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
     row = store._db.execute(
         "SELECT command_id,receipt_json FROM operator_commands"
     ).fetchone()
     assert tuple(row) == ("old-command", "{}")
     assert store._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
-    ).fetchone()[0] == 5
+    ).fetchone()[0] == 6
 
 
 def test_existing_v2_additive_operator_schema_is_rebuilt_without_data_loss(tmp_path):
@@ -229,7 +229,7 @@ def test_existing_v2_additive_operator_schema_is_rebuilt_without_data_loss(tmp_p
     ).fetchall())
     assert sequences == {"operator_commands": 15, "operator_transitions": 21}
     assert migrated._db.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_existing_v2_legacy_receipt_constraint_is_repaired_without_data_loss(tmp_path):
@@ -279,7 +279,7 @@ def test_existing_v2_legacy_receipt_constraint_is_repaired_without_data_loss(tmp
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='serial206_receipts'"
     ).fetchone()[0]
     assert "CHECK(idempotency_replay_enabled IN (0, 1))" in table_sql
-    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_future_schema_version_refuses_without_mutation(tmp_path):
@@ -305,10 +305,10 @@ def test_v2_migration_is_idempotent(tmp_path):
     first.close()
     second = OEMRuntimeStore(tmp_path)
 
-    assert second._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert second._db.execute("PRAGMA user_version").fetchone()[0] == 6
     assert second._db.execute(
         "SELECT COUNT(*) FROM runtime_schema_migrations"
-    ).fetchone()[0] == 5
+    ).fetchone()[0] == 6
 
 
 def _seed_committed_v2_identity(tmp_path, monkeypatch, digest):
@@ -452,7 +452,7 @@ def test_deployed_v2_operator_manifold_advances_to_v5_without_data_or_trigger_lo
     verify_canonical_runtime_database(migrated._db)
     assert inspect_database(tmp_path / "bioxp_runtime.db")["schema_contract_issues"] == []
 
-    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 6
     evidence_digest = hashlib.sha256(b'{"legacy":"operator-evidence"}\n').hexdigest()
     evidence = migrated._db.execute(
         """
@@ -550,7 +550,7 @@ def test_deployed_v2_migration_identity_advances_without_rewriting_history(tmp_p
 
     migrated = OEMRuntimeStore(tmp_path)
 
-    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 6
     assert migrated._db.execute(
         "SELECT ddl_sha256 FROM runtime_schema_migrations WHERE version=2"
     ).fetchone()[0] == deployed_digest
@@ -567,7 +567,7 @@ def test_canonical_registry_has_unique_monotonic_exact_identities(tmp_path):
     store = OEMRuntimeStore(tmp_path)
     registry = canonical_runtime_migration_registry()
 
-    assert [item.version for item in registry] == [1, 2, 3, 4, 5]
+    assert [item.version for item in registry] == [1, 2, 3, 4, 5, 6]
     assert len({item.version for item in registry}) == len(registry)
     rows = store._db.execute(
         """
@@ -655,5 +655,5 @@ def test_committed_intermediate_migration_resumes_to_v5(
 
     monkeypatch.setattr(runtime_store_module, blocked_symbol, original)
     resumed = OEMRuntimeStore(tmp_path)
-    assert resumed._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert resumed._db.execute("PRAGMA user_version").fetchone()[0] == 6
     resumed.close()

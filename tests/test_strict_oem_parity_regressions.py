@@ -865,7 +865,7 @@ def test_x_move_steps_delegates_to_cached_currentposition_source_wrapper(monkeyp
     assert result["source_return_code"] == 1125
 
 
-def test_protocol_motion_handler_uses_serial206_oem_providers(tmp_path, monkeypatch):
+def test_protocol_motion_handler_uses_canonical_durable_deck_executor(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp import api
@@ -873,8 +873,11 @@ def test_protocol_motion_handler_uses_serial206_oem_providers(tmp_path, monkeypa
     source = inspect.getsource(api._protocol_live_move_handler)
     assert "_execute_absolute_move" not in source
     assert "_execute_relative_move" not in source
-    assert "execute_x_intent" in source
-    assert "execute_z_intent" in source
+    assert "execute_x_intent" not in source
+    assert "execute_z_intent" not in source
+    assert "ClassMoveToIntent" in source
+    assert "oem_mov_execution_admitter" in source
+    assert "_wait_protocol_deck_command" in source
 
 
 def test_v2_catalog_and_receipt_source_cover_all_interrupt_states():

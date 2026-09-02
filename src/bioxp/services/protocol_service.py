@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +19,7 @@ DEFAULT_PROTOCOL_JOBS_ROOT = Path("/mnt/BioModStack/bms_results/bioxp_protocol_j
 FALLBACK_PROTOCOL_JOBS_ROOT = Path.home() / ".bioxp" / "protocol_jobs"
 PROTOCOL_OPERATOR_BUNDLE_SCHEMA_VERSION = "bioxp.protocol_operator_bundle.v1"
 PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION = "bioxp.protocol_live_execution_contract.v1"
+PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION = "bioxp.protocol_live_idempotency_reservation.v1"
 LIVE_REFERENCE_REQUIRED_AXES = ("x", "y", "z")
 REFERENCE_REQUIRED_ACTION_KINDS = {
     ProtocolActionKind.MOVE,
@@ -248,6 +252,8 @@ def _utc_now_iso() -> str:
 def _job_status_from_state(state: ProtocolRuntimeState) -> str:
     if state.completed:
         return "completed"
+    if any(stage.status is StageExecutionStatus.FAILED for stage in state.stage_states.values()):
+        return "failed"
     if state.awaiting_review or state.paused:
         return "awaiting_review"
     return "running"
@@ -288,6 +294,64 @@ class ProtocolOperatorBundleStore:
 
     def _bundle_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "bundle.json"
+
+    def _reservation_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "idempotency-reservation.json"
+
+    @contextmanager
+    def live_creation_lock(self, job_id: str):
+        job_dir = self._job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        root_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+        lock_path = job_dir / ".idempotency.lock"
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def load_live_reservation(self, job_id: str) -> dict[str, Any] | None:
+        path = self._reservation_path(job_id)
+        if not path.exists():
+            return None
+        try:
+            reservation = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ProtocolLiveContractError(
+                "The live protocol idempotency reservation is unreadable; operator recovery is required.",
+                details={"idempotency_recovery_required": True, "job_id": job_id},
+            ) from exc
+        if not isinstance(reservation, dict):
+            raise ProtocolLiveContractError(
+                "The live protocol idempotency reservation is invalid; operator recovery is required.",
+                details={"idempotency_recovery_required": True, "job_id": job_id},
+            )
+        return reservation
+
+    def save_live_reservation(self, reservation: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(reservation)
+        job_id = str(payload["job_id"])
+        path = self._reservation_path(job_id)
+        temporary_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with temporary_path.open("w", encoding="utf-8") as temporary_file:
+                json.dump(payload, temporary_file, indent=2, sort_keys=True)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return payload
 
     def save(self, bundle: Mapping[str, Any]) -> dict[str, Any]:
         job_id = str(bundle["job_id"])
@@ -374,7 +438,12 @@ def compile_protocol_source(payload: Mapping[str, Any]) -> CompiledProtocolSourc
             experiment=dict(imported.experiment),
             inventory=dict(imported.inventory),
         )
-    document_payload = payload.get("document") if isinstance(payload.get("document"), Mapping) else payload
+    nested_document = payload.get("document")
+    document_payload = (
+        nested_document
+        if isinstance(nested_document, Mapping)
+        else {key: value for key, value in payload.items() if key != "idempotency_key"}
+    )
     document = compile_native_protocol(document_payload)
     return CompiledProtocolSource(
         source_type="native",
@@ -421,6 +490,125 @@ def _build_operator_bundle(
     }
 
 
+def _request_fingerprint(protocol: Mapping[str, Any], live_contract: Mapping[str, Any]) -> str:
+    fingerprint_contract = dict(live_contract)
+    fingerprint_contract.pop("created_at", None)
+    return hashlib.sha256(
+        json.dumps(
+            {"protocol": dict(protocol), "live_contract": fingerprint_contract},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _idempotency_recovery_error(job_id: str, message: str) -> ProtocolLiveContractError:
+    return ProtocolLiveContractError(
+        message,
+        details={"idempotency_recovery_required": True, "job_id": job_id},
+    )
+
+
+def _validate_terminal_live_replay(
+    *,
+    job_id: str,
+    key_digest: str,
+    request_fingerprint: str,
+    reservation: Mapping[str, Any],
+    bundle: Any,
+) -> dict[str, Any]:
+    if (
+        reservation.get("schema_version") != PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION
+        or reservation.get("job_id") != job_id
+        or reservation.get("idempotency_key_digest") != key_digest
+        or not isinstance(reservation.get("request_fingerprint"), str)
+    ):
+        raise _idempotency_recovery_error(
+            job_id,
+            "The live protocol idempotency reservation is invalid; operator recovery is required.",
+        )
+    if not isinstance(bundle, Mapping):
+        raise _idempotency_recovery_error(
+            job_id,
+            "The live protocol operator bundle is invalid; operator recovery is required.",
+        )
+    execution = bundle.get("execution")
+    if not isinstance(execution, Mapping):
+        raise _idempotency_recovery_error(
+            job_id,
+            "The live protocol operator bundle execution record is invalid; operator recovery is required.",
+        )
+    runtime_state = execution.get("runtime_state")
+    live_contract = execution.get("live_contract")
+    binding = execution.get("idempotency_binding")
+    protocol = bundle.get("protocol")
+    protocol_document = protocol.get("document") if isinstance(protocol, Mapping) else None
+    stage_states = runtime_state.get("stage_states") if isinstance(runtime_state, Mapping) else None
+    action_results = runtime_state.get("action_results") if isinstance(runtime_state, Mapping) else None
+    failed_stage_ids = {
+        str(stage_id)
+        for stage_id, stage_state in stage_states.items()
+        if isinstance(stage_state, Mapping) and stage_state.get("status") == "failed"
+    } if isinstance(stage_states, Mapping) else set()
+    has_failed_action_result = (
+        isinstance(action_results, list)
+        and any(
+            isinstance(result, Mapping)
+            and result.get("stage_id") in failed_stage_ids
+            and result.get("ok") is not True
+            for result in action_results
+        )
+    )
+    completed_terminal = (
+        bundle.get("status") == "completed"
+        and isinstance(runtime_state, Mapping)
+        and runtime_state.get("completed") is True
+    )
+    failed_terminal = (
+        bundle.get("status") == "failed"
+        and isinstance(runtime_state, Mapping)
+        and runtime_state.get("completed") is False
+        and runtime_state.get("paused") is False
+        and runtime_state.get("awaiting_review") is False
+        and bool(failed_stage_ids)
+        and has_failed_action_result
+    )
+    if (
+        bundle.get("schema_version") != PROTOCOL_OPERATOR_BUNDLE_SCHEMA_VERSION
+        or bundle.get("job_id") != job_id
+        or not (completed_terminal or failed_terminal)
+        or execution.get("dry_run") is not False
+        or not isinstance(runtime_state, Mapping)
+        or runtime_state.get("job_id") != job_id
+        or runtime_state.get("dry_run") is not False
+        or not isinstance(protocol, Mapping)
+        or not isinstance(protocol_document, Mapping)
+        or runtime_state.get("protocol_id") != protocol_document.get("protocol_id")
+        or not isinstance(live_contract, Mapping)
+        or not isinstance(binding, Mapping)
+    ):
+        raise _idempotency_recovery_error(
+            job_id,
+            "The live protocol operator bundle is not a terminal bound execution; operator recovery is required.",
+        )
+    persisted_fingerprint = _request_fingerprint(protocol, live_contract)
+    if (
+        binding.get("idempotency_key_digest") != key_digest
+        or binding.get("request_fingerprint") != persisted_fingerprint
+        or reservation.get("request_fingerprint") != persisted_fingerprint
+    ):
+        raise _idempotency_recovery_error(
+            job_id,
+            "The live protocol replay artifacts do not share one request binding; operator recovery is required.",
+        )
+    if request_fingerprint != persisted_fingerprint:
+        raise ProtocolLiveContractError(
+            "The live protocol idempotency key is already bound to different execution intent.",
+            details={"idempotency_conflict": True, "job_id": job_id},
+        )
+    return dict(bundle)
+
+
 def create_protocol_job(
     payload: Mapping[str, Any],
     *,
@@ -433,18 +621,76 @@ def create_protocol_job(
     if not dry_run:
         live_contract = _build_live_execution_contract(payload=payload, compiled=compiled, handlers=handlers)
     created_at = _utc_now_iso()
-    job_id = f"protocol-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
-    state = ProtocolExecutor(dry_run=dry_run, job_id=job_id, handlers=handlers).execute(compiled.document)
-    bundle = _build_operator_bundle(
-        job_id=job_id,
-        compiled=compiled,
-        state=state,
-        dry_run=dry_run,
-        created_at=created_at,
-        live_contract=live_contract,
-    )
     active_store = store or ProtocolOperatorBundleStore()
-    return active_store.save(bundle)
+    if dry_run:
+        job_id = f"protocol-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+        state = ProtocolExecutor(dry_run=True, job_id=job_id, handlers=handlers).execute(compiled.document)
+        bundle = _build_operator_bundle(
+            job_id=job_id,
+            compiled=compiled,
+            state=state,
+            dry_run=True,
+            created_at=created_at,
+        )
+        return active_store.save(bundle)
+
+    raw_idempotency_key = payload.get("idempotency_key")
+    if not isinstance(raw_idempotency_key, str) or not raw_idempotency_key.strip():
+        raise ProtocolLiveContractError(
+            "Live protocol execution requires an explicit idempotency key.",
+            details={"missing_contract_fields": ["idempotency_key"]},
+        )
+    idempotency_key = raw_idempotency_key.strip()
+    if len(idempotency_key) > 256:
+        raise ProtocolLiveContractError(
+            "The live protocol idempotency key exceeds 256 characters.",
+            details={"invalid_contract_fields": ["idempotency_key"]},
+        )
+    key_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    job_id = f"protocol-live-{key_digest}"
+    request_fingerprint = _request_fingerprint(compiled.to_payload(), dict(live_contract or {}))
+
+    with active_store.live_creation_lock(job_id):
+        reservation = active_store.load_live_reservation(job_id)
+        if reservation is not None:
+            try:
+                replay_bundle = active_store.load(job_id)
+            except Exception as exc:
+                raise _idempotency_recovery_error(
+                    job_id,
+                    "A matching live protocol execution is reserved but its bundle is unreadable or incomplete; operator recovery is required.",
+                ) from exc
+            return _validate_terminal_live_replay(
+                job_id=job_id,
+                key_digest=key_digest,
+                request_fingerprint=request_fingerprint,
+                reservation=reservation,
+                bundle=replay_bundle,
+            )
+
+        active_store.save_live_reservation(
+            {
+                "schema_version": PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION,
+                "job_id": job_id,
+                "idempotency_key_digest": key_digest,
+                "request_fingerprint": request_fingerprint,
+                "reserved_at": created_at,
+            }
+        )
+        state = ProtocolExecutor(dry_run=False, job_id=job_id, handlers=handlers).execute(compiled.document)
+        bundle = _build_operator_bundle(
+            job_id=job_id,
+            compiled=compiled,
+            state=state,
+            dry_run=False,
+            created_at=created_at,
+            live_contract=live_contract,
+        )
+        bundle["execution"]["idempotency_binding"] = {
+            "idempotency_key_digest": key_digest,
+            "request_fingerprint": request_fingerprint,
+        }
+        return active_store.save(bundle)
 
 
 def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None = None) -> dict[str, Any]:

@@ -22,6 +22,33 @@ def test_source_normalization_tecan_low_high_adjustments_and_digest() -> None:
     assert table.to_snapshot()["position_table_sha256"] == table.digest
 
 
+def test_wp8_provider_rejects_absent_target_before_handler_call(monkeypatch) -> None:
+    from bioxp import oem_serial206_initialization
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+
+    table = PositionTable.from_rows([
+        {"location_id": "LOC_MS", "x": 1, "y": 2, "zLow": 60000, "zDelta": 10000},
+    ])
+    monkeypatch.setattr(
+        oem_serial206_initialization, "load_bound_oem_position_table", lambda: table,
+    )
+    provider = object.__new__(Serial206OemInitializationProvider)
+    calls = []
+    provider.wp8_scriptmove_to = lambda *args, **kwargs: calls.append((args, kwargs))
+    child = {
+        "order": 0, "operation": "scriptmoveTo",
+        "arguments": {"destination": 32},
+    }
+    with pytest.raises(
+        RuntimeError,
+        match="machine_target_absent_from_serial206_position_table:32",
+    ):
+        provider.execute_wp8_child(
+            child, command_id="absent-32", child_order=0, plan_digest="digest",
+        )
+    assert calls == []
+
+
 def test_duplicate_and_unknown_rows_fail_closed() -> None:
     row = {"name": "LOC_OC", "x": 1, "y": 2, "zLow": 60000, "zDelta": 1000, "inc_factor": 0}
     with pytest.raises(ValueError, match="duplicate"):

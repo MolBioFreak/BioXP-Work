@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 import src.bioxp.services.motion_service as motion_service_module
+from src.bioxp.operator_command_plane import COMMAND_TERMINAL
 from src.bioxp.services.artifact_service import BIOXP_VALIDATION_ARTIFACT_ROOT_ENV
 from src.bioxp.services.motion_service import (
     AbsoluteMoveCommand,
@@ -1136,6 +1137,462 @@ def test_protocol_live_move_is_blocked_after_maintenance_before_executor(monkeyp
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["hardware_motion_commanded"] is False
 
+
+@pytest.mark.parametrize("status", sorted(COMMAND_TERMINAL))
+def test_protocol_deck_waiter_handles_every_authoritative_terminal_state(monkeypatch, status):
+    api = load_api(monkeypatch)
+    row = {"command_id": "deck-terminal", "status": status, "response": {"durable": True}}
+    getter_calls = []
+    clock = iter([0.0, 0.0, 1.0])
+    api.app.state.operator_command_plane = types.SimpleNamespace(
+        store=types.SimpleNamespace(
+            get_command=lambda command_id: getter_calls.append(command_id) or row
+        )
+    )
+    monkeypatch.setattr(api.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+
+    if status == "completed":
+        assert api._wait_protocol_deck_command("deck-terminal", timeout_s=0.5) == row
+    else:
+        with pytest.raises(HTTPException) as exc_info:
+            api._wait_protocol_deck_command("deck-terminal", timeout_s=0.5)
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == {
+            "error": "canonical_deck_command_failed",
+            "command": row,
+        }
+
+    assert getter_calls == ["deck-terminal"]
+
+
+def test_protocol_deck_waiter_polls_nonterminal_until_completed(monkeypatch):
+    api = load_api(monkeypatch)
+    rows = iter([
+        {"command_id": "deck-progress", "status": "queued"},
+        {"command_id": "deck-progress", "status": "completed", "response": {"ok": True}},
+    ])
+    getter_calls = []
+    api.app.state.operator_command_plane = types.SimpleNamespace(
+        store=types.SimpleNamespace(
+            get_command=lambda command_id: getter_calls.append(command_id) or next(rows)
+        )
+    )
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+
+    result = api._wait_protocol_deck_command("deck-progress", timeout_s=0.5)
+
+    assert result["status"] == "completed"
+    assert getter_calls == ["deck-progress", "deck-progress"]
+
+
+def test_protocol_plate_move_admits_one_composite_and_waits_for_terminal(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.models import ProtocolAction, ProtocolActionKind
+    from src.bioxp.oem_compat.position_table import PositionTable
+
+    admitted = []
+    api.app.state.oem_deck_position_table_provider = lambda: PositionTable.from_rows([
+        {"location_id": "LOC_P_TC", "x": 1, "y": 2, "zLow": 60000, "zDelta": 10000},
+    ])
+    api.app.state.oem_wp8_operation_admitter = lambda operation, *, inputs, idempotency_key=None: (
+        admitted.append((operation, inputs, idempotency_key)) or {"command_id": "deck-1", "status": "queued"}
+    )
+    api.app.state.operator_command_plane = types.SimpleNamespace(
+        store=types.SimpleNamespace(
+            get_command=lambda command_id: {
+                "command_id": command_id,
+                "status": "completed",
+                "response": {"ok": True},
+            }
+        )
+    )
+    action = ProtocolAction(
+        action_id="stage-1-mp", stage_id="stage-1", kind=ProtocolActionKind.PLATE_MOVE,
+        params={"plate_id": "PL_OUTPUT", "target_location": "LOC_TC", "move_mode": "PRESS", "extra_args": []},
+        description="move", required_capability=None,
+    )
+    result = api._protocol_live_plate_move_handler(action, types.SimpleNamespace(job_id="job-1"))
+    assert result["status"] == "completed"
+    assert admitted == [
+        ("move_plate", {"plate": 1, "destination": 23, "press_plate": True}, "protocol:job-1:stage-1-mp"),
+    ]
+
+
+def test_protocol_plate_prepare_preserves_recognized_source_order(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.models import ProtocolAction, ProtocolActionKind
+
+    admitted = []
+    api.app.state.oem_wp8_operation_admitter = lambda operation, *, inputs, idempotency_key=None: (
+        admitted.append((operation, inputs, idempotency_key)) or {"command_id": "deck-pp", "status": "queued"}
+    )
+    api.app.state.operator_command_plane = types.SimpleNamespace(
+        store=types.SimpleNamespace(get_command=lambda command_id: {"command_id": command_id, "status": "completed"})
+    )
+    action = ProtocolAction(
+        action_id="stage-1-pp", stage_id="stage-1", kind=ProtocolActionKind.PLATE_PREPARE,
+        params={"plate_ids": ["PL_POOL", "IGNORED", "PL_REAGENT"]},
+        description="prepare", required_capability=None,
+    )
+    result = api._protocol_live_plate_prepare_handler(action, types.SimpleNamespace(job_id="job-1"))
+    assert result["status"] == "completed"
+    assert admitted == [
+        ("press_plates", {"plates": [0, 2]}, "protocol:job-1:stage-1-pp"),
+    ]
+
+
+def test_protocol_thermal_door_open_waits_then_initializes_pipette(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.models import ProtocolAction, ProtocolActionKind
+
+    events = []
+    api.app.state.oem_wp8_operation_admitter = lambda operation, *, inputs, idempotency_key=None: (
+        events.append(("admit", operation, inputs, idempotency_key)) or {"command_id": "door-1"}
+    )
+    api.app.state.operator_command_plane = types.SimpleNamespace(
+        store=types.SimpleNamespace(
+            get_command=lambda command_id: events.append(("wait", command_id)) or {
+                "command_id": command_id, "status": "completed",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        api, "_protocol_live_pipette_handler",
+        lambda action, state: events.append(("pipette", action.kind, action.params)) or {"ok": True},
+    )
+    action = ProtocolAction(
+        action_id="stage-1-tcd", stage_id="stage-1", kind=ProtocolActionKind.THERMAL_DOOR,
+        params={"door_command": "DO", "door_state": "open"},
+        description="door", required_capability=None,
+    )
+    result = api._protocol_live_thermal_door_handler(
+        action, types.SimpleNamespace(job_id="job-1"),
+    )
+    assert result["ok"] is True
+    assert result["door"]["status"] == "completed"
+    assert events == [
+        ("admit", "thermal_door", {"open": True}, "protocol:job-1:stage-1-tcd"),
+        ("wait", "door-1"),
+        ("pipette", ProtocolActionKind.PIPETTE_INIT, {}),
+    ]
+
+
+def test_protocol_thermal_door_failure_is_top_level_false_and_skips_pipette(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.models import ProtocolAction, ProtocolActionKind
+
+    calls = []
+    api.app.state.oem_wp8_operation_admitter = lambda operation, *, inputs, idempotency_key=None: (
+        calls.append(("admit", operation, inputs, idempotency_key)) or {"command_id": "door-failed"}
+    )
+    door_failure = {
+        "command_id": "door-failed",
+        "status": "failed",
+        "error": {"code": "door_jam", "message": "door did not open"},
+    }
+    monkeypatch.setattr(
+        api,
+        "_wait_protocol_deck_command",
+        lambda command_id: calls.append(("wait", command_id)) or door_failure,
+    )
+    monkeypatch.setattr(
+        api,
+        "_protocol_live_pipette_handler",
+        lambda action, state: calls.append(("pipette", action.action_id)) or {"ok": True},
+    )
+    action = ProtocolAction(
+        action_id="stage-1-tcd", stage_id="stage-1", kind=ProtocolActionKind.THERMAL_DOOR,
+        params={"door_command": "DO", "door_state": "open"},
+        description="door", required_capability=None,
+    )
+
+    result = api._protocol_live_thermal_door_handler(
+        action, types.SimpleNamespace(job_id="job-1"),
+    )
+
+    assert result == {"ok": False, "door": door_failure, "pipette": None}
+    assert calls == [
+        ("admit", "thermal_door", {"open": True}, "protocol:job-1:stage-1-tcd"),
+        ("wait", "door-failed"),
+    ]
+
+
+def test_protocol_thermal_door_pipette_failure_stops_later_stage(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.compiler import compile_native_protocol
+    from src.bioxp.protocols.executor import ProtocolExecutor
+    from src.bioxp.protocols.models import ProtocolActionKind
+    from src.bioxp.protocols.runtime_state import StageExecutionStatus
+
+    admitted = []
+    api.app.state.oem_wp8_operation_admitter = lambda operation, *, inputs, idempotency_key=None: (
+        admitted.append((operation, inputs, idempotency_key)) or {"command_id": "door-completed"}
+    )
+    door_completion = {"command_id": "door-completed", "status": "completed"}
+    monkeypatch.setattr(api, "_wait_protocol_deck_command", lambda command_id: door_completion)
+    pipette_failure = {
+        "ok": False,
+        "command_id": "pipette-init-failed",
+        "error": {"code": "pipette_init_failed", "message": "initialization denied"},
+    }
+    monkeypatch.setattr(api, "_protocol_live_pipette_handler", lambda action, state: pipette_failure)
+    document = compile_native_protocol(
+        {
+            "protocol_id": "thermal-door-pipette-failure",
+            "stages": [
+                {
+                    "stage_id": "door-stage",
+                    "actions": [
+                        {
+                            "action_id": "open-door",
+                            "kind": "thermal_door",
+                            "params": {"door_command": "DO", "door_state": "open"},
+                        }
+                    ],
+                },
+                {
+                    "stage_id": "later-stage",
+                    "actions": [
+                        {
+                            "action_id": "close-door",
+                            "kind": "thermal_door",
+                            "params": {"door_command": "DC", "door_state": "closed"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    result = ProtocolExecutor(
+        dry_run=False,
+        job_id="job-1",
+        handlers={ProtocolActionKind.THERMAL_DOOR: api._protocol_live_thermal_door_handler},
+    ).execute(document)
+
+    assert result.completed is False
+    assert result.stage_states["door-stage"].status is StageExecutionStatus.FAILED
+    assert result.stage_states["later-stage"].status is StageExecutionStatus.PENDING
+    assert result.action_results == [
+        {
+            "stage_id": "door-stage",
+            "action_id": "open-door",
+            "kind": "thermal_door",
+            "ok": False,
+            "door": door_completion,
+            "pipette": pipette_failure,
+            "dry_run": False,
+        }
+    ]
+    assert admitted == [
+        ("thermal_door", {"open": True}, "protocol:job-1:open-door"),
+    ]
+
+
+def test_protocol_class_move_to_enters_canonical_admission_and_wait(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.oem_deck_movement import ClassMoveToIntent
+    from src.bioxp.protocols.compiler import compile_native_protocol
+    from src.bioxp.protocols.executor import ProtocolExecutor
+
+    class Provider:
+        def __getattr__(self, name):
+            raise AssertionError(f"direct provider call is forbidden: {name}")
+
+    calls = []
+    api.app.state.oem_deck_provider = Provider()
+    api.app.state.oem_mov_execution_admitter = lambda intent, *, idempotency_key=None: (
+        calls.append(("admit", intent, idempotency_key))
+        or {"command_id": "mov-1", "status": "queued"}
+    )
+    monkeypatch.setattr(
+        api,
+        "_wait_protocol_deck_command",
+        lambda command_id: calls.append(("wait", command_id))
+        or {"command_id": command_id, "status": "completed"},
+    )
+    document = compile_native_protocol(
+        {
+            "protocol_id": "class-move-to",
+            "stages": [
+                {
+                    "stage_id": "move-stage",
+                    "actions": [
+                        {
+                            "action_id": "move-1",
+                            "kind": "move",
+                            "params": {
+                                "script_line": 17,
+                                "plate_name": 0,
+                                "well": "A1",
+                                "material": "sample",
+                                "continuation": "next",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    result = ProtocolExecutor(
+        dry_run=False,
+        job_id="job-7",
+        handlers=api._protocol_live_handlers(),
+    ).execute(document)
+
+    assert result.completed is True
+    assert calls == [
+        (
+            "admit",
+            ClassMoveToIntent(
+                script_line=17,
+                plate_name=0,
+                well="A1",
+                material="sample",
+                continuation="next",
+            ),
+            "protocol:job-7:move-1",
+        ),
+        ("wait", "mov-1"),
+    ]
+
+
+def test_protocol_class_move_to_retry_uses_stable_idempotency_key(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.compiler import compile_native_protocol
+
+    keys = []
+    api.app.state.oem_mov_execution_admitter = lambda _intent, *, idempotency_key=None: (
+        keys.append(idempotency_key) or {"command_id": "mov-retry"}
+    )
+    monkeypatch.setattr(
+        api,
+        "_wait_protocol_deck_command",
+        lambda command_id: {"command_id": command_id, "status": "completed"},
+    )
+    action = compile_native_protocol(
+        {
+            "protocol_id": "retry-move",
+            "stages": [
+                {
+                    "stage_id": "move-stage",
+                    "actions": [
+                        {
+                            "action_id": "stable-action",
+                            "kind": "move",
+                            "params": {"script_line": 9, "location_id": 16},
+                        }
+                    ],
+                }
+            ],
+        }
+    ).stages[0].actions[0]
+    state = types.SimpleNamespace(job_id="stable-job")
+
+    api._protocol_live_move_handler(action, state)
+    api._protocol_live_move_handler(action, state)
+
+    assert keys == [
+        "protocol:stable-job:stable-action",
+        "protocol:stable-job:stable-action",
+    ]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"script_line": 3, "plate_name": 0, "location_id": 16},
+        {"plate_name": 0},
+        {"script_line": 3, "location_id": 6.0},
+        {"script_line": 3, "plate_name": 0, "well": True},
+        {"script_line": 3, "plate_name": 0, "authority_digest": "caller-owned"},
+    ],
+)
+def test_protocol_malformed_or_conflicting_class_move_to_rejects_before_admission(monkeypatch, params):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.compiler import compile_native_protocol
+
+    api.app.state.oem_mov_execution_admitter = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("malformed intent must not be admitted"))
+    action = compile_native_protocol(
+        {
+            "protocol_id": "invalid-move",
+            "stages": [
+                {
+                    "stage_id": "move-stage",
+                    "actions": [{"action_id": "invalid", "kind": "move", "params": params}],
+                }
+            ],
+        }
+    ).stages[0].actions[0]
+
+    with pytest.raises(HTTPException) as exc_info:
+        api._protocol_live_move_handler(action, types.SimpleNamespace(job_id="invalid-job"))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "error": "canonical_deck_queue_required",
+        "hardware_motion_commanded": False,
+    }
+
+
+def test_protocol_class_move_to_requires_nonempty_admitted_command_id(monkeypatch):
+    api = load_api(monkeypatch)
+    from src.bioxp.protocols.compiler import compile_native_protocol
+
+    api.app.state.oem_mov_execution_admitter = lambda *_args, **_kwargs: {"command_id": ""}
+    monkeypatch.setattr(
+        api,
+        "_wait_protocol_deck_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty command must not be waited")),
+    )
+    action = compile_native_protocol(
+        {
+            "protocol_id": "empty-command",
+            "stages": [
+                {
+                    "stage_id": "move-stage",
+                    "actions": [
+                        {"action_id": "empty-command", "kind": "move", "params": {"script_line": 4, "plate_name": 0}}
+                    ],
+                }
+            ],
+        }
+    ).stages[0].actions[0]
+
+    with pytest.raises(HTTPException) as exc_info:
+        api._protocol_live_move_handler(action, types.SimpleNamespace(job_id="empty-command-job"))
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == {"error": "canonical_deck_admission_invalid"}
+
+
+def test_protocol_generic_move_is_zero_io_outside_canonical_deck_queue(monkeypatch):
+    api = load_api(monkeypatch)
+
+    api.app.state.oem_mov_execution_admitter = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("raw coordinates must not be admitted"))
+
+    class Provider:
+        def execute_x_intent(self, *_args, **_kwargs):
+            raise AssertionError("direct provider must not run")
+
+    class Action:
+        action_id = "legacy-generic-move"
+        params = {"axis": "x", "position_steps": 100}
+
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", Provider())
+    with pytest.raises(HTTPException) as exc_info:
+        api._protocol_live_move_handler(Action(), None)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "error": "canonical_deck_queue_required",
+        "hardware_motion_commanded": False,
+    }
 
 
 def test_controller_only_motion_truth_does_not_update_reference(monkeypatch):

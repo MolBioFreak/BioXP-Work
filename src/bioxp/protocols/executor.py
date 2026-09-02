@@ -101,6 +101,16 @@ class ProtocolExecutor:
                         **action_result,
                     }
                 )
+                if action_result.get("ok") is not True:
+                    stage_state.status = StageExecutionStatus.FAILED
+                    runtime_state.completed = False
+                    runtime_state.record_event(
+                        "action_failed",
+                        stage_id=stage.stage_id,
+                        action_id=action.action_id,
+                        detail=dict(action_result),
+                    )
+                    return runtime_state
                 stage_state.completed_actions.append(action.action_id)
                 completed_actions.add(action.action_id)
                 stage_state.current_action_id = None

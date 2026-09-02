@@ -7,6 +7,7 @@ from fastapi import HTTPException
 import pytest
 
 from bioxp.operator_command_plane import ACTION_REQUEST_SCHEMA, OperatorCommandPlane, OperatorCommandStore
+from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.oem_deck_catalog import configured_location_names
 from bioxp.oem_deck_movement import DeckExecutionFailure, make_deck_command_executor
 from bioxp.oem_compat.position_table import PositionTable
@@ -25,6 +26,11 @@ class State:
 
 class App:
     state = State()
+
+
+def _store(root):
+    OEMRuntimeStore(root).close()
+    return OperatorCommandStore(root)
 
 
 def test_canonical_worker_dispatches_deck_only_through_bound_executor() -> None:
@@ -172,7 +178,7 @@ class _MissingTerminalPrimitiveProvider(_CompletedPrimitiveProvider):
 def test_provider_ok_without_compatible_controller_terminal_proof_is_ambiguous_and_not_committed(
     tmp_path, contradictory
 ) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -220,7 +226,7 @@ def test_provider_ok_without_compatible_controller_terminal_proof_is_ambiguous_a
     after = store.deck_semantic_state()
     assert after["current_location"] == before["current_location"]
     assert after["current_well"] == before["current_well"]
-    assert after["ambiguity_state"] == "recovery_required"
+    assert after["ambiguity_state"] == "none"
     assert store.recovery()["hold"] is True
     assert store.claim_next() is None
     store.stop()
@@ -259,7 +265,7 @@ class _LatchPredicateProvider(_CompletedPrimitiveProvider):
 def test_each_unsafe_latch_predicate_is_persisted_from_its_own_observation(
     tmp_path, host_latch, sensor_latch, failed_operation
 ) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -342,7 +348,7 @@ class _EpochFenceProvider(_CompletedPrimitiveProvider):
 
 
 def test_real_worker_store_post_io_exception_sets_durable_recovery_hold(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -385,7 +391,22 @@ def test_real_worker_store_post_io_exception_sets_durable_recovery_hold(tmp_path
     plane._dispatch_one(claimed)
 
     receipt = store.get_command(admitted["command_id"])
+    delivery = store.connection.execute(
+        "SELECT work_kind,work_identity,dispatch_attempt_id,plan_digest,owner_id,"
+        "ownership_generation,board_epoch_4,board_epoch_5 "
+        "FROM operator_plane_delivery_attempts WHERE command_id=?",
+        (admitted["command_id"],),
+    ).fetchall()
     assert provider.invocations == 1, receipt
+    assert len(delivery) == 1
+    assert delivery[0]["work_kind"] == "named_stage"
+    assert delivery[0]["work_identity"].endswith(":moveTo")
+    assert delivery[0]["dispatch_attempt_id"] == claimed["dispatch_attempt_id"]
+    assert delivery[0]["plan_digest"] == receipt["deck_movement"]["plan_digest"]
+    assert delivery[0]["owner_id"] == store.owner_id
+    assert tuple(delivery[0][key] for key in (
+        "ownership_generation", "board_epoch_4", "board_epoch_5",
+    )) == (7, 10, 11)
     assert receipt["status"] == "ambiguous"
     assert receipt["controller_acknowledged"] is False
     assert receipt["terminal_evidence"]["delivery_attempted"] is True
@@ -404,7 +425,7 @@ def test_real_worker_store_post_io_exception_sets_durable_recovery_hold(tmp_path
 
 
 def test_semantic_commit_failure_after_controller_completion_is_recovery_required(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -469,7 +490,7 @@ def test_semantic_commit_failure_after_controller_completion_is_recovery_require
 
 
 def test_stage_persistence_failure_after_provider_completion_requires_durable_recovery(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -524,14 +545,14 @@ def test_stage_persistence_failure_after_provider_completion_requires_durable_re
     assert receipt["deck_movement"]["controller_completion_verified"] is True
     assert receipt["deck_movement"]["semantic_state_committed"] is False
     assert receipt["deck_movement"]["ambiguity_state"] == "recovery_required"
-    assert store.deck_semantic_state()["ambiguity_state"] == "recovery_required"
+    assert store.deck_semantic_state()["ambiguity_state"] == "none"
     assert store.recovery()["hold"] is True
     assert store.claim_next() is None
     store.stop()
 
 
 def test_outer_terminalization_failure_after_semantic_commit_publishes_deck_hold(tmp_path) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {
@@ -585,7 +606,7 @@ def test_outer_terminalization_failure_after_semantic_commit_publishes_deck_hold
     assert receipt["deck_movement"]["controller_completion_verified"] is True
     assert receipt["deck_movement"]["ambiguity_state"] == "recovery_required"
     assert semantic["current_location"] == "LOC_OC"
-    assert semantic["ambiguity_state"] == "recovery_required"
+    assert semantic["ambiguity_state"] == "none"
     assert store.recovery()["hold"] is True
     assert store.claim_next() is None
     store.stop()
@@ -602,7 +623,7 @@ def test_outer_terminalization_failure_after_semantic_commit_publishes_deck_hold
 def test_admitted_board_epochs_are_exact_execution_fence(
     tmp_path, epoch_snapshots, expected_status, expected_force, expected_moves
 ) -> None:
-    store = OperatorCommandStore(tmp_path)
+    store = _store(tmp_path)
     state = {
         "ownership_generation": 7,
         "serial206_initialization_provider": {

@@ -1996,7 +1996,11 @@ def install_operator_control_plane(
     app.state.operator_command_plane = command_plane
     app.state.operator_receipt_store = store
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
-        from .oem_deck_movement import make_deck_command_executor
+        from .oem_deck_movement import (
+            compile_finite_plate_operation,
+            make_deck_command_executor,
+            make_wp8_operation_executor,
+        )
         installed_deck_provider = oem_deck_provider()
         semantic_binder = getattr(installed_deck_provider, "bind_deck_semantic_state_reader", None)
         if callable(semantic_binder):
@@ -2033,6 +2037,46 @@ def install_operator_control_plane(
             position_table_provider=oem_deck_position_table_provider,
             command_store=command_plane.store,
         )
+        app.state.oem_wp8_operation_executor = make_wp8_operation_executor(
+            provider_getter=oem_deck_provider,
+            command_store=command_plane.store,
+        )
+
+        def admit_mov_execution(intent: Any, *, idempotency_key: str | None = None) -> dict[str, Any]:
+            return command_plane.store.admit_internal_mov_execution(
+                intent,
+                state=command_plane._state(),
+                idempotency_key=idempotency_key,
+            )
+
+        def admit_wp8_operation(
+            operation: str,
+            *,
+            inputs: Mapping[str, Any],
+            idempotency_key: str | None = None,
+        ) -> dict[str, Any]:
+            snapshot_reader = getattr(installed_deck_provider, "wp8_operation_machine_state", None)
+            if not callable(snapshot_reader):
+                raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
+            machine_inputs = snapshot_reader(operation, dict(inputs))
+            if not isinstance(machine_inputs, Mapping):
+                raise RuntimeError("source_authority_invalid:wp8_operation_machine_state")
+            compile_finite_plate_operation(
+                operation,
+                source_leaf_available=callable(
+                    getattr(installed_deck_provider, "execute_wp8_child", None)
+                ),
+                **{**dict(machine_inputs), **dict(inputs)},
+            )
+            return command_plane.store.admit_internal_wp8_operation(
+                operation,
+                inputs=inputs,
+                state=command_plane._state(),
+                idempotency_key=idempotency_key,
+            )
+
+        app.state.oem_mov_execution_admitter = admit_mov_execution
+        app.state.oem_wp8_operation_admitter = admit_wp8_operation
 
     def deck_contract(state: Mapping[str, Any]) -> dict[str, Any]:
         disabled_reason: str | None = None

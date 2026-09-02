@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+from typing import Any, cast
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import pytest
 
@@ -12,6 +14,7 @@ from bioxp import operator_controls
 from bioxp.operator_command_plane import OperatorCommandStore
 from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.oem_deck_catalog import DeckCatalog
+from bioxp.oem_deck_movement import WP8_COMPILED_CHILD_OPERATIONS
 from bioxp.oem_serial206_initialization import (
     SERIAL206_INITIALIZE_MOTION_STAGE_SPECS,
     Serial206OemInitializationProvider,
@@ -150,7 +153,8 @@ class BootstrapFakeDeckProvider(FakeDeckProvider):
     def deck_authority_snapshot(self, *, expected_generation: int):
         assert callable(self.semantic_reader)
         semantic: dict[str, object] = self.semantic_reader()
-        assert semantic["semantic_state_revision"] == 1
+        revision = semantic["semantic_state_revision"]
+        assert type(revision) is int and revision >= 1
         result = super().deck_authority_snapshot(expected_generation=expected_generation)
         result["machine_state_revision"] = semantic["semantic_state_revision"]
         return result
@@ -213,7 +217,6 @@ def _install_reconciliation_app(tmp_path, monkeypatch):
     provider = ReconciliationFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
     monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
@@ -228,6 +231,7 @@ def _install_reconciliation_app(tmp_path, monkeypatch):
         oem_deck_provider=lambda: provider,
         oem_deck_position_table_provider=lambda: table,
     )
+    app.state.operator_command_plane.start()
     return app, provider, table
 
 
@@ -393,9 +397,8 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
         for index, name in enumerate(configured_location_names())
     ])
-    provider = FakeDeckProvider(table)
+    provider = BootstrapFakeDeckProvider(table)
     app = FastAPI()
-    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
     monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
 
@@ -411,7 +414,10 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         oem_deck_provider=lambda: provider,
         oem_deck_position_table_provider=lambda: table,
     )
+    app.state.operator_command_plane.start()
     assert callable(app.state.oem_deck_command_executor)
+    assert callable(app.state.oem_mov_execution_admitter)
+    assert callable(app.state.oem_wp8_operation_admitter)
     assert provider.tip_tray_reader is not None
     assert provider.tip_tray_reader(0)["tip_available"] is None
     assert provider.tip_tray_publisher is not None
@@ -444,7 +450,7 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         if detail["status"] not in {"queued", "dispatched", "issued_pending"}:
             break
         time.sleep(0.01)
-    assert detail is not None and detail["status"] == "completed"
+    assert detail is not None and detail["status"] == "completed", json.dumps(detail, indent=2)
     assert any(name == "moveTo" for name, _ in provider.calls)
     detail_v2 = TestClient(app).get(f"/operator/v2/actions/receipts/{command_id}?detail=true")
     assert detail_v2.status_code == 200
@@ -454,11 +460,351 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
     assert dashboard.json()["deck"] == {
         "current_location": "LOC_OC",
         "current_well": 0,
-        "semantic_state_revision": 2,
+        "semantic_state_revision": 3,
         "position_table_revision": table.digest,
         "destination_catalog_revision": deck_action["destination_catalog_revision"],
         "ambiguity_state": "none",
     }
+    app.state.operator_command_plane.stop()
+
+
+class Wp8BootstrapFakeDeckProvider(BootstrapFakeDeckProvider):
+    def deck_owner_authority_stamps(self):
+        return {"ownership_generation": 7, "board_epoch_4": 10, "board_epoch_5": 11}
+
+    def wp8_operation_machine_state(self, operation, intent_inputs):
+        assert operation == "send_z_and_gripper_home"
+        assert intent_inputs == {"run_in_parallel": False}
+        return {"gripper_position": 0, "closed_position": 3000}
+
+    def execute_wp8_child(self, child, *, command_id, child_order, plan_digest):
+        self.calls.append(("wp8", {
+            "child": dict(child),
+            "command_id": command_id,
+            "child_order": child_order,
+            "plan_digest": plan_digest,
+        }))
+        return {
+            "ok": True,
+            "controller_command_acknowledged": True,
+            "controller_completion_verified": True,
+            "hardware_postcondition_verified": True,
+        }
+
+
+class Wp8PrimitiveAllowlistFake:
+    def __init__(self):
+        self.calls = []
+        self.tester = self
+
+    def sleep(self, milliseconds):
+        self.calls.append(("sleep", milliseconds))
+        return {"ok": True}
+
+    def unrelated_mutation(self):
+        self.calls.append(("unrelated_mutation", None))
+        return {"ok": True}
+
+    def rPunchFoil(self, **arguments):
+        self.calls.append(("rPunchFoil", arguments))
+        return {"ok": True, "controller_command_acknowledged": True, "controller_completion_verified": True}
+
+    def CirclePunch(self, **arguments):
+        self.calls.append(("CirclePunch", arguments))
+        return {"ok": True, "controller_command_acknowledged": True, "controller_completion_verified": True}
+
+    def z_move_z_home(self, *, timeout_s):
+        self.calls.append(("z_move_z_home", timeout_s))
+        return {"ok": True, "controller_command_acknowledged": True, "controller_completion_verified": True}
+
+    def setGripperCurrent(self, current):
+        self.calls.append(("dynamic_setGripperCurrent", current))
+        return {"ok": True}
+
+    def motor_set_axis_param(self, board, parameter, value, *, motor):
+        self.calls.append(("motor_set_axis_param", board, motor, parameter, value))
+        return {"ok": True}
+
+    def motor_get_axis_param(self, board, parameter, *, motor):
+        self.calls.append(("motor_get_axis_param", board, motor, parameter))
+        return {"ok": True, "value": 31}
+
+
+def test_production_wp8_dispatch_is_explicit_and_rejects_uncompiled_primitive() -> None:
+    provider = object.__new__(Serial206OemInitializationProvider)
+    provider.primitives = Wp8PrimitiveAllowlistFake()
+    assert provider.execute_wp8_child({
+        "order": 0, "operation": "Sleep", "arguments": {"milliseconds": 5},
+    }, command_id="cmd-1", child_order=0, plan_digest="plan-1") == {"ok": True}
+    homed = provider.execute_wp8_child(
+        {
+            "order": 1,
+            "operation": "MoveZHome",
+            "arguments": {},
+        },
+        command_id="cmd-1", child_order=1, plan_digest="plan-1",
+    )
+    assert homed["source_anchor"] == "ControlLib.movExecution:w:MoveZHome"
+    current = provider.execute_wp8_child(
+        {
+            "order": 2,
+            "operation": "setGripperCurrent",
+            "arguments": {"current": 31},
+        },
+        command_id="cmd-1", child_order=2, plan_digest="plan-1",
+    )
+    assert current["source_anchor"] == "ClassControlInterface.setGripperCurrent"
+    with pytest.raises(RuntimeError, match="source_authority_missing:unrelated_mutation"):
+        provider.execute_wp8_child(
+            {"order": 1, "operation": "unrelated_mutation", "arguments": {}},
+            command_id="cmd-1", child_order=1, plan_digest="plan-1",
+        )
+    assert provider.primitives.calls == [
+        ("sleep", 5),
+        ("z_move_z_home", 30.0),
+        ("motor_set_axis_param", 4, 2, 6, 31),
+        ("motor_get_axis_param", 4, 2, 6),
+    ]
+
+
+def test_production_wp8_dispatch_inventory_closes_compiler_denominator() -> None:
+    assert set(Serial206OemInitializationProvider.wp8_child_binding_inventory()) == set(
+        WP8_COMPILED_CHILD_OPERATIONS
+    )
+    assert {
+        operation: handler_name
+        for operation, handler_name in Serial206OemInitializationProvider._WP8_CHILD_BINDINGS.items()
+        if not callable(getattr(Serial206OemInitializationProvider, handler_name, None))
+    } == {}
+
+
+def test_production_wp8_z_location_binding_uses_canonical_location_name(monkeypatch) -> None:
+    from bioxp import oem_serial206_initialization as initialization
+
+    class Row:
+        z_low = 12345
+
+    class Table:
+        def rows(self):
+            return [{"location_id": "LOC_P_TC_PRESS"}]
+
+        def resolve(self, *, location_id):
+            assert location_id == "LOC_P_TC_PRESS"
+            return Row()
+
+    class Primitives:
+        def __init__(self):
+            self.calls = []
+
+        def oem_move_z(self, target, **kwargs):
+            self.calls.append((target, kwargs))
+            return {
+                "ok": True,
+                "controller_command_acknowledged": True,
+                "controller_completion_verified": True,
+            }
+
+    monkeypatch.setattr(initialization, "load_bound_oem_position_table", lambda: Table())
+    provider = object.__new__(Serial206OemInitializationProvider)
+    provider.primitives = Primitives()
+    provider.mov_execution_machine_state = lambda: {"pseudo_z_home": 65000}
+    result = provider.execute_wp8_child(
+        {
+            "order": 0,
+            "operation": "moveZPress",
+            "arguments": {"pressure_target": 24, "z_low_offset": -2200, "wait": True},
+        },
+        command_id="cmd-z", child_order=0, plan_digest="plan-z",
+    )
+    assert result["ok"] is True
+    assert provider.primitives.calls == [
+        (10145, {"pseudo_home_steps": 65000, "motor_current": 31, "wait_for_stop": True})
+    ]
+
+
+def test_production_mov_execution_continuation_leaves_preserve_oem_arguments() -> None:
+    provider = object.__new__(Serial206OemInitializationProvider)
+    provider.primitives = Wp8PrimitiveAllowlistFake()
+    assert provider.rPunchFoil(plate_name=2, location_id=3)["ok"] is True
+    assert provider.CirclePunch(destination=2, column=0, row=0)["ok"] is True
+    assert provider.primitives.calls == [
+        ("rPunchFoil", {"plate_name": 2, "location_id": 3}),
+        ("CirclePunch", {"destination": 2, "column": 0, "row": 0}),
+    ]
+
+
+def test_production_wp8_snapshot_owns_gripper_branch_inputs(monkeypatch) -> None:
+    from bioxp import oem_initialization
+
+    monkeypatch.setattr(
+        oem_initialization,
+        "build_machine_calibration_manifest",
+        lambda **_kwargs: {
+            "ok": True,
+            "gripper": {"GripperClosePOS": {"value": 27350}},
+            "thermal_door": {
+                "TCDoorOpen": {"value": 2000},
+                "TCDoorStallGuardThreshold": {"value": 17},
+                "TC_DOOR_MAX_CURRENT": {"value": 80},
+            },
+        },
+    )
+    provider = object.__new__(Serial206OemInitializationProvider)
+    provider.mov_execution_machine_state = lambda: {
+        "gripper_position": 0,
+        "plate_locations": {1: 21, 4: 29, 5: 20},
+        "plate_on_gantry": 1,
+        "tip_loaded": True,
+        "thermal_door_open": False,
+    }
+    provider.primitives = SimpleNamespace(
+        tester=SimpleNamespace(motor_get_position=lambda board, motor: {"position": 12345})
+    )
+    snapshot = provider.wp8_operation_machine_state(
+        "send_z_and_gripper_home", {"run_in_parallel": False},
+    )
+    assert snapshot["gripper_position"] == 12345
+    assert snapshot["closed_position"] == 27350
+
+
+def test_mov_execution_snapshot_carries_server_owned_wp8_branch_state(monkeypatch) -> None:
+    from bioxp import oem_serial206_initialization as serial_module
+    from bioxp.oem_deck_catalog import configured_location_names
+
+    table = PositionTable.from_rows([
+        {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
+        for index, name in enumerate(configured_location_names())
+    ])
+    monkeypatch.setattr(serial_module, "load_bound_oem_position_table", lambda: table)
+    provider = object.__new__(Serial206OemInitializationProvider)
+    provider._canonical_deck_semantic_state = lambda: {
+        "current_location": "LOC_MS",
+        "current_well": 0,
+        "movable_plate_locations": _complete_oem_movable_locations(),
+        "semantic_state_revision": 1,
+        "ownership_generation": 7,
+        "board_epoch_4": 10,
+        "board_epoch_5": 11,
+        "tip_loaded": False,
+        "tip_dirty": False,
+        "tip_location": -1,
+        "clean_path": True,
+        "pseudo_z_home": 65000,
+        "plate_on_gantry": None,
+    }
+    provider._lock = nullcontext()
+    provider._load_state = lambda: {"machine_status": {
+        "thermal_door_open": True,
+        "GripperVersion": 2,
+        "BoardTestMode": True,
+    }}
+    snapshot = provider.mov_execution_machine_state()
+    assert snapshot["thermal_door_open"] is True
+    assert snapshot["gripper_version"] == 2
+    assert snapshot["board_test_mode"] is True
+
+
+def test_install_binds_internal_wp8_fifo_and_worker_executes_durable_children(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
+    from bioxp.oem_deck_catalog import configured_location_names
+    table = PositionTable.from_rows([
+        {"name": name, "x": index, "y": index + 1, "zLow": 60000, "zDelta": 10000, "inc_factor": 0}
+        for index, name in enumerate(configured_location_names())
+    ])
+    provider = Wp8BootstrapFakeDeckProvider(table)
+    app = FastAPI()
+    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
+    state = {
+        "ownership_generation": 7,
+        "x_authority": {"active_board_epoch": 11},
+        "board4_authority": {"active_board_epoch": 10},
+    }
+    operator_controls.install_operator_control_plane(
+        app,
+        maintenance_state_provider=lambda: {"motion_blocked": False, "recovery_required": False},
+        reference_state_provider=lambda: {"rows": {}},
+        lifecycle_state_provider=lambda: {},
+        serial206_initialization_state_provider=lambda: dict(state),
+        oem_deck_provider=lambda: provider,
+        oem_deck_position_table_provider=lambda: table,
+    )
+    assert callable(app.state.oem_wp8_operation_executor)
+    original_snapshot = provider.wp8_operation_machine_state
+    command_count_before = app.state.operator_command_plane.store.connection.execute(
+        "SELECT COUNT(*) FROM operator_plane_commands"
+    ).fetchone()[0]
+    provider_calls_before = list(provider.calls)
+    from bioxp.oem_compat.pathing import LOCATION_NAME_TO_ID
+    provider.wp8_operation_machine_state = lambda operation, intent_inputs: {
+        "thermal_door_open": False,
+        "position_table_by_location": {
+            str(LOCATION_NAME_TO_ID[row["location_id"]]): row for row in table.rows()
+        },
+    }
+    from bioxp.oem_deck_movement import translate_oem_plate_move
+    absent_target = translate_oem_plate_move("PL_OUTPUT", "LOC_RC", None)
+    assert absent_target["destination"] == 32
+    with pytest.raises(
+        RuntimeError,
+        match="machine_target_absent_from_serial206_position_table:32",
+    ):
+        app.state.oem_wp8_operation_admitter(
+            "move_plate",
+            inputs=absent_target,
+            idempotency_key="wp8-position-table-absent-32",
+        )
+    assert app.state.operator_command_plane.store.connection.execute(
+        "SELECT COUNT(*) FROM operator_plane_commands"
+    ).fetchone()[0] == command_count_before
+    assert provider.calls == provider_calls_before
+    provider.wp8_operation_machine_state = lambda operation, intent_inputs: {"thermal_door_open": False}
+    with pytest.raises(RuntimeError, match="thermal_door_must_be_open"):
+        app.state.oem_wp8_operation_admitter(
+            "move_plate",
+            inputs={"plate": 0, "destination": 25, "press_plate": False},
+            idempotency_key="wp8-preflight-reject",
+        )
+    assert app.state.operator_command_plane.store.connection.execute(
+        "SELECT COUNT(*) FROM operator_plane_commands"
+    ).fetchone()[0] == command_count_before
+    provider.wp8_operation_machine_state = original_snapshot
+    app.state.operator_command_plane.start()
+    with pytest.raises(HTTPException) as forbidden:
+        app.state.operator_command_plane.store.admit_internal_wp8_operation(
+            "send_z_and_gripper_home",
+            inputs={"run_in_parallel": False, "gripper_position": 999},
+            state=state,
+        )
+    assert forbidden.value.status_code == 422
+    assert forbidden.value.detail["error"] == "workflow_state_override_forbidden"
+    admitted = app.state.operator_command_plane.store.admit_internal_wp8_operation(
+        "send_z_and_gripper_home",
+        inputs={"run_in_parallel": False},
+        state=state,
+        idempotency_key="wp8-install-binding",
+    )
+    deadline = time.monotonic() + 3
+    detail = None
+    while time.monotonic() < deadline:
+        detail = app.state.operator_command_plane.store.get_command(admitted["command_id"])
+        if detail is not None and detail["status"] not in {"queued", "dispatched", "issued_pending"}:
+            break
+        time.sleep(0.01)
+    assert detail is not None and detail["status"] == "completed"
+    evidence = app.state.operator_command_plane.store.wp8_operation_evidence(admitted["command_id"])
+    assert [row["operation"] for row in evidence["children"]] == [
+        "getG", "moveZPseudoHome", "sendGripperHome", "ReleaseLockGripperOperation",
+    ]
+    assert all(row["terminal_state"] == "completed" for row in evidence["children"])
+    wp8_calls = [cast(dict[str, Any], row[1]) for row in provider.calls if row[0] == "wp8"]
+    assert [row["child"]["operation"] for row in wp8_calls] == [
+        "getG", "moveZPseudoHome", "sendGripperHome", "ReleaseLockGripperOperation",
+    ]
+    assert all(row["command_id"] == admitted["command_id"] for row in wp8_calls)
+    assert [row["child_order"] for row in wp8_calls] == [0, 1, 2, 3]
+    assert len({row["plan_digest"] for row in wp8_calls}) == 1
     app.state.operator_command_plane.stop()
 
 
@@ -1352,7 +1698,6 @@ def test_fresh_store_bootstraps_canonical_semantic_state_from_bound_provider(tmp
     provider = BootstrapFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
     monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
 
@@ -1569,7 +1914,6 @@ def test_catalog_disables_deck_action_when_branch_provider_method_is_missing(tmp
     provider.moveZCamera = None
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
     monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
@@ -1594,7 +1938,6 @@ def test_catalog_and_admission_share_durable_deck_recovery_truth(tmp_path, monke
     provider = AmbiguousFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
     monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
@@ -1603,6 +1946,7 @@ def test_catalog_and_admission_share_durable_deck_recovery_truth(tmp_path, monke
         serial206_initialization_state_provider=lambda: {"x_authority": {"active_board_epoch": 11}, "board4_authority": {"active_board_epoch": 10}},
         oem_deck_provider=lambda: provider, oem_deck_position_table_provider=lambda: table,
     )
+    app.state.operator_command_plane.start()
     client = TestClient(app)
     payload = {
         "schema_version": "bioxp.operator_action_request.v2",
@@ -1692,12 +2036,9 @@ def test_initialize_motion_real_tip_query_publishes_current_authority_atomically
         "source_operation": "migrated_successful_semantic_state", "source_command_id": "legacy-1",
     })
     provider, _generation = _current_owner_provider(store)
-    spec = next(
-        row for row in SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
-        if row.key == "initializeMotion.queryTipStatus.initial"
+    result = provider.query_and_publish_pipette_state(
+        source_command_id="initialize-motion-real-tip-query",
     )
-
-    result = provider._execute_initialize_motion_stage(provider._load_state(), spec, timeout_s=2.0)
 
     semantic = store.deck_semantic_state()
     assert result["ok"] is True

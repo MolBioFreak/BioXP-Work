@@ -11,6 +11,7 @@ class StageExecutionStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
+    FAILED = "failed"
     COMPLETED = "completed"
 
 
