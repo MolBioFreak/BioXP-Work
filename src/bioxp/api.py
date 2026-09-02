@@ -66,11 +66,9 @@ from .release_identity import (
     publish_runtime_release_receipt,
 )
 from .serial206_y_provider import Serial206YProvider
-from .operator_controls import (
-    OperatorActionRequestV2,
-    current_operator_dispatch_context,
-    install_operator_control_plane,
-)
+from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
+from .operator_command_plane import COMMAND_TERMINAL
+from .oem_compat.position_table import load_bound_oem_position_table
 from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
@@ -962,18 +960,6 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
-    if not _operator_control_plane_installed:
-        install_operator_control_plane(
-            app,
-            maintenance_state_provider=_maintenance_state_payload,
-            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
-            lifecycle_state_provider=lifecycle_state.projection,
-            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
-            pipette_status_provider=_operator_pipette_status,
-        )
-        operator_store = app.state.operator_receipt_store
-        operator_store.converge_startup_state()
-        _operator_control_plane_installed = True
     release_start_task = None
     if app.state.release_identity.get("verified") is True:
         async def commit_release_start_receipt() -> None:
@@ -999,6 +985,26 @@ async def lifespan(app: FastAPI):
         )
     else:
         app.state.release_start_ready.set()
+    if release_start_task is not None:
+        await release_start_task
+    command_plane_to_start = None
+    if not _operator_control_plane_installed and app.state.release_start_error is None:
+        install_operator_control_plane(
+            app,
+            maintenance_state_provider=_maintenance_state_payload,
+            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
+            lifecycle_state_provider=lifecycle_state.projection,
+            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+            pipette_status_provider=_operator_pipette_status,
+            oem_deck_provider=lambda: _serial206_oem_initialization_provider,
+            oem_deck_position_table_provider=load_bound_oem_position_table,
+        )
+        operator_store = app.state.operator_receipt_store
+        command_plane_to_start = app.state.operator_command_plane
+        operator_store.converge_startup_state()
+    if command_plane_to_start is not None and app.state.release_start_error is None:
+        command_plane_to_start.start()
+        _operator_control_plane_installed = True
     try:
         yield
     finally:
@@ -1021,6 +1027,20 @@ async def lifespan(app: FastAPI):
                         history_reader.close()
                     except Exception as exc:
                         shutdown_errors.append(f"operator history reader shutdown: {exc}")
+                command_plane = getattr(app.state, "operator_command_plane", None)
+                command_plane_failure: Exception | None = None
+                if command_plane is not None:
+                    try:
+                        command_plane.stop()
+                    except Exception as exc:
+                        command_plane_failure = exc
+                        shutdown_errors.append(f"operator command plane shutdown: {exc}")
+                if command_plane_failure is not None:
+                    _startup_error = (
+                        "BioXP lifespan shutdown blocked transport teardown because operator "
+                        f"command workers remain active: {command_plane_failure}"
+                    )
+                    raise RuntimeError(_startup_error) from command_plane_failure
                 cleanup_errors = list(shutdown_errors)
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
@@ -2690,6 +2710,12 @@ class ProtocolCompileRequest(BaseModel):
 
 class ProtocolExecuteRequest(ProtocolCompileRequest):
     dry_run: bool = True
+    idempotency_key: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Caller-stable execution identity required for dry_run=false; raw value is not persisted.",
+    )
     live_execution: Optional[dict[str, Any]] = Field(
         None,
         description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
@@ -8298,29 +8324,17 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
 
 @app.post("/motion/oem/move_to")
 async def motion_oem_move_to(req: OemMoveToRequest):
-    if current_operator_dispatch_context() is None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "canonical_xz_method_requires_v2_route",
-                "replacement_method_action_id": "oem.xyz.move_to",
-                "replacement_route": "/operator/v2/methods",
-                "required_schema": "bioxp.operator_method_request.v1",
-                "physical_motion_commanded": False,
-            },
-        )
-    _require_motion_route_ready()
-    return await _run_blocking(
-        "serial-206 provider moveTo",
-        lambda: _execute_serial206_motion_intent(
-            "move_to",
-            {
-                **req.model_dump(exclude={"operator_ack", "timeout_s"}),
-                "wait_timeout_s": float(req.timeout_s),
-            },
-        ),
-        timeout_s=min(max(float(req.timeout_s) + 30.0, 45.0), 180.0),
-    )
+    """Preview-only legacy raw move route; canonical deck worker owns execution."""
+    return {
+        "ok": True,
+        "schema_version": "bioxp.oem_move_to_preview.v1",
+        "executor_status": "preview_only",
+        "requested": req.model_dump(exclude={"operator_ack"}),
+        "opened_usb": False,
+        "motion_commanded": False,
+        "physical_motion": False,
+        "legacy_live_execution_retired": True,
+    }
 
 
 def _serial206_stage_approvals(
@@ -9654,54 +9668,48 @@ def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
 
 
 def _protocol_live_move_handler(action, state):
+    from .oem_deck_movement import ClassMoveToIntent
+
     _require_motion_route_ready()
     params = dict(action.params or {})
-    raw_axis = params.get("axis") or params.get("axis_name")
-    if raw_axis is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
-    axis = AxisName(str(raw_axis).strip().lower())
-    acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
-    command_id = f"protocol-{axis.value}-{uuid.uuid4().hex}"
-    position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
-    steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
-    if position_steps is None and steps is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps")
-    is_absolute = position_steps is not None
-    move_value = int(position_steps) if position_steps is not None else int(steps)  # type: ignore[arg-type]
-    action_id = f"oem.{axis.value}.{'move_absolute' if is_absolute else 'move_steps'}"
-    input_name = (
-        "target_steps"
-        if axis is AxisName.Y and is_absolute
-        else "position_steps"
-        if is_absolute
-        else "steps"
-    )
-    inputs: dict[str, Any] = {input_name: move_value}
-    if acc is not None and axis in {AxisName.X, AxisName.Z} and is_absolute:
-        inputs["acceleration"] = int(acc)
-    invoker = getattr(app.state, "invoke_operator_action_v2", None)
-    if not callable(invoker):
-        raise RuntimeError("canonical operator action invoker unavailable")
-    typed_invoker = cast(
-        Callable[[str, OperatorActionRequestV2], Awaitable[dict[str, Any]]],
-        invoker,
-    )
-    request = OperatorActionRequestV2(
-        schema_version="bioxp.operator_action_request.v2",
-        idempotency_key=command_id,
-        expected_ownership_generation=int(hardware_state.ownership_epoch),
-        expected_board_epoch_by_board={},
-        inputs=inputs,
-    )
-    receipt = anyio_from_thread.run(typed_invoker, action_id, request)
-    if not isinstance(receipt, Mapping) or receipt.get("status") != "completed":
-        raise RuntimeError(f"Protocol move failed: {receipt}")
-    return {
-        "ok": True,
-        "protocol_action_id": action.action_id,
-        "move_mode": "absolute" if is_absolute else "relative",
-        "operator_receipt": dict(receipt),
+    allowed_fields = {
+        "script_line",
+        "plate_name",
+        "location_id",
+        "well",
+        "material",
+        "continuation",
     }
+    try:
+        if not set(params).issubset(allowed_fields):
+            raise ValueError("unsupported ClassMoveTo field")
+        location_id = params.get("location_id")
+        if location_id is not None and type(location_id) is not int:
+            raise ValueError("location_id must be an integer")
+        well = params.get("well")
+        if well is not None and type(well) not in {str, int}:
+            raise ValueError("well must be text or an integer")
+        intent = ClassMoveToIntent(**params)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "canonical_deck_queue_required",
+                "hardware_motion_commanded": False,
+            },
+        ) from None
+    admitter = getattr(app.state, "oem_mov_execution_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
 
 
 def _protocol_live_pipette_handler(action, state):
@@ -9803,9 +9811,126 @@ def _protocol_live_pipette_handler(action, state):
     }
 
 
+def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) -> dict[str, Any]:
+    plane = getattr(app.state, "operator_command_plane", None)
+    store = getattr(plane, "store", None)
+    getter = getattr(store, "get_command", None)
+    if not callable(getter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = getter(command_id)
+        if isinstance(row, Mapping):
+            status = str(row.get("status") or "")
+            if status == "completed":
+                return dict(row)
+            if status in COMMAND_TERMINAL:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "canonical_deck_command_failed", "command": dict(row)},
+                )
+        time.sleep(0.05)
+    raise HTTPException(
+        status_code=504,
+        detail={"error": "canonical_deck_command_timeout", "command_id": command_id},
+    )
+
+
+def _protocol_live_plate_move_handler(action, state):
+    from .oem_deck_movement import require_serial206_machine_target, translate_oem_plate_move
+
+    params = dict(action.params or {})
+    plate_token = params.get("plate_id", params.get("cover_id"))
+    intent = translate_oem_plate_move(
+        str(plate_token), str(params.get("target_location")), params.get("move_mode"),
+    )
+    position_table_provider = getattr(app.state, "oem_deck_position_table_provider", None)
+    if not callable(position_table_provider):
+        raise HTTPException(status_code=503, detail={"error": "serial206_position_table_unavailable"})
+    require_serial206_machine_target(int(intent["destination"]), position_table_provider())
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "move_plate",
+        inputs=intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_plate_prepare_handler(action, state):
+    from .oem_deck_movement import OEM_SCRIPT_PLATE_TOKENS
+
+    tokens = list((action.params or {}).get("plate_ids") or [])
+    allowed = {"PL_POOL", "PL_OUTPUT", "PL_REAGENT"}
+    plates = [OEM_SCRIPT_PLATE_TOKENS[token] for token in tokens if token in allowed]
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "press_plates", inputs={"plates": plates},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_thermal_door_handler(action, state):
+    mode = str((action.params or {}).get("door_command") or "")
+    if mode not in {"DO", "DC"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "unsupported_oem_thermal_door_command", "hardware_motion_commanded": False},
+        )
+    opening = mode == "DO"
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "thermal_door", inputs={"open": opening},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    door = _wait_protocol_deck_command(command_id)
+    pipette = None
+    if str(door.get("status") or "") != "completed":
+        return {"ok": False, "door": door, "pipette": pipette}
+    if opening:
+        pipette_action = action.__class__(
+            action_id=f"{action.action_id}-pipette-init",
+            stage_id=action.stage_id,
+            kind=ProtocolActionKind.PIPETTE_INIT,
+            params={},
+            description="OEM TCD DO pipette initialization",
+            required_capability=action.required_capability,
+            metadata=dict(action.metadata or {}),
+        )
+        pipette = _protocol_live_pipette_handler(pipette_action, state)
+    return {
+        "ok": not opening or (isinstance(pipette, Mapping) and pipette.get("ok") is True),
+        "door": door,
+        "pipette": pipette,
+    }
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
+        ProtocolActionKind.PLATE_MOVE: _protocol_live_plate_move_handler,
+        ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
+        ProtocolActionKind.PLATE_PREPARE: _protocol_live_plate_prepare_handler,
+        ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
@@ -9853,7 +9978,10 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
             job_id,
             reviewer=req.reviewer,
             note=req.note,
+            handlers=_protocol_live_handlers(),
         )
+    except ProtocolLiveContractError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
