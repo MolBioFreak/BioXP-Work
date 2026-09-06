@@ -611,12 +611,13 @@ class NovoRouter:
                 retained_outcome = "write_exception"
             elif wait_signaled and observed is None and outcome not in {"shutdown", "transport_rebound"}:
                 retained_outcome = "signaled_empty"
-            elif status is not None and outcome not in {"shutdown", "transport_rebound"}:
+            elif wait_signaled and status is not None and outcome not in {"shutdown", "transport_rebound"}:
                 retained_outcome = "response" if status == 100 else "status_error"
             publish_exchange({
-                "exchange_id": base["transaction_id"] + ":1",
+                "exchange_id": base["transaction_id"] + ":" + str(base.get("attempt_ordinal", 1)),
                 "transaction_id": base["transaction_id"],
-                "attempt_ordinal": 1,
+                "attempt_ordinal": base.get("attempt_ordinal", 1),
+                "response_attempt_attribution": base.get("response_attempt_attribution", "single_write"),
                 **{key: base.get(key) for key in (
                     "owner_generation", "matcher", "registration_timestamp",
                     "tx_timestamp", "tx_write_completed_at", "timeout_ms",
@@ -651,6 +652,7 @@ class NovoRouter:
         timeout_s: float,
         write_timeout_ms: int,
         provenance: dict[str, Any],
+        ordinary_motor_retry: bool = False,
     ) -> dict[str, Any]:
         if not self.running:
             raise NovoRouterError("Novo router is not running")
@@ -675,59 +677,101 @@ class NovoRouter:
                 transaction_id=transaction_id,
                 tx_started_at=tx_at,
             )
-            try:
-                self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
-                tx_write_completed_at = self._clock()
-            except Exception as exc:
-                with self._pending_lock:
-                    if self._pending is pending:
-                        self._pending = None
-                self._retain_tmcl_exchange(
-                    {
-                        **provenance,
-                        "transaction_id": transaction_id,
-                        "owner_generation": pending.owner_generation if pending is not None else self._reader_generation,
-                        "matcher": matcher_name,
-                        "registration_timestamp": registered_at,
-                        "tx_timestamp": tx_at,
-                        "tx_write_completed_at": None,
-                        "timeout_ms": int(round(float(timeout_s) * 1000.0)),
-                        "tx_raw": list(raw_tx),
-                    },
-                    wait_signaled=None, outcome="write_exception", error=exc,
-                )
-                raise
             base = {
                 "transaction_id": transaction_id,
-                "owner_generation": self._reader_generation,
+                "owner_generation": pending.owner_generation if pending is not None else self._reader_generation,
                 "matcher": matcher_name,
                 "registration_timestamp": registered_at,
                 "tx_timestamp": tx_at,
-                "tx_write_completed_at": tx_write_completed_at,
+                "tx_write_completed_at": None,
                 "timeout_ms": int(round(float(timeout_s) * 1000.0)),
                 "tx_raw": list(raw_tx),
                 **provenance,
                 "oem_receive_queue_cleared": cleared_pipette_replies,
             }
-            if pending is None:
-                self._retain_tmcl_exchange(base, wait_signaled=None, outcome="tx_only")
-                return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
-            completed = pending.event.wait(max(0.0, float(timeout_s)))
+            # Only mapped source motor callers select ClassNovoCANUSB's first
+            # WaitOne(false) resend. One UUID/pending owner spans both writes.
+            selected = bool(ordinary_motor_retry and pending is not None
+                            and provenance.get("command_family") == "tmcl")
+            attempts = []
+            completed = False
+            outcome = None
+            observed = None
+            for ordinal in range(1, 3 if selected else 2):
+                attempt = {**base, "attempt_ordinal": ordinal,
+                           "tx_timestamp": tx_at if ordinal == 1 else self._clock(),
+                           "tx_write_completed_at": None,
+                           "response_attempt_attribution": "same_call_ambiguous" if ordinal == 2 else "single_write"}
+                try:
+                    if ordinal == 2:
+                        assert pending is not None  # selected waited calls only
+                        # _dispatch may already have collected a legitimate late
+                        # reply and removed this pending owner. Keep its event and
+                        # frames: the wire cannot identify which write it answers.
+                        # Never install a new pending owner/generation for a retry.
+                        with self._pending_lock:
+                            valid_owner = (
+                                self.running and not self._stop.is_set()
+                                and self._reader_generation == pending.owner_generation
+                                and (self._pending is pending or (
+                                    self._pending is None and bool(pending.frames)
+                                    and pending.event.is_set()))
+                            )
+                            if not valid_owner:
+                                outcome = "transport_rebound" if self._reader_generation != pending.owner_generation else "shutdown"
+                                break
+                            self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    else:
+                        self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    attempt["tx_write_completed_at"] = self._clock()
+                except Exception as exc:
+                    with self._pending_lock:
+                        if self._pending is pending:
+                            self._pending = None
+                    self._retain_tmcl_exchange(attempt, wait_signaled=None,
+                                               outcome="write_exception", error=exc)
+                    raise
+                if ordinal == 1:
+                    base["tx_write_completed_at"] = attempt["tx_write_completed_at"]
+                if pending is None:
+                    self._retain_tmcl_exchange(attempt, wait_signaled=None, outcome="tx_only")
+                    return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
+                completed = pending.event.wait(max(0.0, float(timeout_s)))
+                with self._pending_lock:
+                    malformed_seen = any(row.get("classification") == "malformed" for row in pending.skipped)
+                    generation_changed = self._reader_generation != pending.owner_generation
+                    outcome = (
+                        "transport_rebound" if generation_changed else
+                        "shutdown" if selected and self._stop.is_set() else
+                        (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
+                    )
+                    observed = pending.frames[-1] if pending.frames else None
+                    # Preserve terminal/nonselected cleanup before observation;
+                    # only a selected first false wait keeps the owner open.
+                    if (not selected or ordinal == 2 or completed
+                            or outcome in {"shutdown", "transport_rebound"}):
+                        if self._pending is pending:
+                            self._pending = None
+                # Snapshot before the observer callback/next write. A later
+                # success must never overwrite the explicit first false wait.
+                attempts.append({
+                    "attempt_ordinal": ordinal, "tx_timestamp": attempt["tx_timestamp"],
+                    "tx_write_completed_at": attempt["tx_write_completed_at"],
+                    "wait_signaled": completed, "outcome": outcome,
+                    "response_present": observed is not None,
+                    "receive_sequence": observed.receive_sequence if observed is not None else None,
+                    "response_attempt_attribution": attempt["response_attempt_attribution"],
+                })
+                self._retain_tmcl_exchange(attempt, wait_signaled=completed,
+                                           outcome=outcome, observed=observed)
+                if completed or outcome in {"shutdown", "transport_rebound"}:
+                    break
             with self._pending_lock:
                 if self._pending is pending:
                     self._pending = None
-            malformed_seen = any(row.get("classification") == "malformed" for row in pending.skipped)
-            generation_changed = self._reader_generation != pending.owner_generation
-            outcome = (
-                "transport_rebound"
-                if generation_changed
-                else (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
-            )
-            observed = pending.frames[-1] if pending.frames else None
-            self._retain_tmcl_exchange(
-                {**base, "owner_generation": pending.owner_generation},
-                wait_signaled=completed, outcome=outcome, observed=observed,
-            )
+            if selected:
+                base["attempts"] = attempts
+            assert pending is not None  # tx-only returned inside the loop
             multipart_frames = [frame for frame in pending.frames if frame.classification == "pipette_multipart"]
             multipart_projection = {
                 "present": bool(multipart_frames),

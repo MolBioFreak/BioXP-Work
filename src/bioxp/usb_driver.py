@@ -905,6 +905,7 @@ class BioXpTester:
         max_reads=12,
         strict_match=True,
         require_command_echo=True,
+        ordinary_motor_retry=False,
     ):
         with self._transport_guard():
             return self._send_tmcl_locked(
@@ -919,6 +920,7 @@ class BioXpTester:
                 max_reads=max_reads,
                 strict_match=strict_match,
                 require_command_echo=require_command_echo,
+                **({"ordinary_motor_retry": True} if ordinary_motor_retry else {}),
             )
 
     def _send_tmcl_locked(
@@ -934,6 +936,7 @@ class BioXpTester:
         max_reads=12,
         strict_match=True,
         require_command_echo=True,
+        ordinary_motor_retry=False,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
         self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
@@ -956,6 +959,7 @@ class BioXpTester:
                 matcher_name=f"tmcl:{int(board_id)}:{int(command)}",
                 timeout_s=max(0.10, (int(read_timeout_ms) * int(max_reads)) / 1000.0) if wait_reply else 0.0,
                 write_timeout_ms=int(write_timeout_ms),
+                **({"ordinary_motor_retry": True} if ordinary_motor_retry else {}),
                 provenance={
                     "command_family": "tmcl",
                     "tx_id": int(board_id),
@@ -2683,17 +2687,23 @@ class BioXpTester:
         strict_match=True,
         post_delay_s=None,
         allow_recover=True,
+        ordinary_motor_retry=False,
     ):
         board_id = int(board_id)
         self._motor_pace(board_id)
         try:
-            ack = self.send_tmcl_retry(
+            # Source-selected leaves make one whole call; only the router
+            # owns its false-wait resend. Nonselected routes keep their loop.
+            send = self.send_tmcl if ordinary_motor_retry else self.send_tmcl_retry
+            retry_options: dict[str, Any] = ({"ordinary_motor_retry": True} if ordinary_motor_retry
+                             else {"attempts": max(1, int(attempts))})
+            ack = send(
                 board_id,
                 int(command),
                 int(cmd_type),
                 int(motor),
                 int(value),
-                attempts=max(1, int(attempts)),
+                **retry_options,
                 wait_reply=bool(wait_reply),
                 write_timeout_ms=int(write_timeout_ms),
                 read_timeout_ms=int(read_timeout_ms),
@@ -2715,6 +2725,7 @@ class BioXpTester:
             if (
                 ack is None
                 and allow_recover
+                and not ordinary_motor_retry
                 and board_id in self.MOTOR_RECOVERY_BOARDS
                 and self._motor_noresp_streak.get(board_id, 0) >= 2
             ):
@@ -2782,7 +2793,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         val = ack.get("value") if ack else None
         return {"board": int(board_id), "param": int(param), "motor": int(motor), "ack": ack, "value": val}
@@ -2801,7 +2812,7 @@ class BioXpTester:
             read_timeout_ms=transmit_budget_ms,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         ack_success = self._tmcl_success(ack)
         source_return_code = 0 if ack is None or ack_success else 1
@@ -3654,7 +3665,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         ack_success = self._tmcl_success(ack)
         source_return_code = 0 if ack is None or ack_success else 1
@@ -4005,7 +4016,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         retry_ack = None
         effective_ack = ack
@@ -4022,7 +4033,7 @@ class BioXpTester:
                 read_timeout_ms=60000,
                 max_reads=1,
                 strict_match=True,
-                allow_recover=False,
+                allow_recover=False, ordinary_motor_retry=True,
             )
             effective_ack = retry_ack
         # ClassMotor.moveToAbs returns 0 immediately after a first-null reply,
@@ -4695,7 +4706,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         acknowledged = self._tmcl_success(ack)
         return {
@@ -4861,7 +4872,7 @@ class BioXpTester:
                 board, 4, 1, motor, delta,
                 attempts=1, wait_reply=True, write_timeout_ms=55,
                 read_timeout_ms=60000, max_reads=1, strict_match=True,
-                allow_recover=False,
+                allow_recover=False, ordinary_motor_retry=True,
             )
             command_sent = True
             wait = self.motor_oem_wait_target_reached(
@@ -4955,25 +4966,37 @@ class BioXpTester:
         # cmd 4 type 0 = move to absolute position (OEM moveToAbs).
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
         time.sleep(0.001)
-        ack = self._send_motor(
-            int(board_id),
-            4,
-            0,
-            int(motor),
-            int(position),
-            attempts=2,
-            wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=60000,
-            max_reads=1,
-            strict_match=True,
+        first_ack = self._send_motor(
+            int(board_id), 4, 0, int(motor), int(position),
+            attempts=1, wait_reply=True, write_timeout_ms=55,
+            read_timeout_ms=60000, max_reads=1, strict_match=True,
+            allow_recover=False, ordinary_motor_retry=True,
         )
+        retry_ack = None
+        ack = first_ack
+        if first_ack is None:
+            # Independent ClassMotor.moveToAbs null leaf call, not an extra
+            # pre-stop or generic recovery loop. Its result is evidence only
+            # for the source's immediate return-zero branch.
+            retry_ack = self._send_motor(
+                int(board_id), 4, 0, int(motor), int(position),
+                attempts=1, wait_reply=True, write_timeout_ms=55,
+                read_timeout_ms=60000, max_reads=1, strict_match=True,
+                allow_recover=False, ordinary_motor_retry=True,
+            )
+            ack = retry_ack
+        source_return_code = 0 if first_ack is None or self._tmcl_success(first_ack) else 1
         return {
             "board": int(board_id),
             "motor": int(motor),
             "position": int(position),
             "pre_stop": pre_stop,
+            # Preserve the generic wrapper's final-effective ACK/ok meaning.
             "ack": ack,
+            "first_ack": first_ack,
+            "retry_ack": retry_ack,
+            "source_return_code": source_return_code,
+            "low_level_source_return_code": source_return_code,
             "command_sent": True,
             "ok": self._tmcl_success(ack),
         }
@@ -4998,7 +5021,7 @@ class BioXpTester:
             read_timeout_ms=1000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         return {
             "board": int(board_id),
@@ -5091,7 +5114,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         direct_ack = self._tmcl_success(ack)
         if ack is not None:
@@ -5366,10 +5389,12 @@ class BioXpTester:
             raise ValueError(f"unsupported no-motion components: {sorted(invalid)}")
         transcript = []
 
-        def emit(label, board, command, cmd_type, motor, value):
-            ack = self.send_tmcl_retry(
+        def emit(label, board, command, cmd_type, motor, value, *, ordinary_motor_retry=False):
+            send = self.send_tmcl if ordinary_motor_retry else self.send_tmcl_retry
+            retry_options: dict[str, Any] = {"ordinary_motor_retry": True} if ordinary_motor_retry else {"attempts": 1}
+            ack = send(
                 int(board), int(command), int(cmd_type), int(motor), int(value),
-                attempts=1, wait_reply=True, write_timeout_ms=1000,
+                **retry_options, wait_reply=True, write_timeout_ms=1000,
                 read_timeout_ms=100, max_reads=10, strict_match=True,
             )
             row = {
@@ -5385,10 +5410,10 @@ class BioXpTester:
             transcript.append({"label": f"Thread.Sleep({int(ms)})", "sleep_ms": int(ms), "ok": True})
 
         def sap(label, profile, param, value):
-            return emit(label, profile["board"], 5, param, profile["motor"], value)
+            return emit(label, profile["board"], 5, param, profile["motor"], value, ordinary_motor_retry=True)
 
         def gap(label, profile, param):
-            return emit(label, profile["board"], 6, param, profile["motor"], 0)
+            return emit(label, profile["board"], 6, param, profile["motor"], 0, ordinary_motor_retry=True)
 
         # Literal ClassControlInterface.waitForBoard(). It owns board state;
         # CAN_READY/router ownership is intentionally not a substitute. A caller
@@ -7727,7 +7752,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         # OEM ClassMotor.StopMotor unconditionally transmits the frame twice.
         # These are two explicit back-to-back deliveries, not retries of either call.
@@ -7743,7 +7768,7 @@ class BioXpTester:
             read_timeout_ms=60000,
             max_reads=1,
             strict_match=True,
-            allow_recover=False,
+            allow_recover=False, ordinary_motor_retry=True,
         )
         first_ok = self._tmcl_success(first)
         second_ok = self._tmcl_success(second)

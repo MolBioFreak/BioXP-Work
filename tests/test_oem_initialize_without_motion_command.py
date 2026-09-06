@@ -42,6 +42,17 @@ def test_live_parity_test_case_emits_literal_oem_sequence(monkeypatch):
         return {"status": 100}
 
     monkeypatch.setattr(tester, "send_tmcl_retry", send_tmcl_retry)
+
+    def send_source_motor(*args, **kwargs):
+        # F06 moves source motor emissions below the generic None-loop seam.
+        # Preserve the literal sequence oracle and check the explicit selector;
+        # primitive-write counts are proved by test_f06_motor_retries instead.
+        assert args[1] in {5, 6}
+        assert kwargs["ordinary_motor_retry"] is True
+        assert "attempts" not in kwargs
+        return send_tmcl_retry(*args, **kwargs)
+
+    monkeypatch.setattr(tester, "send_tmcl", send_source_motor)
     tester._oem_board_initialized = {4: False, 5: False, 6: False, 7: False}
     tester._motor_last_tx_ts = {}
     tester._motor_noresp_streak = {}
