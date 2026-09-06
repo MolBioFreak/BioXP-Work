@@ -4867,23 +4867,23 @@ class BioXpTester:
             wait = self.motor_oem_wait_target_reached(
                 board, motor=motor, timeout_s=float(timeout_s), event_window=event_window
             )
-            if board == self.BOARD_DECK:
-                # ClassDeckBoard.moveSteps: both timeout and completion query
+            if board in (self.BOARD_DECK, self.BOARD_HEAD):
+                # Deck/Head moveSteps: both timeout and completion query
                 # before the board's power check, independently of CI's query.
                 board_position = self.motor_get_position(board, motor=motor)
             if self.oem_no24v_state() or (
                 isinstance(wait, Mapping) and wait.get("failure") == "No24V"
             ):
-                deck_completed = (
-                    board == self.BOARD_DECK
+                board_completed = (
+                    board in (self.BOARD_DECK, self.BOARD_HEAD)
                     and isinstance(wait, Mapping)
                     and wait.get("ok") is True
                 )
-                stage = 4 if deck_completed else 3
+                stage = 4 if board_completed else 3
                 raise RuntimeError(f"Lost 24V power moveSteps{stage}. moveSteps()")
             event = wait.get("event") if isinstance(wait, Mapping) else None
             if isinstance(wait, Mapping) and wait.get("ok") is True:
-                if board != self.BOARD_DECK:
+                if board not in (self.BOARD_DECK, self.BOARD_HEAD):
                     board_position = self.motor_get_position(board, motor=motor)
                 board_value = board_position.get("position") if isinstance(board_position, Mapping) else None
                 board_wrapper_return = int(board_value) if type(board_value) is int else -1
@@ -4891,7 +4891,7 @@ class BioXpTester:
             else:
                 board_wrapper_return = -1
                 completion_class = "timeout"
-        elif board == self.BOARD_DECK:
+        elif board in (self.BOARD_DECK, self.BOARD_HEAD):
             # Zero displacement skips the move, not the board's final query.
             board_position = self.motor_get_position(board, motor=motor)
             board_value = board_position.get("position") if isinstance(board_position, Mapping) else None
@@ -4900,7 +4900,7 @@ class BioXpTester:
                 raise RuntimeError("Lost 24V power moveSteps4. moveSteps()")
 
         public_position = self.motor_get_position(board, motor=motor)
-        if board != self.BOARD_DECK and self.oem_no24v_state():
+        if board not in (self.BOARD_DECK, self.BOARD_HEAD) and self.oem_no24v_state():
             raise RuntimeError("Lost 24V power moveSteps4. moveSteps()")
         public_value = public_position.get("position") if isinstance(public_position, Mapping) else None
         source_completed = type(public_value) is int

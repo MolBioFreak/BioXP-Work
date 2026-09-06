@@ -177,7 +177,7 @@ def test_move_steps_uses_cached_position_before_limit_decision_and_zero_sends_no
     assert result["ok"] is True
     assert result["source_noop"] is True
     assert result["source_return_code"] == 500
-    assert calls == ["position"]
+    assert calls == ["position", "position"]
 
 
 def test_nonzero_move_steps_dispatches_from_cached_position_before_public_read(monkeypatch):
