@@ -9194,6 +9194,33 @@ async def liquid_status():
     }
 
 
+@app.get("/liquid/requests")
+async def liquid_request_lookup(request: Request):
+    # Observation only: use the already-owned journal, never construct an owner.
+    from .pipette.direct_requests import lookup_envelope
+
+    headers = request.headers.getlist("idempotency-key")
+    key = headers[0].strip() if len(headers) == 1 else ""
+    query = list(request.query_params.multi_items())
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,199}", key) is None
+        or len(query) != 1
+        or query[0][0] != "request_kind"
+        or query[0][1] not in {"readback", "application_plan"}
+    ):
+        return JSONResponse(status_code=422, content={"detail": "invalid direct-liquid lookup identity"}, headers={"Cache-Control": "no-store"})
+    async for chunk in request.stream():
+        if chunk:
+            return JSONResponse(status_code=422, content={"detail": "lookup body is forbidden"}, headers={"Cache-Control": "no-store"})
+    kind = query[0][1]
+    if _pipette_receipts is None:
+        result = lookup_envelope(kind, key, "unavailable", "store_unavailable")
+    else:
+        result = _pipette_receipts.lookup_direct_request(request_kind=kind, idempotency_key=key)
+    code = {"conflict": 409, "unavailable": 503}.get(result["lookup_state"], 200)
+    return JSONResponse(status_code=code, content=result, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/liquid/readback")
 async def liquid_readback(req: PipetteReadbackRequest):
     return await run_pipette_operation(
