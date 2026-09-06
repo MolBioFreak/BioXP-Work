@@ -8,6 +8,8 @@ from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from .command_exchange_observer import publish_exchange, record_retention_failure
+
 
 PIPETTE_FUNCTIONS = (0, 1, 3, 4, 6)
 PIPETTE_RX_IDS = frozenset(
@@ -586,6 +588,60 @@ class NovoRouter:
                 "skipped_frames_truncated": pending.skipped_total > len(pending.skipped),
             }
 
+    def _retain_tmcl_exchange(
+        self,
+        base: dict[str, Any],
+        *,
+        wait_signaled: bool | None,
+        outcome: str | None,
+        observed: NovoFrame | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Finalize bounded evidence before driver None conversion or rethrow.
+
+        Deliberately TMCL-only in this slice: pipette/CANopen and transact_many
+        retain their existing policies. This observer does not authorize retries.
+        """
+        if base.get("command_family") != "tmcl":
+            return
+        try:
+            status = observed.data[1] if observed is not None and len(observed.data) == 8 else None
+            retained_outcome = outcome
+            if error is not None:
+                retained_outcome = "write_exception"
+            elif wait_signaled and observed is None and outcome not in {"shutdown", "transport_rebound"}:
+                retained_outcome = "signaled_empty"
+            elif status is not None and outcome not in {"shutdown", "transport_rebound"}:
+                retained_outcome = "response" if status == 100 else "status_error"
+            publish_exchange({
+                "exchange_id": base["transaction_id"] + ":1",
+                "transaction_id": base["transaction_id"],
+                "attempt_ordinal": 1,
+                **{key: base.get(key) for key in (
+                    "owner_generation", "matcher", "registration_timestamp",
+                    "tx_timestamp", "tx_write_completed_at", "timeout_ms",
+                    "tx_raw", "command_family", "tx_id", "tx_dlc",
+                    "expected_board", "expected_command",
+                )},
+                "write_attempted": True,
+                "write_returned": error is None,
+                "wait_signaled": wait_signaled,
+                "response_present": observed is not None,
+                "observed_status": status,
+                "observed_rx_raw": list(observed.raw) if observed is not None else None,
+                "observed_rx_id": observed.arbitration_id if observed is not None else None,
+                "observed_rx_dlc": observed.dlc if observed is not None else None,
+                "receive_timestamp": observed.received_at if observed is not None else None,
+                "receive_sequence": observed.receive_sequence if observed is not None else None,
+                "outcome": retained_outcome,
+                "router_outcome": outcome,
+                "exception": {"class": type(error).__name__, "message": str(error)[:512]} if error is not None else None,
+                "finalized_at": self._clock(),
+                "physical_effect_verified": False,
+            })
+        except Exception as exc:
+            record_retention_failure("router_finalize", exc)
+
     def transact(
         self,
         raw_tx: bytes,
@@ -622,10 +678,24 @@ class NovoRouter:
             try:
                 self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
                 tx_write_completed_at = self._clock()
-            except Exception:
+            except Exception as exc:
                 with self._pending_lock:
                     if self._pending is pending:
                         self._pending = None
+                self._retain_tmcl_exchange(
+                    {
+                        **provenance,
+                        "transaction_id": transaction_id,
+                        "owner_generation": pending.owner_generation if pending is not None else self._reader_generation,
+                        "matcher": matcher_name,
+                        "registration_timestamp": registered_at,
+                        "tx_timestamp": tx_at,
+                        "tx_write_completed_at": None,
+                        "timeout_ms": int(round(float(timeout_s) * 1000.0)),
+                        "tx_raw": list(raw_tx),
+                    },
+                    wait_signaled=None, outcome="write_exception", error=exc,
+                )
                 raise
             base = {
                 "transaction_id": transaction_id,
@@ -640,6 +710,7 @@ class NovoRouter:
                 "oem_receive_queue_cleared": cleared_pipette_replies,
             }
             if pending is None:
+                self._retain_tmcl_exchange(base, wait_signaled=None, outcome="tx_only")
                 return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
             completed = pending.event.wait(max(0.0, float(timeout_s)))
             with self._pending_lock:
@@ -653,6 +724,10 @@ class NovoRouter:
                 else (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
             )
             observed = pending.frames[-1] if pending.frames else None
+            self._retain_tmcl_exchange(
+                {**base, "owner_generation": pending.owner_generation},
+                wait_signaled=completed, outcome=outcome, observed=observed,
+            )
             multipart_frames = [frame for frame in pending.frames if frame.classification == "pipette_multipart"]
             multipart_projection = {
                 "present": bool(multipart_frames),
