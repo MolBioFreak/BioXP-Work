@@ -478,7 +478,19 @@ def physical_aggregate_stop(
     # ClassMotor.StopMotor must run before forceAbortMotion latches No24V.
     # The source StopMotor path rejects delivery after that latch is active.
     latch = getattr(driver, "motor_oem_force_abort_motion", None)
-    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
+    try:
+        force_abort_latch = (
+            latch(reason="forceAbortMotion")
+            if callable(latch)
+            else {"ok": False, "error": "forceAbortMotion is unavailable"}
+        )
+    except Exception as exc:
+        force_abort_latch = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    latch_completed = bool(
+        isinstance(force_abort_latch, Mapping)
+        and force_abort_latch.get("ok") is True
+        and force_abort_latch.get("latched") is True
+    )
 
     # Complete the fan-out before polling so one slow component cannot delay a
     # StopMotor command to another component that may still be moving.
@@ -515,16 +527,18 @@ def physical_aggregate_stop(
         })
 
     all_stopped = all(row["status"] in {"stopped", "not_present_by_authority"} for row in components)
+    complete = all_stopped and latch_completed
     return {
         "schema_version": STOP_SCHEMA,
-        "ok": all_stopped,
-        "state": "stopped" if all_stopped else "failed_ambiguous",
+        "ok": complete,
+        "state": "stopped" if complete else "failed_ambiguous",
         "machine_serial": authority.machine_serial,
         "controller_evidence": authority.controller_evidence(),
         "components": components,
         "stage_receipts": components,
         "delivery_attempted": any(row["delivery_attempted"] for row in components),
         "oem_24v_latch": force_abort_latch,
+        "abort_latch_completed": latch_completed,
         "controller_terminal_state_verified": all_stopped,
         "physical_effect_verified": False,
         "physical_effect_verification_required": True,

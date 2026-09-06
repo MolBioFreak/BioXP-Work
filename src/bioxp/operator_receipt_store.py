@@ -1323,6 +1323,8 @@ class OperatorReceiptStore:
     ) -> dict[str, Any]:
         """Fsync one safety receipt without waiting for SQLite."""
         row = dict(receipt)
+        if isinstance(row.get("interrupt_evidence"), Mapping):
+            row["interrupt_evidence"] = {**row["interrupt_evidence"], "persistence_state": "recovery_required"}
         row["persistence_fallback"] = {
             "kind": "operator_interrupt_jsonl",
             "reason": str(reason)[:500],
@@ -1381,7 +1383,12 @@ class OperatorReceiptStore:
                 raise RuntimeError("operator interrupt fallback contains a non-object row")
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                prepared = [(dict(row), self._persist_evidence(row)) for row in receipts]
+                prepared = []
+                for row in receipts:
+                    imported = dict(row)
+                    if isinstance(imported.get("interrupt_evidence"), Mapping):
+                        imported["interrupt_evidence"] = {**imported["interrupt_evidence"], "persistence_state": "committed"}
+                    prepared.append((imported, self._persist_evidence(imported)))
                 for row, evidence in prepared:
                     self._upsert(row, evidence=evidence)
                     self._register_evidence(row, evidence)
@@ -1443,6 +1450,9 @@ class OperatorReceiptStore:
 
     def put_interrupt(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Persist a delivered safety interrupt without waiting on normal DB work."""
+        receipt = dict(receipt)
+        if isinstance(receipt.get("interrupt_evidence"), Mapping):
+            receipt["interrupt_evidence"] = {**receipt["interrupt_evidence"], "persistence_state": "committed"}
         if not self.lock.acquire(blocking=False):
             return self.append_interrupt_fallback(receipt, reason="sqlite_connection_busy")
         try:

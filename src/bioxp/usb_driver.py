@@ -5802,12 +5802,12 @@ class BioXpTester:
                 "physical_effect_verified": False,
             }
 
-        position_before = self.motor_get_position(board, motor=motor)
+        # ClassMotor properties are cached fields, not fresh GAP telemetry.
+        # Evaluate both before any read can update CurrentPosition.
         cached_home_before = bool(home_cache.get(channel, False))
-        home_before = self.motor_query_home_switch(board, motor=motor)
-        speed_before = self.motor_get_speed(board, motor=motor)
-        position_before_value = position_before.get("position") if isinstance(position_before, dict) else None
-        if cached_home_before and position_before_value == 0:
+        cached_position_before = position_cache.get(channel, -1000)
+        if cached_home_before and cached_position_before == 0:
+            position_before = {"position": cached_position_before, "authority": "oem_cached_CurrentPosition"}
             return {
                 "ok": True,
                 "axis": key,
@@ -5816,25 +5816,32 @@ class BioXpTester:
                 "speed": int(speed),
                 "rehome": bool(rehome),
                 "source_noop": True,
+                "short_circuit": "MotorHome_and_CurrentPosition_zero",
+                "completion_class": "source_cached_noop",
+                "source_return_ok": True,
+                "search_stop_set_home_inapplicable": True,
                 "source_return_code": 0,
                 "board_lifecycle_generation": self.oem_current_board_lifecycle_generation(),
                 "position_before": position_before,
                 "position_after": position_before,
-                "home_before": home_before,
-                "home_after": home_before,
-                "speed_before": speed_before,
+                "home_before": None,
+                "home_after": None,
+                "speed_before": None,
                 "move_home": None,
                 "move_left": None,
                 "wait": None,
                 "stop": None,
                 "set_home": None,
                 "controller_command_acknowledged": False,
-                "controller_terminal_state_verified": True,
-                "controller_home_proof_verified": True,
+                "controller_terminal_state_verified": False,
+                "controller_home_proof_verified": False,
                 "home_decision": {"source_short_circuit": "MotorHome_and_CurrentPosition_zero"},
                 "physical_effect_verified": False,
             }
 
+        position_before = self.motor_get_position(board, motor=motor)
+        home_before = self.motor_query_home_switch(board, motor=motor)
+        speed_before = self.motor_get_speed(board, motor=motor)
         source_return_code = 0
         rehome_move = None
         deck_rehome_position = None

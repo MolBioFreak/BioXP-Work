@@ -6620,7 +6620,11 @@ async def motion_oem_prepare_without_motion():
     tester = _get_tester()
 
     def prepare_operator_motion_state() -> dict[str, Any]:
-        global_result = prepare_motion_without_motion(tester, authority=authority)
+        provider = _serial206_oem_initialization_provider
+        if provider is None:
+            return {"ok": False, "failure": "serial206_motion_provider_unavailable",
+                    "physical_motion_commanded": False}
+        global_result = provider.prepare_global_motion_without_motion(tester, authority=authority)
         if not isinstance(global_result, Mapping) or global_result.get("ok") is not True:
             return dict(global_result) if isinstance(global_result, Mapping) else {
                 "ok": False,
@@ -6636,7 +6640,7 @@ async def motion_oem_prepare_without_motion():
             "next_required_action": "home_z",
         }
         can_ready = hardware_state.publish_can_ready_from_preparation(
-            expected_ownership_epoch=hardware_state.ownership_epoch,
+            expected_ownership_epoch=global_result["generation"],
             reason="oem_prepare_without_motion_completed",
         )
         ready = bool(can_ready.get("published") is True)
@@ -8304,10 +8308,9 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
         raise HTTPException(
             status_code=409,
             detail={
-                "error": "canonical_xz_method_requires_v2_route",
-                "replacement_method_action_id": "oem.xy.home",
-                "replacement_route": "/operator/v2/methods",
-                "required_schema": "bioxp.operator_method_request.v1",
+                "error": "homexy_requires_canonical_action",
+                "replacement_action_id": "oem.xy.home",
+                "replacement_route": "/operator/v2/actions/oem.xy.home",
                 "physical_motion_commanded": False,
             },
         )

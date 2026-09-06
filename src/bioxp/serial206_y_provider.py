@@ -574,7 +574,8 @@ class Serial206YProvider:
             "set_home_valid": already_home or set_home_valid,
             "zero_readback": already_home or zero_readback,
             "already_home_current_generation": already_home,
-            "stop_wait_set_home_inapplicable": already_home,
+            "stop_wait_set_home_inapplicable": short_circuit_home,
+            "source_cached_noop": short_circuit_home,
         }
 
     def home(self, mode: str, *, command_id: str | None = None, wait_timeout_s: float = 30.0) -> dict[str, Any]:
@@ -592,7 +593,8 @@ class Serial206YProvider:
         axis_authority = dict(axis_raw) if isinstance(axis_raw, Mapping) else {}
         board_authority = dict(board_raw) if isinstance(board_raw, Mapping) else {}
         if (
-            authority.get("ok") is True
+            mode != "manual_panel"
+            and authority.get("ok") is True
             and (
                 axis_authority.get("prepared_board_epoch") != board_authority.get("active_board_epoch")
                 or axis_authority.get("lifecycle_state") not in {"prepared_unreferenced", "referenced_ready"}
@@ -609,14 +611,32 @@ class Serial206YProvider:
                     "preparation": preparation,
                 }
             authority = self._current_authority(allow_unprepared=False)
-        primitive = getattr(self.tester, "motor_oem_home_axis", None)
-        result = primitive(
-            self.axis,
-            speed=int(speed),
-            startup=bool(startup),
-            timeout_s=float(wait_timeout_s),
-            require_switch_transition=False,
-        ) if callable(primitive) else {"ok": False, "failure": "y_home_primitive_not_bound"}
+        if mode == "manual_panel":
+            # ClassControlInterface.btnHomeY_Click calls goHome(true, Y, 500, true)
+            # directly: no generic motor_prepare_axis current/profile prelude.
+            primitive = getattr(self.tester, "motor_oem_go_home", None)
+            result = {
+                "axis": self.axis,
+                "startup": False,
+                "prepare": None,
+                "home": primitive(
+                    self.axis,
+                    speed=int(speed),
+                    rehome=True,
+                    timeout_s=float(wait_timeout_s),
+                    require_switch_transition=False,
+                ) if callable(primitive) else {"ok": False, "failure": "y_home_primitive_not_bound"},
+                "restore_current": None,
+            }
+        else:
+            primitive = getattr(self.tester, "motor_oem_home_axis", None)
+            result = primitive(
+                self.axis,
+                speed=int(speed),
+                startup=bool(startup),
+                timeout_s=float(wait_timeout_s),
+                require_switch_transition=False,
+            ) if callable(primitive) else {"ok": False, "failure": "y_home_primitive_not_bound"}
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "y_home_result_not_mapping", "raw": result}
         source_home_raw = result.get("home")
         source_home = dict(source_home_raw) if isinstance(source_home_raw, Mapping) else {}

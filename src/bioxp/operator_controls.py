@@ -592,9 +592,7 @@ def _provider_x_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
     provider: Mapping[str, Any] = provider_value if isinstance(provider_value, Mapping) else {}
     x_authority_value = provider.get("x_authority")
     x_authority: Mapping[str, Any] = x_authority_value if isinstance(x_authority_value, Mapping) else {}
-    lifecycle_value = x_authority.get("lifecycle")
-    lifecycle: Mapping[str, Any] = lifecycle_value if isinstance(lifecycle_value, Mapping) else x_authority
-    board_fresh = lifecycle.get("board_lifecycle_generation_fresh")
+    board_fresh = x_authority.get("board_generation_fresh")
     dependencies = [
         _operation_motion_dependency(machine_state),
         _dependency("can_ready", "Same-epoch CAN ready", ownership.get("CAN_READY") is True, "Same-epoch CAN readiness has not been established."),
@@ -2092,13 +2090,45 @@ def install_operator_control_plane(
             "reference_state": reference_state,
         }
 
+    def _interrupt_receipt_evidence(
+        row: Mapping[str, Any], observation: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        response = row.get("response")
+        body = response.get("body") if isinstance(response, Mapping) else None
+        source = body if isinstance(body, Mapping) else {}
+        # Unwrap the API/provider envelope without inferring ACK from HTTP success.
+        for _ in range(3):
+            nested = source.get("detail") if isinstance(source.get("detail"), Mapping) else source.get("result")
+            if not isinstance(nested, Mapping):
+                break
+            source = nested
+
+        def evidence_bool(name: str) -> bool | None:
+            value = source.get(name)
+            return value if type(value) is bool else None
+
+        return {
+            "source_call_completed": evidence_bool("source_call_completed"),
+            "source_return_ok": evidence_bool("source_return_ok"),
+            "controller_stop_acknowledged": evidence_bool("controller_command_acknowledged"),
+            "controller_terminal_state_verified": evidence_bool("controller_terminal_state_verified"),
+            "physical_effect_verified": False,
+            "persistence_state": "unknown",
+            "details": {
+                "request": _bounded_json(observation, _MAX_INPUT_BYTES),
+                "response": _bounded_json(response, _MAX_RESPONSE_BYTES),
+                "error": row.get("error"),
+            },
+        }
+
     def _v2_compact_receipt(row: Mapping[str, Any]) -> dict[str, Any]:
         raw_status = str(row.get("status") or "queued")
         status = {
             "acknowledged": "queued",
             "admission_pending": "queued",
             "blocked": "rejected",
-            "reconciliation_required": "failed",
+            "reconciliation_required": "ambiguous",
+            "outcome_unknown": "ambiguous",
             "stop_requested": "interrupting",
             "abort_requested": "interrupting",
             "stopped": "interrupted",
@@ -2120,7 +2150,17 @@ def install_operator_control_plane(
         finished = finite_time(row.get("finished_at"))
         error = None
         if status in {"failed", "rejected", "ambiguous"}:
-            error = {"code": str(row.get("error") or row.get("reason") or raw_status), "message": str(row.get("error") or row.get("reason") or raw_status), "retryable": status == "ambiguous"}
+            response = row.get("response")
+            body = response.get("body") if isinstance(response, Mapping) else None
+            original = body.get("detail") if isinstance(body, Mapping) and isinstance(body.get("detail"), Mapping) else body
+            original = original if isinstance(original, Mapping) else {}
+            code = original.get("error")
+            message = original.get("message")
+            error = {
+                "code": (code if isinstance(code, str) and code else str(row.get("error") or row.get("reason") or raw_status))[:160],
+                "message": (message if isinstance(message, str) and message else str(row.get("error") or row.get("reason") or raw_status))[:1000],
+                "retryable": False,
+            }
             failure_detail = _v2_bounded_failure_detail(row)
             if failure_detail is not None:
                 error["detail"] = failure_detail
@@ -2146,6 +2186,7 @@ def install_operator_control_plane(
             "error": error,
             "transport_exchanges": list(row.get("transport_exchanges") or []),
             "transport_retention_errors": list(row.get("transport_retention_errors") or []),
+            "interrupt_evidence": row.get("interrupt_evidence"),
         }
 
     def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -2212,7 +2253,7 @@ def install_operator_control_plane(
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
         dashboard = _v2_dashboard(state, {}, await asyncio.to_thread(store.list, 25))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if str(action["action_id"]) in v2_canonical_action_ids]}
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if str(action["action_id"]) in v2_canonical_action_ids]}
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
@@ -2286,7 +2327,13 @@ def install_operator_control_plane(
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
-        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": dict(row.get("raw_return_layers") or {}), "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
+        raw_return_layers = dict(row.get("raw_return_layers") or {})
+        if row.get("response") is not None:
+            raw_return_layers["operator_response"] = _bounded_json(row["response"], _MAX_RESPONSE_BYTES)
+        raw_return_layers["source_identity"] = row.get("source_identity")
+        raw_return_layers["completion_ambiguous"] = row.get("completion_ambiguous") is True
+        raw_return_layers["retry_forbidden"] = row.get("retry_forbidden") is True
+        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": raw_return_layers, "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
 
     async def _v2_method_receipt(method: Mapping[str, Any]) -> dict[str, Any]:
         raw_status = str(method.get("status") or "queued")
@@ -2332,7 +2379,7 @@ def install_operator_control_plane(
                     {
                         "action_id": str(action["action_id"]),
                         "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
-                        "response_schema_version": "bioxp.operator_interrupt_receipt.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_receipt.v2",
+                        "response_schema_version": "bioxp.operator_action_receipt.v2",
                         "interrupt": str(action["safety_class"]) == "stop",
                         "enabled": bool(assessed_action(action, state).get("enabled")),
                         "disabled_reason": assessed_action(action, state).get("disabled_reason"),
@@ -2449,15 +2496,27 @@ def install_operator_control_plane(
 
     @router.post("/actions/{action_id}")
     async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        action = by_id.get(action_id)
+        if action is None:
+            raise HTTPException(status_code=404, detail="unknown operator action_id")
+        target = dispatch.get(action_id)
+        is_safety_interrupt = action_id in INTERRUPT_ACTIONS or bool(
+            target is not None
+            and target.get("method") == "POST"
+            and target.get("path") in {
+                "/motion/diagnostics/stop",
+                "/motion/oem/x/stop",
+                "/motion/oem/x/abort",
+                "/motion/oem/y/stop",
+                "/motion/oem/z/stop",
+            }
+        )
+        interrupt_observation = None
         if isinstance(payload, OperatorInterruptRequestV1):
-            if action_id.startswith(("oem.z.", "oem.x.", "oem.y.")) or action_id == "oem.abort_all":
-                expected_generation = (
-                    int(payload.observed_ownership_generation)
-                    if payload.observed_ownership_generation is not None
-                    else int(hardware_state.ownership_epoch)
-                )
+            if is_safety_interrupt:
+                interrupt_observation = payload.model_dump(mode="json")
                 payload = InvokeRequest(
-                    expected_generation=expected_generation,
+                    expected_generation=int(hardware_state.ownership_epoch),
                     idempotency_key=payload.idempotency_key,
                     inputs={},
                 )
@@ -2478,12 +2537,13 @@ def install_operator_control_plane(
         encoded_inputs = json.dumps(payload.inputs, default=str, separators=(",", ":")).encode()
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
-        action = by_id[action_id]
-        existing = await asyncio.to_thread(
-            store.by_idempotency,
-            payload.idempotency_key,
-            include_evidence=False,
-        )
+        existing = None
+        if not is_safety_interrupt:
+            existing = await asyncio.to_thread(
+                store.by_idempotency,
+                payload.idempotency_key,
+                include_evidence=False,
+            )
         if existing is not None:
             if existing.get("action_id") != action_id or existing.get(
                 "requested_inputs", existing.get("inputs")
@@ -2500,28 +2560,11 @@ def install_operator_control_plane(
             verify_replay_source_identity(existing)
             return existing
         expected = int(hardware_state.ownership_epoch)
-        if payload.expected_generation != expected:
+        if not is_safety_interrupt and payload.expected_generation != expected:
             raise HTTPException(status_code=409, detail="ownership generation mismatch")
-        is_safety_interrupt = action_id in {
-            "oem.x.stop",
-            "oem.y.stop",
-            "oem.z.stop",
-            "oem.abort_all",
-        }
-        if action_id not in dispatch:
+        if target is None:
             assessment = _assess_action(action, machine_state(), payload.inputs)
             raise HTTPException(status_code=409, detail={"error": "action_unavailable", "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})
-        target = dispatch[action_id]
-        is_safety_interrupt = is_safety_interrupt or (
-            target.get("method") == "POST"
-            and target.get("path") in {
-                "/motion/diagnostics/stop",
-                "/motion/oem/x/stop",
-                "/motion/oem/x/abort",
-                "/motion/oem/y/stop",
-                "/motion/oem/z/stop",
-            }
-        )
         unknown_inputs = set(payload.inputs) - set(target["inputs"])
         if unknown_inputs:
             raise HTTPException(
@@ -2866,7 +2909,7 @@ def install_operator_control_plane(
                     "machine_assessment": "unverified" if completion_ambiguous else "pass" if ok else "fail",
                     "response": full_response,
                     "error": (
-                        "pipette outcome unknown; reconciliation required and retry forbidden"
+                        "Action outcome unknown; reconciliation required and retry forbidden"
                         if completion_ambiguous
                         else None if ok else f"robot route returned HTTP {status_code}"
                     ),
@@ -2918,7 +2961,25 @@ def install_operator_control_plane(
             receipt["duration_ms"] = (finished - started) * 1000.0
             receipt["receipt_persist_started_at"] = time.time()
             if is_safety_interrupt:
-                persisted = await asyncio.to_thread(store.put_interrupt, receipt)
+                receipt["interrupt_evidence"] = _interrupt_receipt_evidence(receipt, interrupt_observation)
+                try:
+                    persisted = await asyncio.to_thread(store.put_interrupt, receipt)
+                except Exception as exc:
+                    # Delivery has already been attempted. Keep its identity and
+                    # evidence available even if both durable stores fail.
+                    receipt.update({
+                        "status": "outcome_unknown",
+                        "machine_assessment": "unverified",
+                        "error": "Interrupt receipt persistence failed; reconciliation required and retry forbidden",
+                        "automatic_retry": False,
+                        "physical_outcome": "ambiguous",
+                        "completion_ambiguous": True,
+                        "reconciliation_required": True,
+                        "retry_forbidden": True,
+                    })
+                    receipt["interrupt_evidence"]["persistence_state"] = "recovery_required"
+                    receipt["interrupt_evidence"]["details"]["persistence_error"] = f"{type(exc).__name__}: {exc}"[:1000]
+                    persisted = receipt
             else:
                 persisted = await asyncio.to_thread(
                     store.put,
