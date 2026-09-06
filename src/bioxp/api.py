@@ -6667,7 +6667,11 @@ async def motion_oem_prepare_without_motion():
     response = {
         **result,
         "ownership_bootstrap": ownership_bootstrap,
-        "next_required_action": "Home Z from the normal cockpit to establish the operator reference.",
+        "next_required_action": (
+            "Home Z from the normal cockpit to establish the operator reference."
+            if result.get("ok") is True
+            else result.get("error") or result.get("failure") or "Inspect the failed preparation receipt before another activation attempt."
+        ),
     }
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=response)

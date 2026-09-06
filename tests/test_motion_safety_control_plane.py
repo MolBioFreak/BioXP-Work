@@ -137,6 +137,11 @@ class FakeMotionDriver:
         self.calls.append(("query_io", io_type))
         return self.io[io_type]
 
+    def deck_io_set_type(self, io_type: int, value: int):
+        assert io_type == 2
+        self.calls.append(("solenoid", value))
+        return {"ack": {"status": 100}, "ok": True, "value_set": value}
+
     def motor_stop(self, board_id: int, *, motor: int):
         axis = next(name for name, row in self.MOTOR_FUNCTION_PRESETS.items() if row == {"board": board_id, "motor": motor})
         self.calls.append(("stop", axis, board_id, motor))
@@ -222,9 +227,12 @@ def test_prepare_without_motion_uses_only_authoritative_motor_boards_and_exact_r
     assert all(call[0] not in {"move", "home", "enable_motor_power"} for call in driver.calls)
     assert [row["stage_id"] for row in result["stage_ledger"]] == [
         "authority",
-        "rail_24v_readback",
         "door_readback",
         "latch_readback",
+        "latch_solenoid",
+        "door_readback_after_latch",
+        "latch_readback_after_latch",
+        "rail_24v_readback",
         "deactivateBoard",
         "activateBoard",
         "boardLifecycleGeneration",
