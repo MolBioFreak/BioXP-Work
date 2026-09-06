@@ -1,53 +1,20 @@
-from types import SimpleNamespace
-
-from src.bioxp import oem_serial206_initialization as subject
-
-
-ACK = {"status": 100}
+from test_f05_completion_consumers import adapter_for
+from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
 
 
-def test_event_128_is_authoritative_when_final_counter_differs_from_target():
-    adapter = subject.Serial206ProductionPrimitiveAdapter.__new__(
-        subject.Serial206ProductionPrimitiveAdapter
+def test_event_128_is_authoritative_when_final_counter_differs_from_target(monkeypatch):
+    # Exercise the real public caller and consuming waiter, not a fabricated
+    # collector-only event (which does not prove an AutoResetEvent wait).
+    bind_serial206_oem_snapshot(monkeypatch)
+    adapter, driver = adapter_for('valid')
+    result = adapter.z_move_absolute(
+        requested_position_steps=10_000, pseudo_home_steps=0, wait_timeout_s=.002,
     )
-    adapter.tester = SimpleNamespace(
-        motor_wait_stopped=lambda *args, **kwargs: {
-            "stopped": True,
-            "last_speed": 0,
-            "last_ack": ACK,
-        },
-        collect_bus_events=lambda **kwargs: [
-            {
-                "board": 4,
-                "motor": 1,
-                "status": 128,
-                "event_sequence": 11,
-            }
-        ],
-        motor_get_position=lambda *args, **kwargs: {
-            "ok": True,
-            "ack": ACK,
-            "position": 10_006,
-        },
-    )
-    adapter.z_stop = lambda **kwargs: (_ for _ in ()).throw(
-        AssertionError("successful event-128 completion must not issue failure stop")
-    )
-
-    result = adapter._z_finalize_position_move(
-        profile={"board": 4, "motor": 1},
-        before={"ok": True, "ack": ACK, "position": 0},
-        target=10_000,
-        move={"ok": True, "ack": ACK},
-        wait_timeout_s=20.0,
-        pre_command_event_window={"after_sequence": 9},
-        event_window={"after_sequence": 10},
-    )
-
-    assert result["ok"] is True
-    assert result["failure"] is None
-    assert result["controller_command_acknowledged"] is True
-    assert result["controller_terminal_state_verified"] is True
-    assert result["target_position_steps"] == 10_000
-    assert result["after_position_steps"] == 10_006
-    assert result["target_events"][0]["status"] == 128
+    assert result['ok'] is True
+    assert result['failure'] is None
+    assert result['controller_command_acknowledged'] is True
+    assert result['target_position_steps'] == 10_000
+    assert result['after_position_steps'] == 10_006
+    assert result['target_events'][0]['status'] == 128
+    assert result['source_wait']['ok'] is True
+    assert not driver.motor_oem_wait_target_reached(4, 1, timeout_s=0)['ok']

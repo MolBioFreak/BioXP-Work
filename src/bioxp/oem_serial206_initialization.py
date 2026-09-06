@@ -930,6 +930,8 @@ class Serial206ProductionPrimitiveAdapter:
             primitive_wait
             and isinstance(wait, Mapping)
             and wait.get("ok") is True
+            and isinstance(wait.get("event"), Mapping)
+            and wait["event"].get("status") == 128
         )
         result: dict[str, Any] = {
             "ok": source_completed,
@@ -1013,6 +1015,8 @@ class Serial206ProductionPrimitiveAdapter:
                 move.get("completion_class")
                 if isinstance(move, Mapping)
                 else None
+            ) or (
+                wait.get("completion_class") if isinstance(wait, Mapping) else None
             ) or ("event_128" if target_event else None)
             result.update(
                 {
@@ -1020,7 +1024,7 @@ class Serial206ProductionPrimitiveAdapter:
                     "wait_verified": wait_ok,
                     "target_event_128_observed": target_event,
                     "completion_class": completion_class,
-                    "controller_terminal_state_verified": wait_ok,
+                    "controller_terminal_state_verified": wait_ok and target_event,
                     "pending_motion": False,
                 }
             )
@@ -1180,7 +1184,6 @@ class Serial206ProductionPrimitiveAdapter:
             sequence = window.get("after_sequence") if isinstance(window, Mapping) else None
             addressed = [row for row in events if isinstance(row, Mapping) and row.get("board") == board and row.get("motor") == motor and type(row.get("event_sequence")) is int and type(sequence) is int and row["event_sequence"] > sequence and self._x_event_fresh(row, window)]
             errors = [row for row in addressed if row.get("status") in {13, 14, 130}]
-            targets = [row for row in addressed if row.get("status") == 128]
             command_ok = bool(
                 isinstance(command, Mapping)
                 and command.get("ok") is True
@@ -1188,6 +1191,25 @@ class Serial206ProductionPrimitiveAdapter:
             command_acknowledged = bool(not moved or (isinstance(command, Mapping) and command.get("controller_command_acknowledged") is True))
             wait = waits.get(axis)
             wait_ok = bool(isinstance(wait, Mapping) and wait.get("ok") is True and wait.get("target_reached") is True)
+            # The wait already performed the owned, axis-local consumption.
+            # Collector rows are diagnostics, not another opportunity to Set it.
+            # Bind to the historical window, never to the router's current
+            # generation: a later reader change does not undo a completed wait.
+            event = wait.get("event") if isinstance(wait, Mapping) else None
+            targets = [event] if (
+                wait_ok and isinstance(event, Mapping)
+                and event.get("source") == "novo_router_async"
+                and event.get("latch_disposition") == "consumed"
+                and event.get("board") == board and event.get("motor") == motor
+                and event.get("status") == 128
+                and type(event.get("event_sequence")) is int
+                and isinstance(event.get("receive_owner"), str)
+                and type(event.get("owner_generation")) is int
+                and (not isinstance(window, Mapping) or all(
+                    event.get(key) == window[key]
+                    for key in ("receive_owner", "owner_generation") if key in window
+                ))
+            ) else []
             position_delta = (position_value - receipt["requested"][axis]) if type(position_value) is int else None
             if axis == "x":
                 position_ok = bool(
@@ -1854,6 +1876,11 @@ class Serial206ProductionPrimitiveAdapter:
     ) -> dict[str, Any]:
         board = int(profile["board"])
         motor = int(profile["motor"])
+        # The sole caller issues wait_for_stop=False. Consume the board latch
+        # here; retained collector records are diagnostic, not another wait.
+        source_wait = self.tester.motor_oem_wait_target_reached(
+            board, motor=motor, timeout_s=float(wait_timeout_s), event_window=event_window
+        )
         wait = self.tester.motor_wait_stopped(
             board,
             motor=motor,
@@ -1871,7 +1898,8 @@ class Serial206ProductionPrimitiveAdapter:
             and type(after_sequence) is int
             and int(row["event_sequence"]) > int(after_sequence)
         ]
-        target_events = [row for row in axis_events if row.get("status") == 128]
+        consumed = source_wait.get("event")
+        target_events = [consumed] if source_wait.get("ok") is True and isinstance(consumed, Mapping) and consumed.get("status") == 128 else []
         error_events = [row for row in axis_events if row.get("status") in {13, 14, 130}]
         after = self.tester.motor_get_position(board, motor=motor)
         before_value = self._z_value(before)
@@ -1882,7 +1910,7 @@ class Serial206ProductionPrimitiveAdapter:
             and self._z_tmcl_success(move.get("ack"))
         )
         terminal = self._z_terminal_zero_verified(wait)
-        event_completed = bool(target_events)
+        event_completed = source_wait.get("ok") is True
         timeout_target_equal = bool(
             allow_timeout_target_equal
             and not event_completed
@@ -1901,7 +1929,7 @@ class Serial206ProductionPrimitiveAdapter:
             "robot_http_acknowledged": True,
             "controller_command_acknowledged": move_ack,
             "controller_terminal_state_verified": terminal,
-            "completion_class": "event_128" if target_events else "oem_timeout_target_equal" if timeout_target_equal else None,
+            "completion_class": source_wait.get("completion_class", "event_128") if event_completed else "oem_timeout_target_equal" if timeout_target_equal else None,
             "physical_effect_verified": False,
             "pre_command_event_window": _json_safe(pre_command_event_window),
             "event_window": _json_safe(event_window),
@@ -1914,6 +1942,8 @@ class Serial206ProductionPrimitiveAdapter:
             "after_position_steps": after_value,
             "move": _json_safe(move),
             "wait": _json_safe(wait),
+            "source_wait": _json_safe(source_wait),
+            "events": _json_safe(events),
         }
 
     def z_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
@@ -3558,6 +3588,29 @@ class Serial206ProductionPrimitiveAdapter:
         )
         acknowledged = bool(g_move.get("ok") is True and z_move.get("ok") is True)
         terminal = bool(isinstance(wait, Mapping) and wait.get("ok") is True)
+        # Source handle consumption can succeed from construction alone.
+        # Only the actual consumed receives prove both controller targets;
+        # bind their historical ownership without another wait or cursor.
+        reached = wait.get("reached") if isinstance(wait, Mapping) else None
+        controller_terminal = terminal and isinstance(reached, Mapping)
+        for profile in (g_profile, z_profile):
+            board = int(profile["board"])
+            motor = int(profile.get("motor", 0))
+            event = reached.get(f"{board}:{motor}") if isinstance(reached, Mapping) else None
+            controller_terminal = bool(
+                controller_terminal and isinstance(event, Mapping)
+                and event.get("source") == "novo_router_async"
+                and event.get("latch_disposition") == "consumed"
+                and event.get("board") == board and event.get("motor") == motor
+                and event.get("status") == 128
+                and type(event.get("event_sequence")) is int
+                and isinstance(event.get("receive_owner"), str)
+                and type(event.get("owner_generation")) is int
+                and (not isinstance(event_window, Mapping) or all(
+                    event.get(key) == event_window[key]
+                    for key in ("receive_owner", "owner_generation") if key in event_window
+                ))
+            )
         return {
             "ok": bool(acknowledged and terminal),
             "intent": "move_gz",
@@ -3567,7 +3620,7 @@ class Serial206ProductionPrimitiveAdapter:
             "commands": {"g": _json_safe(g_move), "z": _json_safe(z_move)},
             "wait": _json_safe(wait),
             "controller_command_acknowledged": acknowledged,
-            "controller_terminal_state_verified": terminal,
+            "controller_terminal_state_verified": controller_terminal,
             "physical_effect_verified": False,
             "failure": None if acknowledged and terminal else "move_gz_controller_evidence_unverified",
         }

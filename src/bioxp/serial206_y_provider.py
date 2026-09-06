@@ -345,7 +345,7 @@ class Serial206YProvider:
             result.get("ok") is True
             and (
                 not wait_for_stop
-                or completion_class in {"event_128", "oem_timeout_target_equal"}
+                or completion_class in {"event_128", "oem_timeout_target_equal", "oem_initial_latch"}
             )
         )
         terminal_speed = result.get("terminal_speed") if isinstance(result.get("terminal_speed"), Mapping) else None

@@ -853,9 +853,13 @@ class BioXpTester:
     def begin_bus_event_window(self, *, reset_wait_latch=True):
         """Model the OEM axis-local `_waitForMotor` reset cursor."""
         reset = bool(reset_wait_latch)
+        router = getattr(self, "novo_router", None)
+        cursor_fn = getattr(router, "receive_cursor", None)
+        cursor = cursor_fn() if callable(cursor_fn) else {}
         return {
+            **cursor,
             "after_sequence": (
-                int(getattr(self, "_bus_event_sequence", 0)) if reset else None
+                cursor.get("after_sequence", int(getattr(self, "_bus_event_sequence", 0))) if reset else None
             ),
             "oem_wait_latch_reset": reset,
             "cleared": 0,
@@ -1028,8 +1032,13 @@ class BioXpTester:
             provenance = frame.provenance() if hasattr(frame, "provenance") else dict(frame)
             event = self._decode_bus_event_frame(provenance.get("raw") or [], source="novo_router_async")
             if event is not None:
-                self._bus_event_sequence = int(getattr(self, "_bus_event_sequence", 0)) + 1
-                event["event_sequence"] = self._bus_event_sequence
+                event["event_sequence"] = provenance.get("receive_sequence")
+                event["receive_owner"] = provenance.get("receive_owner")
+                event["owner_generation"] = provenance.get("owner_generation")
+                event["command_correlation"] = "unavailable_on_wire"
+                disposition = getattr(router, "motor_event_disposition", None)
+                if callable(disposition):
+                    event["latch_disposition"] = disposition(frame)
                 event["received_at"] = provenance.get("received_at")
                 event["router_provenance"] = provenance
                 decoded.append(event)
@@ -3616,6 +3625,19 @@ class BioXpTester:
         self._motion_last_strict_init = report
         return report
 
+    def _oem_initial_motor_signals(self):
+        """ClassMotor.cs:39: once per constructed motor, not per USB reader.
+
+        As with _oem_board_state, the tester mirrors the ControlInterface board
+        objects. Reconnecting/replacing its transport does not reconstruct them.
+        Keep initial signals separate from received target-event provenance.
+        """
+        signals = getattr(self, "_oem_motor_initial_signals", None)
+        if signals is None:
+            signals = {(4, 0), (4, 1), (4, 2), (5, 0), (6, 0)}
+            self._oem_motor_initial_signals = signals
+        return signals
+
     def motor_query_motor_stop(self, board_id, motor=0):
         """
         OEM pre-move call (ClassMotor.queryMotorStop): cmd 138 type 0.
@@ -3636,6 +3658,10 @@ class BioXpTester:
         )
         ack_success = self._tmcl_success(ack)
         source_return_code = 0 if ack is None or ack_success else 1
+        reset = getattr(getattr(self, "novo_router", None), "reset_motor_event", None)
+        if callable(reset):
+            reset(int(board_id), int(motor), reset=ack is not None,
+                  initial_signals=self._oem_initial_motor_signals())
         return {
             "board": int(board_id),
             "motor": int(motor),
@@ -3644,6 +3670,60 @@ class BioXpTester:
             "ok": ack_success,
             "wait_latch_reset": ack is not None,
         }
+
+    def _wait_router_motor_events(self, targets, timeout_s, event_window):
+        """Consume source-shaped latches owned by the sole receiving router."""
+        router = self.novo_router
+        targets = {(int(board), int(motor)) for board, motor in targets}
+        started = time.monotonic()
+        deadline = started + max(0.0, float(timeout_s))
+        abort_generation = int(getattr(self, "_oem_abort_generation", 0))
+        events = []
+        reached = {}
+        failure = "oem_moveXY_target_event_timeout"
+        while True:
+            if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
+                failure = "No24V"
+                break
+            frames = router.take_motor_events(
+                targets, event_window, initial_signals=self._oem_initial_motor_signals()
+            )
+            if frames or not targets:
+                for frame in frames:
+                    if isinstance(frame, tuple):
+                        board, motor = frame
+                        reached[f"{board}:{motor}"] = {
+                            "board": board, "motor": motor,
+                            "source": "ClassMotor.initialState",
+                            "latch_disposition": "consumed",
+                            "physical_effect_verified": False,
+                        }
+                        continue
+                    provenance = frame.provenance()
+                    data = frame.data
+                    event = {
+                        "board": data[0], "motor": data[6], "status": data[1],
+                        "cmd": data[2], "value": struct.unpack(">i", data[3:7])[0],
+                        "raw": list(frame.raw), "source": "novo_router_async",
+                        "event_sequence": frame.receive_sequence,
+                        "receive_owner": frame.receive_owner,
+                        "owner_generation": frame.owner_generation,
+                        "received_at": frame.received_at, "router_provenance": provenance,
+                        "command_correlation": "unavailable_on_wire",
+                        "latch_disposition": "consumed",
+                    }
+                    reached[f"{data[0]}:{data[6]}"] = event
+                    events.append(event)
+                failure = None
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            events.extend(self.collect_bus_events(duration_s=min(.020, remaining), timeout_ms=8, max_events=32))
+        return {"ok": failure is None, "failure": failure, "no24v": failure == "No24V",
+                "reached": reached, "events": events, "event_window": event_window,
+                "pending": [] if failure is None else [list(key) for key in sorted(targets)],
+                "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
     def motor_oem_wait_target_reached(
         self,
@@ -3654,6 +3734,16 @@ class BioXpTester:
         event_window=None,
     ):
         """Wait for a fresh, axis-qualified OEM target/stall event."""
+        if callable(getattr(getattr(self, "novo_router", None), "take_motor_events", None)):
+            result = self._wait_router_motor_events([(board_id, motor)], timeout_s, event_window)
+            signal = result["reached"].get(f"{int(board_id)}:{int(motor)}")
+            initial = bool(signal and signal.get("source") == "ClassMotor.initialState")
+            event = None if initial else signal
+            result.update(board=int(board_id), motor=int(motor), event=event, target_reached=result["ok"],
+                          completion_class="oem_initial_latch" if initial else "event_128" if event else None)
+            if result["failure"] == "oem_moveXY_target_event_timeout":
+                result["failure"] = "oem_moveToAbs_target_event_timeout"
+            return result
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_s))
         abort_generation = int(getattr(self, "_oem_abort_generation", 0))
@@ -3718,7 +3808,22 @@ class BioXpTester:
         return self.motor_oem_wait_target_reached(board_id, motor=motor, timeout_s=timeout_s, event_window=event_window)
 
     def motor_wait_target_reached_many(self, targets, timeout_s=5.0, *, event_window=None, sta_sequential=False):
-        result = self.motor_oem_wait_targets_reached(targets, timeout_s=timeout_s, event_window=event_window)
+        targets = tuple(targets)
+        if sta_sequential:
+            # OEM STA: one WaitAny(single handle) per axis, each with its own
+            # timeout. Numeric timeout does not skip the following axis wait.
+            waits = [self.motor_oem_wait_target_reached(board, motor, timeout_s, event_window=event_window)
+                     for board, motor in targets]
+            result = {
+                "ok": all(wait.get("ok") for wait in waits),
+                "failure": next((wait.get("failure") for wait in waits if not wait.get("ok")), None),
+                "reached": {f"{int(board)}:{int(motor)}": wait.get("reached", {}).get(f"{int(board)}:{int(motor)}", wait["event"])
+                            for (board, motor), wait in zip(targets, waits) if wait.get("ok")},
+                "events": [event for wait in waits for event in wait.get("events", [])],
+                "event_window": event_window,
+            }
+        else:
+            result = self.motor_oem_wait_targets_reached(targets, timeout_s=timeout_s, event_window=event_window)
         per_axis = {}
         reached = result.get("reached") if isinstance(result, dict) else {}
         for board, motor in targets:
@@ -3734,6 +3839,8 @@ class BioXpTester:
 
     def motor_oem_wait_targets_reached(self, targets, timeout_s=5.0, *, event_window=None):
         """Collect one shared OEM WaitAll-style window for addressed motors."""
+        if callable(getattr(getattr(self, "novo_router", None), "take_motor_events", None)):
+            return self._wait_router_motor_events(targets, timeout_s, event_window)
         pending = {(int(board), int(motor)) for board, motor in targets}
         reached = {}
         events = []
@@ -3973,7 +4080,7 @@ class BioXpTester:
                     completion_class="oem_timeout_target_equal",
                 )
             else:
-                result["completion_class"] = "event_128"
+                result["completion_class"] = result["wait"].get("completion_class", "event_128")
         if self.oem_no24v_state():
             raise RuntimeError("Lost 24V power move abs2. moveToAbs()")
         return result
@@ -4769,7 +4876,7 @@ class BioXpTester:
                 board_position = self.motor_get_position(board, motor=motor)
                 board_value = board_position.get("position") if isinstance(board_position, Mapping) else None
                 board_wrapper_return = int(board_value) if type(board_value) is int else -1
-                completion_class = "event_128"
+                completion_class = wait.get("completion_class", "event_128")
             else:
                 board_wrapper_return = -1
                 completion_class = "timeout"

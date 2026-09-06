@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -27,6 +27,9 @@ class NovoFrame:
     raw: bytes
     received_at: float
     classification: str
+    receive_sequence: int | None = None
+    receive_owner: str | None = None
+    owner_generation: int | None = None
 
     def message(self) -> Any:
         return SimpleNamespace(
@@ -47,6 +50,9 @@ class NovoFrame:
             "data": list(self.data),
             "raw": list(self.raw),
             "received_at": self.received_at,
+            "receive_sequence": self.receive_sequence,
+            "receive_owner": self.receive_owner,
+            "owner_generation": self.owner_generation,
         }
 
 
@@ -137,6 +143,90 @@ class NovoRouter:
         self._pressure_epoch = 0
         self._pressure_epoch_started_at: float | None = None
         self._reader_generation = 0
+        self._receive_sequence = 0
+        self._receive_owner = uuid.uuid4().hex
+        self._motor_event_lock = threading.RLock()
+        self._motor_signals: dict[tuple[int, int], NovoFrame] = {}
+        self._motor_resets: dict[tuple[int, int], tuple[int, int]] = {}
+        self._motor_consumed: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def receive_cursor(self) -> dict[str, Any]:
+        with self._motor_event_lock:
+            return {"after_sequence": self._receive_sequence,
+                    "receive_owner": self._receive_owner,
+                    "owner_generation": self._reader_generation}
+
+    @staticmethod
+    def _motor_key(frame: NovoFrame) -> tuple[int, int] | None:
+        if (frame.arbitration_id == 0 and frame.dlc == 8
+                and frame.data[1] == 128 and frame.data[6] <= 2):
+            return (frame.data[0], frame.data[6])
+        return None
+
+    def reset_motor_event(self, board: int, motor: int, *, reset: bool = True, initial_signals=None) -> None:
+        """ClassMotor.queryMotorStop: Reset only after a nonnull return."""
+        key = (int(board), int(motor))
+        with self._motor_event_lock:
+            if reset:
+                if initial_signals is not None:
+                    initial_signals.discard(key)
+                self._motor_signals.pop(key, None)
+                self._motor_resets[key] = (self._reader_generation, self._receive_sequence)
+            elif self._motor_resets.get(key, (None,))[0] != self._reader_generation:
+                # A null query does not reset, including in a shared XY window.
+                self._motor_resets[key] = (self._reader_generation, -1)
+
+    def take_motor_events(self, targets, event_window=None, *, initial_signals=None) -> list[NovoFrame | tuple[int, int]]:
+        """Atomic AutoResetEvent consumption: WaitAll consumes none on timeout.
+
+        This is a host latch, NOT correlation to a device command. An unlabelled
+        late wire event can Set the current latch, exactly as in the OEM source.
+        """
+        keys = {(int(board), int(motor)) for board, motor in targets}
+        window = event_window if isinstance(event_window, dict) else {}
+        with self._motor_event_lock:
+            if (window.get("receive_owner", self._receive_owner) != self._receive_owner
+                    or window.get("owner_generation", self._reader_generation) != self._reader_generation):
+                return []
+            frames = []
+            for key in sorted(keys):
+                frame = self._motor_signals.get(key)
+                if frame is None or frame.owner_generation != self._reader_generation:
+                    if initial_signals is not None and key in initial_signals:
+                        frames.append(key)  # Source-initialized latch, NOT a wire frame.
+                        continue
+                    return []
+                reset = self._motor_resets.get(key)
+                after = (reset[1] if reset and reset[0] == self._reader_generation
+                         else window.get("after_sequence"))
+                if after is not None and frame.receive_sequence <= after:
+                    if initial_signals is not None and key in initial_signals:
+                        # Filtering receive proof does not Reset the independent
+                        # construction signal. Consume/coalesce both below.
+                        frames.append(key)
+                        continue
+                    return []
+                frames.append(frame)
+            for key in keys:
+                if initial_signals is not None:
+                    initial_signals.discard(key)
+                self._motor_signals.pop(key, None)
+                self._motor_consumed[key] = (self._reader_generation, self._receive_sequence)
+            return frames
+
+    def motor_event_disposition(self, frame: NovoFrame) -> str:
+        with self._motor_event_lock:
+            if frame.receive_owner != self._receive_owner or frame.owner_generation != self._reader_generation:
+                return "previous_receive_owner"
+            key = self._motor_key(frame)
+            if key is None:
+                return "not_target_event"
+            for marks, reason in ((self._motor_resets, "reset"), (self._motor_consumed, "consumed")):
+                mark = marks.get(key)
+                if mark and mark[0] == frame.owner_generation and frame.receive_sequence <= mark[1]:
+                    return reason
+            signal = self._motor_signals.get(key)
+            return "set" if signal is frame else "coalesced_set"
 
     @property
     def running(self) -> bool:
@@ -246,6 +336,25 @@ class NovoRouter:
                 pending.skipped.append(dict(row))
 
     def _dispatch(self, frame: NovoFrame) -> None:
+        # Host receive identity, never a device command/transaction identifier.
+        with self._motor_event_lock:
+            if frame.receive_sequence is None:
+                self._receive_sequence += 1
+                frame = replace(frame, receive_sequence=self._receive_sequence,
+                                receive_owner=self._receive_owner,
+                                owner_generation=self._reader_generation)
+            else:
+                # Retained records cannot re-enter as fresh receives. New reads
+                # of identical wire bytes get distinct ingress identities.
+                self._diagnostics.append({**frame.provenance(), "classification":
+                    "duplicate_receive_record" if frame.receive_owner == self._receive_owner
+                    and frame.owner_generation == self._reader_generation else "previous_receive_owner"})
+                return
+            key = self._motor_key(frame)
+            if key is not None:
+                if key in self._motor_signals and self._motor_signals[key].owner_generation == self._reader_generation:
+                    self._diagnostics.append({**frame.provenance(), "classification": "motor_coalesced_set"})
+                self._motor_signals[key] = frame
         matched = False
         with self._pending_lock:
             pending = self._pending
