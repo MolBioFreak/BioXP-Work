@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
@@ -1145,10 +1145,18 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     operator_command_id = str(context["operator_command_id"])
     expected_generation = int(context["expected_ownership_generation"])
     idempotency_key = str(context["idempotency_key"])
-    command_lease = getattr(provider, "z_command_lease", None)
-    if not callable(command_lease):
-        raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
-    with command_lease():
+    # Match the provider's interrupt classification before taking the ordinary
+    # motion lease. Its existing interrupt path delivers first and only then
+    # acquires the lifecycle lock to reconcile durable state.
+    is_interrupt = str(intent).strip() in {"stop", "abort"}
+    if is_interrupt:
+        lease: Any = nullcontext()
+    else:
+        command_lease = getattr(provider, "z_command_lease", None)
+        if not callable(command_lease):
+            raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
+        lease = command_lease()
+    with lease:
         provider_inputs = dict(inputs or {})
         provider_inputs["command_id"] = operator_command_id
         result = execute(
