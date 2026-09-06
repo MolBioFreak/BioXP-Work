@@ -960,19 +960,48 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
+    def start_operator_control_plane() -> None:
+        global _operator_control_plane_installed
+        command_plane_to_start = None
+        if not _operator_control_plane_installed and app.state.release_start_error is None:
+            install_operator_control_plane(
+                app,
+                maintenance_state_provider=_maintenance_state_payload,
+                reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
+                lifecycle_state_provider=lifecycle_state.projection,
+                serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+                pipette_status_provider=_operator_pipette_status,
+                oem_deck_provider=lambda: _serial206_oem_initialization_provider,
+                oem_deck_position_table_provider=load_bound_oem_position_table,
+            )
+            operator_store = app.state.operator_receipt_store
+            command_plane_to_start = app.state.operator_command_plane
+            operator_store.converge_startup_state()
+        if command_plane_to_start is not None and app.state.release_start_error is None:
+            command_plane_to_start.start()
+            _operator_control_plane_installed = True
+
     release_start_task = None
     if app.state.release_identity.get("verified") is True:
         async def commit_release_start_receipt() -> None:
             global _startup_error
             try:
-                receipt = await asyncio.to_thread(
+                # ASGI startup must yield before the server opens its listener.
+                # Keep the writer owned until it finishes, even on shutdown.
+                writer_task = asyncio.create_task(asyncio.to_thread(
                     record_runtime_release_start,
                     runtime_root,
                     app.state.release_identity,
                     timeout_s=45.0,
-                )
+                ))
+                try:
+                    receipt = await asyncio.shield(writer_task)
+                except asyncio.CancelledError:
+                    await asyncio.gather(writer_task, return_exceptions=True)
+                    raise
                 app.state.release_start_receipt = receipt
                 app.state.release_identity = publish_runtime_release_receipt(receipt)
+                start_operator_control_plane()
             except Exception as exc:
                 app.state.release_start_error = f"{type(exc).__name__}: {exc}"
                 _startup_error = f"Canonical runtime release-start receipt failed: {app.state.release_start_error}"
@@ -984,27 +1013,8 @@ async def lifespan(app: FastAPI):
             name="bioxp-runtime-release-start-receipt",
         )
     else:
+        start_operator_control_plane()
         app.state.release_start_ready.set()
-    if release_start_task is not None:
-        await release_start_task
-    command_plane_to_start = None
-    if not _operator_control_plane_installed and app.state.release_start_error is None:
-        install_operator_control_plane(
-            app,
-            maintenance_state_provider=_maintenance_state_payload,
-            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
-            lifecycle_state_provider=lifecycle_state.projection,
-            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
-            pipette_status_provider=_operator_pipette_status,
-            oem_deck_provider=lambda: _serial206_oem_initialization_provider,
-            oem_deck_position_table_provider=load_bound_oem_position_table,
-        )
-        operator_store = app.state.operator_receipt_store
-        command_plane_to_start = app.state.operator_command_plane
-        operator_store.converge_startup_state()
-    if command_plane_to_start is not None and app.state.release_start_error is None:
-        command_plane_to_start.start()
-        _operator_control_plane_installed = True
     try:
         yield
     finally:
