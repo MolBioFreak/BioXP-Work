@@ -129,6 +129,7 @@ from .services.motion_service import (
 )
 from .services.pipette_service import (
     READ_ONLY_PIPETTE_OPERATIONS,
+    _DIRECT_PIPETTE_IDEMPOTENCY,
     run_pipette_aspirate_command,
     run_pipette_dispense_command,
     run_pipette_init_command,
@@ -9165,11 +9166,14 @@ async def liquid_application_plan(req: PipetteApplicationPlanRequest):
         runtime_binding={
             "owner": "PipetteApplicationPlanner",
             "mode": "plan_only",
-            "dependencies": plan.get("dependencies", {}),
+            "idempotency_key": _DIRECT_PIPETTE_IDEMPOTENCY.get(),
+            # Provider observations belong to the stored result, not request identity.
         },
     )
     return {
-        **plan,
+        # Planning is no-motion receipt creation, not a hardware readback.
+        # Same-key recovery returns the persisted plan, even if providers changed.
+        **receipt["result"],
         "receipt_id": receipt["receipt_id"],
         "receipt_truth": receipt["truth"],
     }

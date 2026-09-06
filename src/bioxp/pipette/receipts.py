@@ -331,7 +331,7 @@ class PipetteReceiptStore:
                 "callback_session_id",
                 f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
             )
-            claim, _ = self.claim(
+            claim, created = self.claim(
                 operation=str(operation),
                 requested_inputs=requested_inputs,
                 entrypoint_id=str(binding.get("entrypoint_id") or "legacy.record"),
@@ -346,6 +346,23 @@ class PipetteReceiptStore:
                 callback_session_id=binding.get("callback_session_id"),
                 runtime_binding=binding,
             )
+            if not created:
+                # Validate the existing authority/status; never finalize a duplicate
+                # with newly computed output or replace its durable receipt identity.
+                replay = self.replay_result(
+                    command_id=claim["command_id"],
+                    pipette_operation_id=claim["pipette_operation_id"],
+                )
+                if replay.get("retry_forbidden") is True:
+                    raise PipetteReceiptError("pipette receipt is in progress or requires reconciliation")
+                row = self.connection.execute(
+                    "SELECT receipt_json FROM pipette_operations WHERE command_id=? AND pipette_operation_id=?",
+                    (claim["command_id"], claim["pipette_operation_id"]),
+                ).fetchone()
+                receipt = json.loads(row["receipt_json"])
+                if receipt.get("schema") != "bioxp.pipette.receipt.v1":
+                    raise PipetteReceiptError("durable pipette replay receipt is unavailable")
+                return receipt
             return self.record(
                 operation=operation,
                 requested_inputs=requested_inputs,
@@ -676,6 +693,12 @@ class PipetteReceiptStore:
                 receipt = dict(parsed)
         nested = receipt.get("result")
         replay = dict(nested) if isinstance(nested, Mapping) else dict(receipt)
+        if receipt.get("schema") == "bioxp.pipette.receipt.v1":
+            # The service adds these fields after persistence on first delivery.
+            # Recover them from the original envelope, not a fresh hardware query.
+            replay["receipt_id"] = receipt["receipt_id"]
+            replay["receipt_truth"] = receipt["truth"]
+            replay["source_identity"] = receipt["source_identity"]
         status = str(row["status"] or "reserved")
         replay.update({
             "replayed": True,
