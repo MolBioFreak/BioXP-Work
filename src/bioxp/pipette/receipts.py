@@ -331,7 +331,7 @@ class PipetteReceiptStore:
                 "callback_session_id",
                 f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
             )
-            claim, _ = self.claim(
+            claim, created = self.claim(
                 operation=str(operation),
                 requested_inputs=requested_inputs,
                 entrypoint_id=str(binding.get("entrypoint_id") or "legacy.record"),
@@ -346,6 +346,23 @@ class PipetteReceiptStore:
                 callback_session_id=binding.get("callback_session_id"),
                 runtime_binding=binding,
             )
+            if not created:
+                # Validate the existing authority/status; never finalize a duplicate
+                # with newly computed output or replace its durable receipt identity.
+                replay = self.replay_result(
+                    command_id=claim["command_id"],
+                    pipette_operation_id=claim["pipette_operation_id"],
+                )
+                if replay.get("retry_forbidden") is True:
+                    raise PipetteReceiptError("pipette receipt is in progress or requires reconciliation")
+                row = self.connection.execute(
+                    "SELECT receipt_json FROM pipette_operations WHERE command_id=? AND pipette_operation_id=?",
+                    (claim["command_id"], claim["pipette_operation_id"]),
+                ).fetchone()
+                receipt = json.loads(row["receipt_json"])
+                if receipt.get("schema") != "bioxp.pipette.receipt.v1":
+                    raise PipetteReceiptError("durable pipette replay receipt is unavailable")
+                return receipt
             return self.record(
                 operation=operation,
                 requested_inputs=requested_inputs,
@@ -650,6 +667,50 @@ class PipetteReceiptStore:
         }
         return self._audit_database.attach_pipette_child(payload)
 
+    def lookup_direct_request(self, *, request_kind: str, idempotency_key: str) -> dict[str, Any]:
+        """One bounded historical snapshot; no migration, replay admission or writes."""
+        from .direct_requests import lookup_envelope, project_lookup_row
+
+        unavailable = lambda: lookup_envelope(request_kind, idempotency_key, "unavailable", "store_unavailable")
+        deadline = time.monotonic() + 0.25
+        if not self.lock.acquire(timeout=0.25):
+            return unavailable()
+        try:
+            # Never borrow a foreign connection or roll back a caller transaction.
+            if (not self.path.is_file() or self.connection.in_transaction
+                    or self.connection is not self._audit_database.connection):
+                return unavailable()
+            with self.connection.direct_request_read_snapshot(
+                coordinator=self._audit_database.coordinator, deadline=deadline
+            ):
+                row = self.connection.execute(
+                    """SELECT c.*, p.pipette_operation_id,
+                       p.operation AS p_operation, p.entrypoint_id AS p_entrypoint_id,
+                       p.caller_class AS p_caller_class, p.control_class AS p_control_class,
+                       p.action_id AS p_action_id, p.status AS p_status,
+                       p.ownership_generation AS p_ownership_generation,
+                       p.connection_generation AS p_connection_generation,
+                       p.requested_inputs_json AS p_requested_inputs_json,
+                       p.source_identity_json AS p_source_identity_json,
+                       p.receipt_json AS p_receipt_json, p.outcome AS p_outcome,
+                       p.failure_code AS p_failure_code,
+                       p.lifecycle_stage_id, p.lifecycle_attempt_id, p.callback_session_id
+                       FROM operator_commands c LEFT JOIN pipette_operations p USING(command_id)
+                       WHERE c.idempotency_key=? AND c.idempotency_replay_enabled=1 LIMIT 1""",
+                    (idempotency_key,),
+                ).fetchone()
+                snapshot = None if row is None else dict(row)
+        except (sqlite3.Error, OSError):
+            return unavailable()
+        finally:
+            self.lock.release()
+        if snapshot is None:
+            return lookup_envelope(request_kind, idempotency_key, "unknown", "identity_not_found")
+        try:
+            return project_lookup_row(snapshot, request_kind, idempotency_key)
+        except (ValueError, TypeError, KeyError):
+            return lookup_envelope(request_kind, idempotency_key, "unavailable", "stored_binding_invalid")
+
     def replay_result(self, *, command_id: str, pipette_operation_id: str) -> dict[str, Any]:
         row = self.connection.execute(
             "SELECT * FROM pipette_operations WHERE command_id=? AND pipette_operation_id=?",
@@ -676,6 +737,12 @@ class PipetteReceiptStore:
                 receipt = dict(parsed)
         nested = receipt.get("result")
         replay = dict(nested) if isinstance(nested, Mapping) else dict(receipt)
+        if receipt.get("schema") == "bioxp.pipette.receipt.v1":
+            # The service adds these fields after persistence on first delivery.
+            # Recover them from the original envelope, not a fresh hardware query.
+            replay["receipt_id"] = receipt["receipt_id"]
+            replay["receipt_truth"] = receipt["truth"]
+            replay["source_identity"] = receipt["source_identity"]
         status = str(row["status"] or "reserved")
         replay.update({
             "replayed": True,

@@ -285,6 +285,94 @@ class RuntimeLifecycleConnection(sqlite3.Connection):
     _lifecycle_root: Path | None = None
     _lifecycle_descriptor: int | None = None
 
+    _progress_handler_state: tuple[Any, int] = (None, 0)
+
+    def set_progress_handler(self, progress_handler: Any, n: int) -> None:
+        # sqlite3 has no getter. Retain exactly the caller's setting so the
+        # direct-request snapshot can restore it rather than clearing it.
+        super().set_progress_handler(progress_handler, n)
+        self._progress_handler_state = (progress_handler, n)
+
+    @contextmanager
+    def direct_request_read_snapshot(
+        self, *, coordinator: RuntimeWriteCoordinator, deadline: float
+    ) -> Iterator[None]:
+        """Only for direct-request lookup under its already-held owner lock.
+
+        Existing lifecycle file only; fail-fast LOCK_NB and SQLite busy=0.
+        The caller's 250ms total budget includes owner acquisition; VM work
+        checks that deadline every 1000 instructions. This is a cooperative
+        bound, not a hard-real-time guarantee for OS scheduling/filesystem IO.
+        No writer/report transaction or lifecycle acquisition policy changes.
+        """
+        state = coordinator.snapshot()
+        if (self._lifecycle_root != coordinator.root
+                or state['owner_thread_id'] != threading.get_ident()
+                or not state['active'] or self.in_transaction
+                or self._lifecycle_descriptor is not None
+                or time.monotonic() >= deadline):
+            raise sqlite3.OperationalError('direct request snapshot unavailable')
+        descriptor = os.open(
+            self._lifecycle_root / RUNTIME_LIFECYCLE_LOCK_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        transferred = False
+        busy_timeout = None
+        progress = self._progress_handler_state
+        original_error = None
+        cleanup_error = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            self._lifecycle_descriptor = descriptor
+            transferred = True  # The connection now owns the sole close.
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError('direct request snapshot deadline exceeded')
+            busy_timeout = super().execute('PRAGMA busy_timeout').fetchone()[0]
+            # Connection-local only, under the real owner and lifecycle lease.
+            # Do not route these temporary settings through mutation acquisition.
+            super().execute('PRAGMA busy_timeout=0')
+            self.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            self.execute('BEGIN')
+            yield
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError('direct request snapshot deadline exceeded')
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            # Only our transaction can exist: entry rejected caller transactions
+            # and the owner lock remains held. Check actual state even if BEGIN
+            # partially succeeded. Keep the lifecycle lease during rollback and
+            # its single fallback; the general execute wrapper releases on error.
+            try:
+                super().set_progress_handler(None, 0)
+                if transferred and self.in_transaction:
+                    try:
+                        super().execute('ROLLBACK')
+                    except sqlite3.Error as exc:
+                        cleanup_error = exc
+                        try:
+                            super().rollback()
+                        except sqlite3.Error:
+                            # If SQLite cannot roll back, retain its lease and
+                            # active transaction; subsequent GET must refuse it.
+                            pass
+            finally:
+                try:
+                    if busy_timeout is not None:
+                        super().execute(f'PRAGMA busy_timeout={int(busy_timeout)}')
+                finally:
+                    try:
+                        self.set_progress_handler(*progress)
+                    finally:
+                        if self._lifecycle_descriptor == descriptor:
+                            if not self.in_transaction:
+                                self._release_lifecycle()
+                        elif not transferred:
+                            os.close(descriptor)
+            if cleanup_error is not None and original_error is None:
+                raise cleanup_error
+
     def bind_lifecycle_root(self, root: Path) -> None:
         self._lifecycle_root = Path(root)
 
