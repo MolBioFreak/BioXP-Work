@@ -56,6 +56,65 @@ def _novo_frame(arbitration_id: int, data: list[int] | bytes | bytearray) -> byt
     return novo_encode(NovoUsbCanBus.build_payload(arbitration_id, data, len(data)))
 
 
+# Independent source-derived wire literals, not encoder/decoder roundtrip oracles.
+# ClassMotor.cs:74-182,231-261,342-378 supplies cmd/type/axis + int32 BE
+# (seven bytes); ClassNovo.cs:194-225 forwards CMD.Length unchanged.
+# CanInterfaceBoard.cs:43-57 prefixes module-id BE + DLC; NovoEncoding.cs:
+# 11-41,112-120 sums unescaped bytes modulo 256 and escapes body AND checksum.
+# These are offline source fixtures, not captured hardware traffic.
+OEM_MOTOR_WIRE_FIXTURES = [
+    pytest.param((5, 2, 0, 0, 200), "7e 00 00 00 05 07 02 00 00 00 00 00 c8 d6 7e", id="move-left"),
+    pytest.param((4, 1, 0, 2, 200), "7e 00 00 00 04 07 01 00 02 00 00 00 c8 d6 7e", id="move-right-axis2"),
+    pytest.param((5, 3, 0, 0, 0), "7e 00 00 00 05 07 03 00 00 00 00 00 00 0f 7e", id="stop"),
+    pytest.param((5, 4, 1, 0, -1), "7e 00 00 00 05 07 04 01 00 ff ff ff ff 0d 7e", id="signed-minus-one"),
+    pytest.param((4, 4, 1, 1, -2147483648), "7e 00 00 00 04 07 04 01 01 80 00 00 00 91 7e", id="signed-minimum"),
+    pytest.param((4, 5, 4, 2, 0x7D7E), "7e 00 00 00 04 07 05 04 02 00 00 7d 5d 7d 5e 11 7e", id="reserved-payload"),
+    pytest.param((5, 2, 0, 0, 111), "7e 00 00 00 05 07 02 00 00 00 00 00 6f 7d 5d 7e", id="checksum-7d"),
+    pytest.param((5, 2, 0, 0, 112), "7e 00 00 00 05 07 02 00 00 00 00 00 70 7d 5e 7e", id="checksum-7e"),
+    pytest.param((4, 4, 1, 2, -130), "7e 00 00 00 04 07 04 01 02 ff ff ff 7d 5e 8d 7e", id="signed-reserved-payload"),
+]
+
+
+@pytest.mark.parametrize("args,expected_hex", OEM_MOTOR_WIRE_FIXTURES)
+@pytest.mark.parametrize("wait_reply", [False, True], ids=["tx-only", "reply"])
+def test_motor_endpoint_bytes_match_oem_fixtures(args, expected_hex, wait_reply):
+    from src.bioxp.usb_driver import BioXpTester
+
+    board, command, _cmd_type, _motor, _value = args
+    # Fake response only; the outbound oracle above never calls novo_encode.
+    replies = [_novo_frame(0, [board, 100, command, 0, 0, 0, 0, 0])] if wait_reply else []
+    shared = FakeSharedUsb(replies)
+    try:
+        tester = object.__new__(BioXpTester)  # No USB discovery/ownership.
+        tester.novo_router = shared.novo_router
+        tester._transport_lock = threading.RLock()
+        tester._record_usb_sniff_ledger = lambda *a, **kw: None
+
+        result = tester.send_tmcl(*args, wait_reply=wait_reply)
+
+        assert shared.ep_out.writes == [(bytes.fromhex(expected_hex), 80)]
+        assert result is not None
+        assert result["provenance"]["tx_dlc"] == 7
+        assert result["provenance"]["tx_raw"] == list(bytes.fromhex(expected_hex))
+    finally:
+        shared.close()
+
+
+@pytest.mark.parametrize("data,expected_hex", [
+    (b"?31", "7e 00 00 01 06 03 3f 33 31 ad 7e"),
+    (b"\x7d\x7e", "7e 00 00 01 06 02 7d 5d 7d 5e 04 7e"),
+])
+def test_pipette_endpoint_framing_retains_source_defined_length(data, expected_hex):
+    shared = FakeSharedUsb([])
+    try:
+        bus = NovoUsbCanBus(shared_usb=shared)
+        msg = type("Msg", (), {"arbitration_id": 0x106, "data": data, "dlc": len(data)})()
+        bus.send(msg)
+        assert shared.ep_out.writes == [(bytes.fromhex(expected_hex), 2000)]
+    finally:
+        shared.close()
+
+
 def test_group_initialization_defers_completion_until_collection_waits():
     shared = FakeSharedUsb([
         _novo_frame(0x501, []),

@@ -23,7 +23,7 @@ import usb.core
 import usb.util
 
 from .novo_router import NovoRouter
-from .novo_usb_can import novo_decode
+from .novo_usb_can import novo_decode, novo_encode
 
 TMCL_STATUS = {
     100: "Success",
@@ -882,26 +882,11 @@ class BioXpTester:
 
     @staticmethod
     def _build_frame(board_id, command, cmd_type, motor, value):
-        val = struct.pack(">i", int(value))
-        inner = bytearray(
-            [
-                0x00,
-                0x00,
-                0x00,
-                board_id,
-                0x08,
-                command,
-                cmd_type,
-                motor,
-                val[0],
-                val[1],
-                val[2],
-                val[3],
-                0x00,
-            ]
-        )
-        chk = sum(inner) & 0xFF
-        return bytearray([0x7E]) + inner + bytearray([chk, 0x7E])
+        # ClassMotor sends seven bytes: command/type/axis + signed int32 BE.
+        payload = bytes([command, cmd_type, motor]) + struct.pack(">i", int(value))
+        inner = bytes([0x00, 0x00, 0x00, board_id, len(payload)]) + payload
+        # CanInterfaceBoard delegates body AND checksum escaping to NovoEncoding.
+        return bytearray(novo_encode(inner))
 
     def send_tmcl(
         self,
@@ -970,7 +955,7 @@ class BioXpTester:
                 provenance={
                     "command_family": "tmcl",
                     "tx_id": int(board_id),
-                    "tx_dlc": 8,
+                    "tx_dlc": 7,
                     "expected_board": int(board_id),
                     "expected_command": int(command),
                 },
