@@ -1,12 +1,30 @@
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from src.bioxp.protocols.models import ProtocolActionKind
-from src.bioxp.protocols.oem_xml_import import generate_oem_fixture_coverage_report, import_oem_xml_protocol
+from src.bioxp.protocols.oem_xml_import import (
+    _compile_supported_action,
+    generate_oem_fixture_coverage_report,
+    import_oem_xml_protocol,
+)
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "testdata" / "oem_xml"
 DEMO_XML = FIXTURE_ROOT / "demo.xml"
 LIFETEST_XML = FIXTURE_ROOT / "lifetest.xml"
+
+
+def test_pp_preserves_every_source_plate_token_in_order() -> None:
+    node = ET.Element("line1", {"Cmd": "PP PL_POOL PL_OUTPUT PL_REAGENT"})
+    action = _compile_supported_action(
+        stage_id="step-01", node=node, path=Path("fixture.xml"),
+        script_position=1, raw_cmd="PP PL_POOL PL_OUTPUT PL_REAGENT", step="1",
+    )
+    assert action is not None
+    assert action.kind is ProtocolActionKind.PLATE_PREPARE
+    assert action.params == {
+        "plate_ids": ["PL_POOL", "PL_OUTPUT", "PL_REAGENT"],
+    }
 
 
 def test_import_demo_xml_maps_supported_subset_with_source_traceability() -> None:

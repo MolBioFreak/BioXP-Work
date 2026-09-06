@@ -9,6 +9,7 @@ remain unavailable until their complete provider sequence is bound.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
@@ -1502,9 +1503,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     add_semantic_alias(
         action_id="oem.z.set_clean_path",
         path="/motion/oem/z/path_clean_mode",
-        label="Set OEM clean-path mode",
-        description="Persist m_controlLib.cleanPath under the current provider generation; subsequent live scriptmoveTo planning reads this state instead of caller payload.",
-        source_anchor="ClassControlInterface.scriptmoveTo:3875-3903",
+        label="Validate and publish OEM clean-path expectation",
+        description="Validate the compatibility Boolean against current authoritative tray-0 tip availability, then publish independently derived !tipAvailable(0); mismatch or stale source state fails closed.",
+        source_anchor="ControlLib.cleanPath:413-423; ClassMachineStatus.tipAvailable:489-492",
         fixed_inputs={"axis": "z"},
         required_provider_capability="initialize_motors",
     )
@@ -1801,6 +1802,34 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     ]
     # Internal XYZ composite helpers remain outside the operator action catalog.
     dispatch = {key: value for key, value in dispatch.items() if not key.startswith("oem.xyz.")}
+    from .oem_deck_catalog import public_target_keys
+    actions.append({
+        "action_id": "oem.deck.move_to_location",
+        "label": "OEM Deck Move to Location",
+        "subsystem": "motion",
+        "category": "deck",
+        "kind": "canonical_method",
+        "safety_class": "motion",
+        "description": "Finite source-shaped Serial-206 named deck movement through the durable global worker.",
+        "source_anchor": "ClassControlInterface.btnLOC1_Click",
+        "informational_method": "INTERNAL",
+        "informational_path": None,
+        "required_provider_capability": "initialize_motors",
+        "provider_available": True,
+        "available": True,
+        "enabled": True,
+        "disabled_reason": None,
+        "dependencies": [],
+        "requires_confirmation": False,
+        "timeout_seconds": 360.0,
+        "inputs": [
+            {"name": "target", "required": True, "type": "string", "enum": sorted(public_target_keys())},
+            {"name": "camera_offset", "required": True, "type": "boolean"},
+        ],
+        "stages": [],
+        "required_board_epochs": [4, 5],
+        "raw_coordinate_inputs": False,
+    })
     return actions, dispatch
 
 
@@ -1887,6 +1916,8 @@ def install_operator_control_plane(
     lifecycle_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     serial206_initialization_state_provider: Callable[[], Mapping[str, Any]] | None = None,
     pipette_status_provider: Callable[[], Mapping[str, Any]] | None = None,
+    oem_deck_provider: Callable[[], Any] | None = None,
+    oem_deck_position_table_provider: Callable[[], Any] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -1962,6 +1993,232 @@ def install_operator_control_plane(
     legacy_command_store = OperatorHistoryReader()
     app.state.operator_history_reader = legacy_command_store
     app.state.operator_receipt_store = store
+
+    # The direct operator plane remains authoritative for live lifecycle and
+    # axis actions. The durable plane owns only admitted deck work and its
+    # non-v2 queue/recovery surfaces; direct canonical v2 routes stay primary.
+    from .operator_command_plane import (
+        OperatorCommandPlane,
+        OperatorMethodRequestV1,
+    )
+
+    command_plane = OperatorCommandPlane(
+        app,
+        machine_state_provider=machine_state,
+        actions=actions,
+        dispatch=dispatch,
+    )
+    app.state.operator_command_plane = command_plane
+    if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
+        from .oem_deck_movement import (
+            compile_finite_plate_operation,
+            make_deck_command_executor,
+            make_wp8_operation_executor,
+        )
+        provider_sentinel = object()
+        installed_deck_provider: Any = provider_sentinel
+
+        def refresh_deck_provider() -> Any:
+            nonlocal installed_deck_provider
+            current_provider = oem_deck_provider()
+            if current_provider is installed_deck_provider:
+                return current_provider
+            installed_deck_provider = current_provider
+            app.state.oem_deck_provider = current_provider
+            if current_provider is None:
+                return None
+            semantic_binder = getattr(current_provider, "bind_deck_semantic_state_reader", None)
+            if callable(semantic_binder):
+                semantic_binder(command_plane.store.deck_semantic_state)
+            semantic_publisher_binder = getattr(current_provider, "bind_deck_semantic_state_publisher", None)
+            if callable(semantic_publisher_binder):
+                semantic_publisher_binder(command_plane.store.publish_deck_owner_state)
+            tip_tray_reader_binder = getattr(current_provider, "bind_tip_tray_state_reader", None)
+            if callable(tip_tray_reader_binder):
+                tip_tray_reader_binder(command_plane.store.tip_tray_state)
+            tip_tray_publisher_binder = getattr(current_provider, "bind_tip_tray_state_publisher", None)
+            if callable(tip_tray_publisher_binder):
+                tip_tray_publisher_binder(command_plane.store.publish_tip_tray_transition)
+            bootstrap_reader = getattr(current_provider, "deck_semantic_bootstrap_snapshot", None)
+            if (
+                callable(bootstrap_reader)
+                and command_plane.store.deck_semantic_state()["semantic_state_revision"] == 0
+            ):
+                try:
+                    bootstrap_snapshot = bootstrap_reader(
+                        expected_generation=int(machine_state().get("ownership_generation") or 0)
+                    )
+                    if not isinstance(bootstrap_snapshot, Mapping):
+                        raise TypeError("deck semantic bootstrap snapshot must be a mapping")
+                    command_plane.store.bootstrap_deck_semantic_state(bootstrap_snapshot)
+                except (KeyError, RuntimeError, TypeError, ValueError):
+                    # An incomplete predecessor snapshot remains fail-closed; the
+                    # catalog reports canonical authority unavailable.
+                    pass
+            return current_provider
+
+        app.state.oem_deck_provider_getter = refresh_deck_provider
+        refresh_deck_provider()
+        app.state.oem_deck_position_table_provider = oem_deck_position_table_provider
+        app.state.oem_deck_command_executor = make_deck_command_executor(
+            provider_getter=refresh_deck_provider,
+            position_table_provider=oem_deck_position_table_provider,
+            command_store=command_plane.store,
+        )
+        app.state.oem_wp8_operation_executor = make_wp8_operation_executor(
+            provider_getter=refresh_deck_provider,
+            command_store=command_plane.store,
+        )
+
+        def admit_mov_execution(intent: Any, *, idempotency_key: str | None = None) -> dict[str, Any]:
+            refresh_deck_provider()
+            return command_plane.store.admit_internal_mov_execution(
+                intent,
+                state=command_plane._state(),
+                idempotency_key=idempotency_key,
+            )
+
+        def admit_wp8_operation(
+            operation: str,
+            *,
+            inputs: Mapping[str, Any],
+            idempotency_key: str | None = None,
+        ) -> dict[str, Any]:
+            current_provider = refresh_deck_provider()
+            snapshot_reader = getattr(current_provider, "wp8_operation_machine_state", None)
+            if not callable(snapshot_reader):
+                raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
+            machine_inputs = snapshot_reader(operation, dict(inputs))
+            if not isinstance(machine_inputs, Mapping):
+                raise RuntimeError("source_authority_invalid:wp8_operation_machine_state")
+            compile_finite_plate_operation(
+                operation,
+                source_leaf_available=callable(
+                    getattr(current_provider, "execute_wp8_child", None)
+                ),
+                **{**dict(machine_inputs), **dict(inputs)},
+            )
+            return command_plane.store.admit_internal_wp8_operation(
+                operation,
+                inputs=inputs,
+                state=command_plane._state(),
+                idempotency_key=idempotency_key,
+            )
+
+        app.state.oem_mov_execution_admitter = admit_mov_execution
+        app.state.oem_wp8_operation_admitter = admit_wp8_operation
+
+    def deck_contract(state: Mapping[str, Any]) -> dict[str, Any]:
+        disabled_reason: str | None = None
+        recovery_disabled_reason: str | None = None
+        raw_maintenance = state.get("maintenance")
+        raw_lifecycle = state.get("lifecycle")
+        maintenance = dict(raw_maintenance) if isinstance(raw_maintenance, Mapping) else {}
+        lifecycle = dict(raw_lifecycle) if isinstance(raw_lifecycle, Mapping) else {}
+        motion_blocked = maintenance.get("motion_blocked")
+        recovery_required = maintenance.get("recovery_required")
+        operation_state = lifecycle.get("operation_state")
+        if not isinstance(raw_maintenance, Mapping):
+            disabled_reason = "maintenance_state_unavailable"
+        elif type(motion_blocked) is not bool or type(recovery_required) is not bool:
+            disabled_reason = "maintenance_state_invalid"
+        elif motion_blocked:
+            disabled_reason = str(maintenance.get("block_reason") or "motion_blocked")
+        elif recovery_required:
+            disabled_reason = "recovery_required"
+        elif maintenance.get("block_reason") is not None:
+            disabled_reason = "maintenance_state_inconsistent"
+        elif not isinstance(raw_lifecycle, Mapping):
+            disabled_reason = "lifecycle_state_unavailable"
+        elif operation_state == "emergency":
+            disabled_reason = "emergency_operation_state"
+        elif operation_state != "stopped":
+            disabled_reason = "operation_state_not_ready"
+        try:
+            recovery_disabled_reason = command_plane.store.deck_recovery_blocker()
+        except Exception:
+            recovery_disabled_reason = "deck_recovery_state_inconsistent"
+        if not callable(getattr(app.state, "oem_deck_command_executor", None)):
+            disabled_reason = "canonical_deck_executor_unavailable"
+        if disabled_reason is None and (oem_deck_provider is None or oem_deck_position_table_provider is None):
+            disabled_reason = "canonical_deck_binding_unavailable"
+        provider_getter = getattr(app.state, "oem_deck_provider_getter", None)
+        provider = provider_getter() if disabled_reason is None and callable(provider_getter) else None
+        required_provider_methods = (
+            "movement_lease", "force_to_high_home", "deck_authority_snapshot",
+            "moveTo", "moveZCamera", "parkGantry",
+        )
+        if disabled_reason is None and provider is None:
+            disabled_reason = "canonical_deck_provider_incomplete"
+        if disabled_reason is None:
+            missing_method = next(
+                (name for name in required_provider_methods if not callable(getattr(provider, name, None))),
+                None,
+            )
+            if missing_method is not None:
+                disabled_reason = f"canonical_deck_provider_incomplete:{missing_method}"
+        table = None
+        catalog = None
+        snapshot = None
+        if disabled_reason is None:
+            try:
+                from .oem_deck_catalog import DeckCatalog
+                table = oem_deck_position_table_provider()  # type: ignore[misc]
+                catalog = DeckCatalog.from_position_table(table)
+                snapshot_reader = getattr(provider, "deck_authority_snapshot")
+                snapshot = snapshot_reader(
+                    expected_generation=int(state.get("ownership_generation") or 0)
+                )
+            except Exception as exc:
+                disabled_reason = f"canonical_deck_authority_unavailable:{type(exc).__name__}"
+        options = []
+        if catalog is not None:
+            source_anchor_by_branch = {
+                "ordinary": ["ClassControlInterface.btnLOC1_Click:1932-1959", "ClassControlInterface.moveTo:3691-3716"],
+                "barcode": ["ClassControlInterface.btnLOC1_Click:1932-1959", "CAMERA_OFFSET"],
+                "park": ["ClassControlInterface.btnLOC1_Click:1932-1959", "ControlLib.parkGantry:7071-7122"],
+            }
+            options = [
+                {
+                    "target": row["target"],
+                    "label": row["panel_label"],
+                    "aliases": list(row["aliases"]),
+                    "location_id": int(row["location_id"]),
+                    "branch_kind": row["branch"],
+                    "camera_offset_option": row["branch"] == "ordinary",
+                    "source_anchors": source_anchor_by_branch[row["branch"]],
+                }
+                for row in catalog.rows()
+            ]
+        disabled_reason = recovery_disabled_reason or disabled_reason
+        options = [
+            {**row, "enabled": disabled_reason is None, "disabled_reason": disabled_reason}
+            for row in options
+        ]
+        board_epochs = (
+            {"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
+            if isinstance(snapshot, Mapping) else {}
+        )
+        return {
+            "enabled": disabled_reason is None,
+            "disabled_reason": disabled_reason,
+            "required_boards": [4, 5],
+            "expected_board_epoch_by_board": board_epochs,
+            "required_references": ["x", "y", "z", "g"],
+            "position_table_revision": table.digest if table is not None else None,
+            "destination_catalog_revision": catalog.revision if catalog is not None else None,
+            "destination_options": options,
+        }
+
+    app.state.oem_deck_command_assessment = deck_contract
+
+    durable_router = APIRouter()
+    durable_router.routes.extend(
+        route
+        for route in command_plane.router.routes
+        if not str(getattr(route, "path", "")).startswith("/operator/v2/")
+    )
+    app.include_router(durable_router)
 
     def replay_authority_fingerprint(state: Mapping[str, Any]) -> str:
         authority_projection = {
@@ -2228,40 +2485,179 @@ def install_operator_control_plane(
         y_rows = [row for row in compact if str(row.get("action_id", "")).startswith("oem.y.")]
         y_axis["active_command"] = next((row for row in y_rows if not row["terminal"]), None)
         y_axis["latest_compact_receipt"] = y_rows[0] if y_rows else None
-        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "active_commands": active, "latest_receipts": compact[:100]}
+        queue_projection = queue_projection or command_plane.store.queue()
+        queue_items = list(queue_projection.get("items") or [])
+        deck_state = command_plane.store.deck_semantic_state()
+        deck_authority = deck_contract(state)
+        deck = {
+            "current_location": deck_state.get("current_location"),
+            "current_well": deck_state.get("current_well"),
+            "semantic_state_revision": int(deck_state.get("semantic_state_revision") or 0),
+            "position_table_revision": deck_authority.get("position_table_revision"),
+            "destination_catalog_revision": deck_authority.get("destination_catalog_revision"),
+            "ambiguity_state": str(deck_state.get("ambiguity_state") or "none"),
+        }
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
-    async def history_rows(limit: int, *, before_sequence: int | None = None) -> list[dict[str, Any]]:
-        current = await asyncio.to_thread(store.list, limit, before_sequence=before_sequence)
-        if len(current) >= limit:
-            return current
-        current_ids = {str(row.get("command_id")) for row in current}
-        legacy = await asyncio.to_thread(
-            legacy_command_store.list_commands,
-            limit=limit - len(current),
-            before_sequence=before_sequence,
-            exclude_command_ids=current_ids,
+    def _history_key(row: Mapping[str, Any]) -> tuple[float, int, int, str]:
+        accepted_at = row.get("accepted_at", row.get("queued_at", row.get("started_at", 0)))
+        try:
+            timestamp = float(accepted_at or 0)
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        source_rank = 1 if row.get("__projection_source") == "direct" else 0
+        return (
+            timestamp,
+            source_rank,
+            int(row.get("sequence") or row.get("stream_sequence") or 0),
+            str(row.get("command_id") or ""),
         )
-        return [*current, *legacy]
+
+    def _encode_history_cursor(row: Mapping[str, Any]) -> str:
+        payload = json.dumps(
+            {"v": 1, "key": list(_history_key(row))},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    def _decode_history_cursor(cursor: str) -> tuple[float, int, int, str]:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+            key = payload["key"]
+            if payload.get("v") != 1 or not isinstance(key, list) or len(key) != 4:
+                raise ValueError
+            return (float(key[0]), int(key[1]), int(key[2]), str(key[3]))
+        except Exception as exc:
+            raise ValueError("invalid_history_cursor") from exc
+
+    async def history_rows(limit: int, *, cursor: str | None = None) -> list[dict[str, Any]]:
+        legacy_before = int(cursor) if cursor is not None and cursor.isdecimal() else None
+        boundary = (
+            _decode_history_cursor(cursor)
+            if cursor is not None and not cursor.isdecimal()
+            else None
+        )
+
+        async def collect(source: str) -> list[dict[str, Any]]:
+            selected: list[dict[str, Any]] = []
+            before_sequence = legacy_before
+            seen_boundaries: set[int] = set()
+            while len(selected) < limit:
+                if source == "direct":
+                    batch = await asyncio.to_thread(
+                        store.list, 200, before_sequence=before_sequence,
+                    )
+                else:
+                    batch = await asyncio.to_thread(
+                        legacy_command_store.list_commands,
+                        limit=200,
+                        before_sequence=before_sequence,
+                        exclude_command_ids=set(),
+                    )
+                if not batch:
+                    break
+                annotated = [
+                    {**dict(row), "__projection_source": source}
+                    for row in batch
+                ]
+                if boundary is not None:
+                    annotated = [
+                        row for row in annotated if _history_key(row) < boundary
+                    ]
+                selected.extend(annotated)
+                sequences = [
+                    int(row.get("sequence") or row.get("stream_sequence") or 0)
+                    for row in batch
+                ]
+                next_before = min(sequences) if sequences else 0
+                if (
+                    len(batch) < 200
+                    or next_before <= 0
+                    or next_before in seen_boundaries
+                ):
+                    break
+                seen_boundaries.add(next_before)
+                before_sequence = next_before
+            return selected
+
+        current_rows, durable_rows = await asyncio.gather(
+            collect("direct"), collect("durable"),
+        )
+        combined = [*current_rows, *durable_rows]
+        combined.sort(key=_history_key, reverse=True)
+        deduplicated: list[dict[str, Any]] = []
+        seen_command_ids: set[str] = set()
+        for row in combined:
+            command_id = str(row.get("command_id") or "")
+            if not command_id or command_id in seen_command_ids:
+                continue
+            seen_command_ids.add(command_id)
+            deduplicated.append(row)
+        return deduplicated[:limit]
 
     @router.get("/v2/dashboard")
     async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
-        rows = await asyncio.to_thread(store.list, 25)
+        rows = await history_rows(25)
         return _v2_dashboard(state, {}, rows)
 
     @router.get("/v2/control-catalog")
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
-        dashboard = _v2_dashboard(state, {}, await asyncio.to_thread(store.list, 25))
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": [{"action_id": str(action["action_id"]), "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2", "response_schema_version": "bioxp.operator_action_receipt.v2", "interrupt": str(action["safety_class"]) == "stop", "enabled": bool(assessed_action(action, state).get("enabled")), "disabled_reason": assessed_action(action, state).get("disabled_reason")} for action in actions if str(action["action_id"]) in v2_canonical_action_ids]}
+        dashboard = _v2_dashboard(state, {}, await history_rows(25))
+        action_rows = []
+        for action in actions:
+            if str(action["action_id"]) not in v2_canonical_action_ids:
+                continue
+            assessment = deck_contract(state) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
+            action_rows.append({
+                "action_id": str(action["action_id"]),
+                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                "response_schema_version": "bioxp.operator_action_receipt.v2",
+                "interrupt": str(action["safety_class"]) == "stop",
+                "enabled": bool(assessment.get("enabled")),
+                "disabled_reason": assessment.get("disabled_reason"),
+                **({
+                    "required_boards": assessment["required_boards"],
+                    "expected_board_epoch_by_board": assessment["expected_board_epoch_by_board"],
+                    "required_references": assessment["required_references"],
+                    "position_table_revision": assessment["position_table_revision"],
+                    "destination_catalog_revision": assessment["destination_catalog_revision"],
+                    "destination_options": assessment["destination_options"],
+                } if action["action_id"] == "oem.deck.move_to_location" else {}),
+            })
+        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
         if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all"}:
             if not isinstance(payload, OperatorInterruptRequestV1):
                 raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
-            direct_receipt = await invoke_action(action_id, payload)
-            return _v2_compact_receipt(direct_receipt)
+            # Keep the approved independent delivery and canonical v2 receipt.
+            # invoke_action reconciles the deck queue only after delivery.
+            return _v2_compact_receipt(await invoke_action(action_id, payload))
+        if action_id == "oem.deck.move_to_location":
+            if not isinstance(payload, OperatorActionRequestV2):
+                raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
+            state = machine_state()
+            assessment = deck_contract(state)
+            if not assessment["enabled"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": assessment["disabled_reason"],
+                        "reason": assessment["disabled_reason"],
+                    },
+                )
+            admitted = await asyncio.to_thread(
+                command_plane.store.admit_command,
+                {**payload.model_dump(), "action_id": action_id},
+                state=state,
+                assessment=assessment,
+            )
+            return _v2_compact_receipt(admitted)
         action = by_id.get(action_id)
         if (
             isinstance(payload, OperatorActionRequestV2)
@@ -2288,35 +2684,38 @@ def install_operator_control_plane(
 
     @router.get("/v2/actions/history")
     async def action_history_v2(limit: int = Query(default=100, ge=1, le=200), cursor: str | None = None) -> dict[str, Any]:
-        before = None
-        if cursor is not None:
-            if not cursor.isdecimal() or int(cursor) < 1:
-                raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
-            before = int(cursor)
-        rows = await history_rows(limit, before_sequence=before)
+        try:
+            rows = await history_rows(limit, cursor=cursor)
+        except ValueError:
+            raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
         items = [_v2_compact_receipt(row) for row in rows]
-        next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+        next_cursor = _encode_history_cursor(rows[-1]) if len(rows) == limit else None
         return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
 
     @router.get("/v2/actions/receipts/{command_id}")
     async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
         row = await asyncio.to_thread(
-            store.by_command,
+            command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
             command_id,
-            include_evidence=detail,
         )
-        if (
-            row is not None
-            and not detail
-            and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}
-        ):
-            detailed_row = await asyncio.to_thread(
+        if row is None:
+            row = await asyncio.to_thread(
                 store.by_command,
                 command_id,
-                include_evidence=True,
+                include_evidence=detail,
             )
-            if detailed_row is not None:
-                row = detailed_row
+            if (
+                row is not None
+                and not detail
+                and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}
+            ):
+                detailed_row = await asyncio.to_thread(
+                    store.by_command,
+                    command_id,
+                    include_evidence=True,
+                )
+                if detailed_row is not None:
+                    row = detailed_row
         if row is None:
             row = await asyncio.to_thread(
                 legacy_command_store.command_detail_v2 if detail else legacy_command_store.get_command,
@@ -2333,12 +2732,15 @@ def install_operator_control_plane(
         raw_return_layers["source_identity"] = row.get("source_identity")
         raw_return_layers["completion_ambiguous"] = row.get("completion_ambiguous") is True
         raw_return_layers["retry_forbidden"] = row.get("retry_forbidden") is True
-        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": raw_return_layers, "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or [])}
+        return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": raw_return_layers, "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or []), "deck_movement": dict(row["deck_movement"]) if isinstance(row.get("deck_movement"), Mapping) else None}
 
-    async def _v2_method_receipt(method: Mapping[str, Any]) -> dict[str, Any]:
+    async def _v2_method_receipt(
+        method: Mapping[str, Any], *, durable: bool = False,
+    ) -> dict[str, Any]:
         raw_status = str(method.get("status") or "queued")
         status = {"running": "active", "cancelled": "cleared", "stopped": "interrupted", "aborted": "interrupted", "recovery_required": "ambiguous"}.get(raw_status, raw_status)
-        children = await asyncio.to_thread(legacy_command_store.list_method_commands, str(method["method_id"]))
+        method_reader = command_plane.store if durable else legacy_command_store
+        children = await asyncio.to_thread(method_reader.list_method_commands, str(method["method_id"]))
         terminal = status in {"completed", "completed_partial", "failed", "cleared", "interrupted", "ambiguous"}
         accepted_at = float(method.get("queued_at") or time.time())
         return {
@@ -2352,12 +2754,24 @@ def install_operator_control_plane(
             "finished_at": float(method.get("updated_at") or accepted_at) if terminal else None,
         }
 
+    @router.post("/v2/methods")
+    async def invoke_method_v2(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request = OperatorMethodRequestV1.model_validate(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": "invalid_operator_method_request"}) from exc
+        method = await command_plane.admit_strict_method(request.model_dump())
+        return await _v2_method_receipt(method, durable=True)
+
     @router.get("/v2/methods/{method_id}")
     async def method_status_v2(method_id: str) -> dict[str, Any]:
-        method = await asyncio.to_thread(legacy_command_store.get_method, method_id)
+        method = await asyncio.to_thread(command_plane.store.get_method, method_id)
+        durable = method is not None
+        if method is None:
+            method = await asyncio.to_thread(legacy_command_store.get_method, method_id)
         if method is None:
             raise HTTPException(status_code=404, detail="operator method not found")
-        return await _v2_method_receipt(method)
+        return await _v2_method_receipt(method, durable=durable)
 
     @router.get("/v2/commands/{command_id}")
     async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
@@ -2370,7 +2784,7 @@ def install_operator_control_plane(
             dashboard = _v2_dashboard(
                 state,
                 {},
-                await asyncio.to_thread(store.list, 100),
+                await history_rows(100),
             )
             return {
                 "schema_version": "bioxp.operator_control_catalog.v2",
@@ -2402,7 +2816,7 @@ def install_operator_control_plane(
     async def operator_dashboard(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
         if schema_version == "bioxp.operator_dashboard.v2":
             state = machine_state()
-            rows = await asyncio.to_thread(store.list, 100)
+            rows = await history_rows(100)
             return _v2_dashboard(state, {}, rows)
         return _dashboard_payload(machine_state())
 
@@ -2424,14 +2838,12 @@ def install_operator_control_plane(
         cursor: str | None = Query(default=None),
     ) -> dict[str, Any]:
         if schema_version == "bioxp.operator_action_history.v2":
-            before = None
-            if cursor is not None:
-                if not cursor.isdecimal() or int(cursor) < 1:
-                    raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
-                before = int(cursor)
-            rows = await history_rows(limit, before_sequence=before)
+            try:
+                rows = await history_rows(limit, cursor=cursor)
+            except ValueError:
+                raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
             items = [_v2_compact_receipt(row) for row in rows]
-            next_cursor = str(items[-1]["sequence"]) if len(items) == limit else None
+            next_cursor = _encode_history_cursor(rows[-1]) if len(rows) == limit else None
             return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
         rows = await history_rows(limit)
         return {"schema_version": HISTORY_SCHEMA, "receipts": rows}
@@ -2778,6 +3190,19 @@ def install_operator_control_plane(
                 "action_id": action_id,
             })
             linked_pipette_finalization = None
+            deck_interrupt_action = None
+            if is_safety_interrupt:
+                deck_interrupt_action = {
+                    "/motion/diagnostics/stop": "oem.abort_all",
+                    "/motion/oem/x/abort": "oem.abort_all",
+                    "/motion/oem/x/stop": "oem.x.stop",
+                    "/motion/oem/y/stop": "oem.y.stop",
+                    "/motion/oem/z/stop": "oem.z.stop",
+                }.get(str(target["path"]))
+                if deck_interrupt_action is not None:
+                    # In-memory queue fencing must precede physical delivery;
+                    # SQLite admission and queue finalization must not precede it.
+                    command_plane.store.mark_interrupt_delivery_active(command_id, deck_interrupt_action)
             try:
                 receipt["provider_entry_at"] = time.time()
                 receipt["status"] = "dispatched"
@@ -2962,6 +3387,30 @@ def install_operator_control_plane(
             receipt["receipt_persist_started_at"] = time.time()
             if is_safety_interrupt:
                 receipt["interrupt_evidence"] = _interrupt_receipt_evidence(receipt, interrupt_observation)
+                if deck_interrupt_action is not None:
+                    delivered = receipt.get("response")
+                    delivered = delivered if isinstance(delivered, Mapping) else {}
+                    try:
+                        reconciliation = await command_plane.compat_invoke(
+                            deck_interrupt_action,
+                            interrupt_observation or {
+                                "idempotency_key": payload.idempotency_key,
+                                "observed_ownership_generation": payload.expected_generation,
+                                "observed_board_epoch_by_board": {},
+                            },
+                            controller_delivery=(int(delivered.get("http_status") or 503), delivered.get("body")),
+                        )
+                    except Exception as exc:
+                        reconciliation = {"persistence_state": "recovery_required", "recovery_hold": True,
+                                          "error": f"deck_interrupt_reconciliation_failed:{type(exc).__name__}"}
+                    finally:
+                        command_plane.store.mark_interrupt_delivery_inactive(command_id, deck_interrupt_action)
+                    if reconciliation.get("persistence_state") == "committed" and reconciliation.get("recovery_hold") is not True:
+                        command_plane.store.release_interrupt_fence(deck_interrupt_action)
+                    else:
+                        receipt.update(status="outcome_unknown", completion_ambiguous=True,
+                                       reconciliation_required=True, retry_forbidden=True)
+                    receipt["interrupt_evidence"]["details"]["deck_reconciliation"] = _bounded_json(reconciliation, _MAX_RESPONSE_BYTES)
                 try:
                     persisted = await asyncio.to_thread(store.put_interrupt, receipt)
                 except Exception as exc:

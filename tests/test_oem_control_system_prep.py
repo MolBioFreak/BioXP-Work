@@ -55,7 +55,8 @@ def test_position_table_resolves_oem_location_well_plate_targets():
 
     target = table.resolve(location_id="PL_POOL", well_id="WLA9", plate_name="pool")
     assert target.location_id == "PL_POOL"
-    assert target.coordinates == {"x": 1010, "y": 1980, "z": -295}
+    assert target.base_coordinates == {"x": 1000, "y": 2000, "z": 0}
+    assert target.coordinates == {"x": 1010, "y": 1980, "z": 5}
     assert target.source_anchor == "fixture-position-table.xml"
 
     move = table.compile_move_to("PL_POOL", well_id="WLA9", plate_name="pool")

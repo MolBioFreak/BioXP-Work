@@ -438,7 +438,7 @@ def _compile_supported_action(
         pause_message = "OEM delay point reached"
     elif verb == "PP" and args:
         kind = ProtocolActionKind.PLATE_PREPARE
-        params = {"plate_id": args[0]}
+        params = {"plate_ids": list(args)}
         description = f"Press or seat plate '{args[0]}'"
     elif verb == "TCD" and args:
         mode = args[0].upper()

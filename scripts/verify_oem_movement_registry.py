@@ -100,7 +100,7 @@ REQUIRED_HAZARDS = {
     "SETTINGS_SERIAL_SETTER_BYPASS", "SETTINGS_SELFTEST_AXIS_CROSS_ASSIGNMENT",
     "SETTINGS_PERMISSIVE_FALLBACK", "MOTION_WORKER_NO_FINALLY",
     "INITIALIZE_GRIPPER_NULL_GUARD_ORDER", "TURN_OFF_HEATER_DUPLICATE_TARGET",
-    "SELFTEST_ASYNC_REPORTING_AND_TIMEOUT_MODE", "VISION_INVALID_IL_REGIONS",
+    "SELFTEST_ASYNC_REPORTING_AND_TIMEOUT_MODE", "VISION_INVALID_IL_REGIONS_UNRELATED",
     "CAMERA_GAIN_UNUSED_BY_ADJUSTER", "DOOR_24V_POLARITY_PROJECTION",
     "NOVO_DECODE_NO_CHECKSUM_VALIDATION",
 }
@@ -238,6 +238,24 @@ def verify(registry_path: Path) -> dict:
                 errors.append(f"canonical mapping evidence not used: {s['source_id']}")
             if evidence.get('source_relative_path')!=rel or evidence.get('binary_id')!=s['binary_id']:
                 errors.append(f"canonical mapping evidence fields mismatch: {s['source_id']}")
+        elif status == 'frozen_ssd_manifest_assembly_root_map' and evidence.get('kind') == status:
+            manifest_path = Path(str(evidence.get('path') or ''))
+            manifest_line = evidence.get('line')
+            expected_binary = 'BioXPCommonLib.dll' if rel.startswith('decompiled_src_bioxpcommon/') else None
+            if expected_binary != s['binary_id']:
+                errors.append(f"supplemental assembly-root mapping mismatch: {s['source_id']}")
+            try:
+                manifest_record = json.loads(manifest_path.read_text().splitlines()[int(manifest_line) - 1])
+            except Exception:
+                errors.append(f"supplemental manifest evidence unreadable: {s['source_id']}")
+            else:
+                if (
+                    manifest_record.get('relative_path') != rel
+                    or manifest_record.get('sha256') != s['sha256']
+                    or evidence.get('source_relative_path') != rel
+                    or evidence.get('binary_id') != s['binary_id']
+                ):
+                    errors.append(f"supplemental manifest evidence mismatch: {s['source_id']}")
         else:
             errors.append(f"source absent from canonical evidence lock: {s['source_id']} ({rel})")
     seen=set(); names=set(); method_by={}

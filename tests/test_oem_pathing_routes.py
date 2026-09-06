@@ -95,24 +95,21 @@ def test_scriptmove_execute_route_defaults_to_no_motion_preview(tmp_path, monkey
     assert payload["execution_steps"][0]["would_call"] == "/motion/axis/absolute_sequence"
 
 
-def test_scriptmove_execute_live_requires_explicit_ack(tmp_path, monkeypatch):
-    from fastapi import HTTPException
+def test_scriptmove_execute_live_request_is_retired_to_zero_io_preview(tmp_path, monkeypatch):
     from src.bioxp.oem_homing_routes import OemScriptMoveExecuteRequest, execute_oem_scriptmove_path
     _bind_test_position_table(monkeypatch)
     _write_bundle(tmp_path)
     monkeypatch.setenv("BIOXP_OEM_MACHINE_CONFIG_DIR", str(tmp_path))
 
-    try:
-        asyncio.run(execute_oem_scriptmove_path(OemScriptMoveExecuteRequest(**{
-            "mode": "live",
-            "location_id": "LOC_MS",
-            "current_loc": "LOC_MS",
-            "gripper_confirmed": True,
-        })))
-    except HTTPException as exc:
-        assert exc.status_code == 409
-        assert isinstance(exc.detail, dict)
-        assert exc.detail["error"] == "legacy_scriptmove_execute_requires_canonical_action"
-        assert exc.detail["canonical_action_id"] == "oem.z.scriptmove_to"
-    else:
-        raise AssertionError("live execution without ack should fail closed")
+    payload = asyncio.run(execute_oem_scriptmove_path(OemScriptMoveExecuteRequest(**{
+        "mode": "live",
+        "location_id": "LOC_MS",
+        "current_loc": "LOC_MS",
+        "gripper_confirmed": True,
+    })))
+
+    assert payload["ok"] is True
+    assert payload["executor_status"] == "preview_only"
+    assert payload["motion_commanded"] is False
+    assert payload["opened_usb"] is False
+    assert payload["legacy_live_execution_retired"] is True

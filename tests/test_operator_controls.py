@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,9 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import BaseModel, Field
 
+import bioxp.operator_command_plane as operator_command_plane
 import bioxp.operator_controls as operator_controls
+from bioxp.operator_command_plane import OperatorCommandPlane
 from bioxp.operator_controls import install_operator_control_plane
 from bioxp.operator_receipt_store import OperatorReceiptStore
 from bioxp.oem_runtime_store import OEMRuntimeStore
@@ -112,6 +116,7 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         calls.append(("move_xy", {"x": x, "y": y, "timeout_s": timeout_s}))
         return {"ok": True, "stages": [{"stage_id": "x"}, {"stage_id": "y"}]}
 
+
     @app.post("/motion/oem/x/internal/enable_xy")
     async def enable_xy_internal():
         calls.append(("enable_xy_internal", None))
@@ -198,11 +203,12 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         },
         "z_authority": {"state": "referenced", "reference_state": "referenced", "lifecycle": {"state": "referenced_ready"}},
     }
+    app.state.operator_test_serial206 = serial206_state
     install_operator_control_plane(
         app,
-        maintenance_state_provider=lambda: maintenance,
+        maintenance_state_provider=lambda: app.state.operator_test_maintenance,
         reference_state_provider=lambda: {"rows": {axis: {"state": "referenced"} for axis in ("x", "y", "z", "g", "door")}},
-        lifecycle_state_provider=lambda: lifecycle,
+        lifecycle_state_provider=lambda: app.state.operator_test_lifecycle,
         serial206_initialization_state_provider=lambda: serial206_state,
         pipette_status_provider=pipette_status_provider,
     )
@@ -278,6 +284,655 @@ def test_v2_catalog_entrypoints_publish_the_same_canonical_action_set(tmp_path, 
     direct_ids = [row["action_id"] for row in direct.json()["actions"]]
     negotiated_ids = [row["action_id"] for row in negotiated.json()["actions"]]
     assert negotiated_ids == direct_ids
+
+
+def test_v2_strict_method_route_is_the_only_admitted_composite_path(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    app.state.operator_test_serial206["board4_authority"] = {"active_board_epoch": 10}
+    app.state.operator_test_serial206["x_authority"]["active_board_epoch"] = 11
+    client = TestClient(app)
+    payload = {
+        "schema_version": "bioxp.operator_method_request.v1",
+        "method_action_id": "oem.xy.move_absolute",
+        "idempotency_key": "v2-strict-method-route-1",
+        "expected_ownership_generation": 7,
+        "expected_board_epoch_by_board": {"4": 10, "5": 11},
+        "inputs": {"x_steps": 200, "y_steps": 300},
+    }
+
+    bypass = client.post(
+        "/operator/v2/actions/oem.xy.move_absolute",
+        json={
+            "schema_version": "bioxp.operator_action_request.v2",
+            "idempotency_key": "v2-strict-action-bypass-1",
+            "expected_ownership_generation": 7,
+            "expected_board_epoch_by_board": {"4": 10, "5": 11},
+            "inputs": {"x": 200, "y": 300},
+        },
+    )
+    assert bypass.status_code == 409
+    assert bypass.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+
+    admitted = client.post("/operator/v2/methods", json=payload)
+
+    assert admitted.status_code == 200, admitted.text
+    body = admitted.json()
+    assert body["action_id"] == "oem.xy.move_absolute"
+    assert body["status"] == "queued"
+    status = client.get(f"/operator/v2/methods/{body['method_id']}")
+    assert status.status_code == 200
+    assert status.json()["method_id"] == body["method_id"]
+
+
+def test_v2_xyz_preview_is_not_admitted_as_a_completed_strict_method(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    app.state.operator_test_serial206["board4_authority"] = {"active_board_epoch": 10}
+    app.state.operator_test_serial206["x_authority"]["active_board_epoch"] = 11
+    client = TestClient(app)
+
+    catalog = client.get("/operator/v2/control-catalog").json()
+    assert "oem.xyz.move_to" not in {row["action_id"] for row in catalog["actions"]}
+    admitted = client.post(
+        "/operator/v2/methods",
+        json={
+            "schema_version": "bioxp.operator_method_request.v1",
+            "method_action_id": "oem.xyz.move_to",
+            "idempotency_key": "v2-strict-xyz-method-1",
+            "expected_ownership_generation": 7,
+            "expected_board_epoch_by_board": {"4": 10, "5": 11},
+            "inputs": {"x": 200, "y": 300, "z": 400, "pseudo_z_home": 500},
+        },
+    )
+
+    assert admitted.status_code == 422
+    assert "oem.xyz.move_to" not in app.state.operator_command_plane.dispatch
+    assert app.state.operator_command_plane.store.connection.execute(
+        "SELECT COUNT(*) FROM operator_plane_methods"
+    ).fetchone()[0] == 0
+
+
+def test_v2_abort_arms_the_durable_interrupt_fence(tmp_path, monkeypatch):
+    app, direct_calls = make_app(tmp_path, monkeypatch)
+    durable_calls: list[tuple[str, dict]] = []
+
+    async def compat_invoke(action_id, payload):
+        durable_calls.append((action_id, dict(payload)))
+        return {
+            "schema_version": "bioxp.operator_interrupt_receipt.v1",
+            "action_id": action_id,
+            "interrupt_id": "interrupt-1",
+            "status": "completed",
+            "persistence_state": "committed",
+        }
+
+    app.state.operator_command_plane.compat_invoke = compat_invoke
+    response = TestClient(app).post(
+        "/operator/v2/actions/oem.abort_all",
+        json={
+            "schema_version": "bioxp.operator_interrupt_request.v1",
+            "idempotency_key": "v2-durable-abort-1",
+            "reason": "operator requested abort",
+            "observed_ownership_generation": 7,
+            "observed_board_epoch_by_board": {"4": 10, "5": 11},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert durable_calls[0][0] == "oem.abort_all"
+    assert durable_calls[0][1]["idempotency_key"] == "v2-durable-abort-1"
+    assert direct_calls == []
+
+
+def test_interrupt_is_durably_admitted_before_controller_delivery(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    order: list[str] = []
+    real_begin = plane.store.begin_interrupt
+    real_mark_attempted = plane.store.mark_interrupt_attempted
+
+    def begin_interrupt(*args, **kwargs):
+        order.append("durable_begin")
+        return real_begin(*args, **kwargs)
+
+    def mark_interrupt_attempted(*args, **kwargs):
+        order.append("durable_attempted")
+        return real_mark_attempted(*args, **kwargs)
+
+    async def deliver(*_args, **_kwargs):
+        order.append("controller_delivery")
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane.store, "begin_interrupt", begin_interrupt)
+    monkeypatch.setattr(plane.store, "mark_interrupt_attempted", mark_interrupt_attempted)
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    receipt = asyncio.run(plane.compat_invoke(
+        "oem.abort_all",
+        {
+            "schema_version": "bioxp.operator_interrupt_request.v1",
+            "idempotency_key": "durable-before-delivery-1",
+            "reason": "test",
+            "observed_ownership_generation": 7,
+            "observed_board_epoch_by_board": {"4": 10, "5": 11},
+        },
+    ))
+
+    assert order[:3] == ["durable_begin", "durable_attempted", "controller_delivery"]
+    assert receipt["persistence_state"] == "committed"
+
+
+def test_interrupt_admission_failure_prevents_controller_delivery(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    delivered = False
+
+    def reject_begin(*_args, **_kwargs):
+        raise RuntimeError("durable interrupt admission unavailable")
+
+    async def deliver(*_args, **_kwargs):
+        nonlocal delivered
+        delivered = True
+        return 200, {"ok": True, "source_call_completed": True}
+
+    monkeypatch.setattr(plane.store, "begin_interrupt", reject_begin)
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    receipt = asyncio.run(plane.compat_invoke(
+        "oem.abort_all",
+        {
+            "schema_version": "bioxp.operator_interrupt_request.v1",
+            "idempotency_key": "failed-durable-admission-1",
+            "reason": "test",
+            "observed_ownership_generation": 7,
+            "observed_board_epoch_by_board": {"4": 10, "5": 11},
+        },
+    ))
+
+    assert delivered is False
+    assert receipt["controller_stop_attempted"] is False
+    assert receipt["recovery_hold"] is True
+
+
+def test_concurrent_identical_interrupts_share_one_durable_attempt_and_delivery(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    barrier = threading.Barrier(2)
+    deliveries: list[str] = []
+
+    class ConcurrentAdmissionGate:
+        def __enter__(self):
+            barrier.wait(timeout=2.0)
+
+        def __exit__(self, *_args):
+            return False
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        deliveries.append(interrupt_attempt_id)
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    plane.store._interrupt_lock = ConcurrentAdmissionGate()
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    request = {
+        "schema_version": "bioxp.operator_interrupt_request.v1",
+        "idempotency_key": "concurrent-durable-interrupt-1",
+        "reason": "test",
+        "observed_ownership_generation": 7,
+        "observed_board_epoch_by_board": {"4": 10, "5": 11},
+    }
+
+    async def invoke_twice():
+        return await asyncio.gather(
+            plane.compat_invoke("oem.abort_all", request),
+            plane.compat_invoke("oem.abort_all", request),
+        )
+
+    receipts = asyncio.run(invoke_twice())
+    distinct_attempts = plane.store.connection.execute(
+        "SELECT COUNT(DISTINCT interrupt_attempt_id) "
+        "FROM operator_plane_interrupt_attempts WHERE idempotency_key=?",
+        (request["idempotency_key"],),
+    ).fetchone()[0]
+
+    assert distinct_attempts == 1
+    assert len(deliveries) == 1
+    assert {receipt["interrupt_attempt_id"] for receipt in receipts} == {deliveries[0]}
+
+
+def test_idempotent_interrupt_replay_keeps_fence_until_live_delivery_finishes(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        delivery_started.set()
+        await release_delivery.wait()
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    request = {
+        "schema_version": "bioxp.operator_interrupt_request.v1",
+        "idempotency_key": "concurrent-live-delivery-fence-1",
+        "reason": "test",
+        "observed_ownership_generation": 7,
+        "observed_board_epoch_by_board": {"4": 10, "5": 11},
+    }
+
+    async def exercise() -> None:
+        first = asyncio.create_task(plane.compat_invoke("oem.abort_all", request))
+        await delivery_started.wait()
+        replay = await plane.compat_invoke("oem.abort_all", request)
+        assert replay["controller_stop_attempted"] is True
+        assert plane.store.action_fenced("oem.x.move_steps") is True
+        release_delivery.set()
+        await first
+        assert plane.store.action_fenced("oem.x.move_steps") is False
+
+    asyncio.run(exercise())
+
+
+def test_completed_interrupt_idempotency_key_is_redelivered_for_new_safety_request(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    deliveries: list[str] = []
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        deliveries.append(interrupt_attempt_id)
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    request = {
+        "schema_version": "bioxp.operator_interrupt_request.v1",
+        "idempotency_key": "repeat-completed-safety-interrupt-1",
+        "reason": "test",
+        "observed_ownership_generation": 7,
+        "observed_board_epoch_by_board": {"4": 10, "5": 11},
+    }
+
+    first = asyncio.run(plane.compat_invoke("oem.abort_all", request))
+    second = asyncio.run(plane.compat_invoke("oem.abort_all", request))
+
+    assert len(deliveries) == 2
+    assert deliveries == [first["interrupt_attempt_id"], second["interrupt_attempt_id"]]
+    assert first["interrupt_attempt_id"] != second["interrupt_attempt_id"]
+
+
+def test_shared_aggregate_fence_waits_for_all_aggregate_interrupt_deliveries(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    started = {"oem.abort_all": asyncio.Event(), "oem.z.abort": asyncio.Event()}
+    release = {"oem.abort_all": asyncio.Event(), "oem.z.abort": asyncio.Event()}
+
+    async def deliver(action_id, *, interrupt_attempt_id):
+        started[action_id].set()
+        await release[action_id].wait()
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+
+    def request(key: str) -> dict:
+        return {
+            "schema_version": "bioxp.operator_interrupt_request.v1",
+            "idempotency_key": key,
+            "reason": "test",
+            "observed_ownership_generation": 7,
+            "observed_board_epoch_by_board": {"4": 10, "5": 11},
+        }
+
+    async def exercise() -> None:
+        first = asyncio.create_task(
+            plane.compat_invoke("oem.abort_all", request("aggregate-overlap-1"))
+        )
+        second = asyncio.create_task(
+            plane.compat_invoke("oem.z.abort", request("aggregate-overlap-2"))
+        )
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        release["oem.abort_all"].set()
+        await first
+        assert plane.store.action_fenced("oem.x.move_steps") is True
+        release["oem.z.abort"].set()
+        await second
+        assert plane.store.action_fenced("oem.x.move_steps") is False
+
+    asyncio.run(exercise())
+
+
+def test_interrupt_finalization_failure_retains_fence_for_reconciliation(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    monkeypatch.setattr(
+        plane.store, "finalize_interrupt",
+        lambda **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("locked")),
+    )
+    response = asyncio.run(
+        plane.compat_invoke(
+            "oem.abort_all",
+            {
+                "schema_version": "bioxp.operator_interrupt_request.v1",
+                "idempotency_key": "finalization-fence-hold-1",
+                "reason": "test",
+                "observed_ownership_generation": 7,
+                "observed_board_epoch_by_board": {"4": 10, "5": 11},
+            },
+        )
+    )
+
+    assert response["recovery_hold"] is True
+    assert plane.store.action_fenced("oem.x.move_steps") is True
+
+
+def test_provider_interrupt_persistence_failure_retains_outer_fence(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    finalized: list[dict] = []
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "source_return_ok": True,
+            "controller_command_acknowledged": True,
+            "persistence_state": "recovery_required",
+            "recovery_hold": True,
+            "error": "interrupt_persistence_failed:OperationalError",
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    monkeypatch.setattr(
+        plane.store, "finalize_interrupt",
+        lambda **kwargs: finalized.append(dict(kwargs)) or {},
+    )
+    response = asyncio.run(
+        plane.compat_invoke(
+            "oem.abort_all",
+            {
+                "schema_version": "bioxp.operator_interrupt_request.v1",
+                "idempotency_key": "provider-persistence-fence-hold-1",
+                "reason": "test",
+                "observed_ownership_generation": 7,
+                "observed_board_epoch_by_board": {"4": 10, "5": 11},
+            },
+        )
+    )
+
+    assert finalized == []
+    assert response["recovery_hold"] is True
+    assert plane.store.action_fenced("oem.x.move_steps") is True
+
+
+def test_interrupt_waits_for_affected_workers_before_parent_terminalization(
+    tmp_path, monkeypatch,
+):
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    receipt = {
+        "schema_version": "bioxp.operator_interrupt_receipt.v1",
+        "interrupt_id": "interrupt-worker-drain",
+        "interrupt_attempt_id": "interrupt-worker-drain",
+        "action_id": "oem.abort_all",
+        "active_command_id": "worker-command",
+        "active_command_ids": ["worker-command"],
+        "controller_stop_attempted": False,
+        "persistence_state": "committed",
+        "recovery_hold": True,
+    }
+    waits: list[tuple[list[str], float]] = []
+    queued: list[dict] = []
+
+    monkeypatch.setattr(plane.store, "begin_interrupt", lambda *_args, **_kwargs: dict(receipt))
+    monkeypatch.setattr(
+        plane.store, "mark_interrupt_attempted",
+        lambda **_kwargs: {**receipt, "controller_stop_attempted": True},
+    )
+    monkeypatch.setattr(
+        plane.store, "wait_for_command_workers",
+        lambda command_ids, timeout: waits.append((list(command_ids), timeout)) or False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plane.store, "finalize_interrupt",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("finalized before drain")),
+    )
+    monkeypatch.setattr(
+        plane.store, "_append_interrupt_spool_event",
+        lambda **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("spool locked")),
+    )
+    monkeypatch.setattr(
+        plane.store, "queue_pending_interrupt_reconciliation",
+        lambda row: queued.append(dict(row)),
+    )
+
+    async def deliver(_action_id, *, interrupt_attempt_id):
+        return 200, {
+            "ok": True,
+            "source_call_completed": True,
+            "controller_command_acknowledged": True,
+        }
+
+    monkeypatch.setattr(plane, "_deliver_controller_interrupt_raw", deliver)
+    response = asyncio.run(
+        plane.compat_invoke(
+            "oem.abort_all",
+            {
+                "schema_version": "bioxp.operator_interrupt_request.v1",
+                "idempotency_key": "worker-drain-interrupt-1",
+                "reason": "test",
+                "observed_ownership_generation": 7,
+                "observed_board_epoch_by_board": {"4": 10, "5": 11},
+            },
+        )
+    )
+
+    assert waits and waits[0][0] == ["worker-command"]
+    assert queued
+    assert response["recovery_hold"] is True
+    assert response["error"] == "interrupt_worker_drain_timeout"
+    assert plane.store.action_fenced("oem.x.move_steps") is True
+
+
+def test_y_pending_terminalizer_is_registered_with_its_command_identity(monkeypatch):
+    class Store:
+        def __init__(self):
+            self.started = []
+
+        def mark_dispatched(self, command_id, **_kwargs):
+            assert command_id == "y-pending-command"
+            return {"status": "issued_pending", "command_version": 2}
+
+        def action_fenced(self, _action_id):
+            return False
+
+        def _start_command_worker(self, worker, command_id):
+            self.started.append((worker, command_id))
+
+    async def pending_response(*_args, **_kwargs):
+        return 200, {"ok": True, "state": "issued_pending"}
+
+    monkeypatch.setattr(operator_command_plane, "_dispatch_asgi", pending_response)
+    plane = OperatorCommandPlane.__new__(OperatorCommandPlane)
+    plane.app = FastAPI()
+    plane.store = Store()
+    plane.machine_state_provider = lambda: {"ownership_generation": 7}
+    plane.dispatch = {
+        "oem.y.move_absolute": {
+            "method": "POST", "path": "/y/move-absolute",
+            "locations": {}, "fixed_inputs": {},
+        }
+    }
+    plane._current_assessment = lambda *_args: {"enabled": True}
+    plane._require_enabled_assessment = lambda *_args: None
+
+    plane._dispatch_one(
+        {
+            "command_id": "y-pending-command",
+            "action_id": "oem.y.move_absolute",
+            "requested_inputs": {"target_steps": 123},
+            "effective_inputs": {"target_steps": 123},
+            "ownership_generation": 7,
+            "expected_board_epoch_by_board": {"4": 10},
+            "dispatch_attempt_id": "y-pending-attempt",
+        }
+    )
+
+    assert len(plane.store.started) == 1
+    worker, command_id = plane.store.started[0]
+    assert command_id == "y-pending-command"
+    assert worker.name == "bioxp-y-terminalizer-y-pending-command"
+
+
+def test_y_pending_terminalizer_requires_refreshed_pending_claim() -> None:
+    class Store:
+        def __init__(self):
+            self.finished = []
+            self._worker_lock = threading.Lock()
+            self._workers = set()
+            self._worker_commands = {}
+
+        def finish(self, command_id, **kwargs):
+            self.finished.append((command_id, kwargs))
+
+    plane = OperatorCommandPlane.__new__(OperatorCommandPlane)
+    plane.app = FastAPI()
+    plane.app.state.serial206_y_terminalizer = lambda *_args: {
+        "ok": True,
+        "controller_command_acknowledged": True,
+        "completion_class": "event_128",
+        "terminal_speed_zero": True,
+    }
+    plane.store = Store()
+    claimed = {
+        "command_id": "y-terminal-claim",
+        "action_id": "oem.y.move_absolute",
+        "dispatch_attempt_id": "attempt-y-terminal-claim",
+        "ownership_generation": 7,
+        "command_status": "issued_pending",
+        "command_version": 2,
+    }
+
+    plane._terminalize_y_pending(
+        "y-terminal-claim", {"target_steps": 123}, claimed,
+    )
+
+    assert plane.store.finished[0][0] == "y-terminal-claim"
+    assert plane.store.finished[0][1]["claimed"] == claimed
+
+
+def test_y_pending_claim_can_terminalize_issued_pending_command(
+    tmp_path, monkeypatch,
+) -> None:
+    app, _ = make_app(tmp_path, monkeypatch)
+    plane = app.state.operator_command_plane
+    state = plane._state()
+    admitted = plane.store.admit_command(
+        {
+            "schema_version": "bioxp.operator_action_request.v2",
+            "action_id": "oem.y.move_absolute",
+            "inputs": {"target_steps": 100},
+            "expected_ownership_generation": 7,
+            "idempotency_key": "y-pending-terminal-claim-1",
+            "expected_board_epoch_by_board": {"4": 10},
+        },
+        state=state,
+    )
+    claimed = plane.store.claim_next()
+    assert claimed is not None
+    pending = plane.store.mark_dispatched(
+        claimed["command_id"], payload={"pending": True}
+    )
+    pending_claim = {
+        **claimed,
+        "command_status": "issued_pending",
+        "command_version": pending["command_version"],
+    }
+    stale_finish = plane.store.finish(
+        admitted["command_id"], status="completed",
+        payload={"completion_class": "event_128"}, claimed=claimed,
+    )
+    assert stale_finish["status"] == "issued_pending"
+
+    finished = plane.store.finish(
+        admitted["command_id"], status="completed",
+        payload={"completion_class": "event_128"}, claimed=pending_claim,
+    )
+
+    assert finished["status"] == "completed"
+
+
+def test_v2_strict_method_rechecks_board_epochs_before_dispatch(tmp_path, monkeypatch):
+    app, calls = make_app(tmp_path, monkeypatch)
+    app.state.operator_test_serial206["board4_authority"] = {"active_board_epoch": 10}
+    app.state.operator_test_serial206["x_authority"]["active_board_epoch"] = 11
+    client = TestClient(app)
+    admitted = client.post(
+        "/operator/v2/methods",
+        json={
+            "schema_version": "bioxp.operator_method_request.v1",
+            "method_action_id": "oem.xy.move_absolute",
+            "idempotency_key": "v2-strict-dispatch-fence-1",
+            "expected_ownership_generation": 7,
+            "expected_board_epoch_by_board": {"4": 10, "5": 11},
+            "inputs": {"x_steps": 200, "y_steps": 300},
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+    method_id = admitted.json()["method_id"]
+
+    app.state.operator_test_serial206["x_authority"]["active_board_epoch"] = 12
+    plane = app.state.operator_command_plane
+    body: dict = {}
+    plane.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            body = client.get(f"/operator/v2/methods/{method_id}").json()
+            if body["status"] in {"completed", "failed", "interrupted", "ambiguous"}:
+                break
+            time.sleep(0.01)
+    finally:
+        plane.stop()
+
+    assert body["status"] == "failed"
+    assert body["child_receipts"][0]["status"] == "failed"
+    assert all(call[0] != "move_xy" for call in calls)
 
 
 def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_path, monkeypatch):
@@ -1072,7 +1727,7 @@ def test_unknown_inputs_generation_mismatch_and_disabled_meta_fail_without_dispa
     assert calls == []
 
 
-def test_home_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatch):
+def test_legacy_home_xy_action_requires_the_strict_method_route(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
@@ -1082,13 +1737,12 @@ def test_home_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatc
         "idempotency_key": "home-xy-meta-1234",
         "inputs": {},
     })
-    assert response.status_code == 200, response.text
-    assert calls == [("home_xy", None)]
-    receipt = response.json()
-    assert receipt["stage_receipts"] == []
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+    assert calls == []
 
 
-def test_move_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatch):
+def test_legacy_move_xy_action_requires_the_strict_method_route(tmp_path, monkeypatch):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
     catalog = client.get("/operator/control-catalog").json()
@@ -1099,8 +1753,9 @@ def test_move_xy_primitive_maps_to_one_visible_source_route(tmp_path, monkeypatc
         "idempotency_key": "move-xy-canonical-1234",
         "inputs": {"x": 123, "y": 456},
     })
-    assert response.status_code == 200, response.text
-    assert calls == [("move_xy", {"x": 123, "y": 456, "timeout_s": 120.0})]
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+    assert calls == []
 
 
 def test_generic_assessment_rejects_provider_owned_z_manual_home_receipt(tmp_path, monkeypatch):
@@ -1177,3 +1832,21 @@ def test_receipt_store_keeps_compact_history_and_replaces_by_command_id(tmp_path
             "operator_assessment": "fail",
         })
     assert store.connection.execute("SELECT COUNT(*) FROM operator_commands").fetchone()[0] == 520
+
+
+def test_public_durable_command_route_rejects_a_disabled_machine_assessment(
+    tmp_path, monkeypatch,
+):
+    app, _calls = make_app(tmp_path, monkeypatch)
+    app.state.operator_test_maintenance["motion_blocked"] = True
+    app.state.operator_test_maintenance["block_reason"] = "maintenance"
+    response = TestClient(app).post("/operator/commands", json={
+        "schema_version": "bioxp.operator_command_request.v1",
+        "idempotency_key": "blocked-durable-x-move",
+        "expected_ownership_generation": 7,
+        "action_id": "oem.x.move_steps",
+        "inputs": {"steps": 1},
+    })
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "action_unavailable"
+    assert app.state.operator_command_plane.store.queue()["pending_count"] == 0

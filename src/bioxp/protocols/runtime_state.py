@@ -11,6 +11,7 @@ class StageExecutionStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
+    FAILED = "failed"
     COMPLETED = "completed"
 
 
@@ -114,14 +115,20 @@ class ProtocolRuntimeState:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "ProtocolRuntimeState":
+        boolean_values: dict[str, bool] = {}
+        for field in ("dry_run", "paused", "awaiting_review", "completed"):
+            value = payload.get(field, False)
+            if type(value) is not bool:
+                raise ValueError(f"runtime state field '{field}' must be a boolean")
+            boolean_values[field] = value
         return cls(
             protocol_id=str(payload["protocol_id"]),
-            dry_run=bool(payload.get("dry_run", False)),
+            dry_run=boolean_values["dry_run"],
             job_id=payload.get("job_id"),
             current_stage_id=payload.get("current_stage_id"),
-            paused=bool(payload.get("paused", False)),
-            awaiting_review=bool(payload.get("awaiting_review", False)),
-            completed=bool(payload.get("completed", False)),
+            paused=boolean_values["paused"],
+            awaiting_review=boolean_values["awaiting_review"],
+            completed=boolean_values["completed"],
             pause_reason=payload.get("pause_reason"),
             stage_states={
                 str(stage_id): ProtocolStageState.from_payload(stage_payload)

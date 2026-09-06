@@ -1,8 +1,150 @@
 from fastapi.testclient import TestClient
 from types import SimpleNamespace
 from typing import Any
+import asyncio
 
 import pytest
+
+
+def test_lifespan_does_not_teardown_transports_while_command_workers_are_alive(
+    monkeypatch, tmp_path,
+):
+    from fastapi import FastAPI
+    import src.bioxp.api as api
+
+    calls: list[str] = []
+
+    class FakeReceipts:
+        root = tmp_path
+
+        def attest_first_install_absence(self):
+            return None
+
+        def migrate_legacy_jsonl(self):
+            return {}
+
+        def reconcile_nonterminal_claims(self):
+            return {}
+
+    class LiveWorkerPlane:
+        def stop(self):
+            calls.append("plane_stop")
+            raise RuntimeError("operator command workers did not stop; lane owner retained")
+
+    class Transport:
+        def close(self):
+            calls.append("transport_close")
+
+    class Tester:
+        def _disconnect(self):
+            calls.append("tester_disconnect")
+            return {"ok": True, "release_interface_ok": True, "dispose_resources_ok": True}
+
+    async def stop_camera(*, reason: str):
+        return None
+
+    monkeypatch.setattr(api, "runtime_state_root", lambda: tmp_path)
+    monkeypatch.setattr(api, "migrate_runtime_database_v2", lambda *_args: None)
+    monkeypatch.setattr(api, "configure_release_identity", lambda: {"verified": False})
+    monkeypatch.setattr(api, "reconcile_operator_report_exports", lambda *_args: {})
+    monkeypatch.setattr(
+        api,
+        "configure_oem_machine_snapshot_from_env",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("test skips USB startup")),
+    )
+    monkeypatch.setattr(api, "_ownership_changed", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_stop_owned_camera_session", stop_camera)
+    monkeypatch.setattr(api, "_operator_control_plane_installed", True)
+    monkeypatch.setattr(api, "_operator_reports_installed", True)
+    monkeypatch.setattr(api, "_pipette_receipts", FakeReceipts())
+    monkeypatch.setattr(api, "_pipette_transport", Transport())
+    monkeypatch.setattr(api, "_tester", Tester())
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    app = FastAPI()
+    app.state.operator_command_plane = LiveWorkerPlane()
+    app.state.operator_history_reader = SimpleNamespace(close=lambda: None)
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="workers did not stop"):
+            async with api.lifespan(app):
+                pass
+
+    asyncio.run(exercise())
+    assert calls == ["plane_stop"]
+
+
+def test_lifespan_commits_release_start_before_starting_command_dispatcher(
+    monkeypatch, tmp_path,
+):
+    from fastapi import FastAPI
+    import src.bioxp.api as api
+
+    calls: list[str] = []
+
+    class FakeReceipts:
+        root = tmp_path
+
+        def attest_first_install_absence(self):
+            return None
+
+        def migrate_legacy_jsonl(self):
+            return {}
+
+        def reconcile_nonterminal_claims(self):
+            return {}
+
+    class CommandPlane:
+        def start(self):
+            calls.append("dispatcher_start")
+
+        def stop(self):
+            calls.append("dispatcher_stop")
+
+    def install(app, **_kwargs):
+        calls.append("plane_install")
+        app.state.operator_receipt_store = SimpleNamespace(
+            converge_startup_state=lambda: calls.append("converge")
+        )
+        app.state.operator_command_plane = CommandPlane()
+        app.state.operator_history_reader = SimpleNamespace(close=lambda: None)
+
+    def record_release_start(*_args, **_kwargs):
+        calls.append("release_receipt")
+        return {"receipt_id": "release-start-1"}
+
+    async def stop_camera(*, reason: str):
+        return None
+
+    monkeypatch.setattr(api, "runtime_state_root", lambda: tmp_path)
+    monkeypatch.setattr(api, "migrate_runtime_database_v2", lambda *_args: None)
+    monkeypatch.setattr(api, "configure_release_identity", lambda: {"verified": True})
+    monkeypatch.setattr(api, "record_runtime_release_start", record_release_start)
+    monkeypatch.setattr(api, "publish_runtime_release_receipt", lambda value: value)
+    monkeypatch.setattr(api, "reconcile_operator_report_exports", lambda *_args: {})
+    monkeypatch.setattr(api, "install_operator_control_plane", install)
+    monkeypatch.setattr(
+        api,
+        "configure_oem_machine_snapshot_from_env",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("test skips USB startup")),
+    )
+    monkeypatch.setattr(api, "_ownership_changed", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_stop_owned_camera_session", stop_camera)
+    monkeypatch.setattr(api, "_operator_control_plane_installed", False)
+    monkeypatch.setattr(api, "_operator_reports_installed", True)
+    monkeypatch.setattr(api, "_pipette_receipts", FakeReceipts())
+    monkeypatch.setattr(api, "_pipette_transport", None)
+    monkeypatch.setattr(api, "_tester", None)
+    monkeypatch.setattr(api, "_tester_quarantine", None)
+    app = FastAPI()
+
+    async def exercise() -> None:
+        async with api.lifespan(app):
+            await asyncio.wait_for(app.state.release_start_ready.wait(), timeout=1)
+
+    asyncio.run(exercise())
+    assert calls.index("release_receipt") < calls.index("plane_install")
+    assert calls.index("release_receipt") < calls.index("converge")
+    assert calls.index("release_receipt") < calls.index("dispatcher_start")
 
 
 def test_oem_compat_api_startup_dry_run_exposes_trace_without_physical_motion():

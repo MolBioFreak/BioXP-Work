@@ -17,6 +17,7 @@ from bioxp.oem_runtime_store import OEMRuntimeStore
 
 def _create_legacy_history(path: Path, *, canonical_existing: bool = False) -> None:
     connection = sqlite3.connect(path)
+    connection.create_function("authority_write_allowed", 0, lambda: 1)
     if canonical_existing:
         connection.execute(
             """
@@ -29,7 +30,7 @@ def _create_legacy_history(path: Path, *, canonical_existing: bool = False) -> N
             (
                 "legacy-running", 7, "legacy-method", 1, "oem.y.move_steps",
                 json.dumps({"steps": 10}), json.dumps({"steps": 10}),
-                "dispatched", 3, 11, 100.0, 101.0, None, None, 101.0,
+                "queued", 3, 11, 100.0, None, None, None, 100.0,
             ),
         )
         connection.execute(
@@ -42,16 +43,8 @@ def _create_legacy_history(path: Path, *, canonical_existing: bool = False) -> N
             """,
             (
                 "legacy-method", "legacy move", "{}", "digest", "fail_fast",
-                "running", 2, 11, 1, 7, 7, 100.0, 101.0, 1,
+                "queued", 2, 11, 1, 7, 7, 100.0, 100.0, 0,
             ),
-        )
-        connection.execute(
-            """
-            INSERT INTO operator_plane_transitions(
-                transition_sequence,event_kind,command_id,method_id,state,payload_json,created_at
-            ) VALUES(?,?,?,?,?,?,?)
-            """,
-            (1, "dispatch", "legacy-running", "legacy-method", "dispatched", "{}", 101.0),
         )
         connection.commit()
         connection.close()
@@ -264,15 +257,14 @@ def test_only_aggregate_abort_is_catalogued_and_legacy_z_abort_route_is_excluded
     assert abort_ids == {"oem.abort_all"}
 
 
-def test_duplicate_authority_module_and_successive_queue_are_deleted() -> None:
+def test_durable_deck_authority_replaces_the_deleted_successive_queue() -> None:
     package_root = Path(operator_controls.__file__).parent
-    assert not (package_root / "operator_command_plane.py").exists()
+    assert (package_root / "operator_command_plane.py").exists()
     assert not hasattr(operator_controls, "_SuccessiveMoveQueue")
     source = Path(operator_controls.__file__).read_text(encoding="utf-8")
-    assert "operator_command_plane" not in source
+    assert "operator_command_plane" in source
     assert "_successive_move_queue" not in source
     assert '"successive_move_queue"' not in source
-    assert '"command_queue"' not in source
     assert "oem.z.abort" not in source
 
 

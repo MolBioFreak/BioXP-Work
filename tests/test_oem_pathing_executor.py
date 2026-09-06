@@ -2,7 +2,6 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
 
 from src.bioxp import oem_homing_routes as routes
 
@@ -99,34 +98,37 @@ def test_scriptmove_execute_dry_run_remains_no_motion_preview():
     assert executor.calls == []
 
 
-def test_scriptmove_execute_live_rejects_without_ack_before_executor():
+def test_scriptmove_execute_live_without_ack_is_preview_only_before_executor():
     executor = FakeExecutor()
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(
-            routes._execute_oem_scriptmove_path_impl(
-                {"location_id": "LOC_PARK", "mode": "live", "reason": "commissioning"},
-                motion_executor=executor,
-            )
+    result = asyncio.run(
+        routes._execute_oem_scriptmove_path_impl(
+            {"location_id": "LOC_PARK", "mode": "live", "reason": "commissioning"},
+            motion_executor=executor,
         )
-    assert exc.value.status_code == 409
+    )
+    assert result["executor_status"] == "preview_only"
+    assert result["motion_commanded"] is False
+    assert result["opened_usb"] is False
+    assert result["legacy_live_execution_retired"] is True
     assert executor.calls == []
 
 
-def test_scriptmove_execute_live_requires_reason_before_executor():
+def test_scriptmove_execute_live_without_reason_is_preview_only_before_executor():
     executor = FakeExecutor()
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(
-            routes._execute_oem_scriptmove_path_impl(
-                {"location_id": "LOC_PARK", "mode": "live", "operator_ack": "OEM_PATH_EXECUTE"},
-                motion_executor=executor,
-            )
+    result = asyncio.run(
+        routes._execute_oem_scriptmove_path_impl(
+            {"location_id": "LOC_PARK", "mode": "live", "operator_ack": "OEM_PATH_EXECUTE"},
+            motion_executor=executor,
         )
-    assert exc.value.status_code == 409
-    assert "reason" in str(exc.value.detail).lower()
+    )
+    assert result["executor_status"] == "preview_only"
+    assert result["motion_commanded"] is False
+    assert result["opened_usb"] is False
+    assert result["legacy_live_execution_retired"] is True
     assert executor.calls == []
 
 
-def test_scriptmove_execute_live_uses_provider_authority_and_executes():
+def test_scriptmove_execute_live_with_legacy_ack_is_preview_only_and_zero_io():
     executor = FakeExecutor()
     result = asyncio.run(
         routes._execute_oem_scriptmove_path_impl(
@@ -139,15 +141,15 @@ def test_scriptmove_execute_live_uses_provider_authority_and_executes():
             motion_executor=executor,
         )
     )
-    assert result["ok"] is True, (result.get("error"), result.get("execution_results"), executor.calls)
-    assert result["executor_status"] == "live_step_execution_complete"
-    assert result["path_planning_authority"]["source"] == "test-provider-authority"
-    assert [row[:4] for row in executor.calls if row[0] == "move_to"] == [
-        ("move_to", 1506, 71, 65000)
-    ]
+    assert result["ok"] is True
+    assert result["executor_status"] == "preview_only"
+    assert result["motion_commanded"] is False
+    assert result["opened_usb"] is False
+    assert result["legacy_live_execution_retired"] is True
+    assert executor.calls == []
 
 
-def test_scriptmove_live_ignores_caller_supplied_machine_state(monkeypatch):
+def test_scriptmove_live_preview_never_reads_or_calls_provider_authority(monkeypatch):
     captured = {}
 
     async def capture_plan(**kwargs):
@@ -156,7 +158,7 @@ def test_scriptmove_live_ignores_caller_supplied_machine_state(monkeypatch):
 
     monkeypatch.setattr(routes, "plan_oem_scriptmove_path", capture_plan)
     executor = FakeExecutor()
-    asyncio.run(
+    result = asyncio.run(
         routes._execute_oem_scriptmove_path_impl(
             {
                 "location_id": "LOC_PARK",
@@ -176,12 +178,9 @@ def test_scriptmove_live_ignores_caller_supplied_machine_state(monkeypatch):
             motion_executor=executor,
         )
     )
-    assert captured["current_x"] == 100
-    assert captured["current_y"] == 200
-    assert captured["current_z"] == 65000
-    assert captured["tip_loaded"] is False
-    assert captured["tip_dirty"] is False
-    assert captured["clean_path"] is False
-    assert captured["tip_location"] == -1
-    assert captured["gripper_confirmed"] is True
-    assert captured["plate_on_gantry"] is None
+    assert result["executor_status"] == "preview_only"
+    assert result["motion_commanded"] is False
+    assert result["opened_usb"] is False
+    assert result["legacy_live_execution_retired"] is True
+    assert captured["current_x"] == 999999
+    assert executor.calls == []

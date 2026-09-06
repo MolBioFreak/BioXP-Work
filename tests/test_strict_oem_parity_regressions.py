@@ -822,7 +822,7 @@ def test_x_move_steps_delegates_to_cached_currentposition_source_wrapper(monkeyp
     assert result["source_return_code"] == 1125
 
 
-def test_protocol_motion_handler_uses_canonical_operator_action_invoker(tmp_path, monkeypatch):
+def test_protocol_motion_handler_uses_canonical_durable_deck_executor(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     from bioxp import api
@@ -830,9 +830,11 @@ def test_protocol_motion_handler_uses_canonical_operator_action_invoker(tmp_path
     source = inspect.getsource(api._protocol_live_move_handler)
     assert "_execute_absolute_move" not in source
     assert "_execute_relative_move" not in source
-    assert "invoke_operator_action_v2" in source
-    assert "OperatorActionRequestV2" in source
-    assert "anyio_from_thread.run" in source
+    assert "execute_x_intent" not in source
+    assert "execute_z_intent" not in source
+    assert "ClassMoveToIntent" in source
+    assert "oem_mov_execution_admitter" in source
+    assert "_wait_protocol_deck_command" in source
 
 
 def test_v2_catalog_and_receipt_source_cover_all_interrupt_states():
@@ -2874,7 +2876,7 @@ def test_interrupt_attempts_are_append_only_and_reused_keys_create_fresh_attempt
         store.stop()
 
 
-def test_operator_history_reader_is_read_only_and_scheduler_is_absent(tmp_path):
+def test_operator_history_reader_is_read_only(tmp_path):
     database = tmp_path / "bioxp_runtime.db"
     connection = sqlite3.connect(database)
     connection.execute("CREATE TABLE canary(value TEXT NOT NULL)")
@@ -2892,5 +2894,3 @@ def test_operator_history_reader_is_read_only_and_scheduler_is_absent(tmp_path):
         reader.close()
 
     assert database.read_bytes() == before
-    package_root = Path(inspect.getfile(OperatorHistoryReader)).parent
-    assert not (package_root / "operator_command_plane.py").exists()

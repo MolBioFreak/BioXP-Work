@@ -284,6 +284,7 @@ class RuntimeLifecycleConnection(sqlite3.Connection):
 
     _lifecycle_root: Path | None = None
     _lifecycle_descriptor: int | None = None
+    _exclusive_lifecycle_descriptor: int | None = None
 
     _progress_handler_state: tuple[Any, int] = (None, 0)
 
@@ -376,7 +377,30 @@ class RuntimeLifecycleConnection(sqlite3.Connection):
     def bind_lifecycle_root(self, root: Path) -> None:
         self._lifecycle_root = Path(root)
 
+    @contextmanager
+    def exclusive_lifecycle(self) -> Iterator[None]:
+        if self._lifecycle_descriptor is not None or self._exclusive_lifecycle_descriptor is not None:
+            raise RuntimeAuditStoreError("runtime lifecycle lock is already held")
+        if self._lifecycle_root is None:
+            raise RuntimeAuditStoreError("runtime lifecycle root is not bound")
+        descriptor = os.open(
+            self._lifecycle_root / RUNTIME_LIFECYCLE_LOCK_NAME,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            self._exclusive_lifecycle_descriptor = descriptor
+            yield
+        finally:
+            self._exclusive_lifecycle_descriptor = None
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def _acquire_lifecycle(self) -> None:
+        if self._exclusive_lifecycle_descriptor is not None:
+            return
         if self._lifecycle_descriptor is not None:
             return
         if self._lifecycle_root is None:

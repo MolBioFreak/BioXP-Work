@@ -1,5 +1,6 @@
 from src.bioxp.protocols.compiler import compile_native_protocol
 from src.bioxp.protocols.executor import ProtocolExecutor
+from src.bioxp.protocols.models import ProtocolActionKind
 from src.bioxp.protocols.runtime_state import StageExecutionStatus
 
 
@@ -84,3 +85,32 @@ def test_protocol_runtime_state_retains_generated_job_identity():
 
     assert result.job_id == "protocol-job-123"
     assert result.to_payload()["job_id"] == "protocol-job-123"
+
+
+def test_live_handler_false_result_fails_stage_without_completing_later_actions():
+    document = compile_native_protocol(
+        {
+            "protocol_id": "live-failure",
+            "stages": [
+                {
+                    "stage_id": "run",
+                    "actions": [
+                        {"action_id": "move-1", "kind": "move", "target": "a"},
+                        {"action_id": "move-2", "kind": "move", "target": "b"},
+                    ],
+                }
+            ],
+        }
+    )
+    calls = []
+    result = ProtocolExecutor(
+        dry_run=False,
+        handlers={ProtocolActionKind.MOVE: lambda action, state: calls.append(action.action_id) or {"ok": False, "error": "denied"}},
+    ).execute(document)
+
+    assert result.completed is False
+    assert result.stage_states["run"].status is StageExecutionStatus.FAILED
+    assert result.stage_states["run"].completed_actions == []
+    assert calls == ["move-1"]
+    assert result.action_results[-1]["ok"] is False
+    assert result.events[-1].event == "action_failed"
