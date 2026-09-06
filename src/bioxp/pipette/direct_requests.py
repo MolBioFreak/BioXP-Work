@@ -2,7 +2,8 @@
 
 Original BMS model blob dae94c9, SHA256
 5d930d075a083460649c483dc20c5cb582433b28c96a2a9787c5b135a3892803.
-Original channel/effect validators retained; approved strict semantic truth added.
+Original channel/effect validators retained; approved strict semantic truth and
+required original stored hardware_query classification added.
 No runtime dependency on BMS or current robot authority.
 """
 from __future__ import annotations
@@ -50,6 +51,7 @@ class PipetteReadbackResponse(BaseModel):
     include_data: StrictBool
     live_query_performed: Literal[True]
     truth_source: Literal["live_hardware_queries"]
+    hardware_truth_level: Literal["hardware_query"]
     delivery_verified: Literal[False]
     controller_acknowledged: Literal[False]
     completion_verified: Literal[False]
@@ -314,7 +316,7 @@ def project_lookup_row(row, kind, key):
             raise ValueError('semantic truth binding invalid')
         if payload.get('callback_session_id') != row['callback_session_id']:
             raise ValueError('result callback binding invalid')
-        for metadata in ('callback_session_id', 'hardware_truth_level', 'semantic_query_response_verified'):
+        for metadata in ('callback_session_id', 'semantic_query_response_verified'):
             payload.pop(metadata, None)
         PipetteReadbackResponse.model_validate(payload)
     else:
@@ -329,7 +331,11 @@ def project_lookup_row(row, kind, key):
             expected_inputs = {'direction': plan_operation.removeprefix('plunger_')}
         else:
             expected_inputs = {}
-        if payload.get('requested_inputs') != expected_inputs:
+        # Match the producer's scalar types as well as values; bool/int and
+        # integral-float equality must not bind a different stored projection.
+        actual_inputs = payload.get('requested_inputs')
+        if (not isinstance(actual_inputs, dict) or actual_inputs.keys() != expected_inputs.keys()
+                or any(type(actual_inputs[k]) is not type(v) or actual_inputs[k] != v for k, v in expected_inputs.items())):
             raise ValueError('planner transformed request binding invalid')
         PipetteApplicationPlanResponse.model_validate(payload)
     record['result'] = payload

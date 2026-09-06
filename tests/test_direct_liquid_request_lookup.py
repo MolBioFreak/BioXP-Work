@@ -186,6 +186,77 @@ def test_real_post_historical_lookup_retains_typed_result(lookup_owner, monkeypa
             assert (r['entrypoint_id'], r['caller_class'], r['control_class']) == ('legacy.record', 'legacy', 'pipette_state_command')
 
 
+@pytest.mark.parametrize('include_data', [False, True])
+def test_readback_projection_retains_original_hardware_truth(lookup_owner, monkeypatch, include_data):
+    original = post(lookup_owner[0], 'readback', {'include_data': include_data}).json()
+    conn = lookup_owner[1]['_pipette_receipts'].connection
+    receipt = json.loads(conn.execute('SELECT receipt_json FROM pipette_operations').fetchone()[0])
+    stored = receipt['result']['hardware_truth_level']
+    assert stored == original['hardware_truth_level'] == 'hardware_query'
+    result = guarded_get(lookup_owner, monkeypatch).json()['record']['result']
+    assert result['hardware_truth_level'] == stored
+    assert 'semantic_query_response_verified' not in result
+    assert result['receipt_truth']['semantic_query_response_verified'] == original['semantic_query_response_verified']
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'wrong', 'extra'])
+def test_readback_hardware_truth_corruption_fails_closed(lookup_owner, monkeypatch, mutation):
+    post(lookup_owner[0], 'readback', {'include_data': False})
+    conn = lookup_owner[1]['_pipette_receipts'].connection
+    receipt = json.loads(conn.execute('SELECT receipt_json FROM pipette_operations').fetchone()[0])
+    if mutation == 'missing':
+        receipt['result'].pop('hardware_truth_level')
+    elif mutation == 'wrong':
+        receipt['result']['hardware_truth_level'] = 'physical_effect'
+    else:
+        receipt['result']['unknown_truth'] = 'hardware_query'
+    conn.execute('UPDATE pipette_operations SET receipt_json=?', (json.dumps(receipt),))
+    conn.execute('UPDATE operator_commands SET response_summary_json=?', (json.dumps(receipt['result']),))
+    conn.commit()
+    response = guarded_get(lookup_owner, monkeypatch)
+    assert response.status_code == 503
+    assert response.json()['record'] is None
+
+
+@pytest.mark.parametrize('field,original,changed', [
+    ('tip_type', 1, True), ('tip_type', 0, False),
+    ('tip_location', 0, False),
+    ('home_z_after', True, 1), ('home_z_after', False, 0),
+    ('tip_type', 1, 1.0), ('tip_location', 0, 0.0),
+    ('tip_type', 1, '1'), ('home_z_after', True, 'true'),
+])
+def test_direct_liquid_r1_type_exact_historical_association(lookup_owner, monkeypatch, field, original, changed):
+    body = dict(operation='load_tip', tip_tray='fixture-tray', tip_well='A1',
+                tip_type=1, tip_location=0, home_z_after=True)
+    body[field] = original
+    first = post(lookup_owner[0], 'application_plan', body).json()
+    positive = guarded_get(lookup_owner, monkeypatch, 'application_plan')
+    assert positive.status_code == 200, positive.text
+    assert positive.json()['lookup_state'] == 'resolved'
+    assert positive.json()['record']['result'] == first
+    assert type(first['requested_inputs'][field]) is type(original)
+    conn = lookup_owner[1]['_pipette_receipts'].connection
+    identity_sql = 'SELECT requested_inputs_json, canonical_request_sha256 FROM operator_commands'
+    identity_before = tuple(conn.execute(identity_sql).fetchone())
+    child_before = conn.execute('SELECT requested_inputs_json FROM pipette_operations').fetchone()[0]
+    receipt = json.loads(conn.execute('SELECT receipt_json FROM pipette_operations').fetchone()[0])
+    request_before = json.dumps(receipt['requested_inputs'], sort_keys=True)
+    receipt['result']['requested_inputs'][field] = changed
+    # Consistent hostile result + summary; original normalized request and digest
+    # remain untouched, so only transformed-input association can reject it.
+    conn.execute('UPDATE pipette_operations SET receipt_json=?', (json.dumps(receipt),))
+    conn.execute('UPDATE operator_commands SET response_summary_json=?', (json.dumps(receipt['result']),))
+    conn.commit()
+    response = guarded_get(lookup_owner, monkeypatch, 'application_plan')
+    assert tuple(conn.execute(identity_sql).fetchone()) == identity_before
+    assert conn.execute('SELECT requested_inputs_json FROM pipette_operations').fetchone()[0] == child_before
+    stored = json.loads(conn.execute('SELECT receipt_json FROM pipette_operations').fetchone()[0])
+    assert json.dumps(stored['requested_inputs'], sort_keys=True) == request_before
+    assert response.status_code == 503, response.text
+    assert response.json()['reason'] == 'stored_binding_invalid'
+    assert response.json()['record'] is None
+
+
 def reserve(lookup_owner):
     store = lookup_owner[1]['_pipette_receipts']
     claim, created = store.claim(operation='live_readback', requested_inputs={'include_data': False},
