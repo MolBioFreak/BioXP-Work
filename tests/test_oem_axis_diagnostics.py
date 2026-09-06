@@ -156,9 +156,10 @@ def test_safety_interrupt_uses_reserved_worker_when_general_threadpool_is_satura
 
     async def single_worker_general_pool(func, *args):
         async with general_pool_token:
-            if func is normal_operation:
-                general_worker_started.set()
-                await release_general_worker.wait()
+            # Saturate the general lane regardless of its worker-exit wrapper.
+            # The interrupt must use the reserved executor, not this pool.
+            general_worker_started.set()
+            await release_general_worker.wait()
             return func(*args)
 
     monkeypatch.setattr(api, "run_in_threadpool", single_worker_general_pool)

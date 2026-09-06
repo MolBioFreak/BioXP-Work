@@ -72,6 +72,11 @@ class ExchangeObserver:
 _CURRENT: ContextVar[ExchangeObserver | None] = ContextVar("bioxp_command_exchange_owner", default=None)
 
 
+def current_exchange_owner() -> ExchangeObserver | None:
+    """Capture the existing handle for actual worker-exit retention."""
+    return _CURRENT.get()
+
+
 @contextmanager
 def exchange_scope(
     command_id: str | None = None,

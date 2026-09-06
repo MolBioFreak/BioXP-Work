@@ -17,6 +17,7 @@ import re
 import time
 import uuid
 from contextvars import ContextVar
+from contextlib import nullcontext
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
@@ -33,6 +34,7 @@ from .oem_full_lifecycle import (
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
 from .operator_receipt_store import OperatorHistoryReader, OperatorReceiptStore
+from .command_exchange_observer import exchange_scope
 from .release_identity import current_release_identity
 from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGE_KEYS
 from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPECS
@@ -2142,6 +2144,8 @@ def install_operator_control_plane(
             "completion_class": row.get("completion_class"),
             "physical_effect_verified": bool(row.get("physical_effect_verified") is True),
             "error": error,
+            "transport_exchanges": list(row.get("transport_exchanges") or []),
+            "transport_retention_errors": list(row.get("transport_retention_errors") or []),
         }
 
     def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -2714,6 +2718,16 @@ def install_operator_control_plane(
                 for name, value in effective_inputs.items()
                 if name in target["locations"]
             }
+            def retain_exchanges(evidence: dict[str, Any]) -> None:
+                store.merge_transport_evidence(command_id, evidence)
+
+            exchange_context = (
+                nullcontext(None) if is_safety_interrupt else exchange_scope(
+                    command_id,
+                    sink=retain_exchanges,
+                )
+            )
+            exchange_owner = exchange_context.__enter__()
             context_token = _DISPATCH_CONTEXT.set({
                 "operator_command_id": command_id,
                 "idempotency_key": payload.idempotency_key,
@@ -2894,6 +2908,11 @@ def install_operator_control_plane(
                 receipt.update({"status": "failed", "machine_assessment": "fail", "error": f"{type(exc).__name__}: {exc}"[:2000]})
             finally:
                 _DISPATCH_CONTEXT.reset(context_token)
+                try:
+                    if exchange_owner is not None:
+                        receipt.update(exchange_owner.snapshot())
+                finally:
+                    exchange_context.__exit__(None, None, None)
             finished = time.time()
             receipt["finished_at"] = str(finished)
             receipt["duration_ms"] = (finished - started) * 1000.0

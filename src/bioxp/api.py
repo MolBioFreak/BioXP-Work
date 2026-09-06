@@ -5400,9 +5400,20 @@ _usb_sniff_manager = UsbSniffManager()
 
 
 async def _run_blocking(label: str, func, timeout_s: float = 30.0):
+    from .command_exchange_observer import current_exchange_owner
+
+    exchange_owner = current_exchange_owner()
+
+    def invoke():
+        try:
+            return func()
+        finally:
+            if exchange_owner is not None:
+                exchange_owner.flush()
+
     async def leased_operation():
         async with _tester_lock:
-            return await run_in_threadpool(func)
+            return await run_in_threadpool(invoke)
 
     worker = asyncio.create_task(leased_operation(), name=f"bioxp-tester:{label}")
     try:
@@ -5434,6 +5445,10 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
     worker thread that cannot itself be cancelled.
     """
 
+    from .command_exchange_observer import current_exchange_owner
+
+    exchange_owner = current_exchange_owner()
+
     async def leased_interrupt():
         async with _tester_transition_lock:
             tester = _get_tester()
@@ -5441,7 +5456,11 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             interrupt_context = copy_context()
 
             def invoke_interrupt():
-                return interrupt_context.run(func, tester)
+                try:
+                    return interrupt_context.run(func, tester)
+                finally:
+                    if exchange_owner is not None:
+                        exchange_owner.flush()
 
             return await loop.run_in_executor(
                 _safety_interrupt_executor,

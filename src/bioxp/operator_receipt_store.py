@@ -831,7 +831,7 @@ class OperatorReceiptStore:
         if not command_id or not idempotency_key or not action_id:
             raise ValueError("operator receipt requires command_id, idempotency_key, and action_id")
         previous = self.connection.execute(
-            "SELECT status FROM operator_commands WHERE command_id=?",
+            "SELECT status,receipt_json FROM operator_commands WHERE command_id=?",
             (command_id,),
         ).fetchone()
         previous_status = str(previous["status"]) if previous is not None else None
@@ -852,6 +852,8 @@ class OperatorReceiptStore:
                 )
         elif expected_status is not None:
             raise RuntimeError("operator receipt expected state has no matching claim")
+        if previous is not None:
+            self._merge_transport_evidence(compact, json.loads(previous["receipt_json"]))
         relpath, digest, size = evidence
         if relpath is None and previous is not None:
             existing = self.connection.execute(
@@ -1587,6 +1589,52 @@ class OperatorReceiptStore:
                 result=dict(child_result),
                 normalized=dict(normalized),
             )
+
+    @staticmethod
+    def _merge_transport_evidence(target: dict[str, Any], evidence: Mapping[str, Any]) -> None:
+        """Union only attempt evidence; existing identities are immutable."""
+        for key in ("transport_exchanges", "transport_retention_errors"):
+            if key not in target and key not in evidence:
+                continue
+            rows = list(target.get(key) or [])
+            for row in evidence.get(key) or []:
+                if key == "transport_exchanges":
+                    if any(item["exchange_id"] == row["exchange_id"] for item in rows):
+                        continue
+                elif row in rows:
+                    continue
+                rows.append(dict(row))
+            target[key] = rows
+
+    def merge_transport_evidence(self, command_id: str, evidence: Mapping[str, Any]) -> dict[str, Any]:
+        """Evidence-only current-JSON update, including after terminalization.
+
+        Uses the existing runtime coordinator/connection ownership. No command,
+        transition, timestamp, authority or response artifact is created here.
+        Storage errors propagate to the owner's explicit retention-error channel.
+        """
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.connection.execute(
+                    "SELECT receipt_json FROM operator_commands WHERE command_id=?", (command_id,),
+                ).fetchone()
+                if existing is None:
+                    raise KeyError("transport evidence requires an existing operator command")
+                current = json.loads(existing["receipt_json"])
+                for row in evidence.get("transport_exchanges") or []:
+                    if row.get("command_id") != command_id:
+                        raise ValueError("transport evidence command identity mismatch")
+                self._merge_transport_evidence(current, evidence)
+                self.connection.execute(
+                    "UPDATE operator_commands SET receipt_json=? WHERE command_id=?",
+                    (_json_text(current), command_id),
+                )
+                self.connection.execute("COMMIT")
+                return current
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
 
     def put(
         self,
