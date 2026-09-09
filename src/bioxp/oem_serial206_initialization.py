@@ -12,9 +12,10 @@ import hashlib
 import inspect
 import json
 import math
+import uuid
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -1105,7 +1106,8 @@ class Serial206ProductionPrimitiveAdapter:
                     "pending_motion": False,
                 }
             )
-            result["ok"] = bool(result.get("ok") is True and wait_ok)
+            result["source_wait_signaled"] = bool(isinstance(wait, Mapping) and wait.get("ok") is True)
+            result["ok"] = bool(result.get("ok") is True and result["source_wait_signaled"])
             if not result["ok"]:
                 result["failure"] = str(
                     result.get("failure")
@@ -1307,6 +1309,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "source_call_completed": command_ok,
                 "command_acknowledged": command_acknowledged,
                 "wait_accepted": wait_ok,
+                "source_wait_signaled": bool(isinstance(wait, Mapping) and wait.get("ok") is True),
                 "target_event_128_observed": bool(targets) if moved else False,
                 "controller_error_events": _json_safe(errors),
                 "position": _json_safe(position),
@@ -1320,7 +1323,7 @@ class Serial206ProductionPrimitiveAdapter:
         command_acknowledged = all(evidence[axis]["command_acknowledged"] for axis in required_axes)
         terminal_ok = all(evidence[axis]["ok"] for axis in required_axes)
         target_ok = all(evidence[axis]["position_verified"] for axis in required_axes)
-        restore_ok = all(isinstance(restore.get(axis), Mapping) and restore[axis].get("ok") is True and isinstance(restore[axis].get("readback"), Mapping) and restore[axis]["readback"].get("value") == (350 if axis == "x" else 400) for axis in ("x", "y"))
+        restore_ok = all(isinstance(restore.get(axis), Mapping) and self._x_tmcl_success(restore[axis].get("ack")) for axis in ("x", "y"))
         ok = bool(source_calls_completed)
         receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
         moved_axes = tuple(axis for axis in required_axes if isinstance(commands.get(axis), Mapping) and commands[axis].get("command_issued") is True)
@@ -1394,15 +1397,18 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def x_abort(self, *, reason: str = "forceAbortMotion") -> dict[str, Any]:
-        abort = physical_aggregate_stop(
-            self.tester,
-            Serial206MotionAuthority.from_active_snapshot(),
-            terminal_timeout_s=3.0,
-        )
+        abort = self.tester.motor_oem_force_abort_motion(reason=reason)
         desync = self._x_desync(reason, "abort") if self.reference_store is not None else None
         source_completed = isinstance(abort, Mapping)
         source_return_ok = bool(source_completed and abort.get("ok") is True)
-        return {"ok": source_return_ok, "axis_context": "x", "intent": "aggregate_oem_abort", "physical_scope": "aggregate_oem_all_present_boards", "x_only": False, "logical_abort": _json_safe(abort), "x_terminal_stop": None, "reference_desync": _json_safe(desync), "source_call_completed": source_completed, "source_return_ok": source_return_ok, "controller_command_acknowledged": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "controller_terminal_state_verified": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_abort_source_return_failure" if source_completed else "x_abort_source_call_failed"}
+        return {"ok": source_return_ok, "axis_context": "x", "intent": "aggregate_oem_abort",
+                "physical_scope": "none_software_flags_and_waiters", "x_only": False,
+                "software_abort": True, "invocation_attempted": True, "stop_delivery_attempted": False,
+                "logical_abort": _json_safe(abort), "x_terminal_stop": None,
+                "reference_desync": _json_safe(desync), "source_call_completed": source_completed,
+                "source_return_ok": source_return_ok, "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False, "physical_effect_verified": False,
+                "failure": None if source_return_ok else "x_abort_source_call_failed"}
 
     def prepare_x(self, *, expected_generation: int) -> dict[str, Any]:
         result = self.prepare_for_initialize_motors(
@@ -1683,7 +1689,7 @@ class Serial206ProductionPrimitiveAdapter:
         errors: list[str] = []
         home_exceptions: list[Exception] = []
         restore: dict[str, Any] = {}
-        setup_ok = all(isinstance(row, Mapping) and row.get("ok") is True for row in setup.values())
+        setup_ok = all(isinstance(row, Mapping) and self._x_tmcl_success(row.get("ack")) for row in setup.values())
         def run(axis: str) -> None:
             try:
                 results[axis] = self.tester.motor_oem_go_home(axis, speed=200, rehome=False, timeout_s=30.0, require_switch_transition=False)
@@ -1732,13 +1738,17 @@ class Serial206ProductionPrimitiveAdapter:
             "y_acc": self.tester.motor_set_axis_param(4, 5, 400, motor=0),
         }
         expected_restore = {"x_speed": 1700, "x_acc": 350, "y_speed": 1800, "y_acc": 400}
-        restore_ok = all(isinstance(restore[name], Mapping) and restore[name].get("ok") is True for name in expected_restore)
-        positions = {"x": self.tester.motor_get_position(5, motor=0), "y": self.tester.motor_get_position(4, motor=0)}
+        restore_ok = all(isinstance(restore[name], Mapping) and self._x_tmcl_success(restore[name].get("ack")) for name in expected_restore)
+        # CI.HomeXY returns child scalars after restore; no extra GAP queries.
+        # Reuse existing child observations only, never reinterpret scalar0 as proof.
+        positions = {axis: results[axis]["position_after_sethome"] for axis in ("x", "y")
+                     if isinstance(results.get(axis), Mapping)
+                     and isinstance(results[axis].get("position_after_sethome"), Mapping)}
         source_return = {axis: results[axis].get("source_return_code") if isinstance(results.get(axis), Mapping) else None for axis in ("x", "y")}
         controller_acknowledged = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_command_acknowledged") is True for axis in ("x", "y"))
         terminal_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_terminal_state_verified") is True for axis in ("x", "y"))
         home_proof_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y"))
-        reference_publication_required = bool(home_proof_verified and all(self._x_value(positions[axis]) == 0 for axis in ("x", "y")))
+        reference_publication_required = bool(home_proof_verified and all(self._x_readback_verified(positions.get(axis), 0) for axis in ("x", "y")))
         receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": _json_safe(setup), "setup_verified": setup_ok, "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
         return receipt
 
@@ -2341,9 +2351,23 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        # CI.stopMotor's board-null branch precedes Head.stopMotor's guards.
+        present = getattr(self.tester, "_oem_board_present", None)
+        if callable(present) and not present(4):
+            return {
+                "ok": True, "intent": "stop", "source_call_completed": True,
+                "source_board_return": None, "source_return_code": None,
+                "source_noop": True, "source_noop_reason": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "physical_effect_verified": False, "failure": None,
+                "stop": None, "wait": None,
+                "timeout_s_omitted_by_source": float(timeout_s),
+            }
         stop = self.tester.motor_oem_board_stop(4, motor=1, axis_name="z")
         source_completed = isinstance(stop, Mapping) and stop.get("source_call_completed") is True
-        source_return_ok = bool(source_completed and stop.get("source_return_code") == 0)
+        # Head.stopMotor is void; leaf scalar/ACK are evidence, not its return.
+        source_return_ok = source_completed
         command_acknowledged = bool(
             isinstance(stop, Mapping)
             and self._z_tmcl_success(stop.get("second_delivery"))
@@ -2352,6 +2376,7 @@ class Serial206ProductionPrimitiveAdapter:
             "ok": source_return_ok,
             "intent": "stop",
             "source_call_completed": source_completed,
+            "source_board_return": None,
             "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None,
             "controller_command_acknowledged": command_acknowledged,
             "controller_terminal_state_verified": False,
@@ -2370,7 +2395,8 @@ class Serial206ProductionPrimitiveAdapter:
             "intent": "full_machine_force_abort_from_z_recovery_context",
             "source_method": "ClassControlInterface.forceAbortMotion",
             "source_anchor": "ClassControlInterface.cs:5095-5121",
-            "physical_scope": "all_present_motor_boards",
+            "physical_scope": "none_software_flags_and_waiters",
+            "software_abort": True, "stop_delivery_attempted": False,
             "z_only": False,
             "abort": _json_safe(abort),
             "stop": None,
@@ -2497,6 +2523,12 @@ class Serial206ProductionPrimitiveAdapter:
 
     def motor_thermal_door_status(self) -> Any:
         return self.tester.motor_thermal_door_status()
+
+    def motor_oem_confirm_thermal_door_closed(self) -> Any:
+        return self.tester.motor_oem_confirm_thermal_door_closed()
+
+    def motor_oem_board_move_steps(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_board_move_steps(*args, **kwargs)
 
     def _machine_config_bundle(self) -> Any:
         return self.tester._machine_config_bundle()
@@ -2934,9 +2966,10 @@ class Serial206ProductionPrimitiveAdapter:
         y: int,
         *,
         wait_timeout_s: float = 5.0,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
         """ClassControlInterface.moveXY source ordering and acceleration."""
-        result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
+        result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s), source_context=source_context)
         if self.y_provider is not None and isinstance(result, Mapping):
             result = dict(result)
             result["y_authority"] = _json_safe(
@@ -3045,6 +3078,7 @@ class Serial206ProductionPrimitiveAdapter:
         plate_on_gantry: int | None = None,
         location19_y: int | None = None,
         interrupt_reason: Callable[[], str | None] | None = None,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
         """Literal ClassControlInterface.moveTo branch ordering."""
         pseudo = int(pseudo_home_steps)
@@ -3236,7 +3270,7 @@ class Serial206ProductionPrimitiveAdapter:
             interruption = interrupted("move_xy")
             if interruption is not None:
                 return interruption
-            results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0))
+            results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0, source_context=source_context))
             branch = "confirmed_gripper_no_tip_moveXY"
         elif target["y"] < current["y"] or target["y"] < 46800:
             if plate_on_gantry in {4, 5}:
@@ -3391,7 +3425,15 @@ class Serial206ProductionPrimitiveAdapter:
         speed: int | None = None,
         acc: int | None = None,
         wait_timeout_s: float,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
+        # Source context, not the Linux worker thread: App.Main is STA and
+        # btnLOC1_Click calls both moveTo overloads then moveXY synchronously
+        # (BioXPControlLib IL_075c -> IL_007c -> IL_01e6). Other callers have
+        # not yet been sealed; retain their legacy WaitAll without claiming MTA.
+        if source_context not in (None, "ClassControlInterface.btnLOC1_Click"):
+            raise ValueError("unsealed_moveXY_source_context")
+        sta_sequential = source_context == "ClassControlInterface.btnLOC1_Click"
         requested = {"x": int(x), "y": int(y)}
         present_fn = getattr(self.tester, "motor_oem_axis_board_present", None)
         if callable(present_fn):
@@ -3406,6 +3448,9 @@ class Serial206ProductionPrimitiveAdapter:
             "board_present": present,
             "ignored_compatibility_inputs": {"speed": speed, "acc": acc, "wait_timeout_s": float(wait_timeout_s)},
             "oem_wait_timeout_ms": 5000,
+            "source_context": source_context,
+            "source_context_sealed": source_context is not None,
+            "wait_schedule": "STA_WaitAny_X_then_Y" if sta_sequential else "unsealed_legacy_WaitAll",
         }
         if not present["y"]:
             fallback = self.x_move_absolute(position_steps=requested["x"], source_mode="moveXY.missing_y.moveX", clamp_low_to_60=True)
@@ -3424,9 +3469,10 @@ class Serial206ProductionPrimitiveAdapter:
             })
             return receipt
         reference = self._reference_snapshot(("x", "y"), "ClassControlInterface.moveXY")
+        # CI.moveXY IL_0081 then IL_00b8: Y before X.
         before_rows = {
-            "x": self.tester.motor_get_position(5, motor=0),
             "y": self.tester.motor_get_position(4, motor=0),
+            "x": self.tester.motor_get_position(5, motor=0),
         }
         x_before = self._x_value(before_rows["x"])
         y_before = self._x_value(before_rows["y"])
@@ -3503,7 +3549,9 @@ class Serial206ProductionPrimitiveAdapter:
         x_acc = 400 if distances["x"] > 10000 else 350
         y_acc = 750 if distances["y"] > 10000 else 400
         acceleration_set = {"x": self.tester.motor_set_axis_param(5, 5, x_acc, motor=0), "y": self.tester.motor_set_axis_param(4, 5, y_acc, motor=0)}
-        setup_ok = all(isinstance(acceleration_set[axis], Mapping) and acceleration_set[axis].get("ok") is True and isinstance(acceleration_set[axis].get("readback"), Mapping) and acceleration_set[axis]["readback"].get("value") == expected for axis, expected in (("x", x_acc), ("y", y_acc)))
+        # setMaxAcc is a source void call; SAP replies have no readback.
+        setup_ok = all(isinstance(row, Mapping) and self._x_tmcl_success(row.get("ack")) for row in acceleration_set.values())
+        receipt["acceleration_evidence_kind"] = "controller_ack_not_parameter_readback"
         event_window = self.tester.begin_bus_event_window()
         commands: dict[str, Any] = {}
         launch_order: list[str] = []
@@ -3539,7 +3587,7 @@ class Serial206ProductionPrimitiveAdapter:
         many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
         pair_wait: Any = None
         if callable(many_wait):
-            pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=False)
+            pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=sta_sequential)
             waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
             if not waits:
                 waits = {"x": pair_wait, "y": pair_wait}
@@ -4253,11 +4301,15 @@ class Serial206OemInitializationProvider:
         self._tip_tray_state_reader: Callable[[int], Mapping[str, Any]] | None = None
         self._tip_tray_state_publisher: Callable[..., Mapping[str, Any]] | None = None
         self._x_interrupt_state_lock = threading.Lock()
-        self._x_interrupt_dispatch_lock = threading.Lock()
+        self._x_interrupt_dispatch_lock = threading.RLock()
+        self._x_interrupt_count = 0
+        self._x_interrupt_recovery_required = False
         self._x_interrupt_epoch = 0
         self._x_interrupt_active = False
         self._z_interrupt_state_lock = threading.Lock()
-        self._z_interrupt_dispatch_lock = threading.Lock()
+        self._z_interrupt_dispatch_lock = threading.RLock()
+        self._z_interrupt_count = 0
+        self._z_interrupt_recovery_required = False
         self._z_interrupt_epoch = 0
         self._z_interrupt_active = False
         self._memory_state: dict[str, Any] | None = None
@@ -4279,6 +4331,7 @@ class Serial206OemInitializationProvider:
     def bind_deck_semantic_state_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
         if not callable(reader):
             raise TypeError("deck semantic state reader must be callable")
+        self.invalidate_deck_authority_cache(reason="semantic_owner_bound")
         self._deck_semantic_state_reader = reader
 
     def bind_tip_tray_state_reader(self, reader: Callable[[int], Mapping[str, Any]]) -> None:
@@ -4290,6 +4343,26 @@ class Serial206OemInitializationProvider:
         if not callable(publisher):
             raise TypeError("tip tray state publisher must be callable")
         self._tip_tray_state_publisher = publisher
+        owner = getattr(publisher, "__self__", None)
+        binder = getattr(owner, "bind_tip_tray_constructor_reader", None)
+        if callable(binder):
+            # Software construction belongs to the persisted machine object;
+            # board-stamped transitions remain in the existing tray ledger.
+            binder(self._read_constructed_tip_tray)
+
+    def _read_constructed_tip_tray(self, tray_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            machine = self._load_state().get("machine_status") or {}
+            identity = machine.get("construction_id")
+            trays = machine.get("constructed_tip_trays")
+            if not identity or not isinstance(trays, list) or len(trays) != 5:
+                return None
+            tray = copy.deepcopy(trays[tray_id])
+        occupancy = tray.get("occupancy")
+        if (not isinstance(occupancy, list) or len(occupancy) != 96
+                or any(type(value) is not bool for value in occupancy)):
+            raise RuntimeError("durable OEM constructor tray occupancy is corrupt")
+        return {**tray, "construction_id": identity}
 
     def publish_tip_tray_transition(
         self,
@@ -4305,6 +4378,7 @@ class Serial206OemInitializationProvider:
         publisher = getattr(self, "_tip_tray_state_publisher", None)
         if not callable(publisher):
             raise RuntimeError("tip_tray_state_publisher_not_bound")
+        self.invalidate_deck_authority_cache(reason="tray_owner_publication")
         published = publisher(
             tray_id=tray_id,
             transition=transition,
@@ -4327,6 +4401,83 @@ class Serial206OemInitializationProvider:
         binder = getattr(owner, "bind_deck_owner_authority_reader", None)
         if callable(binder):
             binder(self.deck_owner_authority_stamps)
+        bootstrap = getattr(owner, "bootstrap_deck_semantic_state", None)
+        if callable(bootstrap):
+            self.bind_deck_semantic_bootstrap_publisher(bootstrap)
+
+    def bind_deck_semantic_bootstrap_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        """Bind migration independently of provider identity or first catalog read."""
+        if not callable(publisher):
+            raise TypeError("deck semantic bootstrap publisher must be callable")
+        self._deck_semantic_bootstrap_publisher = publisher
+
+    def _publish_constructed_tip_trays(self) -> None:
+        """Project the persisted constructor, never reconstruct a retained tray.
+
+        Board stamps describe publication ownership, not a physical observation.
+        The source constructor itself was persisted before any hardware binding.
+        """
+        with self._lock:
+            machine = dict(self._load_state().get("machine_status") or {})
+        construction_id = machine.get("construction_id")
+        trays = machine.get("constructed_tip_trays")
+        if not construction_id or not isinstance(trays, list):
+            return  # Legacy state is not evidence of a new construction.
+        publisher = self._tip_tray_state_publisher
+        if not callable(publisher):
+            raise RuntimeError("tip_tray_state_publisher_not_bound")
+        stamps = self.deck_owner_authority_stamps()
+        for tray in trays:
+            # Bootstrap precedes the first canonical semantic revision. There
+            # is no accepted cached movement snapshot to invalidate here. Keep
+            # the active sampler's token so concurrent external invalidations
+            # cannot be accidentally acknowledged as our own publication.
+            publisher(
+                tray_id=tray["tray_id"], transition="construct",
+                operation_id=f"{construction_id}:tray:{tray['tray_id']}",
+                command_id=construction_id,
+                provenance={"source_operation": "ClassMachineStatus.constructor",
+                            "physical_observation": False, "constructor": tray},
+                **stamps,
+            )
+
+    def refresh_deck_semantic_bootstrap(self, *, expected_generation: int, latch_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Retry only an untouched canonical row, from complete predecessor facts.
+
+        This is host-state migration, never a position/reference/tray observation.
+        Failed prerequisites remain visible and retryable on the SAME provider.
+        Existing revisions (including recovery/partial rows) are never replaced.
+        """
+        try:
+            reader = getattr(self, "_deck_semantic_state_reader", None)
+            publisher = getattr(self, "_deck_semantic_bootstrap_publisher", None)
+            if not callable(reader) or not callable(publisher):
+                raise RuntimeError("deck_semantic_bootstrap_not_bound")
+            current = reader()
+            if not isinstance(current, Mapping):
+                raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+            if current.get("semantic_state_revision") != 0:
+                result = {"status": "retained", "semantic_state_revision": current.get("semantic_state_revision")}
+                self._deck_semantic_bootstrap_diagnostic = dict(result)
+                return result
+            if current.get("ambiguity_state") != "none":
+                raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+            self._publish_constructed_tip_trays()
+            snapshot = self.deck_semantic_bootstrap_snapshot(expected_generation=expected_generation, latch_observation=latch_observation)
+            published = publisher(snapshot)
+            if not isinstance(published, Mapping):
+                raise RuntimeError("deck semantic bootstrap publisher returned malformed state")
+            result = {"status": "published", "semantic_state_revision": published["semantic_state_revision"]}
+        except Exception as exc:
+            # Persistence failure must remain distinct from the OEM source
+            # startup return; retain the error rather than turning it into success.
+            result = {"status": "blocked", "reason": str(exc), "error_type": type(exc).__name__}
+        self._deck_semantic_bootstrap_diagnostic = dict(result)
+        return result
+
+    def deck_semantic_bootstrap_diagnostic(self) -> dict[str, Any]:
+        """Cached producer result; no hardware or SQLite access for diagnostics."""
+        return dict(getattr(self, "_deck_semantic_bootstrap_diagnostic", {"status": "not_attempted"}))
 
     def deck_owner_authority_stamps(self) -> dict[str, int]:
         ownership_generation = int(self.generation_provider())
@@ -4356,6 +4507,7 @@ class Serial206OemInitializationProvider:
         publisher = getattr(self, "_deck_semantic_state_publisher", None)
         if not callable(publisher):
             raise RuntimeError("deck_semantic_state_publisher_not_bound")
+        self.invalidate_deck_authority_cache(reason="semantic_owner_publication")
         authority = self.deck_owner_authority_stamps()
         result = publisher(
             source_operation=source_operation,
@@ -4396,7 +4548,7 @@ class Serial206OemInitializationProvider:
         tip_location = semantic["tip_location"] if loaded else -1
         tip_dirty = semantic["tip_dirty"] if loaded else False
         if loaded and (
-            type(tip_location) is not int or tip_location not in {0, 1, 2, 3}
+            type(tip_location) is not int or tip_location not in {-1, 0, 1, 2, 3}
             or type(tip_dirty) is not bool
         ):
             raise RuntimeError("loaded_tip_authoritative_location_unavailable")
@@ -4474,7 +4626,7 @@ class Serial206OemInitializationProvider:
             },
         )
 
-    def deck_semantic_bootstrap_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+    def deck_semantic_bootstrap_snapshot(self, *, expected_generation: int, latch_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Project one complete predecessor SQLite state for canonical migration."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
@@ -4507,6 +4659,8 @@ class Serial206OemInitializationProvider:
         if type(tip_loaded) is not bool or type(tip_dirty) is not bool or type(clean_path) is not bool:
             raise RuntimeError("deck_bootstrap_branch_state_unavailable")
         tip_location = machine.get("tip_location", -1 if tip_loaded is False else None)
+        if latch_observation is not None:
+            machine.update(latch_observation)
         latch_status = machine.get("latch_status")
         machine_latch_closed = machine.get("latch_closed", machine.get("machine_latch_closed"))
         latch_observation_id = machine.get("latch_observation_id")
@@ -4551,6 +4705,13 @@ class Serial206OemInitializationProvider:
             raise RuntimeError(f"deck_semantic_state_reader_failed:{type(exc).__name__}") from exc
         if not isinstance(semantic, Mapping):
             raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+        if semantic.get("semantic_state_revision") == 0 and callable(
+            getattr(self, "_deck_semantic_bootstrap_publisher", None)
+        ):
+            refresh = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
+            if refresh["status"] == "blocked":
+                raise RuntimeError(str(refresh["reason"]))
+            semantic = reader()
         ambiguity_state = semantic.get("ambiguity_state")
         if ambiguity_state != "none" and not (
             allow_recovery and ambiguity_state in {"ambiguous", "recovery_required"}
@@ -4588,7 +4749,7 @@ class Serial206OemInitializationProvider:
         if not semantic["latch_observation_id"].strip():
             raise RuntimeError("deck_semantic_state_not_authoritative:latch_observation_id")
         tip_location = int(semantic["tip_location"])
-        if tip_location not in {-1, 0, 1, 2, 3} or (semantic["tip_loaded"] is True and tip_location < 0):
+        if tip_location not in {-1, 0, 1, 2, 3}:
             raise RuntimeError("deck_semantic_state_not_authoritative:tip_location")
         if int(semantic["pseudo_z_home"]) not in {500, 65000}:
             raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
@@ -4673,20 +4834,29 @@ class Serial206OemInitializationProvider:
                 },
             },
             "machine_status": {
+                "construction_id": str(uuid.uuid4()),
+                "constructed_tip_trays": [
+                    {"tray_id": tray_id, "tip_type": "T200" if tray_id == 3 else "T50",
+                     "location": (7, 8, 9, 10, 15)[tray_id],
+                     "plate_name": "TIP_HOTEL" if tray_id == 4 else "TIP_TRAY",
+                     "occupancy": [tray_id != 4] * 96, "tip_available": True}
+                    for tray_id in range(5)
+                ],
                 "stop_scripts": None,
                 "forceabort": None,
                 "pause_scripts": None,
                 "thermal_door_open": None,
-                "tip_loaded": None,
-                "tip_dirty": None,
+                # ClassMachineStatus fields: software defaults, not observations.
+                "tip_loaded": False,
+                "tip_dirty": False,
                 "tip_location": -1,
                 "clean_path": False,
                 "plate_on_gantry": None,
                 "current_tray": None,
                 "movable_plate_locations": copy.deepcopy(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS),
                 "psudo_z_home_steps": 65000,
-                "current_location": None,
-                "current_well": None,
+                "current_location": 0,  # OEM enum default LOC_MS, not Park.
+                "current_well": 0,  # OEM wellID default.
                 "system_status": None,
                 "initialization_complete": False,
                 "calibrated_ui_positions": {"x": None, "y": None, "z": None},
@@ -4763,13 +4933,20 @@ class Serial206OemInitializationProvider:
                     "reference_state": "desynced",
                     "last_failure": "legacy_x_state_missing_board_lifecycle_generation",
                 })
-        upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
+        # Migration is not a new OEM object construction. Missing legacy facts
+        # remain unknown and never receive a fresh tray-construction identity.
+        legacy_defaults = copy.deepcopy(defaults["machine_status"])
+        legacy_defaults.pop("construction_id", None)
+        legacy_defaults.pop("constructed_tip_trays", None)
+        for key in ("tip_loaded", "tip_dirty", "current_location", "current_well"):
+            legacy_defaults[key] = None
+        upgraded.setdefault("machine_status", copy.deepcopy(legacy_defaults))
         machine = upgraded.get("machine_status")
         if isinstance(machine, dict):
             machine.pop("source_tip_trays", None)
             machine.pop("tip_tray_availability", None)
             pseudo_home_missing = "psudo_z_home_steps" not in machine
-            for key, value in defaults["machine_status"].items():
+            for key, value in legacy_defaults.items():
                 machine.setdefault(key, copy.deepcopy(value))
             if pseudo_home_missing:
                 machine["psudo_z_home_steps"] = 500 if machine.get("tip_loaded") is True else 65000
@@ -4932,7 +5109,9 @@ class Serial206OemInitializationProvider:
         if self.state_store is not None and hasattr(self.state_store, "read_oem_serial206_initialization_state"):
             stored = self.state_store.read_oem_serial206_initialization_state()
             if stored is None:
-                return self._new_state()
+                # Persist actual construction once; a later read must not
+                # reconstruct trays or generate a new construction identity.
+                return self._save_state(self._new_state())
             stored_z = stored.get("z_lifecycle") if isinstance(stored, Mapping) else None
             stored_z_mapping = dict(stored_z) if isinstance(stored_z, Mapping) else {}
             board_generation_missing = (
@@ -5089,6 +5268,7 @@ class Serial206OemInitializationProvider:
         return self._validate_state(self._upgrade_state(self._memory_state))
 
     def _save_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        self.invalidate_deck_authority_cache(reason="provider_state_changed")
         payload = self._validate_state(self._upgrade_state(copy.deepcopy(dict(state))))
         if self.state_store is not None and hasattr(self.state_store, "write_oem_serial206_initialization_state"):
             self.state_store.write_oem_serial206_initialization_state(payload)
@@ -5429,6 +5609,105 @@ class Serial206OemInitializationProvider:
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
+    def _begin_aggregate_software_abort(self, *, include_z: bool = True) -> dict[str, int]:
+        # Only volatile owner fences here. Never acquire _lock, the DB writer
+        # lock, or the other axis's dispatch lease before releasing waiters.
+        if include_z:
+            with self._z_interrupt_state_lock:
+                self._z_interrupt_epoch += 1
+                self._z_interrupt_count += 1
+                self._z_interrupt_active = True
+        axes = {}
+        begin = getattr(self.state_store, "begin_axis_interrupt", None)
+        if callable(begin):
+            for axis in ("y", "z", "gripper"):
+                axes[axis] = begin(axis)
+        return axes
+
+    def _reconcile_aggregate_software_abort(
+        self, command_id: str, *, invalidate_x: bool = False,
+    ) -> dict[str, Any]:
+        recovery_owner = object()
+        with self._x_interrupt_state_lock:
+            covered_x_epoch = self._x_interrupt_epoch
+            if invalidate_x:
+                self._x_interrupt_recovery_owner = recovery_owner
+        with self._z_interrupt_state_lock:
+            covered_z_epoch = self._z_interrupt_epoch
+            self._z_interrupt_recovery_owner = recovery_owner
+        errors = {}
+        runtime_epochs = {}
+        begin = getattr(self.state_store, "begin_axis_interrupt", None)
+        if callable(begin):
+            for axis in ("y", "z", "gripper"):
+                runtime_epochs[axis] = begin(axis)
+        reconcile = getattr(self.state_store, "require_axis_reconciliation", None)
+        if callable(reconcile):
+            for axis in ("y", "z", "gripper"):
+                try:
+                    reconciled = reconcile(
+                        axis, receipt_id=command_id, expected_interrupt_epoch=runtime_epochs.get(axis))
+                    if not isinstance(reconciled, Mapping) or reconciled.get("ok") is not True:
+                        raise RuntimeError("axis reconciliation not verified")
+                except Exception as exc:
+                    errors[axis] = f"{type(exc).__name__}: {exc}"
+        try:
+            with self._lock:
+                state = self._load_state()
+                if invalidate_x:
+                    state["x_lifecycle"].update(
+                        state="failed_latched", active_receipt=None, pending_ticket=None,
+                        reference_state="desynced",
+                        last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                    )
+                state["z_lifecycle"].update(
+                    state="failed_latched", active_receipt=None,
+                    prepared_receipt=None, board_lifecycle_generation=None,
+                    awaiting_observation_receipt_id=None, reference_state="desynced",
+                    last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                )
+                self._save_state(state)
+                if self.reference_store is not None:
+                    self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
+                                          "serial206.aggregate.software_abort")
+                    if invalidate_x:
+                        invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                            axis="x", reason="Aggregate software Abort invalidated X authority.",
+                            source="serial206.aggregate.software_abort",
+                        ))
+                        if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
+                            raise RuntimeError("durable X reference invalidation unverified")
+        except Exception as exc:
+            errors["z_lifecycle"] = f"{type(exc).__name__}: {exc}"
+        # Keep retry admission fenced until the complete persistence attempt
+        # (including lifecycle/reference invalidation) has a result. Every
+        # member uses the generation captured before this attempt did any work.
+        with self._z_interrupt_state_lock:
+            current_owner = (covered_z_epoch == self._z_interrupt_epoch
+                             and self._z_interrupt_recovery_owner is recovery_owner)
+        if invalidate_x:
+            with self._x_interrupt_state_lock:
+                current_owner = current_owner and (covered_x_epoch == self._x_interrupt_epoch
+                    and self._x_interrupt_recovery_owner is recovery_owner)
+        for axis, epoch in runtime_epochs.items():
+            self.state_store.end_axis_interrupt(
+                axis, reconciled=not errors if current_owner else True,
+                expected_epoch=epoch, persistence_owner=current_owner)
+        if invalidate_x:
+            with self._x_interrupt_state_lock:
+                if (covered_x_epoch == self._x_interrupt_epoch
+                        and self._x_interrupt_recovery_owner is recovery_owner):
+                    self._x_interrupt_recovery_required = bool(errors)
+                self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
+        # The same owner method can retry only persistence after a failure;
+        # it never repeats software Abort (or any controller command).
+        with self._z_interrupt_state_lock:
+            if (covered_z_epoch == self._z_interrupt_epoch
+                    and self._z_interrupt_recovery_owner is recovery_owner):
+                self._z_interrupt_recovery_required = bool(errors)
+            self._z_interrupt_active = bool(self._z_interrupt_count or self._z_interrupt_recovery_required)
+        return {"ok": not errors, "errors": errors, "controller_dispatches": 0}
+
     def execute_x_stop_interrupt(
         self,
         values: Mapping[str, Any] | None = None,
@@ -5446,12 +5725,18 @@ class Serial206OemInitializationProvider:
         idempotency_key = values.get("idempotency_key")
         idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
         safe_inputs = _json_safe(values)
-        with self._x_interrupt_dispatch_lock:
+        # Software Abort has no controller sequence to serialize. In particular,
+        # another invocation must not wait behind persistence or a reentrant
+        # provider owner. Addressed Stop retains its existing dispatch lease.
+        with nullcontext() if abort else self._x_interrupt_dispatch_lock:
             with self._x_interrupt_state_lock:
                 self._x_interrupt_epoch += 1
                 interrupt_epoch = self._x_interrupt_epoch
+                self._x_interrupt_count += 1
                 self._x_interrupt_active = True
             started_at = time.time()
+            aggregate_axes = self._begin_aggregate_software_abort() if abort else {}
+            aggregate_reconciled = False
             try:
                 snapshot_active: Mapping[str, Any] | None = None
                 snapshot_lifecycle: dict[str, Any] = {}
@@ -5477,6 +5762,12 @@ class Serial206OemInitializationProvider:
                     "ok": False,
                     "failure": f"x_{selected}_result_not_mapping",
                 }
+                if abort:
+                    reconciliation = self._reconcile_aggregate_software_abort(str(command_id))
+                    aggregate_reconciled = reconciliation["ok"] is True
+                    result["aggregate_authority_invalidation"] = reconciliation
+                    if not aggregate_reconciled:
+                        result.update(ok=False, recovery_hold=True, persistence_state="recovery_required")
                 try:
                     with self._lock:
                         state = self._load_state()
@@ -5507,6 +5798,18 @@ class Serial206OemInitializationProvider:
                             "interrupted_command_ids": sorted(interrupted_ids),
                             "result": _json_safe(result),
                         }
+                        with self._x_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._x_interrupt_epoch
+                        if superseded:
+                            # A later Abort may finish while addressed Stop is in
+                            # flight. Its lifecycle, failure and receipts own the
+                            # current epoch; the old snapshot is not authority.
+                            state = self._load_state()
+                            lifecycle = state["x_lifecycle"]
+                            snapshot_lifecycle = copy.deepcopy(lifecycle)
+                            if not abort:
+                                result.update(ok=False, failure="x_interrupt_superseded_by_safety_command")
+                                receipt.update(status="failed", result=_json_safe(result))
                         prior_state = str(snapshot_lifecycle.get("state") or "unprepared")
                         prior_reference = str(snapshot_lifecycle.get("reference_state") or "unknown")
                         prior_board_generation = snapshot_lifecycle.get("board_lifecycle_generation")
@@ -5515,7 +5818,11 @@ class Serial206OemInitializationProvider:
                             and result.get("ok") is True
                             and result.get("controller_command_acknowledged") is True
                         )
-                        if abort:
+                        if superseded:
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = lifecycle.get("last_failure")
+                        elif abort:
                             next_state = "failed_latched"
                             next_reference = "desynced"
                             next_failure = {
@@ -5549,14 +5856,15 @@ class Serial206OemInitializationProvider:
                             next_state = "unprepared"
                             next_reference = prior_reference
                             next_failure = None
-                        lifecycle.update({
-                            "state": next_state,
-                            "generation": generation,
-                            "active_receipt": None,
-                            "pending_ticket": None,
-                            "reference_state": next_reference,
-                            "last_failure": next_failure,
-                        })
+                        if not superseded:
+                            lifecycle.update({
+                                "state": next_state,
+                                "generation": generation,
+                                "active_receipt": None,
+                                "pending_ticket": None,
+                                "reference_state": next_reference,
+                                "last_failure": next_failure,
+                            })
                         lifecycle["receipts"].append(receipt)
                         lifecycle["receipts"] = lifecycle["receipts"][-8:]
                         self._save_state(state)
@@ -5594,8 +5902,21 @@ class Serial206OemInitializationProvider:
                         "error": f"interrupt_persistence_failed:{type(persistence_exc).__name__}",
                     }
             finally:
+                if abort:
+                    if self.state_store is not None:
+                        for axis, epoch in aggregate_axes.items():
+                            self.state_store.end_axis_interrupt(
+                                axis, reconciled=aggregate_reconciled, expected_epoch=epoch)
+                    with self._z_interrupt_state_lock:
+                        self._z_interrupt_count -= 1
+                        # The helper owns publication (including retry). This
+                        # finalizer only releases its count, even after failure.
+                        self._z_interrupt_active = bool(
+                            self._z_interrupt_count or self._z_interrupt_recovery_required
+                        )
                 with self._x_interrupt_state_lock:
-                    self._x_interrupt_active = False
+                    self._x_interrupt_count -= 1
+                    self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
 
     def prepare_global_motion_without_motion(
         self, tester: Any, *, authority: Serial206MotionAuthority,
@@ -5730,6 +6051,18 @@ class Serial206OemInitializationProvider:
                 if self._z_interrupt_active:
                     return {"ok": False, "axis": "xyz", "failure": "z_safety_interrupt_in_progress"}
 
+        def stale_x_result() -> dict[str, Any] | None:
+            # Used by early returns as well as dispatch/completion. Never carry
+            # an old whole-provider snapshot across a reentrant owner callback.
+            with self._x_interrupt_state_lock:
+                stale = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
+            if not stale:
+                return None
+            return {"ok": False, "axis": "x", "intent": selected,
+                    "state": self._load_state()["x_lifecycle"]["state"],
+                    "result": {"ok": False, "failure": "x_intent_interrupted_by_safety_command"},
+                    "failure": "x_intent_interrupted_by_safety_command"}
+
         def move_to_interrupt_reason() -> str | None:
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
@@ -5790,6 +6123,9 @@ class Serial206OemInitializationProvider:
                     existing = self._durable_serial206_receipt("x", command_id)
                 if existing is None and idempotency_key is not None:
                     existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 if isinstance(existing, Mapping):
                     if (
                         existing.get("intent") != selected
@@ -5827,6 +6163,9 @@ class Serial206OemInitializationProvider:
                 else lifecycle.get("board_lifecycle_generation")
             )
             automatic_prerequisites: list[dict[str, Any]] = []
+            stale = stale_x_result()
+            if stale is not None:
+                return stale
             if selected == "observe_home":
                 expected_receipt = lifecycle.get("awaiting_observation_receipt_id")
                 observed_receipt = values.get("receipt_id")
@@ -5836,12 +6175,25 @@ class Serial206OemInitializationProvider:
                 if not confirmed:
                     desync = getattr(self.primitives, "_x_desync", None)
                     invalidation = desync("Operator rejected serial-206 X home observation.", "operator_observation") if callable(desync) else None
+                    state = self._load_state()
+                    lifecycle = state["x_lifecycle"]
+                    stale = stale_x_result()
+                    if stale is not None:
+                        return stale
                     lifecycle.update({"state": "failed_latched", "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": "operator_rejected_x_home"})
                     self._save_state(state)
                     return {"ok": False, "axis": "x", "state": "failed_latched", "failure": "operator_rejected_x_home", "reference_invalidation": _json_safe(invalidation)}
                 if self.reference_store is None:
                     return {"ok": False, "axis": "x", "state": prior_state, "failure": "x_reference_store_not_bound"}
                 reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=int(values.get("position_steps", 0)), source="serial206.x.operator_observation", motion_kind="home"))
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                stale = stale_x_result()
+                if stale is not None:
+                    self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis="x", reason="X observation crossed a safety interrupt.",
+                        source="serial206.x.operator_observation", motion_kind="home"))
+                    return stale
                 accepted = bool(isinstance(reference, Mapping) and reference.get("ok") is True and reference.get("durable_clean") is True)
                 lifecycle.update({"state": "referenced_ready" if accepted else "failed_latched", "reference_state": "referenced" if accepted else "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if accepted else _json_safe(reference)})
                 observation = {"ok": accepted, "axis": "x", "intent": "observe_home", "observed_receipt_id": observed_receipt, "confirmed": True, "reference_state": _json_safe(reference), "physical_motion_commanded": False, "physical_effect_verified": True, "failure": None if accepted else "x_reference_publication_failed"}
@@ -5864,6 +6216,13 @@ class Serial206OemInitializationProvider:
                     else None
                 )
                 ok = bool(ok and type(prepared_board_generation) is int)
+                # Preparation/board callbacks may update other axis owners even
+                # without an X interrupt. Publish into their latest full state.
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 lifecycle.update({"state": "prepared_unreferenced" if ok else "failed_latched", "generation": generation, "board_lifecycle_generation": prepared_board_generation if ok else None, "prepared_receipt": _json_safe(result), "reference_state": "desynced" if ok else "unknown", "last_failure": None if ok else _json_safe(result)})
                 self._save_state(state)
                 return {"ok": ok, "axis": "x", "intent": selected, "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "board_lifecycle_generation": prepared_board_generation}
@@ -5898,6 +6257,9 @@ class Serial206OemInitializationProvider:
                     }
                     z_lifecycle.update({"state": "executing", "active_receipt": z_active_receipt})
                 self._save_state(state)
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 try:
                     if selected == "move_absolute":
                         result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "ClassControlInterface.moveX"))
@@ -6079,6 +6441,42 @@ class Serial206OemInitializationProvider:
                     z_receipts = list(z_lifecycle.get("receipts") or [])
                     z_receipts.append(z_receipt)
                     z_lifecycle["receipts"] = z_receipts[-8:]
+            # This owner saved its executing snapshot before dispatch. Reentrant
+            # owners publish through _save_state too. Read their latest snapshot
+            # without invoking _load_state's restart recovery on our live command.
+            latest = copy.deepcopy(self._memory_state) if self._memory_state is not None else state
+            with self._x_interrupt_state_lock:
+                superseded = admitted_interrupt_epoch != self._x_interrupt_epoch
+            if superseded:
+                # Append only this stale attempt's failed receipts to the newer
+                # owner state. Do not replace its failure, preparation or history.
+                state = latest
+                lifecycle = state["x_lifecycle"]
+                z_lifecycle = state["z_lifecycle"]
+                result.update(ok=False, failure="x_intent_interrupted_by_safety_command", pending_motion=False)
+                if receipt is None:
+                    # A pending result can be invalidated by the completion
+                    # generation callback, after the earlier primitive check.
+                    receipt = {"command_id": command_id, "receipt_id": command_id,
+                               "intent": selected, "idempotency_key": idempotency_key,
+                               "idempotency_replay_enabled": True, "generation": generation,
+                               "inputs": safe_inputs, "status": "failed", "result": _json_safe(result)}
+                if selected == "enable_xyz_current" and z_receipt is None:
+                    z_receipt = {**copy.deepcopy(receipt), "stream": "z",
+                                 "x_generation": generation, "z_generation": z_lifecycle.get("generation"),
+                                 "z_board_lifecycle_generation": z_lifecycle.get("board_lifecycle_generation"),
+                                 "z_state": z_lifecycle.get("state"),
+                                 "z_reference_state": z_lifecycle.get("reference_state")}
+                for row, owner in ((receipt, lifecycle), (z_receipt, z_lifecycle)):
+                    if row is not None:
+                        row.update(status="failed", result=_json_safe(result))
+                        owner["receipts"].append(row)
+                        owner["receipts"] = owner["receipts"][-8:]
+            else:
+                latest["x_lifecycle"] = lifecycle
+                if selected == "enable_xyz_current":
+                    latest["z_lifecycle"] = z_lifecycle
+                state = latest
             self._save_state(state)
             if (
                 receipt is not None
@@ -6128,6 +6526,10 @@ class Serial206OemInitializationProvider:
         )
         if any(type(value) is not bool for value in flags):
             raise ValueError("X observation fields must be strict booleans")
+        with self._x_interrupt_state_lock:
+            admitted_interrupt_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "axis": "x", "failure": "x_safety_interrupt_in_progress"}
         with self._lock:
             state = self._load_state()
             lifecycle = state["x_lifecycle"]
@@ -6141,7 +6543,11 @@ class Serial206OemInitializationProvider:
             )
             if receipt is None:
                 receipt = self._durable_serial206_receipt("x", command_id)
+            with self._x_interrupt_state_lock:
+                interrupted = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
             current = bool(
+                not interrupted
+                and
                 isinstance(receipt, Mapping)
                 and receipt.get("status") == "completed"
                 and lifecycle.get("state") == "awaiting_operator_observation"
@@ -6174,8 +6580,8 @@ class Serial206OemInitializationProvider:
                 "reference_eligible": eligible,
                 "idempotency_replay_enabled": True,
             }
+            reference = None
             if eligible:
-                reference = None
                 if self.reference_store is not None:
                     observed_home_xy = isinstance(receipt, Mapping) and receipt.get("motion_kind") == "home_xy"
                     if observed_home_xy:
@@ -6211,6 +6617,26 @@ class Serial206OemInitializationProvider:
                     "awaiting_observation_receipt_id": None,
                     "last_failure": "x_observation_not_reference_eligible",
                 })
+            latest = self._load_state()
+            with self._x_interrupt_state_lock:
+                superseded = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
+            if superseded:
+                eligible = False
+                if reference is not None and self.reference_store is not None:
+                    axes = ("x", "y") if isinstance(receipt, Mapping) and receipt.get("motion_kind") == "home_xy" else ("x",)
+                    self.reference_store.mark_desynced_many([
+                        MarkAxisDesyncedCommand(axis=axis,
+                            reason="X observation publication crossed a safety interrupt.",
+                            source="serial206.x.operator_observation", motion_kind="home")
+                        for axis in axes
+                    ])
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                observation["failure"] = "x_intent_interrupted_by_safety_command"
+            else:
+                latest["x_lifecycle"] = lifecycle
+                state = latest
+            observation.update(status="completed" if eligible else "failed", reference_eligible=eligible)
             lifecycle["receipts"].append(observation)
             lifecycle["receipts"] = lifecycle["receipts"][-8:]
             self._save_state(state)
@@ -7136,13 +7562,58 @@ class Serial206OemInitializationProvider:
             ),
         }
 
+    def invalidate_deck_authority_cache(self, *, reason: str = "authority_changed") -> None:
+        """Owner-event hook: no hardware, SQLite, or motion-held mutex."""
+        self._deck_authority_cache_epoch = object()
+        self._deck_authority_cache = None
+        self._deck_authority_cache_reason = str(reason)
+
+    def deck_authority_cached_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Passive availability projection of an actual successful active sample.
+
+        The existing operator freshness window is 15 seconds, not a controller
+        timeout. This read never renews captured_at and cannot authorize execution;
+        execution must still use deck_authority_snapshot under its admission lease.
+        External reference/board/semantic owners must invalidate on mutations.
+        """
+        cached = getattr(self, "_deck_authority_cache", None)
+        if cached is None:
+            raise RuntimeError("deck_authority_cache_unavailable")
+        sampled_at, epoch, snapshot = cached
+        if epoch is not getattr(self, "_deck_authority_cache_epoch", None):
+            raise RuntimeError("deck_authority_cache_unavailable")
+        if snapshot["ownership_generation"] != expected_generation:
+            raise RuntimeError("ownership_generation_changed")
+        if time.monotonic() - sampled_at >= 15.0:
+            raise RuntimeError("deck_authority_cache_stale")
+        return copy.deepcopy(snapshot)
+
     def deck_authority_snapshot(
         self, *, expected_generation: int, _allow_recovery: bool = False
     ) -> dict[str, Any]:
         """Return one complete current-generation named-movement authority snapshot."""
+        self.invalidate_deck_authority_cache(reason="active_snapshot_pending")
+        cache_epoch = self._deck_authority_cache_epoch
+        sample_started = time.monotonic()
+        captured_at = time.time()
         observed_generation = int(self.generation_provider())
         if int(expected_generation) != observed_generation:
             raise RuntimeError("ownership_generation_changed")
+        initial_latch = None
+        reader = self._deck_semantic_state_reader
+        current = reader() if callable(reader) else {}
+        if current.get("semantic_state_revision") == 0:
+            with self._lock:
+                constructed = bool((self._load_state().get("machine_status") or {}).get("construction_id"))
+            if constructed:
+                # This is the explicit active collection, not a passive GET or
+                # constructor. Use the real observation once; never synthesize
+                # host/sensor latch values to publish software defaults.
+                initial_latch = self._fresh_deck_latch_observation()
+                if cache_epoch is not self._deck_authority_cache_epoch:
+                    raise RuntimeError("deck_authority_changed_during_collection")
+                self.refresh_deck_semantic_bootstrap(
+                    expected_generation=expected_generation, latch_observation=initial_latch)
         semantic = self._canonical_deck_semantic_state(allow_recovery=_allow_recovery)
         clean_path = self._clean_path_from_tip_tray_authority(
             ownership_generation=int(semantic["ownership_generation"]),
@@ -7184,7 +7655,7 @@ class Serial206OemInitializationProvider:
         coordinates = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
         if any(type(value) is not int for value in coordinates.values()):
             raise RuntimeError("deck_controller_positions_not_authoritative")
-        latch = self._fresh_deck_latch_observation()
+        latch = initial_latch if initial_latch is not None else self._fresh_deck_latch_observation()
         if (
             int(semantic["ownership_generation"]) != observed_generation
             or int(semantic["board_epoch_4"]) != int(board_epoch_4)
@@ -7201,7 +7672,7 @@ class Serial206OemInitializationProvider:
             "y": y_interrupt_epoch,
             "z": int(self._z_interrupt_epoch),
         }
-        return {
+        snapshot = {
             "ownership_generation": observed_generation,
             "provider_owner_id": self._deck_owner_id,
             "board_epoch_4": int(board_epoch_4),
@@ -7213,7 +7684,7 @@ class Serial206OemInitializationProvider:
             "safety_epochs": safety_epochs,
             "latch_observation_id": str(latch["latch_observation_id"]),
             "controller_position_observation_id": position_observation_id,
-            "captured_at": time.time(),
+            "captured_at": captured_at,
             "current_x": int(coordinates["x"]),
             "current_y": int(coordinates["y"]),
             "current_z": int(coordinates["z"]),
@@ -7229,6 +7700,24 @@ class Serial206OemInitializationProvider:
             "latch_status": bool(latch["latch_status"]),
             "machine_latch_closed": bool(latch["machine_latch_closed"]),
         }
+        final_stamps = self.deck_owner_authority_stamps()
+        final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+        final_semantic = self._canonical_deck_semantic_state(allow_recovery=_allow_recovery)
+        if (
+            cache_epoch is not self._deck_authority_cache_epoch
+            or any(final_stamps[key] != snapshot[key] for key in final_stamps)
+            or any(
+                (final_refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                or (final_refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                for axis, version in reference_versions.items()
+            )
+            or final_semantic["semantic_state_revision"] != semantic["semantic_state_revision"]
+            or final_semantic["transition_provenance_digest"] != semantic["transition_provenance_digest"]
+        ):
+            raise RuntimeError("deck_authority_changed_during_observation")
+        if not _allow_recovery:
+            self._deck_authority_cache = (sample_started, cache_epoch, copy.deepcopy(snapshot))
+        return snapshot
 
     def deck_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
         """Bind exact semantic observation to current controller coordinates; never infer nearest."""
@@ -7522,7 +8011,13 @@ class Serial206OemInitializationProvider:
             raise RuntimeError(f"durable Z reference invalidation failed: {result}")
         return dict(result)
 
-    def _z_mark_referenced(self, *, source: str, motion_kind: str) -> dict[str, Any]:
+    def _z_mark_referenced(
+        self, *, source: str, motion_kind: str, expected_interrupt_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        with self._z_interrupt_state_lock:
+            epoch = self._z_interrupt_epoch if expected_interrupt_epoch is None else expected_interrupt_epoch
+            if self._z_interrupt_active or epoch != self._z_interrupt_epoch:
+                raise RuntimeError("Z reference superseded by safety interrupt")
         if self.reference_store is None:
             raise RuntimeError("durable Z reference publication unavailable: reference store not bound")
         try:
@@ -7538,6 +8033,11 @@ class Serial206OemInitializationProvider:
             raise RuntimeError(
                 f"durable Z reference publication failed: {type(exc).__name__}: {exc}"
             ) from exc
+        with self._z_interrupt_state_lock:
+            interrupted = self._z_interrupt_active or epoch != self._z_interrupt_epoch
+        if interrupted:
+            self._z_mark_desynced("Z publication crossed a safety interrupt.", source)
+            raise RuntimeError("Z reference superseded by safety interrupt")
         if not self._z_reference_commit_verified(result, expected_state="referenced"):
             raise RuntimeError(f"durable Z reference publication failed: {result}")
         return dict(result)
@@ -7568,12 +8068,24 @@ class Serial206OemInitializationProvider:
             else f"z_{interrupt_intent}_{int(time.time() * 1000)}"
         )
         safe_inputs = _json_safe(values)
-        with self._z_interrupt_dispatch_lock:
+        # Software Abort has no controller sequence to serialize. In particular,
+        # another invocation must not wait behind persistence or a reentrant
+        # provider owner. Addressed Stop retains its existing dispatch lease.
+        with nullcontext() if abort else self._z_interrupt_dispatch_lock:
             with self._z_interrupt_state_lock:
                 self._z_interrupt_epoch += 1
                 interrupt_epoch = self._z_interrupt_epoch
+                self._z_interrupt_count += 1
                 self._z_interrupt_active = True
             dispatch_started_at = time.time()
+            aggregate_axes = {}
+            aggregate_reconciled = False
+            if abort:
+                with self._x_interrupt_state_lock:
+                    self._x_interrupt_epoch += 1
+                    self._x_interrupt_count += 1
+                    self._x_interrupt_active = True
+                aggregate_axes = self._begin_aggregate_software_abort(include_z=False)
             try:
                 snapshot_active: Mapping[str, Any] | None = None
                 try:
@@ -7597,6 +8109,12 @@ class Serial206OemInitializationProvider:
                     "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
+                if abort:
+                    reconciliation = self._reconcile_aggregate_software_abort(
+                        str(command_id), invalidate_x=True,
+                    )
+                    aggregate_reconciled = reconciliation["ok"] is True
+                    result["aggregate_authority_invalidation"] = reconciliation
 
                 try:
                     with self._lock:
@@ -7659,6 +8177,11 @@ class Serial206OemInitializationProvider:
                             and controller_acknowledged
                             and terminal_verified
                         )
+                        with self._z_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._z_interrupt_epoch
+                        if superseded:
+                            stop_verified = False
+                            result["failure"] = "z_interrupt_superseded_by_safety_command"
                         result.update(
                             {
                                 "ok": stop_verified,
@@ -7691,7 +8214,7 @@ class Serial206OemInitializationProvider:
                         }
                         must_desync = bool(abort or interrupted_ids or not stop_verified or not generation_match)
                         authority_state_verified = True
-                        if must_desync:
+                        if must_desync and not superseded:
                             z.update(
                                 {
                                     "state": "failed_latched",
@@ -7731,6 +8254,16 @@ class Serial206OemInitializationProvider:
                                 receipt["status"] = "failed"
                             receipt["authority_state_verified"] = authority_state_verified
                             receipt["result"] = _json_safe(result)
+                        with self._z_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._z_interrupt_epoch
+                        if superseded:
+                            # Reference callbacks can reenter the aggregate owner
+                            # too. Keep its full state and only append this receipt.
+                            state = self._load_state()
+                            z = state["z_lifecycle"]
+                            stop_verified = False
+                            result.update(ok=False, failure="z_interrupt_superseded_by_safety_command")
+                            receipt.update(status="failed", result=_json_safe(result))
                         durable_receipt = self._append_z_receipt(z, receipt)
                         state = self._save_state(state)
                         self._persist_z_receipt(durable_receipt)
@@ -7760,8 +8293,20 @@ class Serial206OemInitializationProvider:
                     }
 
             finally:
+                if abort:
+                    if self.state_store is not None:
+                        for axis, epoch in aggregate_axes.items():
+                            self.state_store.end_axis_interrupt(
+                                axis, reconciled=aggregate_reconciled, expected_epoch=epoch)
+                    with self._x_interrupt_state_lock:
+                        self._x_interrupt_count -= 1
+                        self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
+                # The helper owns hold publication; release only our count.
                 with self._z_interrupt_state_lock:
-                    self._z_interrupt_active = False
+                    self._z_interrupt_count -= 1
+                    self._z_interrupt_active = bool(
+                        self._z_interrupt_count or self._z_interrupt_recovery_required
+                    )
 
     def execute_z_intent(
         self,
@@ -7787,6 +8332,8 @@ class Serial206OemInitializationProvider:
                     "ok": False,
                     "blockers": ["z_safety_interrupt_in_progress"],
                 }
+        with self._x_interrupt_state_lock:
+            admitted_x_interrupt_epoch = self._x_interrupt_epoch
         with self._lock:
             with self._z_interrupt_state_lock:
                 if (
@@ -8034,6 +8581,9 @@ class Serial206OemInitializationProvider:
             expected_noop_pseudo_home: int | None = None
             expected_noop_effective_target: int | None = None
             try:
+                with self._z_interrupt_state_lock:
+                    if self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch:
+                        raise RuntimeError("Z admission superseded before controller dispatch")
                 if intent == "prepare":
                     preparer = self.preparation_provider
                     if preparer is None:
@@ -8421,6 +8971,7 @@ class Serial206OemInitializationProvider:
                 try:
                     reference = self._z_mark_referenced(
                         source=f"serial206.z.{intent}",
+                        expected_interrupt_epoch=admitted_interrupt_epoch,
                         motion_kind=(
                             "manual_set_home" if intent == "set_home"
                             else "source_cached_noop" if result.get("completion_class") == "source_cached_noop"
@@ -8434,7 +8985,14 @@ class Serial206OemInitializationProvider:
                     reference_published = True
                     result["reference_persistence_ok"] = True
                     result["reference_persistence"] = _json_safe(reference)
+            with self._z_interrupt_state_lock:
+                interrupted_by_safety = bool(
+                    self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+                )
             if interrupted_by_safety:
+                ok = False
+                reference_published = False
+                result.update(ok=False, failure="z_intent_interrupted_by_safety_stop")
                 result = {
                     **dict(result),
                     "failure_stop": {
@@ -8547,6 +9105,13 @@ class Serial206OemInitializationProvider:
                     "last_failure": _json_safe(receipt),
                 })
                 self._z_mark_desynced(f"Failed serial-206 Z intent {intent}.", f"serial206.z.{intent}")
+            with self._x_interrupt_state_lock:
+                x_interrupted = admitted_x_interrupt_epoch != self._x_interrupt_epoch
+            if x_interrupted:
+                # A reentrant aggregate Abort may already have committed X. Do
+                # not overwrite it with this Z operation's earlier snapshot.
+                state["x_lifecycle"] = self._load_state()["x_lifecycle"]
+                x_recovery_receipt = None
             durable_receipt = self._append_z_receipt(z, receipt)
             try:
                 state = self._save_state(state)
@@ -8557,7 +9122,6 @@ class Serial206OemInitializationProvider:
                         "serial206.z.reference_commit_compensation",
                     )
                 raise
-            self._persist_z_receipt(durable_receipt)
             if ok and intent == "set_clean_path" and callable(
                 getattr(self, "_deck_semantic_state_publisher", None)
             ):
@@ -8575,6 +9139,23 @@ class Serial206OemInitializationProvider:
                 and hasattr(self.state_store, "append_serial206_receipt")
             ):
                 self.state_store.append_serial206_receipt("x", x_recovery_receipt)
+            with self._z_interrupt_state_lock:
+                interrupted_by_safety = bool(
+                    self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+                )
+            if interrupted_by_safety:
+                ok = False
+                result.update(ok=False, failure="z_intent_interrupted_by_safety_stop")
+                result_summary.update(ok=False, failure=result["failure"])
+                receipt.update(status="failed", result=_json_safe(result), result_summary=result_summary)
+                z = state["z_lifecycle"]
+                z.update(state="failed_latched", reference_state="desynced",
+                         prepared_receipt=None, board_lifecycle_generation=None,
+                         awaiting_observation_receipt_id=None, last_failure=_json_safe(receipt))
+                self._z_mark_desynced("Z completion crossed a safety interrupt.", "serial206.z.completion")
+                durable_receipt = self._append_z_receipt(z, receipt)
+                state = self._save_state(state)
+            self._persist_z_receipt(durable_receipt)
             z = state["z_lifecycle"]
             return {"ok": ok, "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
 
@@ -8591,6 +9172,12 @@ class Serial206OemInitializationProvider:
         note: str,
         expected_generation: int,
     ) -> dict[str, Any]:
+        with self._z_interrupt_state_lock:
+            admitted_interrupt_epoch = self._z_interrupt_epoch
+            if self._z_interrupt_active:
+                raise ValueError("Z observation superseded by safety interrupt")
+        with self._x_interrupt_state_lock:
+            admitted_x_interrupt_epoch = self._x_interrupt_epoch
         if verdict not in {"pass", "fail"}:
             raise ValueError("Z observation verdict must be pass or fail")
         for name, value in (
@@ -8681,6 +9268,17 @@ class Serial206OemInitializationProvider:
                 "controller_terminal_state_verified": False,
             }
 
+            with self._z_interrupt_state_lock:
+                interrupted = self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+            if interrupted:
+                authority_current = False
+                state = self._load_state()
+                z = state["z_lifecycle"]
+                receipts = list(z.get("receipts") or [])
+                observation.update(authority_current=False, reference_eligible=False,
+                                   error="z_observation_interrupted_by_safety_command")
+                observation_receipt.update(observation, status="failed")
+
             # A movement-only observation of a failed/obsolete command is useful
             # historical evidence but can never publish reference authority.
             if not authority_current:
@@ -8697,7 +9295,7 @@ class Serial206OemInitializationProvider:
                 ):
                     self.state_store.append_serial206_receipt("z", match)
                 return {
-                    "ok": True,
+                    "ok": not interrupted,
                     "annotation_only": True,
                     "observation": observation,
                     "observation_receipt": _json_safe(observation_receipt),
@@ -8746,6 +9344,7 @@ class Serial206OemInitializationProvider:
                         reference = self._z_mark_referenced(
                             source="serial206.z.operator_observation",
                             motion_kind="home",
+                            expected_interrupt_epoch=admitted_interrupt_epoch,
                         )
                     except Exception as exc:
                         publication_error = f"{type(exc).__name__}: {exc}"
@@ -8795,6 +9394,25 @@ class Serial206OemInitializationProvider:
                     }
                 )
 
+            with self._z_interrupt_state_lock:
+                interrupted = self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+            if interrupted:
+                operation_ok = False
+                error = "z_observation_interrupted_by_safety_command"
+                self._z_mark_desynced("Z observation crossed a safety interrupt.", "serial206.z.observation")
+                state = self._load_state()
+                z = state["z_lifecycle"]
+                receipts = list(z.get("receipts") or [])
+                z.update(state="failed_latched", reference_state="desynced",
+                         prepared_receipt=None, board_lifecycle_generation=None,
+                         awaiting_observation_receipt_id=None)
+            with self._x_interrupt_state_lock:
+                x_interrupted = admitted_x_interrupt_epoch != self._x_interrupt_epoch
+            if x_interrupted:
+                state["x_lifecycle"] = self._load_state()["x_lifecycle"]
+            if not operation_ok:
+                observation.update(reference_eligible=False, error=error)
+                observation_receipt.update(status="failed", reference_eligible=False, error=error)
             match["operator_assessment"] = _json_safe(observation)
             match["physical_effect_verified"] = bool(physical_motion_observed)
             match["observation_receipt_id"] = observation_id
@@ -9045,6 +9663,7 @@ class Serial206OemInitializationProvider:
         }
 
     def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+        self.invalidate_deck_authority_cache(reason="deck_execution_started")
         if authority_snapshot is None:
             return self._canonical_deck_semantic_state()
         if not isinstance(authority_snapshot, Mapping):
@@ -9081,6 +9700,7 @@ class Serial206OemInitializationProvider:
         *,
         location_id: int,
         camera_offset: bool = False,
+        barcode: bool = False,
         authority_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute the finite diagnostic offset overload through OEM primitives."""
@@ -9090,11 +9710,16 @@ class Serial206OemInitializationProvider:
             raise ValueError("unknown finite OEM location ordinal")
         if type(camera_offset) is not bool:
             raise ValueError("camera_offset must be bool")
+        # btnLOC1_Click IL_065e..075c: ordinary checkbox and barcode are
+        # distinct callers of the offset overload, not synonyms for TC/RC.
+        if type(barcode) is not bool or (barcode and (location_id not in {2, 3} or not camera_offset)):
+            raise ValueError("barcode requires TC/RC with camera offsets")
         table = load_bound_oem_position_table()
         target_name = LOCATION_ID_TO_NAME[location_id]
         target = table.resolve(location_id=target_name)
         camera = table.resolve(location_id="CAMERA_OFFSET") if camera_offset else None
-        if camera is not None and location_id in {2, 3}:
+        if barcode:
+            assert camera is not None
             source_x = {2: -11847, 3: -23930}[location_id]
             offset_x = source_x + int(camera.base_coordinates["x"])
             offset_y = 7582 + int(camera.base_coordinates["y"])
@@ -9126,6 +9751,7 @@ class Serial206OemInitializationProvider:
             tip_loaded=bool(semantics["tip_loaded"]),
             plate_on_gantry=semantics.get("plate_on_gantry"),
             location19_y=int(location19.base_coordinates["y"]),
+            source_context="ClassControlInterface.btnLOC1_Click",
         )
         ok = isinstance(result, Mapping) and result.get("ok") is True
         return {
@@ -11057,9 +11683,15 @@ class Serial206OemInitializationProvider:
         motion = state.get("initialize_motion_ledger") if isinstance(state, Mapping) else None
         machine = state.get("machine_status") if isinstance(state, Mapping) else None
         terminal = motion.get("terminal_state") if isinstance(motion, Mapping) else "failed_closed"
+        bootstrap = None
+        if terminal == "initializeMotion_complete" and callable(
+            getattr(self, "_deck_semantic_bootstrap_publisher", None)
+        ):
+            bootstrap = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
         return {
             "ok": bool(ok),
             "ready": bool(terminal == "initializeMotion_complete"),
+            "deck_semantic_bootstrap": bootstrap,
             "state": terminal,
             "schema": "bioxp.serial206_initializeMotion.v2",
             "mode": "live",
@@ -11425,10 +12057,7 @@ class Serial206OemInitializationProvider:
         if stage == "gripper-current-31":
             return p.motor_set_axis_param(4, 6, 31, motor=2)
         if stage == "gripper-clear-10000":
-            return self._merge_move_wait(
-                p.motor_move_relative(4, 10000, motor=2),
-                p.motor_wait_stopped(4, motor=2, timeout_s=min(bounded, 20.0), require_seen_nonzero=True),
-            )
+            return p.motor_oem_board_move_steps(4, 10000, motor=2, axis="g", timeout_s=20.0)
         if stage == "gripper-home":
             return p.motor_oem_axis_search_home(
                 "g",
@@ -11458,54 +12087,30 @@ class Serial206OemInitializationProvider:
         if stage == "y-home":
             return p.motor_oem_home_axis("y", startup=True, speed=250, timeout_s=min(bounded, 45.0))
         if stage == "door-home":
-            result = p.motor_oem_door_search_home(startup=True, timeout_s=min(bounded, 45.0))
-            status_after = result.get("status_after") if isinstance(result, Mapping) else None
-            predicates = status_after.get("oem_predicates") if isinstance(status_after, Mapping) else None
-            closed = predicates.get("tcDoorClosed") if isinstance(predicates, Mapping) else None
-            binding = p.oem_initialize_motors_branch_binding()
-            serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
-            if type(serial_number) is int and serial_number > 9 and closed is False and camera_calibrated is True:
-                p.motor_oem_open_thermal_door(timeout_s=min(bounded, 20.0))
-                raise RuntimeError("Cannot close thermal cycler door!")
-            return dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "door_search_home_result_invalid"}
+            return p.motor_oem_door_search_home(startup=True, timeout_s=min(bounded, 45.0))
         if stage == "door-closed-predicate":
-            status = p.motor_thermal_door_status()
-            predicates = status.get("oem_predicates") if isinstance(status, Mapping) else None
-            closed = predicates.get("tcDoorClosed") if isinstance(predicates, Mapping) else None
-            source = predicates.get("closed_source") if isinstance(predicates, Mapping) else None
             binding = p.oem_initialize_motors_branch_binding()
             serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
-            if type(serial_number) is not int or type(camera_calibrated) is not bool:
-                return {
-                    **(dict(status) if isinstance(status, Mapping) else {}),
-                    "ok": False,
-                    "failure": "initializeMotors_serial_camera_branch_authority_not_bound",
-                    "branch_binding": _json_safe(binding),
-                }
-            if type(closed) is not bool or source != "queryHome(ThermalDoor)":
-                return {
-                    **(dict(status) if isinstance(status, Mapping) else {}),
-                    "ok": False,
-                    "failure": "tcDoorClosed_source_predicate_required",
-                    "branch_binding": _json_safe(binding),
-                }
-            source_condition_active = serial_number > 9 and closed is False and camera_calibrated is True
-            opened = None
-            if source_condition_active:
+            if type(serial_number) is not int:
+                raise RuntimeError("initializeMotors_serial_camera_branch_authority_not_bound")
+            status = {}
+            condition = False
+            if serial_number > 9:
+                status = p.motor_oem_confirm_thermal_door_closed()
+                closed = status["oem_predicates"]["tcDoorClosed"]
+                if closed is False:
+                    camera_calibrated = binding.get("camera_calibrated")
+                    if type(camera_calibrated) is not bool:
+                        raise RuntimeError("initializeMotors_serial_camera_branch_authority_not_bound")
+                    condition = camera_calibrated
+            if condition:
                 p.motor_oem_open_thermal_door(timeout_s=min(bounded, 20.0))
                 raise RuntimeError("Cannot close thermal cycler door!")
-            return {
-                **dict(status),
-                "ok": True,
-                "failure": None,
-                "source_condition": "SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated",
-                "source_condition_active": False,
-                "branch_binding": _json_safe(binding),
-                "openThermalDoor": None,
-                "open_attempted_before_throw": False,
-            }
+            return {**status, "ok": True, "source_condition_active": False,
+                    "branch_binding": dict(binding), "source_condition_evaluated": True,
+                    "confirm_axis_evaluated": serial_number > 9,
+                    "source_condition": "SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated",
+                    "open_attempted_before_throw": False}
         if stage == "y-set-home":
             return p.motor_set_home(4, motor=0)
         if stage == "ui-zero-calibrated":
@@ -11746,21 +12351,10 @@ class Serial206OemInitializationProvider:
                 )
             )
         elif spec.key == "gripper-clear-10000":
-            move = result.get("move")
-            positions = result.get("position")
-            before = position(positions.get("before")) if isinstance(positions, Mapping) else None
-            after = position(positions.get("after")) if isinstance(positions, Mapping) else None
-            ack = move.get("ack") if isinstance(move, Mapping) else None
-            ok = bool(
-                isinstance(move, Mapping)
-                and move.get("ok") is True
-                and ack_ok(ack)
-                and wait_ok(result.get("wait"))
-                and before is not None
-                and after is not None
-                and after != before
-                and abs(after - before) <= spec.bound
-            )
+            # initializeMotors ignores board moveSteps' numeric return. A
+            # nonthrowing timeout/no-op is not a measured-motion assertion.
+            ack = result.get("ack")
+            ok = result.get("source_call_completed") is True and type(result.get("board_wrapper_return")) is int
         elif spec.key in {"gripper-current-31", "x-speed-1700", "gripper-idle-current-10"}:
             expected = {"gripper-current-31": 31, "x-speed-1700": 1700, "gripper-idle-current-10": 10}[spec.key]
             ok = source_write_ok(result, expected)
@@ -11774,33 +12368,16 @@ class Serial206OemInitializationProvider:
             ok = result.get("settled") is True and result.get("settle_ms") == expected
         elif spec.key == "door-closed-predicate":
             predicate = result.get("oem_predicates")
-            pos = result.get("position")
-            speed = result.get("speed")
-            binding = result.get("branch_binding")
-            after = position(pos)
-            serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
+            binding = result.get("branch_binding") or {}
+            serial_number = binding.get("serial_number")
             closed = predicate.get("tcDoorClosed") if isinstance(predicate, Mapping) else None
-            expected_condition = bool(
-                type(serial_number) is int
-                and type(camera_calibrated) is bool
-                and serial_number > 9
-                and closed is False
-                and camera_calibrated is True
-            )
-            ok = bool(
-                result.get("ok") is True
-                and result.get("source_condition_active") is False
-                and expected_condition is False
-                and isinstance(predicate, Mapping)
-                and type(closed) is bool
-                and predicate.get("closed_source") == "queryHome(ThermalDoor)"
-                and after is not None
-                and isinstance(speed, Mapping)
-                and type(speed.get("speed")) is int
-                and speed.get("speed") == 0
-                and ack_ok(speed.get("ack"))
-            )
+            ok = bool(result.get("ok") is True
+                      and result.get("source_condition_evaluated") is True
+                      and result.get("source_condition_active") is False
+                      and type(serial_number) is int
+                      and (serial_number <= 9 or
+                           (type(closed) is bool and
+                            (closed or binding.get("camera_calibrated") is False))))
             switch = predicate
         elif spec.key == "ui-zero-calibrated":
             writes = result.get("writes")

@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import logging
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -875,6 +876,8 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 async def lifespan(app: FastAPI):
     global _tester, _tester_quarantine, _startup_error, _pipette_transport, _pipette_receipts
     global _operator_control_plane_installed, _operator_reports_installed
+    global _receiver_audit_shutdown
+    _receiver_audit_shutdown = None
     try:
         app.state.release_identity = configure_release_identity()
     except ReleaseIdentityError as exc:
@@ -1047,6 +1050,9 @@ async def lifespan(app: FastAPI):
                         command_plane_failure = exc
                         shutdown_errors.append(f"operator command plane shutdown: {exc}")
                 if command_plane_failure is not None:
+                    _receiver_audit_shutdown = {"state": "skipped", "reason": "command_workers_active",
+                                                "durable_ownership_claimed": False}
+                    app.state.receiver_audit_shutdown = _receiver_audit_shutdown
                     _startup_error = (
                         "BioXP lifespan shutdown blocked transport teardown because operator "
                         f"command workers remain active: {command_plane_failure}"
@@ -1061,6 +1067,7 @@ async def lifespan(app: FastAPI):
                     except Exception as exc:
                         cleanup_errors.append(f"pipette transport close: {exc}")
                 owners = (_tester,) if _tester_quarantine is _tester else (_tester, _tester_quarantine)
+                audit_buffers = _receiver_audit_buffers(owners)
                 for owner in owners:
                     if owner is None:
                         continue
@@ -1097,6 +1104,20 @@ async def lifespan(app: FastAPI):
                     )
                     if cleanup_errors:
                         _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
+        # No transport/controller ownership lock may cover this storage wait.
+        # If teardown could not prove producer shutdown, do not close its audit
+        # admission. USB quarantine truth remains independent of logging truth.
+        if failed_owner is not None:
+            _receiver_audit_shutdown = {"state": "skipped", "reason": "usb_teardown_incomplete",
+                                        "durable_ownership_claimed": False}
+        else:
+            _receiver_audit_shutdown = {"state": "draining", "durable_ownership_claimed": False}
+            _receiver_audit_shutdown = await asyncio.to_thread(_drain_receiver_audits, audit_buffers)
+        app.state.receiver_audit_shutdown = _receiver_audit_shutdown
+        if _receiver_audit_shutdown["state"] != "complete":
+            logging.getLogger(__name__).warning(
+                "Receiver audit shutdown %s; buffered evidence is not confirmed durable; "
+                "USB teardown status is separate", _receiver_audit_shutdown)
 
 
 app = FastAPI(
@@ -4654,6 +4675,63 @@ def _domain_observation(projection: dict[str, Any], domain: str) -> Any:
     return row.get("observation") if isinstance(row, dict) and row.get("status") == "observed" else None
 
 
+# One application-wide logging join budget, not a USB teardown timeout.
+# A timed-out daemon writer is retained; no commit cancellation/retry is implied.
+_RECEIVER_AUDIT_DRAIN_TIMEOUT_S = 2.0
+_receiver_audit_shutdown = None
+
+
+def _receiver_audit_buffers(owners):
+    from .receiver_audit_buffer import current_receiver_audit_buffer
+    buffers = []
+    for audit in [current_receiver_audit_buffer(),
+                  *(getattr(owner, "_receiver_audit", None) for owner in owners)]:
+        if audit is not None and all(audit is not other for other in buffers):
+            buffers.append(audit)
+    return buffers
+
+
+def _public_receiver_audit_buffer(audit):
+    status = audit.status()
+    # Storage exceptions may contain filesystem paths; expose a stable reason,
+    # not exception text, on the unauthenticated compatibility status surface.
+    status["writer_error"] = "writer_failed" if status["writer_error"] else None
+    return status
+
+
+def _receiver_audit_health():
+    owners = tuple(owner for owner in (_tester, _tester_quarantine) if owner is not None)
+    buffers = _receiver_audit_buffers(owners)
+    statuses = [_public_receiver_audit_buffer(audit) for audit in buffers]
+    setup_failed = any(getattr(owner, "_receiver_audit_setup_error", None) for owner in owners)
+    hook_failures = sum(getattr(getattr(owner, "novo_router", None), "_audit_hook_failures", 0)
+                        for owner in {id(owner): owner for owner in owners}.values())
+    return {"available": bool(statuses), "healthy": bool(statuses) and not setup_failed
+            and not hook_failures and all(row["healthy"] for row in statuses),
+            "setup_error": "setup_failed" if setup_failed else None,
+            "hook_failures": hook_failures, "buffers": statuses,
+            "shutdown": _receiver_audit_shutdown, "durable_ownership_claimed": False}
+
+
+def _drain_receiver_audits(buffers):
+    """Worker-thread only; caller has stopped producers and released ownership."""
+    deadline = time.monotonic() + _RECEIVER_AUDIT_DRAIN_TIMEOUT_S
+    results = []
+    for audit in buffers:
+        try:
+            status = audit.close(timeout_s=max(0.0, deadline - time.monotonic()))
+            results.append({"session": status["session"],
+                            "timed_out": not status["finished"],
+                            "clean_drain_committed": status["clean_drain_committed"],
+                            "writer_failed": bool(status["writer_error"])})
+        except Exception:
+            results.append({"error": "drain_failed", "clean_drain_committed": False})
+    return {"state": "complete" if all(row["clean_drain_committed"] and
+            not row.get("timed_out") and not row.get("writer_failed") for row in results)
+            else "incomplete", "budget_s": _RECEIVER_AUDIT_DRAIN_TIMEOUT_S,
+            "buffers": results, "durable_ownership_claimed": False}
+
+
 def _status_payload() -> dict:
     """Compatibility envelope projected from canonical state only."""
     projection = hardware_state.project("transport", "boards", "latch", "chiller")
@@ -4677,6 +4755,7 @@ def _status_payload() -> dict:
     return {
         **projection,
         "runtime_identity": public_release_identity(current_release_identity()),
+        "receiver_audit": _receiver_audit_health(),
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
         "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
@@ -6067,48 +6146,124 @@ def _camera_process_active() -> bool:
         return bool(process is not None and process.returncode is None)
 
 
-async def _stop_owned_camera_session(*, reason: str) -> dict[str, Any]:
+_camera_owner_lock = asyncio.Lock()
+
+
+async def _reap_camera_session(session: dict[str, Any]) -> None:
+    """One cleanup task per process; cancellation never releases a live device."""
+    async def cleanup():
+        proc = session["process"]
+        provider = session["provider"]
+        provider.invalidate_stream(session["session_id"])
+
+        async def discard(pipe):
+            if pipe is not None:
+                while await pipe.read(16384):
+                    pass
+
+        # Reap can otherwise hang on paused pipe transports after reader cancel.
+        stdout_task = asyncio.create_task(discard(proc.stdout))
+        if session.get("stderr_task") is None:
+            session["stderr_task"] = asyncio.create_task(discard(proc.stderr))
+        try:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            else:
+                await proc.wait()
+        finally:
+            if not stdout_task.done():
+                stdout_task.cancel()
+            await asyncio.gather(stdout_task, return_exceptions=True)
+            stderr_task = session.get("stderr_task")
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+        provider.end_stream(session["session_id"])
+
+    task = session.get("cleanup_task")
+    if task is None:
+        task = asyncio.create_task(cleanup())
+        session["cleanup_task"] = task
+    await asyncio.shield(task)
+
+
+def _camera_finish_queue(queue) -> None:
+    while not queue.empty():
+        queue.get_nowait()
+    queue.put_nowait(None)
+
+
+async def _stop_owned_camera_session(*, reason: str, expected_session_id: str | None = None) -> dict[str, Any]:
+    async with _camera_owner_lock:
+        if expected_session_id is not None and (
+            _camera_session is None or _camera_session.get("session_id") != expected_session_id
+            or int(_camera_session.get("viewers") or 0) > 0
+        ):
+            return {**_camera_stream_control_payload(_camera_session, state=_camera_stream_phase(_camera_session), idempotent=True), "ok": True}
+        task = asyncio.create_task(_stop_owned_camera_session_locked(reason=reason))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+
+async def _stop_owned_camera_session_locked(*, reason: str) -> dict[str, Any]:
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
     with _camera_projection_lock:
         session = _camera_session
         _camera_session = None
         _camera_projection_epoch += 1
         _camera_probe_cache = None
-        epoch = _camera_projection_epoch
+        _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
+    if session is not None:
+        session["provider"].invalidate_stream(session["session_id"])
+        viewer_shutdown = session.get("viewer_shutdown_task")
+        # The grace task can itself be waiting for this stop: do not cancel it.
+        if viewer_shutdown is not None and reason != "viewer grace expired" and not viewer_shutdown.done():
+            viewer_shutdown.cancel()
+            await asyncio.gather(viewer_shutdown, return_exceptions=True)
+        reader = session.get("reader_task")
+        if reader is not None and not reader.done():
+            reader.cancel()
+        if reader is not None:
+            await asyncio.gather(reader, return_exceptions=True)
+        await _reap_camera_session(session)
+        _camera_finish_queue(session["queue"])
     hardware_state.invalidate(reason=f"camera ownership changed: {reason}")
     lifecycle_state.record_camera_evidence(None)
-    if session is not None:
-        proc = session.get("process")
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        queue = session.get("queue")
-        if queue is not None:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(None)
-                except asyncio.QueueEmpty:
-                    pass
-        viewer_shutdown = session.get("viewer_shutdown_task")
-        if viewer_shutdown is not None and viewer_shutdown is not asyncio.current_task() and not viewer_shutdown.done():
-            viewer_shutdown.cancel()
-        task = session.get("reader_task")
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-    _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
     return {
         **_camera_stream_control_payload(session, state="off", error=reason),
         "ok": True,
         "stopped_session_id": None if session is None else session.get("session_id"),
         "replacement": reason == "replacement",
     }
+
+
+def _camera_stream_phase(session: dict[str, Any] | None) -> str:
+    if (session is None or session is not _camera_session
+            or session.get("camera_ownership_epoch") != _camera_projection_epoch
+            or session["provider"] is not _camera_provider
+            or not _camera_stream_state.get("active")
+            or session["process"].returncode is not None):
+        return "off"
+    status = session["provider"].status()
+    if (session.get("frames_emitted", 0) >= 2 and status.available
+            and status.provider_generation == session["provider_generation"]):
+        return "live"
+    return "starting"
 
 
 def _camera_stream_control_payload(
@@ -6141,98 +6296,130 @@ def _camera_stream_control_payload(
 
 
 async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]:
+    async with _camera_owner_lock:
+        previous = _camera_session
+        task = asyncio.create_task(_start_owned_camera_session_locked(payload))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                if _camera_session is not previous:
+                    await _stop_owned_camera_session_locked(reason="start cancelled")
+            raise
+        except Exception:
+            if _camera_session is not previous:
+                await _stop_owned_camera_session_locked(reason="start failed")
+            raise
+
+
+async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[str, Any]:
+    from .camera_provider import CameraJpegBuffer
+
     del payload
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
-    with _camera_projection_lock:
-        existing = _camera_session
-        existing_active = bool(
-            existing is not None
-            and _camera_stream_state.get("active")
-            and existing.get("process") is not None
-            and existing["process"].returncode is None
-        )
-        if existing_active:
-            return _camera_stream_control_payload(existing, state="live", idempotent=True)
+    existing = _camera_session
+    phase = _camera_stream_phase(existing)
+    if phase != "off":
+        return _camera_stream_control_payload(existing, state=phase, idempotent=True)
     replacement = existing is not None
     if replacement:
-        await _stop_owned_camera_session(reason="replacement")
-    device = "/dev/video0"
-    fps = 8
-    quality = 7
-    width = 640
-    height = 480
-    pick = _pick_stream_device(device)
-    if not pick.get("ok"):
-        raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
-    device = str(pick["device"])
+        await _stop_owned_camera_session_locked(reason="replacement")
     if shutil.which("ffmpeg") is None:
-        raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg", device=device))
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    if proc.stdout is None:
-        proc.terminate()
-        raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
+        raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg"))
+    provider = _camera_provider
     session_id = uuid.uuid4().hex
+    try:
+        # Fixed card + USB VID/PID + capture-capability admission, off-loop.
+        identity = await run_in_threadpool(provider.begin_stream, session_id)
+    except CameraError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    device = identity.device
+    fps, quality, width, height = 8, 7, 640, 480
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except BaseException:
+        provider.end_stream(session_id)
+        raise
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
     with _camera_projection_lock:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         epoch = _camera_projection_epoch
-        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "provider": provider, "provider_generation": provider.generation, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
         _camera_session = session
+    if provider is not _camera_provider:
+        await _reap_camera_session(session)
+        raise HTTPException(status_code=503, detail="camera owner changed during stream start")
+    if proc.stdout is None:
+        await _reap_camera_session(session)
+        raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
     hardware_state.invalidate(reason="camera ownership changed: stream started")
-    _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
+    _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "dropped_frames": provider.status().dropped_frames, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
 
-    async def reader() -> None:
-        buffer = bytearray()
-        try:
-            while proc.returncode is None:
-                chunk = await proc.stdout.read(16384)
+    def current():
+        return (_camera_session is session and _camera_projection_epoch == epoch
+                and _camera_provider is provider and provider.generation == session["provider_generation"])
+
+    async def drain_stderr():
+        if proc.stderr is not None:
+            while True:
+                chunk = await proc.stderr.read(4096)
                 if not chunk:
                     break
-                buffer.extend(chunk)
-                while True:
-                    start = buffer.find(b"\xff\xd8")
-                    if start < 0:
-                        if len(buffer) > 65536:
-                            buffer.clear()
-                        break
-                    if start:
-                        del buffer[:start]
-                    end = buffer.find(b"\xff\xd9", 2)
-                    if end < 0:
-                        break
-                    frame = bytes(buffer[: end + 2])
-                    del buffer[: end + 2]
-                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii") + frame + b"\r\n"
+                session["stderr_tail"] = (session.get("stderr_tail", "") + chunk.decode("utf-8", errors="replace"))[-4096:]
+
+    session["stderr_task"] = asyncio.create_task(drain_stderr())
+
+    async def reader() -> None:
+        parser = CameraJpegBuffer()
+        try:
+            while proc.returncode is None and current():
+                chunk = await proc.stdout.read(16384)
+                if not chunk:
+                    session["error"] = "camera stream ended"
+                    break
+                for content in parser.feed(chunk):
+                    if not current():
+                        return
+                    try:
+                        frame = await run_in_threadpool(provider.publish_stream_frame, session_id, content)
+                    except CameraError as exc:
+                        session["error"] = str(exc)
+                        if current():
+                            _camera_stream_state.update({"last_error": str(exc), "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
+                        continue
+                    if not current():
+                        return
+                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame.content)}\r\n\r\n".encode("ascii") + frame.content + b"\r\n"
                     if queue.full():
-                        try:
-                            queue.get_nowait()
-                            _camera_stream_state["dropped_frames"] = int(_camera_stream_state.get("dropped_frames") or 0) + 1
-                        except asyncio.QueueEmpty:
-                            pass
+                        queue.get_nowait()
+                        provider.drop_stream_frame(session_id)
                     queue.put_nowait(part)
-                    session["frames_emitted"] = int(session.get("frames_emitted") or 0) + 1
-                    _camera_stream_state["frames_emitted"] = session["frames_emitted"]
-                    _camera_stream_state["last_frame_at"] = time.time()
+                    session["frames_emitted"] += 1
+                    session["error"] = None
+                    _camera_stream_state.update({"frames_emitted": session["frames_emitted"], "last_frame_at": frame.captured_at.timestamp(), "last_error": None, "dropped_frames": provider.status().dropped_frames})
+                if parser.dropped and current():
+                    provider.drop_stream_frame(session_id, invalid=True, count=parser.dropped)
+                    parser.dropped = 0
+                    session["error"] = "camera JPEG exceeded bounded frame size"
+                    _camera_stream_state.update({"last_error": session["error"], "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             session["error"] = str(exc)
-            _camera_stream_state["last_error"] = str(exc)
         finally:
-            _camera_stream_state["active"] = False
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(None)
-                except asyncio.QueueEmpty:
-                    pass
+            was_current = current()
+            if was_current:
+                _camera_stream_state.update({"active": False, "last_error": session["error"], "last_frame_at": None})
+            await _reap_camera_session(session)
+            _camera_finish_queue(queue)
+            if was_current and _camera_session is session:
+                lifecycle_state.record_camera_evidence(None)
 
-    task = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
-    session["reader_task"] = task
+    session["reader_task"] = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
     return {
         **_camera_stream_control_payload(session, state="starting"),
         "replacement": replacement,
@@ -6247,12 +6434,11 @@ def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]
         session = _camera_session
         if session is None or session.get("camera_ownership_epoch") != epoch:
             return None, {"available": False, "cache_state": "missing", "camera_ownership_epoch": epoch, "freshness": {"state": "missing", "age_s": None}, "provenance": "POST /camera/stream/start"}
-        projection = {key: value for key, value in session.items() if key not in {"queue", "process", "reader_task"}}
-    age = max(0.0, time.time() - float(projection["started_at"]))
-    active = bool(_camera_stream_state.get("active"))
-    state = "fresh" if active else "stale"
-    return session, {"available": active, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": round(age, 3)}, "provenance": "POST /camera/stream/start", "session": projection}
-
+        projection = {key: session[key] for key in ("session_id", "camera_ownership_epoch", "device", "fps", "quality", "width", "height", "viewers", "started_at", "frames_emitted", "error")}
+    status = session["provider"].status()
+    active = _camera_stream_phase(session) != "off"
+    state = "fresh" if active and status.available else "stale"
+    return session, {"available": active, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": status.frame_age_seconds}, "provenance": "POST /camera/stream/start", "session": projection}
 
 @app.get("/status")
 async def get_status():
@@ -6288,7 +6474,19 @@ def _collect_and_publish_hardware_snapshot(
     reason: str,
 ) -> dict[str, Any]:
     tester = _get_tester()
+    deck_requested = {"axes", "latch"}.issubset(requested)
+    if deck_requested:
+        provider = getattr(app.state, "oem_deck_provider", None)
+        invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
+        if callable(invalidate):
+            invalidate(reason="explicit_hardware_collection_started")
     result = hardware_state.collect(requested, _hardware_collectors(tester))
+    # Only the existing explicit query collection path may warm deck readiness.
+    # Never attach this to GET/status, and never turn a failed collection into
+    # fresh authority. The source reader performs its own current-owner checks.
+    deck_collect = getattr(app.state, "oem_deck_authority_collector", None)
+    if deck_requested and result.get("ok") and callable(deck_collect):
+        result["deck_authority"] = deck_collect()
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
     if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
         return result
@@ -7240,7 +7438,10 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
                 else None
             )
             idle_verified = None
-        verified_stopped = speed == 0
+        speed_row = (row.get("speed") if req.axis == "g" else (row.get("status") or {}).get("speed")) or {}
+        speed_ack = speed_row.get("ack") or {}
+        verified_stopped = bool(type(speed) is int and speed == 0
+            and speed_row.get("speed_reply_valid") is True and speed_ack.get("status") == 100)
         payload = {
             "ok": bool(verified_stopped and (idle_verified is not False)),
             "schema": "bioxp.oem_axis_diagnostic_stop.v1",
@@ -7559,7 +7760,9 @@ async def motion_oem_y_move_steps(req: OemYMoveStepsRequest):
 async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
     return await _run_blocking(
         "serial-206 Y moveY absolute",
-        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=True),
+        # Manual panel btnMoveYTo_Click passes false,false (installed IL
+        # 29681–29745). Do not apply this policy to Board Test/Home/relative.
+        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
         timeout_s=30.0,
     )
 
@@ -7801,14 +8004,15 @@ async def motion_oem_x_abort():
     result = await _run_safety_interrupt_blocking(
         "aggregate OEM abort from X controls",
         lambda _tester: _execute_provider_x_intent(
-            "abort", {"timeout_s": 3.0, "physical_scope": "all_present_motion_boards"}
+            "abort", {"timeout_s": 3.0, "physical_scope": "none_software_flags_and_waiters"}
         ),
         timeout_s=10.0,
     )
     return {
         **result,
-        "aggregate_abort": True,
-        "physical_scope": "all_present_motion_boards",
+        "aggregate_abort": True, "software_abort": True,
+        "invocation_attempted": True, "stop_delivery_attempted": False,
+        "physical_scope": "none_software_flags_and_waiters",
         "x_only": False,
     }
 
@@ -8999,7 +9203,7 @@ async def camera_stream_start(
         raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     del req
     result = await _start_owned_camera_session({})
-    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("active")), "provenance": "POST /camera/stream/start"})
+    lifecycle_state.record_camera_evidence({**result, "available": result.get("state") == "live", "provenance": "POST /camera/stream/start"})
     return result
 
 
@@ -9037,14 +9241,20 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
 
 @app.get("/camera/status", response_model=CameraStatusResponse)
 async def camera_status():
-    status = await run_in_threadpool(_camera_provider.status)
+    provider = _camera_provider
+    status = await run_in_threadpool(provider.status)
+    if provider is not _camera_provider or getattr(provider, "generation", None) != getattr(status, "provider_generation", None):
+        raise HTTPException(status_code=503, detail="camera owner changed during status read")
     return status.to_payload()
 
 
 @app.get("/camera/frame/latest")
 async def camera_frame_latest():
     try:
-        frame = await run_in_threadpool(_camera_provider.latest)
+        provider = _camera_provider
+        frame = await run_in_threadpool(provider.latest)
+        if provider is not _camera_provider or getattr(provider, "generation", frame.provider_generation) != frame.provider_generation:
+            raise CameraError("camera owner changed during frame read")
     except CameraError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _camera_jpeg_response(frame)
@@ -9055,7 +9265,10 @@ async def camera_snapshot(req: CameraSnapshotRequest = CameraSnapshotRequest()):
     """Capture through the fixed provider identity/capability admission boundary."""
     del req
     try:
-        frame = await run_in_threadpool(_camera_provider.capture)
+        provider = _camera_provider
+        frame = await run_in_threadpool(provider.capture)
+        if provider is not _camera_provider or getattr(provider, "generation", frame.provider_generation) != frame.provider_generation:
+            raise CameraError("camera owner changed during frame read")
     except CameraError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _camera_jpeg_response(frame)
@@ -9132,7 +9345,7 @@ async def camera_stream_state(request: Request):
     if request.query_params:
         raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     session, projection = _camera_session_projection()
-    state = "live" if projection.get("available") and _camera_stream_state.get("last_frame_at") else "starting" if projection.get("available") else "off"
+    state = await run_in_threadpool(_camera_stream_phase, session)
     return {
         **_camera_stream_control_payload(session, state=state),
         "session": projection.get("session"),
@@ -9164,7 +9377,7 @@ async def camera_mjpeg(request: Request):
                 viewers = 0 if current is None else int(current.get("viewers") or 0)
                 should_stop = current is not None and current.get("session_id") == session_id and viewers == 0
             if should_stop:
-                await _stop_owned_camera_session(reason="viewer grace expired")
+                await _stop_owned_camera_session(reason="viewer grace expired", expected_session_id=session_id)
         except asyncio.CancelledError:
             return
 

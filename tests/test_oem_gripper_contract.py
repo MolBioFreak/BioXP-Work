@@ -134,9 +134,9 @@ def test_gripper_home_requires_ack_and_routes_through_oem_home_with_restore():
     payload = gripper_home(tester, operator_ack="GRIPPER_HOME", reason="supervised test")
 
     assert payload["ok"] is True
-    assert any(call[0] == "home" and call[1] == "g" for call in tester.calls)
-    assert tester.current[(4, 6, 2)] == 10
-    assert tester.current[(4, 7, 2)] == 10
+    assert tester.calls == [("home", "g", False, 15.0)]
+    assert payload["acceptance"]["operator_validated_physical_home"] is False
+    assert payload["physical_effect_verified"] is False
 
 
 
@@ -170,7 +170,7 @@ def test_gripper_profile_reports_machine_config_positions_and_source_anchor(monk
 
 
 
-def test_gripper_home_accepts_final_query_home_even_with_both_limits_active():
+def test_gripper_home_does_not_override_failed_source_with_extra_telemetry():
     from src.bioxp.oem_gripper import gripper_home
 
     class FinalQueryHomeTester(FakeTester):
@@ -190,15 +190,10 @@ def test_gripper_home_accepts_final_query_home_even_with_both_limits_active():
 
     tester = FinalQueryHomeTester()
 
-    payload = gripper_home(tester, operator_ack="GRIPPER_HOME", reason="operator watched physical home")
-
-    assert payload["ok"] is True
-    assert payload["acceptance"]["query_home_active"] is True
-    assert payload["acceptance"]["accepted_by"] == "queryHome(MotorGrip)"
-    assert payload["acceptance"]["both_effective_limits_active_is_diagnostic"] is True
-    assert payload["after_status"]["switches"]["both_effective_limits_active"] is True
-    assert tester.current[(4, 6, 2)] == 10
-    assert tester.current[(4, 7, 2)] == 10
+    with pytest.raises(HTTPException) as error:
+        gripper_home(tester, operator_ack="GRIPPER_HOME", reason="operator watched physical home")
+    assert error.value.status_code == 409
+    assert tester.calls == [("home", "g", False, 15.0)]
 
 
 

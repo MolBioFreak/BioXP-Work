@@ -879,22 +879,17 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
         "from_active_snapshot",
         classmethod(lambda cls: object()),
     )
-    monkeypatch.setattr(
-        api,
-        "prepare_motion_without_motion",
-        lambda tester, authority: {"ok": True, "physical_motion_commanded": False},
-    )
-    monkeypatch.setattr(
-        api,
-        "_execute_provider_z_intent",
-        lambda intent, inputs: {
-            "ok": True,
-            "receipt": {
-                "status": "completed",
-                "result": {"ok": True, "physical_motion": False},
-            },
-        },
-    )
+    provider_calls = []
+    class PreparationProvider:
+        def prepare_global_motion_without_motion(self, tester, *, authority):
+            assert tester is api._tester
+            provider_calls.append(authority)
+            return {"ok": True, "generation": 17, "physical_motion_commanded": False}
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", PreparationProvider())
+    def retired_preparation(*args, **kwargs):
+        raise AssertionError("route must use the canonical global provider, not a retired preparation/Z mutation")
+    monkeypatch.setattr(api, "prepare_motion_without_motion", retired_preparation)
+    monkeypatch.setattr(api, "_execute_provider_z_intent", retired_preparation)
     monkeypatch.setattr(
         api.hardware_state,
         "publish_can_ready_from_preparation",
@@ -915,6 +910,10 @@ def test_prepare_without_motion_preserves_an_already_clear_recovery_latch(monkey
 
     result = asyncio.run(api.motion_oem_prepare_without_motion())
 
+    assert len(provider_calls) == 1
+    assert result["physical_motion_commanded"] is False
+    assert result["z_prepare_receipt"]["state"] == "deferred_to_explicit_z_action"
+    assert result["can_ready_publication"]["ownership_epoch"] == 17
     assert result["ok"] is True
     assert result["maintenance_state"]["motion_blocked"] is False
     assert result["maintenance_state"]["recovery_required"] is False

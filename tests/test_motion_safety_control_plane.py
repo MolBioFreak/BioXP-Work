@@ -162,13 +162,16 @@ class FakeMotionDriver:
 
     def motor_oem_force_abort_motion(self, *, reason: str):
         self.calls.append(("force_abort", reason))
-        return {"ok": True, "reason": reason, "controller_terminal_state_verified": True}
+        return {"ok": True, "reason": reason, "latched": True, "controller_terminal_state_verified": False}
 
     def motor_wait_stopped(self, board_id: int, *, motor: int, timeout_s: float, require_seen_nonzero: bool):
         axis = next(name for name, row in self.MOTOR_FUNCTION_PRESETS.items() if row == {"board": board_id, "motor": motor})
         self.calls.append(("wait_stopped", axis, board_id, motor, timeout_s, require_seen_nonzero))
         speed = self.speeds[axis]
-        return {"board": board_id, "motor": motor, "terminal_speed": speed, "ok": speed == 0}
+        # Explicit ACK-qualified sample: OEM cached scalar zero alone is NOT proof.
+        return {"board": board_id, "motor": motor, "terminal_speed": speed, "ok": speed == 0,
+                "speed_reply_valid": True, "last_ack": {"status": 100, "value": speed},
+                "controller_terminal_state_verified": speed == 0}
 
 
 def authority() -> Serial206MotionAuthority:
@@ -327,6 +330,8 @@ def test_prepare_without_motion_stops_after_failed_deactivation():
     assert failed["status"] == "failed"
 
 
+# These tests characterize the existing aggregate extension, not OEM CI abort
+# parity or approval of its Stop-before-latch sequence (an open policy conflict).
 def test_physical_aggregate_stop_calls_every_component_and_verifies_ack_and_zero_speed():
     driver = FakeMotionDriver()
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from src.bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
 
 
-def test_move_z_home_source_short_circuit_is_acknowledged_by_controller_home_proof():
+def test_move_z_home_source_cached_short_circuit_does_not_invent_ack_or_home_proof():
     adapter = object.__new__(Serial206ProductionPrimitiveAdapter)
     adapter._z_profile = lambda: {"board": 4, "motor": 1}  # type: ignore[method-assign]
     adapter._z_profile_overrides = {}
@@ -14,10 +14,13 @@ def test_move_z_home_source_short_circuit_is_acknowledged_by_controller_home_pro
             "home": {
                 "ok": True,
                 "short_circuit": "MotorHome_and_CurrentPosition_zero",
-                "controller_home_proof_verified": True,
-                "controller_terminal_state_verified": True,
-                "position_after": {"value": 0},
-                "home_after": {"value": 1},
+                "source_noop": True,
+                "source_return_code": 0,
+                "controller_command_acknowledged": False,
+                "controller_home_proof_verified": False,
+                "controller_terminal_state_verified": False,
+                "position_after": {"position": 0, "authority": "oem_cached_CurrentPosition"},
+                "home_after": None,
             },
         },
     )
@@ -25,8 +28,9 @@ def test_move_z_home_source_short_circuit_is_acknowledged_by_controller_home_pro
     result = adapter.z_move_z_home()
 
     assert result["ok"] is True
-    assert result["controller_command_acknowledged"] is True
-    assert result["controller_terminal_state_verified"] is True
+    assert result["controller_command_acknowledged"] is False
+    assert result["controller_terminal_state_verified"] is False
+    assert result["physical_effect_verified"] is False
 
 
 def test_resume_after_abort_reads_nested_axis_search_home_evidence():

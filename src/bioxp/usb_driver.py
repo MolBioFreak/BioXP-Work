@@ -443,6 +443,13 @@ class BioXpTester:
                 cleanup_report=cleanup_report,
             ) from exc
 
+    def receiver_audit_status(self):
+        """Internal logging health only; does not rewrite motion admission."""
+        audit = getattr(self, "_receiver_audit", None)
+        return {"setup_error": getattr(self, "_receiver_audit_setup_error", None),
+                "buffer": audit.status() if audit is not None else None,
+                "router": self.novo_router.audit_status() if self.novo_router is not None else None}
+
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
 
@@ -498,7 +505,19 @@ class BioXpTester:
                 raise ValueError("BioXP Novo USB endpoints were not found.")
             if self.novo_router is not None:
                 raise RuntimeError("Novo router already exists during USB connect")
-            self.novo_router = NovoRouter(ep_in=self.ep_in, ep_out=self.ep_out, decode=novo_decode)
+            # This USB owner retains the logging worker across cleanup until it
+            # actually exits. Reconnect cannot pile up blocked SQLite writers.
+            from .receiver_audit_buffer import ReceiverAuditBuffer
+            audit = getattr(self, "_receiver_audit", None)
+            if audit is None or not audit.alive:
+                try:
+                    audit = ReceiverAuditBuffer.from_environment()
+                    self._receiver_audit = audit
+                    self._receiver_audit_setup_error = None
+                except Exception as exc:
+                    self._receiver_audit_setup_error = repr(exc)[:512]
+            self.novo_router = NovoRouter(ep_in=self.ep_in, ep_out=self.ep_out,
+                                          decode=novo_decode, audit_buffer=audit)
             self.novo_router.start()
 
     @classmethod
@@ -544,6 +563,14 @@ class BioXpTester:
                 except Exception as exc:
                     summary["router_shutdown_ok"] = False
                     summary["router_shutdown_error"] = str(exc)
+                if summary["router_shutdown_ok"] is True:
+                    # Audit failure is not USB-reader cleanup failure.
+                    audit = getattr(self, "_receiver_audit", None)
+                    if audit is not None:
+                        try:
+                            summary["receiver_audit"] = audit.close(timeout_s=0.0)
+                        except Exception as exc:
+                            summary["receiver_audit_error"] = repr(exc)[:512]
             if dev is self.dev:
                 # Disable I/O immediately, but retain the device handle until
                 # release and disposal are authoritatively complete. Quarantine
@@ -758,26 +785,28 @@ class BioXpTester:
         if tuple(frame) in self.KNOWN_UNSOLICITED_FRAMES or len(frame) < 14:
             return None
         try:
-            status = int(frame[7])
-            value = struct.unpack(">i", bytes(frame[9:13]))[0]
+            normalized = novo_decode(bytes(frame))
+            if len(normalized) != 13 or normalized[4] != 8 or int.from_bytes(normalized[:4], "big") not in (0, 99):
+                return None
+            data = normalized[5:]
+            status = int(data[1])
+            value = struct.unpack(">i", bytes(data[3:7]))[0]
         except Exception:
             return None
-        # OEM ClassHeadBoard.handleReturnMessageNovo uses different fields per
-        # status: target-position uses msg[8] (USB wrapper frame[12]), while
-        # stall-guard uses msg[4] (frame[8]). Other layouts are not axis-qualified
-        # by preserved source and remain unknown rather than borrowing a checksum.
+        # ClassHeadBoard uses normalized payload[6] for target axis and [2]
+        # for stall axis. USB escape bytes must never become field offsets.
         motor = None
         if status == 128:
-            candidate = int(frame[12])
+            candidate = int(data[6])
             motor = candidate if 0 <= candidate <= 2 else None
         elif status == 130:
-            candidate = int(frame[8])
+            candidate = int(data[2])
             motor = candidate if 0 <= candidate <= 2 else None
         return {
-            "board": int(frame[6]),
+            "board": int(data[0]),
             "status": status,
             "status_str": TMCL_STATUS.get(status, f"?({status})"),
-            "cmd": int(frame[8]),
+            "cmd": int(data[2]),
             "value": int(value),
             "motor": motor,
             "raw": frame,
@@ -948,6 +977,11 @@ class BioXpTester:
         if router is None:
             return None
         try:
+            # ClassNovo.TransmitMessage: global sendingLock encloses Sleep(1),
+            # the whole sendCommand (including its resend), then Sleep(10).
+            # Only source-selected motor calls are reconciled here.
+            if ordinary_motor_retry:
+                time.sleep(0.001)
             transaction = router.transact(
                 bytes(frame),
                 matcher=(
@@ -972,6 +1006,9 @@ class BioXpTester:
                     "expected_command": int(command),
                 },
             )
+            # Normal null still gets post10ms; a thrown USB exception does not.
+            if ordinary_motor_retry:
+                time.sleep(0.010)
         except usb.core.USBTimeoutError:
             self._record_usb_sniff_ledger("error", None, source="send_tmcl", error="usb_write_timeout", board=int(board_id), command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
@@ -2715,7 +2752,8 @@ class BioXpTester:
         ordinary_motor_retry=False,
     ):
         board_id = int(board_id)
-        self._motor_pace(board_id)
+        if not ordinary_motor_retry:
+            self._motor_pace(board_id)
         try:
             # Source-selected leaves make one whole call; only the router
             # owns its false-wait resend. Nonselected routes keep their loop.
@@ -3239,16 +3277,22 @@ class BioXpTester:
         time.sleep(0.001)
         affected = []
         if self._oem_board_present(self.BOARD_HEAD):
+            self._oem_24v_dropped = True
             affected.extend(("y", "z", "g"))
+            self._oem_set_abort_waiters(self.BOARD_HEAD, (0, 1, 2))
         if self._oem_board_present(self.BOARD_DECK):
+            self._oem_24v_dropped = True
             affected.append("x")
+            self._oem_set_abort_waiters(self.BOARD_DECK, (0,))
         if self._oem_board_present(self.BOARD_THERMAL):
-            self._oem_user_stopped = True
             affected.append("door")
             # ClassThermalBoard.forceAbortMotion disables the board's internal
             # thermal-control timer. It does not stop ClassThermalFanControl's
             # independent five-second fan service.
             self._oem_thermal_board_timer_enabled = False
+            self._oem_set_abort_waiters(self.BOARD_THERMAL, (0,))
+            self._oem_user_stopped = True
+            self._oem_24v_dropped = True
         return {
             "ok": True,
             "no24v": True,
@@ -3258,6 +3302,18 @@ class BioXpTester:
             "affected_waiters": affected,
             "source_anchor": "ClassControlInterface.forceAbortMotion; board forceAbort overrides",
         }
+
+    def _oem_set_abort_waiters(self, board, motors):
+        setter = getattr(getattr(self, "novo_router", None), "set_motor_abort_event", None)
+        for motor in motors:
+            if callable(setter):
+                setter(board, motor)
+            else:
+                with self._transport_guard():
+                    signals = getattr(self, "_oem_abort_signals", None)
+                    if signals is None:
+                        signals = self._oem_abort_signals = set()
+                    signals.add((int(board), int(motor)))
 
     @staticmethod
     def _safe_int(value):
@@ -3674,6 +3730,61 @@ class BioXpTester:
             self._oem_motor_initial_signals = signals
         return signals
 
+    def _take_fallback_motor_signals(self, targets, event_window):
+        """Consume all requested fallback AutoReset handles or none."""
+        with self._transport_guard():
+            initial = self._oem_initial_motor_signals()
+            aborted = getattr(self, "_oem_abort_signals", set())
+            wires = getattr(self, "_oem_fallback_motor_signals", {})
+            generation = int(getattr(self, "_oem_abort_generation", 0))
+            after = event_window.get("after_sequence") if isinstance(event_window, dict) else None
+            available = {}
+            for key in targets:
+                if key in aborted:
+                    available[key] = {"board": key[0], "motor": key[1],
+                                      "source": "board.forceAbortMotion", "physical_effect_verified": False}
+                elif key in initial:
+                    available[key] = {"board": key[0], "motor": key[1],
+                                      "source": "ClassMotor.initialState", "physical_effect_verified": False}
+                elif key in wires:
+                    stamp, event = wires[key]
+                    sequence = event.get("event_sequence")
+                    if stamp == generation and (after is None or
+                            (sequence is not None and int(sequence) > int(after))):
+                        available[key] = event
+            if set(available) != set(targets):
+                return None
+            for key in targets:
+                initial.discard(key)
+                aborted.discard(key)
+                wires.pop(key, None)
+            return {f"{board}:{motor}": event for (board, motor), event in available.items()}
+
+    def _collect_fallback_motor_signals(self, duration_s):
+        # Use the existing sole endpoint lock for receive, Set, Reset and take.
+        # Do not hold it across the complete timeout: Abort must be able to Set.
+        with self._transport_guard():
+            generation = int(getattr(self, "_oem_abort_generation", 0))
+            window = self.collect_bus_events(duration_s=duration_s, timeout_ms=8, max_events=32)
+            if generation != int(getattr(self, "_oem_abort_generation", 0)):
+                return window  # Do not restamp pre-Abort wire events into its generation.
+            wires = getattr(self, "_oem_fallback_motor_signals", None)
+            if wires is None:
+                wires = self._oem_fallback_motor_signals = {}
+            generation = int(getattr(self, "_oem_abort_generation", 0))
+            for event in window:
+                if not isinstance(event, dict) or event.get("status") != 128:
+                    continue
+                board, motor = event.get("board"), event.get("motor")
+                if type(board) is not int or type(motor) is not int:
+                    continue
+                if (board, motor) not in {(4, 0), (4, 1), (4, 2), (5, 0), (6, 0)}:
+                    continue
+                # Set on an already-signaled handle coalesces; preserve latest
+                # provenance so an explicit sequence reset rejects older input.
+                wires[(board, motor)] = (generation, event)
+            return window
+
     def motor_query_motor_stop(self, board_id, motor=0):
         """
         OEM pre-move call (ClassMotor.queryMotorStop): cmd 138 type 0.
@@ -3698,6 +3809,12 @@ class BioXpTester:
         if callable(reset):
             reset(int(board_id), int(motor), reset=ack is not None,
                   initial_signals=self._oem_initial_motor_signals())
+        elif ack is not None:
+            with self._transport_guard():
+                channel = (int(board_id), int(motor))
+                self._oem_initial_motor_signals().discard(channel)
+                getattr(self, "_oem_abort_signals", set()).discard(channel)
+                getattr(self, "_oem_fallback_motor_signals", {}).pop(channel, None)
         return {
             "board": int(board_id),
             "motor": int(motor),
@@ -3718,14 +3835,14 @@ class BioXpTester:
         reached = {}
         failure = "oem_moveXY_target_event_timeout"
         while True:
-            if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
-                failure = "No24V"
-                break
             frames = router.take_motor_events(
                 targets, event_window, initial_signals=self._oem_initial_motor_signals()
             )
             if frames or not targets:
                 for frame in frames:
+                    if isinstance(frame, dict):
+                        reached[f"{frame['board']}:{frame['motor']}"] = frame
+                        continue
                     if isinstance(frame, tuple):
                         board, motor = frame
                         reached[f"{board}:{motor}"] = {
@@ -3774,71 +3891,38 @@ class BioXpTester:
             result = self._wait_router_motor_events([(board_id, motor)], timeout_s, event_window)
             signal = result["reached"].get(f"{int(board_id)}:{int(motor)}")
             initial = bool(signal and signal.get("source") == "ClassMotor.initialState")
-            event = None if initial else signal
-            result.update(board=int(board_id), motor=int(motor), event=event, target_reached=result["ok"],
-                          completion_class="oem_initial_latch" if initial else "event_128" if event else None)
+            aborted = bool(signal and signal.get("source") == "board.forceAbortMotion")
+            event = None if initial or aborted else signal
+            result.update(board=int(board_id), motor=int(motor), event=event, target_reached=bool(result["ok"] and event and event.get("status") == 128),
+                          source_wait_signaled=result["ok"],
+                          completion_class="oem_abort_latch" if aborted else "oem_initial_latch" if initial else "event_128" if event else None,
+                          physical_effect_verified=False)
             if result["failure"] == "oem_moveXY_target_event_timeout":
                 result["failure"] = "oem_moveToAbs_target_event_timeout"
             return result
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_s))
-        abort_generation = int(getattr(self, "_oem_abort_generation", 0))
-        after_sequence = None
-        if isinstance(event_window, dict) and event_window.get("after_sequence") is not None:
-            after_sequence = int(event_window["after_sequence"])
+        targets = {(int(board_id), int(motor))}
         events = []
-        while time.monotonic() <= deadline:
-            if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
-                return {
-                    "ok": False,
-                    "target_reached": False,
-                    "board": int(board_id),
-                    "motor": int(motor),
-                    "events": events,
-                    "failure": "No24V",
-                    "no24v": True,
-                    "event_window": event_window,
-                }
-            window = self.collect_bus_events(
-                duration_s=min(0.020, max(0.0, deadline - time.monotonic())),
-                timeout_ms=8,
-                max_events=32,
-            )
-            events.extend(window)
-            for event in window:
-                if not isinstance(event, dict):
-                    continue
-                sequence = event.get("event_sequence")
-                if after_sequence is not None and (sequence is None or int(sequence) <= after_sequence):
-                    continue
-                if int(event.get("board", -1)) != int(board_id):
-                    continue
-                status = int(event.get("status", -1))
-                event_motor = event.get("motor")
-                if event_motor is None or int(event_motor) != int(motor):
-                    continue
-                if status != 128:
-                    continue
-                return {
-                    "ok": True,
-                    "target_reached": True,
-                    "board": int(board_id),
-                    "motor": int(motor),
-                    "event": event,
-                    "elapsed_ms": int((time.monotonic() - started) * 1000),
-                    "events": events,
-                    "event_window": event_window,
-                }
-        return {
-            "ok": False,
-            "target_reached": False,
-            "board": int(board_id),
-            "motor": int(motor),
-            "elapsed_ms": int((time.monotonic() - started) * 1000),
-            "events": events,
-            "failure": "oem_moveToAbs_target_event_timeout",
-            "event_window": event_window,
-        }
+        signals = self._take_fallback_motor_signals(targets, event_window)
+        first_poll = True
+        while signals is None and (first_poll or time.monotonic() <= deadline):
+            first_poll = False
+            events.extend(self._collect_fallback_motor_signals(
+                min(0.020, max(0.0, deadline - time.monotonic()))))
+            signals = self._take_fallback_motor_signals(targets, event_window)
+        signal = (signals or {}).get(f"{int(board_id)}:{int(motor)}")
+        event = signal if signal and signal.get("status") == 128 else None
+        source = signal.get("source") if signal else None
+        return {"ok": signals is not None, "source_wait_signaled": signals is not None,
+                "target_reached": event is not None, "board": int(board_id), "motor": int(motor),
+                "event": event, "events": events, "reached": signals or {},
+                "completion_class": "event_128" if event else
+                    "oem_abort_latch" if source == "board.forceAbortMotion" else
+                    "oem_initial_latch" if signal else None,
+                "physical_effect_verified": False, "event_window": event_window,
+                "failure": None if signals is not None else "oem_moveToAbs_target_event_timeout",
+                "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
     def motor_wait_target_reached(self, board_id, motor=0, timeout_s=20.0, *, event_window=None):
         return self.motor_oem_wait_target_reached(board_id, motor=motor, timeout_s=timeout_s, event_window=event_window)
@@ -3853,7 +3937,7 @@ class BioXpTester:
             result = {
                 "ok": all(wait.get("ok") for wait in waits),
                 "failure": next((wait.get("failure") for wait in waits if not wait.get("ok")), None),
-                "reached": {f"{int(board)}:{int(motor)}": wait.get("reached", {}).get(f"{int(board)}:{int(motor)}", wait["event"])
+                "reached": {f"{int(board)}:{int(motor)}": wait.get("reached", {}).get(f"{int(board)}:{int(motor)}", wait.get("event") or {"source": wait.get("completion_class"), "physical_effect_verified": False})
                             for (board, motor), wait in zip(targets, waits) if wait.get("ok")},
                 "events": [event for wait in waits for event in wait.get("events", [])],
                 "event_window": event_window,
@@ -3866,7 +3950,10 @@ class BioXpTester:
             key = f"{int(board)}:{int(motor)}"
             event = reached.get(key) if isinstance(reached, dict) else None
             per_axis["x" if int(board) == 5 else "y" if int(board) == 4 else key] = {
-                "ok": bool(event), "target_reached": bool(event), "event": event,
+                "ok": bool(event), "source_wait_signaled": bool(event),
+                "target_reached": bool(event and event.get("status") == 128),
+                "event": event if event and event.get("status") == 128 else None,
+                "signal": event, "physical_effect_verified": False,
                 "failure": None if event else result.get("failure"),
             }
         result["per_axis"] = per_axis
@@ -3877,49 +3964,25 @@ class BioXpTester:
         """Collect one shared OEM WaitAll-style window for addressed motors."""
         if callable(getattr(getattr(self, "novo_router", None), "take_motor_events", None)):
             return self._wait_router_motor_events(targets, timeout_s, event_window)
-        pending = {(int(board), int(motor)) for board, motor in targets}
-        reached = {}
+        targets = {(int(board), int(motor)) for board, motor in targets}
         events = []
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_s))
         abort_generation = int(getattr(self, "_oem_abort_generation", 0))
-        after_sequence = None
-        if isinstance(event_window, dict) and event_window.get("after_sequence") is not None:
-            after_sequence = int(event_window["after_sequence"])
-        while pending and time.monotonic() <= deadline:
+        reached = self._take_fallback_motor_signals(targets, event_window)
+        first_poll = True
+        while reached is None and (first_poll or time.monotonic() <= deadline):
+            first_poll = False
             if self.oem_no24v_state() or int(getattr(self, "_oem_abort_generation", 0)) != abort_generation:
-                return {"ok": False, "failure": "No24V", "no24v": True, "reached": reached, "events": events}
-            window = self.collect_bus_events(
-                duration_s=min(0.020, max(0.0, deadline - time.monotonic())),
-                timeout_ms=8,
-                max_events=32,
-            )
-            events.extend(window)
-            for event in window:
-                if not isinstance(event, dict):
-                    continue
-                sequence = event.get("event_sequence")
-                if after_sequence is not None and (sequence is None or int(sequence) <= after_sequence):
-                    continue
-                status = int(event.get("status", -1))
-                event_board = int(event.get("board", -1))
-                event_motor = event.get("motor")
-                if event_motor is None:
-                    continue
-                key = (event_board, int(event_motor))
-                if key not in pending:
-                    continue
-                if status != 128:
-                    continue
-                reached[f"{key[0]}:{key[1]}"] = event
-                pending.remove(key)
+                return {"ok": False, "failure": "No24V", "no24v": True, "reached": {}, "events": events}
+            events.extend(self._collect_fallback_motor_signals(
+                min(0.020, max(0.0, deadline - time.monotonic()))))
+            reached = self._take_fallback_motor_signals(targets, event_window)
         return {
-            "ok": not pending,
-            "failure": None if not pending else "oem_moveXY_target_event_timeout",
-            "pending": [list(key) for key in sorted(pending)],
-            "reached": reached,
-            "events": events,
-            "event_window": event_window,
+            "ok": reached is not None,
+            "failure": None if reached is not None else "oem_moveXY_target_event_timeout",
+            "pending": [] if reached is not None else [list(key) for key in sorted(targets)],
+            "reached": reached or {}, "events": events, "event_window": event_window,
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
 
@@ -3931,6 +3994,7 @@ class BioXpTester:
         *,
         wait_for_stop=True,
         max_position=None,
+        gripper_recover=False,
     ):
         """ClassHeadBoard/ClassMotor.moveToAbs source-shaped primitive."""
         board_id = int(board_id)
@@ -4084,8 +4148,18 @@ class BioXpTester:
             "command_sent": True,
             "oem_wait_for_stop": bool(wait_for_stop),
         }
+        if board_id == self.BOARD_HEAD and motor == 2 and gripper_recover:
+            # Head.moveToAbs IL_0093..00ea: software flag only, not rail restore.
+            time.sleep(10.0)
+            self._oem_24v_dropped = False
+            result["gripper_recovery"] = self.motor_oem_axis_search_home(
+                "g", speed=600 if self._motion_oem_gripper_version() == 0 else 1500)
+            time.sleep(5.0)
+            result["y_recovery"] = self.motor_oem_axis_search_home("y", speed=1000)
         if wait_for_stop:
             timeout_s = 30.0 if board_id == self.BOARD_THERMAL else 20.0
+            # Recovery runs before the enclosing WaitOne; nested G may consume
+            # this same latch. Never reset or replace its cursor afterward.
             result["wait"] = self.motor_oem_wait_target_reached(
                 board_id,
                 motor=motor,
@@ -4093,7 +4167,7 @@ class BioXpTester:
                 event_window=event_window,
             )
             if result["wait"].get("ok") is not True:
-                if self.oem_no24v_state() or result["wait"].get("failure") == "No24V":
+                if board_id != self.BOARD_HEAD and (self.oem_no24v_state() or result["wait"].get("failure") == "No24V"):
                     raise RuntimeError("Lost 24V power move abs2. moveToAbs()")
                 timeout_position = self.motor_get_position(board_id, motor=motor)
                 result["timeout_position"] = timeout_position
@@ -4718,7 +4792,7 @@ class BioXpTester:
     def motor_move_relative(self, board_id, steps, motor=0):
         # cmd 4 type 1 = move to relative position (OEM MovetoRelPosition).
         pre_stop = self.motor_query_motor_stop(board_id, motor=motor)
-        time.sleep(0.001)
+        # Board.moveSteps has no extra absolute-move Sleep(1) here.
         ack = self._send_motor(
             int(board_id),
             4,
@@ -4746,7 +4820,15 @@ class BioXpTester:
             "ok": True,
         }
 
-    def _motor_oem_move_steps_source(self, *, board, motor, axis, steps, timeout_s):
+    def motor_oem_board_move_steps(self, board, steps, motor=0, *, axis, timeout_s=20.0):
+        """Direct board moveSteps: no enclosing CI.getCurrentPosition call."""
+        result = self._motor_oem_move_steps_source(
+            board=board, motor=motor, axis=axis, steps=steps,
+            timeout_s=timeout_s, board_only=True,
+        )
+        return result
+
+    def _motor_oem_move_steps_source(self, *, board, motor, axis, steps, timeout_s, board_only=False):
         """Recovered board moveSteps plus public moveSteps return semantics."""
         board = int(board)
         motor = int(motor)
@@ -4754,6 +4836,8 @@ class BioXpTester:
         delta = int(steps)
         board_present = bool(self._oem_board_present(board))
         if not board_present:
+            if board_only:
+                raise RuntimeError("OEM direct moveSteps board is null")
             return {
                 "ok": True,
                 "board": board,
@@ -4774,6 +4858,11 @@ class BioXpTester:
             raise RuntimeError("Lost 24V power moveSteps1. moveSteps()")
 
         if not bool(self._oem_board_state().get(board, False)):
+            if board_only:
+                return {"ok": True, "source_call_completed": True,
+                        "board_wrapper_return": 1, "source_return_code": 1,
+                        "source_noop": True, "command_sent": False,
+                        "source_noop_reason": "board_not_initialized"}
             public_position = self.motor_get_position(board, motor=motor)
             public_value = public_position.get("position") if isinstance(public_position, Mapping) else 0
             source_completed = type(public_value) is int
@@ -4830,7 +4919,7 @@ class BioXpTester:
 
         if beyond_limit(target):
             refreshed_before = self.motor_get_position(board, motor=motor)
-            if self.oem_no24v_state():
+            if not board_only and self.oem_no24v_state():
                 raise RuntimeError("Lost 24V power moveSteps2. moveSteps()")
             refreshed_value = refreshed_before.get("position") if isinstance(refreshed_before, Mapping) else None
             if type(refreshed_value) is not int:
@@ -4848,6 +4937,13 @@ class BioXpTester:
             current = int(refreshed_value)
             target = current + delta
             if beyond_limit(target):
+                if board_only:
+                    if self.oem_no24v_state():
+                        raise RuntimeError("Lost 24V power moveSteps2. moveSteps()")
+                    return {"ok": True, "source_call_completed": True,
+                            "board_wrapper_return": -1, "source_return_code": -1,
+                            "source_noop": True, "command_sent": False,
+                            "source_noop_reason": "beyond_limit_after_source_refresh"}
                 public_position = self.motor_get_position(board, motor=motor)
                 public_value = public_position.get("position") if isinstance(public_position, Mapping) else None
                 return {
@@ -4935,6 +5031,15 @@ class BioXpTester:
             if self.oem_no24v_state():
                 raise RuntimeError("Lost 24V power moveSteps4. moveSteps()")
 
+        if board_only:
+            return {"ok": True, "source_call_completed": True,
+                    "board": board, "motor": motor, "steps": delta,
+                    "board_wrapper_return": board_wrapper_return,
+                    "source_return_code": board_wrapper_return,
+                    "command_sent": command_sent, "ack": ack, "wait": wait,
+                    "event": event, "board_position": board_position,
+                    "completion_class": completion_class,
+                    "physical_effect_verified": False}
         public_position = self.motor_get_position(board, motor=motor)
         if board not in (self.BOARD_DECK, self.BOARD_HEAD) and self.oem_no24v_state():
             raise RuntimeError("Lost 24V power moveSteps4. moveSteps()")
@@ -5237,7 +5342,7 @@ class BioXpTester:
             raise RuntimeError("immutable OEM machine snapshot is required for GripperVersion")
         raw = (((machine.get("config") or {}).get("config") or {}).get("GripperVersion"))
         try:
-            return 1 if int(raw) == 1 else 0
+            return int(raw)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("serial-206 GripperVersion is missing or malformed") from exc
 
@@ -5724,8 +5829,9 @@ class BioXpTester:
         # OEM ignores the normal setHome return and queryHome maps a null switch
         # response to active. Neither result is an admission gate.
         sethome_init = self.motor_set_home(board, motor=motor)
+        self._oem_store_search_speed(board, motor, speed)
         home_before = self.motor_query_home_switch(board, motor=motor)
-        switches_before = self.motor_get_switch_activity(board, motor=motor)
+        switches_before = None  # axisSearchHome has no diagnostic switch read.
         preclear_move = None
         preclear_wait = None
         home_after_preclear = None
@@ -5787,9 +5893,9 @@ class BioXpTester:
         require_switch_transition=False,
         max_search_abs_delta=None,
     ):
-        """Recovered ClassHeadBoard.goHome behavior for X, Y, and Z."""
+        """Head/Deck goHome, including Head's coupled G timeout recovery."""
         key = str(axis_key).strip().lower()
-        if key not in {"x", "y", "z"}:
+        if key not in {"x", "y", "z", "g"}:
             return self._motor_oem_go_home_adapted(
                 axis_key,
                 speed=speed,
@@ -5864,9 +5970,12 @@ class BioXpTester:
                 "physical_effect_verified": False,
             }
 
-        position_before = self.motor_get_position(board, motor=motor)
-        home_before = self.motor_query_home_switch(board, motor=motor)
-        speed_before = self.motor_get_speed(board, motor=motor)
+
+        # Reuse cached input; source has no pre-search telemetry queries here.
+        self._oem_store_search_speed(board, motor, speed)
+        position_before = {"position": cached_position_before, "authority": "oem_cached_CurrentPosition"}
+        home_before = None
+        speed_before = None
         source_return_code = 0
         rehome_move = None
         deck_rehome_position = None
@@ -5878,7 +5987,8 @@ class BioXpTester:
                 wait_for_stop=True,
                 max_position=preset.get("axis_max_steps"),
             )
-            if not isinstance(rehome_move, dict) or rehome_move.get("ok") is not True:
+            if not isinstance(rehome_move, dict) or (rehome_move.get("ok") is not True
+                    and not (key == "g" and type(rehome_move.get("source_return_code")) is int)):
                 return {
                     "ok": False,
                     "axis": key,
@@ -5899,33 +6009,47 @@ class BioXpTester:
                 source_return_code = int(rehome_move["source_return_code"])
 
         event_window = self.begin_bus_event_window()
-        move_home = self.motor_move_left(board, speed=int(speed), motor=motor)
+        move_home = None
+        if key == "g" and self.oem_no24v_state():
+            raise RuntimeError("Lost 24V power moveLeft 1. moveLeft() axis: g")
+        if key != "g" or self._oem_board_state().get(board, False):
+            move_home = self.motor_move_left(board, speed=int(speed), motor=motor)
+            if key == "g" and self.oem_no24v_state():
+                raise RuntimeError("Lost 24V power moveLeft 2. moveLeft() axis: g")
         home_cache[channel] = False
         source_timeout_s = 30.0
+        wall_start = time.time() if key == "g" else None
         deadline = time.monotonic() + source_timeout_s
-        wait = self.motor_wait_stopped(
+        wait_method = self._motor_oem_gripper_home_wait if key == "g" else self.motor_wait_stopped
+        wait = wait_method(
             board,
             motor=motor,
             timeout_s=source_timeout_s,
             require_seen_nonzero=False,
             min_polls=1,
+            oem_board_predicate=True,
+            **({"source_wall_start": wall_start, "source_timer_start": deadline - source_timeout_s} if key == "g" else {}),
         )
         if not isinstance(wait, dict) or wait.get("stopped") is not True:
-            self.motor_oem_stop_exact(board, motor=motor)
+            self.motor_oem_board_stop(board, motor=motor, axis_name=key)
             raise RuntimeError(f"{key} Move to left time out")
 
         trace = []
         home_hit = None
         stop = None
         set_home = None
-        position_after = self.motor_get_position(board, motor=motor)
-        while time.monotonic() < deadline:
-            home_poll = self.motor_query_home_switch(board, motor=motor)
+        position_after = None
+        while (time.time() - wall_start < source_timeout_s if wall_start is not None else time.monotonic() < deadline):
+            home_poll = ({"home": True, "reply_valid": False, "ack": None,
+                          "source_noop": "board_not_initialized"}
+                         if key == "g" and not self._oem_board_state().get(board, False)
+                         else self.motor_query_home_switch(board, motor=motor))
             home_active = bool(isinstance(home_poll, dict) and home_poll.get("home") is True)
             trace.append({"home": home_poll, "home_active": home_active})
             if home_active:
                 home_hit = home_poll
-                stop = self.motor_oem_stop_exact(board, motor=motor)
+                # Head/Deck.goHome invokes the No24V/initialized board wrapper.
+                stop = self.motor_oem_board_stop(board, motor=motor, axis_name=key)
                 position_after = self.motor_get_position(board, motor=motor)
                 position_value = position_after.get("position") if isinstance(position_after, dict) else position_cache.get(channel, -1000)
                 if type(position_value) is int:
@@ -5934,8 +6058,9 @@ class BioXpTester:
                 position_cache[channel] = 0
                 break
 
-        home_after = self.motor_query_home_switch(board, motor=motor)
-        position_after_sethome = self.motor_get_position(board, motor=motor) if set_home is not None else None
+        # Reuse the source poll; never imply a fresh post-setHome observation.
+        home_after = home_hit
+        position_after_sethome = None
         stop_acknowledged = bool(
             isinstance(stop, dict)
             and stop.get("ok") is True
@@ -5945,10 +6070,16 @@ class BioXpTester:
         terminal_zero_verified = bool(
             isinstance(wait, dict)
             and wait.get("stopped") is True
+            and wait.get("controller_terminal_state_verified") is True
+            and wait.get("speed_reply_valid") is True
+            and self._tmcl_success(wait.get("last_ack"))
             and type(wait.get("last_speed")) is int
             and int(wait["last_speed"]) == 0
         )
-        set_home_verified = bool(isinstance(set_home, dict) and set_home.get("ok") is True)
+        set_home_verified = bool(isinstance(set_home, dict) and self._tmcl_success(set_home.get("ack")))
+        home_observed = bool(isinstance(home_hit, dict) and home_hit.get("home") is True
+                             and home_hit.get("reply_valid") is True
+                             and self._tmcl_success(home_hit.get("ack")))
         return {
             "ok": True,
             "axis": key,
@@ -5976,10 +6107,10 @@ class BioXpTester:
             "set_home": set_home,
             "controller_command_acknowledged": bool(isinstance(move_home, dict) and self._tmcl_success(move_home.get("ack"))),
             "controller_terminal_state_verified": terminal_zero_verified,
-            "controller_home_proof_verified": bool(home_hit is not None and set_home is not None),
+            "controller_home_proof_verified": bool(terminal_zero_verified and home_observed and set_home_verified),
             "home_decision": {
                 "source_returned_normally": True,
-                "home_observed": home_hit is not None,
+                "home_observed": home_observed,
                 "terminal_stop_verified": stop_acknowledged and terminal_zero_verified,
                 "set_home_verified": set_home_verified,
             },
@@ -5988,6 +6119,54 @@ class BioXpTester:
             "independent_physical_motion_verified": False,
             "physical_effect_verified": False,
         }
+
+    def _oem_store_search_speed(self, board, motor, speed):
+        speeds = getattr(self, "_oem_search_home_speeds", None)
+        if speeds is None:
+            speeds = self._oem_search_home_speeds = {}
+        speeds[(int(board), int(motor))] = int(speed)
+
+    def _motor_oem_gripper_recovery_position(self):
+        from .oem_initialization import build_machine_calibration_manifest
+        manifest = build_machine_calibration_manifest()
+        if not manifest.get("ok"):
+            raise RuntimeError("OEM gripper recovery settings unavailable")
+        values = manifest["gripper"]
+        offset = values["originOffsetG"]["value"]
+        wide = values["GripperOpenWide"]["value"]
+        version = self._motion_oem_gripper_version()
+        if version == 0 and type(offset) is int:
+            return 59500 + offset
+        if version == 1 and type(wide) is int:
+            if wide != 0:
+                return wide
+            if type(offset) is int:
+                return 33000 + offset
+        raise RuntimeError("OEM GripperStatus4 binding unavailable")
+
+    def _motor_oem_gripper_home_wait(self, board, *, motor, source_wall_start, source_timer_start, **_):
+        # Predicate precedes timeout. The first recovery stops the stopwatch;
+        # neither it nor the DateTime origin restarts on subsequent recovery.
+        wall_start, timer_start = source_wall_start, source_timer_start
+        stopped_elapsed = None
+        polls = 0
+        while True:
+            no24v = self.oem_no24v_state()
+            if no24v or not self._oem_board_state().get(int(board), False):
+                return {"stopped": True, "source_predicate_reason": "No24V" if no24v else "board_not_initialized",
+                    "controller_terminal_state_verified": False, "speed_reply_valid": False,
+                    "last_speed": None, "last_ack": None, "polls": polls}
+            row = self.motor_get_speed(board, motor=motor)
+            polls += 1
+            if row.get("speed") == 0:
+                valid = row.get("speed_reply_valid") is True and self._tmcl_success(row.get("ack"))
+                return {"stopped": True, "last_speed": 0, "last_ack": row.get("ack"),
+                    "speed_reply_valid": valid, "controller_terminal_state_verified": valid, "polls": polls}
+            elapsed = time.monotonic() - timer_start if stopped_elapsed is None else stopped_elapsed
+            if time.time() - wall_start > 30.0 and elapsed > 30.0:
+                stopped_elapsed = elapsed
+                self.motor_oem_move_absolute(board, self._motor_oem_gripper_recovery_position(),
+                    motor=motor, wait_for_stop=True, gripper_recover=True)
 
     def _motor_oem_go_home_adapted(
         self,
@@ -6527,6 +6706,18 @@ class BioXpTester:
             "restore_plan": plan,
         }
 
+    def motor_oem_confirm_thermal_door_closed(self) -> dict:
+        """Only confirmAxis(tcDoorClosed), not the diagnostic status sweep."""
+        preset = self._motion_oem_axis_profile("door")
+        if not isinstance(preset, dict):
+            raise RuntimeError("thermal door profile unavailable")
+        home = self.motor_query_home_switch(int(preset["board"]), motor=int(preset["motor"]))
+        if not isinstance(home, Mapping) or type(home.get("value")) is not int:
+            raise RuntimeError("tcDoorClosed_source_predicate_unavailable")
+        closed = home["value"] == int(self.MOTOR_SWITCH_ACTIVE_VALUE)
+        return {"home": home, "oem_predicates": {
+            "tcDoorClosed": closed, "closed_source": "queryHome(ThermalDoor)"}}
+
     def motor_thermal_door_status(self) -> dict:
         """Return OEM thermal-door position plus closed/open predicates.
 
@@ -6672,105 +6863,189 @@ class BioXpTester:
             "oem_reference": "ClassControlInterface.closeThermalDoor lines 2678-2692",
         }
 
-    def motor_oem_door_search_home(self, *, timeout_s=20.0, startup=False):
-        """OEM thermal-door search-home.
+    def _motor_oem_door_search_wait(self, board, motor):
+        """Thermal.doorSearchHome IL_0075..00b0, not a timed speed wait.
 
-        Both startup initializeMotors() and manual HomeAxis("D") delegate to
-        ClassThermalBoard.doorSearchHome(). That board primitive pre-clears
-        +2000 whenever queryHome is active (or serial <10), independent of its
-        caller. Serial 206 therefore preserves the active-home preclear in both
-        modes while retaining separately bounded waits.
+        The postdecrement tests the OLD counter. Even an already-stopped motor
+        gets queryHome and Sleep(50) first. Cached scalar speed zero remains a
+        source predicate only, never fresh stopped/physical evidence.
         """
-        preset = self._motion_oem_axis_profile("door")
-        board = int(preset["board"])
-        motor = int(preset["motor"])
-        threshold = int(preset.get("stall_guard", 6))
-        wait_timeout = max(2.0, min(float(timeout_s), 20.0 if bool(startup) else float(timeout_s)))
-        status_before = self.motor_thermal_door_status()
-        home_before = status_before.get("home") if isinstance(status_before, dict) else self.motor_query_home_switch(board, motor=motor)
-        preclear_threshold = None
-        preclear_move = None
-        preclear_wait = None
-        if isinstance(home_before, dict) and home_before.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE):
-            preclear_threshold = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold + 2, motor=motor)
-            preclear_move = self.motor_move_relative(board, 2000, motor=motor)
-            preclear_wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 8.0))
-        threshold_restore = self.motor_set_axis_param(board, int(preset.get("stall_guard_param", 205)), threshold, motor=motor)
-        move_left = self.motor_move_left(board, speed=int(preset.get("home_speed", preset.get("speed", 600))), motor=motor)
-        wait = self.motor_wait_stopped(
-            board,
-            motor=motor,
-            timeout_s=wait_timeout,
-            require_seen_nonzero=not bool(startup),
-        )
-        stop = self.motor_stop(board, motor=motor)
-        status_after = self.motor_thermal_door_status()
-        home_after = status_after.get("home") if isinstance(status_after, dict) else self.motor_query_home_switch(board, motor=motor)
-        switches_after = status_after.get("switches") if isinstance(status_after, dict) else self.motor_get_switch_activity(board, motor=motor)
-        closed_confirmed = bool(status_after.get("closed")) if isinstance(status_after, dict) else (home_after.get("value") == int(self.MOTOR_SWITCH_ACTIVE_VALUE) if isinstance(home_after, dict) else False)
-        base = {
-            "axis": "door",
-            "board": board,
-            "motor": motor,
-            "startup": bool(startup),
-            "oem_mode": "initializeMotors.doorSearchHome" if bool(startup) else "HomeAxis(D).doorSearchHome",
-            "speed": int(preset.get("home_speed", preset.get("speed", 600))),
-            "status_before": status_before,
-            "closed_before": bool(status_before.get("closed")) if isinstance(status_before, dict) else None,
-            "opened_before": bool(status_before.get("opened")) if isinstance(status_before, dict) else None,
-            "home_before": home_before,
-            "preclear_threshold": preclear_threshold,
-            "preclear_move": preclear_move,
-            "preclear_wait": preclear_wait,
-            "threshold_restore": threshold_restore,
-            "move_left": move_left,
-            "wait": wait,
-            "stop": stop,
-            "status_after": status_after,
-            "closed_after": bool(status_after.get("closed")) if isinstance(status_after, dict) else None,
-            "opened_after": bool(status_after.get("opened")) if isinstance(status_after, dict) else None,
-            "home_after": home_after,
-            "switches_after": switches_after,
-            "closed_confirmed": bool(closed_confirmed),
-        }
-        # Live OEM-parity test showed the door may reach the closed/home predicate
-        # while motor_wait_stopped reports a timeout. OEM truth is predicate-backed:
-        # once tcDoorClosed/queryHome is true and speed is stopped, setHome is valid.
-        if bool(closed_confirmed):
+        counter = 300
+        trace = []
+        last = None
+        while True:
+            home = self._motor_oem_door_query_home(board, motor)
+            if isinstance(home, dict) and home.get("home") is True and counter > 81:
+                counter = 80
+            time.sleep(0.05)
+            old_counter = counter
+            counter -= 1
+            row = {"home": home, "counter_before_decrement": old_counter}
+            trace.append(row)
+            if old_counter < 0:
+                return {"stopped": False, "timeout": True, "source_counter": counter,
+                        "polls": len(trace) - 1, "trace": trace,
+                        "last_speed": last.get("speed") if isinstance(last, dict) else None,
+                        "last_ack": last.get("ack") if isinstance(last, dict) else None,
+                        "controller_terminal_state_verified": False}
+            # Thermal.checkMotorStopped: No24V, initialized, then one source
+            # queryMotorSpeed (its null-reply leaf retry is not an outer poll).
+            no24v = self.oem_no24v_state()
+            if no24v or not self._oem_board_state().get(int(board), False):
+                return {"stopped": True, "source_counter": counter, "trace": trace,
+                        "polls": len(trace) - 1,
+                        "source_predicate_reason": "No24V" if no24v else "board_not_initialized",
+                        "controller_terminal_state_verified": False,
+                        "speed_reply_valid": False, "last_speed": None, "last_ack": None}
+            last = self.motor_get_speed(board, motor=motor)
+            row["speed"] = last
+            if isinstance(last, dict) and last.get("speed") == 0:
+                valid = bool(last.get("speed_reply_valid") is True
+                             and self._tmcl_success(last.get("ack")))
+                return {"stopped": True, "source_counter": counter, "trace": trace,
+                        "polls": len(trace), "last_speed": last.get("speed"),
+                        "last_ack": last.get("ack"), "speed_reply_valid": valid,
+                        "controller_terminal_state_verified": valid}
+
+    def _motor_oem_door_source_settings(self):
+        # CI constructor IL_02d6..02ec binds ThermalDoor to ZLow/HighLimit.
+        # Branch selectors must come from the same accepted immutable snapshot,
+        # never a serial206/default CameraCalibrated guess.
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+        snapshot = get_active_oem_machine_snapshot()
+        return {"serial": int(snapshot.machine_serial),
+                "camera_calibrated": snapshot.camera_calibrated,
+                "min_steps": int(snapshot.axis_limits["z"]["min_steps"]),
+                "max_steps": int(snapshot.axis_limits["z"]["max_steps"])}
+
+    def _motor_oem_door_query_home(self, board, motor):
+        # Thermal.queryHome returns true without querying an uninitialized board.
+        if not self._oem_board_state().get(int(board), False):
+            return {"home": True, "reply_valid": False, "ack": None,
+                    "home_source": "board_not_initialized"}
+        return self.motor_query_home_switch(board, motor=motor)
+
+    def _motor_oem_door_preclear(self, board, motor, settings):
+        """Thermal.moveSteps(axis, 2000, true), without CI's extra query.
+
+        ClassCanLib RVAab38: cached bound, optional refresh, query138/relative,
+        30000ms AutoResetEvent wait, one final position query then power check.
+        A normal -1 return does not prevent doorSearchHome's continuation.
+        """
+        if self.oem_no24v_state():
+            raise RuntimeError("Lost 24V power moveSteps1. moveSteps() axis: door")
+        if not self._oem_board_state().get(int(board), False):
+            return {"source_return_code": 1, "source_noop": "board_not_initialized"}
+        cache = getattr(self, "_oem_position_cache", {})
+        current = cache.get((int(board), int(motor)), -1000)
+        def beyond(position):
+            return position > settings["max_steps"] - 20 or position < settings["min_steps"] + 20
+        before = None
+        if beyond(current + 2000):
+            before = self.motor_get_position(board, motor=motor)
+            current = before["position"]
+            if beyond(current + 2000):
+                if self.oem_no24v_state():
+                    raise RuntimeError("Lost 24V power moveSteps2. moveSteps() axis: door")
+                return {"source_return_code": -1, "source_noop": "beyond_limit_after_source_refresh",
+                        "before": before}
+        pre_stop = self.motor_query_motor_stop(board, motor=motor)
+        # Cursor BEFORE issuance: an event arriving before its ACK is valid.
+        event_window = self.begin_bus_event_window(
+            reset_wait_latch=pre_stop.get("wait_latch_reset") is True)
+        home_cache = getattr(self, "_oem_motor_home_cache", None)
+        if not isinstance(home_cache, dict):
+            home_cache = {}
+            self._oem_motor_home_cache = home_cache
+        home_cache[(int(board), int(motor))] = False
+        ack = self._send_motor(board, 4, 1, motor, 2000,
+            attempts=1, wait_reply=True, write_timeout_ms=55,
+            read_timeout_ms=60000, max_reads=1, strict_match=True,
+            allow_recover=False, ordinary_motor_retry=True)
+        move = {"pre_stop": pre_stop, "ack": ack}
+        wait = self.motor_oem_wait_target_reached(
+            board, motor=motor, timeout_s=30.0, event_window=event_window)
+        position = self.motor_get_position(board, motor=motor)
+        completed = isinstance(wait, dict) and wait.get("ok") is True
+        if self.oem_no24v_state():
+            stage = 4 if completed else 3
+            raise RuntimeError(f"Lost 24V power moveSteps{stage}. moveSteps() axis: door")
+        return {"source_return_code": position["position"] if completed else -1,
+                "before": before, "move": move, "wait": wait, "position": position,
+                "physical_effect_verified": False}
+
+    def motor_oem_door_search_home(self, *, timeout_s=20.0, startup=False):
+        """Thermal.doorSearchHome: source return is not physical proof.
+
+        Both CI HomeAxis(D) and startup use the same board method. Its counter
+        schedule and preclear event budget do not depend on the caller timeout.
+        """
+        preset = cast(dict[str, Any], self._motion_oem_axis_profile("door"))
+        board, motor = int(preset["board"]), int(preset["motor"])
+        if self.oem_no24v_state():
+            raise RuntimeError("Lost 24V power doorSearchHome() axis: door")
+        if not self._oem_board_state().get(board, False):
+            return {"ok": True, "axis": "door", "board": board, "motor": motor,
+                    "source_call_completed": True, "source_board_return": None,
+                    "source_noop": "board_not_initialized",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "controller_home_proof_verified": False,
+                    "physical_effect_verified": False}
+        settings = self._motor_oem_door_source_settings()
+        threshold = int(preset["stall_guard"])
+        speed = int(preset["home_speed"])
+        home_before = self._motor_oem_door_query_home(board, motor)
+        preclear_threshold = preclear_move = None
+        if home_before.get("home") is True or settings["serial"] < 10:
+            preclear_threshold = self.motor_set_axis_param(board, 205, threshold + 2, motor=motor)
+            preclear_move = self._motor_oem_door_preclear(board, motor, settings)
+        threshold_restore = self.motor_set_axis_param(board, 205, threshold, motor=motor)
+        # Thermal.moveLeft board wrapper: No24V -> initialized -> leaf -> No24V.
+        if self.oem_no24v_state():
+            raise RuntimeError("Lost 24V power moveLeft 1. moveLeft() axis: door")
+        move_left = None
+        if self._oem_board_state().get(board, False):
+            move_left = self.motor_move_left(board, speed=speed, motor=motor)
+            if self.oem_no24v_state():
+                raise RuntimeError("Lost 24V power moveLeft 2. moveLeft() axis: door")
+        wait = self._motor_oem_door_search_wait(board, motor)
+        # Thermal.stopMotor ignores waitforstop; the existing board wrapper is
+        # already source-correct and remains unchanged.
+        stop = self.motor_oem_board_stop(board, motor=motor, axis_name="door")
+        home_after = self._motor_oem_door_query_home(board, motor)
+        sethome = None
+        if home_after.get("home") is True or settings["serial"] < 10:
             sethome = self.motor_set_home(board, motor=motor)
-            return {
-                **base,
-                "set_home": sethome,
-                "ambiguous_no_motion": bool(wait.get("ambiguous_no_motion")),
-                "partial": False,
-                "failure": None,
-                "wait_warning": None if wait.get("stopped") is True else "wait_not_stopped_but_closed_predicate_confirmed",
-                "ok": True,
-            }
-        if wait.get("ambiguous_no_motion"):
-            return {
-                **base,
-                "set_home": None,
-                "ambiguous_no_motion": True,
-                "partial": False,
-                "failure": "door_search_no_motion_observed",
-                "ok": False,
-            }
-        if wait.get("stopped") is not True:
-            return {
-                **base,
-                "set_home": None,
-                "partial": True,
-                "failure": "door_search_wait_timeout",
-                "ok": False,
-            }
-        return {
-            **base,
-            "set_home": None,
-            "partial": False,
-            "failure": "door_search_closed_predicate_not_confirmed",
-            "ok": False,
-        }
+        elif settings["camera_calibrated"]:
+            raise RuntimeError("Failed to find door home")
+        home_observed = bool(home_after.get("home") is True
+                             and home_after.get("reply_valid") is True
+                             and self._tmcl_success(home_after.get("ack")))
+        terminal_verified = wait.get("controller_terminal_state_verified") is True
+        sethome_verified = bool(isinstance(sethome, dict)
+                                and self._tmcl_success(sethome.get("ack")))
+        return {"ok": True, "axis": "door", "board": board, "motor": motor,
+                "startup": bool(startup), "speed": speed,
+                "oem_mode": "initializeMotors.doorSearchHome" if startup else "HomeAxis(D).doorSearchHome",
+                "requested_timeout_s": float(timeout_s),
+                "source_call_completed": True, "source_board_return": None,
+                "home_before": home_before, "home_after": home_after,
+                "status_before": None, "status_after": None,
+                "closed_before": home_before.get("home"), "opened_before": None,
+                "closed_after": home_after.get("home"), "opened_after": None,
+                "closed_confirmed": home_observed,
+                "preclear_threshold": preclear_threshold, "preclear_move": preclear_move,
+                "preclear_wait": preclear_move.get("wait") if isinstance(preclear_move, dict) else None,
+                "threshold_restore": threshold_restore, "move_left": move_left,
+                "wait": wait, "stop": stop, "set_home": sethome,
+                "failure": None, "partial": False,
+                "wait_warning": "source_counter_expired" if wait.get("timeout") else None,
+                "controller_command_acknowledged": bool(isinstance(move_left, dict)
+                    and self._tmcl_success(move_left.get("ack"))),
+                "controller_terminal_state_verified": terminal_verified,
+                "controller_home_proof_verified": terminal_verified and home_observed and sethome_verified,
+                "independent_physical_motion_verified": False, "physical_effect_verified": False}
 
     def motor_oem_switch_search_home_axis(self, axis_key, *, speed=None, timeout_s=20.0):
         """Manual true-homing path: switch-search with inactive->active transition required.
@@ -6828,90 +7103,30 @@ class BioXpTester:
         restore_idle_current=True,
         oem_exact_current=False,
     ):
-        """Run one G home with caller-selected OEM current lifetime.
-
-        Standalone/manual homing restores the idle current in this primitive.
-        `initializeMotors()` passes ``restore_idle_current=False`` because the
-        direct OEM method intentionally retains run current 31 until its final
-        source line after X/Y/Z/door initialization.
-        """
-        prepare = None
-        home = None
-        restore_current = None
-        retained_current = None
-        try:
-            prepare = self.motor_prepare_axis(
-                preset["board"],
-                motor=preset["motor"],
-                run_current=int(preset.get("home_current", 31)),
-                standby_current=int(preset.get("standby_current", 10)),
-                speed=preset.get("speed"),
-                acc=preset.get("acc"),
-                stall_guard=preset.get("stall_guard"),
-                ramp_mode=preset.get("ramp_mode"),
-                disable_right=preset.get("disable_right"),
-                disable_left=preset.get("disable_left"),
-                rdiv=preset.get("rdiv"),
-                pdiv=preset.get("pdiv"),
-                warm_enable=bool(preset.get("warm_enable", False)),
-                write_standby=not bool(oem_exact_current),
-            )
-            effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
-            if bool(startup):
-                home = self.motor_oem_axis_search_home(
-                    "g",
-                    speed=effective_speed,
-                    timeout_s=timeout_s,
-                    max_search_abs_delta=preset.get("home_search_max_abs_delta"),
-                )
-            else:
-                home = self.motor_oem_go_home(
-                    "g",
-                    speed=effective_speed,
-                    rehome=True,
-                    timeout_s=timeout_s,
-                )
-            if not bool(restore_idle_current):
-                retained_current = self.motor_get_axis_param(
-                    int(preset["board"]),
-                    6,
-                    motor=int(preset["motor"]),
-                )
-        finally:
-            if bool(restore_idle_current):
-                if bool(oem_exact_current):
-                    restore_row = self.motor_set_axis_param(
-                        int(preset["board"]), 6, 10, motor=int(preset["motor"])
-                    )
-                    restore_current = {
-                        **dict(restore_row),
-                        "oem_method": "setMaxCurrent(MotorGrip, 10)",
-                        "standby_current_param7_written": False,
-                    }
-                else:
-                    restore_current = self.motor_restore_gripper_idle_current(
-                        reason="oem_home_axis_g_finally"
-                    )
-        if bool(restore_idle_current) and (
-            not isinstance(restore_current, dict) or restore_current.get("ok") is not True
-        ):
-            raise RuntimeError("gripper idle-current restoration was not proven")
-        if not bool(restore_idle_current) and (
-            not isinstance(retained_current, dict)
-            or retained_current.get("ok") is not True
-            or int(retained_current.get("value", -1)) != int(preset.get("home_current", 31))
-        ):
-            raise RuntimeError("gripper OEM run current was not retained at 31 after homing")
-        return {
-            "axis": "g",
-            "startup": bool(startup),
-            "prepare": prepare,
-            "home": home,
-            "restore_current": restore_current,
-            "restore_idle_current_requested": bool(restore_idle_current),
-            "source_current_retained": not bool(restore_idle_current),
-            "retained_current_readback": retained_current,
-        }
+        """Home-only startup delegation; standalone G keeps its OEM lifetime."""
+        if not startup:
+            board, motor = int(preset["board"]), int(preset["motor"])
+            if not self._oem_board_present(board):
+                return {"axis": "g", "source_noop": "board_null", "home": {"ok": True, "source_noop": True}}
+            version = int(preset["gripper_version"])
+            prepare = self.motor_set_axis_param(board, 6, 31, motor=motor)
+            home = self.motor_oem_go_home("g", speed=600 if version == 0 else 200,
+                rehome=True, timeout_s=timeout_s)
+            restore = self.motor_set_axis_param(board, 6, 10, motor=motor) if version == 1 else None
+            return {"axis": "g", "startup": False, "prepare": prepare,
+                    "home": home, "restore_current": restore, "source_current_retained": version != 1}
+        # Startup home-only role: the enclosing initializeMotors owns current
+        # 31, moveSteps(+10000,true), and final current10. Manual branch above
+        # retains its separate source contract. Legacy current flags cannot
+        # cause additional startup writes or finally restoration.
+        effective_speed = int(preset.get("home_speed", 200)) if speed is None else int(speed)
+        home = self.motor_oem_axis_search_home(
+            "g", speed=effective_speed, timeout_s=timeout_s,
+            max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+        )
+        return {"axis": "g", "startup": True, "prepare": None,
+                "home": home, "restore_current": None,
+                "current_lifetime_owner": "ClassControlInterface.initializeMotors"}
 
     def motor_oem_move_z_home(self, *, rehome=True, timeout_s=30.0):
         """Literal ``ClassControlInterface.MoveZHome`` for serial-206 Z."""
@@ -7024,6 +7239,8 @@ class BioXpTester:
         if key == "g":
             board = int(preset["board"])
             motor = int(preset["motor"])
+            if not self._oem_board_present(board):
+                return {**out, "ok": True, "source_noop": "board_null", "source_call_completed": True}
             gv = int(preset.get("gripper_version", 1))
             current_row = self.motor_set_axis_param(board, 6, 31, motor=motor)
             stall_row = self.motor_set_axis_param(board, 205, 5, motor=motor)
@@ -7031,16 +7248,14 @@ class BioXpTester:
                 {"op": "setGripperCurrent", "param": 6, "value": 31, "receipt": current_row},
                 {"op": "setStallGuardThreshold", "param": 205, "value": 5, "receipt": stall_row},
             ])
-            try:
-                out["home"] = self.motor_oem_axis_search_home(
-                    "g",
-                    speed=200 if gv != 0 else 150,
-                    timeout_s=timeout_s,
-                    max_search_abs_delta=preset.get("home_search_max_abs_delta"),
-                )
-            finally:
-                if gv == 1:
-                    out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
+            out["home"] = self.motor_oem_axis_search_home(
+                "g",
+                speed=200 if gv != 0 else 150,
+                timeout_s=timeout_s,
+                max_search_abs_delta=preset.get("home_search_max_abs_delta"),
+            )
+            if gv == 1:
+                out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
             return finish()
         out["home"] = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
         return finish()
@@ -7114,8 +7329,9 @@ class BioXpTester:
         if caught_plate and not bool(development_machine):
             x_home = caught_plate_x_home()
             solenoid = self.deck_io_set_type(2, 0)
-            if solenoid.get("ok") is True:
-                self._mark_oem_latch_unlocked()
+            # Source latchStatus assignment follows the normal void call,
+            # independent of ACK; this is host state, not an unlocked sensor.
+            self._mark_oem_latch_unlocked()
             recovery = {
                 "x_home": x_home,
                 "solenoid": solenoid,
@@ -7137,6 +7353,9 @@ class BioXpTester:
                 "source_anchor": "ClassControlInterface.homeGZ:4674-4680",
             }
 
+        # CI.moveZ always sets current, including its second homeGZ call.
+        z_restore_current = self.motor_set_axis_param(
+            z_profile["board"], 6, 31, motor=z_profile.get("motor", 0))
         z_restore = self.motor_oem_move_absolute(
             z_profile["board"],
             max(int(pseudo_z_home), 0),
@@ -7166,6 +7385,7 @@ class BioXpTester:
             "gripper_home": gripper_home,
             "caught_plate": False,
             "z_restore": z_restore,
+            "z_restore_current": z_restore_current,
             "restore_gripper_idle_current": restore_idle,
             "failure": None if all_commands_ok else "home_gz_source_command_not_acknowledged",
             "source_anchor": "ClassControlInterface.homeGZ:4657-4687",
@@ -7447,20 +7667,33 @@ class BioXpTester:
         require_seen_nonzero=False,
         min_polls=3,
         target_position=None,
+        oem_board_predicate=False,
     ):
         t0 = time.monotonic()
         deadline = t0 + max(0.3, float(timeout_s))
         polls = 0
         last = None
         last_speed = None
+        last_speed_reply_valid = False
         seen_nonzero = False
         last_position = None
         target_reached = False
         while time.monotonic() < deadline:
+            # Head/Deck.checkMotorStopped checks No24V BEFORE initialized and
+            # returns true without telemetry in either short-circuit branch.
+            # This is source control flow, never controller stopped evidence.
+            if oem_board_predicate:
+                no24v = self.oem_no24v_state()
+                if no24v or not self._oem_board_state().get(int(board_id), False):
+                    return {"stopped": True, "source_predicate_reason": "No24V" if no24v else "board_not_initialized",
+                            "controller_terminal_state_verified": False, "speed_reply_valid": False,
+                            "last_speed": last_speed, "last_ack": last, "polls": polls,
+                            "elapsed_ms": int((time.monotonic() - t0) * 1000)}
             row = self.motor_get_speed(board_id, motor=motor)
             polls += 1
             last = row.get("ack")
             last_speed = row.get("speed")
+            last_speed_reply_valid = bool(row.get("speed_reply_valid") is True and self._tmcl_success(last))
             if isinstance(last_speed, int) and last_speed != 0:
                 seen_nonzero = True
             if (
@@ -7498,10 +7731,15 @@ class BioXpTester:
                     "target_reached": target_reached,
                     "last_position": last_position,
                     "last_ack": last,
+                    "speed_reply_valid": last_speed_reply_valid,
+                    "controller_terminal_state_verified": last_speed_reply_valid and type(last_speed) is int,
                 }
-            time.sleep(max(0.02, float(poll_s)))
+            if not oem_board_predicate:
+                time.sleep(max(0.02, float(poll_s)))
         return {
             "stopped": False,
+            "controller_terminal_state_verified": False,
+            "speed_reply_valid": last_speed_reply_valid,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "polls": polls,
             "last_speed": last_speed,
@@ -7826,7 +8064,7 @@ class BioXpTester:
         axis = str(axis_name or self.motor_axis_key_for_channel(board_id, motor=motor))
         if self.oem_no24v_state():
             raise RuntimeError(f"Lost 24V power stopMotor 1. stopMotor() axis: {axis}")
-        if not self._oem_board_present(int(board_id)):
+        if not self._oem_board_state().get(int(board_id), False):
             return {
                 "ok": True,
                 "board": int(board_id),
@@ -7841,7 +8079,9 @@ class BioXpTester:
         result = self.motor_oem_stop_exact(board_id, motor=motor)
         if self.oem_no24v_state():
             raise RuntimeError(f"Lost 24V power stopMotor2. stopMotor() axis: {axis}")
-        return result
+        # Board stopMotor is void (ClassHeadBoard IL_0034 pop). Preserve the
+        # leaf scalar/ACK fields separately; normal board return is not proof.
+        return {**result, "source_call_completed": True, "source_board_return": None}
 
     def motor_stop(self, board_id, motor=0):
         return self.motor_oem_stop_exact(board_id, motor=motor)

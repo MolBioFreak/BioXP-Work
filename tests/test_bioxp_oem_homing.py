@@ -85,9 +85,10 @@ def test_motor_oem_home_axis_restores_gripper_current_for_version_one(monkeypatc
     result = tester.motor_oem_home_axis("g")
 
     assert result["axis"] == "g"
-    assert observed["prepare"]["run_current"] == 31
+    assert "prepare" not in observed  # btnGripperHome writes only SAP6.
     assert observed["go_home"] == {"axis_key": "g", "speed": 200, "rehome": True, "timeout_s": 20.0}
     assert observed["restores"] == [
+        {"board_id": tester.BOARD_HEAD, "param": 6, "value": 31, "motor": 2},
         {
             "board_id": tester.BOARD_HEAD,
             "param": 6,
@@ -129,81 +130,79 @@ def test_head_clearance_default_is_operator_requested_15k(monkeypatch):
 
 
 
+def _bind_source_door_fixture(tester, monkeypatch, calls, *, stalled=False):
+    monkeypatch.setattr(tester, 'oem_no24v_state', lambda: False)
+    monkeypatch.setattr(tester, '_oem_board_state', lambda: {6: True})
+    monkeypatch.setattr(tester, '_motor_oem_door_source_settings', lambda: {
+        'serial': 206, 'camera_calibrated': True, 'min_steps': 0, 'max_steps': 160000})
+    monkeypatch.setattr(tester, '_motor_oem_door_preclear', lambda board, motor, settings:
+        calls.append(('board_moveSteps', board, 2000, motor)) or
+        {'source_return_code': 2000, 'wait': {'ok': True}})
+    monkeypatch.setattr(tester, 'motor_query_home_switch', lambda board, motor=0:
+        calls.append(('home', board, motor)) or
+        {'home': True, 'value': 1, 'ack': {'status': 100}, 'reply_valid': True})
+    monkeypatch.setattr(tester, 'motor_get_speed', lambda board, motor=0:
+        calls.append(('speed', board, motor)) or
+        {'speed': 7 if stalled else 0, 'ack': {'status': 100}, 'speed_reply_valid': True})
+    monkeypatch.setattr(tester, 'motor_set_axis_param', lambda board, param, value, motor=0:
+        calls.append(('sap', board, param, value, motor)) or {'ok': True})
+    monkeypatch.setattr(tester, 'motor_move_left', lambda board, speed, motor=0:
+        calls.append(('left', board, speed, motor)) or {'ack': {'status': 100}})
+    monkeypatch.setattr(tester, 'motor_oem_board_stop', lambda board, motor=0, axis_name=None:
+        calls.append(('board_stop', board, motor)) or {'source_call_completed': True})
+    monkeypatch.setattr(tester, 'motor_set_home', lambda board, motor=0:
+        calls.append(('set_home', board, motor)) or {'ok': True, 'ack': {'status': 100}})
+    monkeypatch.setattr(time, 'sleep', lambda seconds: calls.append(('sleep', seconds)))
+
+
 def test_startup_door_home_preserves_board_level_oem_active_home_preclear(monkeypatch):
-    tester, _ = _make_tester(monkeypatch)
-    calls = []
-
-    monkeypatch.setattr(tester, "motor_prepare_axis", lambda board_id, motor=0, **kwargs: calls.append(("prepare", board_id, motor, kwargs)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"ok": True, "value": 1})
-    monkeypatch.setattr(tester, "motor_set_axis_param", lambda board_id, param, value, motor=0: calls.append(("sap", board_id, param, value, motor)) or {"ok": True, "value": value})
-    monkeypatch.setattr(tester, "motor_move_relative", lambda board_id, steps, motor=0: calls.append(("relative", board_id, steps, motor)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=600, motor=0: calls.append(("move_left", board_id, speed, motor)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=20.0, **kwargs: calls.append(("wait", board_id, motor, timeout_s, kwargs)) or {"stopped": True, "seen_nonzero": True})
-    monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: calls.append(("stop", board_id, motor)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: calls.append(("set_home", board_id, motor)) or {"ok": True})
-    monkeypatch.setattr(tester, "motor_get_switch_activity", lambda board_id, motor=0: {"left_state": 1, "right_state": 0})
-    monkeypatch.setattr(
-        tester,
-        "motor_thermal_door_status",
-        lambda: {"closed": True, "opened": False, "home": {"value": 1}, "switches": {"left_state": 1, "right_state": 0}},
-    )
-
-    result = tester.motor_oem_home_axis("door", startup=True, timeout_s=90.0)
-    home = result["home"]
-
-    assert home["oem_mode"] == "initializeMotors.doorSearchHome"
-    assert home["startup"] is True
-    assert home["preclear_move"]["ok"] is True
-    assert calls[:4] == [
-        ("prepare", tester.BOARD_THERMAL, 0, {
-            "run_current": 31,
-            "standby_current": 10,
-            "speed": 50,
-            "acc": 20,
-            "stall_guard": 6,
-            "ramp_mode": None,
-            "disable_right": True,
-            "disable_left": True,
-            "rdiv": None,
-            "pdiv": None,
-            "warm_enable": False,
-            "write_standby": True,
-            }),
-        ("sap", tester.BOARD_THERMAL, 205, 8, 0),
-        ("relative", tester.BOARD_THERMAL, 2000, 0),
-        ("wait", tester.BOARD_THERMAL, 0, 8.0, {}),
-    ]
-    assert home["wait"]["stopped"] is True
-    assert home["ok"] is True
-    assert ("wait", tester.BOARD_THERMAL, 0, 20.0, {"require_seen_nonzero": False}) in calls
-
+    # Replaces the obsolete 8s speed wait with the IL-locked board event chain.
+    from test_motion_finalization_sequences import DoorSequence, preclear_vector, poll, suffix
+    tester = DoorSequence(monkeypatch, initial_home=True)
+    preset = dict(tester.MOTOR_FUNCTION_PRESETS['door'])
+    monkeypatch.setattr(tester, '_motion_oem_axis_profile', lambda *a, **k: preset)
+    monkeypatch.setattr(tester, 'motor_prepare_axis',
+                        lambda board, **kw: tester.calls.append(('prepare', board, kw)) or {'ok': True})
+    result = tester.motor_oem_home_axis('door', startup=True, timeout_s=90.0)
+    home = result['home']
+    assert home['oem_mode'] == 'initializeMotors.doorSearchHome'
+    assert home['startup'] is True
+    assert home['preclear_move']['source_return_code'] == 2100
+    assert tester.calls == [
+        ('prepare', 6, {'motor': 0, 'run_current': 31, 'standby_current': 10,
+            'speed': 50, 'acc': 20, 'stall_guard': 6, 'ramp_mode': None,
+            'disable_right': True, 'disable_left': True, 'rdiv': None, 'pdiv': None,
+            'warm_enable': False, 'write_standby': True}),
+        ('No24V', False), ('initialized', 6, True), ('initialized', 6, True),
+        ('queryHome', 6, 0, True), ('SAP', 6, 0, 205, 8),
+    ] + preclear_vector() + [
+        ('SAP', 6, 0, 205, 6), ('No24V', False), ('initialized', 6, True),
+        ('MoveLeft', 6, 0, 50), ('No24V', False),
+    ] + poll(False, 0) + suffix()
+    assert home['wait']['stopped'] is True
+    assert home['ok'] is True
+    assert home['preclear_wait']['ok'] is True
+    assert home['physical_effect_verified'] is False
 
 
 def test_startup_door_home_accepts_oem_closed_predicate_after_wait_timeout(monkeypatch):
-    tester, _ = _make_tester(monkeypatch)
-
-    monkeypatch.setattr(tester, "motor_query_home_switch", lambda board_id, motor=0: {"ok": True, "value": 1})
-    monkeypatch.setattr(tester, "motor_set_axis_param", lambda board_id, param, value, motor=0: {"ok": True, "value": value})
-    monkeypatch.setattr(tester, "motor_move_relative", lambda board_id, steps, motor=0: {"ok": True, "steps": steps})
-    monkeypatch.setattr(tester, "motor_move_left", lambda board_id, speed=600, motor=0: {"ok": True})
-    monkeypatch.setattr(tester, "motor_wait_stopped", lambda board_id, motor=0, timeout_s=20.0, **kwargs: {"stopped": False, "seen_nonzero": True, "elapsed_ms": 20000})
-    monkeypatch.setattr(tester, "motor_stop", lambda board_id, motor=0: {"ok": True})
-    monkeypatch.setattr(tester, "motor_set_home", lambda board_id, motor=0: {"ok": True, "board": board_id, "motor": motor})
-    monkeypatch.setattr(tester, "motor_get_switch_activity", lambda board_id, motor=0: {"left_state": 1, "right_state": 0})
-    monkeypatch.setattr(
-        tester,
-        "motor_thermal_door_status",
-        lambda: {"closed": True, "opened": False, "home": {"value": 1}, "switches": {"left_state": 1, "right_state": 0}},
-    )
-
+    # OEM counter expiration (not a generic wait timeout) still reaches setHome.
+    from test_motion_finalization_sequences import DoorSequence, prefix, poll, suffix
+    tester = DoorSequence(monkeypatch, home_at=0, stop_at=None)
     home = tester.motor_oem_door_search_home(timeout_s=90.0, startup=True)
-
-    assert home["ok"] is True
-    assert home["partial"] is False
-    assert home["failure"] is None
-    assert home["closed_confirmed"] is True
-    assert home["set_home"]["ok"] is True
-    assert home["wait_warning"] == "wait_not_stopped_but_closed_predicate_confirmed"
+    assert tester.calls == prefix() + poll(True, 7) * 81 + [
+        ('initialized', 6, True), ('queryHome', 6, 0, True), ('sleep', .05),
+    ] + suffix()
+    assert home['ok'] is True
+    assert home['partial'] is False
+    assert home['failure'] is None
+    assert home['closed_confirmed'] is True
+    assert home['set_home']['ack']['status'] == 100
+    assert home['wait_warning'] == 'source_counter_expired'
+    assert home['wait']['timeout'] is True
+    assert home['controller_terminal_state_verified'] is False
+    assert home['controller_home_proof_verified'] is False
+    assert home['physical_effect_verified'] is False
 
 def test_duplicate_and_signed_z_authorities_are_absent(monkeypatch):
     tester, _ = _make_tester(monkeypatch)

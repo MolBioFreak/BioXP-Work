@@ -399,7 +399,12 @@ def test_door_closed_source_branch_opens_door_then_throws():
 
     class Primitives:
         def motor_oem_door_search_home(self, **_kwargs):
+            calls.append("home")
             return {"status_after": {"oem_predicates": {"tcDoorClosed": False}}}
+
+        def motor_oem_confirm_thermal_door_closed(self):
+            calls.append("confirm")
+            return {"oem_predicates": {"tcDoorClosed": False}}
 
         def oem_initialize_motors_branch_binding(self):
             return {"serial_number": 206, "camera_calibrated": True}
@@ -411,9 +416,12 @@ def test_door_closed_source_branch_opens_door_then_throws():
     provider = Serial206OemInitializationProvider(Primitives(), generation_provider=lambda: 7, sleep=lambda _s: None)
     spec = next(row for row in SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS if row.key == "door-home")
 
+    provider._execute_stage(spec, timeout_s=30.0)
+    assert calls == ["home"]  # S5 enclosing decision is not duplicated here.
+    predicate = next(row for row in SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS if row.key == "door-closed-predicate")
     with pytest.raises(RuntimeError, match="Cannot close thermal cycler door"):
-        provider._execute_stage(spec, timeout_s=30.0)
-    assert calls == ["open"]
+        provider._execute_stage(predicate, timeout_s=30.0)
+    assert calls == ["home", "confirm", "open"]
 
 
 def test_initialize_motion_runs_source_branch_without_stage_approvals(monkeypatch):
@@ -991,7 +999,7 @@ class _ProviderHomeXYFailureTester:
 
     def motor_set_axis_param(self, board, param, value, motor=0):
         self.parameter_writes.append((int(board), int(motor), int(param), int(value)))
-        return {"ok": True, "readback": None}
+        return {"ok": True, "ack": ACK, "readback": None}
 
     def motor_oem_go_home(self, axis, **_kwargs):
         return {
@@ -1039,6 +1047,9 @@ def test_provider_home_xy_restores_profiles_after_normal_child_return_code():
     assert result["restore_verified"] is True
     assert result["restore"]["x_speed"]["ok"] is True
     assert result["restore"]["y_acc"]["ok"] is True
+    assert result["positions"] == {}
+    assert result["source_return"] == {"x": -1, "y": 0}
+    assert result["reference_publication_required"] is False
     restored = [value for *_prefix, value in tester.parameter_writes]
     for expected in (1700, 350, 1800, 400):
         assert expected in restored
@@ -1588,7 +1599,8 @@ def test_no24v_during_move_steps_wait_raises_source_exception(monkeypatch):
 def test_board_stop_preserves_oem_no24v_and_uninitialized_board_semantics():
     driver = object.__new__(BioXpTester)
     calls: list[str] = []
-    driver._oem_board_present = lambda _board: False
+    driver._oem_board_present = lambda _board: True
+    driver._oem_board_state = lambda: {4: False, 5: False}
     driver.oem_no24v_state = lambda: False
     driver.motor_oem_stop_exact = lambda *_args, **_kwargs: calls.append("leaf") or {}
 
@@ -1603,6 +1615,8 @@ def test_board_stop_preserves_oem_no24v_and_uninitialized_board_semantics():
     assert calls == []
 
     states = iter([False, True])
+    # ClassHeadBoard.stopMotor tests initialized, not board presence.
+    driver._oem_board_state = lambda: {4: True, 5: True}
     driver._oem_board_present = lambda _board: True
     driver.oem_no24v_state = lambda: next(states)
     driver.motor_oem_stop_exact = lambda *_args, **_kwargs: calls.append("leaf") or {"ok": True, "source_call_completed": True, "source_return_code": 0}
@@ -1812,7 +1826,8 @@ def test_initialize_motors_gripper_home_calls_axis_search_without_profile_prepar
 
 def test_x_rehome_uses_deck_post_move_position_as_tail_return(monkeypatch):
     driver = object.__new__(BioXpTester)
-    positions = iter([111, 9999, 8888])
+    # Deck.goHome reads once after rehome; no before/proof reads are source calls.
+    positions = iter([9999])
     driver._oem_position_cache = {}
     driver._oem_home_cache = {}
     monkeypatch.setattr(driver, "oem_no24v_state", lambda: False)

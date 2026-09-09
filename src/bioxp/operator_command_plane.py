@@ -141,7 +141,7 @@ ALLOWED_ACTIONS = frozenset({
     "oem.deck.move_to_location",
 })
 INTERRUPT_ACTIONS = frozenset({
-    "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all", "oem.z.abort",
+    "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.g.stop", "oem.abort_all", "oem.z.abort",
 })
 INTERNAL_ACTIONS = frozenset({"oem.deck._mov_execution", "oem.deck._finite_operation"})
 CANONICAL_ACTIONS = ALLOWED_ACTIONS | INTERRUPT_ACTIONS | INTERNAL_ACTIONS
@@ -265,6 +265,7 @@ AXIS_BY_ACTION = {
     "oem.z.move_absolute": "z",
     "oem.x.stop": "x",
     "oem.z.stop": "z",
+    "oem.g.stop": "g",
 }
 
 
@@ -1000,6 +1001,23 @@ class DeckReconciliationRequest(BaseModel):
     current_location: str | None = Field(default=None, min_length=1, max_length=80)
     current_well: StrictInt | None = Field(default=None, ge=0, le=95)
     approved_home_state: dict[str, Any] | None = None
+
+
+def _interrupt_stop_acknowledged(action_id: str, response: Any) -> bool:
+    return bool(action_id not in {"oem.abort_all", "oem.z.abort"}
+                and isinstance(response, Mapping)
+                and response.get("controller_command_acknowledged") is True)
+
+
+def _interrupt_invocation_evidence(action_id: str, *, attempted: bool) -> dict[str, Any]:
+    software = action_id in {"oem.abort_all", "oem.z.abort"}
+    return {
+        "invocation_attempted": bool(attempted), "software_abort": software,
+        "stop_delivery_attempted": bool(attempted) and not software,
+        "controller_stop_attempted": bool(attempted) and not software,
+        "physical_scope": "none_software_flags_and_waiters" if software else AXIS_BY_ACTION.get(action_id),
+        "fence_scope": "aggregate" if software or action_id == "oem.g.stop" else AXIS_BY_ACTION.get(action_id),
+    }
 
 
 class OperatorCommandStore:
@@ -3232,6 +3250,11 @@ class OperatorCommandStore:
         with self._lock:
             return self._deck_recovery_blocker(self.connection)
 
+    def bind_tip_tray_constructor_reader(self, reader: Callable[[int], Mapping[str, Any] | None]) -> None:
+        if not callable(reader):
+            raise TypeError("tip tray constructor reader must be callable")
+        self._tip_tray_constructor_reader = reader
+
     def tip_tray_state(self, tray_id: int) -> dict[str, Any]:
         if type(tray_id) is not int or tray_id not in range(5):
             raise ValueError("tip tray id must be in 0..4")
@@ -3242,6 +3265,33 @@ class OperatorCommandStore:
             ).fetchone()
         if row is None:
             raise RuntimeError("tip tray projection is unavailable")
+        reader = getattr(self, "_tip_tray_constructor_reader", None)
+        if int(row["revision"]) == 0 and callable(reader):
+            constructor = reader(tray_id)
+            if isinstance(constructor, Mapping):
+                # The persisted runtime object owns constructor facts. No board
+                # generation or physical observation exists for a C# constructor.
+                with self._lock:
+                    revision = self.connection.execute(
+                        "SELECT revision FROM operator_plane_tip_tray_state WHERE tray_id=?", (tray_id,)
+                    ).fetchone()[0]
+                if revision != 0:
+                    return self.tip_tray_state(tray_id)
+                provenance = {"source_operation": "ClassMachineStatus.constructor",
+                              "physical_observation": False,
+                              "construction_id": constructor["construction_id"],
+                              "constructor": dict(constructor)}
+                encoded = _canonical(provenance)
+                return {"schema_version": "bioxp.operator_tip_tray_state.v1",
+                        "tray_id": tray_id, "occupancy": constructor["occupancy"],
+                        "tip_available": constructor["tip_available"],
+                        "available_count": sum(all(constructor["occupancy"][i:i+4]) for i in range(0,96,4)),
+                        "revision": 0, "constructor_only": True,
+                        "operation_id": f"{constructor['construction_id']}:tray:{tray_id}",
+                        "command_id": constructor["construction_id"],
+                        "ownership_generation": None, "board_epoch_4": None, "board_epoch_5": None,
+                        "timestamp": None, "provenance": provenance,
+                        "provenance_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
         occupancy = _json_load(row["occupancy_json"])
         provenance = _json_load(row["provenance_json"])
         return {
@@ -3315,12 +3365,19 @@ class OperatorCommandStore:
             if current is None:
                 raise RuntimeError("tip tray projection is unavailable")
             before_revision = int(current["revision"])
+            if operation == "construct" and before_revision != 0:
+                # Constructor projection is resumable, never a reset of retained
+                # depletion/inspection state, even when publication was interrupted.
+                return self.tip_tray_state(tray_id)
             prior_occupancy = _json_load(current["occupancy_json"])
             prior_available = None if current["tip_available"] is None else bool(current["tip_available"])
             if operation in {"construct", "reset", "load_all"}:
-                occupancy = [True] * 96
+                # ClassWellCollection(TIP_TRAY, tipHotel:true) empties hotel
+                # wells but does not set ClassTipTray.m_trayempty.
+                hotel_constructor = operation == "construct" and tray_id == 4
+                occupancy = [not hotel_constructor] * 96
                 tip_available = True
-                available_count: int | None = 24
+                available_count: int | None = 0 if hotel_constructor else 24
             else:
                 if not isinstance(prior_occupancy, list) or len(prior_occupancy) != 96 or any(type(value) is not bool for value in prior_occupancy):
                     raise RuntimeError("tip tray occupancy is unavailable")
@@ -3456,7 +3513,7 @@ class OperatorCommandStore:
         for key, expected in typed.items():
             if type(snapshot.get(key)) is not expected:
                 raise ValueError(f"deck bootstrap {key} is not authoritative")
-        if snapshot["tip_location"] not in {-1, 0, 1, 2, 3} or (snapshot["tip_loaded"] and snapshot["tip_location"] < 0):
+        if snapshot["tip_location"] not in {-1, 0, 1, 2, 3}:
             raise ValueError("deck bootstrap tip location is not authoritative")
         if snapshot["pseudo_z_home"] not in {500, 65000}:
             raise ValueError("deck bootstrap pseudo Z home is not authoritative")
@@ -3475,11 +3532,18 @@ class OperatorCommandStore:
 
         with self._transaction() as conn:
             current = conn.execute(
-                "SELECT semantic_state_revision FROM operator_plane_deck_semantic_state WHERE singleton=1"
+                "SELECT semantic_state_revision,ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
             assert current is not None
             if int(current[0]) != 0:
                 return self.deck_semantic_state()
+            if current[1] != "none":
+                raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+            self._validate_deck_owner_authority(
+                ownership_generation=snapshot["ownership_generation"],
+                board_epoch_4=snapshot["board_epoch_4"],
+                board_epoch_5=snapshot["board_epoch_5"],
+            )
             command_id = str(uuid.uuid4())
             now = _now()
             sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
@@ -3591,7 +3655,7 @@ class OperatorCommandStore:
                 "pseudo_z_home": int(current["pseudo_z_home"]),
             }
             merged.update(values)
-            if merged["tip_loaded"] is True and merged["tip_location"] not in {0, 1, 2, 3}:
+            if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
                 raise ValueError("loaded tip requires a valid tip location")
             before = int(current["semantic_state_revision"])
             after = before + 1
@@ -5382,7 +5446,16 @@ class OperatorCommandStore:
             "controller_position_observation_id", "current_x", "current_y", "current_z",
             "observed_location_id", "observed_well_id",
         )
-        initial_fence = {key: authority.get(key) for key in fence_fields}
+        def resampled_fence(payload: Mapping[str, Any]) -> dict[str, Any]:
+            from .oem_deck_movement import _latch_owner_identity
+            result = {key: payload.get(key) for key in fence_fields}
+            # The second source read has distinct sensor transaction evidence.
+            # Keep the independent host identity and both observed latch values
+            # fenced, while retaining the full original observation in receipts.
+            result["latch_observation_id"] = _latch_owner_identity(str(payload.get("latch_observation_id")))
+            return result
+
+        initial_fence = resampled_fence(authority)
 
         with self._transaction() as conn:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
@@ -5446,7 +5519,7 @@ class OperatorCommandStore:
             final_authority = final_authority_reader()
             if not isinstance(final_authority, Mapping):
                 raise ValueError("final current provider authority is malformed")
-            final_fence = {key: final_authority.get(key) for key in fence_fields}
+            final_fence = resampled_fence(final_authority)
             if final_fence != initial_fence:
                 raise ValueError("deck authority changed before reconciliation commit")
 
@@ -5926,13 +5999,19 @@ class OperatorCommandStore:
             )
             self._insert_transition(conn, event_kind="method_derived", method_id=method_id, state=target, payload={"child_states": states})
 
+    @staticmethod
+    def _conservative_aggregate_interrupt(action_id: str) -> bool:
+        # G diagnostic Stop historically used the aggregate scheduler barrier.
+        # Keep that invalidation coverage without changing its addressed Stop.
+        return action_id in {"oem.abort_all", "oem.z.abort", "oem.g.stop"}
+
     def begin_interrupt(self, action_id: str, *, state: Mapping[str, Any], request: Mapping[str, Any], interrupt_attempt_id: str | None = None) -> dict[str, Any]:
         if action_id not in INTERRUPT_ACTIONS:
             raise HTTPException(status_code=422, detail={"error": "interrupt_action_not_allowed"})
         key = str(request["idempotency_key"])
         fp = _digest({"operation_kind": "interrupt", "action_id": action_id, **_without_idempotency(request)})
         replay = False
-        aggregate_interrupt = action_id in {"oem.abort_all", "oem.z.abort"}
+        aggregate_interrupt = self._conservative_aggregate_interrupt(action_id)
         if aggregate_interrupt:
             self._priority_fence.set()
         with self._interrupt_lock:
@@ -6013,11 +6092,11 @@ class OperatorCommandStore:
                             if str(row[0]) not in active_ids
                         )
                     active_id = active_ids[0] if active_ids else None
-                    global_epoch = int(safety["global_epoch"]) + (1 if action_id in {"oem.abort_all", "oem.z.abort"} else 0)
+                    global_epoch = int(safety["global_epoch"]) + (1 if aggregate_interrupt else 0)
                     x_epoch = int(safety["x_epoch"]) + (1 if action_id == "oem.x.stop" else 0)
                     y_epoch = int(safety["y_epoch"]) + (1 if action_id == "oem.y.stop" else 0)
                     z_epoch = int(safety["z_epoch"]) + (1 if action_id == "oem.z.stop" else 0)
-                    if action_id in {"oem.abort_all", "oem.z.abort"}:
+                    if self._conservative_aggregate_interrupt(action_id):
                         x_epoch += 1
                         y_epoch += 1
                         z_epoch += 1
@@ -6087,7 +6166,7 @@ class OperatorCommandStore:
                             "INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)",
                             (str(uuid.uuid4()), queued_id, transition_sequence, "pending", _canonical(terminal_payload), now),
                         )
-                    if aggregate_interrupt:
+                    if action_id in {"oem.abort_all", "oem.z.abort"}:
                         for method_id in affected_method_ids:
                             conn.execute("UPDATE operator_plane_methods SET status='aborting',version=version+1,updated_at=? WHERE method_id=? AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted','recovery_required')", (now, method_id))
                             self._insert_transition(conn, event_kind="method_derived", method_id=method_id, state="aborting", payload={"reason": action_id, "cutoff": cutoff})
@@ -6103,7 +6182,7 @@ class OperatorCommandStore:
                         row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (str(active_id),)).fetchone()
                         if row is None or str(row["status"]) not in {"dispatched", "issued_pending", "stop_requested", "abort_requested"}:
                             continue
-                        requested_state = "abort_requested" if aggregate_interrupt else "stop_requested"
+                        requested_state = "abort_requested" if action_id in {"oem.abort_all", "oem.z.abort"} else "stop_requested"
                         conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,interrupt_id=?,interrupt_global_safety_epoch=?,interrupt_axis_safety_epoch=?,updated_at=?,terminal_json=? WHERE command_id=? AND status IN ('dispatched','issued_pending')", (requested_state, interrupt_id, global_epoch, {"x": x_epoch, "y": y_epoch, "z": z_epoch}.get(axis or "", z_epoch), _now(), _canonical({"interrupt_id": interrupt_id, "action_id": action_id}), str(active_id)))
                         conn.execute("UPDATE serial206_movement_commands SET state='interrupting',state_version=state_version+1 WHERE command_id=? AND state IN ('dispatched','issued_pending')", (str(active_id),))
                         transition = self._insert_transition(conn, event_kind="interrupt_requested", command_id=str(active_id), method_id=row["method_id"], state=requested_state, payload={"interrupt_id": interrupt_id, "action_id": action_id, "cutoff": cutoff})
@@ -6111,7 +6190,7 @@ class OperatorCommandStore:
                         self._derive_method(conn, method_id)
                     active_id = active_ids[0] if active_ids else None
                     response = {"schema_version": "bioxp.operator_interrupt_receipt.v1", "robot_identity": ROBOT_IDENTITY, "ownership_generation": int(state.get("ownership_generation") or 0), "interrupt_id": interrupt_id, "interrupt_attempt_id": interrupt_id, "action_id": action_id, "scope": "aggregate" if action_id in {"oem.abort_all", "oem.z.abort"} else axis, "cutoff": cutoff, "active_command_id": active_id, "active_command_ids": active_ids, "global_safety_epoch": global_epoch, "x_safety_epoch": x_epoch, "y_safety_epoch": y_epoch, "z_safety_epoch": z_epoch, "oem_abort_latched": action_id in {"oem.abort_all", "oem.z.abort"}, "controller_stop_attempted": False, "source_call_completed": False, "source_return_ok": False, "controller_stop_acknowledged": False, "physical_effect_verified": False, "persistence_state": "committed", "transition_sequence": transition, "idempotent_replay": replay}
-                    response.update({"observed_ownership_generation": request.get("observed_ownership_generation"), "observed_board_epoch_by_board": dict(request.get("observed_board_epoch_by_board") or {}), "recovery_hold": False, "terminal_transition_sequences": []})
+                    response.update({"fence_scope": "aggregate" if aggregate_interrupt else axis, "invocation_attempted": False, "stop_delivery_attempted": False, "software_abort": action_id in {"oem.abort_all", "oem.z.abort"}, "physical_scope": "none_software_flags_and_waiters" if action_id in {"oem.abort_all", "oem.z.abort"} else axis, "observed_ownership_generation": request.get("observed_ownership_generation"), "observed_board_epoch_by_board": dict(request.get("observed_board_epoch_by_board") or {}), "recovery_hold": False, "terminal_transition_sequences": []})
                     self._append_interrupt_attempt(
                         conn,
                         interrupt_attempt_id=interrupt_id,
@@ -6125,7 +6204,7 @@ class OperatorCommandStore:
                 if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                     raise
                 failed_attempt_id = str(interrupt_attempt_id or uuid.uuid4())
-                return {"schema_version": "bioxp.operator_interrupt_receipt.v1", "robot_identity": ROBOT_IDENTITY, "ownership_generation": int(state.get("ownership_generation") or 0), "observed_ownership_generation": request.get("observed_ownership_generation"), "observed_board_epoch_by_board": dict(request.get("observed_board_epoch_by_board") or {}), "interrupt_id": failed_attempt_id, "interrupt_attempt_id": failed_attempt_id, "action_id": action_id, "scope": "aggregate" if action_id in {"oem.abort_all", "oem.z.abort"} else AXIS_BY_ACTION.get(action_id), "oem_abort_latched": action_id in {"oem.abort_all", "oem.z.abort"}, "controller_stop_attempted": False, "source_call_completed": False, "source_return_ok": False, "controller_stop_acknowledged": False, "physical_effect_verified": False, "persistence_state": "lock_timeout", "recovery_hold": True, "idempotent_replay": replay}
+                return {"schema_version": "bioxp.operator_interrupt_receipt.v1", "robot_identity": ROBOT_IDENTITY, "ownership_generation": int(state.get("ownership_generation") or 0), "observed_ownership_generation": request.get("observed_ownership_generation"), "observed_board_epoch_by_board": dict(request.get("observed_board_epoch_by_board") or {}), "interrupt_id": failed_attempt_id, "interrupt_attempt_id": failed_attempt_id, "action_id": action_id, "scope": "aggregate" if action_id in {"oem.abort_all", "oem.z.abort"} else AXIS_BY_ACTION.get(action_id), "oem_abort_latched": action_id in {"oem.abort_all", "oem.z.abort"}, "controller_stop_attempted": False, **_interrupt_invocation_evidence(action_id, attempted=False), "source_call_completed": False, "source_return_ok": False, "controller_stop_acknowledged": False, "physical_effect_verified": False, "persistence_state": "lock_timeout", "recovery_hold": True, "idempotent_replay": replay}
         self._wake.set()
         return response
 
@@ -6143,13 +6222,14 @@ class OperatorCommandStore:
             if str(saved["phase"]) in {"attempted", "terminal"} or current.get("controller_stop_attempted") is True:
                 current["idempotent_replay"] = True
                 return current
+            action_id = str(saved["action_id"])
             current.update({
-                "controller_stop_attempted": True,
+                **_interrupt_invocation_evidence(action_id, attempted=True),
                 "source_call_completed": False,
                 "source_return_ok": False,
                 "controller_stop_acknowledged": False,
                 "controller_response": None,
-                "error": "controller_stop_outcome_pending",
+                "error": "software_abort_outcome_pending" if action_id in {"oem.abort_all", "oem.z.abort"} else "controller_stop_outcome_pending",
                 "persistence_state": "recovery_required",
                 "recovery_hold": True,
             })
@@ -6192,7 +6272,7 @@ class OperatorCommandStore:
             if str(saved["phase"]) == "terminal":
                 current["idempotent_replay"] = True
                 return current
-            controller_acknowledged = bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True)
+            controller_acknowledged = _interrupt_stop_acknowledged(str(saved["action_id"]), response)
             source_return_ok = bool(isinstance(response, Mapping) and response.get("ok") is True)
             exact_response_evidence = self._store_interrupt_evidence(
                 conn,
@@ -6203,7 +6283,7 @@ class OperatorCommandStore:
             )
             current.update({
                 "interrupt_attempt_id": interrupt_attempt_id,
-                "controller_stop_attempted": bool(attempted),
+                **_interrupt_invocation_evidence(str(saved["action_id"]), attempted=attempted),
                 "source_call_completed": bool(acknowledged),
                 "source_return_ok": source_return_ok,
                 "controller_stop_acknowledged": controller_acknowledged,
@@ -6263,7 +6343,7 @@ class OperatorCommandStore:
         return {axis} if axis in {"x", "y", "z"} else set()
 
     def arm_interrupt_fence(self, action_id: str) -> None:
-        if action_id in {"oem.abort_all", "oem.z.abort"}:
+        if self._conservative_aggregate_interrupt(action_id):
             self._priority_fence.set()
         else:
             axis = AXIS_BY_ACTION.get(action_id)
@@ -6272,7 +6352,7 @@ class OperatorCommandStore:
         self._wake.set()
 
     def clear_interrupt_fence(self, action_id: str) -> None:
-        if action_id in {"oem.abort_all", "oem.z.abort"}:
+        if self._conservative_aggregate_interrupt(action_id):
             self._priority_fence.clear()
         else:
             axis = AXIS_BY_ACTION.get(action_id)
@@ -6282,7 +6362,7 @@ class OperatorCommandStore:
 
     @staticmethod
     def _interrupt_actions_share_fence(left: str, right: str) -> bool:
-        aggregate = {"oem.abort_all", "oem.z.abort"}
+        aggregate = {"oem.abort_all", "oem.z.abort", "oem.g.stop"}
         if left in aggregate or right in aggregate:
             return left in aggregate and right in aggregate
         return AXIS_BY_ACTION.get(left) == AXIS_BY_ACTION.get(right)
@@ -6356,8 +6436,9 @@ class OperatorCommandStore:
         pending["action_id"] = action_id
         pending["state"] = dict(pending.get("state") or {})
         pending["request"] = dict(request)
-        self._append_interrupt_spool_event(phase="pending", payload=pending)
         with self._pending_interrupt_lock:
+            self.arm_interrupt_fence(action_id)
+            self._append_interrupt_spool_event(phase="pending", payload=pending)
             self._pending_interrupt_reconciliations = [
                 row for row in self._pending_interrupt_reconciliations
                 if str(row.get("interrupt_attempt_id")) != attempt_id
@@ -6382,7 +6463,14 @@ class OperatorCommandStore:
                     request=dict(row["request"]),
                     interrupt_attempt_id=attempt_id,
                 )
-                if str(receipt.get("persistence_state")) != "committed":
+                # An attempted ledger row deliberately carries recovery_required.
+                # Reconcile its saved outcome; do not treat it as failed admission
+                # and do not repeat delivery. Lock-timeout receipts stay blocked.
+                if str(receipt.get("persistence_state")) != "committed" and not (
+                    receipt.get("persistence_state") == "recovery_required"
+                    and (receipt.get("invocation_attempted") is True
+                         or receipt.get("controller_stop_attempted") is True)
+                ):
                     continue
                 active_ids = [
                     str(value)
@@ -7076,11 +7164,24 @@ class OperatorCommandPlane:
                 return
             ok = isinstance(response, Mapping) and response.get("ok") is True
             delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
-            completed = bool(ok and response.get("controller_completion_verified") is True and response.get("semantic_state_committed") is True)
+            provider_results = response.get("provider_results") if isinstance(response, Mapping) else None
+            source_noop = bool(
+                ok and response.get("source_branch") == "park"
+                and response.get("delivery_attempted") is False
+                and response.get("semantic_state_committed") is True
+                and isinstance(provider_results, list) and len(provider_results) == 1
+                and isinstance(provider_results[0], Mapping)
+                and provider_results[0].get("source_noop") is True
+                and provider_results[0].get("ok") is True
+                and provider_results[0].get("delivery_attempted") is False
+                and provider_results[0].get("source_anchor") == "ControlLib.parkGantry:7073-7076"
+            )
+            completed = bool(ok and response.get("semantic_state_committed") is True
+                             and (response.get("controller_completion_verified") is True or source_noop))
             terminal_status = "completed" if completed else ("ambiguous" if delivery_attempted else "failed")
             terminal_payload = {
                 "response": _bounded_json(response, 131072),
-                "completion_class": "deck_terminal" if completed else "deck_incomplete",
+                "completion_class": "source_noop" if source_noop else ("deck_terminal" if completed else "deck_incomplete"),
                 "delivery_attempted": delivery_attempted,
                 **({"outcome_unknown": True} if terminal_status == "ambiguous" else {}),
             }
@@ -7108,7 +7209,9 @@ class OperatorCommandPlane:
                 command_id,
                 status=terminal_status,
                 payload=terminal_payload,
-                remote_acknowledged=ok,
+                source_noop=source_noop,
+                source_noop_reason="already_at_park" if source_noop else None,
+                remote_acknowledged=bool(ok and not source_noop),
                 controller_acknowledged=bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
                 claimed=claimed,
                 full_response=response,
@@ -7463,7 +7566,7 @@ class OperatorCommandPlane:
     async def _invoke_controller_interrupt(self, action_id: str, *, receipt: Mapping[str, Any], idempotency_key: str) -> dict[str, Any]:
         if str(receipt.get("persistence_state")) != "committed":
             return dict(receipt)
-        if receipt.get("controller_stop_attempted") is True:
+        if receipt.get("invocation_attempted") is True or receipt.get("controller_stop_attempted") is True:
             return dict(receipt)
         try:
             receipt = await asyncio.to_thread(
@@ -7518,10 +7621,10 @@ class OperatorCommandPlane:
             return {
                 **dict(receipt),
                 "interrupt_attempt_id": interrupt_attempt_id,
-                "controller_stop_attempted": True,
+                **_interrupt_invocation_evidence(action_id, attempted=True),
                 "source_call_completed": acknowledged,
                 "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
-                "controller_stop_acknowledged": bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
+                "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                 "controller_response": _bounded_json(response, 131072),
                 "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
                 "persistence_state": "recovery_required",
@@ -7577,10 +7680,10 @@ class OperatorCommandPlane:
                         "ownership_generation": int(state.get("ownership_generation") or 0),
                         "observed_ownership_generation": payload.get("observed_ownership_generation"),
                         "observed_board_epoch_by_board": dict(payload.get("observed_board_epoch_by_board") or {}),
-                        "controller_stop_attempted": True,
+                        **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
                         "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
-                        "controller_stop_acknowledged": bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
+                        "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "physical_effect_verified": False,
                         "error": reason,
@@ -7697,12 +7800,10 @@ class OperatorCommandPlane:
                     return {
                         **dict(receipt),
                         "interrupt_attempt_id": interrupt_attempt_id,
-                        "controller_stop_attempted": True,
+                        **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
                         "source_return_ok": False,
-                        "controller_stop_acknowledged": bool(
-                            response.get("controller_command_acknowledged") is True
-                        ),
+                        "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "error": error,
                         "persistence_state": "recovery_required",
@@ -7746,16 +7847,13 @@ class OperatorCommandPlane:
                     return {
                         **dict(receipt),
                         "interrupt_attempt_id": interrupt_attempt_id,
-                        "controller_stop_attempted": True,
+                        **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
                         "source_return_ok": bool(
                             isinstance(response, Mapping)
                             and response.get("ok") is True
                         ),
-                        "controller_stop_acknowledged": bool(
-                            isinstance(response, Mapping)
-                            and response.get("controller_command_acknowledged") is True
-                        ),
+                        "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "error": error,
                         "persistence_state": "recovery_required",
@@ -7787,10 +7885,10 @@ class OperatorCommandPlane:
                     return {
                         **dict(receipt),
                         "interrupt_attempt_id": interrupt_attempt_id,
-                        "controller_stop_attempted": True,
+                        **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
                         "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
-                        "controller_stop_acknowledged": bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
+                        "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
                         "persistence_state": "recovery_required",

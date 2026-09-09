@@ -75,5 +75,7 @@ def test_gv1_home_scopes_action_current_and_restores_on_every_exit(monkeypatch, 
         result = tester.motor_oem_home_axis("g", startup=True)
         assert result["home"]["ok"] is True
 
-    assert events[0] == ("prepare", 31, 10)
-    assert events[-1] == ("restore", "oem_home_axis_g_finally")
+    # S7: startup is home-only. CI.initializeMotors owns current31 and
+    # final current10; there is no source finally restoration on failure.
+    # Retain the historical test ID and both normal/exception vectors.
+    assert events == [("home",)]

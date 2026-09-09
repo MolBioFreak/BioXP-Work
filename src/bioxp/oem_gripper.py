@@ -338,46 +338,27 @@ def gripper_clear(tester: Any, *, operator_ack: str | None, reason: str | None, 
 
 def gripper_home(tester: Any, *, operator_ack: str | None, reason: str | None, timeout_s: float = 15.0) -> dict[str, Any]:
     _require_action(operator_ack, GRIPPER_HOME_ACK, reason)
-    before = _preflight_for_motion(tester)
-    profile = _profile(tester)
-    prepare = None
-    home = None
-    try:
-        prepare = _apply_profile(tester, profile)
-        home = tester.motor_oem_home_axis("g", startup=False, timeout_s=timeout_s)
-        home_payload = home.get("home") if isinstance(home, dict) else home
-        home_ok = bool((home_payload or {}).get("ok") if isinstance(home_payload, dict) else home)
-        after = gripper_status(tester)
-        oem_pred = after.get("oem_home_predicate", {}) if isinstance(after, dict) else {}
-        oem_confirmed = bool(oem_pred.get("query_home_active") is True)
-        # Operator-validated RCA 2026-06-13: after a real gripper home, the final
-        # state can have both raw/effective switch lines active while OEM
-        # queryHome(MotorGrip) is true.  For G home, queryHome is the acceptance
-        # proof; both-switch state remains diagnostic, not a failure by itself.
-        ok = bool(home_ok or oem_confirmed)
-        if not ok:
-            raise HTTPException(status_code=409, detail={"error": "OEM gripper home failed", "motion_commanded": True, "home": home, "before": before, "after_status": after})
-        return {
-            "ok": True,
-            "schema": "bioxp.oem_gripper_home.v1",
-            "motion_commanded": True,
-            "physical_motion": True,
-            "oem_source": "btnGripperHome/initializeMotors: gripper-version-specific goHome/axisSearchHome with current restore",
-            "acceptance": {
-                "home_payload_ok": home_ok,
-                "query_home_active": oem_pred.get("query_home_active"),
-                "accepted_by": "queryHome(MotorGrip)" if oem_confirmed and not home_ok else "home_payload_ok",
-                "both_effective_limits_active_is_diagnostic": bool(((after.get("switches") or {}) if isinstance(after, dict) else {}).get("both_effective_limits_active")),
-                "operator_validated_physical_home": True,
-            },
-            "before": before,
-            "after_status": after,
-            "profile": profile,
-            "prepare": prepare,
-            "home": home,
-        }
-    finally:
-        _restore_idle(tester, "gripper_home_finally")
+    # Manual panel handler: current31 -> goHome(true,600|200) -> current10
+    # only for version1 on normal return. No duplicate profile or finally writes.
+    home = tester.motor_oem_home_axis("g", startup=False, timeout_s=timeout_s)
+    payload = home.get("home") if isinstance(home, dict) else None
+    # The manual handler discards goHome's normal integer return (including
+    # board-not-initialized = 1); exceptions still escape before restoration.
+    normal_noop = bool(isinstance(payload, dict) and payload.get("source_return_code") == 1
+                       and payload.get("failure") == "board_not_initialized")
+    ok = bool(isinstance(payload, dict) and (payload.get("ok") is True or normal_noop))
+    if not ok or not isinstance(payload, dict):
+        raise HTTPException(status_code=409, detail={"error": "OEM gripper home failed", "home": home})
+    return {"ok": True, "schema": "bioxp.oem_gripper_home.v1",
+            "oem_source": "ClassControlInterface.btnGripperHome_Click",
+            "home": home, "before": None, "after_status": None,
+            "prepare": home.get("prepare"),
+            "motion_commanded": not (normal_noop or bool(payload.get("source_noop"))),
+            "source_call_completed": True, "source_return_code": payload.get("source_return_code"),
+            "physical_effect_verified": False,
+            "acceptance": {"home_payload_ok": payload.get("ok") is True,
+                "accepted_by": "source_return_only",
+                "operator_validated_physical_home": False}}
 
 
 # OEM calibrated gripper positions (from SSD machine config)

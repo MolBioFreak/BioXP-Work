@@ -76,8 +76,9 @@ class FakeTester:
 
     def motor_set_axis_param(self, board, param, value, motor=0):
         self.acceleration_writes.append((int(board), int(param), int(value), int(motor)))
-        readback = int(value) + 1 if self.fail_acceleration and int(board) == 5 and int(value) in {350, 400} else int(value)
-        return {"ok": True, "ack": {"status": 100}, "readback": {"ok": True, "ack": {"status": 100}, "value": readback}}
+        # Production SAP returns no readback; failure evidence is its ACK.
+        status = 2 if self.fail_acceleration and int(board) == 5 and int(value) in {350, 400} else 100
+        return {"ok": status == 100, "ack": {"status": status}, "readback": None}
 
     def begin_bus_event_window(self):
         token = {"after_sequence": 0}

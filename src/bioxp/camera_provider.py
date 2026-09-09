@@ -26,6 +26,41 @@ EXPECTED_USB_PID = "f37d"
 MAX_VIDEO_NODES = 64
 DISCOVERY_TIMEOUT_SECONDS = 3.0
 CAPTURE_TIMEOUT_SECONDS = 12.0
+MAX_JPEG_BYTES = 2 * 1024 * 1024
+MAX_PROVIDER_GENERATION = (1 << 53) - 1
+
+
+class CameraJpegBuffer:
+    """Bounded incremental MJPEG framing; decoding remains provider-owned."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.dropped = 0
+
+    def feed(self, chunk: bytes):
+        # Accept arbitrary caller chunk sizes without growing an unbounded buffer.
+        for offset in range(0, len(chunk), 16384):
+            self.buffer.extend(chunk[offset:offset + 16384])
+            while self.buffer:
+                start = self.buffer.find(b"\xff\xd8")
+                if start < 0:
+                    self.buffer[:] = b"\xff" if self.buffer[-1:] == b"\xff" else b""
+                    break
+                if start:
+                    del self.buffer[:start]
+                end = self.buffer.find(b"\xff\xd9", 2)
+                if end >= 0:
+                    frame = bytes(self.buffer[:end + 2])
+                    del self.buffer[:end + 2]
+                    if len(frame) <= MAX_JPEG_BYTES:
+                        yield frame
+                    else:
+                        self.dropped += 1
+                    continue
+                if len(self.buffer) > MAX_JPEG_BYTES:
+                    self.dropped += 1
+                    self.buffer[:] = b"\xff" if self.buffer[-1:] == b"\xff" else b""
+                break
 
 
 class CameraError(RuntimeError):
@@ -114,16 +149,78 @@ class CameraProvider:
             raise ValueError("camera freshness budget must be greater than zero and at most 60 seconds")
         self._sysfs_root = Path(sysfs_root)
         self._dev_root = Path(dev_root)
-        if generation is not None and (type(generation) is not int or generation < 0):
-            raise ValueError("camera provider generation must be a non-negative integer")
+        if generation is not None and (type(generation) is not int or not 0 <= generation <= MAX_PROVIDER_GENERATION):
+            raise ValueError("camera provider generation must be a non-negative JSON-safe integer")
         self._runner = runner or subprocess.run
-        self._generation = generation if generation is not None else max(1, secrets.randbits(63))
+        self._generation = generation if generation is not None else max(1, secrets.randbits(52))
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._freshness_budget_seconds = budget
         self._lock = threading.RLock()
         self._latest: CameraFrame | None = None
         self._sequence = 0
         self._dropped_frames = 0
+        self._stream_owner: str | None = None
+        self._stream_identity: CameraIdentity | None = None
+        self._stream_accepting = False
+
+    def begin_stream(self, owner: str) -> CameraIdentity:
+        """Reserve the device under the same lock as still capture/discovery."""
+        with self._lock:
+            if self._stream_owner is not None:
+                raise CameraUnavailable("camera stream already owns the device")
+            identity = self.discover()
+            self._stream_owner = owner
+            self._stream_identity = identity
+            self._stream_accepting = True
+            self._generation = self._generation % MAX_PROVIDER_GENERATION + 1
+            self._latest = None
+            return identity
+
+    def invalidate_stream(self, owner: str) -> None:
+        with self._lock:
+            if self._stream_owner == owner:
+                self._stream_accepting = False
+                self._latest = None
+
+    def end_stream(self, owner: str) -> None:
+        """Release only after the corresponding process is reaped."""
+        with self._lock:
+            if self._stream_owner == owner:
+                self._stream_owner = None
+                self._stream_identity = None
+                self._stream_accepting = False
+                self._latest = None
+                self._generation = self._generation % MAX_PROVIDER_GENERATION + 1
+
+    def drop_stream_frame(self, owner: str, *, invalid: bool = False, count: int = 1) -> None:
+        with self._lock:
+            if self._stream_owner == owner and self._stream_accepting:
+                self._dropped_frames += count
+                if invalid:
+                    self._latest = None
+
+    def publish_stream_frame(self, owner: str, content: bytes) -> CameraFrame:
+        with self._lock:
+            if self._stream_owner != owner or not self._stream_accepting:
+                raise CameraFrameUnavailable("obsolete camera stream owner")
+            assert self._stream_identity is not None
+            try:
+                self._validate_jpeg(content)
+            except CameraError:
+                self.drop_stream_frame(owner, invalid=True)
+                raise
+            return self._publish(content, self._stream_identity)
+
+    def _publish(self, content: bytes, identity: CameraIdentity) -> CameraFrame:
+        captured_at = self._aware_now()
+        self._sequence += 1
+        frame = CameraFrame(
+            content=content, sequence=self._sequence, captured_at=captured_at,
+            provider_generation=self._generation,
+            content_sha256=hashlib.sha256(content).hexdigest(), identity=identity,
+        )
+        self._latest = frame
+        return frame
 
     @property
     def generation(self) -> int:
@@ -163,6 +260,8 @@ class CameraProvider:
 
     def capture(self) -> CameraFrame:
         with self._lock:
+            if self._stream_owner is not None:
+                return self.latest()
             identity = self.discover()
             argv = [
                 "ffmpeg",
@@ -201,18 +300,7 @@ class CameraProvider:
                 raise CameraUnavailable(error)
             content = bytes(completed.stdout or b"")
             self._validate_jpeg(content)
-            captured_at = self._aware_now()
-            self._sequence += 1
-            frame = CameraFrame(
-                content=content,
-                sequence=self._sequence,
-                captured_at=captured_at,
-                provider_generation=self._generation,
-                content_sha256=hashlib.sha256(content).hexdigest(),
-                identity=identity,
-            )
-            self._latest = frame
-            return frame
+            return self._publish(content, identity)
 
     def capture_snapshot(self) -> dict[str, Any]:
         """Capture one frame and expose only immutable, provider-owned pixels.
@@ -261,12 +349,12 @@ class CameraProvider:
                     provider_generation=self._generation,
                     dropped_frames=self._dropped_frames,
                     content_sha256=None,
-                    detail="latest_frame_unavailable; streaming_not_supported",
+                    detail="latest_frame_unavailable",
                 )
             age = round(self._frame_age(frame), 3)
             fresh = age <= self._freshness_budget_seconds
             return CameraStatus(
-                available=True,
+                available=fresh,
                 frame_sequence=frame.sequence,
                 frame_captured_at=frame.captured_at,
                 frame_age_seconds=age,
@@ -275,9 +363,9 @@ class CameraProvider:
                 dropped_frames=self._dropped_frames,
                 content_sha256=frame.content_sha256,
                 detail=(
-                    "latest_frame_available; streaming_not_supported"
+                    "latest_frame_available"
                     if fresh
-                    else "latest_frame_stale; streaming_not_supported"
+                    else "latest_frame_stale"
                 ),
             )
 
@@ -355,13 +443,15 @@ class CameraProvider:
 
     @staticmethod
     def _validate_jpeg(content: bytes) -> None:
+        if len(content) > MAX_JPEG_BYTES:
+            raise CameraUnavailable("camera JPEG exceeds bounded frame size")
         if not content.startswith(b"\xff\xd8") or not content.endswith(b"\xff\xd9"):
             raise CameraUnavailable("camera capture did not return a complete JPEG")
         try:
             with Image.open(io.BytesIO(content)) as image:
-                image.load()
                 if image.format != "JPEG" or image.size != (640, 480):
                     raise CameraUnavailable("camera capture is not a 640x480 JPEG")
+                image.load()
         except CameraUnavailable:
             raise
         except Exception as exc:

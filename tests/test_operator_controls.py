@@ -128,7 +128,7 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         return {"ok": True, "controller_acknowledged": True}
 
     @app.post("/motion/diagnostics/stop")
-    async def diagnostic_stop():
+    async def diagnostic_stop(axis: str = "g"):
         calls.append(("diagnostic_stop", None))
         return {"ok": True, "verified_stopped": True}
 
@@ -311,7 +311,11 @@ def test_v2_strict_method_route_is_the_only_admitted_composite_path(tmp_path, mo
         },
     )
     assert bypass.status_code == 409
-    assert bypass.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+    assert bypass.json()["detail"]["error"] == "action_unavailable"
+    assert bypass.json()["detail"]["reason"]
+    assert app.state.operator_command_plane.store.connection.execute(
+        "SELECT COUNT(*) FROM operator_plane_methods"
+    ).fetchone()[0] == 0
 
     admitted = client.post("/operator/v2/methods", json=payload)
 
@@ -355,7 +359,8 @@ def test_v2_abort_arms_the_durable_interrupt_fence(tmp_path, monkeypatch):
     app, direct_calls = make_app(tmp_path, monkeypatch)
     durable_calls: list[tuple[str, dict]] = []
 
-    async def compat_invoke(action_id, payload):
+    async def compat_invoke(action_id, payload, *, controller_delivery=None):
+        assert controller_delivery is not None
         durable_calls.append((action_id, dict(payload)))
         return {
             "schema_version": "bioxp.operator_interrupt_receipt.v1",
@@ -380,10 +385,10 @@ def test_v2_abort_arms_the_durable_interrupt_fence(tmp_path, monkeypatch):
     assert response.status_code == 200, response.text
     assert durable_calls[0][0] == "oem.abort_all"
     assert durable_calls[0][1]["idempotency_key"] == "v2-durable-abort-1"
-    assert direct_calls == []
+    assert direct_calls == [("abort_all", None)]
 
 
-def test_interrupt_is_durably_admitted_before_controller_delivery(tmp_path, monkeypatch):
+def test_interrupt_delivery_precedes_durable_reconciliation(tmp_path, monkeypatch):
     app, _ = make_app(tmp_path, monkeypatch)
     plane = app.state.operator_command_plane
     order: list[str] = []
@@ -420,11 +425,13 @@ def test_interrupt_is_durably_admitted_before_controller_delivery(tmp_path, monk
         },
     ))
 
-    assert order[:3] == ["durable_begin", "durable_attempted", "controller_delivery"]
+    assert order == ["controller_delivery", "durable_begin", "durable_attempted"]
+    assert receipt["invocation_attempted"] is True
+    assert receipt["controller_stop_attempted"] is False
     assert receipt["persistence_state"] == "committed"
 
 
-def test_interrupt_admission_failure_prevents_controller_delivery(tmp_path, monkeypatch):
+def test_interrupt_admission_failure_does_not_prevent_controller_delivery(tmp_path, monkeypatch):
     app, _ = make_app(tmp_path, monkeypatch)
     plane = app.state.operator_command_plane
     delivered = False
@@ -450,12 +457,13 @@ def test_interrupt_admission_failure_prevents_controller_delivery(tmp_path, monk
         },
     ))
 
-    assert delivered is False
+    assert delivered is True
+    assert receipt["invocation_attempted"] is True
     assert receipt["controller_stop_attempted"] is False
     assert receipt["recovery_hold"] is True
 
 
-def test_concurrent_identical_interrupts_share_one_durable_attempt_and_delivery(
+def test_concurrent_identical_interrupts_retain_distinct_durable_attempts_and_deliveries(
     tmp_path, monkeypatch,
 ):
     app, _ = make_app(tmp_path, monkeypatch)
@@ -470,7 +478,8 @@ def test_concurrent_identical_interrupts_share_one_durable_attempt_and_delivery(
         def __exit__(self, *_args):
             return False
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         deliveries.append(interrupt_attempt_id)
         return 200, {
             "ok": True,
@@ -497,16 +506,17 @@ def test_concurrent_identical_interrupts_share_one_durable_attempt_and_delivery(
     receipts = asyncio.run(invoke_twice())
     distinct_attempts = plane.store.connection.execute(
         "SELECT COUNT(DISTINCT interrupt_attempt_id) "
-        "FROM operator_plane_interrupt_attempts WHERE idempotency_key=?",
-        (request["idempotency_key"],),
+        "FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id IN (?, ?)",
+        tuple(deliveries),
     ).fetchone()[0]
 
-    assert distinct_attempts == 1
-    assert len(deliveries) == 1
-    assert {receipt["interrupt_attempt_id"] for receipt in receipts} == {deliveries[0]}
+    assert distinct_attempts == 2
+    assert len(deliveries) == len(set(deliveries)) == 2
+    assert {receipt["interrupt_attempt_id"] for receipt in receipts} == set(deliveries)
+    assert all(receipt["persistence_state"] == "committed" for receipt in receipts)
 
 
-def test_idempotent_interrupt_replay_keeps_fence_until_live_delivery_finishes(
+def test_repeated_interrupt_keeps_fence_until_both_live_deliveries_finish(
     tmp_path, monkeypatch,
 ):
     app, _ = make_app(tmp_path, monkeypatch)
@@ -514,9 +524,14 @@ def test_idempotent_interrupt_replay_keeps_fence_until_live_delivery_finishes(
     delivery_started = asyncio.Event()
     release_delivery = asyncio.Event()
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    deliveries = []
+
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
+        deliveries.append(interrupt_attempt_id)
         delivery_started.set()
-        await release_delivery.wait()
+        if len(deliveries) == 1:
+            await asyncio.wait_for(release_delivery.wait(), 3)
         return 200, {
             "ok": True,
             "source_call_completed": True,
@@ -534,12 +549,16 @@ def test_idempotent_interrupt_replay_keeps_fence_until_live_delivery_finishes(
 
     async def exercise() -> None:
         first = asyncio.create_task(plane.compat_invoke("oem.abort_all", request))
-        await delivery_started.wait()
-        replay = await plane.compat_invoke("oem.abort_all", request)
-        assert replay["controller_stop_attempted"] is True
+        await asyncio.wait_for(delivery_started.wait(), 1)
+        replay = await asyncio.wait_for(plane.compat_invoke("oem.abort_all", request), 1)
+        assert len(set(deliveries)) == 2
+        assert replay["interrupt_attempt_id"] == deliveries[1]
+        assert replay["invocation_attempted"] is True
+        assert replay["controller_stop_attempted"] is False
         assert plane.store.action_fenced("oem.x.move_steps") is True
         release_delivery.set()
-        await first
+        original = await asyncio.wait_for(first, 1)
+        assert original["interrupt_attempt_id"] == deliveries[0]
         assert plane.store.action_fenced("oem.x.move_steps") is False
 
     asyncio.run(exercise())
@@ -552,7 +571,8 @@ def test_completed_interrupt_idempotency_key_is_redelivered_for_new_safety_reque
     plane = app.state.operator_command_plane
     deliveries: list[str] = []
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         deliveries.append(interrupt_attempt_id)
         return 200, {
             "ok": True,
@@ -577,15 +597,21 @@ def test_completed_interrupt_idempotency_key_is_redelivered_for_new_safety_reque
     assert first["interrupt_attempt_id"] != second["interrupt_attempt_id"]
 
 
-def test_shared_aggregate_fence_waits_for_all_aggregate_interrupt_deliveries(
+def test_shared_axis_fence_waits_for_aggregate_and_addressed_stop_deliveries(
     tmp_path, monkeypatch,
 ):
     app, _ = make_app(tmp_path, monkeypatch)
     plane = app.state.operator_command_plane
-    started = {"oem.abort_all": asyncio.Event(), "oem.z.abort": asyncio.Event()}
-    release = {"oem.abort_all": asyncio.Event(), "oem.z.abort": asyncio.Event()}
+    # Retired Z Abort is not a second aggregate entrypoint. Exercise the
+    # supported addressed X Stop's overlapping axis fence instead.
+    assert "oem.z.abort" not in plane.dispatch
+    catalog = TestClient(app).get("/operator/v2/control-catalog").json()
+    assert "oem.z.abort" not in {row["action_id"] for row in catalog["actions"]}
+    started = {"oem.abort_all": asyncio.Event(), "oem.x.stop": asyncio.Event()}
+    release = {"oem.abort_all": asyncio.Event(), "oem.x.stop": asyncio.Event()}
 
-    async def deliver(action_id, *, interrupt_attempt_id):
+    async def deliver(action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         started[action_id].set()
         await release[action_id].wait()
         return 200, {
@@ -610,13 +636,13 @@ def test_shared_aggregate_fence_waits_for_all_aggregate_interrupt_deliveries(
             plane.compat_invoke("oem.abort_all", request("aggregate-overlap-1"))
         )
         second = asyncio.create_task(
-            plane.compat_invoke("oem.z.abort", request("aggregate-overlap-2"))
+            plane.compat_invoke("oem.x.stop", request("aggregate-overlap-2"))
         )
-        await asyncio.gather(*(event.wait() for event in started.values()))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 1)
         release["oem.abort_all"].set()
         await first
         assert plane.store.action_fenced("oem.x.move_steps") is True
-        release["oem.z.abort"].set()
+        release["oem.x.stop"].set()
         await second
         assert plane.store.action_fenced("oem.x.move_steps") is False
 
@@ -629,7 +655,8 @@ def test_interrupt_finalization_failure_retains_fence_for_reconciliation(
     app, _ = make_app(tmp_path, monkeypatch)
     plane = app.state.operator_command_plane
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         return 200, {
             "ok": True,
             "source_call_completed": True,
@@ -665,7 +692,8 @@ def test_provider_interrupt_persistence_failure_retains_outer_fence(
     plane = app.state.operator_command_plane
     finalized: list[dict] = []
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         return 200, {
             "ok": True,
             "source_call_completed": True,
@@ -741,7 +769,8 @@ def test_interrupt_waits_for_affected_workers_before_parent_terminalization(
         lambda row: queued.append(dict(row)),
     )
 
-    async def deliver(_action_id, *, interrupt_attempt_id):
+    async def deliver(_action_id, *, interrupt_attempt_id, observed_generation):
+        assert observed_generation == 7
         return 200, {
             "ok": True,
             "source_call_completed": True,
@@ -967,6 +996,11 @@ def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_pa
         "recovery_required": True,
         "block_reason": "injected maintenance transition",
     })
+    # Polling is stale-while-refresh: a completed action does not make the
+    # prior cached catalog a new observation. Wait for the bounded single
+    # refresh, then assert the unchanged activation/recovery contract.
+    client.get("/operator/v2/control-catalog")
+    app.state.operator_poll_cache._pending.result(timeout=1)
     recovery_catalog = client.get("/operator/v2/control-catalog").json()
     recovery_action = next(
         row for row in recovery_catalog["actions"]
@@ -1039,8 +1073,8 @@ def test_v2_failed_receipt_preserves_bounded_home_z_provider_detail(tmp_path, mo
 
     assert response.status_code == 200, response.text
     expected_error = {
-        "code": "robot route returned HTTP 409",
-        "message": "robot route returned HTTP 409",
+        "code": "z_manual_home_evidence_not_verified",
+        "message": "Z manual home evidence was not verified.",
         "retryable": False,
         "detail": {
             "provider_failure": "z_manual_home_evidence_not_verified",
@@ -1738,7 +1772,7 @@ def test_legacy_home_xy_action_requires_the_strict_method_route(tmp_path, monkey
         "inputs": {},
     })
     assert response.status_code == 409
-    assert response.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+    assert response.json()["detail"]["error"] == "action_unavailable"
     assert calls == []
 
 
@@ -1754,7 +1788,7 @@ def test_legacy_move_xy_action_requires_the_strict_method_route(tmp_path, monkey
         "inputs": {"x": 123, "y": 456},
     })
     assert response.status_code == 409
-    assert response.json()["detail"]["error"] == "canonical_strict_method_requires_v2_route"
+    assert response.json()["detail"]["error"] == "action_unavailable"
     assert calls == []
 
 

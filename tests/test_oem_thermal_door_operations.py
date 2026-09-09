@@ -143,16 +143,20 @@ def test_close_thermal_door_does_not_move_when_open_predicate_false():
     assert not any(call[0] == "move_absolute" for call in tester.calls)
 
 
-def test_door_search_home_reports_before_after_predicates_and_sets_home_when_closed():
-    tester = FakeDoorTester(closed=False, opened=True)
+def test_door_search_home_reports_before_after_predicates_and_sets_home_when_closed(monkeypatch):
+    from test_motion_finalization_sequences import DoorSequence, prefix, poll, suffix
+    tester = DoorSequence(monkeypatch)
     result = tester.motor_oem_door_search_home(timeout_s=5, startup=True)
-
+    assert tester.calls == prefix() + poll(False, 0) + suffix()
     assert result["ok"] is True
     assert result["closed_before"] is False
-    assert result["opened_before"] is True
+    # Source queryHome does not sample the opened sensor or composite status.
+    assert result["opened_before"] is None
     assert result["closed_after"] is True
-    assert result["opened_after"] is False
-    assert any(call[0] == "set_home" for call in tester.calls)
+    assert result["opened_after"] is None
+    assert result["status_before"] is None and result["status_after"] is None
+    assert any(call[0] == "setHome" for call in tester.calls)
+    assert result["physical_effect_verified"] is False
 
 
 class TimeoutButClosedDoorTester(FakeDoorTester):
@@ -164,12 +168,18 @@ class TimeoutButClosedDoorTester(FakeDoorTester):
         return {"stopped": False, "timeout": True, "seen_nonzero": True}
 
 
-def test_door_search_home_sets_home_when_closed_predicate_confirmed_despite_wait_timeout():
-    tester = TimeoutButClosedDoorTester(closed=False, opened=False)
-
+def test_door_search_home_sets_home_when_closed_predicate_confirmed_despite_wait_timeout(monkeypatch):
+    from test_motion_finalization_sequences import DoorSequence, prefix, poll, suffix
+    tester = DoorSequence(monkeypatch, home_at=0, stop_at=None)
     result = tester.motor_oem_door_search_home(timeout_s=5, startup=False)
-
+    assert tester.calls == prefix() + poll(True, 7) * 81 + [
+        ('initialized', 6, True), ('queryHome', 6, 0, True), ('sleep', .05),
+    ] + suffix()
     assert result["ok"] is True
     assert result["closed_after"] is True
-    assert result["wait_warning"] == "wait_not_stopped_but_closed_predicate_confirmed"
-    assert any(call[0] == "set_home" for call in tester.calls)
+    assert result["wait_warning"] == "source_counter_expired"
+    assert result["wait"]["timeout"] is True
+    assert any(call[0] == "setHome" for call in tester.calls)
+    assert result["controller_terminal_state_verified"] is False
+    assert result["controller_home_proof_verified"] is False
+    assert result["physical_effect_verified"] is False

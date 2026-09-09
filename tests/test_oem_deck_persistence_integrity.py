@@ -17,10 +17,10 @@ from bioxp.oem_deck_movement import (
     compile_mov_execution,
 )
 import bioxp.oem_runtime_store as runtime_store_module
-from bioxp.oem_deck_schema_v6 import verify_deck_schema_v6
+from bioxp.oem_deck_schema_v7 import verify_deck_schema_v7
 from bioxp.oem_runtime_store import (
     OEMRuntimeStore,
-    OEM_DECK_SCHEMA_VERSION,
+    OEM_DECK_GROUP_SCHEMA_VERSION,
     canonical_runtime_migration_registry,
     verify_canonical_runtime_database,
 )
@@ -36,7 +36,7 @@ def test_fresh_database_has_exact_wp9_schema_manifest_and_complete_migration_led
     try:
         verify_canonical_runtime_database(store.connection)
         assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert int(store.connection.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_SCHEMA_VERSION
+        assert int(store.connection.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_GROUP_SCHEMA_VERSION
         rows = store.connection.execute(
             "SELECT version,result,name FROM runtime_schema_migrations ORDER BY version"
         ).fetchall()
@@ -264,7 +264,7 @@ def test_v6_verifier_rejects_unexpected_same_domain_object(tmp_path):
             "CREATE INDEX operator_plane_deck_counterfeit_idx ON operator_plane_deck_commands(target)"
         )
         with pytest.raises(RuntimeError, match="object manifest is not exact"):
-            verify_deck_schema_v6(store.connection)
+            verify_deck_schema_v7(store.connection)
     finally:
         store.connection.close()
 
@@ -277,7 +277,7 @@ def test_v6_verifier_attests_exact_sql_and_complete_constraint_tuples(tmp_path):
             "CREATE INDEX operator_plane_deck_commands_plan_idx ON operator_plane_deck_commands(target)"
         )
         with pytest.raises(RuntimeError, match="normalized SQL|constraint tuples"):
-            verify_deck_schema_v6(store.connection)
+            verify_deck_schema_v7(store.connection)
     finally:
         store.connection.close()
 

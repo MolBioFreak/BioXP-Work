@@ -38,10 +38,16 @@ def test_public_z_absolute_uses_owned_consumption_not_retained_diagnostics(mode,
     from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
     bind_serial206_oem_snapshot(monkeypatch)
     adapter, driver = adapter_for(mode)
-    result = adapter.z_move_absolute(requested_position_steps=10000, pseudo_home_steps=0, wait_timeout_s=.002)
-    assert result['ok'] is (mode == 'valid')
-    assert result['physical_effect_verified'] is False
-    if mode == 'valid':
+    # Head.moveToAbs throws after timeout unless its read equals the target.
+    # This wire fixture reports10006, so invalid/consumed latches cannot return
+    # an outer failure dict (nor may diagnostics substitute for a consumed wait).
+    if mode != 'valid':
+        with pytest.raises(RuntimeError, match=r'^Reach GZ position time out! board=4; axis=1; position=10000$'):
+            adapter.z_move_absolute(requested_position_steps=10000, pseudo_home_steps=0, wait_timeout_s=.002)
+    else:
+        result = adapter.z_move_absolute(requested_position_steps=10000, pseudo_home_steps=0, wait_timeout_s=.002)
+        assert result['ok'] is True
+        assert result['physical_effect_verified'] is False
         assert result['target_events'][0]['latch_disposition'] == 'consumed'
         assert not driver.motor_oem_wait_target_reached(4, 1, timeout_s=0)['ok']
     assert driver.collect_bus_events(duration_s=0), 'diagnostic receive records must remain available'

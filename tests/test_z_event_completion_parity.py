@@ -14,7 +14,13 @@ def test_event_128_is_authoritative_when_final_counter_differs_from_target(monke
     assert result['failure'] is None
     assert result['controller_command_acknowledged'] is True
     assert result['target_position_steps'] == 10_000
-    assert result['after_position_steps'] == 10_006
+    # A successful Head event wait has no source final-position query.
+    assert result['after_position_steps'] is None
+    assert result['after'] is None
+    assert result['controller_terminal_state_verified'] is False
+    # An explicitly separate observation may differ; never fill the receipt
+    # from a query invented inside the provider finalizer.
+    assert driver.motor_get_position(4, motor=1)['position'] == 10_006
     assert result['target_events'][0]['status'] == 128
     assert result['source_wait']['ok'] is True
     assert not driver.motor_oem_wait_target_reached(4, 1, timeout_s=0)['ok']

@@ -511,6 +511,10 @@ def physical_aggregate_stop(
             speed = terminal.get("last_speed")
         terminal_completion_verified = bool(
             isinstance(terminal, Mapping)
+            and terminal.get("controller_terminal_state_verified") is True
+            and terminal.get("speed_reply_valid") is True
+            and isinstance(terminal.get("last_ack"), Mapping)
+            and terminal["last_ack"].get("status") == 100
             and (
                 terminal.get("stopped") is True
                 if "stopped" in terminal

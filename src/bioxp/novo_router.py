@@ -116,12 +116,15 @@ class NovoRouter:
         read_timeout_ms: int = 100,
         queue_size: int = 256,
         clock: Callable[[], float] = time.monotonic,
+        audit_buffer: Any = None,
     ) -> None:
         if ep_in is None or ep_out is None:
             raise NovoRouterError("Novo router requires connected IN and OUT endpoints")
         self.ep_in = ep_in
         self.ep_out = ep_out
         self._decode = decode
+        self._audit_buffer = audit_buffer
+        self._audit_hook_failures = 0
         self.read_size = int(read_size)
         self.read_timeout_ms = int(read_timeout_ms)
         self._clock = clock
@@ -158,27 +161,57 @@ class NovoRouter:
                     "receive_owner": self._receive_owner,
                     "owner_generation": self._reader_generation}
 
+    def audit_status(self) -> dict[str, Any]:
+        return {"hook_failures": self._audit_hook_failures,
+                "buffer": self._audit_buffer.status() if self._audit_buffer is not None else None}
+
+    def _audit(self, kind: str, payload: dict[str, Any]) -> None:
+        # Separate from decoding and routing: logging cannot classify a valid
+        # frame as malformed or interfere with a Stop response/pending waiter.
+        if self._audit_buffer is not None:
+            try:
+                self._audit_buffer.offer(kind, {"receive_owner": self._receive_owner,
+                    "owner_generation": self._reader_generation, **payload})
+            except Exception:
+                self._audit_hook_failures += 1
+
     @staticmethod
     def _motor_key(frame: NovoFrame) -> tuple[int, int] | None:
-        if (frame.arbitration_id == 0 and frame.dlc == 8
+        if (frame.arbitration_id in (0, 99) and frame.dlc == 8
+                and 4 <= frame.data[0] <= 10
                 and frame.data[1] == 128 and frame.data[6] <= 2):
             return (frame.data[0], frame.data[6])
         return None
+
+    def set_motor_abort_event(self, board: int, motor: int) -> None:
+        """Board forceAbortMotion's AutoResetEvent.Set; not a received frame."""
+        key = (int(board), int(motor))
+        with self._motor_event_lock:
+            signals = getattr(self, "_motor_abort_signals", None)
+            if signals is None:
+                signals = self._motor_abort_signals = set()
+            coalesced = key in signals or key in self._motor_signals
+            signals.add(key)
+            self._audit("motor_abort_set", {"board": key[0], "motor": key[1],
+                "coalesced": coalesced, "physical_effect_verified": False})
 
     def reset_motor_event(self, board: int, motor: int, *, reset: bool = True, initial_signals=None) -> None:
         """ClassMotor.queryMotorStop: Reset only after a nonnull return."""
         key = (int(board), int(motor))
         with self._motor_event_lock:
             if reset:
+                getattr(self, "_motor_abort_signals", set()).discard(key)
                 if initial_signals is not None:
                     initial_signals.discard(key)
                 self._motor_signals.pop(key, None)
                 self._motor_resets[key] = (self._reader_generation, self._receive_sequence)
+                self._audit("motor_reset", {"board": key[0], "motor": key[1],
+                    "receive_sequence": self._receive_sequence})
             elif self._motor_resets.get(key, (None,))[0] != self._reader_generation:
                 # A null query does not reset, including in a shared XY window.
                 self._motor_resets[key] = (self._reader_generation, -1)
 
-    def take_motor_events(self, targets, event_window=None, *, initial_signals=None) -> list[NovoFrame | tuple[int, int]]:
+    def take_motor_events(self, targets, event_window=None, *, initial_signals=None) -> list[NovoFrame | tuple[int, int] | dict[str, Any]]:
         """Atomic AutoResetEvent consumption: WaitAll consumes none on timeout.
 
         This is a host latch, NOT correlation to a device command. An unlabelled
@@ -192,6 +225,11 @@ class NovoRouter:
                 return []
             frames = []
             for key in sorted(keys):
+                if key in getattr(self, "_motor_abort_signals", set()):
+                    frames.append({"board": key[0], "motor": key[1],
+                        "source": "board.forceAbortMotion", "latch_disposition": "consumed",
+                        "physical_effect_verified": False})
+                    continue
                 frame = self._motor_signals.get(key)
                 if frame is None or frame.owner_generation != self._reader_generation:
                     if initial_signals is not None and key in initial_signals:
@@ -210,10 +248,13 @@ class NovoRouter:
                     return []
                 frames.append(frame)
             for key in keys:
+                getattr(self, "_motor_abort_signals", set()).discard(key)
                 if initial_signals is not None:
                     initial_signals.discard(key)
                 self._motor_signals.pop(key, None)
                 self._motor_consumed[key] = (self._reader_generation, self._receive_sequence)
+                self._audit("motor_consume", {"board": key[0], "motor": key[1],
+                    "receive_sequence": self._receive_sequence})
             return frames
 
     def motor_event_disposition(self, frame: NovoFrame) -> str:
@@ -250,6 +291,7 @@ class NovoRouter:
             name=f"bioxp-novo-router-{self._reader_generation}",
             daemon=True,
         )
+        self._audit("reader_started", {"receive_sequence": self._receive_sequence})
         self._reader.start()
 
     def shutdown(self, *, join_timeout_s: float = 2.0) -> None:
@@ -260,6 +302,7 @@ class NovoRouter:
             if reader.is_alive():
                 raise NovoRouterError("Novo reader did not stop before USB release")
         self._reader = None
+        self._audit("reader_stopped", {"receive_sequence": self._receive_sequence})
         # Any waiter or completion registered under the previous reader owner is
         # stale after shutdown/rebind, even if a late USB frame arrives.
         self._reader_generation += 1
@@ -298,7 +341,7 @@ class NovoRouter:
             classification = "pipette_multipart" if function in (3, 4) else "pipette"
         elif arbitration_id in UNPROVEN_ASYNC_IDS:
             classification = "unknown_async"
-        elif arbitration_id == 0 and dlc == 8:
+        elif arbitration_id in (0, 99) and dlc == 8:
             classification = "valid_async" if data[1] in (128, 129, 130, 132) else "tmcl"
         elif 0x500 <= arbitration_id <= 0x5FF:
             classification = "unknown"
@@ -318,6 +361,7 @@ class NovoRouter:
                 if exc.__class__.__name__ == "USBTimeoutError" or isinstance(exc, TimeoutError):
                     continue
                 self._diagnostics.append({"classification": "reader_error", "error": repr(exc), "at": self._clock()})
+                self._audit("reader_error", {"error": repr(exc)[:512], "at": self._clock()})
                 continue
             received_at = self._clock()
             try:
@@ -327,6 +371,7 @@ class NovoRouter:
                 self._queues["malformed"].append(row)
                 self._diagnostics.append(row)
                 self._record_skipped(row)
+                self._audit("malformed", row)
                 continue
             self._dispatch(frame)
 
@@ -352,12 +397,8 @@ class NovoRouter:
                     "duplicate_receive_record" if frame.receive_owner == self._receive_owner
                     and frame.owner_generation == self._reader_generation else "previous_receive_owner"})
                 return
-            key = self._motor_key(frame)
-            if key is not None:
-                if key in self._motor_signals and self._motor_signals[key].owner_generation == self._reader_generation:
-                    self._diagnostics.append({**frame.provenance(), "classification": "motor_coalesced_set"})
-                self._motor_signals[key] = frame
         matched = False
+        self._audit("ingress", frame.provenance())
         with self._pending_lock:
             pending = self._pending
             if pending is not None:
@@ -397,6 +438,20 @@ class NovoRouter:
                         completion.ack_frame = frame
             return
 
+        # NovoCANUSB.ProcessReceivedTrafficPacket matches pending replies FIRST.
+        # Only unmatched module0/99 traffic passes filterMassage (board4..10)
+        # to ClassNovo / the board target latch. A pending query138 can consume
+        # status128; it must not also Set the asynchronous motor event.
+        with self._motor_event_lock:
+            key = self._motor_key(frame)
+            if key is not None:
+                if key in self._motor_signals and self._motor_signals[key].owner_generation == self._reader_generation:
+                    self._diagnostics.append({**frame.provenance(), "classification": "motor_coalesced_set"})
+                    self._audit("motor_coalesced_set", frame.provenance())
+                else:
+                    self._audit("motor_set", frame.provenance())
+                self._motor_signals[key] = frame
+
         completion_matched = False
         if frame.arbitration_id in PIPETTE_RX_IDS:
             channel = (frame.arbitration_id & 0x78) >> 3
@@ -435,7 +490,11 @@ class NovoRouter:
             queue_name = "stale"
         if queue_name not in self._queues:
             queue_name = "unknown"
-        self._queues[queue_name].append(frame)
+        queue = self._queues[queue_name]
+        if len(queue) == queue.maxlen:
+            self._audit("routing_queue_eviction", {"queue": queue_name,
+                "receive_sequence": frame.receive_sequence})
+        queue.append(frame)
 
     def _bind_completion_owner_from_provenance(
         self,
@@ -1070,11 +1129,11 @@ class NovoRouter:
         require_command_echo: bool = True,
     ) -> Callable[[NovoFrame], MatchResult]:
         def match(frame: NovoFrame) -> MatchResult:
-            if frame.classification != "tmcl" or len(frame.data) != 8:
+            if frame.arbitration_id not in (0, 99) or frame.dlc != 8 or len(frame.data) != 8:
                 return MatchResult(False, classification=frame.classification)
             if strict and frame.data[0] != int(board_id):
                 return MatchResult(False, classification="tmcl_wrong_board_or_command")
-            if strict and require_command_echo and frame.data[2] != int(command):
+            if strict and require_command_echo and int(command) != 64 and frame.data[2] != int(command):
                 return MatchResult(False, classification="tmcl_wrong_board_or_command")
             return MatchResult(True, terminal=True, classification="tmcl", outcome="completion")
         return match

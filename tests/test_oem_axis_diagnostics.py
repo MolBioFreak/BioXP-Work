@@ -638,7 +638,7 @@ def test_gripper_stop_restores_idle_and_verifies_stop(monkeypatch):
         "gripper_status",
         lambda _tester: {
             "ok": True,
-            "speed": {"speed": 0},
+            "speed": {"speed": 0, "speed_reply_valid": True, "ack": {"status": 100}},
             "current": {"run_current_param6": 10, "standby_current_param7": 10},
         },
     )

@@ -90,7 +90,7 @@ class FakeDeckProvider:
 
     def deck_authority_snapshot(self, *, expected_generation: int):
         self.calls.append(("snapshot", expected_generation))
-        return {
+        result = {
             "ownership_generation": expected_generation,
             "provider_owner_id": "fake-provider",
             "board_epoch_4": 10,
@@ -117,6 +117,24 @@ class FakeDeckProvider:
             "latch_status": True,
             "machine_latch_closed": True,
         }
+
+        self._cached_authority = (time.monotonic(), result)
+        return result
+
+    def invalidate_deck_authority_cache(self, *, reason):
+        self._cached_authority = None
+
+    def deck_authority_cached_snapshot(self, *, expected_generation):
+        import copy
+        cached = getattr(self, "_cached_authority", None)
+        if cached is None:
+            raise RuntimeError("deck_authority_cache_unavailable")
+        sampled_at, result = cached
+        if time.monotonic() - sampled_at >= 15.0:
+            raise RuntimeError("deck_authority_cache_stale")
+        if result["ownership_generation"] != expected_generation:
+            raise RuntimeError("ownership_generation_changed")
+        return copy.deepcopy(result)
 
     def force_to_high_home(self, *, command_id: str):
         self.calls.append(("force_to_high_home", command_id))
@@ -481,6 +499,9 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
     assert provider.tip_tray_reader is not None
     assert provider.tip_tray_reader(0)["tip_available"] is None
     assert provider.tip_tray_publisher is not None
+    cold = next(row for row in TestClient(app).get("/operator/v2/control-catalog").json()["actions"] if row["action_id"] == "oem.deck.move_to_location")
+    assert cold["enabled"] is False and cold["disabled_reason"] == "canonical_deck_authority_unavailable:deck_authority_cache_unavailable"
+    assert app.state.oem_deck_authority_collector()["enabled"] is True
     catalog_response = TestClient(app).get("/operator/v2/control-catalog")
     assert catalog_response.status_code == 200
     deck_action = next(
@@ -1309,7 +1330,8 @@ class _ProductionMoveReceiptAdapter(Serial206ProductionPrimitiveAdapter):
     def _axis_profile(self, axis):
         return {"board": {"x": 5, "y": 4, "z": 4}[axis], "motor": {"x": 0, "y": 0, "z": 1}[axis]}
 
-    def oem_move_xy(self, x, y, *, wait_timeout_s=5.0):
+    def oem_move_xy(self, x, y, *, wait_timeout_s=5.0, source_context=None):
+        assert source_context == "ClassControlInterface.btnLOC1_Click"
         self.motion_calls.append(("moveTo", x, y))
         return {
             "ok": True,
@@ -1370,7 +1392,7 @@ def test_real_production_move_to_shape_proves_named_move_children(monkeypatch, o
         results = [provider.moveTo(location_id=1, authority_snapshot=authority)]
     elif operation == "barcode":
         results = [
-            provider.moveTo(location_id=2, camera_offset=True, authority_snapshot=authority),
+            provider.moveTo(location_id=2, camera_offset=True, barcode=True, authority_snapshot=authority),
             provider.moveZCamera(location_id=2, authority_snapshot=authority),
         ]
     else:
@@ -1421,7 +1443,7 @@ def test_barcode_uses_raw_il_offsets_high_clamp_and_source_child_order(
         "plate_on_gantry": None,
     }
 
-    provider.moveTo(location_id=location_id, camera_offset=True, authority_snapshot=authority)
+    provider.moveTo(location_id=location_id, camera_offset=True, barcode=True, authority_snapshot=authority)
     provider.moveZCamera(location_id=location_id, authority_snapshot=authority)
 
     assert adapter.motion_calls[0] == ("moveTo", expected_x, expected_y)
@@ -1886,6 +1908,7 @@ def test_fresh_store_bootstraps_canonical_semantic_state_from_bound_provider(tmp
     assert semantic["producer_operation"] == "semantic_state_bootstrap"
     assert semantic["transition_provenance"]["source_operation"] == "semantic_state_bootstrap"
     assert semantic["transition_provenance"]["upstream_source_operation"] == "migrated_successful_semantic_state"
+    assert app.state.oem_deck_authority_collector()["enabled"] is True
     action = next(row for row in TestClient(app).get("/operator/v2/control-catalog").json()["actions"] if row["action_id"] == "oem.deck.move_to_location")
     assert action["enabled"] is True
     app.state.operator_command_plane.stop()
@@ -2169,6 +2192,7 @@ def test_catalog_and_admission_share_durable_deck_recovery_truth(tmp_path, monke
         decision={"decision_id": "catalog-seam-decision-1", "approved_by": "operator-test", "reason": "known canonical location observed"},
         final_authority_reader=lambda: dict(reconciliation_authority),
     )
+    assert app.state.oem_deck_authority_collector()["enabled"] is True
     restored = next(row for row in client.get("/operator/v2/control-catalog").json()["actions"] if row["action_id"] == "oem.deck.move_to_location")
     assert restored["enabled"] is True
     assert all(row["enabled"] is True and row["disabled_reason"] is None for row in restored["destination_options"])

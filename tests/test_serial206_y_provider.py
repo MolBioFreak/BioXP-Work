@@ -84,9 +84,9 @@ class FakeYTester:
             "ok": True, "axis": axis,
             "home": {
                 "ok": True,
-                "home_after": {"ok": True, "home": True, "value": 1, "ack": {"status": 100}},
+                "home_after": {"ok": True, "reply_valid": True, "home": True, "value": 1, "ack": {"status": 100}},
                 "stop": {"ok": True, "first_delivery": {"status": 100}, "second_delivery": {"status": 100}},
-                "wait": {"stopped": True, "last_speed": 0, "last_ack": {"status": 100}},
+                "wait": {"stopped": True, "speed_reply_valid": True, "controller_terminal_state_verified": True, "last_speed": 0, "last_ack": {"status": 100}},
                 "set_home": {
                     "ok": True,
                     "source_call_completed": True,
@@ -99,6 +99,12 @@ class FakeYTester:
                 "switch_transition": False,
             },
         }
+
+    def motor_oem_go_home(self, axis, *, speed, rehome, require_switch_transition, **kwargs):
+        assert rehome is True
+        result = self.motor_oem_home_axis(axis, speed=speed, startup=False, require_switch_transition=require_switch_transition)
+        self.calls[-1] = ("go_home", axis, speed, rehome, require_switch_transition)
+        return result["home"]
 
     def motor_oem_stop_exact(self, board, *, motor=0):
         self.calls.append(("stop", board, motor))
@@ -229,47 +235,29 @@ def test_home_modes_use_distinct_source_speed_and_publish_reference_without_tran
 
     result = provider.home("manual_panel", command_id="y-home-2")
     assert result["source_speed"] == 500
-    assert provider.tester.calls[-1] == ("home", "y", 500, False, False)
+    assert provider.tester.calls[-1] == ("go_home", "y", 500, True, False)
 
 
-def test_already_home_y_accepts_current_generation_zero_terminal_proof_without_inapplicable_steps(tmp_path):
+def test_already_home_y_preserves_cached_return_without_fresh_reference(tmp_path):
+    from src.bioxp.usb_driver import BioXpTester
     provider = make_provider(tmp_path)
-    authority = provider._current_authority(allow_unprepared=True)
-    board_epoch = authority["board"]["active_board_epoch"]
-    production_go_home = {
-        "ok": True,
-        "axis": "y",
-        "board": 4,
-        "motor": 0,
-        "board_lifecycle_generation": board_epoch,
-        "source_noop": True,
-        "source_return_code": 0,
-        "controller_command_acknowledged": False,
-        "controller_terminal_state_verified": True,
-        "controller_home_proof_verified": True,
-        "position_before": {"ok": True, "position": 0, "ack": {"status": 100}},
-        "position_after": {"ok": True, "position": 0, "ack": {"status": 100}},
-        "speed_before": {"ok": True, "speed": 0, "ack": {"status": 100}},
-        "home_before": {"ok": True, "value": 1, "ack": {"status": 100}},
-        "home_after": {"ok": True, "value": 1, "ack": {"status": 100}},
-        "home_decision": {
-            "source_short_circuit": "MotorHome_and_CurrentPosition_zero",
-        },
-    }
-    provider.tester.motor_oem_home_axis = lambda *_args, **_kwargs: {
-        "axis": "y",
-        "startup": False,
-        "prepare": {"ok": True},
-        "home": production_go_home,
-        "restore_current": None,
-    }
-
+    driver = object.__new__(BioXpTester)
+    driver._motion_oem_axis_profile = lambda axis: {"board": 4, "motor": 0}
+    driver._oem_board_state = lambda: {4: True}
+    driver.oem_no24v_state = lambda: False
+    driver.oem_current_board_lifecycle_generation = lambda: 7
+    driver._oem_motor_home_cache = {(4, 0): True}
+    driver._oem_position_cache = {(4, 0): 0}
+    driver._send_motor = lambda *a, **k: (_ for _ in ()).throw(AssertionError("cached home must not transmit"))
+    provider.tester.motor_oem_go_home = driver.motor_oem_go_home
     result = provider.home("manual_panel", command_id="y-already-home-current")
-
     assert result["ok"] is True
-    assert result["controller_home_proof_verified"] is True
-    assert result["home_proof"]["already_home_current_generation"] is True
-    assert result["reference_published"] is True
+    assert result["result"]["home"]["source_return_code"] == 0
+    assert result["home_proof"]["source_cached_noop"] is True
+    assert result["home_proof"]["stop_wait_set_home_inapplicable"] is True
+    assert result["home_proof"]["already_home_current_generation"] is False
+    assert result["controller_home_proof_verified"] is False
+    assert result["reference_published"] is False
 
 
 def test_set_home_is_explicit_no_motion_and_does_not_claim_home_reference(tmp_path):

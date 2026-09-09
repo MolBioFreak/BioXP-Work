@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -67,6 +68,9 @@ REPORT_IDENTITY_SCHEMA_VERSION = 3
 RUNTIME_RELEASE_SCHEMA_VERSION = 4
 OPERATOR_COMMAND_PLANE_SCHEMA_VERSION = 5
 OEM_DECK_SCHEMA_VERSION = 6
+OEM_DECK_GROUP_SCHEMA_VERSION = 7
+
+from . import oem_deck_schema_v7 as _deck_v7
 _ACCEPTED_LEGACY_SERIAL206_MIGRATION_DIGESTS = frozenset({
     "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c",
 })
@@ -100,6 +104,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     4: "c10b9517ff0134b44c0fcec240fdcfafc640d3c56634c1fb9a88eaea87995317",
     5: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     6: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
+    7: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2655,6 +2660,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         runtime_release_migration_identity(),
         operator_command_plane_migration_identity(),
         oem_deck_schema_v6_migration_identity(),
+        oem_deck_schema_v7_migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -2981,7 +2987,7 @@ def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
     return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
-def canonical_runtime_schema_manifest() -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = OEM_DECK_GROUP_SCHEMA_VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3013,6 +3019,8 @@ def canonical_runtime_schema_manifest() -> dict[tuple[str, str], str]:
         _apply_runtime_release_start(expected)
         _apply_operator_command_plane_schema_v1(expected)
         apply_deck_schema_v6(expected)
+        if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
+            _deck_v7.apply_deck_schema_v7(expected)
         _reinstall_operator_global_triggers(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
@@ -3029,8 +3037,10 @@ def canonical_runtime_schema_manifest() -> dict[tuple[str, str], str]:
         expected.close()
 
 
-def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
-    registry = canonical_runtime_migration_registry()
+def verify_canonical_runtime_database(
+    connection: sqlite3.Connection, *, version: int = OEM_DECK_GROUP_SCHEMA_VERSION,
+) -> None:
+    registry = tuple(item for item in canonical_runtime_migration_registry() if item.version <= version)
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version != registry[-1].version:
         raise RuntimeError(f"canonical runtime schema is not prepared (found {version})")
@@ -3044,8 +3054,11 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
     _verify_report_identity_metadata_v1(connection)
     _verify_runtime_release_start(connection)
     _verify_operator_command_plane_schema_v1(connection)
-    verify_deck_schema_v6(connection)
-    expected_manifest = canonical_runtime_schema_manifest()
+    if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
+        _deck_v7.verify_deck_schema_v7(connection)
+    else:
+        verify_deck_schema_v6(connection)
+    expected_manifest = canonical_runtime_schema_manifest(version=version)
     actual_manifest = {
         (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
         for row in connection.execute(
@@ -3107,8 +3120,8 @@ def verify_canonical_runtime_database(connection: sqlite3.Connection) -> None:
     identity = connection.execute(
         "SELECT schema_version FROM runtime_store_identity WHERE identity_id=1"
     ).fetchone()
-    if identity is None or int(identity[0]) != OEM_DECK_SCHEMA_VERSION:
-        raise RuntimeError("runtime store identity does not attest canonical schema v6")
+    if identity is None or int(identity[0]) != registry[-1].version:
+        raise RuntimeError("runtime store identity does not attest canonical schema version")
 
 
 def _verified_sqlite_backup(
@@ -3359,7 +3372,10 @@ def _migrate_oem_deck_schema_v6_locked(
     if assert_migration_slot(connection, identity):
         if version < identity.version:
             raise RuntimeError("OEM deck migration ledger and PRAGMA user_version disagree")
-        verify_deck_schema_v6(connection)
+        if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
+            _deck_v7.verify_deck_schema_v7(connection)
+        else:
+            verify_deck_schema_v6(connection)
         return
     if version >= identity.version:
         raise RuntimeError("OEM deck migration version is occupied without exact ledger identity")
@@ -3419,6 +3435,84 @@ def _migrate_oem_deck_schema_v6_locked(
         )
         connection.execute(f"PRAGMA user_version={identity.version}")
         verify_deck_schema_v6(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def oem_deck_schema_v7_migration_identity() -> RuntimeMigrationIdentity:
+    # Bind the new schema/verifier and lifecycle, leaving prior identities frozen.
+    source = "\n".join((
+        inspect.getsource(_deck_v7),
+        _deck_v7.DECK_SCHEMA_V7_TRIGGER_SQL,
+        inspect.getsource(_migrate_oem_deck_schema_v7),
+        inspect.getsource(_migrate_oem_deck_schema_v7_locked),
+    ))
+    return RuntimeMigrationIdentity(
+        version=OEM_DECK_GROUP_SCHEMA_VERSION,
+        name="oem_deck_loaded_tip_group_v7",
+        ddl_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    )
+
+
+def _migrate_oem_deck_schema_v7(
+    connection: sqlite3.Connection, root: Path, identity: RuntimeMigrationIdentity,
+) -> None:
+    lifecycle = (
+        connection.exclusive_lifecycle()
+        if isinstance(connection, RuntimeLifecycleConnection)
+        else runtime_lifecycle_lock(root, exclusive=True)
+    )
+    with lifecycle:
+        _migrate_oem_deck_schema_v7_locked(connection, root, identity)
+
+
+def _migrate_oem_deck_schema_v7_locked(
+    connection: sqlite3.Connection, root: Path, identity: RuntimeMigrationIdentity,
+) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if assert_migration_slot(connection, identity):
+        verify_canonical_runtime_database(connection)
+        return
+    if version != OEM_DECK_SCHEMA_VERSION:
+        raise RuntimeError("OEM loaded-tip migration requires the exact canonical v1-v6 prefix")
+    started_at = time.time()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        verify_canonical_runtime_database(connection, version=OEM_DECK_SCHEMA_VERSION)
+        active = connection.execute(
+            "SELECT 1 FROM operator_plane_commands WHERE status IN "
+            "('queued','dispatched','issued_pending','stop_requested','abort_requested') LIMIT 1"
+        ).fetchone()
+        if active is not None:
+            raise RuntimeError("OEM loaded-tip migration requires quiesced operator mutation admission")
+        if connection.execute(
+            "SELECT 1 FROM operator_plane_deck_semantic_state WHERE tip_loaded=1 AND "
+            "(tip_location IS NULL OR typeof(tip_location)<>'integer' OR tip_location NOT BETWEEN -1 AND 3)"
+        ).fetchone() is not None:
+            raise RuntimeError("OEM loaded-tip migration found invalid existing loaded-tip state")
+        if [tuple(row) for row in connection.execute("PRAGMA integrity_check")] != [("ok",)]:
+            raise RuntimeError("OEM loaded-tip migration integrity check failed")
+        backup_source = sqlite3.connect(root / "bioxp_runtime.db", timeout=2.0, isolation_level=None)
+        try:
+            backup_sha256 = _verified_sqlite_backup(backup_source, root, lifecycle_lock_held=True)
+        finally:
+            backup_source.close()
+        _deck_v7.apply_deck_schema_v7(connection)
+        _deck_v7.verify_deck_schema_v7(connection)
+        finished_at = time.time()
+        _record_runtime_migration(
+            connection, identity=identity, backup_sha256=backup_sha256,
+            source_digests={}, started_at=started_at, finished_at=finished_at,
+        )
+        connection.execute(
+            "UPDATE runtime_store_identity SET schema_version=?,updated_at=? WHERE identity_id=1",
+            (identity.version, finished_at),
+        )
+        connection.execute(f"PRAGMA user_version={identity.version}")
+        verify_canonical_runtime_database(connection)
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
@@ -3547,6 +3641,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
             _migrate_runtime_release_start(connection, selected_root, registry[3])
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
         _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
+        _migrate_oem_deck_schema_v7(connection, selected_root, registry[6])
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3676,6 +3771,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_runtime_release_start(connection, selected_root, registry[3])
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
         _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
+        _migrate_oem_deck_schema_v7(connection, selected_root, registry[6])
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
@@ -3698,6 +3794,19 @@ def _compact_controller_state(
         "content_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         "encoded_bytes": len(encoded.encode("utf-8")),
     }
+    if key == "constructed_tip_trays":
+        # Exact bounded OEM software-constructor state, not diagnostic samples.
+        # In particular the 96 wells must never become a 64-item summary.
+        if (isinstance(value, list) and len(value) == 5
+                and all(isinstance(tray, Mapping)
+                        and tray.get("tray_id") == index
+                        and isinstance(tray.get("occupancy"), list)
+                        and len(tray["occupancy"]) == 96
+                        and all(type(well) is bool for well in tray["occupancy"])
+                        for index, tray in enumerate(value))
+                and len(encoded.encode("utf-8")) < 8192):
+            return json.loads(encoded)
+        raise ValueError("OEM constructor tray state must contain five exact 96-well trays")
     if budget[0] <= 0 or depth >= 12:
         return digest_summary
     budget[0] -= 1
@@ -3787,6 +3896,13 @@ class OEMRuntimeStore:
         self._lock = self._audit_database.writer_lock
         self._db = self._audit_database.connection
         self._authority_write_depth = 0
+        # Volatile admission fence belongs to this authority owner, not its DB
+        # writer lock. Software cancellation must never wait for SQLite.
+        self._axis_interrupt_lock = threading.RLock()
+        self._axis_interrupts = {
+            axis: {"epoch": 0, "active": 0, "recovery_required": False}
+            for axis in SERIAL206_BOARD4_MEMBERS
+        }
         self._db.create_function(
             "sha256_utf8",
             1,
@@ -3896,26 +4012,80 @@ class OEMRuntimeStore:
             output[axis] = self._authority_row(row)
         return output
 
+    def axis_interrupt_snapshot(self, axis: str) -> dict[str, Any]:
+        """Nonblocking-on-storage admission/completion generation."""
+        with self._axis_interrupt_lock:
+            row = self._axis_interrupts[str(axis)]
+            return {"epoch": row["epoch"],
+                    "active": bool(row["active"] or row["recovery_required"])}
+
+    def begin_axis_interrupt(self, axis: str) -> int:
+        with self._axis_interrupt_lock:
+            row = self._axis_interrupts[str(axis)]
+            row["epoch"] += 1
+            row["active"] += 1
+            return row["epoch"]
+
+    def end_axis_interrupt(
+        self, axis: str, *, reconciled: bool, expected_epoch: int | None = None,
+        persistence_owner: bool = False,
+    ) -> None:
+        with self._axis_interrupt_lock:
+            row = self._axis_interrupts[str(axis)]
+            row["active"] -= 1
+            # Only persistence covering this generation may clear a hold.
+            # Aggregate finalizers release their count, not newer authority.
+            if expected_epoch == row["epoch"]:
+                if persistence_owner or not reconciled:
+                    row["recovery_required"] = not reconciled
+            elif expected_epoch is None and not reconciled:
+                row["recovery_required"] = True
+
+    def _axis_publication_interrupted(self, axis: str, expected: int | None) -> bool:
+        snapshot = self.axis_interrupt_snapshot(axis)
+        return bool(snapshot["active"] or
+                    (expected is not None and expected != snapshot["epoch"]))
+
     def board4_authority_projection(self) -> dict[str, Any]:
         with self._lock:
-            return {"board": self._board4_row_locked(), "axes": self._axis_rows_locked()}
+            axes = self._axis_rows_locked()
+            for axis, row in axes.items():
+                fence = self.axis_interrupt_snapshot(axis)
+                row["software_interrupt_epoch"] = fence["epoch"]
+                row["software_interrupt_active"] = fence["active"]
+                if fence["active"]:
+                    row.update(lifecycle_state="reconciliation_required",
+                               reference_state="reconciliation_required",
+                               prepared_board_epoch=None)
+            return {"board": self._board4_row_locked(), "axes": axes}
 
-    def require_axis_reconciliation(self, axis: str, *, receipt_id: str) -> dict[str, Any]:
+    def require_axis_reconciliation(
+        self, axis: str, *, receipt_id: str, expected_interrupt_epoch: int | None = None,
+    ) -> dict[str, Any]:
         selected = str(axis).strip().lower()
         if selected not in SERIAL206_BOARD4_MEMBERS:
             raise ValueError("unsupported board-4 axis")
-        with self._lock, self._authority_write():
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                changed = self._db.execute(
-                    "UPDATE serial206_axis_authority SET lifecycle_state='reconciliation_required',reference_state='reconciliation_required',prepared_board_epoch=NULL,last_receipt_id=?,interrupt_epoch=interrupt_epoch+1,state_version=state_version+1,updated_at=? WHERE axis=?",
-                    (str(receipt_id), time.time(), selected),
-                ).rowcount
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
-        return {"ok": changed == 1, "axis": selected, "receipt_id": str(receipt_id), "reconciliation_required": changed == 1}
+        owns_interrupt = expected_interrupt_epoch is None
+        interrupt_epoch = self.begin_axis_interrupt(selected) if owns_interrupt else expected_interrupt_epoch
+        reconciled = False
+        try:
+            with self._lock, self._authority_write():
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    changed = self._db.execute(
+                        "UPDATE serial206_axis_authority SET lifecycle_state='reconciliation_required',reference_state='reconciliation_required',prepared_board_epoch=NULL,last_receipt_id=?,interrupt_epoch=interrupt_epoch+1,state_version=state_version+1,updated_at=? WHERE axis=?",
+                        (str(receipt_id), time.time(), selected),
+                    ).rowcount
+                    self._db.execute("COMMIT")
+                    reconciled = changed == 1
+                except Exception:
+                    self._db.execute("ROLLBACK")
+                    raise
+            return {"ok": reconciled, "axis": selected, "receipt_id": str(receipt_id), "reconciliation_required": reconciled}
+        finally:
+            if owns_interrupt:
+                self.end_axis_interrupt(selected, reconciled=reconciled,
+                                        expected_epoch=interrupt_epoch, persistence_owner=True)
 
     def record_board4_transition(
         self,
@@ -4056,12 +4226,18 @@ class OEMRuntimeStore:
         *,
         ownership_generation: int,
         profile_fingerprint: str,
+        expected_interrupt_epoch: int | None = None,
+        expected_software_interrupt_epoch: int | None = None,
     ) -> dict[str, Any]:
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
         with self._lock, self._authority_write():
             board = self._board4_row_locked()
+            row = self._axis_rows_locked().get(axis, {})
+            if (self._axis_publication_interrupted(axis, expected_software_interrupt_epoch)
+                or (expected_interrupt_epoch is not None and expected_interrupt_epoch != row.get("interrupt_epoch"))):
+                return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
             if board.get("state") != "active" or board.get("active_board_epoch") is None:
                 return {"ok": False, "failure": "board4_not_active", "axis": axis, "board": board}
             now = time.time()
@@ -4082,6 +4258,8 @@ class OEMRuntimeStore:
                 if self._db.in_transaction:
                     self._db.execute("ROLLBACK")
                 raise
+            if self._axis_publication_interrupted(axis, expected_software_interrupt_epoch):
+                return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
             return {"ok": True, "axis": self._axis_rows_locked()[axis], "board": self._board4_row_locked()}
 
     def publish_axis_reference(
@@ -4091,6 +4269,8 @@ class OEMRuntimeStore:
         position_steps: int,
         ownership_generation: int,
         receipt_id: str | None = None,
+        expected_interrupt_epoch: int | None = None,
+        expected_software_interrupt_epoch: int | None = None,
     ) -> dict[str, Any]:
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
@@ -4098,6 +4278,9 @@ class OEMRuntimeStore:
         with self._lock, self._authority_write():
             board = self._board4_row_locked()
             row = self._axis_rows_locked().get(axis, {})
+            if (self._axis_publication_interrupted(axis, expected_software_interrupt_epoch)
+                or (expected_interrupt_epoch is not None and expected_interrupt_epoch != row.get("interrupt_epoch"))):
+                return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
             if board.get("state") != "active" or row.get("prepared_board_epoch") != board.get("active_board_epoch"):
                 return {"ok": False, "failure": "axis_board_epoch_not_current", "axis": axis, "board": board, "axis_state": row}
             now = time.time()
@@ -4118,6 +4301,8 @@ class OEMRuntimeStore:
                 if self._db.in_transaction:
                     self._db.execute("ROLLBACK")
                 raise
+            if self._axis_publication_interrupted(axis, expected_software_interrupt_epoch):
+                return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
             return {"ok": True, "axis": self._axis_rows_locked()[axis], "board": self._board4_row_locked()}
 
     def record_axis_observation(
@@ -4127,12 +4312,15 @@ class OEMRuntimeStore:
         requested_position_steps: int,
         observed_position_steps: int,
         receipt_id: str | None = None,
+        expected_software_interrupt_epoch: int | None = None,
     ) -> dict[str, Any]:
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
         discrepancy = int(observed_position_steps) - int(requested_position_steps)
         with self._lock, self._authority_write():
+            if self._axis_publication_interrupted(axis, expected_software_interrupt_epoch):
+                return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
             now = time.time()
             self._db.execute("BEGIN IMMEDIATE")
             try:

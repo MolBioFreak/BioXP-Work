@@ -144,7 +144,9 @@ def _raw_for(stage: str) -> dict:
     if stage == "gripper-current-31":
         return _write(31)
     if stage == "gripper-clear-10000":
-        return _move(10, 10010)
+        # S4 direct board moveSteps, not the old raw move/speed-poll envelope.
+        return {"ok": True, "source_call_completed": True, "board_wrapper_return": 10010,
+                "ack": dict(ACK), "wait": {"ok": True}, "board_position": _position(10010)}
     if stage == "x-set-home" or stage == "y-set-home":
         return _write(0)
     if stage == "x-speed-1700":
@@ -157,10 +159,10 @@ def _raw_for(stage: str) -> dict:
         return {
             "ok": True,
             "source_condition_active": False,
+            "source_condition_evaluated": True,
+            "confirm_axis_evaluated": False,
             "branch_binding": {"serial_number": 9, "camera_calibrated": True},
-            "oem_predicates": {"tcDoorClosed": True, "closed_source": "queryHome(ThermalDoor)"},
-            "position": _position(0),
-            "speed": {"speed": 0, "ack": dict(ACK)},
+            # S5 source short circuit: serial<=9 performs no confirmAxis query.
         }
     if stage == "ui-zero-calibrated":
         return {"ok": True, "calibrated": True, "writes": [{"axis": axis, "value": "0", "applied": True} for axis in ("x", "y", "z", "z")], "readback": {"x": "0", "y": "0", "z": "0"}}

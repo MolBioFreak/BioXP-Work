@@ -261,8 +261,9 @@ class DeckAuthoritySnapshot:
             raise ValueError("reference versions must contain x,y,z,g")
         if set(self.safety_epochs) != {"global", "x", "y", "z"}:
             raise ValueError("safety epochs must contain global,x,y,z")
-        if self.tip_loaded and not 0 <= self.tip_location <= 3:
-            raise ValueError("loaded tip requires a valid tip_location")
+        # ClassPipetteCollection uses -1 for group/all-channel mode, even loaded.
+        if type(self.tip_location) is not int or self.tip_location not in {-1, 0, 1, 2, 3}:
+            raise ValueError("tip_location is outside the source domain")
         if len(self.position_table_sha256) != 64:
             raise ValueError("invalid PositionTable digest")
         object.__setattr__(self, "plate_on_gantry", canonical_plate_name(self.plate_on_gantry))
@@ -271,6 +272,32 @@ class DeckAuthoritySnapshot:
     def digest(self) -> str:
         authoritative = asdict(self)
         return _digest({"schema_version": "bioxp.oem_deck_authority.v1", **authoritative})
+
+
+def _latch_owner_identity(value: str) -> str:
+    host, separator, sample = value.partition(";sensor=type3:")
+    sensor, compound_separator, compound = sample.partition(";compound=")
+    if (host.startswith("deck-latch:host=") and separator and compound_separator
+            and len(sensor) == 64 and len(compound) == 64):
+        return host
+    return value
+
+
+def _same_authority_after_resampling(before: DeckAuthoritySnapshot, after: DeckAuthoritySnapshot) -> bool:
+    """Compare owner/state fences, not identity of two distinct observations.
+
+    Full receipt digests still bind timestamps and sensor transaction evidence.
+    Serial206's compound latch ID includes a stable independent host-owner token
+    plus a fresh sensor transaction digest. Only that sensor sample component may
+    change here; host identity, both predicates, coordinates and all epochs remain
+    exact. Unknown/legacy latch ID formats still require exact identity.
+    """
+    return (
+        after.captured_at >= before.captured_at
+        and _latch_owner_identity(after.latch_observation_id) == _latch_owner_identity(before.latch_observation_id)
+        and replace(after, captured_at=before.captured_at,
+                    latch_observation_id=before.latch_observation_id).digest == before.digest
+    )
 
 
 @dataclass(frozen=True)
@@ -327,7 +354,7 @@ def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, ta
         steps.append(DeckPlanStep(3, "parkGantry", "ClassControlInterface.btnLOC1_Click:Park", ("x", "y", "z", "g")))
     elif destination.branch == "barcode":
         steps.extend((
-            DeckPlanStep(3, "moveTo", "ClassControlInterface.btnLOC1_Click:barcode", ("x", "y", "z"), {"location_id": destination.location_id, "camera_offset": True}),
+            DeckPlanStep(3, "moveTo", "ClassControlInterface.btnLOC1_Click:barcode", ("x", "y", "z"), {"location_id": destination.location_id, "camera_offset": True, "barcode": True}),
             DeckPlanStep(4, "moveZCamera", "ClassControlInterface.btnLOC1_Click:1932-1945", ("z",), {"location_id": destination.location_id}),
         ))
     else:
@@ -1851,7 +1878,9 @@ def make_deck_command_executor(
                 }
             revalidated = DeckAuthoritySnapshot(**dict(snapshot_fn(expected_generation=expected_ownership_generation)))
             require_expected_board_epochs(revalidated, phase="before_first_movement_write")
-            if revalidated.digest != authority.digest:
+            # Fresh time/sensor transaction evidence is not authority drift.
+            # Preserve the full receipt digest and fence every owner/state field.
+            if not _same_authority_after_resampling(authority, revalidated):
                 raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
             results: list[Mapping[str, Any]] = []
             delivery_attempted = False

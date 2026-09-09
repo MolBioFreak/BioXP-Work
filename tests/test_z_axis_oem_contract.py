@@ -115,7 +115,7 @@ def test_async_z_event_window_actively_waits_and_returns_decoded_motor_event(mon
     class Frame:
         def provenance(self):
             return {
-                "raw": [0x7E, 0, 0, 0, 0, 8, 4, 128, 138, 0, 0, 0, 1, 1, 0, 0x7E],
+                "raw": [0x7E, 0, 0, 0, 0, 8, 4, 128, 138, 0, 0, 0, 1, 1, 24, 0x7E],  # Novo additive checksum24
                 "received_at": 1.0,
             }
 
@@ -169,6 +169,7 @@ def test_begin_event_window_returns_monotonic_cursor(monkeypatch):
 
 def test_wait_target_reached_ignores_stale_event_and_accepts_fresh_event(monkeypatch):
     driver = _driver()
+    driver._oem_motor_initial_signals = set()  # Test wire freshness after the source latch reset.
     driver._oem_abort_generation = 0
     monkeypatch.setattr(driver, "oem_no24v_state", lambda: False)
     monkeypatch.setattr(

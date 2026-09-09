@@ -18,11 +18,13 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .runtime_audit_store import (
+    RUNTIME_LIFECYCLE_LOCK_NAME,
     RuntimeAuditDatabase,
     assert_migration_slot,
     runtime_audit_migration_identity,
@@ -982,6 +984,7 @@ class OperatorReceiptStore:
         if not relpaths:
             return
         with self.lock:
+            busy_timeout = int(self.connection.execute("PRAGMA busy_timeout").fetchone()[0])
             if nonblocking:
                 self.connection.execute("PRAGMA busy_timeout=0")
             try:
@@ -998,7 +1001,7 @@ class OperatorReceiptStore:
                     raise
             finally:
                 if nonblocking:
-                    self.connection.execute("PRAGMA busy_timeout=2000")
+                    self.connection.execute(f"PRAGMA busy_timeout={busy_timeout}")
 
     def _remove_orphan_evidence(self) -> None:
         """Classify every unbound object durably before confined cleanup."""
@@ -1331,7 +1334,9 @@ class OperatorReceiptStore:
             "recorded_at": time.time(),
         }
         compact, _ = self._compact_receipt(row)
-        raw = _json_bytes(compact) + b"\n"
+        # The recovery journal is the only durable copy when SQLite is busy.
+        # Compact only the public result, never the recoverable evidence.
+        raw = _json_bytes(row) + b"\n"
         lock_descriptor = os.open(self.interrupt_fallback_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             os.fchmod(lock_descriptor, 0o600)
@@ -1448,13 +1453,55 @@ class OperatorReceiptStore:
                 raise RuntimeError("operator claim missing after durable commit")
             return self._row_receipt(stored, include_evidence=False), created
 
+    @contextmanager
+    def _try_interrupt_lifecycle(self):
+        """Keep a shared lease so nested connection leases cannot block.
+
+        The prepared store already owns this lock file. Failure to acquire it
+        immediately selects the existing recovery journal, not a new queue.
+        """
+        descriptor = os.open(
+            self.root / RUNTIME_LIFECYCLE_LOCK_NAME,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        acquired = False
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                pass
+            yield acquired
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def put_interrupt(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        """Persist a delivered safety interrupt without waiting on normal DB work."""
+        """Persist a delivered interrupt; never await ordinary DB/lifecycle work.
+
+        Recovery-file locking/fsync still take time. This is post-delivery
+        retention, not a pre-delivery admission or hard-real-time primitive.
+        """
         receipt = dict(receipt)
         if isinstance(receipt.get("interrupt_evidence"), Mapping):
             receipt["interrupt_evidence"] = {**receipt["interrupt_evidence"], "persistence_state": "committed"}
         if not self.lock.acquire(blocking=False):
             return self.append_interrupt_fallback(receipt, reason="sqlite_connection_busy")
+        try:
+            # RLock acquisition is reentrant: never BEGIN/ROLLBACK someone
+            # else's already active transaction on the shared connection.
+            if self.connection.in_transaction:
+                return self.append_interrupt_fallback(receipt, reason="sqlite_transaction_active")
+            with self._try_interrupt_lifecycle() as acquired:
+                if not acquired:
+                    return self.append_interrupt_fallback(receipt, reason="runtime_lifecycle_busy")
+                return self._put_interrupt_locked(receipt)
+        finally:
+            self.lock.release()
+
+    def _put_interrupt_locked(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        busy_timeout = int(self.connection.execute("PRAGMA busy_timeout").fetchone()[0])
         try:
             self.connection.execute("PRAGMA busy_timeout=0")
             artifact_id = None
@@ -1485,10 +1532,8 @@ class OperatorReceiptStore:
                     receipt,
                     reason=f"{type(exc).__name__}: {exc}",
                 )
-            finally:
-                self.connection.execute("PRAGMA busy_timeout=2000")
         finally:
-            self.lock.release()
+            self.connection.execute(f"PRAGMA busy_timeout={busy_timeout}")
         self._remove_pruned_evidence(pruned, nonblocking=True)
         return compact
 
@@ -1607,10 +1652,17 @@ class OperatorReceiptStore:
             if key not in target and key not in evidence:
                 continue
             rows = list(target.get(key) or [])
+            # A checkpoint contains the whole observer snapshot. Index once,
+            # rather than comparing every incoming row against every old row.
+            by_identity = {item["exchange_id"]: item for item in rows} if key == "transport_exchanges" else {}
             for row in evidence.get(key) or []:
                 if key == "transport_exchanges":
-                    if any(item["exchange_id"] == row["exchange_id"] for item in rows):
+                    identity = row["exchange_id"]
+                    if identity in by_identity:
+                        if by_identity[identity] != row:
+                            raise ValueError("transport evidence identity collision")
                         continue
+                    by_identity[identity] = row
                 elif row in rows:
                     continue
                 rows.append(dict(row))

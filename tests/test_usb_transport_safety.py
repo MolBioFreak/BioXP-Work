@@ -21,20 +21,14 @@ def _bare_tester():
 
 
 def _event_frame(*, status: int, cmd_or_axis: int, value_bytes: tuple[int, int, int, int], checksum: int = 0xEE):
-    return [
-        0x7E,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x08,
-        BioXpTester.BOARD_HEAD,
-        status,
-        cmd_or_axis,
-        *value_bytes,
-        checksum,
-        0x7E,
-    ]
+    # NovoEncoding: DLC8 payload plus additive checksum, escape body/checksum.
+    # The old fixture declared DLC8 but supplied seven payload bytes and a
+    # fabricated checksum. Keep a distinct payload[7] to test axis extraction.
+    body = [0, 0, 0, 0, 8, 4, status, cmd_or_axis, *value_bytes, checksum]
+    escaped = []
+    for byte in [*body, sum(body) & 255]:
+        escaped.extend([125, byte ^ 32] if byte in (125, 126) else [byte])
+    return [126, *escaped, 126]
 
 
 @pytest.mark.parametrize("motor", [0, 1, 2])
@@ -169,10 +163,11 @@ def test_chiller_activation_matcher_preserves_board_identity_without_command_ech
 
 
 def test_default_tmcl_matcher_still_requires_command_echo():
-    matcher = NovoRouter.tmcl_matcher(board_id=7, command=64, strict=True)
+    # NovoCANUSB.IsAMatch exempts64, not ordinary GAP6 commands.
+    matcher = NovoRouter.tmcl_matcher(board_id=7, command=6, strict=True)
 
     assert matcher(_tmcl_frame(board=7, status=2, command=0)).matched is False
-    assert matcher(_tmcl_frame(board=7, status=2, command=64)).matched is True
+    assert matcher(_tmcl_frame(board=7, status=2, command=6)).matched is True
 
 
 def test_oem_board_activation_relaxes_command_echo_only_for_chiller(monkeypatch):

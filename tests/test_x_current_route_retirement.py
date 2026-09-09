@@ -131,5 +131,19 @@ def test_homexy_fails_closed_without_provider_before_tester_access(monkeypatch, 
         asyncio.run(api.motion_oem_home_xy(request))
 
     assert raised.value.status_code == 409
-    assert raised.value.detail["error"] == "canonical_xz_method_requires_v2_route"
-    assert raised.value.detail["physical_motion_commanded"] is False
+    assert raised.value.detail == {
+        "error": "homexy_requires_canonical_action",
+        "replacement_action_id": "oem.xy.home",
+        "replacement_route": "/operator/v2/actions/oem.xy.home",
+        "physical_motion_commanded": False,
+    }
+    # Once the canonical caller is admitted, a missing provider still refuses
+    # before tester access; this is not permission for a legacy direct fallback.
+    monkeypatch.setattr(api, "current_operator_dispatch_context", lambda: object())
+    with pytest.raises(HTTPException) as owned:
+        asyncio.run(api.motion_oem_home_xy(request))
+    assert owned.value.status_code == 503
+    assert owned.value.detail == {
+        "error": "serial206_homexy_provider_unavailable",
+        "physical_motion_commanded": False,
+    }

@@ -115,8 +115,17 @@ def test_failed_preparation_never_instructs_home_z(monkeypatch):
     async def run_inline(label, func, timeout_s):
         return func()
     monkeypatch.setattr(api, '_run_blocking', run_inline)
+    provider_calls = []
+    class PreparationProvider:
+        def prepare_global_motion_without_motion(self, tester, *, authority):
+            assert tester is driver
+            provider_calls.append(authority)
+            return prepare_motion_without_motion(tester, authority)
+    monkeypatch.setattr(api, '_serial206_oem_initialization_provider', PreparationProvider())
     with pytest.raises(HTTPException) as raised:
         asyncio.run(api.motion_oem_prepare_without_motion())
     assert raised.value.status_code == 409
     assert raised.value.detail['failure_stage'] == 'rail_24v_readback'
+    assert len(provider_calls) == 1
+    assert raised.value.detail['physical_motion_commanded'] is False
     assert 'Home Z' not in raised.value.detail['next_required_action']
