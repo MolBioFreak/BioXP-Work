@@ -46,6 +46,10 @@ class CollectionContext:
     allow_recover: bool = False
 
 
+class HardwareCollectionPreempted(RuntimeError):
+    """A background read yielded before its next query; no snapshot published."""
+
+
 class HardwareStateOwner:
     """Thread-safe owner of one completed canonical hardware snapshot."""
 
@@ -197,10 +201,12 @@ class HardwareStateOwner:
         age = max(ages) if ages else max(0.0, now - float(snapshot.get("completed_unix", now)))
         return ("fresh" if age <= self._fresh_for_s else "stale"), age
 
-    def project(self, *domains: str) -> dict[str, Any]:
+    def project(self, *domains: str, independent_domains: bool = False) -> dict[str, Any]:
         requested = tuple(dict.fromkeys(str(item) for item in domains))
         with self._lock:
-            snapshot = copy.deepcopy(self._snapshot)
+            # The lock protects the published snapshot. Copy only the requested
+            # domains below; copying every domain here multiplied poll cost.
+            snapshot = self._snapshot
             cache_state, age_s = self._cache_state(snapshot, requested)
             base = {
                 "snapshot_id": None if snapshot is None else snapshot.get("snapshot_id"),
@@ -216,7 +222,7 @@ class HardwareStateOwner:
                 "provenance": "POST /hardware/snapshot/collect",
                 "lifecycle": lifecycle_state.projection(),
             }
-            if cache_state == "missing" or snapshot is None:
+            if snapshot is None or snapshot.get("ownership_epoch") != self._epoch or (cache_state == "missing" and not independent_domains):
                 return {
                     **base,
                     "available": False,
@@ -247,7 +253,7 @@ class HardwareStateOwner:
                 projected_rows[domain] = row
             return {
                 **base,
-                "available": True,
+                "available": cache_state != "missing",
                 "completed_at": snapshot.get("completed_at"),
                 "domains": projected_rows,
             }
@@ -256,6 +262,7 @@ class HardwareStateOwner:
         self,
         domains: Iterable[str],
         collectors: Mapping[str, Callable[[CollectionContext], Any]],
+        *, yield_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Serialize query-only collection and atomically publish on completion."""
         requested = tuple(dict.fromkeys(str(item) for item in domains))
@@ -270,10 +277,14 @@ class HardwareStateOwner:
             context = CollectionContext(ownership_epoch=epoch, started_at=started_at, allow_recover=False)
             rows: dict[str, Any] = {}
             for domain in requested:
+                if yield_requested is not None and yield_requested():
+                    return {"ok": False, "published": False, "reason": "operator_action_pending"}
                 observed_unix = time.time()
                 observed_at = _utc_now()
                 try:
                     observation = collectors[domain](context)
+                except HardwareCollectionPreempted:
+                    return {"ok": False, "published": False, "reason": "operator_action_pending"}
                 except Exception as exc:
                     rows[domain] = {
                         "status": "error",

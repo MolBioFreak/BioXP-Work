@@ -6640,8 +6640,13 @@ class OperatorCommandStore:
 
     def _dispatch_loop(self, dispatch_one: Callable[[dict[str, Any]], None]) -> None:
         next_renewal = 0.0
+        next_reconciliation = 0.0
         while not self._stop.is_set():
-            self.reconcile_pending_interrupts()
+            # Deliveries wake this loop immediately. Retained/external work is
+            # still checked each second, without twenty idle SQLite reopens.
+            if self._wake.is_set() or time.monotonic() >= next_reconciliation:
+                self.reconcile_pending_interrupts()
+                next_reconciliation = time.monotonic() + 1.0
             if _now() >= next_renewal:
                 try:
                     if not self._renew_owner():
@@ -6688,7 +6693,10 @@ class OperatorCommandStore:
                     except Exception:
                         pass
             if not spawned:
-                self._wake.wait(timeout=0.05)
+                if self._wake.wait(timeout=0.05):
+                    # Preserve the wake through clear(): delivered interrupts
+                    # must not wait for the idle reconciliation interval.
+                    next_reconciliation = 0.0
                 self._wake.clear()
 
     def _dispatch_worker(self, dispatch_one: Callable[[dict[str, Any]], None], claimed: dict[str, Any]) -> None:

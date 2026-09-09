@@ -48,7 +48,7 @@ def installed(tmp_path, monkeypatch, rig, request):
     provider = Serial206OemInitializationProvider(primitives, state_store=runtime,
         reference_store=references, generation_provider=lambda: generation['value'])
     slot = {'provider': provider}
-    monkeypatch.setattr(operator_controls.hardware_state, 'project', lambda name: {'domains': {}, 'freshness': {'state': 'fresh', 'age_s': 0, 'fresh_for_s': 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, 'project', lambda *names, **kwargs: {'domains': {}, 'freshness': {'state': 'fresh', 'age_s': 0, 'fresh_for_s': 30}})
     monkeypatch.setattr(operator_controls.hardware_state, 'ownership_projection', lambda: {'ownership_epoch': generation['value'], 'ownership': {'transport': 'owned', 'usb': 'service', 'router': 'running', 'CAN_READY': True}})
     app = FastAPI()
     app.add_api_route('/hardware/snapshot/collect', api.hardware_snapshot_collect, methods=['POST'])
@@ -291,7 +291,7 @@ def test_independent_latch_refusal_is_preserved_in_ready_catalog(installed, host
 
 
 @pytest.mark.parametrize('complete', [False, True])
-def test_v2_ui_explicit_collection_to_deck_move_and_expiry(installed, monkeypatch, complete):
+def test_v2_ui_explicit_collection_to_deck_move_and_expiry(installed, monkeypatch, complete, request):
     app, provider, runtime, *_ = installed
     collected = []
     def collect(requested, collectors):
@@ -303,6 +303,8 @@ def test_v2_ui_explicit_collection_to_deck_move_and_expiry(installed, monkeypatc
         provider.publish_tip_tray_transition(tray_id=0, transition='construct', operation_id='ui-fixture',
             command_id='ui-fixture', provenance={'source': 'ClassTipTray..ctor', 'kind': 'host_semantic_default'})
     client = TestClient(app)
+    client.__enter__()
+    request.addfinalizer(lambda: client.__exit__(None, None, None))
     for _ in range(2):
         catalog = client.get('/operator/v2/control-catalog').json()
         refresh = next(row for row in catalog['actions'] if row['action_id'] == 'oem.deck.collect_authority')
@@ -314,7 +316,13 @@ def test_v2_ui_explicit_collection_to_deck_move_and_expiry(installed, monkeypatc
             'schema_version': 'bioxp.operator_action_request.v2', 'idempotency_key': f'ui-collect-{attempt}',
             'expected_ownership_generation': 7, 'expected_board_epoch_by_board': {}, 'inputs': {}})
         assert response.status_code == 200, response.text
-        assert response.json()['status'] == 'completed', response.json()
+        assert response.json()['status'] == 'queued', response.json()
+        terminal = response.json()
+        deadline = time.monotonic() + 2
+        while not terminal['terminal'] and time.monotonic() < deadline:
+            time.sleep(.01)
+            terminal = client.get(response.json()['status_path']).json()
+        assert terminal['status'] == 'completed', terminal
         assert collected[-1] == ['axes', 'latch']
         assert provider.primitives.calls == []
         current = action(app)

@@ -168,7 +168,11 @@ def make_app(tmp_path: Path, monkeypatch, *, pipette_status_provider=None):
         def ownership_projection(self):
             return {"ownership_epoch": self.ownership_epoch, "ownership": {"transport": "owned", "usb": "service", "router": "running", "CAN_READY": True}}
 
-        def project(self, domain):
+        def project(self, *domains, independent_domains=False):
+            rows = [self._project_domain(domain) for domain in domains]
+            return {**rows[0], "domains": {key: value for row in rows for key, value in row["domains"].items()}}
+
+        def _project_domain(self, domain):
             if domain == "power":
                 observation = {"safety_valid": True}
             elif domain == "latch":
@@ -964,9 +968,11 @@ def test_v2_strict_method_rechecks_board_epochs_before_dispatch(tmp_path, monkey
     assert all(call[0] != "move_xy" for call in calls)
 
 
-def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_path, monkeypatch):
+def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_path, monkeypatch, request):
     app, calls = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
+    client.__enter__()
+    request.addfinalizer(lambda: client.__exit__(None, None, None))
 
     catalog = client.get("/operator/v2/control-catalog").json()
     by_id = {row["action_id"]: row for row in catalog["actions"]}
@@ -989,6 +995,14 @@ def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_pa
         },
     )
     assert activation.status_code == 200, activation.text
+    assert activation.json()["status"] == "queued"
+    import time
+    deadline = time.monotonic() + 2
+    terminal = activation.json()
+    while not terminal["terminal"] and time.monotonic() < deadline:
+        time.sleep(.01)
+        terminal = client.get(activation.json()["status_path"]).json()
+    assert terminal["status"] == "completed", terminal
     assert calls == [("prepare_without_motion", None)]
 
     app.state.operator_test_maintenance.update({
@@ -1018,6 +1032,13 @@ def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_pa
         },
     )
     assert recovery.status_code == 200, recovery.text
+    assert recovery.json()["status"] == "queued"
+    deadline = time.monotonic() + 2
+    terminal = recovery.json()
+    while not terminal["terminal"] and time.monotonic() < deadline:
+        time.sleep(.01)
+        terminal = client.get(recovery.json()["status_path"]).json()
+    assert terminal["status"] == "completed", terminal
     assert calls[-1] == (
         "recover_motion_non_homing",
         {
@@ -1028,9 +1049,11 @@ def test_v2_catalog_and_dispatch_retain_exact_oem_activation_and_recovery(tmp_pa
     )
 
 
-def test_v2_failed_receipt_preserves_bounded_home_z_provider_detail(tmp_path, monkeypatch):
+def test_v2_failed_receipt_preserves_bounded_home_z_provider_detail(tmp_path, monkeypatch, request):
     app, _ = make_app(tmp_path, monkeypatch)
     client = TestClient(app)
+    client.__enter__()
+    request.addfinalizer(lambda: client.__exit__(None, None, None))
 
     async def rejected_home(*_args, **_kwargs):
         return 409, {
@@ -1090,9 +1113,13 @@ def test_v2_failed_receipt_preserves_bounded_home_z_provider_detail(tmp_path, mo
             "reference_state": "desynced",
         },
     }
-    assert response.json()["error"] == expected_error
+    assert response.json()["terminal"] is False
     command_id = response.json()["command_id"]
-    polled = client.get(f"/operator/v2/actions/receipts/{command_id}")
+    for _ in range(100):
+        polled = client.get(f"/operator/v2/actions/receipts/{command_id}")
+        if polled.json()["terminal"]:
+            break
+        time.sleep(.01)
     assert polled.status_code == 200, polled.text
     assert polled.json()["error"] == expected_error
 

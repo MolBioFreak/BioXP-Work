@@ -3896,6 +3896,8 @@ class OEMRuntimeStore:
         self._lock = self._audit_database.writer_lock
         self._db = self._audit_database.connection
         self._authority_write_depth = 0
+        self._projection_read_depth = 0
+        self._projection_verified_state = None
         # Volatile admission fence belongs to this authority owner, not its DB
         # writer lock. Software cancellation must never wait for SQLite.
         self._axis_interrupt_lock = threading.RLock()
@@ -4048,8 +4050,15 @@ class OEMRuntimeStore:
 
     def board4_authority_projection(self) -> dict[str, Any]:
         with self._lock:
+            board = self._board4_row_locked()
             axes = self._axis_rows_locked()
             for axis, row in axes.items():
+                if row.get("prepared_board_epoch") is not None and (
+                    board.get("state") != "active"
+                    or row["prepared_board_epoch"] != board.get("active_board_epoch")
+                ):
+                    # Never present an old persisted ready label as current.
+                    row.update(lifecycle_state="generation_stale", reference_state="generation_stale")
                 fence = self.axis_interrupt_snapshot(axis)
                 row["software_interrupt_epoch"] = fence["epoch"]
                 row["software_interrupt_active"] = fence["active"]
@@ -4057,7 +4066,7 @@ class OEMRuntimeStore:
                     row.update(lifecycle_state="reconciliation_required",
                                reference_state="reconciliation_required",
                                prepared_board_epoch=None)
-            return {"board": self._board4_row_locked(), "axes": axes}
+            return {"board": board, "axes": axes}
 
     def require_axis_reconciliation(
         self, axis: str, *, receipt_id: str, expected_interrupt_epoch: int | None = None,
@@ -4182,8 +4191,13 @@ class OEMRuntimeStore:
                         now,
                     ),
                 )
-                if invalidate_axes:
+                # Even an owned Z preparation must invalidate stale sibling Y/G
+                # authority after a physical board cycle. The Z owner's own
+                # preparation lifecycle remains governed by its existing flag.
+                if invalidate_axes or state != "active" or active_epoch != current["active_board_epoch"]:
                     for axis, row in self._axis_rows_locked().items():
+                        if not invalidate_axes and axis == "z":
+                            continue
                         has_authority = bool(
                             row.get("lifecycle_state") != "unprepared"
                             or row.get("reference_state") != "unreferenced"
@@ -4469,9 +4483,30 @@ class OEMRuntimeStore:
         if latest is not None:
             self._append_serial206_authority_snapshot_locked(json.loads(str(latest["state_json"])))
 
+    @contextmanager
+    def serial206_projection_scope(self):
+        """One verified receipt-set read per coherent provider projection.
+
+        This memo never survives the read scope. The shared coordinator excludes
+        concurrent runtime writers; a nested write invalidates it via SQLite's
+        change counter. No integrity check or admission lifetime is weakened.
+        """
+        with self._lock:
+            self._projection_read_depth += 1
+            try:
+                yield
+            finally:
+                self._projection_read_depth -= 1
+                if not self._projection_read_depth:
+                    self._projection_verified_state = None
+
     def read_oem_serial206_initialization_state(self) -> dict[str, Any] | None:
         """Read append-only serial-206 authority bound to the immutable receipt set."""
         with self._lock:
+            memo = self._projection_verified_state
+            revision = (self._db.total_changes, self._db.execute("PRAGMA data_version").fetchone()[0]) if self._projection_read_depth else None
+            if self._projection_read_depth and memo is not None and memo[0] == revision:
+                return json.loads(memo[1])
             selected = self._db.execute(
                 "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
@@ -4521,6 +4556,8 @@ class OEMRuntimeStore:
             if stored_receipt_set_json != receipt_set_json or str(selected["receipt_set_sha256"]) != receipt_set_sha256:
                 raise RuntimeError("serial-206 authority snapshot is not bound to the current immutable receipt set")
             payload = json.loads(state_json)
+            if self._projection_read_depth:
+                self._projection_verified_state = (revision, state_json)
         if not isinstance(payload, dict):
             raise ValueError("serial-206 initialization state must be an object")
         return payload

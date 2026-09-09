@@ -2808,6 +2808,26 @@ class RuntimeAuditDatabase:
             raise
 
     @serialized_runtime_write
+    def record_event_batch(self, events: list[dict[str, Any]]) -> list[str]:
+        """Commit bounded evidence, preserving every event and source sequence.
+
+        No accepted record is durable until the outer COMMIT succeeds. Never
+        retry an ambiguous commit; this is not a controller command queue.
+        """
+        if not events or len(events) > 128:
+            raise ValueError("runtime event batch must contain 1..128 records")
+        if self.connection.in_transaction:
+            raise RuntimeError("runtime event batch must own its transaction")
+        owns_transaction = self._begin_write()
+        try:
+            ids = [self.record_event(**event) for event in events]
+            self._commit_write(owns_transaction)
+            return ids
+        except Exception:
+            self._rollback_write(owns_transaction)
+            raise
+
+    @serialized_runtime_write
     def record_pressure_stream(
         self,
         *,

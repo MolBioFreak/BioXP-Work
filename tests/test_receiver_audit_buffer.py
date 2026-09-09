@@ -212,7 +212,15 @@ def test_bounds_include_inflight_and_overflow_is_durable_gap(root, bound):
 
 
 def test_write_failure_gap_without_false_commit_or_decode_change(root):
+    failed_batches = []
     class FailsIngress(RuntimeAuditDatabase):
+        def record_event_batch(self, events):
+            try:
+                return super().record_event_batch(events)
+            except Exception:
+                failed_batches.append(len(events))
+                raise
+
         def record_event(self, **kw):
             if kw['event_kind'] == 'ingress':
                 raise OSError(28, 'injected ENOSPC')
@@ -227,12 +235,15 @@ def test_write_failure_gap_without_false_commit_or_decode_change(root):
     finally:
         router.shutdown()
         s = audit.close(5)
-    assert s['write_failed_records'] == 1
-    assert s['committed_records'] == s['accepted_volatile'] - 1
+    # A failed outer transaction loses its entire batch, not only the row
+    # triggering ENOSPC. Account every affected record without a false commit.
+    assert sum(failed_batches) >= 1
+    assert s['write_failed_records'] == sum(failed_batches)
+    assert s['committed_records'] == s['accepted_volatile'] - sum(failed_batches)
     assert not s['clean_drain_committed'] and s['close_accounting_committed']
     assert not s['healthy']
     gaps = [p for k, p, _, _ in rows(root) if k == 'gap']
-    assert gaps[-1]['write_failed_or_commit_uncertain_records'] == 1
+    assert gaps[-1]['write_failed_or_commit_uncertain_records'] == sum(failed_batches)
     assert gaps[-1]['crash_lost_count'] is None
 
 
@@ -392,9 +403,9 @@ def test_oversized_record_and_late_offer_do_not_claim_durable_drain(root):
 
 def test_exception_after_real_commit_is_uncertain_not_retried(root):
     class AfterCommit(RuntimeAuditDatabase):
-        def record_event(self, **kw):
-            result = super().record_event(**kw)
-            if kw['event_kind'] == 'fixture':
+        def record_event_batch(self, events):
+            result = super().record_event_batch(events)
+            if any(event['event_kind'] == 'fixture' for event in events):
                 raise OSError('injected failure after COMMIT returned')
             return result
     audit = ReceiverAuditBuffer(root=root, database_factory=AfterCommit)

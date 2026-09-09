@@ -1964,6 +1964,25 @@ class OperatorReceiptStore:
             ).fetchone()
             return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
 
+    def history_keys(self) -> list[dict[str, Any]]:
+        """Select ordering metadata without hydrating every receipt/evidence.
+
+        Preserve key-presence semantics, including explicit null timestamps.
+        Archive ordering is not insertion ordering, so sequence-only LIMIT is
+        incorrect for imported history. Only the chosen page is hydrated.
+        """
+        with self.lock:
+            rows = self.connection.execute("""
+                SELECT command_id,sequence,
+                    CASE WHEN json_type(receipt_json,'$.accepted_at') IS NOT NULL
+                        THEN json_extract(receipt_json,'$.accepted_at')
+                    WHEN json_type(receipt_json,'$.queued_at') IS NOT NULL
+                        THEN json_extract(receipt_json,'$.queued_at')
+                    ELSE json_extract(receipt_json,'$.started_at') END AS accepted_at
+                FROM operator_commands
+            """).fetchall()
+            return [dict(row) for row in rows]
+
     def by_idempotency(self, key: str, *, include_evidence: bool = True) -> dict[str, Any] | None:
         with self.lock:
             row = self.connection.execute(
@@ -2118,6 +2137,22 @@ class OperatorHistoryReader:
                 "SELECT * FROM operator_plane_commands WHERE command_id=?", (str(command_id),)
             ).fetchone()
             return None if row is None else self._command_projection(row)
+
+    def history_keys(self) -> list[dict[str, Any]]:
+        with self.lock:
+            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
+                return []
+            columns = self._table_columns("serial206_movement_commands")
+            if columns is not None and not {"command_id", "sequence", "state", "state_version", "expected_board_epochs_json", "terminal_receipt_id"}.issubset(columns):
+                raise RuntimeError("unsupported legacy operator history schema: serial206_movement_commands")
+            sequence = "COALESCE(c.sequence,p.stream_sequence)" if columns is not None else "p.stream_sequence"
+            join = "LEFT JOIN serial206_movement_commands c ON c.command_id=p.command_id" if columns is not None else ""
+            rows = self.connection.execute(f"""
+                SELECT p.command_id,p.stream_sequence,p.queued_at AS accepted_at,
+                       {sequence} AS sequence
+                FROM operator_plane_commands p {join}
+            """).fetchall()
+            return [dict(row) for row in rows]
 
     def list_commands(
         self, *, limit: int = 100, before_sequence: int | None = None,

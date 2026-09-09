@@ -5105,6 +5105,16 @@ class Serial206OemInitializationProvider:
         json.dumps(state, allow_nan=False)
         return copy.deepcopy(state)
 
+    @contextmanager
+    def projection_scope(self):
+        # Preserve the existing provider -> runtime lock order. Mutation-priority
+        # admission remains with this lock; the memo is only for this read pass.
+        with self._lock:
+            scope = getattr(self.state_store, "serial206_projection_scope", None)
+            manager: Any = scope() if callable(scope) else nullcontext()
+            with manager:
+                yield
+
     def _load_state(self) -> dict[str, Any]:
         if self.state_store is not None and hasattr(self.state_store, "read_oem_serial206_initialization_state"):
             stored = self.state_store.read_oem_serial206_initialization_state()
@@ -5404,7 +5414,7 @@ class Serial206OemInitializationProvider:
             return None
         return receipt
 
-    def x_projection(self) -> dict[str, Any]:
+    def x_projection(self, *, observe_controller: bool = False) -> dict[str, Any]:
         with self._lock:
             try:
                 state = self._load_state()
@@ -5596,11 +5606,19 @@ class Serial206OemInitializationProvider:
                     },
                 })
                 reference = self.reference_store.snapshot(("x",)) if self.reference_store is not None else {"ok": False, "authority_untrusted": True}
-                live_status_fn = getattr(self.primitives, "x_terminal_status", None)
-                try:
-                    live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
-                except Exception as exc:
-                    live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
+                # A projection is not an explicit terminal observation. The
+                # command/observe paths still perform x_terminal_status and its
+                # full controller checks. Polling uses canonical snapshot
+                # telemetry without granting fresh terminal authority.
+                live_status = {"ok": False, "available": False,
+                               "authority": "passive_projection",
+                               "failure": "explicit_terminal_readback_required"}
+                if observe_controller:
+                    live_status_fn = getattr(self.primitives, "x_terminal_status", None)
+                    try:
+                        live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
+                    except Exception as exc:
+                        live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
                 source_profile_fn = getattr(self.primitives, "_x_profile", None)
                 source_profile = source_profile_fn() if callable(source_profile_fn) else {}
                 source_min_steps = source_profile.get("axis_min_steps") if isinstance(source_profile, Mapping) else None

@@ -387,6 +387,14 @@ def bind_serial206_oem_initialization_provider(
 
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
+    scope = getattr(provider, "projection_scope", None)
+    manager: Any = scope() if callable(scope) else nullcontext()
+    with manager:
+        return _serial206_oem_initialization_provider_status_snapshot()
+
+
+def _serial206_oem_initialization_provider_status_snapshot() -> dict[str, Any]:
+    provider = _serial206_oem_initialization_provider
     capabilities = provider.capability_status() if provider is not None else {
         "initialize_motors_live_available": False,
         "initialize_motion_live_available": False,
@@ -4848,7 +4856,7 @@ def _query_io_snapshot(tester: BioXpTester) -> dict[int, Any]:
     return {channel: _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"] for channel in (0, 1, 2, 3)}
 
 
-def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
+def _query_aux_snapshot(tester: BioXpTester, kind: str, *, before_query=None) -> dict[str, Any]:
     if kind == "thermal":
         banks = (tester.THERMAL_BANK_NEST, tester.THERMAL_BANK_LID)
         gp_params_by_bank = {
@@ -4860,6 +4868,8 @@ def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
         gp_params_by_bank = {bank: (4, 7, 8, 21) for bank in banks}
 
     def query(command: int, cmd_type: int, motor: int) -> dict[str, Any]:
+        if before_query is not None:
+            before_query()
         ack = tester.query_only_tmcl(
             tester.BOARD_THERMAL if kind == "thermal" else tester.BOARD_CHILLER,
             command,
@@ -4888,7 +4898,7 @@ def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
     return {"activation_attempted": False, "firmware": firmware, "temps": temperatures, "gp": gp, "alive": bool(firmware["ok"] or any(row["ok"] for row in temperatures.values()))}
 
 
-def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
+def _hardware_collectors(tester: BioXpTester, *, before_query=None) -> dict[str, Any]:
     axes_cache: dict[str, Any] | None = None
     io_cache: dict[int, Any] | None = None
 
@@ -4917,12 +4927,11 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
     def boards(_: CollectionContext) -> dict[int, Any]:
         rows = {}
         for board in tester.BOARDS:
-            if int(board) == int(tester.BOARD_THERMAL):
-                rows[int(board)] = _query_aux_snapshot(tester, "thermal")["firmware"]
-            elif int(board) == int(tester.BOARD_CHILLER):
-                rows[int(board)] = _query_aux_snapshot(tester, "chiller")["firmware"]
-            else:
-                rows[int(board)] = _query_motor(tester, int(board), 173, 0)
+            if before_query is not None:
+                before_query()
+            # Board presence requires the firmware query, not every auxiliary
+            # temperature/configuration read (which its own domain collects).
+            rows[int(board)] = _query_motor(tester, int(board), 173, 0)
         return rows
 
     def range_projection(context: CollectionContext) -> dict[str, Any]:
@@ -4994,8 +5003,8 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
         "interlock": interlock,
         "latch": latch,
         "gripper": gripper,
-        "thermal": lambda _: _query_aux_snapshot(tester, "thermal"),
-        "chiller": lambda _: _query_aux_snapshot(tester, "chiller"),
+        "thermal": lambda _: _query_aux_snapshot(tester, "thermal", before_query=before_query),
+        "chiller": lambda _: _query_aux_snapshot(tester, "chiller", before_query=before_query),
         "pipette": pipette,
         "camera": camera,
         "shadow_readback": shadow,
@@ -6443,7 +6452,7 @@ def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]
 
 @app.get("/status")
 async def get_status():
-    return _status_payload()
+    return await run_in_threadpool(_status_payload)
 
 
 def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
@@ -6473,19 +6482,36 @@ def _collect_and_publish_hardware_snapshot(
     requested: list[str],
     *,
     reason: str,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     tester = _get_tester()
+    def yield_requested():
+        active = getattr(app.state, "operator_normal_action_active", None)
+        return bool(automatic and callable(active) and active())
+    def before_query():
+        if yield_requested():
+            from .hardware_status import HardwareCollectionPreempted
+            raise HardwareCollectionPreempted("operator_action_pending")
     deck_requested = {"axes", "latch"}.issubset(requested)
     if deck_requested:
         provider = getattr(app.state, "oem_deck_provider", None)
         invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
         if callable(invalidate):
             invalidate(reason="explicit_hardware_collection_started")
-    result = hardware_state.collect(requested, _hardware_collectors(tester))
+    if automatic:
+        result = hardware_state.collect(requested, _hardware_collectors(tester, before_query=before_query),
+                                        yield_requested=yield_requested)
+    else:
+        result = hardware_state.collect(requested, _hardware_collectors(tester))
     # Only the existing explicit query collection path may warm deck readiness.
     # Never attach this to GET/status, and never turn a failed collection into
     # fresh authority. The source reader performs its own current-owner checks.
     deck_collect = getattr(app.state, "oem_deck_authority_collector", None)
+    if yield_requested():
+        # The base collector may already have atomically published. Do not
+        # deny that publication; only defer further deck-authority queries.
+        result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+        return result
     if deck_requested and result.get("ok") and callable(deck_collect):
         result["deck_authority"] = deck_collect()
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
@@ -6504,6 +6530,12 @@ def _collect_and_publish_hardware_snapshot(
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
+    automatic = (payload or {}).get("automatic", False)
+    if type(automatic) is not bool:
+        raise HTTPException(status_code=400, detail="automatic must be a boolean")
+    active = getattr(app.state, "operator_normal_action_active", None)
+    if automatic and (_tester_lock.locked() or (callable(active) and active())):
+        return {"ok": False, "published": False, "reason": "operator_action_pending"}
     requested = (payload or {}).get("domains") or list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS)
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
@@ -6513,6 +6545,7 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
             lambda: _collect_and_publish_hardware_snapshot(
                 requested,
                 reason="explicit_hardware_snapshot_collect",
+                automatic=automatic,
             ),
             timeout_s=max(30.0, 15.0 * float(len(requested))),
         )
@@ -7723,15 +7756,35 @@ def _execute_serial206_y_call(method_name: str, *args: Any, **kwargs: Any) -> di
             kwargs.setdefault("command_id", str(context["operator_command_id"]))
     provider = _require_serial206_y_provider()
     method = getattr(provider, method_name)
+    from .command_exchange_observer import current_exchange_owner
+    owner = current_exchange_owner()
+    prior_exchanges = {row.get("exchange_id") for row in owner.snapshot().get("transport_exchanges", [])} if owner is not None else set()
     try:
         result = method(*args, **kwargs)
     except Exception as exc:
+        exchanges = owner.snapshot().get("transport_exchanges", []) if owner is not None else []
+        moves = [row for row in exchanges
+                 if row.get("exchange_id") not in prior_exchanges
+                 and row.get("expected_board") == 4
+                 and row.get("expected_command") in {1, 2, 4}
+                 and row.get("write_attempted") is True]
+        # An exception cannot undo an acknowledged controller write. Unknown
+        # observer coverage stays unknown, never a fabricated no-motion claim.
+        evidence = getattr(exc, "motion_evidence", None)
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        ack = evidence.get("retry_ack") or evidence.get("ack") or {}
+        attempted = True if moves or evidence.get("command_sent") is True else None
         return {
             "ok": False,
             "schema": provider.schema,
             "axis": "y",
             "failure": f"{type(exc).__name__}: {exc}",
-            "physical_motion_commanded": False,
+            "physical_motion_commanded": attempted,
+            "controller_command_acknowledged": any(row.get("observed_status") == 100 for row in moves) or ack.get("status") == 100,
+            "source_call_completed": False,
+            "physical_effect_verified": False,
+            "source_failure_evidence": evidence or None,
+            "automatic_retry": False,
         }
     return dict(result) if isinstance(result, Mapping) else {
         "ok": False,
@@ -7840,7 +7893,7 @@ async def motion_oem_x_status():
     projection = getattr(provider, "x_projection", None)
     if not callable(projection):
         raise HTTPException(status_code=409, detail={"error": "serial206_x_authority_not_bound"})
-    return projection()
+    return await _run_blocking("Explicit X controller status", lambda: projection(observe_controller=True))
 
 
 
@@ -9407,7 +9460,7 @@ async def camera_mjpeg(request: Request):
 
 @app.get("/liquid/application/status")
 async def liquid_application_status():
-    return _pipette_application.status()
+    return await run_in_threadpool(_pipette_application.status)
 
 
 @app.post("/liquid/application/plan")

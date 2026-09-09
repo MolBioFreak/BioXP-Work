@@ -167,25 +167,39 @@ class ReceiverAuditBuffer:
                 with self._condition:
                     self._condition.wait_for(lambda: self._queue or self._closing
                         or (self._overflow, self._failed, self._rejected) != self._gap_committed)
-                    item = self._queue.popleft() if self._queue else None
-                    self._inflight_records = int(item is not None)
-                    self._inflight_bytes = item[2] if item is not None else 0
+                    batch = []
+                    batch_bytes = 0
+                    while self._queue and len(batch) < 128:
+                        size = self._queue[0][2]
+                        if batch and batch_bytes + size > 256 * 1024:
+                            break
+                        batch.append(self._queue.popleft())
+                        batch_bytes += size
+                    self._inflight_records = len(batch)
+                    self._inflight_bytes = batch_bytes
                     closing = self._closing
-                if item is not None:
-                    kind, encoded, size, sequence = item
+                if batch:
                     try:
-                        self._event(db, kind, json.loads(encoded), sequence)
+                        events = []
+                        for kind, encoded, size, sequence in batch:
+                            payload = json.loads(encoded)
+                            events.append(dict(command_id=None, pipette_operation_id=None,
+                                event_source=self.SOURCE, event_kind=kind,
+                                event_payload={"audit_session": self.session, **payload},
+                                source_sequence=sequence, reader_generation=payload.get("owner_generation"),
+                                semantic_validity="host_observation"))
+                        db.record_event_batch(events)
                     except Exception as exc:
                         with self._condition:
-                            self._failed += 1
+                            self._failed += len(batch)
                             self._error = repr(exc)[:512]
                     else:
                         with self._condition:
-                            self._committed += 1
+                            self._committed += len(batch)
                     finally:
                         with self._condition:
-                            self._records -= 1
-                            self._bytes -= size
+                            self._records -= len(batch)
+                            self._bytes -= batch_bytes
                             self._inflight_records = self._inflight_bytes = 0
                 # Gap failure terminates this writer rather than hot-looping or
                 # silently retrying ambiguous commits. No controller retry exists.

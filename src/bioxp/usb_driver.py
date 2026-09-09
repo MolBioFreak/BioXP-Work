@@ -60,6 +60,14 @@ class BioXpConstructionError(RuntimeError):
         self.cleanup_report = cleanup_report
 
 
+class OemMotionCompletionError(RuntimeError):
+    """The OEM wait failed after issue; retain evidence without retrying motion."""
+
+    def __init__(self, message, *, evidence):
+        super().__init__(message)
+        self.motion_evidence = dict(evidence)
+
+
 class BioXpTester:
     BOARD_HEAD = 0x04
     BOARD_DECK = 0x05
@@ -4177,11 +4185,13 @@ class BioXpTester:
                 )
                 if board_id != self.BOARD_HEAD or not reached_requested:
                     if board_id == self.BOARD_HEAD:
-                        raise RuntimeError(
-                            f"Reach GZ position time out! board={board_id}; axis={motor}; position={requested}"
+                        raise OemMotionCompletionError(
+                            f"Reach GZ position time out! board={board_id}; axis={motor}; position={requested}",
+                            evidence=result,
                         )
-                    raise RuntimeError(
-                        f"Reach position time out! board={board_id}; axis={motor}; position={requested}"
+                    raise OemMotionCompletionError(
+                        f"Reach position time out! board={board_id}; axis={motor}; position={requested}",
+                        evidence=result,
                     )
                 # ClassHeadBoard alone accepts timeout-at-target and returns
                 # the requested position. ClassDeckBoard still returns -1.
@@ -5980,13 +5990,18 @@ class BioXpTester:
         rehome_move = None
         deck_rehome_position = None
         if bool(rehome):
-            rehome_move = self.motor_oem_move_absolute(
-                board,
-                10000,
-                motor=motor,
-                wait_for_stop=True,
-                max_position=preset.get("axis_max_steps"),
-            )
+            try:
+                rehome_move = self.motor_oem_move_absolute(
+                    board,
+                    10000,
+                    motor=motor,
+                    wait_for_stop=True,
+                    max_position=preset.get("axis_max_steps"),
+                )
+            except OemMotionCompletionError as exc:
+                exc.motion_evidence.update(home_stage="preliminary_rehome_move",
+                                           homing_sweep_started=False)
+                raise
             if not isinstance(rehome_move, dict) or (rehome_move.get("ok") is not True
                     and not (key == "g" and type(rehome_move.get("source_return_code")) is int)):
                 return {

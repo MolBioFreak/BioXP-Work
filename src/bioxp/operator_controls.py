@@ -630,6 +630,20 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     action_id = str(action.get("action_id") or "")
+    if action_id == "oem.xy.move_absolute":
+        provider = machine_state.get("serial206_initialization_provider")
+        y_projection = provider.get("y_authority") if isinstance(provider, Mapping) else None
+        y = y_projection.get("authority") if isinstance(y_projection, Mapping) else None
+        board = y_projection.get("board_authority") if isinstance(y_projection, Mapping) else None
+        current_y = bool(isinstance(y, Mapping) and isinstance(board, Mapping)
+            and y.get("lifecycle_state") == "referenced_ready"
+            and y.get("ownership_generation") == machine_state.get("ownership_generation")
+            and board.get("state") == "active"
+            and type(y.get("prepared_board_epoch")) is int
+            and y.get("prepared_board_epoch") == board.get("active_board_epoch")
+            and y.get("pending_ticket") is None)
+        dependencies.append(_dependency("xy_y_authority_current", "Current Y board authority",
+            current_y, "Y reference/preparation is not current for board 4; reconcile Y before XY movement."))
     x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     y_provider_action = action_id.startswith("oem.y.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     method = str(action.get("informational_method") or "GET")
@@ -936,7 +950,18 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
         if provider_x_available
         else cached_x_axis
     )
+    if provider_x_available and x_live_status.get("available") is False:
+        x_axis = {
+            **dict(cached_x_axis or {"axis": "x"}),
+            "reference": x_lifecycle.get("reference_state") or "unknown",
+            "coordinate_contract": "serial206_x_machine_config_max_effective_min_60_relative_margin_20",
+            "min_steps": x_authority.get("source_min_steps"),
+            "max_steps": x_authority.get("source_max_steps"),
+            "telemetry_authority": "canonical_hardware_snapshot",
+            "physical_position_verified": False,
+        }
     x_provider = {
+        # Keep provider lifecycle authority separate from snapshot telemetry.
         **x_authority,
         "bound": provider_state.get("bound") is True,
         "physical_position_verified": False,
@@ -2281,7 +2306,14 @@ def install_operator_control_plane(
     async def polling_lifespan(application):
         try:
             async with previous_lifespan(application) as state:
-                yield state
+                try:
+                    yield state
+                finally:
+                    # Finish retained owners before the underlying lifespan
+                    # releases USB. HTTP disconnect never cancels their work.
+                    pending = [item[2] for item in direct_requests.values()]
+                    if pending:
+                        await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         finally:
             poll_cache.close()
             admission_state_reader.close()
@@ -2292,6 +2324,10 @@ def install_operator_control_plane(
     reconciliation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-reconcile")
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
+    # Retain one direct owner, not a new motion queue. Competing normal actions
+    # receive a prompt busy response; interrupts retain their separate lane.
+    direct_requests: dict[str, tuple[dict[str, Any], asyncio.Future, asyncio.Task]] = {}
+    app.state.operator_normal_action_active = lambda: bool(direct_requests) or invoke_lock.locked()
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
 
     def machine_state() -> dict[str, Any]:
@@ -2300,8 +2336,9 @@ def install_operator_control_plane(
         snapshot_id = None
         snapshot_ids: set[str] = set()
         freshness_rows: list[dict[str, Any]] = []
+        # One coherent observation, not eleven copies of the same snapshot.
+        projection = hardware_state.project(*domain_names, independent_domains=True)
         for name in domain_names:
-            projection = hardware_state.project(name)
             row = (projection.get("domains") or {}).get(name)
             domains[name] = row if isinstance(row, Mapping) else {"status": "unknown", "observation": None, "error": "not reported"}
             if projection.get("snapshot_id"):
@@ -2899,7 +2936,9 @@ def install_operator_control_plane(
             "completion_class": row.get("completion_class"),
             "physical_effect_verified": bool(row.get("physical_effect_verified") is True),
             "error": error,
-            "transport_exchanges": list(row.get("transport_exchanges") or []),
+            # Wire detail belongs to the explicit receipt-detail endpoint, not
+            # every dashboard/catalog refresh. Keep the existing field shape.
+            "transport_exchanges": [],
             "transport_retention_errors": list(row.get("transport_retention_errors") or []),
             "interrupt_evidence": row.get("interrupt_evidence"),
         }
@@ -2999,44 +3038,9 @@ def install_operator_control_plane(
         )
 
         async def collect(source: str) -> list[dict[str, Any]]:
-            selected: list[dict[str, Any]] = []
-            # Scan both retained stores before selecting identities or applying a
-            # cursor. Sequence ordering is not necessarily timestamp ordering.
-            before_sequence = None
-            seen_boundaries: set[int] = set()
-            while True:
-                if source == "direct":
-                    batch = await asyncio.to_thread(
-                        store.list, 200, before_sequence=before_sequence,
-                    )
-                else:
-                    batch = await asyncio.to_thread(
-                        legacy_command_store.list_commands,
-                        limit=200,
-                        before_sequence=before_sequence,
-                        exclude_command_ids=set(),
-                    )
-                if not batch:
-                    break
-                annotated = [
-                    {**dict(row), "__projection_source": source}
-                    for row in batch
-                ]
-                selected.extend(annotated)
-                sequences = [
-                    # Pagination belongs to the queried store, not the public
-                    # projection (which may carry a canonical receipt sequence).
-                    int(row.get("sequence" if source == "direct" else "stream_sequence") or 0)
-                    for row in batch
-                ]
-                next_before = min(sequences) if sequences else 0
-                if len(batch) < 200:
-                    break
-                if next_before <= 0 or next_before in seen_boundaries:
-                    raise RuntimeError("history_store_pagination_not_advancing")
-                seen_boundaries.add(next_before)
-                before_sequence = next_before
-            return selected
+            reader = store if source == "direct" else legacy_command_store
+            keys = await asyncio.to_thread(reader.history_keys)
+            return [{**row, "__projection_source": source} for row in keys]
 
         current_rows, durable_rows = await asyncio.gather(
             collect("direct"), collect("durable"),
@@ -3061,7 +3065,19 @@ def install_operator_control_plane(
             deduplicated = [row for row in deduplicated if _history_key(row) < boundary]
         if legacy_before is not None:
             deduplicated = [row for row in deduplicated if int(row.get("sequence") or row.get("stream_sequence") or 0) < legacy_before]
-        return deduplicated[:limit]
+        def hydrate_page() -> list[dict[str, Any]]:
+            page = []
+            for key in deduplicated[:limit]:
+                source = key["__projection_source"]
+                row = (store.by_command(key["command_id"], include_evidence=False)
+                       if source == "direct" else legacy_command_store.get_command(key["command_id"]))
+                if row is None:
+                    raise RuntimeError("history_receipt_disappeared_during_projection")
+                # Raw exchanges remain on the detail endpoint, never the poll.
+                row = {**row, "transport_exchanges": [], "__projection_source": source}
+                page.append(row)
+            return page
+        return await asyncio.to_thread(hydrate_page)
 
     @router.get("/v2/dashboard")
     @poll_cache.wrap
@@ -3098,6 +3114,60 @@ def install_operator_control_plane(
             })
         return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
 
+    async def retain_direct_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
+        binding = {"action_id": action_id, **payload.model_dump()}
+        key = payload.idempotency_key
+        # Recovery of a durable same-key receipt must work even while another
+        # command owns the lane. This read never submits or retries motion.
+        existing = await asyncio.to_thread(store.by_idempotency, key, include_evidence=False)
+        if existing is not None:
+            if (existing.get("action_id") != action_id
+                    or existing.get("requested_inputs", existing.get("inputs")) != payload.inputs
+                    or int(existing.get("ownership_generation", -1)) != payload.expected_generation):
+                raise HTTPException(409, detail="idempotency_key already bound to different action request")
+            verify_replay_source_identity(existing)
+            return existing
+        retained = direct_requests.get(key)
+        if retained is not None:
+            if retained[0] != binding:
+                raise HTTPException(409, detail="idempotency_key already bound to different action request")
+            return await asyncio.shield(retained[1])
+        if direct_requests or invoke_lock.locked():
+            raise HTTPException(409, detail={"error": "operator_action_busy",
+                "message": "A normal action is active; observe its receipt before submitting another.",
+                "physical_motion_commanded": False, "automatic_retry": False})
+        admitted = asyncio.get_running_loop().create_future()
+        # Observe late admission failures even if the HTTP waiter disconnects.
+        admitted.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+        async def run():
+            try:
+                result = await invoke_action(action_id, payload, _admitted=admitted)
+                if not admitted.done():
+                    admitted.set_result(result)
+            except BaseException as exc:
+                if not admitted.done():
+                    admitted.set_exception(exc)
+                else:
+                    # A post-admission owner failure is not safe to replay.
+                    # Existing terminal CAS rules protect a completed receipt.
+                    row = await asyncio.to_thread(store.by_command, admitted.result()["command_id"], include_evidence=False)
+                    if row is not None and row.get("status") in {"admission_pending", "queued", "dispatched"}:
+                        previous = str(row["status"])
+                        row.update(status="outcome_unknown", completion_ambiguous=True,
+                                   reconciliation_required=True, retry_forbidden=True,
+                                   finished_at=str(time.time()),
+                                   error=f"retained_action_owner_failed:{type(exc).__name__}")
+                        await asyncio.to_thread(store.put, row, _expected_status=previous)
+                raise
+            finally:
+                direct_requests.pop(key, None)
+
+        task = asyncio.create_task(run(), name=f"operator-retained:{action_id}")
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        direct_requests[key] = (binding, admitted, task)
+        return await asyncio.shield(admitted)
+
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
         if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all"}:
@@ -3109,7 +3179,7 @@ def install_operator_control_plane(
         if action_id == "oem.deck.move_to_location":
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
-            state = machine_state()
+            state = await admission_state_reader.read()
             assessment = deck_contract(state)
             if not assessment["enabled"]:
                 raise HTTPException(
@@ -3138,7 +3208,7 @@ def install_operator_control_plane(
                 idempotency_key=payload.idempotency_key,
                 inputs=dict(payload.inputs),
             )
-            direct_receipt = await invoke_action(action_id, direct_payload)
+            direct_receipt = await retain_direct_action(action_id, direct_payload)
             if str(direct_receipt.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
                 detailed_receipt = await asyncio.to_thread(
                     store.by_command,
@@ -3194,6 +3264,7 @@ def install_operator_control_plane(
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
+        compact["transport_exchanges"] = list(row.get("transport_exchanges") or [])
         raw_return_layers = dict(row.get("raw_return_layers") or {})
         if row.get("response") is not None:
             raw_return_layers["operator_response"] = _bounded_json(row["response"], _MAX_RESPONSE_BYTES)
@@ -3384,7 +3455,14 @@ def install_operator_control_plane(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/actions/{action_id}")
-    async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+    async def legacy_invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        # The cockpit still reaches canonical X through the v1 receipt envelope.
+        # It must not retain the old completion-blocking HTTP behavior.
+        if isinstance(payload, InvokeRequest) and action_id.startswith("oem.x.") and action_id not in INTERRUPT_ACTIONS:
+            return await retain_direct_action(action_id, payload)
+        return await invoke_action(action_id, payload)
+
+    async def invoke_action(action_id: str, payload: InvokeRequest | OperatorActionRequestV2 | OperatorInterruptRequestV1, *, _admitted: Any = None) -> dict[str, Any]:
         action = by_id.get(action_id)
         if action is None:
             raise HTTPException(status_code=404, detail="unknown operator action_id")
@@ -3636,6 +3714,7 @@ def install_operator_control_plane(
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
             receipt["queued_at"] = time.time()
+            queued = receipt
             if not is_safety_interrupt:
                 queued = await asyncio.to_thread(
                     store.put,
@@ -3644,6 +3723,10 @@ def install_operator_control_plane(
                 )
                 claim_expected_status = str(queued["status"])
             receipt["admission_completed_at"] = time.time()
+            if _admitted is not None and not _admitted.done():
+                # This is a committed admission, not physical completion. The
+                # retained owner continues under the existing action lock.
+                _admitted.set_result(queued)
             target = dispatch[action_id]
             wire_inputs = {
                 name: value
@@ -3684,6 +3767,13 @@ def install_operator_control_plane(
                 receipt["provider_entry_at"] = time.time()
                 receipt["status"] = "dispatched"
                 receipt["dispatched_at"] = receipt["provider_entry_at"]
+                if not is_safety_interrupt and _admitted is not None:
+                    # Durable dispatch intent precedes the controller call. A
+                    # disconnected waiter/restart never turns it into a retry.
+                    dispatched = await asyncio.to_thread(store.put, receipt, _expected_status=claim_expected_status)
+                    claim_expected_status = str(dispatched["status"])
+                    if claim_expected_status != "dispatched":
+                        return dispatched
                 if action_id == "meta.activate_motion":
                     # OEM preparation is one synchronous controller transaction.
                     # A disconnected caller must not abandon it after the durable
