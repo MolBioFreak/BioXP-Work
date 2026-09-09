@@ -2207,8 +2207,10 @@ class _OperatorPollCache:
                     # this is not an admission token. Interrupts remain visible.
                     if elapsed >= 15.0:
                         for action in result.get("actions", []):
-                            if action.get("interrupt") is not True and action.get("safety_class") != "stop":
+                            if action.get("interrupt") is not True and action.get("safety_class") != "stop" and action.get("enabled") is True:
                                 action.update(enabled=False, disabled_reason="cached_projection_stale")
+                                for option in action.get("destination_options", []):
+                                    option.update(enabled=False, disabled_reason="cached_projection_stale")
                     return result
                 # A different cold view must not queue behind a held provider.
                 # Retrying this metadata GET is safe; no action is submitted.

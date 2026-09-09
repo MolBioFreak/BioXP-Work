@@ -57,8 +57,11 @@ def test_cached_projection_ages_at_exact_boundary(monkeypatch):
 
     key = ('catalog', None)
     cache._cache[key] = ({'generated_at': 25.0,
-                          'actions': [{'enabled': True, 'interrupt': False},
-                                      {'enabled': True, 'interrupt': True}],
+                          'actions': [{'enabled': True, 'interrupt': False,
+                                       'destination_options': [{'enabled': True, 'disabled_reason': None}]},
+                                      {'enabled': True, 'interrupt': True},
+                                      {'enabled': False, 'disabled_reason': 'canonical_deck_authority_unavailable',
+                                       'destination_options': [{'enabled': False, 'disabled_reason': 'canonical_deck_authority_unavailable'}]}],
                           'snapshot': {'snapshot_id': 'device-observation', 'observed_at': 25.0,
                                        'freshness': {'state': 'fresh', 'age_s': 0.0, 'fresh_for_s': 15.0}}}, 100.0)
     async def run():
@@ -69,6 +72,9 @@ def test_cached_projection_ages_at_exact_boundary(monkeypatch):
         after = await catalog()
         assert after['actions'][0]['enabled'] is False
         assert after['actions'][1]['enabled'] is True
+        assert after['actions'][0]['destination_options'] == [{'enabled': False, 'disabled_reason': 'cached_projection_stale'}]
+        assert after['actions'][2]['disabled_reason'] == 'canonical_deck_authority_unavailable'
+        assert after['actions'][2]['destination_options'][0]['disabled_reason'] == after['actions'][2]['disabled_reason']
         assert after['snapshot']['freshness']['state'] == 'stale'
         assert after['snapshot']['observed_at'] == 25.0
         assert after['generated_at'] == 25.0
