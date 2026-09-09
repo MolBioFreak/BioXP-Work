@@ -1864,6 +1864,10 @@ class OperatorReceiptStore:
 
     def _row_receipt(self, row: sqlite3.Row, *, include_evidence: bool) -> dict[str, Any]:
         receipt = json.loads(row["receipt_json"])
+        # Historical receipt JSON can predate sequence publication. The SQL
+        # ordering key is authoritative for both projection and pagination.
+        receipt["sequence"] = int(row["sequence"])
+        receipt["command_id"] = str(row["command_id"])
         receipt["status"] = str(row["status"])
         receipt["controller_acknowledged"] = bool(row["controller_acknowledged"])
         receipt["physical_effect_verified"] = bool(row["physical_effect_verified"])

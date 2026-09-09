@@ -3022,7 +3022,9 @@ def install_operator_control_plane(
                 ]
                 selected.extend(annotated)
                 sequences = [
-                    int(row.get("sequence") or row.get("stream_sequence") or 0)
+                    # Pagination belongs to the queried store, not the public
+                    # projection (which may carry a canonical receipt sequence).
+                    int(row.get("sequence" if source == "direct" else "stream_sequence") or 0)
                     for row in batch
                 ]
                 next_before = min(sequences) if sequences else 0
