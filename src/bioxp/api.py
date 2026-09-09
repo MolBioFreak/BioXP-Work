@@ -889,6 +889,7 @@ async def lifespan(app: FastAPI):
     runtime_root = runtime_state_root()
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
+    migration_connection.row_factory = sqlite3.Row
     migration_authorized = False
     migration_connection.create_function("authority_write_allowed", 0, lambda: 1 if migration_authorized else 0)
     migration_connection.create_function(
