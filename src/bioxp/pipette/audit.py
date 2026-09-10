@@ -328,6 +328,38 @@ def _normal_exchange(row: Mapping[str, Any], result: Mapping[str, Any]) -> dict[
     }
 
 
+def normalize_pipette_command_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Only semantic channel outcomes; no exchange/sample normalization."""
+    from ..critical_logging import critical_receipt
+
+    if not isinstance(result, Mapping):
+        raise PipetteAuditIntegrityError("pipette result must be a mapping")
+    provenance = _mapping(result.get("provenance"))
+    channels = [
+        critical_receipt(_normal_channel(row, result))
+        for row in _channel_rows(result, provenance)
+        if row.get("channel") is not None
+    ]
+    for channel, value in _mapping(result.get("pressure_offset_evidence")).items():
+        evidence = _mapping(value)
+        valid = evidence.get("valid") is True
+        offset = evidence.get("offset")
+        if valid and type(offset) not in {int, float}:
+            raise PipetteAuditIntegrityError("valid pressure offset requires an exact number")
+        channels.append({
+            "channel": int(channel), "phase": "precondition",
+            "semantic_validity": "valid" if valid else "unknown",
+            "truth_source": "novo_router_pressure_epoch", "tip_loaded": None,
+            "pressure": float(offset) if valid and isinstance(offset, (float, int)) else None,
+            "pressure_units": evidence.get("units"),
+            "status": "measured" if valid else "missing_samples",
+            "error_code": None, "firmware_class": None,
+            "detail": {"valid": valid, "offset": offset},
+        })
+    return {"channels": channels, "exchanges": [], "events": [],
+            "pressure_samples": [], "pressure_chunks": [], "pressure_stream": {}}
+
+
 def normalize_pipette_result(result: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(result, Mapping):
         raise PipetteAuditIntegrityError("pipette result must be a mapping")

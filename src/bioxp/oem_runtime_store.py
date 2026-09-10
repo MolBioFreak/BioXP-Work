@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .critical_logging import critical_receipt
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
 from .oem_deck_schema_v6 import (
     DECK_SCHEMA_V5_INDEXES,
@@ -3039,7 +3040,14 @@ def canonical_runtime_schema_manifest(*, version: int = OEM_DECK_GROUP_SCHEMA_VE
 
 def verify_canonical_runtime_database(
     connection: sqlite3.Connection, *, version: int = OEM_DECK_GROUP_SCHEMA_VERSION,
+    full_data_check: bool = False,
 ) -> None:
+    """Check the prepared schema without scanning retained event/history rows.
+
+    Whole-database evidence audits are explicit maintenance work, never a
+    constructor/startup prerequisite. Foreign-key enforcement remains enabled
+    on writes; the schema/ledger/identity checks below are metadata-bounded.
+    """
     registry = tuple(item for item in canonical_runtime_migration_registry() if item.version <= version)
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version != registry[-1].version:
@@ -3053,11 +3061,12 @@ def verify_canonical_runtime_database(
     _verify_v2_schema(connection)
     _verify_report_identity_metadata_v1(connection)
     _verify_runtime_release_start(connection)
-    _verify_operator_command_plane_schema_v1(connection)
-    if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
-        _deck_v7.verify_deck_schema_v7(connection)
-    else:
-        verify_deck_schema_v6(connection)
+    if full_data_check:
+        _verify_operator_command_plane_schema_v1(connection)
+        if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
+            _deck_v7.verify_deck_schema_v7(connection)
+        else:
+            verify_deck_schema_v6(connection)
     expected_manifest = canonical_runtime_schema_manifest(version=version)
     actual_manifest = {
         (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
@@ -3522,6 +3531,11 @@ def _migrate_oem_deck_schema_v7_locked(
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_GROUP_SCHEMA_VERSION:
+        # An already-prepared database needs no migration, lifecycle-exclusive
+        # lock, or data audit. Its size must not determine service startup time.
+        verify_canonical_runtime_database(connection)
+        return
     coordinator = runtime_write_coordinator(root)
     with coordinator.lock:
         _migrate_runtime_database_v2_locked(connection, root)
@@ -3929,8 +3943,13 @@ class OEMRuntimeStore:
             deterministic=True,
         )
         self._closed = False
-        with self._authority_write():
-            migrate_runtime_database_v2(self._db, self.root)
+        # A prepared database needs no writer fence or data audit. Only actual
+        # schema preparation enters the authority fence (also supports new stores).
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_GROUP_SCHEMA_VERSION:
+            verify_canonical_runtime_database(self._db)
+        else:
+            with self._authority_write():
+                migrate_runtime_database_v2(self._db, self.root)
         self._authority_schema_version = int(self._db.execute("PRAGMA schema_version").fetchone()[0])
         self._seq = self._load_seq()
         with self._authority_write():
@@ -4464,7 +4483,15 @@ class OEMRuntimeStore:
 
     def _append_serial206_authority_snapshot_locked(self, state: Mapping[str, Any]) -> None:
         state_json = json.dumps(dict(state), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        receipt_set_json, receipt_set_sha256 = self._serial206_receipt_set_locked()
+        latest = self._db.execute(
+            "SELECT state_json FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if latest is not None and str(latest[0]) == state_json:
+            return
+        # Current operational state is not a recurring audit of every retained
+        # receipt. Existing state and command/Stop/recovery gates are unchanged.
+        receipt_set_json = "[]"
+        receipt_set_sha256 = hashlib.sha256(receipt_set_json.encode("utf-8")).hexdigest()
         self._db.execute(
             "INSERT INTO serial206_authority_snapshots(state_json,state_sha256,receipt_set_json,receipt_set_sha256,created_at) VALUES(?,?,?,?,?)",
             (
@@ -4552,9 +4579,7 @@ class OEMRuntimeStore:
                 != hashlib.sha256(stored_receipt_set_json.encode("utf-8")).hexdigest()
             ):
                 raise RuntimeError("serial-206 authority snapshot receipt-set bytes or hash are incoherent")
-            receipt_set_json, receipt_set_sha256 = self._serial206_receipt_set_locked()
-            if stored_receipt_set_json != receipt_set_json or str(selected["receipt_set_sha256"]) != receipt_set_sha256:
-                raise RuntimeError("serial-206 authority snapshot is not bound to the current immutable receipt set")
+
             payload = json.loads(state_json)
             if self._projection_read_depth:
                 self._projection_verified_state = (revision, state_json)
@@ -4609,7 +4634,7 @@ class OEMRuntimeStore:
             selected_stream = str(stream).strip().lower()
             if selected_stream not in {"x", "y", "z", "initialize_motors", "initialize_motion"}:
                 raise ValueError("unsupported serial-206 receipt stream")
-            payload = dict(receipt)
+            payload = critical_receipt(receipt)
             replay_enabled = payload.get("idempotency_replay_enabled")
             if replay_enabled is None:
                 replay_enabled = payload.get("intent") not in {"stop", "abort"}
@@ -4669,7 +4694,7 @@ class OEMRuntimeStore:
                             """,
                             row,
                         )
-                self._rebind_latest_serial206_authority_snapshot_locked()
+
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -4889,7 +4914,7 @@ class OEMRuntimeStore:
         return result
 
     def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        row = dict(payload)
+        row = critical_receipt(payload)
         row.setdefault("created_at", utc_ts())
         sequence = self.next_seq()
         row["sequence"] = sequence

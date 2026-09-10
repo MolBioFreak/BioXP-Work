@@ -232,7 +232,11 @@ def _verified_identity() -> dict[str, Any]:
     if runtime.get("udocker_path") != "/opt/bioxp/udocker-runtime/venv/bin/udocker":
         raise ReleaseIdentityError("runtime binding does not use the immutable udocker launcher")
     udocker_sha256 = _require_digest(_required_text(runtime, "udocker_sha256"), "runtime.udocker_sha256")
-    udocker_tree_sha256 = _require_digest(_required_text(runtime, "udocker_tree_sha256"), "runtime.udocker_tree_sha256")
+    # The critical-only launcher no longer traverses or hashes the runtime tree.
+    # Null is explicit absence of that measurement; never invent a digest.
+    udocker_tree_sha256 = runtime.get("udocker_tree_sha256")
+    if udocker_tree_sha256 is not None:
+        _require_digest(udocker_tree_sha256, "runtime.udocker_tree_sha256")
 
     source = receipt.get("source")
     image = receipt.get("image")

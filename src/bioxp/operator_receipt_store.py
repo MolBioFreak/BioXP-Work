@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .critical_logging import critical_receipt
 from .runtime_audit_store import (
     RUNTIME_LIFECYCLE_LOCK_NAME,
     RuntimeAuditDatabase,
@@ -854,8 +855,7 @@ class OperatorReceiptStore:
                 )
         elif expected_status is not None:
             raise RuntimeError("operator receipt expected state has no matching claim")
-        if previous is not None:
-            self._merge_transport_evidence(compact, json.loads(previous["receipt_json"]))
+
         relpath, digest, size = evidence
         if relpath is None and previous is not None:
             existing = self.connection.execute(
@@ -1325,7 +1325,7 @@ class OperatorReceiptStore:
         reason: str,
     ) -> dict[str, Any]:
         """Fsync one safety receipt without waiting for SQLite."""
-        row = dict(receipt)
+        row = critical_receipt(receipt)
         if isinstance(row.get("interrupt_evidence"), Mapping):
             row["interrupt_evidence"] = {**row["interrupt_evidence"], "persistence_state": "recovery_required"}
         row["persistence_fallback"] = {
@@ -1483,7 +1483,7 @@ class OperatorReceiptStore:
         Recovery-file locking/fsync still take time. This is post-delivery
         retention, not a pre-delivery admission or hard-real-time primitive.
         """
-        receipt = dict(receipt)
+        receipt = dict(critical_receipt(receipt))
         if isinstance(receipt.get("interrupt_evidence"), Mapping):
             receipt["interrupt_evidence"] = {**receipt["interrupt_evidence"], "persistence_state": "committed"}
         if not self.lock.acquire(blocking=False):
@@ -1507,7 +1507,7 @@ class OperatorReceiptStore:
             artifact_id = None
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
-                evidence = self._persist_evidence(receipt)
+                evidence = (None, None, None)
                 previous = self.connection.execute(
                     "SELECT evidence_relpath FROM operator_commands WHERE command_id=?",
                     (str(receipt.get("command_id") or ""),),
@@ -1706,11 +1706,13 @@ class OperatorReceiptStore:
         _reconciliation_transition: bool = False,
         _linked_pipette_finalization: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        row = dict(receipt)
+        row = critical_receipt(receipt)
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                evidence = self._persist_evidence(row) if row.get("status") in TERMINAL_STATES else (None, None, None)
+                # Retained legacy artifacts remain readable. New commands do
+                # not write a second, full-response diagnostic evidence file.
+                evidence = (None, None, None)
                 artifact_id = None
                 previous = self.connection.execute(
                     "SELECT evidence_relpath FROM operator_commands WHERE command_id=?",

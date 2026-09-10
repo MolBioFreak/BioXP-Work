@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from .command_exchange_observer import publish_exchange, record_retention_failure
+
 
 
 PIPETTE_FUNCTIONS = (0, 1, 3, 4, 6)
@@ -168,6 +168,8 @@ class NovoRouter:
     def _audit(self, kind: str, payload: dict[str, Any]) -> None:
         # Separate from decoding and routing: logging cannot classify a valid
         # frame as malformed or interfere with a Stop response/pending waiter.
+        if kind != "reader_error":
+            return
         if self._audit_buffer is not None:
             try:
                 self._audit_buffer.offer(kind, {"receive_owner": self._receive_owner,
@@ -190,10 +192,8 @@ class NovoRouter:
             signals = getattr(self, "_motor_abort_signals", None)
             if signals is None:
                 signals = self._motor_abort_signals = set()
-            coalesced = key in signals or key in self._motor_signals
+
             signals.add(key)
-            self._audit("motor_abort_set", {"board": key[0], "motor": key[1],
-                "coalesced": coalesced, "physical_effect_verified": False})
 
     def reset_motor_event(self, board: int, motor: int, *, reset: bool = True, initial_signals=None) -> None:
         """ClassMotor.queryMotorStop: Reset only after a nonnull return."""
@@ -205,8 +205,6 @@ class NovoRouter:
                     initial_signals.discard(key)
                 self._motor_signals.pop(key, None)
                 self._motor_resets[key] = (self._reader_generation, self._receive_sequence)
-                self._audit("motor_reset", {"board": key[0], "motor": key[1],
-                    "receive_sequence": self._receive_sequence})
             elif self._motor_resets.get(key, (None,))[0] != self._reader_generation:
                 # A null query does not reset, including in a shared XY window.
                 self._motor_resets[key] = (self._reader_generation, -1)
@@ -253,8 +251,6 @@ class NovoRouter:
                     initial_signals.discard(key)
                 self._motor_signals.pop(key, None)
                 self._motor_consumed[key] = (self._reader_generation, self._receive_sequence)
-                self._audit("motor_consume", {"board": key[0], "motor": key[1],
-                    "receive_sequence": self._receive_sequence})
             return frames
 
     def motor_event_disposition(self, frame: NovoFrame) -> str:
@@ -291,7 +287,6 @@ class NovoRouter:
             name=f"bioxp-novo-router-{self._reader_generation}",
             daemon=True,
         )
-        self._audit("reader_started", {"receive_sequence": self._receive_sequence})
         self._reader.start()
 
     def shutdown(self, *, join_timeout_s: float = 2.0) -> None:
@@ -302,7 +297,6 @@ class NovoRouter:
             if reader.is_alive():
                 raise NovoRouterError("Novo reader did not stop before USB release")
         self._reader = None
-        self._audit("reader_stopped", {"receive_sequence": self._receive_sequence})
         # Any waiter or completion registered under the previous reader owner is
         # stale after shutdown/rebind, even if a late USB frame arrives.
         self._reader_generation += 1
@@ -371,7 +365,6 @@ class NovoRouter:
                 self._queues["malformed"].append(row)
                 self._diagnostics.append(row)
                 self._record_skipped(row)
-                self._audit("malformed", row)
                 continue
             self._dispatch(frame)
 
@@ -398,7 +391,6 @@ class NovoRouter:
                     and frame.owner_generation == self._reader_generation else "previous_receive_owner"})
                 return
         matched = False
-        self._audit("ingress", frame.provenance())
         with self._pending_lock:
             pending = self._pending
             if pending is not None:
@@ -447,9 +439,8 @@ class NovoRouter:
             if key is not None:
                 if key in self._motor_signals and self._motor_signals[key].owner_generation == self._reader_generation:
                     self._diagnostics.append({**frame.provenance(), "classification": "motor_coalesced_set"})
-                    self._audit("motor_coalesced_set", frame.provenance())
                 else:
-                    self._audit("motor_set", frame.provenance())
+                    pass  # Routine transport logging retired.
                 self._motor_signals[key] = frame
 
         completion_matched = False
@@ -492,8 +483,7 @@ class NovoRouter:
             queue_name = "unknown"
         queue = self._queues[queue_name]
         if len(queue) == queue.maxlen:
-            self._audit("routing_queue_eviction", {"queue": queue_name,
-                "receive_sequence": frame.receive_sequence})
+            pass  # Routine transport logging retired.
         queue.append(frame)
 
     def _bind_completion_owner_from_provenance(
@@ -647,60 +637,6 @@ class NovoRouter:
                 "skipped_frames_truncated": pending.skipped_total > len(pending.skipped),
             }
 
-    def _retain_tmcl_exchange(
-        self,
-        base: dict[str, Any],
-        *,
-        wait_signaled: bool | None,
-        outcome: str | None,
-        observed: NovoFrame | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        """Finalize bounded evidence before driver None conversion or rethrow.
-
-        Deliberately TMCL-only in this slice: pipette/CANopen and transact_many
-        retain their existing policies. This observer does not authorize retries.
-        """
-        if base.get("command_family") != "tmcl":
-            return
-        try:
-            status = observed.data[1] if observed is not None and len(observed.data) == 8 else None
-            retained_outcome = outcome
-            if error is not None:
-                retained_outcome = "write_exception"
-            elif wait_signaled and observed is None and outcome not in {"shutdown", "transport_rebound"}:
-                retained_outcome = "signaled_empty"
-            elif wait_signaled and status is not None and outcome not in {"shutdown", "transport_rebound"}:
-                retained_outcome = "response" if status == 100 else "status_error"
-            publish_exchange({
-                "exchange_id": base["transaction_id"] + ":" + str(base.get("attempt_ordinal", 1)),
-                "transaction_id": base["transaction_id"],
-                "attempt_ordinal": base.get("attempt_ordinal", 1),
-                "response_attempt_attribution": base.get("response_attempt_attribution", "single_write"),
-                **{key: base.get(key) for key in (
-                    "owner_generation", "matcher", "registration_timestamp",
-                    "tx_timestamp", "tx_write_completed_at", "timeout_ms",
-                    "tx_raw", "command_family", "tx_id", "tx_dlc",
-                    "expected_board", "expected_command",
-                )},
-                "write_attempted": True,
-                "write_returned": error is None,
-                "wait_signaled": wait_signaled,
-                "response_present": observed is not None,
-                "observed_status": status,
-                "observed_rx_raw": list(observed.raw) if observed is not None else None,
-                "observed_rx_id": observed.arbitration_id if observed is not None else None,
-                "observed_rx_dlc": observed.dlc if observed is not None else None,
-                "receive_timestamp": observed.received_at if observed is not None else None,
-                "receive_sequence": observed.receive_sequence if observed is not None else None,
-                "outcome": retained_outcome,
-                "router_outcome": outcome,
-                "exception": {"class": type(error).__name__, "message": str(error)[:512]} if error is not None else None,
-                "finalized_at": self._clock(),
-                "physical_effect_verified": False,
-            })
-        except Exception as exc:
-            record_retention_failure("router_finalize", exc)
 
     def transact(
         self,
@@ -787,13 +723,10 @@ class NovoRouter:
                     with self._pending_lock:
                         if self._pending is pending:
                             self._pending = None
-                    self._retain_tmcl_exchange(attempt, wait_signaled=None,
-                                               outcome="write_exception", error=exc)
                     raise
                 if ordinal == 1:
                     base["tx_write_completed_at"] = attempt["tx_write_completed_at"]
                 if pending is None:
-                    self._retain_tmcl_exchange(attempt, wait_signaled=None, outcome="tx_only")
                     return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
                 completed = pending.event.wait(max(0.0, float(timeout_s)))
                 with self._pending_lock:
@@ -821,8 +754,6 @@ class NovoRouter:
                     "receive_sequence": observed.receive_sequence if observed is not None else None,
                     "response_attempt_attribution": attempt["response_attempt_attribution"],
                 })
-                self._retain_tmcl_exchange(attempt, wait_signaled=completed,
-                                           outcome=outcome, observed=observed)
                 if completed or outcome in {"shutdown", "transport_rebound"}:
                     break
             with self._pending_lock:

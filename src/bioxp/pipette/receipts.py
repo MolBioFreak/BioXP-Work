@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..critical_logging import critical_receipt
 from ..hardware_status import hardware_state
 from ..oem_full_lifecycle import current_authority_identity, current_registry_sha256
 from ..runtime_audit_store import (
@@ -23,7 +24,7 @@ from ..runtime_audit_store import (
 )
 from ..release_identity import current_release_identity
 from ..storage_operations import create_backup_unit, verify_backup_unit
-from .audit import PipetteAuditIntegrityError, normalize_pipette_result
+from .audit import PipetteAuditIntegrityError, normalize_pipette_result, normalize_pipette_command_outcome
 
 
 _LINKED_FINALIZATION_KEY = "_bioxp_linked_pipette_finalization"
@@ -381,7 +382,7 @@ class PipetteReceiptStore:
             "operation": str(operation),
             "requested_inputs": _redact(dict(requested_inputs or {})),
             "effective_inputs": _redact(dict(effective_inputs or {})),
-            "result": _redact(dict(result)),
+            "result": critical_receipt(_redact(dict(result))),
             "truth": self._truth(result),
             "runtime_binding": _redact(dict(runtime_binding or {"owner": "pipette_receipt_store"})),
             "ownership_epoch": int(getattr(hardware_state, "ownership_epoch", 0)),
@@ -417,7 +418,7 @@ class PipetteReceiptStore:
                 else str(result.get("error") or result.get("code") or "pipette_operation_failed")
             )
             try:
-                normalized_result = normalize_pipette_result(result)
+                normalized_result = normalize_pipette_command_outcome(result)
                 linked_finalization = self._linked_finalization(
                     command_id=str(command_id),
                     pipette_operation_id=str(pipette_operation_id),
@@ -515,7 +516,7 @@ class PipetteReceiptStore:
         normalized: Mapping[str, Any] | None = None,
     ) -> dict[str, list[str]]:
         normalized_result = (
-            dict(normalized) if normalized is not None else normalize_pipette_result(result)
+            dict(normalized) if normalized is not None else normalize_pipette_command_outcome(result)
         )
         return self._audit_database.persist_normalized_pipette_result(
             command_id=str(command_id),
@@ -550,7 +551,7 @@ class PipetteReceiptStore:
             "physical_effect_verified": False,
         }
         try:
-            normalized_result = normalize_pipette_result(result)
+            normalized_result = normalize_pipette_command_outcome(result)
             if self._is_linked_operator_claim(
                 command_id=str(command_id),
                 pipette_operation_id=str(pipette_operation_id),

@@ -16,6 +16,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, cast
 
+from .critical_logging import critical_receipt
+
 
 CANONICAL_RUNTIME_ROOT = Path("/var/lib/bioxp-oem-runtime")
 RUNTIME_ROOT_ENV_NAMES = (
@@ -1965,7 +1967,9 @@ class RuntimeAuditDatabase:
         ):
             raise ValueError("expected protected state is reserved for reconcile_claim")
         now = time.time()
-        bounded_result = canonical_json(dict(result))
+        bounded_result = canonical_json(critical_receipt(result))
+        if receipt_json is not None:
+            receipt_json = canonical_json(critical_receipt(json.loads(receipt_json)))
         effective_json = canonical_json(dict(effective_inputs or {}))
         flags = {
             "delivery_verified": self._truth_flag(result, "delivery_verified"),
@@ -2195,151 +2199,25 @@ class RuntimeAuditDatabase:
         result: Mapping[str, Any],
         normalized: Mapping[str, Any],
     ) -> dict[str, list[str]]:
-        """Append normalized pipette evidence inside an owned write transaction."""
+        """Retain channel outcomes, not wire exchanges or sampled telemetry."""
         if not self.connection.in_transaction:
             raise RuntimeAuditStoreError(
-                "normalized pipette evidence requires an active finalization transaction"
+                "channel outcomes require an active finalization transaction"
             )
-        observation_ids: list[str] = []
-        exchange_ids: list[str] = []
-        event_ids: list[str] = []
-        for row in normalized.get("channels") or ():
-            observation_ids.append(
-                self.record_channel_observation(
-                    command_id=str(command_id),
-                    pipette_operation_id=str(pipette_operation_id),
-                    **dict(row),
-                )
-            )
-        for row in normalized.get("exchanges") or ():
-            exchange_ids.append(
-                self.record_transport_exchange(
-                    command_id=str(command_id),
-                    pipette_operation_id=str(pipette_operation_id),
-                    **dict(row),
-                )
-            )
-        for row in normalized.get("events") or ():
-            event_ids.append(
-                self.record_event(
-                    command_id=str(command_id),
-                    pipette_operation_id=str(pipette_operation_id),
-                    **dict(row),
-                )
-            )
-        pressure_samples = [dict(row) for row in normalized.get("pressure_samples") or ()]
-        pressure_chunks = [dict(row) for row in normalized.get("pressure_chunks") or ()]
-        pressure_stream = dict(normalized.get("pressure_stream") or {})
-        pressure_stream_ids: list[str] = []
-        pressure_chunk_ids: list[str] = []
-        if pressure_samples or pressure_chunks or pressure_stream:
-            if any(type(sample.get("channel")) is not int for sample in pressure_samples):
-                raise RuntimeAuditStoreError("pressure sample channel attribution is required")
-            if any(type(chunk.get("channel")) is not int for chunk in pressure_chunks):
-                raise RuntimeAuditStoreError("pressure chunk channel attribution is required")
-            observed_channels = sorted(
-                {
-                    *[int(sample["channel"]) for sample in pressure_samples],
-                    *[int(chunk["channel"]) for chunk in pressure_chunks],
-                }
-            )
-            selected_channels = pressure_stream.get("selected_channels")
-            if selected_channels is not None:
-                if not isinstance(selected_channels, list) or any(type(channel) is not int for channel in selected_channels):
-                    raise RuntimeAuditStoreError("pressure stream selected channels are malformed")
-                channels = sorted(set(int(channel) for channel in selected_channels))
-            else:
-                channels = observed_channels
-            if not channels:
-                channels = sorted(
-                    {
-                        int(row["channel"])
-                        for row in normalized.get("channels") or ()
-                        if row.get("truth_source") == "novo_router_pressure_epoch"
-                    }
-                )
-            stream_id = self.record_pressure_stream(
+        observation_ids = [
+            self.record_channel_observation(
                 command_id=str(command_id),
                 pipette_operation_id=str(pipette_operation_id),
-                channels=channels,
-                sample_period_ms=pressure_stream.get("sample_period_ms", result.get("sample_period_ms")),
-                source_generation=pressure_stream.get(
-                    "source_generation",
-                    result.get("source_generation", result.get("reader_generation", 0)),
-                ),
-                reader_generation=pressure_stream.get("reader_generation", result.get("reader_generation")),
-                offset_identity=pressure_stream.get("offset_identity", result.get("offset_identity")),
+                **dict(row),
             )
-            pressure_stream_ids.append(stream_id)
-            materialized_chunks = pressure_chunks or [
-                {
-                    "channel": channel,
-                    "chunk_sequence": 0,
-                    "samples": [
-                        {
-                            **sample,
-                            "raw_pressure": sample.get("raw_pressure", sample.get("value")),
-                            "corrected_pressure": sample.get("corrected_pressure", sample.get("value")),
-                            "controller_timestamp": sample.get(
-                                "controller_timestamp", sample.get("controller_time")
-                            ),
-                        }
-                        for sample in pressure_samples
-                        if int(sample["channel"]) == channel
-                    ],
-                }
-                for channel in channels
-            ]
-            for chunk in materialized_chunks:
-                chunk_samples = [dict(sample) for sample in chunk.get("samples") or ()]
-                if not chunk_samples:
-                    continue
-                sample_units = next(
-                    (
-                        sample.get("units")
-                        for sample in chunk_samples
-                        if isinstance(sample.get("units"), str) and sample.get("units")
-                    ),
-                    None,
-                )
-                units = chunk.get(
-                    "units",
-                    pressure_stream.get("units", result.get("pressure_units", sample_units)),
-                )
-                if not isinstance(units, str) or not units.strip():
-                    raise RuntimeAuditStoreError("pressure chunk units are required")
-                pressure_chunk_ids.append(
-                    self.record_pressure_chunk(
-                        stream_session_id=stream_id,
-                        channel=int(chunk["channel"]),
-                        chunk_sequence=int(chunk.get("chunk_sequence", 0)),
-                        samples=chunk_samples,
-                        units=units,
-                        offset_identity=chunk.get(
-                            "offset_identity",
-                            pressure_stream.get("offset_identity", result.get("offset_identity")),
-                        ),
-                        chunk_schema=str(chunk.get("chunk_schema") or "bioxp.pipette.pressure.chunk.v1"),
-                        lost_sample_count=int(chunk.get("lost_sample_count", 0)),
-                        evidence_artifact_id=chunk.get("evidence_artifact_id"),
-                    )
-                )
-            terminal_state = str(pressure_stream.get("terminal_state") or "outcome_unknown")
-            self.connection.execute(
-                "UPDATE pipette_pressure_streams SET stopped_at=?,terminal_state=?,loss_count=? WHERE stream_session_id=?",
-                (
-                    time.time() if terminal_state == "stopped" else None,
-                    terminal_state,
-                    sum(int(chunk.get("lost_sample_count", 0)) for chunk in materialized_chunks),
-                    stream_id,
-                ),
-            )
+            for row in normalized.get("channels") or ()
+        ]
         return {
             "observation_ids": observation_ids,
-            "exchange_ids": exchange_ids,
-            "event_ids": event_ids,
-            "pressure_stream_ids": pressure_stream_ids,
-            "pressure_chunk_ids": pressure_chunk_ids,
+            "exchange_ids": [],
+            "event_ids": [],
+            "pressure_stream_ids": [],
+            "pressure_chunk_ids": [],
         }
 
     @serialized_runtime_write
@@ -3091,7 +2969,7 @@ def record_runtime_release_start(
         "image_inspection_receipt_sha256": str(image["inspection_receipt_sha256"]),
         "udocker_path": str(binding["udocker_path"]),
         "udocker_sha256": str(binding["udocker_sha256"]),
-        "udocker_tree_sha256": str(binding["udocker_tree_sha256"]),
+        "udocker_tree_sha256": binding.get("udocker_tree_sha256"),
         "unit_sha256": str(binding["unit_sha256"]),
         "launcher_sha256": str(binding["launcher_sha256"]),
         "configuration_sha256": str(binding["configuration_sha256"]),
@@ -3124,7 +3002,7 @@ def record_runtime_release_start(
                     pid, cgroup, receipt["application_cgroup_sha256"], start_ticks, started_at,
                     receipt["canonical_receipt_sha256"], receipt["source_manifest_sha256"], receipt["source_aggregate_sha256"],
                     receipt["image_id"], receipt["image_inspection_receipt_sha256"], receipt["udocker_path"],
-                    receipt["udocker_sha256"], receipt["udocker_tree_sha256"], receipt["unit_sha256"],
+                    receipt["udocker_sha256"], receipt["udocker_tree_sha256"] or "", receipt["unit_sha256"],
                     receipt["launcher_sha256"], receipt["configuration_sha256"], receipt["oem_lock_sha256"],
                     canonical_json(receipt["declared_listener"]), canonical_json(observed), canonical_json(receipt),
                     receipt_sha256, receipt["recorded_at"],

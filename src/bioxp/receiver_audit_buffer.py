@@ -1,14 +1,13 @@
-"""Bounded host evidence handoff, never a controller command queue.
+"""Critical receiver faults only; routine/raw receiver auditing is retired.
 
-Only the writer thread opens the governed store. In-flight records count against
-both bounds. A successful offer is VOLATILE, not a durable receipt. Defaults are
-provisional engineering limits, not approved throughput/capacity guarantees.
+The receiver never waits for SQLite. Repeated identical transport faults are
+coalesced by receive owner. Commands, Stops and retries never use this buffer.
 """
 from __future__ import annotations
 
 from collections import deque
 import json
-import os
+
 import threading
 import uuid
 from typing import Any
@@ -31,9 +30,9 @@ def current_receiver_audit_buffer():
 
 
 class ReceiverAuditBuffer:
-    SOURCE = "novo_receiver_audit"
+    SOURCE = "critical_runtime_fault"
 
-    def __init__(self, *, root=None, max_records=4096, max_bytes=4 * 1024 * 1024,
+    def __init__(self, *, root=None, max_records=128, max_bytes=64 * 1024,
                  database_factory=RuntimeAuditDatabase):
         if type(max_records) is not int or type(max_bytes) is not int or min(max_records, max_bytes) < 1:
             raise ValueError("receiver audit bounds must be positive integers")
@@ -51,7 +50,8 @@ class ReceiverAuditBuffer:
         self._closed_committed = False
         self._error = None
         self._opened = False
-        self._thread = threading.Thread(target=self._run, name="bioxp-receiver-audit", daemon=True)
+        self._last_fault = None
+        self._thread = threading.Thread(target=self._run, name="bioxp-critical-log", daemon=True)
         self._thread.start()
 
     @classmethod
@@ -62,9 +62,7 @@ class ReceiverAuditBuffer:
         global _OWNER_BUFFER
         with _OWNER_LOCK:
             if _OWNER_BUFFER is None or not _OWNER_BUFFER.alive:
-                _OWNER_BUFFER = cls(
-                    max_records=int(os.environ.get("BIOXP_RECEIVER_AUDIT_MAX_RECORDS", "4096")),
-                    max_bytes=int(os.environ.get("BIOXP_RECEIVER_AUDIT_MAX_BYTES", "4194304")))
+                _OWNER_BUFFER = cls()
             return _OWNER_BUFFER
 
     @property
@@ -72,10 +70,25 @@ class ReceiverAuditBuffer:
         return self._thread.is_alive()
 
     def offer(self, kind: str, payload: dict[str, Any]) -> bool:
-        # Private producers supply bounded primitive fields, not arbitrary objects.
+        # Hard policy, not an opt-in flag. Reject before encoding or queue work.
+        if kind not in {"reader_error", "pipette_error"}:
+            return False
+        if kind == "pipette_error":
+            if not payload.get("error_code"):
+                return False
+            payload = {"channel": int(payload["channel"]),
+                       "error_code": int(payload["error_code"]),
+                       "owner_generation": payload.get("owner_generation")}
+        else:
+            payload = {"error": str(payload.get("error", "receiver failure"))[:256],
+                       "receive_owner": payload.get("receive_owner"),
+                       "owner_generation": payload.get("owner_generation")}
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
         size = len(encoded) + len(kind.encode("utf-8"))
         with self._condition:
+            if encoded == self._last_fault:
+                return False
+            self._last_fault = encoded
             self._offered += 1
             if self._closing or self._finished:
                 self._rejected += 1
@@ -93,7 +106,8 @@ class ReceiverAuditBuffer:
 
     def status(self):
         with self._condition:
-            return {"session": self.session, "max_records": self.max_records,
+            return {"mode": "critical_only", "routine_capture_enabled": False,
+                    "session": self.session, "max_records": self.max_records,
                     "max_bytes": self.max_bytes, "offered": self._offered,
                     "accepted_volatile": self._accepted, "buffered_records": self._records,
                     "buffered_bytes": self._bytes, "committed_records": self._committed,
@@ -101,7 +115,8 @@ class ReceiverAuditBuffer:
                     "inflight_records": self._inflight_records, "inflight_bytes": self._inflight_bytes,
                     "overflow_records": self._overflow, "write_failed_records": self._failed,
                     "rejected_records": self._rejected, "committed_gap_counts": self._gap_committed,
-                    "writer_open_committed": self._opened, "writer_error": self._error,
+                    "writer_ready": self._opened, "writer_open_committed": False,
+                    "writer_error": self._error,
                     "closing": self._closing, "finished": self._finished,
                     "close_accounting_committed": self._closed_committed,
                     "clean_drain_committed": self._clean and self._gap_committed ==
@@ -150,17 +165,8 @@ class ReceiverAuditBuffer:
         db = None
         try:
             db = self._factory(self._root)
-            # Existing append-only runtime_events is the lifecycle/gap authority;
-            # no auxiliary journal, migration, schema or retention change.
-            previous = db.connection.execute(
-                "SELECT event_kind,event_json FROM runtime_events WHERE event_source=? "
-                "AND event_kind IN ('opened','closed') ORDER BY event_id DESC LIMIT 1",
-                (self.SOURCE,)).fetchone()
-            self._event(db, "opened", {"previous_lifecycle": previous[0] if previous else None,
-                "previous_session": json.loads(previous[1]).get("audit_session") if previous else None,
-                "unclean_previous_session": previous[0] != "closed" if previous else None,
-                "crash_lost_count": None,
-                "pre_open_ingress_loss_unknown": True})
+            # No historical event lookup and no opened/closed audit records.
+            # An idle service writes nothing to the receiver log.
             with self._condition:
                 self._opened = True
             while True:
@@ -208,18 +214,6 @@ class ReceiverAuditBuffer:
                     drained = not self._queue and self._records == 0
                 if closing and drained:
                     with self._condition:
-                        close_payload = {"accepted_volatile": self._accepted,
-                            "committed_records": self._committed,
-                            "all_accepted_committed": self._failed == 0,
-                            "gap_counts": (self._overflow, self._failed, self._rejected),
-                            "offered_through": self._offered,
-                            "counts_scope": "offers_observed_at_close_snapshot",
-                            "later_rejected_offers_unknown": True,
-                            "lossless": not (self._overflow or self._failed or self._rejected)}
-                    self._event(db, "closed", close_payload)
-                    with self._condition:
-                        self._gap_committed = close_payload["gap_counts"]
-                        self._closed_committed = True
                         self._clean = self._failed == 0
                     break
         except Exception as exc:

@@ -253,9 +253,11 @@ _operator_control_plane_installed = False
 
 
 def _persist_pipette_runtime_error(channel: int, error_code: int) -> None:
-    if _pipette_receipts is None:
-        raise RuntimeError("pipette runtime event store is unavailable")
-    _pipette_receipts.record_runtime_error_event(int(channel), int(error_code))
+    from .receiver_audit_buffer import ReceiverAuditBuffer
+    ReceiverAuditBuffer.from_environment().offer("pipette_error", {
+        "channel": int(channel), "error_code": int(error_code),
+        "owner_generation": int(hardware_state.ownership_epoch),
+    })
 
 
 def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
@@ -4715,7 +4717,8 @@ def _receiver_audit_health():
     setup_failed = any(getattr(owner, "_receiver_audit_setup_error", None) for owner in owners)
     hook_failures = sum(getattr(getattr(owner, "novo_router", None), "_audit_hook_failures", 0)
                         for owner in {id(owner): owner for owner in owners}.values())
-    return {"available": bool(statuses), "healthy": bool(statuses) and not setup_failed
+    return {"mode": "critical_only", "routine_capture_enabled": False,
+            "available": bool(statuses), "healthy": bool(statuses) and not setup_failed
             and not hook_failures and all(row["healthy"] for row in statuses),
             "setup_error": "setup_failed" if setup_failed else None,
             "hook_failures": hook_failures, "buffers": statuses,
@@ -5534,16 +5537,8 @@ _usb_sniff_manager = UsbSniffManager()
 
 
 async def _run_blocking(label: str, func, timeout_s: float = 30.0):
-    from .command_exchange_observer import current_exchange_owner
-
-    exchange_owner = current_exchange_owner()
-
     def invoke():
-        try:
-            return func()
-        finally:
-            if exchange_owner is not None:
-                exchange_owner.flush()
+        return func()
 
     async def leased_operation():
         async with _tester_lock:
@@ -5579,10 +5574,6 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
     worker thread that cannot itself be cancelled.
     """
 
-    from .command_exchange_observer import current_exchange_owner
-
-    exchange_owner = current_exchange_owner()
-
     async def leased_interrupt():
         async with _tester_transition_lock:
             tester = _get_tester()
@@ -5590,11 +5581,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             interrupt_context = copy_context()
 
             def invoke_interrupt():
-                try:
-                    return interrupt_context.run(func, tester)
-                finally:
-                    if exchange_owner is not None:
-                        exchange_owner.flush()
+                return interrupt_context.run(func, tester)
 
             return await loop.run_in_executor(
                 _safety_interrupt_executor,

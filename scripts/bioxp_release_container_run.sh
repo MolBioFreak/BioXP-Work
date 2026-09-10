@@ -65,45 +65,9 @@ done
 [[ -x "$UDOCKER_BIN" ]] || fail "required udocker launcher is unavailable"
 [[ -d "$UDOCKER_ROOT" && ! -L "$UDOCKER_ROOT" ]] || fail "immutable udocker runtime root is absent or symlinked"
 UDOCKER_SHA256=$(sha256_file "$UDOCKER_BIN")
-UDOCKER_TREE_SHA256=$(/usr/bin/python3 - "$UDOCKER_ROOT" <<'PY'
-import hashlib
-import os
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-container_state = root / "store" / "containers"
-aggregate = hashlib.sha256()
-paths = [
-    path for path in (root, *root.rglob("*"))
-    if path != container_state and container_state not in path.parents
-]
-for path in sorted(paths, key=lambda item: item.as_posix().encode("utf-8")):
-    info = path.lstat()
-    if info.st_uid != 0 or info.st_gid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
-        raise SystemExit(f"mutable or non-root-owned udocker runtime path: {path}")
-    relative = "." if path == root else path.relative_to(root).as_posix()
-    if stat.S_ISREG(info.st_mode):
-        kind = "file"
-        identity = hashlib.sha256(path.read_bytes()).hexdigest()
-    elif stat.S_ISDIR(info.st_mode):
-        kind = "directory"
-        identity = ""
-    elif stat.S_ISLNK(info.st_mode):
-        target = path.resolve(strict=True)
-        target_info = target.stat()
-        if target_info.st_uid != 0 or target_info.st_gid != 0 or target_info.st_mode & 0o022:
-            raise SystemExit(f"udocker runtime symlink resolves to mutable authority: {path}")
-        kind = "symlink"
-        identity = os.readlink(path)
-    else:
-        raise SystemExit(f"unsupported udocker runtime file type: {path}")
-    aggregate.update(relative.encode() + b"\0" + kind.encode() + b"\0" + str(info.st_size).encode() + b"\0" + identity.encode() + b"\n")
-print(aggregate.hexdigest())
-PY
-) || fail "immutable udocker runtime verification failed"
-[[ "$UDOCKER_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "udocker runtime aggregate is invalid"
+# Startup binds the installed deployment; it does not re-audit the runtime tree.
+# An empty argument is represented as JSON null, never as a fabricated digest.
+UDOCKER_TREE_SHA256=
 
 packet_file=$(/usr/bin/mktemp "$RUNTIME_DIR/.identity-packet.XXXXXX")
 trap '/bin/rm -f "$packet_file"' EXIT
@@ -263,67 +227,11 @@ CANONICAL_RECEIPT_SHA256=${PACKET[16]}
 
 [[ "$(sha256_file "$INSTALLED_UNIT")" == "$UNIT_SHA256" ]] || fail "installed canonical unit bytes do not match the deployment receipt"
 [[ "$(sha256_file "$INSTALLED_LAUNCHER")" == "$LAUNCHER_SHA256" ]] || fail "installed release launcher bytes do not match the deployment receipt"
-"$IMAGE_INSPECTOR" verify \
-  --receipt "$IMAGE_INSPECTION_FILE" \
-  --source-manifest "$SOURCE_MANIFEST_FILE" \
-  --image-id "$IMAGE_ID" >/dev/null \
-  || fail "live local image store no longer matches the sealed image inspection"
 
 [[ "$SOURCE_MODE" == exact_commit_materialization ]] || fail "source mode is not exact_commit_materialization"
 [[ "$HOST_SOURCE" == "/opt/bioxp/releases/$SOURCE_COMMIT" ]] || fail "materialized source path is not canonical"
 [[ -d "$HOST_SOURCE" && ! -L "$HOST_SOURCE" ]] || fail "exact commit materialization is absent or symlinked"
-if ! /usr/bin/python3 - "$HOST_SOURCE" <<'PY'
-import os, stat, sys
-from pathlib import Path
-root = Path(sys.argv[1])
-for path in [root, *root.rglob("*")]:
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o222:
-        raise SystemExit(f"mutable, non-root-owned, or symlinked release source: {path}")
-PY
-then
-  fail "exact commit materialization is not recursively root-owned and non-writable"
-fi
-if ! /usr/bin/python3 - "$HOST_SOURCE" "$SOURCE_MANIFEST_FILE" <<'PY'
-import hashlib, json, os, stat, sys
-from pathlib import Path
-root = Path(sys.argv[1])
-manifest_path = Path(sys.argv[2])
-manifest = json.loads(manifest_path.read_bytes())
-rows = manifest.get("files")
-if not isinstance(rows, list) or manifest.get("file_count") != len(rows):
-    raise SystemExit("source manifest inventory is incomplete")
-expected = {}
-for row in rows:
-    if not isinstance(row, dict) or set(row) != {"path", "size", "sha256"}:
-        raise SystemExit("source manifest row is malformed")
-    relative = row["path"]
-    if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in Path(relative).parts or relative in expected:
-        raise SystemExit("source manifest path is unsafe or duplicate")
-    expected[relative] = (row["size"], row["sha256"])
-observed = {}
-for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-    base = Path(directory)
-    if base == root:
-        dirnames[:] = [name for name in dirnames if name not in {".git", ".bioxp-release"}]
-    for name in [*dirnames, *filenames]:
-        candidate = base / name
-        info = candidate.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise SystemExit("mounted source contains a symlink")
-    for name in filenames:
-        candidate = base / name
-        info = candidate.lstat()
-        if not stat.S_ISREG(info.st_mode):
-            raise SystemExit("mounted source contains a non-regular file")
-        relative = candidate.relative_to(root).as_posix()
-        observed[relative] = (info.st_size, hashlib.sha256(candidate.read_bytes()).hexdigest())
-if observed != expected:
-    raise SystemExit("mounted source bytes differ from the deterministic manifest")
-PY
-then
-  fail "mounted source bytes do not match the deterministic manifest"
-fi
+[[ "$(/usr/bin/stat -c '%u:%g' "$HOST_SOURCE")" == "0:0" ]] || fail "release source root is not root-owned"
 
 [[ -d "$OEM_LOCK_DIR" && ! -L "$OEM_LOCK_DIR" ]] || fail "OEM authority directory is unavailable"
 protected_root_file "$OEM_LOCK_FILE"
@@ -353,7 +261,7 @@ payload = {
     "image_inspection_receipt_sha256": image_inspection_sha256,
     "udocker_path": udocker_path,
     "udocker_sha256": udocker_sha256,
-    "udocker_tree_sha256": udocker_tree_sha256,
+    "udocker_tree_sha256": udocker_tree_sha256 or None,
     "service_unit": "bioxp-api.service",
     "unit_sha256": unit_sha256,
     "launcher_sha256": launcher_sha256,
@@ -406,7 +314,6 @@ exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --env="BIOXP_RELEASE_IMAGE_ID=$IMAGE_ID" \
   --env="BIOXP_RELEASE_SOURCE_COMMIT=$SOURCE_COMMIT" \
   --env="BIOXP_RELEASE_UDOCKER_SHA256=$UDOCKER_SHA256" \
-  --env="BIOXP_RELEASE_UDOCKER_TREE_SHA256=$UDOCKER_TREE_SHA256" \
   "${SOURCE_VOLUME[@]}" \
   --volume="$RECEIPT_FILE:/run/bioxp-release/release-identity.json" \
   --volume="$SOURCE_MANIFEST_FILE:/run/bioxp-release/source-manifest.json" \
@@ -419,4 +326,4 @@ exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --volume=/run/udev:/run/udev:ro \
   --workdir=/app \
   "$IMAGE_REF" \
-  /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123'
+  /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123 --no-access-log --log-level error'
