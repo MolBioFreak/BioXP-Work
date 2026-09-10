@@ -9,7 +9,7 @@ remain unavailable until their complete provider sequence is bound.
 from __future__ import annotations
 
 import asyncio
-import base64
+
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -39,6 +39,7 @@ from .oem_full_lifecycle import (
 )
 from .oem_machine_bundle import OEM_MACHINE_SERIAL
 from .operator_receipt_store import OperatorHistoryReader, OperatorReceiptStore
+from .operator_history import read_history_page, receipt_accepted_at, receipt_timestamp
 from .command_exchange_observer import exchange_scope
 from .release_identity import current_release_identity
 from .oem_serial206_initialization_contract import OEM_INITIALIZE_MOTORS_STAGE_KEYS
@@ -46,7 +47,7 @@ from .oem_serial206_initialization import SERIAL206_INITIALIZE_MOTION_STAGE_SPEC
 
 CATALOG_SCHEMA = "bioxp.operator_control_catalog.v1"
 RECEIPT_SCHEMA = "bioxp.operator_action_receipt.v1"
-HISTORY_SCHEMA = "bioxp.operator_action_history.v1"
+HISTORY_SCHEMA = "bioxp.operator_action_history.v2"
 INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all",
 })
@@ -2887,17 +2888,12 @@ def install_operator_control_plane(
         }.get(raw_status, raw_status)
         if status not in {"queued", "dispatched", "issued_pending", "interrupting", "completed", "failed", "cleared", "interrupted", "ambiguous", "rejected"}:
             status = "failed"
-        now = time.time()
-        def finite_time(value: Any) -> float | None:
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                return None
-            return parsed if math.isfinite(parsed) else None
-        accepted = finite_time(row.get("accepted_at") or row.get("started_at")) or now
-        queued = finite_time(row.get("queued_at")) or accepted
-        dispatched = finite_time(row.get("dispatched_at"))
-        finished = finite_time(row.get("finished_at"))
+        accepted = receipt_accepted_at(row)
+        queued = receipt_timestamp(row.get("queued_at"))
+        if queued is None:
+            queued = accepted
+        dispatched = receipt_timestamp(row.get("dispatched_at"))
+        finished = receipt_timestamp(row.get("finished_at"))
         error = None
         if status in {"failed", "rejected", "ambiguous"}:
             response = row.get("response")
@@ -2996,88 +2992,9 @@ def install_operator_control_plane(
         }
         return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "telemetry": _bounded_telemetry(state), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
-    def _history_key(row: Mapping[str, Any]) -> tuple[float, int, int, str]:
-        accepted_at = row.get("accepted_at", row.get("queued_at", row.get("started_at", 0)))
-        try:
-            timestamp = float(accepted_at or 0)
-        except (TypeError, ValueError):
-            timestamp = 0.0
-        source_rank = 1 if row.get("__projection_source") == "direct" else 0
-        return (
-            timestamp,
-            source_rank,
-            int(row.get("sequence") or row.get("stream_sequence") or 0),
-            str(row.get("command_id") or ""),
-        )
-
-    def _encode_history_cursor(row: Mapping[str, Any]) -> str:
-        payload = json.dumps(
-            {"v": 1, "key": list(_history_key(row))},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-
-    def _decode_history_cursor(cursor: str) -> tuple[float, int, int, str]:
-        try:
-            padded = cursor + "=" * (-len(cursor) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
-            key = payload["key"]
-            if payload.get("v") != 1 or not isinstance(key, list) or len(key) != 4:
-                raise ValueError
-            return (float(key[0]), int(key[1]), int(key[2]), str(key[3]))
-        except Exception as exc:
-            raise ValueError("invalid_history_cursor") from exc
-
     async def history_rows(limit: int, *, cursor: str | None = None) -> list[dict[str, Any]]:
-        legacy_before = int(cursor) if cursor is not None and cursor.isdecimal() else None
-        boundary = (
-            _decode_history_cursor(cursor)
-            if cursor is not None and not cursor.isdecimal()
-            else None
-        )
-
-        async def collect(source: str) -> list[dict[str, Any]]:
-            reader = store if source == "direct" else legacy_command_store
-            keys = await asyncio.to_thread(reader.history_keys)
-            return [{**row, "__projection_source": source} for row in keys]
-
-        current_rows, durable_rows = await asyncio.gather(
-            collect("direct"), collect("durable"),
-        )
-        combined = [*current_rows, *durable_rows]
-        # Direct receipts are the public lookup authority when both stores have
-        # the same command identity, irrespective of conflicting timestamps or
-        # status. Never merge evidence fields from incompatible projections.
-        combined.sort(key=lambda row: (row["__projection_source"] == "direct", _history_key(row)), reverse=True)
-        deduplicated: list[dict[str, Any]] = []
-        seen_command_ids: set[str] = set()
-        for row in combined:
-            command_id = str(row.get("command_id") or "")
-            if not command_id:
-                raise RuntimeError("history_receipt_missing_command_id")
-            if command_id in seen_command_ids:
-                continue
-            seen_command_ids.add(command_id)
-            deduplicated.append(row)
-        deduplicated.sort(key=_history_key, reverse=True)
-        if boundary is not None:
-            deduplicated = [row for row in deduplicated if _history_key(row) < boundary]
-        if legacy_before is not None:
-            deduplicated = [row for row in deduplicated if int(row.get("sequence") or row.get("stream_sequence") or 0) < legacy_before]
-        def hydrate_page() -> list[dict[str, Any]]:
-            page = []
-            for key in deduplicated[:limit]:
-                source = key["__projection_source"]
-                row = (store.by_command(key["command_id"], include_evidence=False)
-                       if source == "direct" else legacy_command_store.get_command(key["command_id"]))
-                if row is None:
-                    raise RuntimeError("history_receipt_disappeared_during_projection")
-                # Raw exchanges remain on the detail endpoint, never the poll.
-                row = {**row, "transport_exchanges": [], "__projection_source": source}
-                page.append(row)
-            return page
-        return await asyncio.to_thread(hydrate_page)
+        rows, _ = await asyncio.to_thread(read_history_page, store.root, limit, cursor)
+        return rows
 
     @router.get("/v2/dashboard")
     @poll_cache.wrap
@@ -3220,40 +3137,28 @@ def install_operator_control_plane(
             return _v2_compact_receipt(direct_receipt)
         raise HTTPException(status_code=404, detail="unknown v2 operator action_id")
 
-    @router.get("/v2/actions/history")
-    async def action_history_v2(limit: int = Query(default=100, ge=1, le=200), cursor: str | None = None) -> dict[str, Any]:
-        try:
-            rows = await history_rows(limit, cursor=cursor)
-        except ValueError:
-            raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
-        items = [_v2_compact_receipt(row) for row in rows]
-        next_cursor = _encode_history_cursor(rows[-1]) if len(rows) == limit else None
-        return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
 
     @router.get("/v2/actions/receipts/{command_id}")
     async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
+        # Match the single history reader's identity precedence. Never show a
+        # retained projection for a command whose direct receipt is authoritative.
         row = await asyncio.to_thread(
-            command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
+            store.by_command,
             command_id,
+            include_evidence=detail,
         )
+        source_receipt = row if detail else None
+        if row is not None and not detail and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
+            detailed_row = await asyncio.to_thread(store.by_command, command_id, include_evidence=True)
+            if detailed_row is not None:
+                row = detailed_row
         if row is None:
             row = await asyncio.to_thread(
-                store.by_command,
+                command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
                 command_id,
-                include_evidence=detail,
             )
-            if (
-                row is not None
-                and not detail
-                and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}
-            ):
-                detailed_row = await asyncio.to_thread(
-                    store.by_command,
-                    command_id,
-                    include_evidence=True,
-                )
-                if detailed_row is not None:
-                    row = detailed_row
+            if detail:
+                source_receipt = await asyncio.to_thread(legacy_command_store.get_command, command_id)
         if row is None:
             row = await asyncio.to_thread(
                 legacy_command_store.command_detail_v2 if detail else legacy_command_store.get_command,
@@ -3265,6 +3170,7 @@ def install_operator_control_plane(
         if not detail:
             return compact
         compact["transport_exchanges"] = list(row.get("transport_exchanges") or [])
+        compact["source_receipt"] = source_receipt
         raw_return_layers = dict(row.get("raw_return_layers") or {})
         if row.get("response") is not None:
             raw_return_layers["operator_response"] = _bounded_json(row["response"], _MAX_RESPONSE_BYTES)
@@ -3377,24 +3283,17 @@ def install_operator_control_plane(
     @router.get("/actions/history")
     async def action_history(
         limit: int = Query(default=100, ge=1, le=200),
-        schema_version: str | None = Query(default=None),
         cursor: str | None = Query(default=None),
     ) -> dict[str, Any]:
-        if schema_version == "bioxp.operator_action_history.v2":
-            try:
-                rows = await history_rows(limit, cursor=cursor)
-            except ValueError:
-                raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"})
-            items = [_v2_compact_receipt(row) for row in rows]
-            next_cursor = _encode_history_cursor(rows[-1]) if len(rows) == limit else None
-            return {"schema_version": "bioxp.operator_action_history.v2", "items": items, "next_cursor": next_cursor, "limit": limit}
-        rows = await history_rows(limit)
-        # Keep the source rank until sorting/cursor encoding is finished, but
-        # never publish this private merge annotation as a receipt field.
-        return {"schema_version": HISTORY_SCHEMA, "receipts": [
-            {key: value for key, value in row.items() if key != "__projection_source"}
+        try:
+            rows, next_cursor = await asyncio.to_thread(read_history_page, store.root, limit, cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": "invalid_history_cursor"}) from exc
+        items = [
+            {**_v2_compact_receipt(row), "history": row["history"]}
             for row in rows
-        ]}
+        ]
+        return {"schema_version": HISTORY_SCHEMA, "items": items, "next_cursor": next_cursor, "limit": limit}
 
     @router.get("/actions/receipts/{command_id}")
     async def action_receipt(command_id: str, detail: bool = False) -> dict[str, Any]:

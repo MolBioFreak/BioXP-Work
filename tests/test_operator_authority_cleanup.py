@@ -220,7 +220,7 @@ def test_operator_receipt_lookup_is_current_first_on_legacy_identity_collision(
     assert selected.status_code == 200
     assert selected.json()["status"] == "completed"
     matches = [
-        row for row in history.json()["receipts"]
+        row for row in history.json()["items"]
         if row["command_id"] == "legacy-running"
     ]
     assert len(matches) == 1

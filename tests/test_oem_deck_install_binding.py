@@ -252,7 +252,7 @@ def _install_reconciliation_app(tmp_path, monkeypatch):
     provider = ReconciliationFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
         app,
@@ -313,7 +313,7 @@ def test_deck_provider_refreshes_after_startup_without_usb_owner(tmp_path, monke
     provider_slot: dict[str, Any] = {"current": None}
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
         app,
@@ -477,7 +477,7 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         "block_reason": None,
     }
     lifecycle = {"operation_state": "stopped"}
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
 
     operator_controls.install_operator_control_plane(
@@ -618,11 +618,11 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         "response": {"http_status": 200, "body": {"ok": True}},
         "stage_receipts": [],
     })
-    first_page = TestClient(app).get("/operator/v2/actions/history", params={"limit": 1}).json()
+    first_page = TestClient(app).get("/operator/actions/history", params={"limit": 1}).json()
     assert [row["command_id"] for row in first_page["items"]] == [direct_command_id]
     assert first_page["next_cursor"]
     second_page = TestClient(app).get(
-        "/operator/v2/actions/history",
+        "/operator/actions/history",
         params={"limit": 1, "cursor": first_page["next_cursor"]},
     ).json()
     assert [row["command_id"] for row in second_page["items"]] == [command_id]
@@ -645,11 +645,11 @@ def test_install_binds_reachable_executor_and_queue_reaches_fake_provider_async(
         )
         durable_ids.add(admitted_bulk["command_id"])
     bulk_first = TestClient(app).get(
-        "/operator/v2/actions/history", params={"limit": 200},
+        "/operator/actions/history", params={"limit": 200},
     ).json()
     assert len(bulk_first["items"]) == 200
     bulk_second = TestClient(app).get(
-        "/operator/v2/actions/history",
+        "/operator/actions/history",
         params={"limit": 200, "cursor": bulk_first["next_cursor"]},
     ).json()
     paged_ids = {
@@ -907,7 +907,7 @@ def test_install_binds_internal_wp8_fifo_and_worker_executes_durable_children(tm
     provider = Wp8BootstrapFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setattr(operator_controls, "_build_catalog", lambda _app: ([], {}))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     state = {
         "ownership_generation": 7,
@@ -1892,7 +1892,7 @@ def test_fresh_store_bootstraps_canonical_semantic_state_from_bound_provider(tmp
     provider = BootstrapFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
 
     operator_controls.install_operator_control_plane(
@@ -2109,7 +2109,7 @@ def test_catalog_disables_deck_action_when_branch_provider_method_is_missing(tmp
     provider.moveZCamera = None
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
         app, maintenance_state_provider=lambda: {"motion_blocked": False, "recovery_required": False, "block_reason": None},
@@ -2133,7 +2133,7 @@ def test_catalog_and_admission_share_durable_deck_recovery_truth(tmp_path, monke
     provider = AmbiguousFakeDeckProvider(table)
     app = FastAPI()
     monkeypatch.setenv("BIOXP_RUNTIME_STATE_ROOT", str(tmp_path))
-    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda _name: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
+    monkeypatch.setattr(operator_controls.hardware_state, "project", lambda *_names, **_options: {"domains": {}, "freshness": {"state": "fresh", "age_s": 0, "fresh_for_s": 30}})
     monkeypatch.setattr(operator_controls.hardware_state, "ownership_projection", lambda: {"ownership_epoch": 7, "ownership": "service"})
     operator_controls.install_operator_control_plane(
         app, maintenance_state_provider=lambda: {"motion_blocked": False, "recovery_required": False, "block_reason": None},
