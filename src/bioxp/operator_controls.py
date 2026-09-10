@@ -2191,7 +2191,12 @@ class _OperatorPollCache:
                         self._cache.pop(key, None)
                         cached = None
                 now = time.monotonic()
-                # Abandoned cold callers cannot freeze other views forever.
+                # Give an expired cold demand one free retry turn before a hot
+                # view reclaims the slot. Dropping it first starves clients whose
+                # normal polling round-trip exceeds the 0.5s expiry. This adds
+                # no queued work or extended waiter: abandoned demand is removed
+                # now and can suppress only this one hot refresh.
+                cold_turn_due = bool(self._cold_waiting)
                 self._cold_waiting = {view: requested for view, requested in self._cold_waiting.items()
                                       if now - requested < 0.5}
                 if cached is None:
@@ -2199,7 +2204,7 @@ class _OperatorPollCache:
                 # A hot caller cannot continually take the refresh slot from
                 # cold views that have requested it. This finite demand set is
                 # metadata fairness, not a queue of robot actions/work items.
-                can_refresh = cached is None or not self._cold_waiting
+                can_refresh = cached is None or not (cold_turn_due or self._cold_waiting)
                 if (self._pending is None or self._pending.done()) and can_refresh:
                     def collect():
                         token = _PASSIVE_OPERATOR_POLL.set(True)
