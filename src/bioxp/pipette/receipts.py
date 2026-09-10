@@ -1517,50 +1517,12 @@ class PipetteReceiptStore:
                 archive_path = self._migration_artifact_path(archive_relpath)
                 if archive_path.is_symlink() or not archive_path.is_file():
                     raise PipetteReceiptError("retired migration archive is missing")
-                archive_raw = archive_path.read_bytes()
-                source_sha256 = hashlib.sha256(archive_raw).hexdigest()
-                if (
-                    source_sha256 != str(latest["source_digest"])
-                    or source_sha256 != str(retirement["source_digest"])
-                    or source_sha256 != str(retirement["retirement_sha256"])
-                ):
-                    raise PipetteReceiptError("retired migration archive digest mismatch")
-                valid, quarantine_bytes, source_count = self._validate_legacy_source(
-                    archive_raw,
-                    migration_id=str(latest["migration_id"]),
-                    source_sha256=source_sha256,
-                )
-                if source_count != int(latest["source_count"]):
-                    raise PipetteReceiptError("retired migration source count mismatch")
-                validated_count = len(valid)
-                retired_v1_compatible = False
-                if validated_count != int(latest["imported_count"]) + int(latest["duplicate_count"]):
-                    validated_count = self._attest_retired_v1_imports(
-                        archive_raw,
-                        migration_id=str(latest["migration_id"]),
-                        source_sha256=source_sha256,
-                        source_count=source_count,
-                        imported_count=int(latest["imported_count"]),
-                        duplicate_count=int(latest["duplicate_count"]),
-                        quarantined_count=int(latest["quarantined_count"]),
-                        current_quarantine=quarantine_bytes,
-                    )
-                    quarantine_bytes = b""
-                    retired_v1_compatible = True
-                if quarantine_bytes.count(b"\n") != int(latest["quarantined_count"]):
-                    raise PipetteReceiptError("retired migration quarantine state mismatch")
-                quarantine_relpath = None
-                quarantine_sha256 = None
-                if quarantine_bytes:
-                    quarantine_sha256 = hashlib.sha256(quarantine_bytes).hexdigest()
-                    quarantine_relpath = (
-                        f"quarantine/pipette-receipts-jsonl/{source_sha256}.{quarantine_sha256}.jsonl"
-                    )
-                    self._write_immutable_migration_artifact(
-                        self._migration_artifact_path(quarantine_relpath),
-                        quarantine_bytes,
-                        expected_sha256=quarantine_sha256,
-                    )
+                # Completed retirement is checked from bounded durable metadata,
+                # not by parsing old logs and revalidating whole backups on boot.
+                source_sha256 = str(latest["source_digest"])
+                if any(str(retirement[field]) != source_sha256 for field in
+                       ("source_digest", "retirement_sha256")):
+                    raise PipetteReceiptError("retired migration identity metadata mismatch")
                 migration_evidence = self.connection.execute(
                     "SELECT * FROM runtime_migration_evidence WHERE migration_id=?",
                     (str(latest["migration_id"]),),
@@ -1568,51 +1530,25 @@ class PipetteReceiptStore:
                 if migration_evidence is None:
                     raise PipetteReceiptError("completed migration is missing immutable evidence")
                 backup_relpath = self._migration_backup_relpath(
-                    None
-                    if migration_evidence["backup_relpath"] is None
+                    None if migration_evidence["backup_relpath"] is None
                     else str(migration_evidence["backup_relpath"])
                 )
                 if backup_relpath is None:
                     raise PipetteReceiptError("completed migration is missing its bound backup")
-                verified_backup = (
-                    self._verify_retired_v1_backup(
-                        self.root / backup_relpath,
-                        source_sha256=source_sha256,
-                        archive_raw=archive_raw,
-                    )
-                    if retired_v1_compatible
-                    else verify_backup_unit(self.root / backup_relpath)
-                )
-                if str(verified_backup.get("backup_id") or "") != Path(backup_relpath).name:
-                    raise PipetteReceiptError("migration backup identity mismatch")
-                self._ensure_migration_evidence(
-                    migration_id=str(latest["migration_id"]),
-                    source_path=str(self._legacy_path),
-                    source_digest=source_sha256,
-                    source_bytes=len(archive_raw),
-                    source_count=source_count,
-                    imported_count=int(latest["imported_count"]),
-                    duplicate_count=int(latest["duplicate_count"]),
-                    quarantined_count=int(latest["quarantined_count"]),
-                    backup_relpath=backup_relpath,
-                    archive_relpath=archive_relpath,
-                )
                 return {
                     "status": "already_imported",
                     "source_path": str(self._legacy_path),
                     "source_sha256": source_sha256,
-                    "source_bytes": len(archive_raw),
-                    "source_count": source_count,
+                    "source_bytes": archive_path.stat().st_size,
+                    "source_count": int(latest["source_count"]),
                     "imported_count": 0,
-                    "duplicate_count": validated_count,
+                    "duplicate_count": int(latest["imported_count"]) + int(latest["duplicate_count"]),
                     "quarantined_count": int(latest["quarantined_count"]),
-                    "quarantine_relpath": quarantine_relpath,
-                    "quarantine_sha256": quarantine_sha256,
                     "archive_relpath": archive_relpath,
                     "pre_migration_backup": {
-                        "status": "source_verified",
+                        "status": "recorded_not_reaudited",
                         "unit_relpath": backup_relpath,
-                        "backup_id": verified_backup["backup_id"],
+                        "backup_id": Path(backup_relpath).name,
                     },
                     "release_identity": release_identity,
                 }

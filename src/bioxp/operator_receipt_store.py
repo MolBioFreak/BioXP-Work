@@ -366,8 +366,7 @@ class OperatorReceiptStore:
         with self.lock:
             self._import_legacy_once()
             self._import_interrupt_fallback()
-            self._remove_orphan_evidence()
-            self.sweep_expired_evidence()
+            # Retained diagnostic evidence is not a startup cleanup workload.
             self.reconcile_nonterminal_receipts()
 
     def _configure(self) -> None:

@@ -37,6 +37,11 @@ telemetry logs are retired. This supersedes earlier lossless receiver-audit scop
 - Startup does not purge, truncate, vacuum, or re-copy retained database history.
   Existing bulk history is retained; this change stops new routine log production,
   rather than claiming to erase past evidence gaps or reclaim existing disk usage.
+- Already-retired legacy logs are not reparsed or rehashed on startup, and old
+  evidence directories are not swept. Completed migration/retirement metadata
+  remains checked; actual unfinished migration/recovery remains distinct.
+- The image contains precompiled Python bytecode outside the source overlay.
+  Runtime does not create a writable compilation cache.
 
 ## Acceptance
 

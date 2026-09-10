@@ -6,6 +6,7 @@ ARG BIOXP_SOURCE_MANIFEST_SHA256
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPYCACHEPREFIX=/opt/bioxp-pycache \
     PYTHONPATH=/app/src
 
 LABEL org.opencontainers.image.revision="${BIOXP_SOURCE_COMMIT}" \
@@ -44,5 +45,10 @@ RUN python /app/scripts/bioxp_source_manifest.py verify \
     && install -d -m 0755 /run/bioxp-release \
     && install -m 0444 /app/.bioxp-release/source-manifest.json /usr/share/bioxp-release/source-manifest.json \
     && rm -rf /app/.bioxp-release
+
+# Build bytecode once, outside /app so exact-source materialization cannot hide
+# it. Runtime remains read-only; no cache generation or source compilation is
+# required for imports whose source timestamp/size matches this image build.
+RUN python -m compileall -q /usr/local/lib/python3.12 /app/src
 
 CMD ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123", "--no-access-log", "--log-level", "error"]
