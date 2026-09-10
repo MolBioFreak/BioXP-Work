@@ -326,4 +326,4 @@ exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --volume=/run/udev:/run/udev:ro \
   --workdir=/app \
   "$IMAGE_REF" \
-  /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123 --no-access-log --log-level error'
+  /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123 --no-access-log --log-level error >/dev/null'

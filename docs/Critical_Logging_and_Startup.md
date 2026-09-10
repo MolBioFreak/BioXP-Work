@@ -18,7 +18,9 @@ telemetry logs are retired. This supersedes earlier lossless receiver-audit scop
   raw-exchange observers and normalized pressure/sample/event writers are not on
   the active command logging path. Existing archived evidence stays readable.
 - Healthy idle receiver logging writes no opened/closed/session trace records.
-  HTTP access logging and routine Uvicorn messages are disabled.
+  HTTP access logging and routine Uvicorn messages are disabled. The managed
+  service discards legacy routine stdout; error logging/tracebacks on stderr and
+  structured command outcomes/critical faults in SQLite remain enabled.
 
 ## Startup boundary
 
