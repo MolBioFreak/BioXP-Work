@@ -24,7 +24,7 @@ _EXPECTED_CONFIGURATION = {
     "declared_listener": {"host": "0.0.0.0", "port": 8123},
     "database_root": "/app/.oem_runtime_state",
     "working_directory": "/app",
-    "argv": ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123"],
+    "argv": ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123", "--no-access-log", "--log-level", "error"],
     "environment": {
         "BIOXP_OEM_MACHINE_BUNDLE_LOCK": "/app/.oem_lock/OEM_EVIDENCE_LOCK.json",
         "BIOXP_OEM_RUNTIME_ROOT": "/app/.oem_runtime_state",

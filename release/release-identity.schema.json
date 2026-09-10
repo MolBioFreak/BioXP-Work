@@ -68,7 +68,7 @@
             "database_root": {"const": "/app/.oem_runtime_state"},
             "working_directory": {"const": "/app"},
             "argv": {
-              "const": ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123"]
+              "const": ["python", "-m", "uvicorn", "bioxp.api:app", "--host", "0.0.0.0", "--port", "8123", "--no-access-log", "--log-level", "error"]
             },
             "environment": {
               "const": {
