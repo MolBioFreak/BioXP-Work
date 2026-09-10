@@ -3802,6 +3802,27 @@ def _compact_controller_state(
 ) -> Any:
     if budget is None:
         budget = [2048]
+    summary_keys = {
+        "value_omitted_from_current_state", "content_sha256", "encoded_bytes",
+        "controller_payload_omitted_to_provider_receipt", "item_count",
+        "ok", "stopped", "target_reached", "timed_out", "last_speed", "failure",
+        "source_return_code", "status", "value", "return_status",
+    }
+    if (
+        isinstance(value, Mapping)
+        and value.get("value_omitted_from_current_state") is True
+        and isinstance(value.get("content_sha256"), str)
+        and len(value["content_sha256"]) == 64
+        and all(char in "0123456789abcdef" for char in value["content_sha256"])
+        and type(value.get("encoded_bytes")) is int
+        and value["encoded_bytes"] >= 0
+        and set(value).issubset(summary_keys)
+        and all(item is None or isinstance(item, (str, int, float, bool)) for item in value.values())
+        and len(json.dumps(value, allow_nan=False).encode("utf-8")) <= 4096
+    ):
+        # A digest describes the original omitted value, not another digest.
+        # Recompacting persisted state must never manufacture a new state.
+        return dict(value)
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
     digest_summary: dict[str, Any] = {
         "value_omitted_from_current_state": True,
@@ -3846,8 +3867,15 @@ def _compact_controller_state(
     if isinstance(value, str) and len(value.encode("utf-8")) > 512:
         return digest_summary
     if isinstance(value, Mapping):
+        existing_omission = value.get("_omitted_current_state_items")
+        preserve_omission = (
+            isinstance(existing_omission, Mapping)
+            and existing_omission.get("value_omitted_from_current_state") is True
+        )
         items = []
         for original_key, child in value.items():
+            if original_key == "_omitted_current_state_items" and preserve_omission:
+                continue
             child_key = str(original_key)
             if len(child_key.encode("utf-8")) > 128:
                 child_key = "_oversized_key_" + hashlib.sha256(child_key.encode("utf-8")).hexdigest()
@@ -3860,12 +3888,23 @@ def _compact_controller_state(
         }
         if len(items) > len(selected):
             result["_omitted_current_state_items"] = {**digest_summary, "item_count": len(items) - len(selected)}
+        elif preserve_omission:
+            result["_omitted_current_state_items"] = _compact_controller_state(existing_omission)
         return result
     if isinstance(value, (list, tuple)):
+        existing_omission = None
+        if (value and isinstance(value[-1], Mapping)
+                and set(value[-1]) == {"_omitted_current_state_items"}
+                and isinstance(value[-1]["_omitted_current_state_items"], Mapping)
+                and value[-1]["_omitted_current_state_items"].get("value_omitted_from_current_state") is True):
+            existing_omission = value[-1]["_omitted_current_state_items"]
+            value = value[:-1]
         selected = list(value[:64])
         result = [_compact_controller_state(child, depth=depth + 1, budget=budget) for child in selected]
         if len(value) > len(selected):
             result.append({"_omitted_current_state_items": {**digest_summary, "item_count": len(value) - len(selected)}})
+        elif existing_omission is not None:
+            result.append({"_omitted_current_state_items": _compact_controller_state(existing_omission)})
         return result
     return value
 

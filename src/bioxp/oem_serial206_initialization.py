@@ -5234,6 +5234,13 @@ class Serial206OemInitializationProvider:
                 x_lifecycle.get("state") == "awaiting_operator_observation"
                 and completed_awaiting_x_home is not None
                 and self.reference_store is not None
+                # Loading old receipts is not fresh board authority. Without
+                # this guard, polling publishes a reference only to invalidate
+                # it immediately in x_projection(), indefinitely.
+                and x_lifecycle.get("generation") == int(self.generation_provider())
+                and type(x_lifecycle.get("board_lifecycle_generation")) is int
+                and callable(getattr(self.preparation_provider, "current_board_lifecycle_generation", None))
+                and x_lifecycle["board_lifecycle_generation"] == self.preparation_provider.current_board_lifecycle_generation()
             ):
                 reference = self.reference_store.mark_referenced(
                     MarkAxisReferencedCommand(
