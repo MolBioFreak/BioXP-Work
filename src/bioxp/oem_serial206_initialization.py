@@ -2620,7 +2620,7 @@ class Serial206ProductionPrimitiveAdapter:
             operation,
             requested_inputs=dict(requested_inputs or {}),
             lifecycle_stage_id=lifecycle_stage_id,
-            lifecycle_attempt_id=str(attempt["approval_id"]),
+            lifecycle_attempt_id=str(attempt["command_id"]),
             lifecycle_idempotency_key=str(attempt["idempotency_key"]),
         )
 
@@ -11972,11 +11972,17 @@ class Serial206OemInitializationProvider:
                                 for key, row in state["movement_ledger"]["stages"].items()
                             )
                     else:
-                        raw = self._execute_initialize_motion_stage(
-                            state,
-                            spec,
-                            timeout_s=float(timeout_s),
-                        )
+                        # The stage command is persisted above before pipette dispatch.
+                        previous_attempt = getattr(self.primitives, "_lifecycle_pipette_attempt", None)
+                        self.primitives._lifecycle_pipette_attempt = {
+                            "command_id": command_id, "idempotency_key": command_id,
+                        }
+                        try:
+                            raw = self._execute_initialize_motion_stage(
+                                state, spec, timeout_s=float(timeout_s),
+                            )
+                        finally:
+                            self.primitives._lifecycle_pipette_attempt = previous_attempt
                     raw_result = dict(raw) if isinstance(raw, Mapping) else {"value": raw}
                     stage_ok = bool(raw_result.get("ok") is True)
                 except Exception as exc:
