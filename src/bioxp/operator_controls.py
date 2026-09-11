@@ -2902,6 +2902,7 @@ def install_operator_control_plane(
         status = {
             "acknowledged": "queued",
             "admission_pending": "queued",
+            "observed": "completed",
             "blocked": "rejected",
             "reconciliation_required": "ambiguous",
             "outcome_unknown": "ambiguous",
