@@ -953,6 +953,10 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     )
     if provider_x_available and x_live_status.get("available") is False:
         x_axis = {
+            # A cold/stale view can precede the first canonical X sample. Keep
+            # the same closed dashboard contract without claiming telemetry.
+            "motor_temperature_c": None,
+            "motor_temperature_available": False,
             **dict(cached_x_axis or {"axis": "x"}),
             "reference": x_lifecycle.get("reference_state") or "unknown",
             "coordinate_contract": "serial206_x_machine_config_max_effective_min_60_relative_margin_20",
