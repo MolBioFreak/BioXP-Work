@@ -1593,7 +1593,6 @@ def _operator_pipette_status() -> dict[str, Any]:
         "group_status_spacing_ms": 30,
         "live_query_performed": False,
         "last_group_transaction": None,
-        "liquid_mutation_enabled": False,
         "tip_type": 201,
         "tip_location": -1,
         "allow_to_stop": True,

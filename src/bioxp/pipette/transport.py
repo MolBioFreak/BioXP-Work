@@ -424,8 +424,8 @@ class CanPipetteTransport:
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
         if command.prime_volume_ul is not None:
             raise PipetteCommandError(
-                "Initialization priming remains blocked; this pass enables no liquid mutation.",
-                details={"prime_volume_ul": command.prime_volume_ul, "liquid_mutation_enabled": False},
+                "OEM pipette initialization has no priming operation; use an explicit liquid command.",
+                details={"prime_volume_ul": command.prime_volume_ul},
             )
         driver = self._get_driver()
         init_result = self._assert_driver_result(
@@ -942,7 +942,6 @@ class FourPipetteTransport:
         transports: list[CanPipetteTransport],
         *,
         sleep: Callable[[float], None] = time.sleep,
-        liquid_mutation_enabled: bool = False,
         error_callback: Callable[[int, int], None] | None = None,
         forceabort: Callable[[], bool] | None = None,
     ) -> None:
@@ -957,7 +956,6 @@ class FourPipetteTransport:
         self._tip_location = -1
         self._allow_to_stop = True
         self._forceabort = forceabort or (lambda: False)
-        self._liquid_mutation_enabled = bool(liquid_mutation_enabled)
         self._fluid_detection_timestamps: dict[int, float | None] = {channel: None for channel in self.CHANNELS}
         self._last_error: dict[str, Any] | None = None
         self._error_callback = error_callback
@@ -1007,7 +1005,6 @@ class FourPipetteTransport:
             "group_status_spacing_ms": 30,
             "live_query_performed": False,
             "last_group_transaction": self._last_group_transaction,
-            "liquid_mutation_enabled": self._liquid_mutation_enabled,
             "tip_type": self._tip_type,
             "tip_location": self._tip_location,
             "allow_to_stop": self._allow_to_stop,
@@ -1097,7 +1094,6 @@ class FourPipetteTransport:
         }
 
     def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
-        self._require_physical_command_admission(cycle)
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
             driver = transport._get_driver()
@@ -1307,7 +1303,6 @@ class FourPipetteTransport:
                 "pressure_offsets_valid": initial_group.get("pressure_offsets_valid") is True,
                 "pressure_offset_order": initial_group.get("pressure_offset_order"),
                 "group_wait_ms": 10_000,
-                "liquid_mutation_enabled": self._liquid_mutation_enabled,
             }
             return dict(self._last_group_transaction)
 
@@ -1354,7 +1349,6 @@ class FourPipetteTransport:
             "group_wait_ms": 10_000,
             "pipette_transaction_timeout_ms": 60_000,
             "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),
-            "liquid_mutation_enabled": self._liquid_mutation_enabled,
         }
         return dict(self._last_group_transaction)
 
@@ -1423,7 +1417,6 @@ class FourPipetteTransport:
 
     def reinitialize_pipette(self) -> dict[str, Any]:
         """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait."""
-        self._require_physical_command_admission("reinitialize")
         with self._transaction_lock:
             sends: list[dict[str, Any]] = []
             for channel, transport in enumerate(self._transports):
@@ -1496,7 +1489,6 @@ class FourPipetteTransport:
         }
 
     def set_top_speed(self, velocity: float, channels: list[int] | None = None) -> dict[str, Any]:
-        self._require_physical_command_admission("set_top_speed")
         value = float(velocity)
         selected, eligibility = self._tip_eligibility(channels)
         if not selected:
@@ -1542,7 +1534,6 @@ class FourPipetteTransport:
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "query": "Q:<raw-byte>1", "hardware_truth_level": "hardware_query"}
 
     def execute_diagnoses(self, command: PipetteDiagnosticCommand, channels: list[int] | None = None) -> dict[str, Any]:
-        self._require_physical_command_admission("diagnoses")
         selected, eligibility = self._tip_eligibility(channels)
         if not selected:
             return {
@@ -1658,7 +1649,6 @@ class FourPipetteTransport:
             return wait(float(timeout_s))
 
     def terminate(self, command: PipetteTerminateCommand | None = None) -> dict[str, Any]:
-        self._require_physical_command_admission("terminate")
         with self._transaction_lock:
             self._interrupt_epoch += 1
             interrupt_epoch = self._interrupt_epoch
@@ -1698,28 +1688,11 @@ class FourPipetteTransport:
         }
 
     def heartbeat(self, command: PipetteHeartbeatCommand) -> dict[str, Any]:
-        self._require_physical_command_admission("heartbeat")
         rows = [{"channel": channel, "result": transport.heartbeat(command)} for channel, transport in enumerate(self._transports)]
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
 
     def disable_heartbeat(self) -> dict[str, Any]:
         return self.heartbeat(PipetteHeartbeatCommand(enabled=False))
-
-    def _require_physical_command_admission(self, operation: str) -> None:
-        if not self._liquid_mutation_enabled:
-            raise PipetteCommandError(
-                f"Pipette {operation} remains blocked by the accepted production safety envelope.",
-                details={
-                    "operation": operation,
-                    "liquid_mutation_enabled": False,
-                    "physical_command_admitted": False,
-                    "channel_count": 4,
-                    "physical_effect_verified": False,
-                },
-            )
-
-    def _require_liquid_mutation(self, operation: str) -> None:
-        self._require_physical_command_admission(operation)
 
     def _run_group_liquid_operation(
         self,
@@ -1734,7 +1707,6 @@ class FourPipetteTransport:
         timeout_failure_sleep_s: float = 0.0,
         check_forceabort_after_wait: bool = False,
     ) -> dict[str, Any]:
-        self._require_liquid_mutation(operation)
         self._allow_to_stop = False
         rows: list[dict[str, Any]] = []
         operation_interrupt_epoch = self._interrupt_epoch
@@ -1810,7 +1782,6 @@ class FourPipetteTransport:
             "channel_count": len(channels),
             "timeout_ms": int(timeout_ms),
             "allow_to_stop": self._allow_to_stop,
-            "liquid_mutation_enabled": self._liquid_mutation_enabled,
             "delivery_verified": all(row["result"].get("delivery_verified") is True for row in rows),
             "controller_acknowledged": all(row["result"].get("controller_acknowledged") is True for row in rows),
             "completion_verified": bool(
@@ -1905,7 +1876,6 @@ class FourPipetteTransport:
         return self._oem_timeout_ms(volume_ul, min(speeds), 4_000)
 
     def dispense_all(self, channels: list[int] | None = None) -> dict[str, Any]:
-        self._require_liquid_mutation("dispense all")
         if self._forceabort():
             raise PipetteCommandError("Stopped by user or force abort")
         before = None
@@ -1972,7 +1942,6 @@ class FourPipetteTransport:
         return {**result, "volume_ul": volume, "dispense_type": selected_type, "planned_command": f"D{volume},{selected_type}R"}
 
     def mix_all(self, count: int, vol: float, vigorous: int = 100) -> dict[str, Any]:
-        self._require_physical_command_admission("mix_all")
         if self._forceabort():
             raise PipetteCommandError("Stopped by user or force abort")
         cycles = int(count)
@@ -1982,7 +1951,6 @@ class FourPipetteTransport:
         if vigor < 0 or vigor > 100:
             raise ValueError("vigorous must be between 0 and 100")
         selected = self._selected_channels()
-        self._require_liquid_mutation("mix all")
         effective_volume = float(self._tip_type)
         with self._transaction_lock:
             self._allow_to_stop = False
@@ -2006,7 +1974,6 @@ class FourPipetteTransport:
                 "channels": rows,
                 "oem_volume_source": "tip_type_derived",
                 "planned_wire_command": "composite P/D; no dedicated Mix command",
-                "liquid_mutation_enabled": self._liquid_mutation_enabled,
                 "physical_effect_verified": False,
             }
             self._last_group_transaction = dict(result)
@@ -2137,7 +2104,6 @@ class FourPipetteTransport:
         wait: bool = True,
         channels: list[int] | None = None,
     ) -> dict[str, Any]:
-        self._require_physical_command_admission("eject_all_tips")
         selected = self._selected_channels(channels)
         with self._transaction_lock:
             before = self.query_tip_status_all()
@@ -2202,7 +2168,6 @@ class FourPipetteTransport:
             }
 
     def KeepTip(self, tip: int) -> dict[str, Any]:  # noqa: N802
-        self._require_physical_command_admission("keep_tip")
         keep = self._selected_channels([int(tip)])[0]
         with self._transaction_lock:
             before = self.query_tip_status_all()
@@ -2287,7 +2252,6 @@ class FourPipetteTransport:
         expected_channels_with_tips: list[int],
     ) -> dict[str, Any]:
         """Fixed startup-only E1R sequence with mandatory postcondition readback."""
-        self._require_physical_command_admission("eject_all_tips_for_oem_startup")
         with self._transaction_lock:
             return self._eject_all_tips_for_oem_startup_locked(
                 operator_ack=operator_ack,
@@ -2366,13 +2330,6 @@ class FourPipetteTransport:
                 "ClassPipetteCollection.queryTipStatus:1336-1357",
             ],
         }
-
-    @staticmethod
-    def _mutation_blocked(operation: str) -> dict[str, Any]:
-        raise PipetteCommandError(
-            f"Pipette {operation} remains blocked by the accepted production safety envelope.",
-            details={"operation": operation, "liquid_mutation_enabled": False, "channel_count": 4},
-        )
 
     def aspirate(self, command: PipetteAspirateCommand) -> dict[str, Any]:
         before = None
