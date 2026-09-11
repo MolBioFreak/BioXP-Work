@@ -449,6 +449,9 @@ class Serial206ProductionPrimitiveAdapter:
 
     _MOTOR_METHODS = (
         "motor_oem_home_axis",
+        "motor_oem_axis_search_home",
+        "motor_oem_board_move_steps",
+        "motor_oem_confirm_thermal_door_closed",
         "motor_set_axis_param",
         "motor_move_relative",
         "motor_wait_stopped",
@@ -2506,6 +2509,12 @@ class Serial206ProductionPrimitiveAdapter:
         if str(axis).strip().lower() == "z" and kwargs.get("startup") is True:
             return self.z_startup_home(timeout_s=float(kwargs.get("timeout_s", 30.0)))
         return self.tester.motor_oem_home_axis(axis, *args, **kwargs)
+
+    def motor_oem_axis_search_home(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_axis_search_home(*args, **kwargs)
+
+    def motor_oem_move_absolute(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_move_absolute(*args, **kwargs)
 
     def motor_set_axis_param(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_axis_param(*args, **kwargs)
@@ -11632,13 +11641,30 @@ class Serial206OemInitializationProvider:
                         physical_motion_commanded=physical_motion_commanded,
                     )
 
+                source_call_completed = True
                 try:
                     if stage_key == "initializeMotion.initializeMotors":
                         preserved_motion = copy.deepcopy(motion)
                         stop_scripts = state["machine_status"].get("stop_scripts")
                         forceabort = state["machine_status"].get("forceabort")
-                        raw = self.initialize_motors(mode="live", timeout_s=float(timeout_s))
-                        refreshed = self._load_state()
+                        prior_commands = {row.get("command_id") for row in state["movement_ledger"]["stages"].values()}
+                        try:
+                            raw = self.initialize_motors(mode="live", timeout_s=float(timeout_s))
+                        except Exception as exc:
+                            raw = {"ok": False, "failure": str(exc)}
+                            source_call_completed = False
+                        # A motor-stage exception follows durable partial progress.
+                        # Never overwrite it with the caller's pre-motor snapshot.
+                        try:
+                            refreshed = self._load_state()
+                        except Exception as exc:
+                            return {
+                                "ok": False, "ready": False, "state": "ambiguous",
+                                "failure": f"initializeMotors_state_reload_failed:{exc}",
+                                "physical_motion_commanded": None,
+                                "physical_effect_verified": False,
+                                "physical_outcome": "unknown", "recovery_hold": True,
+                            }
                         refreshed["initialize_motion_ledger"] = preserved_motion
                         refreshed["machine_status"]["stop_scripts"] = stop_scripts
                         refreshed["machine_status"]["forceabort"] = forceabort
@@ -11646,6 +11672,13 @@ class Serial206OemInitializationProvider:
                         motion = state["initialize_motion_ledger"]
                         receipts = motion["stage_receipts"]
                         receipt = receipts[-1]
+                        if not source_call_completed:
+                            raw["physical_motion_commanded"] = any(
+                                row.get("command_id") not in prior_commands
+                                and _SPEC_BY_KEY[key].movement
+                                and row.get("state") != "pending"
+                                for key, row in state["movement_ledger"]["stages"].items()
+                            )
                     else:
                         raw = self._execute_initialize_motion_stage(
                             state,
@@ -11657,11 +11690,12 @@ class Serial206OemInitializationProvider:
                 except Exception as exc:
                     raw_result = {"ok": False, "failure": str(exc)}
                     stage_ok = False
+                    source_call_completed = False
 
                 receipt.update({
                     "status": "completed" if stage_ok else "failed",
                     "ok": stage_ok,
-                    "source_call_completed": True,
+                    "source_call_completed": source_call_completed,
                     "source_return_ok": stage_ok,
                     "failure": None if stage_ok else str(raw_result.get("failure") or "initializeMotion_source_call_failed"),
                     "raw_result": _json_safe(raw_result),
@@ -11723,6 +11757,7 @@ class Serial206OemInitializationProvider:
             "opened_usb": bool(physical_motion_commanded),
             "physical_motion_commanded": bool(physical_motion_commanded),
             "physical_effect_verified": False,
+            "failure": blockers[0] if blockers else None,
             "blockers": list(blockers),
             "initialize_motion_ledger": _json_safe(motion),
             "movement_ledger": _json_safe(state.get("movement_ledger") if isinstance(state, Mapping) else None),

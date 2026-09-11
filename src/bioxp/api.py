@@ -8705,15 +8705,16 @@ def _run_idempotent_serial206_initialization(
         else:
             result = provider.initialize_motion(mode="live", timeout_s=float(timeout_s))
     except Exception as exc:
-        result = {"ok": False, "state": "failed", "failure": f"initialization_source_exception:{type(exc).__name__}", "physical_motion_commanded": False}
+        result = {"ok": False, "state": "ambiguous", "failure": f"initialization_source_exception:{type(exc).__name__}:{exc}", "physical_motion_commanded": None, "physical_outcome": "unknown", "recovery_hold": True}
     result_payload = dict(result) if isinstance(result, Mapping) else {"ok": False, "state": "failed", "failure": "initialization_source_return_not_mapping", "source_return": _json_safe(result)}
-    final_status = "completed" if result_payload.get("ok") is True else "failed"
+    recovery_hold = result_payload.get("recovery_hold") is True
+    final_status = "ambiguous" if recovery_hold else ("completed" if result_payload.get("ok") is True else "failed")
     finished = {**admission, "status": final_status, "finished_at": time.time(), "response": _json_safe(result_payload)}
     try:
         store.append_serial206_receipt(initialization_kind, finished)
     except Exception as exc:
         return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "recovery_required", "recovery_hold": True, "persistence_error": f"initialization_terminal_persistence_failed:{type(exc).__name__}"}
-    return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "committed", "recovery_hold": False}
+    return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "committed", "recovery_hold": recovery_hold}
 
 
 @app.get("/motion/oem/initialization/provider-status")
