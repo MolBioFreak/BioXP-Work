@@ -2870,6 +2870,7 @@ class BioXpTester:
         return {"board": int(board_id), "param": int(param), "motor": int(motor), "ack": ack, "value": val}
 
     def motor_set_axis_param(self, board_id, param, value, motor=0):
+        profile_generation = getattr(self, "_oem_active_board_lifecycle_generation", None)
         transmit_budget_ms = 1000 if int(param) in {5, 6} else 60000
         ack = self._send_motor(
             int(board_id),
@@ -2886,6 +2887,15 @@ class BioXpTester:
             allow_recover=False, ordinary_motor_retry=True,
         )
         ack_success = self._tmcl_success(ack)
+        # OEM homing and ordinary owned controls change these settings after
+        # initialization. Retain only acknowledged changes on prepared axes.
+        profile_key = {4: "speed", 5: "acceleration", 6: "current", 205: "stall_threshold"}.get(int(param))
+        if ack_success and profile_key and type(profile_generation) is int:
+            for axis, profile in tuple(getattr(self, "_oem_no_motion_profile_fingerprints", {}).items()):
+                if (getattr(self, "_oem_active_board_lifecycle_generation", None) == profile_generation
+                        and getattr(self, "_oem_no_motion_profile_generations", {}).get(axis) == profile_generation
+                        and profile.get("board") == int(board_id) and profile.get("motor") == int(motor)):
+                    profile[profile_key] = int(value)
         source_return_code = 0 if ack is None or ack_success else 1
         return {
             "board": int(board_id),
@@ -5744,11 +5754,12 @@ class BioXpTester:
         preset = {str(key): value for key, value in preset_raw.items()}
         board = int(preset["board"])
         motor = int(preset["motor"])
+        profile = getattr(self, "_oem_no_motion_profile_fingerprints", {}).get(key, {})
         expected = {
-            4: int(preset["speed"]),
-            5: int(preset["acc"]),
-            6: int(preset["run_current"]),
-            205: int(preset["stall_guard"]),
+            4: int(profile.get("speed", preset["speed"])),
+            5: int(profile.get("acceleration", preset["acc"])),
+            6: int(profile.get("current", preset["run_current"])),
+            205: int(profile.get("stall_threshold", preset["stall_guard"])),
         }
         if expected_overrides is not None:
             if key not in {"x", "z"} or not isinstance(expected_overrides, dict):

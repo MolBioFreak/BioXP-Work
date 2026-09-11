@@ -713,6 +713,9 @@ class Serial206ProductionPrimitiveAdapter:
         value = getattr(self.tester, "_oem_active_board_lifecycle_generation", None)
         return int(value) if type(value) is int else None
 
+    def motor_get_position(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_get_position(*args, **kwargs)
+
     def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_home(*args, **kwargs)
 
@@ -5955,7 +5958,7 @@ class Serial206OemInitializationProvider:
     def prepare_global_motion_without_motion(
         self, tester: Any, *, authority: Serial206MotionAuthority,
     ) -> dict[str, Any]:
-        """Publish X preparation from this global transaction, never a cached profile.
+        """Publish axis preparation from this verified global transaction.
 
         ControlLib:983 calls initializeMotorsWithoutMotion, whose X setup is
         ClassControlInterface:3187-3195. That setup supplies preparation, not
@@ -5968,6 +5971,18 @@ class Serial206OemInitializationProvider:
                 if self._x_interrupt_active:
                     return {"ok": False, "failure": "x_safety_interrupt_in_progress",
                             "physical_motion_commanded": False}
+            with self._z_interrupt_state_lock:
+                z_interrupt_epoch = self._z_interrupt_epoch
+                if self._z_interrupt_active:
+                    return {"ok": False, "failure": "z_safety_interrupt_in_progress",
+                            "physical_motion_commanded": False}
+            interrupt_reader = getattr(self.state_store, "axis_interrupt_snapshot", None)
+            axis_interrupts: dict[str, Any] = {
+                axis: interrupt_reader(axis) for axis in ("y", "z", "gripper")
+            } if callable(interrupt_reader) else {}
+            if any(row.get("active") for row in axis_interrupts.values()):
+                return {"ok": False, "failure": "board4_safety_interrupt_in_progress",
+                        "physical_motion_commanded": False}
             raw = prepare_motion_without_motion(tester, authority=authority)
             if not isinstance(raw, Mapping) or raw.get("ok") is not True:
                 return dict(raw) if isinstance(raw, Mapping) else {
@@ -5993,9 +6008,54 @@ class Serial206OemInitializationProvider:
             x_component_present = {
                 row.get("label") for row in x_rows if row.get("ok") is True
             }.issuperset({"x.setMaxSpeed", "x.setMaxAcc", "x.setMaxCurrent", "x.setStallGuardThreshold"})
-            with self._x_interrupt_state_lock:
+            # Reuse this transaction's exact GAP receipts and generation-bound
+            # cache. Calling per-axis prepare here would repeat controller setup.
+            readback_evidence = next((
+                row.get("controller_evidence") for row in stages
+                if isinstance(row, Mapping) and row.get("stage_id") == "parameter_readback"
+                and row.get("status") == "passed"
+            ), {})
+            readbacks = readback_evidence.get("readbacks", []) if isinstance(readback_evidence, Mapping) else []
+            fingerprints = getattr(tester, "_oem_no_motion_profile_fingerprints", {})
+            profile_generations = getattr(tester, "_oem_no_motion_profile_generations", {})
+            ready = getattr(tester, "_oem_no_motion_profiles_ready", set())
+            component_receipts: dict[str, Any] = {}
+            for axis, component, motor, parameters in (
+                ("y", "y", 0, {4, 5, 6, 205, 12}),
+                ("z", "z", 1, {4, 5, 6, 205}),
+                ("gripper", "g", 2, {4, 5, 6, 205, 153, 154}),
+            ):
+                rows = [row for row in readbacks if isinstance(row, Mapping)
+                        and row.get("board") == 4 and row.get("motor") == motor
+                        and str(row.get("label", "")).startswith(f"{component}.")]
+                fingerprint = fingerprints.get(component)
+                if not (
+                    component in ready and profile_generations.get(component) == board_generation
+                    and isinstance(fingerprint, Mapping)
+                    and fingerprint.get("board") == 4 and fingerprint.get("motor") == motor
+                    and {row.get("parameter") for row in rows if row.get("matched") is True}.issuperset(parameters)
+                    and all(row.get("matched") is True for row in rows)
+                ):
+                    return {**result, "ok": False,
+                            "failure": f"global_preparation_{axis}_component_receipt_missing"}
+                component_receipts[axis] = {
+                    "ok": True, "axis": axis, "board": 4, "motor": motor,
+                    "observed_generation": generation,
+                    "board_lifecycle_generation": board_generation,
+                    "board_preparation_verified": True,
+                    "initialize_without_motion_verified": True,
+                    "physical_motion": False, "homing_performed": False,
+                    "reference_state": "desynced",
+                    "profile_fingerprint": hashlib.sha256(json.dumps(
+                        dict(fingerprint), sort_keys=True, separators=(",", ":"),
+                        allow_nan=False).encode()).hexdigest(),
+                    "readbacks": _json_safe(rows),
+                }
+            with self._x_interrupt_state_lock, self._z_interrupt_state_lock:
                 failure = None
-                if self._x_interrupt_active or interrupt_epoch != self._x_interrupt_epoch:
+                if self._z_interrupt_active or z_interrupt_epoch != self._z_interrupt_epoch:
+                    failure = "global_preparation_interrupted_by_z_safety_command"
+                elif self._x_interrupt_active or interrupt_epoch != self._x_interrupt_epoch:
                     failure = "global_preparation_interrupted_by_x_safety_command"
                 elif generation != int(self.generation_provider()):
                     failure = "ownership_generation_changed_during_global_preparation"
@@ -6036,6 +6096,38 @@ class Serial206OemInitializationProvider:
                     # Reload after the board callbacks have invalidated authority;
                     # do not overwrite their changes to the other axis lifecycles.
                     state = self._load_state()
+                    if self.state_store is not None:
+                        board4 = self.state_store.board4_authority_projection()
+                        if (board4["board"].get("state") != "active"
+                                or type(board4["board"].get("active_board_epoch")) is not int):
+                            raise RuntimeError("global_preparation_board4_epoch_not_current")
+                        for axis, component_receipt in component_receipts.items():
+                            published = self.state_store.prepare_axis_authority(
+                                axis, ownership_generation=generation,
+                                profile_fingerprint=component_receipt["profile_fingerprint"],
+                                expected_interrupt_epoch=board4["axes"][axis]["interrupt_epoch"],
+                                expected_software_interrupt_epoch=axis_interrupts[axis]["epoch"],
+                            )
+                            if not isinstance(published, Mapping) or published.get("ok") is not True:
+                                raise RuntimeError(f"global_preparation_{axis}_authority_publication_failed")
+                            component_receipt["authority"] = _json_safe(published)
+                        if self.state_store.board4_authority_projection()["board"] != board4["board"]:
+                            raise RuntimeError("global_preparation_board4_changed_during_publication")
+                    if (generation != int(self.generation_provider())
+                            or board_generation != self.preparation_provider.current_board_lifecycle_generation()
+                            or (callable(interrupt_reader) and any(interrupt_reader(axis) != snapshot
+                                    for axis, snapshot in axis_interrupts.items()))):
+                        raise RuntimeError("global_preparation_authority_changed_during_publication")
+                    state["z_lifecycle"].update({
+                        "state": "prepared_unreferenced",
+                        "generation": generation,
+                        "board_lifecycle_generation": board_generation,
+                        "prepared_receipt": _json_safe(component_receipts["z"]),
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "awaiting_observation_receipt_id": None,
+                        "last_failure": None,
+                    })
                     state["x_lifecycle"].update({
                         "state": "prepared_unreferenced",
                         "generation": generation,
@@ -6050,10 +6142,11 @@ class Serial206OemInitializationProvider:
                     self._save_state(state)
                 except Exception as exc:
                     return {**result, "ok": False,
-                            "failure": "x_global_preparation_publication_failed",
+                            "failure": "global_preparation_publication_failed",
                             "error": f"{type(exc).__name__}: {exc}"}
             return {**result, "generation": generation,
-                    "x_prepare_receipt": _json_safe(receipt)}
+                    "x_prepare_receipt": _json_safe(receipt),
+                    "component_prepare_receipts": _json_safe(component_receipts)}
 
     def execute_x_intent(self, intent: str, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -11371,6 +11464,149 @@ class Serial206OemInitializationProvider:
             blockers.append(f"idempotency_key_required:{spec.key}")
         return blockers
 
+    def _aggregate_reference_fence(self, state: Mapping[str, Any], axis: str) -> dict[str, Any]:
+        """Existing preparation/interrupt authority only; never prepare by inference."""
+        generation = int(self.generation_provider())
+        board_generation = self.preparation_provider.current_board_lifecycle_generation()
+        if type(board_generation) is not int:
+            raise RuntimeError("aggregate_reference_board_generation_unavailable")
+        with self._x_interrupt_state_lock, self._z_interrupt_state_lock:
+            if (self._x_interrupt_active or self._z_interrupt_active
+                    or self._x_interrupt_recovery_required or self._z_interrupt_recovery_required):
+                raise RuntimeError("aggregate_reference_interrupted")
+            fence = {"generation": generation, "board_generation": board_generation,
+                     "x_interrupt": self._x_interrupt_epoch, "z_interrupt": self._z_interrupt_epoch}
+        if axis in {"x", "z"}:
+            lifecycle = state[f"{axis}_lifecycle"]
+            if (lifecycle.get("generation") != generation
+                    or lifecycle.get("board_lifecycle_generation") != board_generation
+                    or lifecycle.get("state") not in {"prepared_unreferenced", "referenced_ready"}
+                    or lifecycle.get("active_receipt") is not None
+                    or lifecycle.get("pending_ticket") is not None):
+                raise RuntimeError(f"aggregate_reference_lifecycle_not_current:{axis}")
+        if axis != "x":
+            if self.state_store is None:
+                raise RuntimeError("aggregate_reference_board_authority_unavailable")
+            authority = self.state_store.board4_authority_projection()
+            board, row = authority["board"], authority["axes"]["gripper" if axis == "g" else axis]
+            if (board.get("state") != "active" or type(board.get("active_board_epoch")) is not int
+                    or row.get("prepared_board_epoch") != board["active_board_epoch"]
+                    or row.get("ownership_generation") != generation
+                    or row.get("lifecycle_state") not in {"prepared_unreferenced", "referenced_ready"}
+                    or row.get("pending_ticket") is not None
+                    or row.get("software_interrupt_active") is not False
+                    or type(row.get("interrupt_epoch")) is not int
+                    or type(row.get("software_interrupt_epoch")) is not int):
+                raise RuntimeError(f"aggregate_reference_board_authority_not_current:{axis}")
+            fence.update(board_epoch=board["active_board_epoch"],
+                         interrupt_epoch=row["interrupt_epoch"],
+                         software_interrupt_epoch=row["software_interrupt_epoch"])
+        return fence
+
+    def _publish_aggregate_reference(
+        self, state: dict[str, Any], receipt: dict[str, Any], home: Any,
+        fence: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Publish controller-only evidence, without changing the OEM source return."""
+        axis = receipt["component"]
+        publication: dict[str, Any] = {"published": False, "physical_effect_verified": False,
+                                       "operator_observation": None, "controller_position_observation": None}
+        receipt["reference_publication"] = publication
+        attempted = False
+        try:
+            if self.reference_store is None or self.state_store is None or fence is None:
+                raise RuntimeError("aggregate_reference_current_durable_authority_unavailable")
+            if "blocker" in fence:
+                raise RuntimeError(str(fence["blocker"]))
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            # X/Y wrap axisSearchHome; G/Z return it directly. Do not recursively
+            # hunt for any convenient True flag in a diagnostic receipt.
+            search = home.get("home") if axis in {"x", "y"} and isinstance(home, Mapping) else home
+            leaf = search.get("go_home") if isinstance(search, Mapping) else None
+            if not (isinstance(search, Mapping) and isinstance(leaf, Mapping) and leaf.get("ok") is True
+                    and leaf.get("axis") == axis
+                    and all(leaf.get(key) is True for key in (
+                        "controller_command_acknowledged", "controller_terminal_state_verified",
+                        "controller_home_proof_verified"))
+                    and not leaf.get("source_noop") and not search.get("source_noop")):
+                raise RuntimeError("aggregate_reference_controller_home_not_verified")
+            zero = receipt["raw_result"] if axis in {"x", "y"} else leaf.get("set_home")
+            ack = zero.get("ack") if isinstance(zero, Mapping) else None
+            if not (isinstance(ack, Mapping) and type(ack.get("status")) is int and ack["status"] == 100):
+                raise RuntimeError("aggregate_reference_zero_write_not_acknowledged")
+            publication["controller_home_evidence"] = {
+                key: _json_safe(leaf.get(key)) for key in (
+                    "axis", "board", "motor", "controller_command_acknowledged",
+                    "controller_terminal_state_verified", "controller_home_proof_verified",
+                )
+            }
+            publication["zero_write_ack"] = _json_safe(ack)
+            board, motor = {"x": (5, 0), "y": (4, 0), "z": (4, 1), "g": (4, 2)}[axis]
+            position = self.primitives.motor_get_position(board, motor=motor)
+            publication["controller_position_observation"] = {
+                "source": "post_source_stage_controller_GAP1", "stage": receipt["stage"],
+                "board": board, "motor": motor, "result": _json_safe(position),
+                "observed_at": time.time(), "not_oem_source_receipt": True,
+            }
+            ack = position.get("ack") if isinstance(position, Mapping) else None
+            if not (isinstance(position, Mapping)
+                    and type(position.get("position")) is int and position["position"] == 0
+                    and isinstance(ack, Mapping) and type(ack.get("status")) is int and ack["status"] == 100):
+                raise RuntimeError("aggregate_reference_current_zero_not_verified")
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            # Persist evidence and the existing lifecycle/board authority BEFORE
+            # the reference row (the deck gate). Compensate every partial commit.
+            attempted = True
+            if axis != "x":
+                authority = self.state_store.publish_axis_reference(
+                    "gripper" if axis == "g" else axis, position_steps=position["position"], ownership_generation=fence["generation"],
+                    receipt_id=receipt["command_id"], expected_interrupt_epoch=fence["interrupt_epoch"],
+                    expected_software_interrupt_epoch=fence["software_interrupt_epoch"],
+                )
+                if not isinstance(authority, Mapping) or authority.get("ok") is not True:
+                    raise RuntimeError("aggregate_reference_board_publication_failed")
+            if axis in {"x", "z"}:
+                state[f"{axis}_lifecycle"].update(
+                    state="referenced_ready", reference_state="referenced", last_failure=None,
+                    awaiting_observation_receipt_id=None,
+                )
+            publication["fence"] = dict(fence)
+            state["movement_ledger"]["stages"][receipt["stage"]]["result"] = _json_safe(receipt)
+            self._save_state(state)
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(
+                axis=axis, position_steps=position["position"],
+                source="serial206.initializeMotors.controller_verified_home",
+                note=f"Returned home/zero evidence plus separate current GAP1 at {receipt['stage']}; no physical observation.",
+                motion_kind="oem_initialize_motors_home",
+            ))
+            if not self._z_reference_commit_verified(reference, expected_state="referenced"):
+                raise RuntimeError("aggregate_reference_persistence_failed")
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            publication["published"] = True
+        except Exception as exc:
+            publication["blocker"] = str(exc)
+            if attempted:
+                assert self.reference_store is not None and self.state_store is not None
+                # Reference recovery fails closed globally if a targeted durable
+                # invalidation cannot be confirmed. Board recovery also latches.
+                try:
+                    invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis=axis, reason=str(exc), source="serial206.initializeMotors.publication_failure"))
+                    if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                        raise RuntimeError("aggregate_reference_invalidation_failed")
+                except Exception:
+                    self.reference_store.recover_untrusted_authority(str(exc))
+                if axis != "x":
+                    self.state_store.require_axis_reconciliation("gripper" if axis == "g" else axis, receipt_id=receipt["command_id"])
+                if axis in {"x", "z"}:
+                    state[f"{axis}_lifecycle"].update(state="failed_latched", reference_state="desynced", last_failure=str(exc))
+        return publication
+
     def initialize_motors(
         self,
         *,
@@ -11415,6 +11651,25 @@ class Serial206OemInitializationProvider:
             stage_receipts: list[dict[str, Any]] = []
             motion_commanded = False
             run_id = f"initialize-motors-{time.time_ns()}"
+            home_results: dict[str, Any] = {}
+            reference_fences: dict[str, Any] = {}
+            reference_publications: dict[str, Any] = {}
+            # A new home may partially zero/move before throwing. Old reference
+            # rows must not survive as usable evidence of this run.
+            if self.reference_store is not None:
+                invalidation = self.reference_store.mark_desynced_many([
+                    MarkAxisDesyncedCommand(axis=axis, reason="initializeMotors new source run",
+                                            source="serial206.initializeMotors")
+                    for axis in ("x", "y", "z", "g")
+                ])
+                if invalidation.get("ok") is not True or invalidation.get("durable_clean") is not True:
+                    self.reference_store.recover_untrusted_authority("initializeMotors invalidation failed")
+                    return self._failure("failed_closed", ["aggregate_reference_invalidation_failed"])
+            for axis in ("x", "y", "z", "g"):
+                try:
+                    reference_fences[axis] = self._aggregate_reference_fence(state, axis)
+                except Exception as exc:
+                    reference_fences[axis] = {"blocker": str(exc)}
 
             for spec in SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS:
                 row = ledger["stages"][spec.key]
@@ -11471,6 +11726,12 @@ class Serial206OemInitializationProvider:
                     "physical_effect_verified": False,
                     "raw_result": _json_safe(raw_mapping),
                 }
+                if stage_ok and spec.key in {"z-home", "gripper-home", "x-home", "y-home"}:
+                    home_results[spec.component] = raw_mapping
+                if stage_ok and spec.key in {"z-home", "gripper-home", "x-set-home", "y-set-home"}:
+                    reference_publications[spec.component] = self._publish_aggregate_reference(
+                        state, receipt, home_results.get(spec.component), reference_fences.get(spec.component),
+                    )
                 row["result"] = _json_safe(receipt)
                 row["state"] = "completed" if stage_ok else "failed"
                 stage_receipts.append(receipt)
@@ -11480,9 +11741,15 @@ class Serial206OemInitializationProvider:
                     advance_initialize_motors_ledger(ledger, spec.key)
                 else:
                     ledger["terminal_state"] = "failed"
+                    if self.reference_store is not None:
+                        # A thrown source move (including X park) has no trusted
+                        # terminal result; do not retain aggregate motion authority.
+                        self.reference_store.recover_untrusted_authority("initializeMotors source exception")
                 try:
                     self._save_state(state)
                 except Exception:
+                    if self.reference_store is not None:
+                        self.reference_store.recover_untrusted_authority("initializeMotors result persistence failed")
                     return self._failure(
                         "failed_closed",
                         ["durable_stage_result_persistence_failed"],
@@ -11495,7 +11762,7 @@ class Serial206OemInitializationProvider:
                     if source_exception is not None:
                         raise source_exception
 
-            return self._result_from_state(
+            result = self._result_from_state(
                 state,
                 ok=True,
                 blockers=[],
@@ -11503,6 +11770,31 @@ class Serial206OemInitializationProvider:
                 stage_receipts=stage_receipts,
                 physical_motion_commanded=motion_commanded,
             )
+            for axis, publication in reference_publications.items():
+                if publication.get("published") is True:
+                    try:
+                        if reference_fences[axis] != self._aggregate_reference_fence(state, axis):
+                            raise RuntimeError("aggregate_reference_fence_changed")
+                    except Exception as exc:
+                        publication.update(published=False, blocker=str(exc))
+                        if self.reference_store is not None:
+                            self.reference_store.recover_untrusted_authority("initializeMotors completion fence changed")
+            if self.reference_store is not None:
+                current_references = self.reference_store.snapshot(("x", "y", "z", "g"))
+                for axis, publication in reference_publications.items():
+                    if (publication.get("published") is True
+                            and (current_references.get("durable_clean") is not True
+                                 or current_references.get("rows", {}).get(axis, {}).get("state") != "referenced")):
+                        publication.update(published=False, blocker="aggregate_reference_no_longer_current")
+            result["reference_publications"] = reference_publications
+            result["reference_blockers"] = [
+                f"{axis}:{reference_publications.get(axis, {}).get('blocker', 'not_published')}"
+                for axis in ("x", "y", "z", "g")
+                if reference_publications.get(axis, {}).get("published") is not True
+            ]
+            result["door_reference_blocker"] = "aggregate_door_board_lifecycle_publication_not_bound"
+            result["ready"] = result["ready"] and not result["reference_blockers"]
+            return result
 
     def record_observation(
         self,

@@ -3932,11 +3932,7 @@ def _execute_relative_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if axis is AxisName.Z
-            else tester.motor_prepare_motion_interlock(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             raise HTTPException(status_code=409, detail={
                 "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
@@ -3949,7 +3945,7 @@ def _execute_relative_move(
             "source_anchor": "ClassControlInterface.cs:4165-4204",
             "axis_profile_rewritten": False,
             "standby_current_param7_written": False,
-            "note": "OEM moveSteps does not rewrite speed, acceleration, current, or switch masks; only the OEM XYZ wake/interlock path ran.",
+            "note": "OEM moveSteps does not rewrite speed, acceleration, current, or switch masks; the prepared profile is preserved and the interlock is freshly observed.",
         }
         prep_policy = {
             "mode": "oem_exact",
@@ -4130,11 +4126,7 @@ def _execute_absolute_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if axis is AxisName.Z
-            else tester.motor_prepare_motion_interlock(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             raise HTTPException(status_code=409, detail={
                 "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
@@ -6885,10 +6877,8 @@ async def motion_oem_prepare_without_motion():
                 "ok": False,
                 "failure": "global_motion_preparation_result_invalid",
             }
-        # Z preparation is now owned by the first explicit Z action. The
-        # retired direct provider mutation must not block global non-motion
-        # preparation or claim a Z reference before the required Z home.
-        z_receipt = {
+        # Forward preparation evidence; preparation is not a Z home/reference.
+        z_receipt = (global_result.get("component_prepare_receipts") or {}).get("z") or {
             "ok": True,
             "physical_motion_commanded": False,
             "state": "deferred_to_explicit_z_action",
@@ -8313,11 +8303,7 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     _require_oem_no_motion_profile_or_409(tester, req.axis)
 
     def execute() -> dict[str, Any]:
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if req.axis == "z"
-            else getattr(tester, "motor_prepare_motion_interlock")(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             return {
                 "ok": False,

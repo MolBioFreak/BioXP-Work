@@ -33,6 +33,7 @@ class AxisReferenceRecord:
     note: str | None = None
     updated_at: str | None = None
     last_motion_kind: str | None = None
+    state_version: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -43,6 +44,7 @@ class AxisReferenceRecord:
             "note": self.note,
             "updated_at": self.updated_at,
             "last_motion_kind": self.last_motion_kind,
+            "state_version": self.state_version,
         }
 
 
@@ -170,7 +172,15 @@ class ReferenceStateStore:
                         return self._failure([], "reference_state_disk_unreadable")
                     previous = dict(self._rows)
                     self._rows = dict(loaded)
-                    return self._commit_candidate_locked({}, previous)
+                    # Keep unknown tombstones so reset cannot reuse an old version.
+                    candidate = {
+                        axis: AxisReferenceRecord(
+                            axis=axis, state=ReferenceState.UNKNOWN,
+                            state_version=record.state_version + 1,
+                        )
+                        for axis, record in loaded.items()
+                    }
+                    return self._commit_candidate_locked(candidate, previous)
             except ReferenceStateAuthorityError as exc:
                 self._authority_untrusted = True
                 return self._failure([], str(exc))
@@ -234,9 +244,11 @@ class ReferenceStateStore:
             proposed: list[AxisReferenceRecord] = []
             for command in commands:
                 axis = _axis_value(command.axis)
+                previous = candidate.get(axis)
                 record = AxisReferenceRecord(
                     axis=axis,
                     state=ReferenceState.REFERENCED,
+                    state_version=1 if previous is None else previous.state_version + 1,
                     origin_position_steps=int(command.position_steps),
                     source=_normalize_text(command.source, fallback="manual"),
                     note=_normalize_optional_text(command.note),
@@ -264,6 +276,7 @@ class ReferenceStateStore:
                 record = AxisReferenceRecord(
                     axis=axis,
                     state=ReferenceState.DESYNCED,
+                    state_version=1 if previous is None else previous.state_version + 1,
                     origin_position_steps=None if previous is None else previous.origin_position_steps,
                     source=_normalize_text(command.source, fallback="manual"),
                     note=_normalize_text(command.reason, fallback="desynced"),
@@ -294,6 +307,7 @@ class ReferenceStateStore:
                     record = AxisReferenceRecord(
                         axis=axis_key,
                         state=ReferenceState.UNKNOWN,
+                        state_version=1,
                         updated_at=_utc_now(),
                         last_motion_kind=normalized_kind,
                     )
@@ -301,6 +315,7 @@ class ReferenceStateStore:
                     record = AxisReferenceRecord(
                         axis=previous.axis,
                         state=previous.state,
+                        state_version=previous.state_version + 1,
                         origin_position_steps=previous.origin_position_steps,
                         source=previous.source,
                         note=previous.note,
@@ -334,6 +349,7 @@ class ReferenceStateStore:
                         replacement = AxisReferenceRecord(
                             axis=record.axis,
                             state=ReferenceState.DESYNCED,
+                            state_version=record.state_version + 1,
                             origin_position_steps=record.origin_position_steps,
                             source="reference_recovery",
                             note=_normalize_text(reason, fallback="reference authority recovery"),
@@ -482,9 +498,15 @@ class ReferenceStateStore:
             state = _normalize_reference_state(row.get("state"))
             if state is None:
                 continue
+            # Missing versions are legacy baseline metadata, not reference proof.
+            state_version = row.get("state_version", 0)
+            if type(state_version) is not int or state_version < 0:
+                logger.warning("Invalid reference state version for axis %s", axis)
+                return None
             loaded[str(axis)] = AxisReferenceRecord(
                 axis=str(row.get("axis", axis)),
                 state=state,
+                state_version=state_version,
                 origin_position_steps=_normalize_optional_int(row.get("origin_position_steps")),
                 source=_normalize_optional_text(row.get("source")),
                 note=_normalize_optional_text(row.get("note")),
