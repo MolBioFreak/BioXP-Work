@@ -485,10 +485,18 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
         "canonical_snapshot", "Canonical hardware snapshot", snapshot_present,
         "Fresh canonical hardware snapshot is unavailable.",
     ))
-    freshness = machine_state.get("freshness") if isinstance(machine_state.get("freshness"), Mapping) else {}
-    freshness_reason = "Canonical hardware snapshot is stale." if freshness.get("state") == "stale" else "Fresh canonical hardware snapshot is unavailable."
+    # Admission needs current motion evidence, not unrelated thermal/pipette
+    # telemetry. project(independent_domains=True) preserves each domain's age
+    # even when the combined display projection is incomplete.
+    domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
+    motion_domains = [domains.get(name) or {} for name in ("axes", "power", "latch", "interlock")]
+    motion_freshness = [row.get("freshness") or {} for row in motion_domains]
+    freshness_reason = "Canonical motion snapshot is stale." if any(row.get("state") == "stale" for row in motion_freshness) else "Fresh motion hardware observations are unavailable."
     dependencies.append(_dependency(
-        "snapshot_fresh", "Canonical snapshot fresh", freshness.get("state") == "fresh", freshness_reason,
+        "snapshot_fresh", "Motion observations fresh",
+        all(row.get("status") == "observed" for row in motion_domains)
+        and all(row.get("state") == "fresh" for row in motion_freshness),
+        freshness_reason,
     ))
     maintenance_value = machine_state.get("maintenance")
     maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
@@ -497,7 +505,6 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
         "motion_enabled", "Motion enabled", motion_enabled,
         "Motion is inactive. Activate motion before moving this motor.",
     ))
-    domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
     power_row = domains.get("power") if isinstance(domains.get("power"), Mapping) else {}
     power = power_row.get("observation") if isinstance(power_row, Mapping) else None
     dependencies.append(_dependency(
