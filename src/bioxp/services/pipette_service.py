@@ -286,6 +286,10 @@ async def _run_transport_call(
         )
         binding = effective_runtime_binding
         outer_command_id = dispatch_context.get("operator_command_id")
+        # Lifecycle steps have their own keys; only direct pipette actions share the outer claim.
+        if outer_command_id and binding.get("caller_class") == "lifecycle":
+            binding["parent_operator_command_id"] = str(outer_command_id)
+            outer_command_id = None
         direct_command_id = binding.get("command_id")
         current_ownership_generation = int(hardware_state.ownership_epoch)
         requested_ownership_generation = binding.get("ownership_generation")
