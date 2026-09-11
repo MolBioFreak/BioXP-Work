@@ -2220,12 +2220,12 @@ class _OperatorPollCache:
                 cold_turn_due = bool(self._cold_waiting)
                 self._cold_waiting = {view: requested for view, requested in self._cold_waiting.items()
                                       if now - requested < 0.5}
-                if cached is None:
+                if cached is None or now - cached[1] >= 15.0:
                     self._cold_waiting[key] = now
-                # A hot caller cannot continually take the refresh slot from
-                # cold views that have requested it. This finite demand set is
-                # metadata fairness, not a queue of robot actions/work items.
-                can_refresh = cached is None or not (cold_turn_due or self._cold_waiting)
+                # Expired hot views need the same fair refresh turn as cold
+                # views; otherwise a frequently polled catalog can indefinitely
+                # starve the dashboard. This records demand, not queued work.
+                can_refresh = key in self._cold_waiting or not (cold_turn_due or self._cold_waiting)
                 if (self._pending is None or self._pending.done()) and can_refresh:
                     def collect():
                         token = _PASSIVE_OPERATOR_POLL.set(True)
