@@ -1072,11 +1072,17 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
 def _bounded_telemetry(state: Mapping[str, Any]) -> dict[str, Any]:
     """Public read-only telemetry; never replace source time with poll time.
 
-    Full provider receipts remain at their existing detail endpoints. If a
-    projection exceeds the hot-path evidence budget, report a bounded explicit
-    service error with the full-detail path, rather than silently return null.
+    Bound wire-detail fields, not channel state or control availability.
+    Full provider receipts remain at their existing detail endpoints.
     """
     payload = _dashboard_payload(state)
+    pipettes = payload["pipettes"]
+    pipettes["last_group_transaction"] = _bounded_json(pipettes.get("last_group_transaction"), 4096)
+    pipettes["channels"] = [
+        {**row, "last_transaction": _bounded_json(row.get("last_transaction"), 2048)}
+        if isinstance(row, Mapping) else row
+        for row in pipettes.get("channels", [])
+    ]
     domains = state.get("domains") or {}
     observations = {
         name: row.get("observed_unix")
@@ -1100,11 +1106,6 @@ def _bounded_telemetry(state: Mapping[str, Any]) -> dict[str, Any]:
     if not valid_times:
         snapshot["freshness"] = {"state": "missing", "age_s": None,
                                  "fresh_for_s": snapshot["freshness"].get("fresh_for_s")}
-    if len(json.dumps(payload, default=str).encode()) > 64 * 1024:
-        raise HTTPException(503, detail={
-            "error": "telemetry_projection_exceeds_64kib",
-            "detail_path": "/operator/dashboard",
-        })
     return payload
 
 
