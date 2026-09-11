@@ -44,6 +44,7 @@ READ_ONLY_PIPETTE_OPERATIONS = frozenset({
     "query_pressure",
     "read_pressure",
     "query_tip_status",
+    "query_all_pipette_tip_states",
     "query_error_log",
     "get_data",
     "get_all_data",
@@ -104,14 +105,13 @@ def _query_result_without_mutation_claims(value: Any) -> Any:
 def _semantic_query_correlation(value: Any) -> tuple[int, bool]:
     """Count command-correlated semantic query leaves without inferring ACK truth."""
     if isinstance(value, Mapping):
-        count = 0
-        valid = True
         if "query_response_correlated" in value:
-            count = 1
-            valid = (
+            return 1, (
                 value.get("query_response_correlated") is True
                 and value.get("semantic_ok") is True
             )
+        count = 0
+        valid = True
         for item in value.values():
             child_count, child_valid = _semantic_query_correlation(item)
             count += child_count

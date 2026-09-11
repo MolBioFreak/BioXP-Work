@@ -315,6 +315,13 @@ _NO_MOTION_PREPARATION_PATHS = {
 }
 
 
+_PIPETTE_QUERY_PATHS = frozenset({
+    "/liquid/readback", "/liquid/error-log", "/liquid/tip-status",
+    "/liquid/data", "/liquid/pressure", "/liquid/firmware", "/liquid/condition",
+    "/liquid/fluid-detection/{channel}/timestamp",
+})
+
+
 def _safety(method: str, path: str) -> str:
     lower = path.lower()
     if "emergency" in lower or "e_stop" in lower or "estop" in lower:
@@ -325,6 +332,8 @@ def _safety(method: str, path: str) -> str:
         return "service"
     if "constructor_pipettes" in lower:
         return "service" if method != "GET" else "read_only"
+    if lower in _PIPETTE_QUERY_PATHS:
+        return "read_only"
     if "/liquid/" in lower:
         return "motion" if method != "GET" else "read_only"
     if lower == "/protocol/execute" or lower.startswith("/oem/runtime/commands/") or lower == "/oem/runtime/events/resume":
@@ -348,7 +357,7 @@ def _value(row: Any, *keys: str) -> Any:
 
 
 def _motor_motion_action(action: Mapping[str, Any]) -> bool:
-    if str(action.get("informational_method")) == "GET":
+    if str(action.get("informational_method")) == "GET" or action.get("safety_class") == "read_only":
         return False
     if str(action.get("safety_class")) in {"stop", "emergency"}:
         return False
@@ -3922,6 +3931,7 @@ def install_operator_control_plane(
                     store.put,
                     receipt,
                     _expected_status=claim_expected_status,
+                    _linked_pipette_finalization=linked_pipette_finalization,
                 )
             return persisted
 

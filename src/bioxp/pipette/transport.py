@@ -1294,7 +1294,10 @@ class FourPipetteTransport:
             self._last_group_transaction = {
                 "ok": False,
                 "outcome": "initial_group_cycle_failed",
-                "channels": initial_group.get("sends", []),
+                "channels": [
+                    {"channel": row["channel"], "result": row}
+                    for row in self.get_status()["channels"]
+                ],
                 "initial_group": initial_group,
                 "pressure_stream": dict(initial_group.get("pressure_stream") or {}),
                 "pressure_epoch": initial_group.get("pressure_epoch"),
@@ -1332,7 +1335,10 @@ class FourPipetteTransport:
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
-            "channels": initial_group.get("sends", []),
+            "channels": [
+                {"channel": row["channel"], "result": row}
+                for row in self.get_status()["channels"]
+            ],
             "initial_group": initial_group,
             "condition_readback": condition,
             "status_readback_first": first_status,

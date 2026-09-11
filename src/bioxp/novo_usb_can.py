@@ -214,7 +214,7 @@ class NovoUsbCanBus:
                 **response,
                 "completion_received": False,
                 "completion_deferred": False,
-                "semantic_query_response_verified": query_verified,
+                "query_response_correlated": query_verified,
             }
         immediate_ack = bool(response.get("outcome") == "ack" and response.get("ack_received"))
         if not immediate_ack:

@@ -150,7 +150,8 @@ class HardwareStateOwner:
                 return {"published": False, "reason": "router_not_running"}
             already_ready = self._ownership.get("CAN_READY") is True
             self._ownership["CAN_READY"] = True
-            lifecycle_state.transport_changed(True, reason=str(reason))
+            if not already_ready:
+                lifecycle_state.transport_changed(True, reason=str(reason))
             return {
                 "published": True,
                 "already_ready": already_ready,
@@ -179,7 +180,8 @@ class HardwareStateOwner:
                 transport["CAN_READY"] = True
                 transport["can_ready_evidence"] = "explicit_transport_and_board_snapshot"
             # Bind canonical readiness and lifecycle state to this exact evidence.
-            lifecycle_state.transport_changed(True, reason=str(reason))
+            if not already_ready:
+                lifecycle_state.transport_changed(True, reason=str(reason))
             return {
                 "published": True,
                 "already_ready": already_ready,
