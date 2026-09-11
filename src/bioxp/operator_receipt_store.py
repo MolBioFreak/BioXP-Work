@@ -26,22 +26,13 @@ from typing import Any
 from .critical_logging import critical_receipt
 from .runtime_audit_store import (
     RUNTIME_LIFECYCLE_LOCK_NAME,
+    TERMINAL_COMMAND_STATES as TERMINAL_STATES,
     RuntimeAuditDatabase,
     assert_migration_slot,
     runtime_audit_migration_identity,
     runtime_state_root as _canonical_runtime_state_root,
 )
 
-TERMINAL_STATES = frozenset({
-    "completed",
-    "cleared",
-    "failed",
-    "rejected",
-    "ambiguous",
-    "outcome_unknown",
-    "cancelled",
-    "reconciliation_required",
-})
 NONREPLAYABLE_INTERRUPT_ACTIONS = frozenset({
     "meta.emergency_stop",
     "oem.y.stop",
