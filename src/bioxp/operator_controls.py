@@ -1270,7 +1270,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
                 "requires_confirmation": safety not in {"read_only", "emergency", "stop"},
                 "timeout_seconds": (
                     360.0
-                    if path in _SERIAL206_PROVIDER_CAPABILITIES
+                    if path in _SERIAL206_PROVIDER_CAPABILITIES or path == "/oem/startup/constructor_pipettes"
                     else (120.0 if safety == "motion" else 30.0)
                 ),
                 "inputs": inputs,
