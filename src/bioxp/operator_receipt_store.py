@@ -18,14 +18,12 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .critical_logging import critical_receipt
 from .runtime_audit_store import (
-    RUNTIME_LIFECYCLE_LOCK_NAME,
     TERMINAL_COMMAND_STATES as TERMINAL_STATES,
     RuntimeAuditDatabase,
     assert_migration_slot,
@@ -57,6 +55,15 @@ _SUMMARY_FIELDS = frozenset({
     "finished_at",
     "duration_ms",
     "delivery_verified",
+    "source_call_completed",
+    "source_return_ok",
+    "controller_command_acknowledged",
+    "double_stop_acknowledged",
+    "controller_terminal_state_verified",
+    "target_event_128_observed",
+    "source_wait_signaled",
+    "source_noop",
+    "completion_class",
     "controller_acknowledged",
     "completion_verified",
     "semantic_query_response_verified",
@@ -276,6 +283,8 @@ def compact_response_summary(value: Any, *, max_depth: int = 6, max_items: int =
             output: dict[str, Any] = {}
             for raw_key, raw_value in item.items():
                 key = str(raw_key)[:96]
+                if key == "provenance":
+                    continue  # transport matching/timing is not command history
                 keep = selected or key in _SUMMARY_FIELDS
                 if keep:
                     output[key] = visit(raw_value, depth + 1, selected=key in {
@@ -795,6 +804,23 @@ class OperatorReceiptStore:
     @staticmethod
     def _compact_receipt(receipt: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
         compact = dict(receipt)
+        interrupt = compact.get("interrupt_evidence")
+        if isinstance(interrupt, Mapping):
+            # Keep one result summary, not embedded copies of the provider
+            # response inside the receipt and its reconciliation receipt.
+            details = dict(interrupt.get("details") or {})
+            details.pop("response", None)
+            reconciliation = details.get("deck_reconciliation")
+            if isinstance(reconciliation, Mapping):
+                details["deck_reconciliation"] = {
+                    key: reconciliation[key] for key in (
+                        "interrupt_id", "interrupt_attempt_id", "action_id",
+                        "source_call_completed", "source_return_ok",
+                        "controller_stop_acknowledged", "persistence_state",
+                        "recovery_hold", "error",
+                    ) if key in reconciliation
+                }
+            compact["interrupt_evidence"] = {**interrupt, "details": details}
         response = compact.pop("response", None)
         compact.pop("stage_receipts", None)
         response_summary = compact_response_summary(response) if response is not None else None
@@ -1443,89 +1469,25 @@ class OperatorReceiptStore:
                 raise RuntimeError("operator claim missing after durable commit")
             return self._row_receipt(stored, include_evidence=False), created
 
-    @contextmanager
-    def _try_interrupt_lifecycle(self):
-        """Keep a shared lease so nested connection leases cannot block.
-
-        The prepared store already owns this lock file. Failure to acquire it
-        immediately selects the existing recovery journal, not a new queue.
-        """
-        descriptor = os.open(
-            self.root / RUNTIME_LIFECYCLE_LOCK_NAME,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        acquired = False
-        try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError:
-                pass
-            yield acquired
-        finally:
-            if acquired:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
-
     def put_interrupt(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        """Persist a delivered interrupt; never await ordinary DB/lifecycle work.
+        """Record an already delivered Stop with the ordinary SQLite writer.
 
-        Recovery-file locking/fsync still take time. This is post-delivery
-        retention, not a pre-delivery admission or hard-real-time primitive.
+        The caller releases the interrupt delivery lock before awaiting this
+        storage-only work. Transient writer/lifecycle contention is not a reason
+        to create a second receipt file. Actual storage failure still uses the
+        existing durable emergency journal; nothing here sends or retries IO.
         """
         receipt = dict(critical_receipt(receipt))
         if isinstance(receipt.get("interrupt_evidence"), Mapping):
             receipt["interrupt_evidence"] = {**receipt["interrupt_evidence"], "persistence_state": "committed"}
-        if not self.lock.acquire(blocking=False):
-            return self.append_interrupt_fallback(receipt, reason="sqlite_connection_busy")
         try:
-            # RLock acquisition is reentrant: never BEGIN/ROLLBACK someone
-            # else's already active transaction on the shared connection.
-            if self.connection.in_transaction:
-                return self.append_interrupt_fallback(receipt, reason="sqlite_transaction_active")
-            with self._try_interrupt_lifecycle() as acquired:
-                if not acquired:
-                    return self.append_interrupt_fallback(receipt, reason="runtime_lifecycle_busy")
-                return self._put_interrupt_locked(receipt)
-        finally:
-            self.lock.release()
-
-    def _put_interrupt_locked(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        busy_timeout = int(self.connection.execute("PRAGMA busy_timeout").fetchone()[0])
-        try:
-            self.connection.execute("PRAGMA busy_timeout=0")
-            artifact_id = None
-            try:
-                self.connection.execute("BEGIN IMMEDIATE")
-                evidence = (None, None, None)
-                previous = self.connection.execute(
-                    "SELECT evidence_relpath FROM operator_commands WHERE command_id=?",
-                    (str(receipt.get("command_id") or ""),),
-                ).fetchone()
-                compact = self._upsert(receipt, evidence=evidence)
-                artifact_id = self._register_evidence(receipt, evidence)
-                if artifact_id is not None:
-                    compact.update({"evidence_artifact_id": artifact_id, "evidence_relpath": evidence[0], "evidence_sha256": evidence[1], "evidence_bytes": evidence[2]})
-                pruned = self._prune_locked()
-                self.connection.execute("COMMIT")
-                if (
-                    previous is not None
-                    and previous["evidence_relpath"]
-                    and evidence[0]
-                    and previous["evidence_relpath"] != evidence[0]
-                ):
-                    pruned.append(str(previous["evidence_relpath"]))
-            except (OSError, RuntimeError, sqlite3.Error) as exc:
+            with self.lock:
+                # Never nest a transaction or roll back another owner's work.
                 if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                return self.append_interrupt_fallback(
-                    receipt,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-        finally:
-            self.connection.execute(f"PRAGMA busy_timeout={busy_timeout}")
-        self._remove_pruned_evidence(pruned, nonblocking=True)
-        return compact
+                    return self.append_interrupt_fallback(receipt, reason="sqlite_transaction_active")
+                return self.put(receipt)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            return self.append_interrupt_fallback(receipt, reason=f"{type(exc).__name__}: {exc}")
 
     def _finalize_linked_pipette(
         self,

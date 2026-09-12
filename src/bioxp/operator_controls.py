@@ -3910,32 +3910,25 @@ def install_operator_control_plane(
                         receipt.update(status="outcome_unknown", completion_ambiguous=True,
                                        reconciliation_required=True, retry_forbidden=True)
                     receipt["interrupt_evidence"]["details"]["deck_reconciliation"] = _bounded_json(reconciliation, _MAX_RESPONSE_BYTES)
-                try:
-                    persisted = await asyncio.to_thread(store.put_interrupt, receipt)
-                except Exception as exc:
-                    # Delivery has already been attempted. Keep its identity and
-                    # evidence available even if both durable stores fail.
-                    receipt.update({
-                        "status": "outcome_unknown",
-                        "machine_assessment": "unverified",
-                        "error": "Interrupt receipt persistence failed; reconciliation required and retry forbidden",
-                        "automatic_retry": False,
-                        "physical_outcome": "ambiguous",
-                        "completion_ambiguous": True,
-                        "reconciliation_required": True,
-                        "retry_forbidden": True,
-                    })
-                    receipt["interrupt_evidence"]["persistence_state"] = "recovery_required"
-                    receipt["interrupt_evidence"]["details"]["persistence_error"] = f"{type(exc).__name__}: {exc}"[:1000]
-                    persisted = receipt
             else:
-                persisted = await asyncio.to_thread(
+                return await asyncio.to_thread(
                     store.put,
                     receipt,
                     _expected_status=claim_expected_status,
                     _linked_pipette_finalization=linked_pipette_finalization,
                 )
-            return persisted
+
+        # Delivery/reconciliation is finished. Do not make the next addressed
+        # Stop wait behind this receipt's SQLite lock, busy timeout or fsync.
+        try:
+            return await asyncio.to_thread(store.put_interrupt, receipt)
+        except Exception as exc:
+            # Keep the actual controller result if both durable sinks failed.
+            # A recording failure is not evidence that the motor Stop failed.
+            receipt["interrupt_evidence"]["persistence_state"] = "recovery_required"
+            receipt["interrupt_evidence"]["details"]["persistence_error"] = f"{type(exc).__name__}: {exc}"[:1000]
+            receipt["retry_forbidden"] = True
+            return receipt
 
     app.state.invoke_operator_action_v2 = invoke_action_v2
     app.include_router(router)
