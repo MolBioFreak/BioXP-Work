@@ -6438,7 +6438,20 @@ class Serial206OemInitializationProvider:
             result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_result_not_mapping"}
             if automatic_prerequisites:
                 result["automatic_prerequisites"] = automatic_prerequisites
-            if selected in home_intents and not (
+            home_evidence = result.get("home")
+            cached_home_noop = bool(
+                selected in {"manual_panel_home", "move_to_origin_home", "caught_plate_recovery_home"}
+                and result.get("ok") is True
+                and result.get("physical_motion_commanded") is False
+                and isinstance(home_evidence, Mapping)
+                and home_evidence.get("ok") is True
+                and home_evidence.get("source_noop") is True
+                and home_evidence.get("source_return_ok") is True
+                and home_evidence.get("completion_class") == "source_cached_noop"
+            )
+            # goHome returns 0 without searching when cached MotorHome and
+            # CurrentPosition==0. That source success is not new home evidence.
+            if selected in home_intents and not cached_home_noop and not (
                 result.get("home_predicate_confirmed") is True
                 and result.get("controller_terminal_state_verified") is True
             ) and result.get("reference_publication_required") is not True:
@@ -6506,7 +6519,12 @@ class Serial206OemInitializationProvider:
                         )
                     )
                 )
-                if home_requires_observation:
+                if cached_home_noop:
+                    # Do not promote cached driver state into reference authority
+                    # or discard an earlier observation/failure obligation.
+                    next_state = prior_state
+                    next_reference = prior_reference_state
+                elif home_requires_observation:
                     next_state = "awaiting_operator_observation"
                     next_reference = "desynced"
                 elif selected in passive_intents or selected in profile_intents:
@@ -6515,7 +6533,7 @@ class Serial206OemInitializationProvider:
                 else:
                     next_state = "referenced_ready"
                     next_reference = "referenced"
-                lifecycle.update({"state": next_state, "active_receipt": None, "pending_ticket": None, "reference_state": next_reference, "awaiting_observation_receipt_id": receipt_id if home_requires_observation else None, "last_failure": None})
+                lifecycle.update({"state": next_state, "active_receipt": None, "pending_ticket": None, "reference_state": next_reference, "awaiting_observation_receipt_id": lifecycle.get("awaiting_observation_receipt_id") if cached_home_noop else receipt_id if home_requires_observation else None, "last_failure": lifecycle.get("last_failure") if cached_home_noop else None})
                 receipt = {"command_id": command_id, "receipt_id": receipt_id, "intent": selected, "motion_kind": "home_xy" if move_to_all_zero else "home" if selected in home_intents else "motion", "idempotency_key": idempotency_key, "idempotency_replay_enabled": not interrupt, "generation": generation, "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"), "inputs": safe_inputs, "status": "completed", "result": _json_safe(result)}
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
