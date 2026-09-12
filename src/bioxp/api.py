@@ -2717,8 +2717,12 @@ class CameraStatusResponse(BaseModel):
         )
         if self.available and any(value is None for value in frame_values):
             raise ValueError("available camera status requires complete frame metadata")
-        if not self.available and any(value is not None for value in frame_values):
-            raise ValueError("unavailable camera status cannot claim frame metadata")
+        stale_frame = (
+            all(value is not None for value in frame_values)
+            and self.frame_age_seconds > self.freshness_budget_seconds
+        )
+        if not self.available and any(value is not None for value in frame_values) and not stale_frame:
+            raise ValueError("unavailable camera status cannot claim fresh or incomplete frame metadata")
         return self
 
 
@@ -6324,7 +6328,7 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
     except CameraError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     device = identity.device
-    fps, quality, width, height = 8, 7, 640, 480
+    fps, quality, width, height = 30, 7, 640, 480
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

@@ -1028,7 +1028,8 @@ class Serial206ProductionPrimitiveAdapter:
             "before": _json_safe(before),
             "before_position_steps": before_value,
             "preflight": _json_safe(preflight),
-            "move": _json_safe(move),
+            # Completion consumes the raw wait; bound diagnostics only afterward.
+            "move": move,
             "event_window": _json_safe(
                 move.get("event_window")
                 if isinstance(move, Mapping) and isinstance(move.get("event_window"), Mapping)
