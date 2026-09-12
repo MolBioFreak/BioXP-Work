@@ -631,7 +631,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
         epochs: dict[str, int] = {}
         x_authority = provider.get("x_authority")
         if isinstance(x_authority, Mapping):
-            x_epoch = x_authority.get("active_board_epoch", x_authority.get("board_lifecycle_generation"))
+            x_epoch = x_authority.get("current_board_lifecycle_generation")
             if type(x_epoch) is int and x_epoch >= 0:
                 epochs["5"] = x_epoch
         y_authority = provider.get("y_authority")
