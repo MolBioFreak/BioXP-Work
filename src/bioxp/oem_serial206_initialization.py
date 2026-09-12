@@ -6782,7 +6782,6 @@ class Serial206OemInitializationProvider:
         self,
         lifecycle: Mapping[str, Any],
         *,
-        require_referenced: bool,
         validate: bool = True,
     ) -> dict[str, Any]:
         generation = int(self.generation_provider())
@@ -6826,8 +6825,10 @@ class Serial206OemInitializationProvider:
         }
         if not validate:
             return snapshot
-        allowed_x_states = {"referenced_ready"} if require_referenced else {"prepared_unreferenced", "referenced_ready"}
-        allowed_y_states = {"referenced_ready"} if require_referenced else {"prepared_unreferenced", "referenced_ready"}
+        # OEM XY calls use controller coordinates, not a human-observation ledger.
+        # Retain preparation/ownership, outstanding-command and interrupt fences.
+        allowed_x_states = {"prepared_unreferenced", "referenced_ready", "awaiting_operator_observation"}
+        allowed_y_states = {"prepared_unreferenced", "referenced_ready"}
         valid = bool(
             snapshot["x"]["lifecycle_state"] in allowed_x_states
             and snapshot["x"]["generation"] == generation
@@ -6943,7 +6944,7 @@ class Serial206OemInitializationProvider:
                     composite = existing_receipt.get("composite_authority")
                     terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
                     current_authority = self._xy_authority_snapshot(
-                        lifecycle, require_referenced=True, validate=False
+                        lifecycle, validate=False
                     )
                     authority_valid = bool(
                         isinstance(terminal_authority, Mapping)
@@ -6976,7 +6977,7 @@ class Serial206OemInitializationProvider:
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
                 admitted_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=True
+                    lifecycle
                 )
                 if admitted_authority.get("ok") is not True:
                     return {
@@ -6993,7 +6994,7 @@ class Serial206OemInitializationProvider:
                 result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
                 current_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=True, validate=False
+                    lifecycle, validate=False
                 )
                 if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
@@ -7009,7 +7010,7 @@ class Serial206OemInitializationProvider:
                     "last_failure": None if source_completed else _json_safe(result),
                 })
                 terminal_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=True, validate=False
+                    lifecycle, validate=False
                 )
                 child_receipts = {
                     axis: {
@@ -7133,7 +7134,7 @@ class Serial206OemInitializationProvider:
                     composite = existing.get("composite_authority")
                     terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
                     current_authority = self._xy_authority_snapshot(
-                        lifecycle, require_referenced=False, validate=False
+                        lifecycle, validate=False
                     )
                     if (
                         existing.get("intent") != "home_xy"
@@ -7169,7 +7170,7 @@ class Serial206OemInitializationProvider:
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
                 admitted_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=False
+                    lifecycle
                 )
                 if admitted_authority.get("ok") is not True:
                     return {
@@ -7192,7 +7193,7 @@ class Serial206OemInitializationProvider:
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "homexy_result_not_mapping"}
                 result["live_preflight"] = _json_safe(live_preflight)
                 current_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=False, validate=False
+                    lifecycle, validate=False
                 )
                 if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
@@ -7215,9 +7216,11 @@ class Serial206OemInitializationProvider:
                         "last_failure": None,
                     })
                 else:
-                    lifecycle.update({"state": "awaiting_operator_observation" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": command_id if verified_success else None, "last_failure": None if verified_success else _json_safe(result)})
+                    # Source completion is neither a physical attestation nor a
+                    # fresh post-setHome readback. Neither gates the next OEM call.
+                    lifecycle.update({"state": "prepared_unreferenced" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if verified_success else _json_safe(result)})
                 terminal_authority = self._xy_authority_snapshot(
-                    lifecycle, require_referenced=False, validate=False
+                    lifecycle, validate=False
                 )
                 child_receipts = {
                     axis: {

@@ -653,14 +653,14 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         y = y_projection.get("authority") if isinstance(y_projection, Mapping) else None
         board = y_projection.get("board_authority") if isinstance(y_projection, Mapping) else None
         current_y = bool(isinstance(y, Mapping) and isinstance(board, Mapping)
-            and y.get("lifecycle_state") == "referenced_ready"
+            and y.get("lifecycle_state") in {"prepared_unreferenced", "referenced_ready"}
             and y.get("ownership_generation") == machine_state.get("ownership_generation")
             and board.get("state") == "active"
             and type(y.get("prepared_board_epoch")) is int
             and y.get("prepared_board_epoch") == board.get("active_board_epoch")
             and y.get("pending_ticket") is None)
         dependencies.append(_dependency("xy_y_authority_current", "Current Y board authority",
-            current_y, "Y reference/preparation is not current for board 4; reconcile Y before XY movement."))
+            current_y, "Y preparation is not current for board 4; reconcile Y before XY movement."))
     x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     y_provider_action = action_id.startswith("oem.y.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     method = str(action.get("informational_method") or "GET")
