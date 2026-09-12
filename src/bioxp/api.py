@@ -6233,7 +6233,8 @@ async def _stop_owned_camera_session_locked(*, reason: str) -> dict[str, Any]:
         if reader is not None:
             await asyncio.gather(reader, return_exceptions=True)
         await _reap_camera_session(session)
-        _camera_finish_queue(session["queue"])
+        for queue in tuple(session["queues"]):
+            _camera_finish_queue(queue)
     hardware_state.invalidate(reason=f"camera ownership changed: {reason}")
     lifecycle_state.record_camera_evidence(None)
     return {
@@ -6335,12 +6336,12 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
     except BaseException:
         provider.end_stream(session_id)
         raise
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
+    queues: set[asyncio.Queue[bytes | None]] = set()
     with _camera_projection_lock:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         epoch = _camera_projection_epoch
-        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "provider": provider, "provider_generation": provider.generation, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queues": queues, "queue_max_frames": 2, "process": proc, "provider": provider, "provider_generation": provider.generation, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
         _camera_session = session
     if provider is not _camera_provider:
         await _reap_camera_session(session)
@@ -6386,10 +6387,13 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
                     if not current():
                         return
                     part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame.content)}\r\n\r\n".encode("ascii") + frame.content + b"\r\n"
-                    if queue.full():
-                        queue.get_nowait()
+                    if not queues:
                         provider.drop_stream_frame(session_id)
-                    queue.put_nowait(part)
+                    for queue in tuple(queues):
+                        if queue.full():
+                            queue.get_nowait()
+                            provider.drop_stream_frame(session_id)
+                        queue.put_nowait(part)
                     session["frames_emitted"] += 1
                     session["error"] = None
                     _camera_stream_state.update({"frames_emitted": session["frames_emitted"], "last_frame_at": frame.captured_at.timestamp(), "last_error": None, "dropped_frames": provider.status().dropped_frames})
@@ -6407,7 +6411,8 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
             if was_current:
                 _camera_stream_state.update({"active": False, "last_error": session["error"], "last_frame_at": None})
             await _reap_camera_session(session)
-            _camera_finish_queue(queue)
+            for queue in tuple(queues):
+                _camera_finish_queue(queue)
             if was_current and _camera_session is session:
                 lifecycle_state.record_camera_evidence(None)
 
@@ -6415,7 +6420,7 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
     return {
         **_camera_stream_control_payload(session, state="starting"),
         "replacement": replacement,
-        "queue_max_frames": queue.maxsize,
+        "queue_max_frames": session["queue_max_frames"],
         "mjpeg_url": "/camera/mjpeg",
     }
 
@@ -9392,8 +9397,9 @@ async def camera_mjpeg(request: Request):
     session, projection = _camera_session_projection()
     if session is None or not projection.get("available"):
         raise HTTPException(status_code=503, detail={**projection, "error": "no active POST-started camera session"})
-    queue = session["queue"]
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=session["queue_max_frames"])
     with _camera_projection_lock:
+        session["queues"].add(queue)
         session["viewers"] = int(session.get("viewers") or 0) + 1
         pending_shutdown = session.get("viewer_shutdown_task")
         if pending_shutdown is not None and not pending_shutdown.done():
@@ -9421,6 +9427,7 @@ async def camera_mjpeg(request: Request):
                 yield part
         finally:
             with _camera_projection_lock:
+                session["queues"].discard(queue)
                 current = _camera_session
                 if current is not None and current.get("session_id") == session["session_id"]:
                     current["viewers"] = max(0, int(current.get("viewers") or 0) - 1)
