@@ -3793,121 +3793,6 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         raise
 
 
-def _compact_controller_state(
-    value: Any,
-    *,
-    key: str | None = None,
-    depth: int = 0,
-    budget: list[int] | None = None,
-) -> Any:
-    if budget is None:
-        budget = [2048]
-    summary_keys = {
-        "value_omitted_from_current_state", "content_sha256", "encoded_bytes",
-        "controller_payload_omitted_to_provider_receipt", "item_count",
-        "ok", "stopped", "target_reached", "timed_out", "last_speed", "failure",
-        "source_return_code", "status", "value", "return_status",
-    }
-    if (
-        isinstance(value, Mapping)
-        and value.get("value_omitted_from_current_state") is True
-        and isinstance(value.get("content_sha256"), str)
-        and len(value["content_sha256"]) == 64
-        and all(char in "0123456789abcdef" for char in value["content_sha256"])
-        and type(value.get("encoded_bytes")) is int
-        and value["encoded_bytes"] >= 0
-        and set(value).issubset(summary_keys)
-        and all(item is None or isinstance(item, (str, int, float, bool)) for item in value.values())
-        and len(json.dumps(value, allow_nan=False).encode("utf-8")) <= 4096
-    ):
-        # A digest describes the original omitted value, not another digest.
-        # Recompacting persisted state must never manufacture a new state.
-        return dict(value)
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
-    digest_summary: dict[str, Any] = {
-        "value_omitted_from_current_state": True,
-        "content_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-        "encoded_bytes": len(encoded.encode("utf-8")),
-    }
-    if key == "constructed_tip_trays":
-        # Exact bounded OEM software-constructor state, not diagnostic samples.
-        # In particular the 96 wells must never become a 64-item summary.
-        if (isinstance(value, list) and len(value) == 5
-                and all(isinstance(tray, Mapping)
-                        and tray.get("tray_id") == index
-                        and isinstance(tray.get("occupancy"), list)
-                        and len(tray["occupancy"]) == 96
-                        and all(type(well) is bool for well in tray["occupancy"])
-                        for index, tray in enumerate(value))
-                and len(encoded.encode("utf-8")) < 8192):
-            return json.loads(encoded)
-        raise ValueError("OEM constructor tray state must contain five exact 96-well trays")
-    if budget[0] <= 0 or depth >= 12:
-        return digest_summary
-    budget[0] -= 1
-    raw_keys = {
-        "wait", "events", "raw_packet", "raw_packets", "packets",
-        "event_snapshot", "last_ack", "ack", "attempt_diagnostics",
-        "controller_response",
-    }
-    if key in raw_keys:
-        if isinstance(value, (list, tuple)):
-            digest_summary["item_count"] = len(value)
-        if isinstance(value, Mapping):
-            for scalar_key in (
-                "ok", "stopped", "target_reached", "timed_out", "last_speed",
-                "failure", "source_return_code", "status", "value", "return_status",
-            ):
-                scalar = value.get(scalar_key)
-                if scalar is None or isinstance(scalar, (str, int, float, bool)):
-                    if scalar_key in value:
-                        digest_summary[scalar_key] = scalar
-        digest_summary["controller_payload_omitted_to_provider_receipt"] = True
-        return digest_summary
-    if isinstance(value, str) and len(value.encode("utf-8")) > 512:
-        return digest_summary
-    if isinstance(value, Mapping):
-        existing_omission = value.get("_omitted_current_state_items")
-        preserve_omission = (
-            isinstance(existing_omission, Mapping)
-            and existing_omission.get("value_omitted_from_current_state") is True
-        )
-        items = []
-        for original_key, child in value.items():
-            if original_key == "_omitted_current_state_items" and preserve_omission:
-                continue
-            child_key = str(original_key)
-            if len(child_key.encode("utf-8")) > 128:
-                child_key = "_oversized_key_" + hashlib.sha256(child_key.encode("utf-8")).hexdigest()
-            items.append((child_key, child))
-        items.sort(key=lambda row: row[0])
-        selected = items[:64]
-        result = {
-            child_key: _compact_controller_state(child, key=child_key, depth=depth + 1, budget=budget)
-            for child_key, child in selected
-        }
-        if len(items) > len(selected):
-            result["_omitted_current_state_items"] = {**digest_summary, "item_count": len(items) - len(selected)}
-        elif preserve_omission:
-            result["_omitted_current_state_items"] = _compact_controller_state(existing_omission)
-        return result
-    if isinstance(value, (list, tuple)):
-        existing_omission = None
-        if (value and isinstance(value[-1], Mapping)
-                and set(value[-1]) == {"_omitted_current_state_items"}
-                and isinstance(value[-1]["_omitted_current_state_items"], Mapping)
-                and value[-1]["_omitted_current_state_items"].get("value_omitted_from_current_state") is True):
-            existing_omission = value[-1]["_omitted_current_state_items"]
-            value = value[:-1]
-        selected = list(value[:64])
-        result = [_compact_controller_state(child, depth=depth + 1, budget=budget) for child in selected]
-        if len(value) > len(selected):
-            result.append({"_omitted_current_state_items": {**digest_summary, "item_count": len(value) - len(selected)}})
-        elif existing_omission is not None:
-            result.append({"_omitted_current_state_items": _compact_controller_state(existing_omission)})
-        return result
-    return value
-
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     """Durably replace one private JSON authority file.
 
@@ -4627,14 +4512,14 @@ class OEMRuntimeStore:
         return payload
 
     def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Append compact current authority with an exact immutable receipt-set binding."""
+        """Append current authority, dropping only noncritical logging attachments."""
         payload = dict(state)
         required = {"movement_ledger", "used_approvals", "initialize_motion_ledger"}
         if not required.issubset(payload):
             raise ValueError("serial-206 state must contain all lifecycle ledgers")
-        stored_payload = _compact_controller_state(payload)
-        if not isinstance(stored_payload, dict):
-            raise ValueError("serial-206 state compaction must preserve object shape")
+        # Keep the latest command facts; full command history lives in SQLite.
+        # Required state is never truncated, hashed into a summary, or budgeted.
+        stored_payload = dict(payload)
         for lifecycle_key in ("z_lifecycle", "x_lifecycle"):
             lifecycle = stored_payload.get(lifecycle_key)
             if isinstance(lifecycle, dict):
@@ -4642,16 +4527,15 @@ class OEMRuntimeStore:
                 receipts = compact_lifecycle.get("receipts")
                 if isinstance(receipts, list):
                     compact_lifecycle["receipts"] = receipts[-1:]
-                    compact_lifecycle["receipts_omitted_to_sqlite"] = max(0, len(receipts) - 1)
+                    if len(receipts) > 1:
+                        compact_lifecycle["receipts_omitted_to_sqlite"] = len(receipts) - 1
+                    else:
+                        compact_lifecycle.setdefault("receipts_omitted_to_sqlite", 0)
                 stored_payload[lifecycle_key] = compact_lifecycle
+        stored_payload = critical_receipt(stored_payload)
         encoded_current = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded_current.encode("utf-8")) > 262_144:
-            stored_payload = _compact_controller_state(payload, budget=[256])
-            if not isinstance(stored_payload, dict):
-                raise ValueError("serial-206 bounded state compaction must preserve object shape")
-            encoded_current = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if len(encoded_current.encode("utf-8")) > 262_144:
-            raise ValueError("serial-206 compact current state exceeds encoded-byte ceiling")
+            raise ValueError("serial-206 current authority exceeds encoded-byte ceiling")
         with self._lock:
             with self._authority_write():
                 self._db.execute("BEGIN IMMEDIATE")
