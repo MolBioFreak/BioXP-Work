@@ -2887,6 +2887,8 @@ def install_operator_control_plane(
         return {
             "source_call_completed": evidence_bool("source_call_completed"),
             "source_return_ok": evidence_bool("source_return_ok"),
+            "first_stop_acknowledged": evidence_bool("first_stop_acknowledged"),
+            "second_stop_acknowledged": evidence_bool("second_stop_acknowledged"),
             "controller_stop_acknowledged": evidence_bool("controller_command_acknowledged"),
             "controller_terminal_state_verified": evidence_bool("controller_terminal_state_verified"),
             "physical_effect_verified": False,

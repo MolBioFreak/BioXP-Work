@@ -88,19 +88,27 @@ def test_real_double_delivery_does_not_invent_terminal_observation(producer):
     assert source['wait'] is None
     assert source['controller_terminal_state_verified'] is False
     assert source['physical_effect_verified'] is False
-    assert result['ok'] is False
-    assert result['authority_receipt']['status'] == 'failed'
+    assert result['ok'] is True
+    assert result['authority_receipt']['status'] == 'completed'
+    assert result['z_lifecycle']['reference_state'] == 'desynced'
 
 
 @pytest.mark.parametrize('first,second', [(True, True), (False, True), (True, False), (False, False)])
 def test_partial_delivery_preserves_void_source_return(producer, monkeypatch, first, second):
     provider, tester, hardware = producer
-    replies = iter([{'status': 100 if first else 2}, {'status': 100 if second else 2}])
-    monkeypatch.setattr(tester, '_send_motor', lambda *a, **kw: next(replies))
-    source = provider.primitives.z_stop()
+    hardware.stop_statuses = iter([100 if first else 2, 100 if second else 2])
+    delivered = provider.execute_z_stop_interrupt(inputs={'command_id': 'acks'}, expected_generation=1, idempotency_key='acks')
+    source = delivered['result']
+    assert delivered['ok'] is second
+    assert delivered['authority_receipt']['status'] == ('completed' if second else 'failed')
     assert source['source_return_ok'] is True
     assert source['controller_command_acknowledged'] is second
     assert source['stop']['double_stop_acknowledged'] is (first and second)
+    assert source['first_stop_acknowledged'] is first
+    assert source['second_stop_acknowledged'] is second
+    persisted = provider.state_store.read_serial206_receipt('z', 'acks')
+    assert persisted['result']['first_stop_acknowledged'] is first
+    assert persisted['result']['second_stop_acknowledged'] is second
     assert source['controller_terminal_state_verified'] is False
     assert source['wait'] is None
 
@@ -139,12 +147,15 @@ def test_http_conflict_retains_independent_evidence(tmp_path, monkeypatch, produ
     assert fresh == persisted
 
 
-def test_actual_route_and_compact_detail_keep_http_conflict_truth(tmp_path, monkeypatch, producer):
+@pytest.mark.parametrize('armed', [True, False], ids=['armed', 'unarmed'])
+@pytest.mark.parametrize('first', [True, False], ids=['both-acks', 'second-ack-only'])
+def test_actual_route_and_compact_detail_keep_source_completion_truth(tmp_path, monkeypatch, producer, armed, first):
     provider, tester, hardware = producer
+    hardware.stop_statuses = iter([100 if first else 2, 100])
     monkeypatch.setattr(api, '_serial206_oem_initialization_provider', provider)
     monkeypatch.setattr(api, '_tester', tester)
     monkeypatch.setattr(api, '_tester_transition_lock', asyncio.Lock())
-    app, _ = make_app(tmp_path / 'outer', monkeypatch, z_stop_route=api.motion_oem_z_stop)
+    app, _ = make_app(tmp_path / 'outer', monkeypatch, z_stop_route=api.motion_oem_z_stop, armed=armed, generation=1)
     client = TestClient(app)
     response = client.post('/operator/v2/actions/oem.z.stop', json={
         'schema_version': 'bioxp.operator_interrupt_request.v1',
@@ -154,19 +165,41 @@ def test_actual_route_and_compact_detail_keep_http_conflict_truth(tmp_path, monk
     assert response.status_code == 200, response.text
     row = response.json()
     assert hardware.stop_writes == 2, row
-    assert row['status'] == 'failed', row
+    assert row['status'] == 'completed', row
     for detail in (False, True):
         projected = client.get(row['status_path'], params={'detail': detail}).json()
+        assert projected['status'] == 'completed', projected
+        assert projected['error'] is None
         evidence = projected['interrupt_evidence']
         assert evidence['source_call_completed'] is True
         assert evidence['source_return_ok'] is True
+        assert evidence['first_stop_acknowledged'] is first
+        assert evidence['second_stop_acknowledged'] is True
         assert evidence['controller_stop_acknowledged'] is True
         assert evidence['controller_terminal_state_verified'] is False
         deck = evidence['details']['deck_reconciliation']
+        assert deck['error'] is None
         assert deck['source_call_completed'] is True
         assert deck['source_return_ok'] is True
+        assert deck['first_stop_acknowledged'] is first
+        assert deck['second_stop_acknowledged'] is True
+        assert deck['controller_terminal_state_verified'] is False
+        assert deck['physical_effect_verified'] is False
         assert deck['controller_stop_acknowledged'] is True
         assert projected['physical_effect_verified'] is False
+        raw = app.state.operator_receipt_store.by_command(row['command_id'], include_evidence=detail)
+        assert raw['status'] == 'completed'
+        assert raw['response']['http_status'] == 200
+        assert raw['response']['body']['ok'] is True
+        code = "import json,sys; from bioxp.operator_receipt_store import OperatorReceiptStore; s=OperatorReceiptStore(sys.argv[1]); print(json.dumps(s.by_command(sys.argv[2],include_evidence=sys.argv[3]=='True')))"
+        fresh = json.loads(subprocess.check_output([sys.executable, '-c', code,
+            str(app.state.operator_receipt_store.root), row['command_id'], str(detail)], text=True))
+        assert fresh == raw
+    history = client.get('/operator/actions/history').json()['items']
+    saved = next(item for item in history if item['command_id'] == row['command_id'])
+    assert saved['status'] == 'completed'
+    assert saved['error'] is None
+    assert saved['physical_effect_verified'] is False
 
 
 def test_next_addressed_stop_delivers_while_prior_sqlite_writer_waits(tmp_path, monkeypatch, producer):
@@ -244,7 +277,7 @@ def test_actual_http_next_stop_bypasses_prior_sqlite_reconciliation(tmp_path, mo
     monkeypatch.setattr(api, '_serial206_oem_initialization_provider', provider)
     monkeypatch.setattr(api, '_tester', tester)
     monkeypatch.setattr(api, '_tester_transition_lock', asyncio.Lock())
-    app, _ = make_app(tmp_path / 'outer', monkeypatch, z_stop_route=api.motion_oem_z_stop)
+    app, _ = make_app(tmp_path / 'outer', monkeypatch, z_stop_route=api.motion_oem_z_stop, generation=1)
     entered = threading.Event()
     fourth = threading.Event()
     original_desync, original_write = provider._z_mark_desynced, hardware.write
@@ -280,12 +313,16 @@ def test_actual_http_next_stop_bypasses_prior_sqlite_reconciliation(tmp_path, mo
                 locker.rollback()
                 locker.close()
                 responses = await asyncio.wait_for(asyncio.gather(first, *([second] if second else [])), 10)
-            for response in responses:
+            for index, response in enumerate(responses):
                 assert response.status_code == 200, response.text
                 row = response.json()
+                # The first delivery is superseded by the second interrupt;
+                # only the last source command may report completion.
+                assert row['status'] == ('failed' if index == 0 else 'completed'), row
                 assert row['interrupt_evidence']['controller_stop_acknowledged'] is True
                 for detail in (False, True):
                     saved = (await client.get(row['status_path'], params={'detail': detail})).json()
+                    assert saved['status'] == row['status']
                     assert saved['interrupt_evidence']['controller_stop_acknowledged'] is True
                     assert saved['interrupt_evidence']['controller_terminal_state_verified'] is False
     asyncio.run(scenario())
@@ -366,3 +403,84 @@ def test_generation_change_after_delivery_is_retained_without_more_controller_ca
     assert result['ok'] is False
     assert result['z_lifecycle']['reference_state'] == 'desynced'
     assert hardware.stop_writes == 2
+
+
+@pytest.mark.parametrize('failure', ['negative-observation', 'failed-readback', 'missing-source-return', 'missing-ack', 'raw-failed-ack', 'source-exception', 'no24v', 'storage'])
+def test_actual_route_preserves_real_failure(tmp_path, monkeypatch, producer, failure):
+    provider, tester, hardware = producer
+    original = provider.primitives.z_stop
+    if failure == 'raw-failed-ack':
+        hardware.stop_statuses = iter([100, 2])
+    elif failure == 'no24v':
+        # Head.stopMotor itself rejects No24V: do not bypass the OEM guard.
+        monkeypatch.setattr(tester, 'oem_no24v_state', lambda: True)
+    elif failure == 'storage':
+        def fail_save(*args, **kwargs):
+            raise sqlite3.OperationalError('offline storage fault')
+        monkeypatch.setattr(provider, '_save_state', fail_save)
+    else:
+        def stop(**kwargs):
+            if failure == 'source-exception':
+                raise RuntimeError('offline source exception')
+            result = original(**kwargs)
+            if failure in {'negative-observation', 'failed-readback'}:
+                hardware.gap_value = 123 if failure == 'negative-observation' else 0
+                hardware.gap_status = 100 if failure == 'negative-observation' else 2
+                result['wait'] = tester.motor_wait_stopped(4, motor=1, timeout_s=0.3, min_polls=1)
+                assert result['wait']['controller_terminal_state_verified'] is False
+            elif failure == 'missing-source-return':
+                result.pop('source_return_ok')
+            else:
+                result['controller_command_acknowledged'] = False
+            return result
+        monkeypatch.setattr(provider.primitives, 'z_stop', stop)
+    monkeypatch.setattr(api, '_serial206_oem_initialization_provider', provider)
+    monkeypatch.setattr(api, '_tester', tester)
+    monkeypatch.setattr(api, '_tester_transition_lock', asyncio.Lock())
+    app, _ = make_app(tmp_path / 'outer', monkeypatch, z_stop_route=api.motion_oem_z_stop, generation=1, armed=False)
+    client = TestClient(app)
+    response = client.post('/operator/v2/actions/oem.z.stop', json={
+        'schema_version': 'bioxp.operator_interrupt_request.v1',
+        'idempotency_key': 'negative-' + failure, 'reason': 'offline negative qualification',
+        'observed_ownership_generation': 1, 'observed_board_epoch_by_board': {}})
+    assert response.status_code == 200
+    row = response.json()
+    assert row['status'] == 'failed', row
+    raw = app.state.operator_receipt_store.by_command(row['command_id'], include_evidence=True)
+    assert raw['response']['http_status'] == 409
+    assert hardware.stop_writes == (0 if failure in {'source-exception', 'no24v'} else 2)
+    for detail in (False, True):
+        saved = client.get(row['status_path'], params={'detail': detail}).json()
+        assert saved['status'] == 'failed'
+        assert saved['physical_effect_verified'] is False
+        assert saved['interrupt_evidence']['controller_terminal_state_verified'] is not True
+
+
+def test_source_completed_stop_does_not_terminalize_active_motion(tmp_path, monkeypatch, producer):
+    from bioxp.operator_command_plane import ACTION_REQUEST_SCHEMA
+    provider, tester, hardware = producer
+    app, _ = make_app(tmp_path / 'outer', monkeypatch, generation=1)
+    store = app.state.operator_command_plane.store
+    state = {'ownership_generation': 1, 'serial206_initialization_provider': {
+        'x_authority': {'active_board_epoch': 11}, 'board4_authority': {'active_board_epoch': 10}}}
+    admitted = store.admit_command({'schema_version': ACTION_REQUEST_SCHEMA,
+        'idempotency_key': 'active-move', 'expected_ownership_generation': 1,
+        'expected_board_epoch_by_board': {}, 'action_id': 'oem.z.move_gz',
+        'inputs': {'gripper_position_steps': 100, 'z_position_steps': 100}}, state=state)
+    assert store.claim_next() is not None
+    receipt = store.begin_interrupt('oem.z.stop', state=state, request={'idempotency_key': 'interrupt'})
+    assert admitted['command_id'] in receipt['active_command_ids']
+    store.mark_interrupt_attempted(idempotency_key='interrupt')
+    delivered = provider.execute_z_stop_interrupt(inputs={'command_id': 'source-stop'}, expected_generation=1, idempotency_key='source-stop')
+    assert delivered['ok'] is True
+    terminal = store.finalize_interrupt(idempotency_key='interrupt', receipt=receipt,
+        attempted=True, acknowledged=True, response=delivered)
+    assert terminal['error'] is None
+    assert terminal['source_return_ok'] is True
+    assert terminal['controller_terminal_state_verified'] is False
+    active = store.connection.execute('SELECT status FROM operator_plane_commands WHERE command_id=?', (admitted['command_id'],)).fetchone()
+    assert active['status'] == 'ambiguous'
+    canonical = store.connection.execute('SELECT state FROM serial206_movement_commands WHERE command_id=?', (admitted['command_id'],)).fetchone()
+    assert canonical['state'] == 'ambiguous'
+    code = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT status FROM operator_plane_commands WHERE command_id=?',(sys.argv[2],)).fetchone()[0])"
+    assert subprocess.check_output([sys.executable, '-c', code, str(store.path), admitted['command_id']], text=True).strip() == 'ambiguous'

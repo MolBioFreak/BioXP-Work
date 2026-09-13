@@ -59,6 +59,8 @@ _SUMMARY_FIELDS = frozenset({
     "source_return_ok",
     "controller_command_acknowledged",
     "double_stop_acknowledged",
+    "first_stop_acknowledged",
+    "second_stop_acknowledged",
     "controller_terminal_state_verified",
     "target_event_128_observed",
     "source_wait_signaled",
@@ -816,6 +818,8 @@ class OperatorReceiptStore:
                     key: reconciliation[key] for key in (
                         "interrupt_id", "interrupt_attempt_id", "action_id",
                         "source_call_completed", "source_return_ok",
+                        "first_stop_acknowledged", "second_stop_acknowledged",
+                        "controller_terminal_state_verified", "physical_effect_verified",
                         "controller_stop_acknowledged", "persistence_state",
                         "recovery_hold", "error",
                     ) if key in reconciliation

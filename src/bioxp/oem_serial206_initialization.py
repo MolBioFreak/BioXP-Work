@@ -2409,6 +2409,9 @@ class Serial206ProductionPrimitiveAdapter:
             "source_return_ok": source_return_ok,
             "source_board_return": None,
             "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None,
+            # Keep both scalar ACK facts outside bounded transport diagnostics.
+            "first_stop_acknowledged": bool(isinstance(stop, Mapping) and self._z_tmcl_success(stop.get("first_delivery"))),
+            "second_stop_acknowledged": command_acknowledged,
             "controller_command_acknowledged": command_acknowledged,
             "controller_terminal_state_verified": False,
             "timeout_s_omitted_by_source": float(timeout_s),
@@ -8393,14 +8396,32 @@ class Serial206OemInitializationProvider:
                             and controller_acknowledged
                             and terminal_verified
                         )
+                        # Head.stopMotor returns void after its second MST ACK;
+                        # it does not observe terminal speed. Complete that source
+                        # command without claiming that the motor stopped. An
+                        # explicit observation failure is not this no-wait case.
+                        source_delivery_completed = bool(
+                            not abort
+                            and result.get("ok") is True
+                            and result.get("source_call_completed") is True
+                            and result.get("source_return_ok") is True
+                            and controller_acknowledged
+                            and result.get("controller_terminal_state_verified") is False
+                            and "wait" in result and result["wait"] is None
+                            and not result.get("failure")
+                        )
                         with self._z_interrupt_state_lock:
                             superseded = interrupt_epoch != self._z_interrupt_epoch
+                        command_completed = bool(
+                            (stop_verified or source_delivery_completed)
+                            and generation_match and not superseded
+                        )
                         if superseded:
                             stop_verified = False
                             result["failure"] = "z_interrupt_superseded_by_safety_command"
                         result.update(
                             {
-                                "ok": stop_verified,
+                                "ok": command_completed,
                                 "interrupt_epoch": interrupt_epoch,
                                 "interrupted_command_ids": sorted(interrupted_ids),
                                 "ownership_generation_match": generation_match,
@@ -8416,7 +8437,7 @@ class Serial206OemInitializationProvider:
                             "observed_generation": observed_generation,
                             "board_lifecycle_generation": z.get("board_lifecycle_generation"),
                             "inputs": safe_inputs,
-                            "status": "completed" if stop_verified else "failed",
+                            "status": "completed" if command_completed else "failed",
                             "started_at": dispatch_started_at,
                             "finished_at": time.time(),
                             "robot_http_acknowledged": True,
@@ -8478,6 +8499,7 @@ class Serial206OemInitializationProvider:
                             state = self._load_state()
                             z = state["z_lifecycle"]
                             stop_verified = False
+                            command_completed = False
                             result.update(ok=False, failure="z_interrupt_superseded_by_safety_command")
                             receipt.update(status="failed", result=_json_safe(result))
                         durable_receipt = self._append_z_receipt(z, receipt)
@@ -8485,7 +8507,7 @@ class Serial206OemInitializationProvider:
                         self._persist_z_receipt(durable_receipt)
                         final_z = state["z_lifecycle"]
                         return {
-                            "ok": bool(stop_verified and authority_state_verified),
+                            "ok": bool(command_completed and authority_state_verified),
                             "result": _json_safe(result),
                             "authority_receipt": _json_safe(receipt),
                             "z_state": final_z.get("state"),

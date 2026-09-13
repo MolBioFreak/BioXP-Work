@@ -6296,6 +6296,13 @@ class OperatorCommandStore:
             controller_acknowledged = _interrupt_stop_acknowledged(str(saved["action_id"]), response)
             source_return_ok = _interrupt_source_return_ok(response)
             interrupt_succeeded = bool(isinstance(response, Mapping) and response.get("ok") is True)
+            if str(saved["action_id"]) == "oem.z.stop":
+                # Successful source delivery does not terminalize interrupted
+                # motion: the OEM void Stop has no terminal observation.
+                interrupt_succeeded = bool(
+                    interrupt_succeeded
+                    and _interrupt_source_response(response).get("controller_terminal_state_verified") is True
+                )
             exact_response_evidence = self._store_interrupt_evidence(
                 conn,
                 interrupt_attempt_id=interrupt_attempt_id,
@@ -6308,6 +6315,8 @@ class OperatorCommandStore:
                 **_interrupt_invocation_evidence(str(saved["action_id"]), attempted=attempted),
                 "source_call_completed": bool(acknowledged),
                 "source_return_ok": source_return_ok,
+                "first_stop_acknowledged": _interrupt_source_response(response).get("first_stop_acknowledged"),
+                "second_stop_acknowledged": _interrupt_source_response(response).get("second_stop_acknowledged"),
                 "controller_stop_acknowledged": controller_acknowledged,
                 "controller_terminal_state_verified": _interrupt_source_response(response).get("controller_terminal_state_verified") is True,
                 "physical_effect_verified": False,

@@ -10,7 +10,7 @@ from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.novo_usb_can import NovoUsbCanBus, novo_encode
 
 
-def make_app(root, monkeypatch, *, z_stop_route=None):
+def make_app(root, monkeypatch, *, z_stop_route=None, armed=True, generation=7):
     monkeypatch.setenv('BIOXP_OEM_RUNTIME_ROOT', str(root))
     monkeypatch.setattr(operator_controls, 'current_release_identity', lambda: {
         'verified': True, 'release_id': 'test-release',
@@ -24,16 +24,16 @@ def make_app(root, monkeypatch, *, z_stop_route=None):
         app.add_api_route('/motion/oem/z/stop', z_stop_route, methods=['POST'])
 
     class HardwareState:
-        ownership_epoch = 7
+        ownership_epoch = generation
 
         def ownership_projection(self):
-            return {'ownership_epoch': 7, 'ownership': {
+            return {'ownership_epoch': generation, 'ownership': {
                 'transport': 'owned', 'usb': 'service', 'router': 'running', 'CAN_READY': True}}
 
         def project(self, *domains, independent_domains=False):
             observations = {'power': {'safety_valid': True},
                 'latch': {'door_sensor': 1, 'latch_sensor': 1},
-                'interlock': {'motion_arm': {'armed': True}}}
+                'interlock': {'motion_arm': {'armed': armed}}}
             return {'snapshot_id': 'test-snapshot',
                 'freshness': {'state': 'fresh', 'age_s': 0.0, 'fresh_for_s': 30.0},
                 'domains': {domain: {'status': 'observed', 'observation': observations.get(domain, {})}
@@ -59,6 +59,7 @@ class HardwareEndpoints:
         self.events = []
         self.gap_value = 1000
         self.gap_status = 100
+        self.stop_statuses = None
 
     def write(self, frame, timeout=None):
         payload = bytes(frame)[1:-2]
@@ -70,6 +71,10 @@ class HardwareEndpoints:
                 self.stop_delivered.set()
         value = self.gap_value if command == 6 else 0
         status = self.gap_status if command == 6 else 100
+        if command == 3 and self.stop_statuses is not None:
+            status = next(self.stop_statuses)
+            if status is None:
+                return len(frame)
         data = bytes([board, status, command]) + value.to_bytes(4, 'big') + b'\x00'
         self.replies.put(novo_encode(NovoUsbCanBus.build_payload(0, data, 8)))
         return len(frame)
