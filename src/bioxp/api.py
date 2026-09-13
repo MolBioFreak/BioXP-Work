@@ -5531,7 +5531,7 @@ class UsbSniffManager:
 _usb_sniff_manager = UsbSniffManager()
 
 
-async def _run_blocking(label: str, func, timeout_s: float = 30.0):
+async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
     def invoke():
         return func()
 
@@ -5546,6 +5546,8 @@ async def _run_blocking(label: str, func, timeout_s: float = 30.0):
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise
     except asyncio.TimeoutError as exc:
+        if timeout_s is None:
+            raise  # The source raised; no wrapper deadline was installed.
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise HTTPException(
             status_code=504,
@@ -8509,7 +8511,9 @@ async def motion_gripper_open():
         lambda: _gripper_success_or_409(
             gripper_open(tester, operator_ack="GRIPPER_OPEN", reason="oem_manual_gripper_open", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        # Original recovery includes G/Y work and its own bounded waits. The
+        # catalog's existing operation limit owns the caller deadline.
+        timeout_s=None,
     )
 
 
@@ -8522,7 +8526,7 @@ async def motion_gripper_open_wide():
         lambda: _gripper_success_or_409(
             gripper_open_wide(tester, operator_ack="GRIPPER_OPEN_WIDE", reason="oem_manual_gripper_open_wide", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 
