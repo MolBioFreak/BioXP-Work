@@ -23,7 +23,7 @@ import time
 import uuid
 from contextvars import ContextVar
 
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
@@ -2303,6 +2303,14 @@ def _age_poll_projection(value: Any, elapsed: float) -> None:
                         child["state"] = "stale"
             else:
                 _age_poll_projection(child, elapsed)
+        if (value.get("enabled") is True
+                and (value.get("snapshot_freshness") or {}).get("state") != "fresh"):
+            for dependency in value.get("dependencies", []):
+                if dependency.get("key") == "snapshot_fresh":
+                    reason = "Canonical motion snapshot is stale."
+                    dependency.update(met=False, reason=reason)
+                    value.update(enabled=False, available=False,
+                                 disabled_reason=reason, unavailable_reason=reason)
     elif isinstance(value, list):
         for child in value:
             _age_poll_projection(child, elapsed)
@@ -2318,6 +2326,7 @@ def install_operator_control_plane(
     pipette_status_provider: Callable[[], Mapping[str, Any]] | None = None,
     oem_deck_provider: Callable[[], Any] | None = None,
     oem_deck_position_table_provider: Callable[[], Any] | None = None,
+    motion_snapshot_collector: Callable[[], Awaitable[Mapping[str, Any]]] | None = None,
 ) -> None:
     """Snapshot final routes and mount the robot-authoritative operator plane."""
     actions, dispatch = _build_catalog(app)
@@ -2799,12 +2808,41 @@ def install_operator_control_plane(
 
     def assessed_action(action: Mapping[str, Any], state: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
         assessment = _assess_action(action, state, inputs)
+        observation = {}
+        if any(row["key"] == "snapshot_fresh" for row in assessment["dependencies"]):
+            # Seal only this predicate's evidence budget, not combined telemetry
+            # age. Cached presentation can expire it but cannot renew it.
+            domains = state.get("domains") or {}
+            rows = [(domains.get(name) or {}).get("freshness") or {}
+                    for name in ("axes", "power", "latch", "interlock")]
+            ages = [float(row["age_s"]) for row in rows if isinstance(row.get("age_s"), (int, float))]
+            windows = [float(row["fresh_for_s"]) for row in rows if isinstance(row.get("fresh_for_s"), (int, float))]
+            observation["snapshot_freshness"] = {
+                "state": "fresh" if all(row.get("state") == "fresh" for row in rows) else (
+                    "stale" if any(row.get("state") == "stale" for row in rows) else "missing"),
+                "age_s": max(ages) if len(ages) == len(rows) else None,
+                "fresh_for_s": min(windows) if len(windows) == len(rows) else None,
+            }
         return {
             **dict(action),
             **assessment,
+            **observation,
             "available": assessment["enabled"],
             "unavailable_reason": assessment["disabled_reason"],
         }
+
+    def motion_dispatch_precheck(action, inputs, expected_generation) -> None:
+        # Executed by the existing tester worker after it acquires its lease.
+        # SQLite/another query may have consumed time after outer admission.
+        # No refresh here: never substitute a new command or retry source work.
+        state = machine_state()
+        if (state["ownership_generation"] != expected_generation
+                or int(hardware_state.ownership_epoch) != expected_generation):
+            raise HTTPException(409, detail="ownership generation mismatch at motion dispatch")
+        assessment = _assess_action(action, state, inputs)
+        if not assessment["enabled"]:
+            raise HTTPException(409, detail={"error": "action_unavailable",
+                "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})
 
     def authority() -> dict[str, Any]:
         try:
@@ -3652,6 +3690,34 @@ def install_operator_control_plane(
                 if is_safety_interrupt
                 else _assess_action(action, locked_state or {}, effective_inputs)
             )
+            dependency_state = {row["key"]: row["met"] for row in assessment["dependencies"]}
+            if (motion_snapshot_collector is not None
+                    and dependency_state.get("snapshot_fresh") is False
+                    and all(dependency_state.get(key) is True for key in (
+                        "provider_available", "transport_live", "can_ready",
+                        "operation_allows_motion", "motion_enabled"))):
+                # One query-only full collection under the existing invocation
+                # owner, before source entry. Automatic collection would yield
+                # to this very owner. This never retries a physical command.
+                published = False
+                try:
+                    collection = await motion_snapshot_collector()
+                    published = collection.get("ok") is True and collection.get("published") is True
+                except Exception:
+                    # Failed/ambiguous observation is not authority. Retain the
+                    # rejected claim below, even if another collector publishes.
+                    pass
+                locked_state = await invoke_state_reader.read()
+                assessment = _assess_action(action, locked_state, effective_inputs)
+                same_epoch = (locked_state["ownership_generation"] == locked_expected
+                              and int(hardware_state.ownership_epoch) == locked_expected)
+                if not published or not same_epoch:
+                    reason = ("ownership generation changed during motion observation collection"
+                              if not same_epoch else "Motion observation collection did not publish.")
+                    assessment["dependencies"].append(_dependency(
+                        "motion_observation_collection", "Current motion observation collection", False, reason))
+                    assessment.update(enabled=False, disabled_reason=reason)
+                receipt["authority_fingerprint"] = replay_authority_fingerprint(locked_state)
             if not assessment["enabled"]:
                 detail = {
                     "error": "action_unavailable",
@@ -3702,6 +3768,9 @@ def install_operator_control_plane(
                 "expected_ownership_generation": payload.expected_generation,
                 "action_id": action_id,
                 "caller_class": "manual_operator",
+                "motion_snapshot_precheck": (
+                    lambda: motion_dispatch_precheck(action, effective_inputs, locked_expected)
+                ) if "snapshot_fresh" in dependency_state else None,
             })
             linked_pipette_finalization = None
             deck_interrupt_action = None

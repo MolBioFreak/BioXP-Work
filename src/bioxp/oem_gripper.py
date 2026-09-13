@@ -130,6 +130,49 @@ def _switch_activity(tester: Any, board: int, motor: int) -> dict[str, Any]:
     }
 
 
+def gripper_current_observation(row: Any, key: str) -> int | None:
+    # Diagnostic evidence only: never reinterpret OEM cached/error sentinels
+    # or a rejected GAP value as an observed register/speed.
+    if not isinstance(row, dict):
+        return None
+    ack = row.get("ack")
+    if not isinstance(ack, dict) or type(ack.get("status")) is not int or ack["status"] != 100:
+        return None
+    value = row.get(key)
+    if type(ack.get("value")) is not int or row.get("speed_reply_valid") is False:
+        return None
+    return value if type(value) is int else None
+
+
+def gripper_current_status(run_value: int | None, standby_value: int | None, speed_value: int | None) -> dict[str, Any]:
+    # SAP6 is a setting, not measured winding current or temperature. OEM
+    # manual Open retains31; only normal version1 Home restores10. These
+    # labels describe read registers, not the last writer or motion admission.
+    run_value = run_value if type(run_value) is int else None
+    standby_value = standby_value if type(standby_value) is int else None
+    speed_value = speed_value if type(speed_value) is int else None
+    idle_setting = speed_value == 0 and run_value == OEM_IDLE_CURRENT and standby_value == OEM_IDLE_CURRENT
+    if speed_value != 0 or run_value is None or standby_value is None:
+        classification = "G_CURRENT_UNKNOWN_OR_MOVING"
+    elif idle_setting:
+        classification = "G_CURRENT_IDLE_SETTING"
+    elif run_value == GRIPPER_ACTION_CURRENT and standby_value == OEM_IDLE_CURRENT:
+        classification = "G_CURRENT_ACTION_SETTING_RETAINED"
+    else:
+        classification = "G_CURRENT_OTHER_SETTING"
+    return {
+        "classification": classification,
+        "speed": speed_value,
+        "run_current_param6": run_value,
+        "standby_current_param7": standby_value,
+        "safe_idle_max": OEM_IDLE_CURRENT,
+        # Legacy field denotes the observed low-current setting only.
+        "idle_safe": idle_setting,
+        "physical_current_verified": False,
+        "motion_commanded": False,
+    }
+
+
 def gripper_status(tester: Any) -> dict[str, Any]:
     profile = _profile(tester)
     board = int(profile["board"])
@@ -147,16 +190,15 @@ def gripper_status(tester: Any) -> dict[str, Any]:
     # null/error semantics. Its value is NOT always raw GAP9 polarity.
     query_home_active = query_home.get("home") if isinstance(query_home, dict) else None
     position_lt_50 = bool(pos_value is not None and pos_value < 50)
-    run_value = _int_or_none(_value(run, "value"))
-    standby_value = _int_or_none(_value(standby, "value"))
-    speed_value = _int_or_none(_value(speed, "speed"))
-    idle_safe = bool((run_value is None or run_value <= OEM_IDLE_CURRENT) and (standby_value is None or standby_value <= OEM_IDLE_CURRENT))
+    run_value = gripper_current_observation(run, "value")
+    standby_value = gripper_current_observation(standby, "value")
+    speed_value = gripper_current_observation(speed, "speed")
+    current = gripper_current_status(run_value, standby_value, speed_value)
     blockers: list[str] = []
     # OEM gripper confirmation is queryHome(MotorGrip) OR getG()<50.
     # GAP9/GAP10 remain raw diagnostics, but generic both-effective-limit
     # state is not a document-aligned gripper motion blocker by itself.
-    if speed_value == 0 and not idle_safe:
-        blockers.append("g_current_hot_while_idle")
+    # Retained SAP6=31 likewise is not a measured hot-idle condition.
     return {
         "ok": True,
         "schema": "bioxp.oem_gripper_status.v1",
@@ -170,10 +212,7 @@ def gripper_status(tester: Any) -> dict[str, Any]:
         "speed": speed,
         "switches": switches,
         "current": {
-            "run_current_param6": run_value,
-            "standby_current_param7": standby_value,
-            "safe_idle_max": OEM_IDLE_CURRENT,
-            "idle_safe": idle_safe,
+            **current,
             "raw": {"run": run, "standby": standby},
         },
         "profile": profile,

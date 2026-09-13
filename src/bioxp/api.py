@@ -43,6 +43,8 @@ from .oem_gripper import (
     gripper_open,
     gripper_open_wide,
     gripper_status,
+    gripper_current_status,
+    gripper_current_observation,
     restore_gripper_idle_current,
 )
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
@@ -1010,6 +1012,7 @@ async def lifespan(app: FastAPI):
                 pipette_status_provider=_operator_pipette_status,
                 oem_deck_provider=lambda: _serial206_oem_initialization_provider,
                 oem_deck_position_table_provider=load_bound_oem_position_table,
+                motion_snapshot_collector=hardware_snapshot_collect,
             )
             operator_store = app.state.operator_receipt_store
             command_plane_to_start = app.state.operator_command_plane
@@ -2948,18 +2951,10 @@ def _axis_status_payload(tester: BioXpTester, axis: AxisName, *, include_current
         status["standby_current"] = tester.motor_get_axis_param(board, 7, motor=motor)
     current_safety = None
     if axis == AxisName.GRIPPER and include_current:
-        speed_value = status.get("speed", {}).get("speed") if isinstance(status.get("speed"), dict) else None
-        run_value = status.get("max_current", {}).get("value") if isinstance(status.get("max_current"), dict) else None
-        standby_value = status.get("standby_current", {}).get("value") if isinstance(status.get("standby_current"), dict) else None
-        unsafe_hot_idle = bool(speed_value == 0 and ((isinstance(run_value, int) and run_value > OEM_IDLE_STANDBY_CURRENT) or (isinstance(standby_value, int) and standby_value > OEM_IDLE_STANDBY_CURRENT)))
-        current_safety = {
-            "classification": "G_CURRENT_UNSAFE_HOT_IDLE" if unsafe_hot_idle else "G_CURRENT_IDLE_SAFE",
-            "speed": speed_value,
-            "run_current_param6": run_value,
-            "standby_current_param7": standby_value,
-            "safe_idle_max": OEM_IDLE_STANDBY_CURRENT,
-            "motion_commanded": False,
-        }
+        speed_value = gripper_current_observation(status.get("speed"), "speed")
+        run_value = gripper_current_observation(status.get("max_current"), "value")
+        standby_value = gripper_current_observation(status.get("standby_current"), "value")
+        current_safety = gripper_current_status(run_value, standby_value, speed_value)
     return {
         "axis": axis.value,
         "preset": preset,
@@ -5602,6 +5597,11 @@ _usb_sniff_manager = UsbSniffManager()
 
 async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
     def invoke():
+        from bioxp.operator_controls import current_operator_dispatch_context
+        context = current_operator_dispatch_context() or {}
+        precheck = context.get("motion_snapshot_precheck")
+        if callable(precheck):
+            precheck()
         return func()
 
     async def leased_operation():
@@ -7338,12 +7338,49 @@ async def motion_diagnostics_catalog():
     return diagnostic_catalog()
 
 
+def _read_axis_profile_registers(tester: BioXpTester, axes: tuple[str, ...]) -> dict[str, Any]:
+    """Explicit diagnostic only: observed raw TMCL values, not configured profiles."""
+    rows = {}
+    for axis in axes:
+        if axis not in {"g", "door"}:
+            raise ValueError("Profile register readback supports only g and door")
+        profile = tester._motion_oem_axis_profile(axis, startup=False)
+        board, motor = int(profile["board"]), int(profile["motor"])
+        registers = {}
+        for param in (4, 5, 140, 153, 154):
+            reply = tester.motor_get_axis_param(board, param, motor=motor)
+            ack = reply.get("ack") if isinstance(reply, dict) else None
+            value = reply.get("value") if isinstance(reply, dict) else None
+            valid = bool(isinstance(ack, dict) and ack.get("status") == 100 and type(value) is int)
+            registers[str(param)] = {
+                "param": param, "ack": ack, "reply_valid": valid,
+                "value": value if valid else None,
+            }
+        rows[axis] = {
+            "board": board, "motor": motor, "units": "raw_tmcl_register",
+            "ok": all(row["reply_valid"] for row in registers.values()),
+            "registers": registers,
+        }
+    return rows
+
+
 @app.get("/motion/diagnostics/status")
-async def motion_diagnostics_status():
+async def motion_diagnostics_status(profile_registers: Literal["g", "door", "gd"] | None = None):
     tester = _get_tester()
+
+    def collect():
+        result = _collect_axis_diagnostic_status(tester)
+        if profile_registers is not None:
+            axes = ("g", "door") if profile_registers == "gd" else (profile_registers,)
+            result["profile_registers"] = _read_axis_profile_registers(tester, axes)
+            result["ok"] = bool(result.get("ok") and all(
+                row["ok"] for row in result["profile_registers"].values()
+            ))
+        return result
+
     return await _run_blocking(
         "OEM axis diagnostic live status",
-        lambda: _collect_axis_diagnostic_status(tester),
+        collect,
         timeout_s=45.0,
     )
 
