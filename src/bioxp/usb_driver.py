@@ -5020,17 +5020,17 @@ class BioXpTester:
             )
             command_sent = True
             wait = self.motor_oem_wait_target_reached(
-                board, motor=motor, timeout_s=float(timeout_s), event_window=event_window
+                board, motor=motor, timeout_s=30.0 if board == self.BOARD_THERMAL else float(timeout_s), event_window=event_window
             )
-            if board in (self.BOARD_DECK, self.BOARD_HEAD):
-                # Deck/Head moveSteps: both timeout and completion query
+            if board in (self.BOARD_DECK, self.BOARD_HEAD, self.BOARD_THERMAL):
+                # Deck/Head/Thermal moveSteps: timeout and completion query
                 # before the board's power check, independently of CI's query.
                 board_position = self.motor_get_position(board, motor=motor)
             if self.oem_no24v_state() or (
                 isinstance(wait, Mapping) and wait.get("failure") == "No24V"
             ):
                 board_completed = (
-                    board in (self.BOARD_DECK, self.BOARD_HEAD)
+                    board in (self.BOARD_DECK, self.BOARD_HEAD, self.BOARD_THERMAL)
                     and isinstance(wait, Mapping)
                     and wait.get("ok") is True
                 )
@@ -5038,7 +5038,7 @@ class BioXpTester:
                 raise RuntimeError(f"Lost 24V power moveSteps{stage}. moveSteps()")
             event = wait.get("event") if isinstance(wait, Mapping) else None
             if isinstance(wait, Mapping) and wait.get("ok") is True:
-                if board not in (self.BOARD_DECK, self.BOARD_HEAD):
+                if board not in (self.BOARD_DECK, self.BOARD_HEAD, self.BOARD_THERMAL):
                     board_position = self.motor_get_position(board, motor=motor)
                 board_value = board_position.get("position") if isinstance(board_position, Mapping) else None
                 board_wrapper_return = int(board_value) if type(board_value) is int else -1
@@ -5046,7 +5046,7 @@ class BioXpTester:
             else:
                 board_wrapper_return = -1
                 completion_class = "timeout"
-        elif board in (self.BOARD_DECK, self.BOARD_HEAD):
+        elif board in (self.BOARD_DECK, self.BOARD_HEAD, self.BOARD_THERMAL):
             # Zero displacement skips the move, not the board's final query.
             board_position = self.motor_get_position(board, motor=motor)
             board_value = board_position.get("position") if isinstance(board_position, Mapping) else None
@@ -5064,7 +5064,7 @@ class BioXpTester:
                     "completion_class": completion_class,
                     "physical_effect_verified": False}
         public_position = self.motor_get_position(board, motor=motor)
-        if board not in (self.BOARD_DECK, self.BOARD_HEAD) and self.oem_no24v_state():
+        if board not in (self.BOARD_DECK, self.BOARD_HEAD, self.BOARD_THERMAL) and self.oem_no24v_state():
             raise RuntimeError("Lost 24V power moveSteps4. moveSteps()")
         public_value = public_position.get("position") if isinstance(public_position, Mapping) else None
         source_completed = type(public_value) is int
@@ -5474,29 +5474,36 @@ class BioXpTester:
             return preset
         if key == "g":
             gv = self._motion_oem_gripper_version()
-            # No-motion/idle state is held at 10 on the commissioned GV1.
-            # Home/action current 31 is scoped by motor_oem_home_axis and
-            # restored in a finally block; it is not the idle profile.
+            # CCI constructor binds MotorGrip to ZLowLimit/ZHighLimit, not
+            # G_limit (C#422; pinned IL_0422..0432). Preserve the XML fields;
+            # select the same constructor envelope as ClassHeadBoard.
             idle_current = 10
             home_current = 31
-            g_max, g_max_source = self._machine_config_axis_max("g")
+            g_max, g_max_source = self._machine_config_axis_max("z")
+            g_min = self._machine_config_bundle()["config"]["axis_limits"]["z"]["min_steps"]
+            if type(g_min) is not int:
+                raise RuntimeError("mandatory OEM MotorGrip ZLowLimit is unavailable")
             preset.update({
-                "speed": 1500,
-                "acc": 20,
-                "stall_guard": 20,
-                "run_current": idle_current if gv == 1 else (home_current if bool(startup) else idle_current),
+                "speed": 600 if gv == 0 else 1500,
+                "acc": 5 if gv == 0 else 20,
+                "stall_guard": 5 if gv == 0 else 20,
+                "run_current": home_current if gv == 0 else idle_current,
                 "home_current": home_current,
                 "standby_current": idle_current,
                 "home_speed": 200 if gv == 1 else 600,
                 "restore_current": idle_current,
-                "axis_min_steps": 0,
+                "axis_min_steps": g_min,
                 "axis_max_steps": g_max,
+                "axis_limit_source": "ClassControlInterface.ctor MotorGrip: ZLowLimit/ZHighLimit",
                 "home_search_max_abs_delta": g_max,
                 "home_search_max_abs_delta_source": g_max_source,
                 "gripper_version": gv,
             })
             return preset
         if key == "door":
+            # CCI constructor405 binds the thermal motor to ZLow/ZHighLimit.
+            limits = self._motor_oem_door_source_settings()
+            preset.update(axis_min_steps=limits["min_steps"], axis_max_steps=limits["max_steps"])
             open_pos, open_source = self._machine_config_offset_int("m_TCDoorOpen", preset.get("open_position", 16000))
             stall_guard, stall_source = self._machine_config_offset_int("m_TCDoorStallGuardThreshold", preset.get("stall_guard", 6))
             velocity, velocity_source = self._machine_config_offset_int("m_TC_DOOR_VELOCITY", preset.get("speed", 50))
@@ -6812,83 +6819,79 @@ class BioXpTester:
         }
 
     def motor_oem_open_thermal_door(self, *, timeout_s=20.0) -> dict:
-        """OEM ClassControlInterface.openThermalDoor parity surface."""
-        preset = self._motion_oem_axis_profile("door")
-        board = int(preset["board"])
-        motor = int(preset["motor"])
-        target = int(preset.get("open_position", 16000))
-        before = self.motor_thermal_door_status()
-        prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
-        move = self.motor_oem_move_absolute(board, target, motor=motor)
-        wait = move.get("wait")
-        after = self.motor_thermal_door_status()
-        # ClassControlInterface.openThermalDoor IL_0153..0166 requires
-        # mutually exclusive predicates, not merely the requested sensor.
-        opened = after.get("opened") is True and after.get("closed") is False
-        source_ok = move.get("ok") is True
-        acknowledged = self._tmcl_success(move.get("ack")) or self._tmcl_success(move.get("retry_ack"))
-        source_noop = move.get("source_noop") is True
-        ok = bool(source_ok and (acknowledged or source_noop) and opened and after.get("predicates_verified") is True)
-        failure = None
-        if not source_ok:
-            failure = "door_open_source_failed"
-        elif not (acknowledged or source_noop):
-            failure = "door_open_ack_failed"
-        elif not opened or after.get("predicates_verified") is not True:
-            failure = "door_open_predicate_not_confirmed"
-        return {
-            "ok": ok,
-            "axis": "door",
-            "operation": "openThermalDoor",
-            "target": target,
-            "before": before,
-            "prepare": prepare,
-            "move": move,
-            "wait": wait,
-            "after": after,
-            "failure": failure,
-            "oem_reference": "ClassControlInterface.openThermalDoor lines 2651-2678",
-        }
+        return self._motor_oem_thermal_door_move(opening=True)
 
     def motor_oem_close_thermal_door(self, *, timeout_s=20.0) -> dict:
-        """OEM ClassControlInterface.closeThermalDoor parity surface."""
+        return self._motor_oem_thermal_door_move(opening=False)
+
+    def _motor_oem_thermal_door_move(self, *, opening: bool) -> dict:
+        """CCI2651-2712 source return, distinct from controller/physical proof."""
         preset = self._motion_oem_axis_profile("door")
-        board = int(preset["board"])
-        motor = int(preset["motor"])
-        target = int(preset.get("close_position", 0))
-        before = self.motor_thermal_door_status()
-        # IL_0021..00da has no pre-open predicate: Close also handles an
-        # intermediate door. Admission and interlocks remain caller-owned.
-        prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
-        move = self.motor_oem_move_absolute(board, target, motor=motor)
-        wait = move.get("wait")
-        after = self.motor_thermal_door_status()
-        # ClassControlInterface.closeThermalDoor IL_0149..0159.
-        closed = after.get("closed") is True and after.get("opened") is False
-        source_ok = move.get("ok") is True
-        acknowledged = self._tmcl_success(move.get("ack")) or self._tmcl_success(move.get("retry_ack"))
-        source_noop = move.get("source_noop") is True
-        ok = bool(source_ok and (acknowledged or source_noop) and closed and after.get("predicates_verified") is True)
-        failure = None
-        if not source_ok:
-            failure = "door_close_source_failed"
-        elif not (acknowledged or source_noop):
-            failure = "door_close_ack_failed"
-        elif not closed or after.get("predicates_verified") is not True:
-            failure = "door_close_predicate_not_confirmed"
-        return {
-            "ok": ok,
-            "axis": "door",
-            "operation": "closeThermalDoor",
-            "target": target,
-            "before": before,
-            "prepare": prepare,
-            "move": move,
-            "wait": wait,
-            "after": after,
-            "failure": failure,
-            "oem_reference": "ClassControlInterface.closeThermalDoor lines 2678-2692",
+        board, motor = int(preset["board"]), int(preset["motor"])
+        target = int(preset["open_position"]) if opening else 0
+        result = {
+            "axis": "door", "operation": "openThermalDoor" if opening else "closeThermalDoor",
+            "target": target, "before": None, "prepare": None, "move": None,
+            "wait": None, "after": None, "failure": None,
+            "source_call_completed": False, "source_return_value": None,
+            "controller_command_acknowledged": False,
+            "controller_terminal_state_verified": False,
+            "predicates_verified": False, "physical_effect_verified": False,
+            "oem_reference": "ClassControlInterface.cs:2651-2712",
         }
+        if not self._oem_board_present(board):
+            return {**result, "ok": True, "source_call_completed": True,
+                    "source_return_value": True, "source_noop": "board_null"}
+        try:
+            result["prepare"] = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
+            move = self.motor_oem_move_absolute(board, target, motor=motor)
+            result["move"] = move
+            result["wait"] = move.get("wait")
+            result["controller_command_acknowledged"] = bool(
+                self._tmcl_success(move.get("ack")) or self._tmcl_success(move.get("retry_ack")))
+            wait = result["wait"]
+            result["controller_terminal_state_verified"] = bool(
+                isinstance(wait, dict) and wait.get("target_reached") is True
+                and isinstance(wait.get("event"), dict) and wait["event"].get("status") == 128)
+            # The CCI ignores the board's scalar return. Older machines have no
+            # predicate stage. Do not turn either fact into sensor/physical proof.
+            source_ok = True
+            if self._motor_oem_door_source_settings()["serial"] > 9:
+                closed = self._motor_oem_door_query_home(board, motor)
+                if not self._oem_board_state().get(board, False):
+                    right = {"opened": True, "reply_valid": False, "ack": None}
+                else:
+                    right = self.motor_get_axis_param(board, 10, motor=motor)
+                    valid = bool(self._tmcl_success(right.get("ack")) and type(right.get("value")) is int)
+                    # Thermal.queryRightSensor -> ClassMotor.queryRightSwitchStatus:
+                    # null returns helper0 (true), nonnull error helper1 (false).
+                    right["opened"] = (right.get("value") == 1 if valid else right.get("ack") is None)
+                    right["reply_valid"] = valid
+                dclose, dopen = closed.get("home") is True, right.get("opened") is True
+                verified = closed.get("reply_valid") is True and right.get("reply_valid") is True
+                result["after"] = {"closed": dclose, "opened": dopen, "home": closed,
+                                   "right": right, "predicates_verified": verified}
+                result["predicates_verified"] = verified
+                source_ok = dopen and not dclose if opening else dclose and not dopen
+            result.update(ok=source_ok, source_call_completed=True, source_return_value=source_ok)
+            if not source_ok:
+                result["failure"] = "door_open_predicate_not_confirmed" if opening else "door_close_predicate_not_confirmed"
+            return result
+        except Exception as exc:
+            evidence = getattr(exc, "motion_evidence", None)
+            if isinstance(evidence, dict):
+                result["move"] = evidence
+                result["wait"] = evidence.get("wait")
+                result["controller_command_acknowledged"] = bool(
+                    self._tmcl_success(evidence.get("ack")) or self._tmcl_success(evidence.get("retry_ack")))
+            result.update(ok=False, failure=str(exc))
+            if opening:
+                # Open has no CCI catch; retain the issued stages for the normal
+                # manual reporting owner instead of losing them in an outer catch.
+                raise OemMotionCompletionError(str(exc), evidence=result) from exc
+            # Close catches/reports and returns false; this is not script Abort.
+            result.update(source_call_completed=True, source_return_value=False)
+            return result
 
     def _motor_oem_door_search_wait(self, board, motor):
         """Thermal.doorSearchHome IL_0075..00b0, not a timed speed wait.
@@ -7042,21 +7045,22 @@ class BioXpTester:
         stop = self.motor_oem_board_stop(board, motor=motor, axis_name="door")
         home_after = self._motor_oem_door_query_home(board, motor)
         sethome = None
+        home_failure = None
         if home_after.get("home") is True or settings["serial"] < 10:
             sethome = self.motor_set_home(board, motor=motor)
         elif settings["camera_calibrated"]:
-            raise RuntimeError("Failed to find door home")
+            home_failure = "Failed to find door home"
         home_observed = bool(home_after.get("home") is True
                              and home_after.get("reply_valid") is True
                              and self._tmcl_success(home_after.get("ack")))
         terminal_verified = wait.get("controller_terminal_state_verified") is True
         sethome_verified = bool(isinstance(sethome, dict)
                                 and self._tmcl_success(sethome.get("ack")))
-        return {"ok": True, "axis": "door", "board": board, "motor": motor,
+        result = {"ok": home_failure is None, "axis": "door", "board": board, "motor": motor,
                 "startup": bool(startup), "speed": speed,
                 "oem_mode": "initializeMotors.doorSearchHome" if startup else "HomeAxis(D).doorSearchHome",
                 "requested_timeout_s": float(timeout_s),
-                "source_call_completed": True, "source_board_return": None,
+                "source_call_completed": home_failure is None, "source_board_return": None,
                 "home_before": home_before, "home_after": home_after,
                 "status_before": None, "status_after": None,
                 "closed_before": home_before.get("home"), "opened_before": None,
@@ -7066,13 +7070,20 @@ class BioXpTester:
                 "preclear_wait": preclear_move.get("wait") if isinstance(preclear_move, dict) else None,
                 "threshold_restore": threshold_restore, "move_left": move_left,
                 "wait": wait, "stop": stop, "set_home": sethome,
-                "failure": None, "partial": False,
+                "failure": home_failure, "partial": home_failure is not None,
                 "wait_warning": "source_counter_expired" if wait.get("timeout") else None,
                 "controller_command_acknowledged": bool(isinstance(move_left, dict)
                     and self._tmcl_success(move_left.get("ack"))),
                 "controller_terminal_state_verified": terminal_verified,
-                "controller_home_proof_verified": terminal_verified and home_observed and sethome_verified,
+                # Thermal364-410 assigns home AFTER Stop even when the search
+                # counter expires. This attests the observed home predicate and
+                # acknowledged SAP1 origin assignment, not a stopped/physical
+                # result. Keep the earlier wait's terminal fact independent.
+                "controller_home_proof_verified": home_observed and sethome_verified,
                 "independent_physical_motion_verified": False, "physical_effect_verified": False}
+        if home_failure is not None:
+            raise OemMotionCompletionError(home_failure, evidence=result)
+        return result
 
     def motor_oem_switch_search_home_axis(self, axis_key, *, speed=None, timeout_s=20.0):
         """Manual true-homing path: switch-search with inactive->active transition required.
@@ -7283,13 +7294,20 @@ class BioXpTester:
             )
             if gv == 1:
                 out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
-            return finish()
+            finish()
+            # HomeAxis returns axisSearchHome's normal integer (including1
+            # when uninitialized); it does not reinterpret it as an exception.
+            if out["home"].get("source_call_completed") is True:
+                out["ok"] = True
+            out["source_call_completed"] = out["ok"]
+            out["source_return_code"] = out["home"].get("source_return_code")
+            return out
         # HomeAxis(D), IL_03a5..04e0: outer absolute preclear is distinct
         # from Thermal.doorSearchHome's own relative preclear.
         board, motor = int(preset["board"]), int(preset["motor"])
         if not self._oem_board_present(board):
             return {**out, "ok": True, "source_noop": "board_null", "source_call_completed": True}
-        if self.motor_thermal_door_status().get("closed") is True:
+        if self._motor_oem_door_query_home(board, motor).get("home") is True:
             out["prelude"].append(self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 6)) + 2, motor=motor))
             out["preclear"] = self.motor_oem_move_absolute(board, 1000, motor=motor)
         out["prelude"].append(self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 6)), motor=motor))

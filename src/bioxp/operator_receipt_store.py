@@ -62,6 +62,35 @@ _SUMMARY_FIELDS = frozenset({
     "first_stop_acknowledged",
     "second_stop_acknowledged",
     "controller_terminal_state_verified",
+    "controller_home_proof_verified",
+    "closed_confirmed",
+    "home",
+    "reply_valid",
+    "position_reply_valid",
+    "speed_reply_valid",
+    "position",
+    "speed",
+    "last_speed",
+    "timeout",
+    "source_counter",
+    "wait_warning",
+    "source_board_return",
+    "source_return_code",
+    "source_return_value",
+    "predicates_verified",
+    "closed",
+    "opened",
+    "low_level_source_return_code",
+    "raw_requested_position",
+    "requested_position",
+    "effective_position",
+    "wire_position",
+    "target_position",
+    "target",
+    "target_reached",
+    "short_circuit",
+    "command_sent",
+    "motion_commanded",
     "target_event_128_observed",
     "source_wait_signaled",
     "source_noop",
@@ -84,6 +113,8 @@ _SUMMARY_FIELDS = frozenset({
     "right_switch_state",
     "home_switch_active",
     "reference_state",
+    "durable_clean",
+    "origin_position_steps",
     "lifecycle_state",
     "result_summary",
     "terminal_state",
@@ -283,7 +314,14 @@ def compact_response_summary(value: Any, *, max_depth: int = 6, max_items: int =
             return {"omitted": "summary_depth_limit"}
         if isinstance(item, Mapping):
             output: dict[str, Any] = {}
-            for raw_key, raw_value in item.items():
+            # Result scalars and their source stages precede broad preflight
+            # context; the latter must not consume the retained outcome budget.
+            ordered = sorted(item.items(), key=lambda row: (
+                0 if (selected or row[0] in _SUMMARY_FIELDS) and not isinstance(row[1], (Mapping, list, tuple)) else
+                1 if row[0] in {"body", "detail", "result_summary", "home", "home_after", "set_home",
+                              "move_to_calibrated", "move", "position_after", "after", "wait", "stop", "reference_state"} else 2
+            ))
+            for raw_key, raw_value in ordered:
                 key = str(raw_key)[:96]
                 if key == "provenance":
                     continue  # transport matching/timing is not command history

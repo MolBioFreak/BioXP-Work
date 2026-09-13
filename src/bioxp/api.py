@@ -3992,6 +3992,17 @@ def _execute_relative_move(
             "reuse_used": False,
             "fresh_oem_interlock": True,
         }
+        if axis is AxisName.GRIPPER:
+            # CCI4194-4203 owns a board moveSteps followed by getCurrentPosition;
+            # do not replace Head's limits/event/normal -1 return with leaf MVP
+            # plus the legacy guardrail/equality loop below.
+            result = tester._motor_oem_move_steps_source(
+                board=preset["board"], motor=preset["motor"], axis="g",
+                steps=int(steps), timeout_s=float(wait_timeout_s),
+            )
+            result.update({"interlock": interlock, "prep": prep,
+                           "physical_effect_verified": False})
+            return result
     else:
         preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(
             tester,
@@ -4178,6 +4189,28 @@ def _execute_absolute_move(
             "standby_current_param7_written": False,
         }
         prep_policy = {"mode": "oem_exact", "fresh_oem_interlock": True}
+        if axis is AxisName.GRIPPER:
+            # CCI4268-4273 delegates to Head.moveToAbs(false,false).
+            # The native board owner retains clamp/cache/no-op/event semantics.
+            if not tester._oem_board_present(preset["board"]):
+                result = {"ok": True, "source_noop": "board_null", "command_sent": False}
+            else:
+                result = tester.motor_oem_move_absolute(
+                    preset["board"], int(position_steps), motor=preset["motor"],
+                    wait_for_stop=True, gripper_recover=False,
+                )
+            # moveG is void: a normal Head return1 is discarded, not thrown.
+            # Preserve that scalar and its non-motion failure evidence intact.
+            normal_uninitialized = (result.get("source_return_code") == 1
+                                    and result.get("failure") == "board_not_initialized")
+            if normal_uninitialized:
+                result.update({"ok": True, "source_noop": "board_not_initialized",
+                               "command_sent": False})
+            result.update({"interlock": interlock, "prep": prep,
+                           "source_call_completed": result.get("ok") is True,
+                           "public_wrapper_return": None,
+                           "physical_effect_verified": False})
+            return result
     else:
         preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, speed=speed, acc=acc)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
@@ -7621,7 +7654,7 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
             reuse_prepared=False,
             oem_exact=True,
         ),
-        timeout_s=30.0,
+        timeout_s=None if axis is AxisName.GRIPPER else 30.0,
     )
     if isinstance(result, dict):
         result["oem_method"] = "ClassControlInterface.moveSteps"
@@ -7721,7 +7754,7 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
     result = await _run_blocking(
         f"OEM manual absolute {req.axis} to {effective}",
         execute,
-        timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
+        timeout_s=None if axis is AxisName.GRIPPER else max(30.0, float(req.wait_timeout_s) + 10.0),
     )
     if axis is AxisName.Z and isinstance(result, dict):
         result = _record_z_motion_outcome(
@@ -8378,23 +8411,14 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
         # a normal source return/no-op alone must never unlock Open/Close.
         ownership_epoch = hardware_state.ownership_epoch
         board_epoch = tester.oem_current_board_lifecycle_generation() if req.axis == "door" else None
-        result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
-        if req.axis == "door" and isinstance(result, dict) and result.get("ok") is True:
-            home = result.get("home")
-            if isinstance(home, dict) and home.get("controller_home_proof_verified") is True:
-                position = tester.motor_get_position(int(home["board"]), motor=int(home["motor"]))
-                result["reference_position"] = position
-                if (position.get("position_reply_valid") is True and position.get("position") == 0
-                        and hardware_state.ownership_epoch == ownership_epoch
-                        and tester.oem_current_board_lifecycle_generation() == board_epoch):
-                    reference = _reference_state_store.mark_referenced(MarkAxisReferencedCommand(
-                        axis="door", position_steps=0, source="ClassControlInterface.HomeAxis.D",
-                        motion_kind="home_axis_board_test",
-                    ))
-                    result["reference_state"] = reference
-                    if reference.get("ok") is not True or reference.get("durable_clean") is not True:
-                        result.update(ok=False, failure="door_home_reference_persistence_failed")
-            result["physical_effect_verified"] = False
+        result = (_thermal_door_source_call(lambda: tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0))
+                  if req.axis == "door" else tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0))
+        if req.axis == "door":
+            _record_thermal_door_home_reference(
+                result, result.get("home") if isinstance(result, dict) else None,
+                tester=tester, ownership_epoch=ownership_epoch, board_epoch=board_epoch,
+                source="ClassControlInterface.HomeAxis.D", motion_kind="home_axis_board_test",
+            )
         if isinstance(result, dict):
             result["interlock"] = interlock
             result["oem_method"] = "ClassControlInterface.HomeAxis"
@@ -8405,7 +8429,7 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     result = await _run_blocking(
         f"OEM manual home {req.axis}",
         execute,
-        timeout_s=45.0,
+        timeout_s=None if req.axis in {"g", "door"} else 45.0,
     )
     if req.axis == "z" and isinstance(result, dict):
         result = _record_z_home_outcome(
@@ -8526,7 +8550,7 @@ async def motion_gripper_clear():
             reason="oem_manual_gripper_clear",
             timeout_s=15.0,
         ),
-        timeout_s=25.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
 
@@ -8542,7 +8566,7 @@ async def motion_gripper_home():
             reason="oem_manual_gripper_home",
             timeout_s=15.0,
         ),
-        timeout_s=25.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
 
@@ -8589,8 +8613,22 @@ async def motion_gripper_close():
         lambda: _gripper_success_or_409(
             gripper_close(tester, operator_ack="GRIPPER_CLOSE", reason="oem_manual_gripper_close", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
+
+
+def _thermal_door_source_call(operation):
+    """Keep native issued-stage evidence through the manual HTTP report path."""
+    try:
+        return operation()
+    except Exception as exc:
+        evidence = getattr(exc, "motion_evidence", None)
+        if not isinstance(evidence, dict):
+            raise
+        raise HTTPException(status_code=409, detail={
+            **evidence, "ok": False, "failure": str(exc),
+            "physical_effect_verified": False,
+        }) from exc
 
 
 def _thermal_door_success_or_409(result: dict) -> dict:
@@ -8599,17 +8637,47 @@ def _thermal_door_success_or_409(result: dict) -> dict:
     raise HTTPException(status_code=409, detail=result)
 
 
+def _record_thermal_door_home_reference(
+    result, home, *, tester, ownership_epoch, board_epoch, source, motion_kind,
+):
+    """Publish source SAP1 origin assignment to the existing admission owner.
+
+    Thermal.doorSearchHome ends with Stop/queryHome/setHome, not a zero-position
+    readback. The origin is zero; subsequent actual position is separate state.
+    Neither source assignment nor durable reference claims stopped/physical proof.
+    """
+    if not isinstance(result, dict):
+        return result
+    result["physical_effect_verified"] = False
+    if (result.get("ok") is True and isinstance(home, dict)
+            and home.get("controller_home_proof_verified") is True
+            and hardware_state.ownership_epoch == ownership_epoch
+            and tester.oem_current_board_lifecycle_generation() == board_epoch):
+        reference = _reference_state_store.mark_referenced(MarkAxisReferencedCommand(
+            axis="door", position_steps=0, source=source, motion_kind=motion_kind,
+        ))
+        result["reference_state"] = reference
+        if reference.get("ok") is not True or reference.get("durable_clean") is not True:
+            result.update(ok=False, failure="door_home_reference_persistence_failed")
+    return result
+
+
 @app.post("/motion/thermal_door/home")
 async def motion_thermal_door_home():
     _require_motion_route_ready()
     tester = _get_tester()
-    return await _run_blocking(
-        "OEM thermal door home",
-        lambda: _thermal_door_success_or_409(
-            tester.motor_oem_door_search_home(timeout_s=20.0, startup=False)
-        ),
-        timeout_s=30.0,
-    )
+
+    def execute():
+        ownership_epoch = hardware_state.ownership_epoch
+        board_epoch = tester.oem_current_board_lifecycle_generation()
+        result = _thermal_door_source_call(lambda: tester.motor_oem_door_search_home(timeout_s=20.0, startup=False))
+        return _thermal_door_success_or_409(_record_thermal_door_home_reference(
+            result, result, tester=tester,
+            ownership_epoch=ownership_epoch, board_epoch=board_epoch,
+            source="ClassControlInterface.btnDHome_Click", motion_kind="manual_door_home",
+        ))
+
+    return await _run_blocking("OEM thermal door home", execute, timeout_s=None)
 
 
 @app.post("/motion/thermal_door/open")
@@ -8619,9 +8687,9 @@ async def motion_thermal_door_open():
     return await _run_blocking(
         "OEM thermal door open",
         lambda: _thermal_door_success_or_409(
-            tester.motor_oem_open_thermal_door(timeout_s=20.0)
+            _thermal_door_source_call(lambda: tester.motor_oem_open_thermal_door(timeout_s=20.0))
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 
@@ -8634,7 +8702,7 @@ async def motion_thermal_door_close():
         lambda: _thermal_door_success_or_409(
             tester.motor_oem_close_thermal_door(timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 

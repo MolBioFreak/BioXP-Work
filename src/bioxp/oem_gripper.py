@@ -90,9 +90,9 @@ def _profile(tester: Any) -> dict[str, Any]:
     out["machine_config"] = machine_gripper
     out["machine_positions"] = {
         "originOffsetG": _manifest_value(machine_gripper.get("originOffsetG")),
-        "close": _manifest_value(machine_gripper.get("GripperClosePOS")),
-        "open": _manifest_value(machine_gripper.get("GripperOpenPOS")),
-        "open_wide": _manifest_value(machine_gripper.get("GripperOpenWide")),
+        "close": _gripper_calibrated_position("GripperClosePOS", gripper_version=out.get("gripper_version"), config=machine_gripper),
+        "open": _gripper_calibrated_position("GripperOpenPOS", gripper_version=out.get("gripper_version"), config=machine_gripper),
+        "open_wide": _gripper_calibrated_position("GripperOpenWide", gripper_version=out.get("gripper_version"), config=machine_gripper),
         "source": "original_ssd_machine_config" if machine_gripper.get("ok") else "unavailable",
     }
     return out
@@ -143,8 +143,9 @@ def gripper_status(tester: Any) -> dict[str, Any]:
     if hasattr(tester, "motor_query_home_switch"):
         query_home = tester.motor_query_home_switch(board, motor=motor)
     pos_value = _int_or_none(_value(position, "position"))
-    query_value = _int_or_none(_value(query_home, "value"))
-    query_home_active = bool(query_value == int(getattr(tester, "MOTOR_SWITCH_ACTIVE_VALUE", 1))) if query_value is not None else None
+    # This helper already applies ClassMotor.queryLeft/Head.queryHome's
+    # null/error semantics. Its value is NOT always raw GAP9 polarity.
+    query_home_active = query_home.get("home") if isinstance(query_home, dict) else None
     position_lt_50 = bool(pos_value is not None and pos_value < 50)
     run_value = _int_or_none(_value(run, "value"))
     standby_value = _int_or_none(_value(standby, "value"))
@@ -209,7 +210,12 @@ def restore_gripper_idle_current(tester: Any, *, reason: str = "operator_restore
     before = gripper_status(tester)
     restore = _restore_idle(tester, reason)
     after = gripper_status(tester)
-    return {"ok": True, "motion_commanded": False, "physical_motion": False, "before": before, "restore": restore, "after": after}
+    result = {"ok": isinstance(restore, dict) and restore.get("ok") is True,
+              "motion_commanded": False, "physical_effect_verified": False,
+              "before": before, "restore": restore, "after": after}
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 def _apply_profile(tester: Any, profile: dict[str, Any]) -> dict[str, Any]:
@@ -246,94 +252,33 @@ def _preflight_for_motion(tester: Any) -> dict[str, Any]:
 
 def gripper_clear(tester: Any, *, operator_ack: str | None, reason: str | None, timeout_s: float = 12.0) -> dict[str, Any]:
     _require_action(operator_ack, GRIPPER_CLEAR_ACK, reason)
-    before = _preflight_for_motion(tester)
+    # Canonical API/enclosure/power admission runs before this helper. Do not
+    # add a status/GAP1 here: Head.moveSteps checks its cached position first.
+    before = None
     profile = _profile(tester)
-    board = int(profile["board"])
-    motor = int(profile["motor"])
-    prepare = None
-    set_action_current = None
-    move = None
-    wait = None
-    restore = None
-    position_before = tester.motor_get_position(board, motor=motor)
-    prior_right_disable = tester.motor_get_axis_param(board, 12, motor=motor)
-    prior_left_disable = tester.motor_get_axis_param(board, 13, motor=motor)
-    limit_mask = {"right_prior": prior_right_disable, "left_prior": prior_left_disable}
-    try:
-        # OEM gripper home already proved that G requires gripper-specific
-        # preparation/current semantics, not the generic axis relative route.
-        # After a successful home this machine reports both G switch channels
-        # active.  Generic unmasked moveSteps ACKs but produces zero motion.
-        # Temporarily masking both G limit inputs matches the existing
-        # supervised force-probe recovery pattern and lets OEM moveSteps(+10000)
-        # actually leave the home switch state; restore happens in finally.
-        prepare = tester.motor_prepare_axis(
-            board,
-            motor=motor,
-            run_current=int(profile.get("run_current", GRIPPER_ACTION_CURRENT)),
-            standby_current=int(profile.get("standby_current", OEM_IDLE_CURRENT)),
-            speed=int(profile.get("speed", 600)),
-            acc=int(profile.get("acc", 5)),
-            stall_guard=profile.get("stall_guard"),
-            rdiv=profile.get("rdiv", 6),
-            pdiv=profile.get("pdiv", 2),
-            disable_right=True,
-            disable_left=True,
-            warm_enable=bool(profile.get("warm_enable", False)),
-        )
-        limit_mask["disable_right_set"] = tester.motor_set_axis_param(board, 12, 1, motor=motor)
-        limit_mask["disable_left_set"] = tester.motor_set_axis_param(board, 13, 1, motor=motor)
-        set_action_current = tester.motor_set_axis_param(board, 6, GRIPPER_ACTION_CURRENT, motor=motor)
-        move = tester.motor_move_relative(board, GRIPPER_CLEAR_STEPS, motor=motor)
-        wait = tester.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 20.0), require_seen_nonzero=False)
-        position_after = tester.motor_get_position(board, motor=motor)
-        pre_pos = _int_or_none(_value(position_before, "position"))
-        post_pos = _int_or_none(_value(position_after, "position"))
-        delta = None if pre_pos is None or post_pos is None else int(post_pos) - int(pre_pos)
-        move_ok = bool(isinstance(move, dict) and (move.get("ok") or _value(move, "ack", "status") == 100))
-        stopped = bool(isinstance(wait, dict) and wait.get("stopped") is True)
-        physical_motion = bool(delta is not None and delta != 0)
-        ok = bool(move_ok and stopped and physical_motion)
-        if not ok:
-            raise HTTPException(status_code=409, detail={
-                "error": "OEM gripper clear failed/ambiguous",
-                "motion_commanded": True,
-                "move": move,
-                "wait": wait,
-                "position_before": position_before,
-                "position_after": position_after,
-                "position_delta": delta,
-                "limit_mask": limit_mask,
-                "before": before,
-            })
-        return {
-            "ok": True,
-            "schema": "bioxp.oem_gripper_clear.v1",
-            "motion_commanded": True,
-            "physical_motion": True,
-            "oem_source": "initializeMotors: setGripperCurrent(31); moveSteps(MotorGrip,+10000,true)",
-            "before": before,
-            "profile": profile,
-            "prepare": prepare,
-            "limit_mask": limit_mask,
-            "set_action_current": set_action_current,
-            "move_steps_10000": move,
-            "wait": wait,
-            "position_before": position_before,
-            "position_after": position_after,
-            "position_delta": delta,
-            "restore": None,
-            "after_status": None,
-        }
-    finally:
-        right_restore_value = _int_or_none(_value(prior_right_disable, "value"))
-        left_restore_value = _int_or_none(_value(prior_left_disable, "value"))
-        if right_restore_value is not None:
-            limit_mask["disable_right_restore"] = tester.motor_set_axis_param(board, 12, right_restore_value, motor=motor)
-        if left_restore_value is not None:
-            limit_mask["disable_left_restore"] = tester.motor_set_axis_param(board, 13, left_restore_value, motor=motor)
-        restore = _restore_idle(tester, "gripper_clear_finally")
-        # Mutate local return if possible is intentionally skipped; always verify with status endpoint.
+    board, motor = int(profile["board"]), int(profile["motor"])
+    # CCI.initializeMotors3354-3355: current31 -> direct board moveSteps.
+    # Its integer result is discarded. No switch masks, generic preparation,
+    # speed-poll substitute, delta gate or finally current restoration exists.
+    current = tester.motor_set_axis_param(board, 6, GRIPPER_ACTION_CURRENT, motor=motor)
+    move = tester.motor_oem_board_move_steps(
+        board, GRIPPER_CLEAR_STEPS, motor=motor, axis="g", timeout_s=20.0)
+    result = {
+        "ok": move.get("source_call_completed") is True,
+        "schema": "bioxp.oem_gripper_clear.v1",
+        "oem_source": "ClassControlInterface.initializeMotors: setGripperCurrent(31); moveSteps(MotorGrip,+10000,true)",
+        "before": before, "profile": profile, "set_action_current": current,
+        "move_steps_10000": move, "wait": move.get("wait"),
+        "motion_commanded": move.get("command_sent") is True,
+        "source_call_completed": move.get("source_call_completed") is True,
+        "source_return_code": move.get("source_return_code"),
+        "source_noop": move.get("source_noop", False),
+        "physical_effect_verified": False,
+        "restore": {"performed": False, "reason": "source_retains_action_current"},
+    }
+    if not result["ok"]:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 def gripper_home(tester: Any, *, operator_ack: str | None, reason: str | None, timeout_s: float = 15.0) -> dict[str, Any]:
@@ -368,13 +313,23 @@ GRIPPER_OPEN_ACK = "GRIPPER_OPEN"
 GRIPPER_OPEN_WIDE_ACK = "GRIPPER_OPEN_WIDE"
 
 
-def _gripper_calibrated_position(field_name):
-    # Look up a calibrated OEM gripper position from machine config.
-    cfg = _machine_gripper_config()
+def _gripper_calibrated_position(field_name, *, gripper_version=1, config=None):
+    # ClassBioXPSettings constructor1669-1701 populates GripperStatus after
+    # loadConfig. Saved GV1 positions already include their calibration offset.
+    cfg = _machine_gripper_config() if config is None else config
     if not cfg.get("ok"):
         return None
-    raw = cfg.get(field_name)
-    return _manifest_value(raw) if isinstance(raw, dict) else None
+    offset = _manifest_value(cfg.get("originOffsetG"))
+    wide = _manifest_value(cfg.get("GripperOpenWide"))
+    if gripper_version == 0:
+        base = {"GripperClosePOS": 54500, "GripperOpenPOS": 58500, "GripperOpenWide": 59500}[field_name]
+        return base + offset if type(offset) is int else None
+    if gripper_version == 1:
+        if wide == 0:
+            base = {"GripperClosePOS": 27950, "GripperOpenPOS": 32000, "GripperOpenWide": 33000}[field_name]
+            return base + offset if type(offset) is int else None
+        return _manifest_value(cfg.get(field_name))
+    return None  # source constructor has no GripperStatus map for other versions
 
 
 def _gripper_move_to_calibrated(
@@ -393,7 +348,7 @@ def _gripper_move_to_calibrated(
     before = _preflight_for_motion(tester)
     profile = _profile(tester)
     board, motor = int(profile["board"]), int(profile["motor"])
-    target = _gripper_calibrated_position(field_name)
+    target = _gripper_calibrated_position(field_name, gripper_version=tester._motion_oem_gripper_version())
     if target is None:
         raise HTTPException(status_code=409, detail={
             "error": "Calibrated position " + field_name + " not available in machine config",
@@ -430,6 +385,10 @@ def _gripper_move_to_calibrated(
         result["move_to_calibrated"] = move
         result["motion_commanded"] = move.get("command_sent") is True
         result["source_call_completed"] = True
+        if opening:
+            # OpenGripper returns getCurrentPosition (CCI3564); its button
+            # independently reads again for the text field (CCI2001/2019).
+            result["source_return_position"] = tester.motor_get_position(board, motor=motor)
         after = tester.motor_get_position(board, motor=motor)
         result["position_after"] = after
         # The source primitive owns event/timeout-at-target and cached no-op
@@ -438,8 +397,14 @@ def _gripper_move_to_calibrated(
         result["target_reached"] = after.get("position") == int(target)
         acknowledged = tester._tmcl_success(move.get("ack")) or tester._tmcl_success(move.get("retry_ack"))
         result["controller_command_acknowledged"] = bool(acknowledged)
-        result["ok"] = bool(move.get("ok") is True and result["target_reached"]
-                            and (result["source_noop"] or (acknowledged and tester._tmcl_success(after.get("ack")))))
+        # CCI manual handlers display the getter after a normal board return;
+        # they do not turn an event/limit no-op into a target-equality failure.
+        # Keep observed arrival and ACK separate from that source outcome.
+        normal_uninitialized = (move.get("source_return_code") == 1
+                                and move.get("failure") == "board_not_initialized")
+        result["source_return_code"] = move.get("source_return_code")
+        result["ok"] = bool(move.get("ok") is True or normal_uninitialized)
+        result["source_call_completed"] = result["ok"]
         if not result["ok"]:
             result["error"] = "OEM gripper " + field_name + " move failed/ambiguous"
         return result
