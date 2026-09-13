@@ -2009,7 +2009,8 @@ def _route_failure_code(status_code: int | None, response: Any) -> str:
             # This exact OEM diagnostic has a known meaning. Do not classify
             # arbitrary exception prose by substring or expose its text.
             if isinstance(value, str) and re.fullmatch(
-                r"RuntimeError: Reach GZ position time out! board=[0-9]{1,3}; axis=[0-9]{1,3}; position=-?[0-9]{1,10}", value
+                r"(?:RuntimeError: |xy_intent_exception:OemMotionCompletionError:)"
+                r"Reach GZ position time out! board=[0-9]{1,3}; axis=[0-9]{1,3}; position=-?[0-9]{1,10}", value
             ):
                 return "controller_position_wait_timeout"
     if status_code == 409:
