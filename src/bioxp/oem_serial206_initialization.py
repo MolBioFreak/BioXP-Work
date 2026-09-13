@@ -2042,7 +2042,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "physical_motion_commanded": False,
             }
         requested = int(requested_position_steps)
-        effective = max(int(pseudo_home_steps), requested)
+        effective = Serial206OemInitializationProvider.z_absolute_target(requested, int(pseudo_home_steps))
         before = self.tester.motor_get_position(4, motor=1)
         before_value = self._z_value(before)
         if before_value is None:
@@ -2057,13 +2057,29 @@ class Serial206ProductionPrimitiveAdapter:
         current_write = self.tester.motor_set_axis_param(4, 6, int(profile["run_current"]), motor=1)
         current_readback = self.tester.motor_get_axis_param(4, 6, motor=1)
         pre_command_event_window = self.tester.begin_bus_event_window()
-        move = self.tester.motor_oem_move_absolute(
-            4,
-            effective,
-            motor=1,
-            wait_for_stop=True,
-            max_position=160000,
-        )
+        try:
+            move = self.tester.motor_oem_move_absolute(
+                4,
+                effective,
+                motor=1,
+                wait_for_stop=True,
+                max_position=160000,
+            )
+        except Exception as exc:
+            # Preserve actual pre-call inputs and the driver's attached timeout
+            # evidence without changing the source exception or adding a read.
+            failed_move = getattr(exc, "motion_evidence", None)
+            failed = self._z_finalize_position_move(
+                before=before, target=failed_move.get("wire_position", effective), move={**failed_move, "ok": False},
+                pre_command_event_window=pre_command_event_window,
+                event_window=pre_command_event_window,
+            ) if isinstance(failed_move, Mapping) else {"before_position_steps": before_value}
+            failed.update(requested_position_steps=requested,
+                effective_position_steps=failed_move.get("wire_position") if isinstance(failed_move, Mapping) else None,
+                pseudo_home_steps=int(pseudo_home_steps), coordinate_mode="absolute", source_return_ok=False)
+            failed["target_clamped"] = failed["effective_position_steps"] != requested if type(failed["effective_position_steps"]) is int else None
+            exc.critical_z_evidence = Serial206OemInitializationProvider._critical_z_result_evidence(failed)
+            raise
         if isinstance(move, Mapping) and move.get("source_noop") is True:
             return {
                 "ok": True,
@@ -2080,6 +2096,10 @@ class Serial206ProductionPrimitiveAdapter:
                 "controller_terminal_state_verified": False,
                 "requested_position_steps": requested,
                 "effective_position_steps": move.get("source_return_code"),
+                "coordinate_mode": "absolute",
+                "target_clamped": move.get("source_return_code") != requested,
+                "before_position_steps": before_value,
+                "after_position_steps": None,
                 "pseudo_home_steps": int(pseudo_home_steps),
                 "source_anchor": "ClassControlInterface.moveZ:4254-4265",
                 "preflight": _json_safe(preflight),
@@ -2095,14 +2115,16 @@ class Serial206ProductionPrimitiveAdapter:
         if not isinstance(move_event_window, Mapping):
             move_event_window = pre_command_event_window
         result = self._z_finalize_position_move(
-            before=before, target=effective, move=move,
+            before=before, target=move.get("wire_position", effective), move=move,
             pre_command_event_window=pre_command_event_window,
             event_window=move_event_window,
         )
         result.update({
             "intent": "move_absolute",
             "requested_position_steps": requested,
-            "effective_position_steps": effective,
+            "effective_position_steps": move.get("wire_position", effective),
+            "coordinate_mode": "absolute",
+            "target_clamped": move.get("wire_position", effective) != requested,
             "pseudo_home_steps": int(pseudo_home_steps),
             "source_anchor": "ClassControlInterface.moveZ:4254-4265",
             "preflight": _json_safe(preflight),
@@ -7441,6 +7463,11 @@ class Serial206OemInitializationProvider:
             self._save_state(state)
             return {"z_affected": True, "board": 4, "invalidation": invalidation}
 
+    @staticmethod
+    def z_absolute_target(requested: int, minimum: int) -> int:
+        """Recovered moveZ minimum; driver travel limits remain independent."""
+        return max(minimum, requested)
+
     def z_projection(self) -> dict[str, Any]:
         with self._lock:
             try:
@@ -7521,6 +7548,7 @@ class Serial206OemInitializationProvider:
                     "coordinate_contract": "oem_source_nonnegative_z",
                     "source_min_steps": 0,
                     "source_max_steps": 160000,
+                    "current_minimum_steps": (state.get("machine_status") or {}).get("psudo_z_home_steps"),
                     "terminal_state": self._sanitize_z_terminal_state(
                         copy.deepcopy(z.get("terminal_state"))
                         if isinstance(z.get("terminal_state"), Mapping)
@@ -7995,9 +8023,7 @@ class Serial206OemInitializationProvider:
         # A large TMCL trace must not consume the global item budget before the
         # failure, endpoint, or controller-event fields are serialized.
         bounded["result_summary"] = _json_safe(receipt.get("result_summary"))
-        bounded["critical_evidence"] = Serial206OemInitializationProvider._critical_z_result_evidence(
-            receipt.get("result")
-        )
+        bounded["critical_evidence"] = dict(receipt["critical_evidence"]) if isinstance(receipt.get("critical_evidence"), Mapping) else Serial206OemInitializationProvider._critical_z_result_evidence(receipt.get("result"))
         for key in (
             "command_id", "intent", "idempotency_key", "idempotency_replay_enabled",
             "expected_generation",
@@ -8047,6 +8073,15 @@ class Serial206OemInitializationProvider:
 
         return {
             "failure": row.get("failure"),
+            **{key: row.get(key) for key in (
+                "requested_position_steps", "effective_position_steps", "pseudo_home_steps",
+                "coordinate_mode", "target_clamped", "source_return_ok", "source_return_code",
+                "source_noop", "completion_class", "controller_command_acknowledged",
+                "controller_terminal_state_verified", "physical_effect_verified", "command_issued",
+            )},
+            "terminal_z_state": {key: row["terminal_z_state"].get(key) for key in (
+                "ok", "position_steps", "speed_steps_s", "authority",
+            )} if isinstance(row.get("terminal_z_state"), Mapping) else None,
             "before_position_steps": row.get("before_position_steps"),
             "target_position_steps": row.get("target_position_steps"),
             "after_position_steps": row.get("after_position_steps"),
@@ -8907,6 +8942,9 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_stop()
             except Exception as exc:
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                critical = getattr(exc, "critical_z_evidence", None)
+                if intent == "move_absolute" and isinstance(critical, Mapping):
+                    result.update(critical)
 
             result = dict(result) if isinstance(result, Mapping) else {
                 "ok": False,
@@ -9195,6 +9233,8 @@ class Serial206OemInitializationProvider:
                 "move_ok": bool(isinstance(result, Mapping) and isinstance(result.get("move"), Mapping) and result["move"].get("ok") is True),
                 "final_home_ok": bool(isinstance(result, Mapping) and isinstance(result.get("home"), Mapping) and result["home"].get("ok") is True),
             }
+            critical_z_evidence = self._critical_z_result_evidence(result)
+            receipt["critical_evidence"] = critical_z_evidence
             receipt.update({
                 "status": "completed" if ok else "failed",
                 "finished_at": time.time(),
@@ -9338,7 +9378,7 @@ class Serial206OemInitializationProvider:
                 state = self._save_state(state)
             self._persist_z_receipt(durable_receipt)
             z = state["z_lifecycle"]
-            return {"ok": ok, "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
+            return {"ok": ok, "critical_evidence": self._critical_z_result_evidence(result), "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
 
     def record_z_observation(
         self,

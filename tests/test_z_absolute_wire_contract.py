@@ -16,9 +16,7 @@ from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
 from tests.test_motor_receive_identity import setup_driver, receive
 
 
-@pytest.mark.parametrize('requested', [0, 90000])
-@pytest.mark.parametrize('start', [0, 50000, 100000])
-def test_z_absolute_requested_values_encode_absolute_not_relative(monkeypatch, requested, start):
+def make_adapter(monkeypatch, start, *, arrives=True):
     bind_serial206_oem_snapshot(monkeypatch)
     driver = setup_driver()
     driver._oem_board_initialized = {4: True}
@@ -39,14 +37,24 @@ def test_z_absolute_requested_values_encode_absolute_not_relative(monkeypatch, r
         if cmd == 4:
             frames.append({'board': board, 'command': cmd, 'mode': param,
                            'motor': motor, 'value': value, 'hex': raw.hex()})
-            registers[(board, motor, 1)] = value
-            receive(driver, board=board, motor=motor)
+            if arrives:
+                registers[(board, motor, 1)] = value
+                receive(driver, board=board, motor=motor)
         return {'status': 100, 'value': registers.get(key, 0)}
 
+    if not arrives:
+        driver.motor_oem_wait_target_reached = lambda *a, **k: {"ok": False, "failure": "timeout"}
     driver.send_tmcl = hardware
     driver.send_tmcl_retry = hardware
     adapter = object.__new__(Serial206ProductionPrimitiveAdapter)
     adapter.tester = driver
+    return adapter, frames
+
+
+@pytest.mark.parametrize('requested', [0, 90000])
+@pytest.mark.parametrize('start', [0, 50000, 100000])
+def test_z_absolute_requested_values_encode_absolute_not_relative(monkeypatch, requested, start):
+    adapter, frames = make_adapter(monkeypatch, start)
     result = adapter.z_move_absolute(requested_position_steps=requested, pseudo_home_steps=65000)
     effective = max(requested, 65000)
     assert result['ok'] is True
@@ -68,3 +76,28 @@ def test_z_absolute_requested_values_encode_absolute_not_relative(monkeypatch, r
                                      'pseudo_home': 65000, 'effective': effective,
                                      'simulated_delta': effective-start, 'wire': frames,
                                      'result': result}) + '\n')
+
+@pytest.mark.parametrize('minimum,requested,start,effective', [
+    (500, 0, 500, 500), (65000, 90000, 90000, 90000),
+    (65000, 200000, 160000, 160000),
+])
+def test_z_absolute_retains_source_noop_facts(monkeypatch, minimum, requested, start, effective):
+    adapter, frames = make_adapter(monkeypatch, start)
+    result = adapter.z_move_absolute(requested_position_steps=requested, pseudo_home_steps=minimum)
+    assert result['source_noop'] is True
+    assert result['requested_position_steps'] == requested
+    assert result['effective_position_steps'] == effective
+    assert result['before_position_steps'] == start
+    assert result['after_position_steps'] is None
+    assert result['coordinate_mode'] == 'absolute'
+    assert result['controller_command_acknowledged'] is False
+    assert result['controller_terminal_state_verified'] is False
+    assert frames == []
+
+
+def test_z_absolute_reports_actual_source_driver_travel_clamp(monkeypatch):
+    adapter, frames = make_adapter(monkeypatch, 0)
+    result = adapter.z_move_absolute(requested_position_steps=200000, pseudo_home_steps=65000)
+    assert result['requested_position_steps'] == 200000
+    assert result['effective_position_steps'] == result['target_position_steps'] == frames[0]['value'] == 160000
+    assert result['target_clamped'] is True

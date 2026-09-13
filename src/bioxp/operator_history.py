@@ -152,6 +152,7 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                         json_extract(d.receipt_json,'$.operator_assessment') AS saved_operator_assessment,
                         json_extract(d.receipt_json,'$.operator_note') AS saved_operator_note,
                         json_extract(d.receipt_json,'$.interrupt_evidence') AS interrupt_json,
+                        json_extract(d.receipt_json,'$.z_move') AS z_move_json,
                         json_extract(d.receipt_json,'$.transport_retention_errors') AS retention_json,
                         json_extract(d.receipt_json,'$.state_version') AS state_version,
                         json_extract(d.receipt_json,'$.method_id') AS method_id,
@@ -166,6 +167,7 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                     assessment_value = _json(item.pop("assessment_json"), {})
                     item["response"] = _json(item.pop("response_summary_json"))
                     item["interrupt_evidence"] = _json(item.pop("interrupt_json"))
+                    item["z_move"] = _json(item.pop("z_move_json"))
                     item["transport_retention_errors"] = _json(item.pop("retention_json"), [])
                     item["expected_board_epoch_by_board"] = _json(item.pop("epochs"), {})
                     item["physical_effect_verified"] = bool(item["physical_effect_verified"])

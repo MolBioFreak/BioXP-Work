@@ -2964,6 +2964,7 @@ def install_operator_control_plane(
             "transport_exchanges": [],
             "transport_retention_errors": list(row.get("transport_retention_errors") or []),
             "interrupt_evidence": row.get("interrupt_evidence"),
+            "z_move": row.get("z_move"),
         }
 
     def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -3249,7 +3250,6 @@ def install_operator_control_plane(
     async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
         return await action_receipt_v2(command_id, detail=detail)
 
-    @router.get("/control-catalog")
     @poll_cache.wrap
     async def control_catalog(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
         state = machine_state()
@@ -3286,6 +3286,30 @@ def install_operator_control_plane(
             # contract; they cannot be advertised as executable V1 primitives.
             "actions": [assessed_action(action, state) for action in _v1_catalog_actions(actions)],
         }
+
+    @router.get("/control-catalog")
+    async def control_catalog_with_z_target(
+        schema_version: str | None = Query(default=None),
+        z_target_steps: int | None = Query(default=None, ge=-2147483648, le=2147483647),
+    ) -> dict[str, Any]:
+        # Reuse the finite cached snapshot; draft values never allocate cache
+        # entries or collect hardware. This is presentation, not admission.
+        catalog = await control_catalog(schema_version=schema_version)
+        if z_target_steps is None or schema_version == "bioxp.operator_control_catalog.v2":
+            return catalog
+        from .oem_serial206_initialization import Serial206OemInitializationProvider
+        dashboard = dict(catalog["dashboard"])
+        z_axis = dict(dashboard.get("z_axis") or {})
+        provider = dict(z_axis.get("provider") or {})
+        minimum = provider.get("current_minimum_steps")
+        provider["target_preview"] = {
+            "requested_position_steps": z_target_steps,
+            "effective_position_steps": min(160000, Serial206OemInitializationProvider.z_absolute_target(z_target_steps, minimum))
+                if type(minimum) is int and minimum in {500, 65000} else None,
+        }
+        z_axis["provider"] = provider
+        dashboard["z_axis"] = z_axis
+        return {**catalog, "dashboard": dashboard}
 
     @router.get("/dashboard")
     @poll_cache.wrap
@@ -3746,6 +3770,31 @@ def install_operator_control_plane(
                     authority_receipt = receipt_source.get("authority_receipt")
                     observation_receipt = receipt_source.get("observation_receipt")
                     pipette_truth = response.get("receipt_truth")
+                    if action_id == "oem.z.move_absolute":
+                        # Critical provider facts are carried outside diagnostic
+                        # response compaction, through the canonical SQLite row.
+                        evidence = receipt_source.get("critical_evidence")
+                        receipt["canonical_inputs"] = dict(effective_inputs)
+                        receipt["requested_values"] = dict(payload.inputs)
+                        if isinstance(evidence, Mapping):
+                            receipt["z_move"] = dict(evidence)
+                            receipt["effective_values"] = {key: evidence.get(key) for key in (
+                                "effective_position_steps", "pseudo_home_steps", "target_clamped", "coordinate_mode",
+                            )}
+                            receipt["observed_values"] = {key: evidence.get(key) for key in (
+                                "before_position_steps", "after_position_steps",
+                            )}
+                            terminal = evidence.get("terminal_z_state")
+                            if isinstance(terminal, Mapping):
+                                receipt["observed_values"].update({
+                                    "terminal_position_steps": terminal.get("position_steps"),
+                                    "terminal_speed_steps_s": terminal.get("speed_steps_s"),
+                                })
+                            receipt["controller_evidence"] = {key: evidence.get(key) for key in (
+                                "source_return_ok", "source_return_code", "source_noop", "completion_class",
+                                "controller_command_acknowledged", "controller_terminal_state_verified",
+                                "target_events", "physical_effect_verified",
+                            )}
                 authority_controller_acknowledged = (
                     authority_receipt.get("controller_command_acknowledged")
                     if (
