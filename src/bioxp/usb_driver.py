@@ -6783,6 +6783,13 @@ class BioXpTester:
             "switches": switches,
             "closed": closed,
             "opened": opened,
+            "predicates_verified": bool(
+                isinstance(home, dict) and home.get("reply_valid") is True
+                and self._tmcl_success(home.get("ack"))
+                and isinstance(switches, dict) and type(switches.get("right_state")) is int
+                and switches.get("right_state") in {0, 1}
+                and self._tmcl_success(((switches.get("switches") or {}).get("right") or {}).get("ack"))
+            ),
             "oem_predicates": {
                 "tcDoorClosed": closed,
                 "tcDoorOpened": opened,
@@ -6793,21 +6800,13 @@ class BioXpTester:
 
     def _prepare_oem_thermal_door_motion(self, *, stall_guard_offset=0) -> dict:
         preset = self._motion_oem_axis_profile("door")
-        return self.motor_prepare_axis(
-            preset["board"],
-            motor=preset["motor"],
-            run_current=int(preset.get("run_current", 31)),
-            standby_current=int(preset.get("standby_current", 10)),
-            speed=int(preset.get("speed", 50)),
-            acc=int(preset.get("acc", 20)),
-            stall_guard=int(preset.get("stall_guard", 6)) + int(stall_guard_offset),
-            ramp_mode=preset.get("ramp_mode"),
-            disable_right=preset.get("disable_right"),
-            disable_left=preset.get("disable_left"),
-            rdiv=preset.get("rdiv"),
-            pdiv=preset.get("pdiv"),
-            warm_enable=bool(preset.get("warm_enable", False)),
-        )
+        # open/closeThermalDoor write only threshold and max current. The
+        # initialized source profile owns all other parameters and their lifetime.
+        board, motor = int(preset["board"]), int(preset["motor"])
+        return {
+            "stall_guard": self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 6)) + int(stall_guard_offset), motor=motor),
+            "current": self.motor_set_axis_param(board, 6, int(preset.get("run_current", 31)), motor=motor),
+        }
 
     def motor_oem_open_thermal_door(self, *, timeout_s=20.0) -> dict:
         """OEM ClassControlInterface.openThermalDoor parity surface."""
@@ -6817,17 +6816,22 @@ class BioXpTester:
         target = int(preset.get("open_position", 16000))
         before = self.motor_thermal_door_status()
         prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
-        move = self.motor_move_absolute(board, target, motor=motor)
-        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 60.0), require_seen_nonzero=False)
+        move = self.motor_oem_move_absolute(board, target, motor=motor)
+        wait = move.get("wait")
         after = self.motor_thermal_door_status()
-        opened = bool(after.get("opened"))
-        ok = bool(self._tmcl_success(move.get("ack")) and wait.get("stopped") is True and opened)
+        # ClassControlInterface.openThermalDoor IL_0153..0166 requires
+        # mutually exclusive predicates, not merely the requested sensor.
+        opened = after.get("opened") is True and after.get("closed") is False
+        source_ok = move.get("ok") is True
+        acknowledged = self._tmcl_success(move.get("ack")) or self._tmcl_success(move.get("retry_ack"))
+        source_noop = move.get("source_noop") is True
+        ok = bool(source_ok and (acknowledged or source_noop) and opened and after.get("predicates_verified") is True)
         failure = None
-        if not self._tmcl_success(move.get("ack")):
+        if not source_ok:
+            failure = "door_open_source_failed"
+        elif not (acknowledged or source_noop):
             failure = "door_open_ack_failed"
-        elif wait.get("stopped") is not True:
-            failure = "door_open_wait_timeout"
-        elif not opened:
+        elif not opened or after.get("predicates_verified") is not True:
             failure = "door_open_predicate_not_confirmed"
         return {
             "ok": ok,
@@ -6850,30 +6854,24 @@ class BioXpTester:
         motor = int(preset["motor"])
         target = int(preset.get("close_position", 0))
         before = self.motor_thermal_door_status()
-        if not bool(before.get("opened")):
-            return {
-                "ok": bool(before.get("closed")),
-                "axis": "door",
-                "operation": "closeThermalDoor",
-                "target": target,
-                "skipped": True,
-                "reason": "tcDoorOpened_false_before_close",
-                "before": before,
-                "after": before,
-                "oem_reference": "ClassControlInterface.closeThermalDoor only moves when tcDoorOpened is true",
-            }
+        # IL_0021..00da has no pre-open predicate: Close also handles an
+        # intermediate door. Admission and interlocks remain caller-owned.
         prepare = self._prepare_oem_thermal_door_motion(stall_guard_offset=2)
-        move = self.motor_move_absolute(board, target, motor=motor)
-        wait = self.motor_wait_stopped(board, motor=motor, timeout_s=min(float(timeout_s), 60.0), require_seen_nonzero=False)
+        move = self.motor_oem_move_absolute(board, target, motor=motor)
+        wait = move.get("wait")
         after = self.motor_thermal_door_status()
-        closed = bool(after.get("closed"))
-        ok = bool(self._tmcl_success(move.get("ack")) and wait.get("stopped") is True and closed)
+        # ClassControlInterface.closeThermalDoor IL_0149..0159.
+        closed = after.get("closed") is True and after.get("opened") is False
+        source_ok = move.get("ok") is True
+        acknowledged = self._tmcl_success(move.get("ack")) or self._tmcl_success(move.get("retry_ack"))
+        source_noop = move.get("source_noop") is True
+        ok = bool(source_ok and (acknowledged or source_noop) and closed and after.get("predicates_verified") is True)
         failure = None
-        if not self._tmcl_success(move.get("ack")):
+        if not source_ok:
+            failure = "door_close_source_failed"
+        elif not (acknowledged or source_noop):
             failure = "door_close_ack_failed"
-        elif wait.get("stopped") is not True:
-            failure = "door_close_wait_timeout"
-        elif not closed:
+        elif not closed or after.get("predicates_verified") is not True:
             failure = "door_close_predicate_not_confirmed"
         return {
             "ok": ok,
@@ -7283,6 +7281,15 @@ class BioXpTester:
             if gv == 1:
                 out["restore"] = self.motor_set_axis_param(board, 6, 10, motor=motor)
             return finish()
+        # HomeAxis(D), IL_03a5..04e0: outer absolute preclear is distinct
+        # from Thermal.doorSearchHome's own relative preclear.
+        board, motor = int(preset["board"]), int(preset["motor"])
+        if not self._oem_board_present(board):
+            return {**out, "ok": True, "source_noop": "board_null", "source_call_completed": True}
+        if self.motor_thermal_door_status().get("closed") is True:
+            out["prelude"].append(self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 6)) + 2, motor=motor))
+            out["preclear"] = self.motor_oem_move_absolute(board, 1000, motor=motor)
+        out["prelude"].append(self.motor_set_axis_param(board, 205, int(preset.get("stall_guard", 6)), motor=motor))
         out["home"] = self.motor_oem_door_search_home(timeout_s=timeout_s, startup=False)
         return finish()
 

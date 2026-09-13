@@ -8321,7 +8321,28 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
                 "physical_motion_commanded": False,
                 "interlock": interlock,
             }
+        # HomeAxis(D) is the cockpit's Home handler. Publish its proven
+        # controller reference to the same store consumed by door admission;
+        # a normal source return/no-op alone must never unlock Open/Close.
+        ownership_epoch = hardware_state.ownership_epoch
+        board_epoch = tester.oem_current_board_lifecycle_generation() if req.axis == "door" else None
         result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
+        if req.axis == "door" and isinstance(result, dict) and result.get("ok") is True:
+            home = result.get("home")
+            if isinstance(home, dict) and home.get("controller_home_proof_verified") is True:
+                position = tester.motor_get_position(int(home["board"]), motor=int(home["motor"]))
+                result["reference_position"] = position
+                if (position.get("position_reply_valid") is True and position.get("position") == 0
+                        and hardware_state.ownership_epoch == ownership_epoch
+                        and tester.oem_current_board_lifecycle_generation() == board_epoch):
+                    reference = _reference_state_store.mark_referenced(MarkAxisReferencedCommand(
+                        axis="door", position_steps=0, source="ClassControlInterface.HomeAxis.D",
+                        motion_kind="home_axis_board_test",
+                    ))
+                    result["reference_state"] = reference
+                    if reference.get("ok") is not True or reference.get("durable_clean") is not True:
+                        result.update(ok=False, failure="door_home_reference_persistence_failed")
+            result["physical_effect_verified"] = False
         if isinstance(result, dict):
             result["interlock"] = interlock
             result["oem_method"] = "ClassControlInterface.HomeAxis"
