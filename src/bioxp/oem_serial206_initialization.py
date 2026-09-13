@@ -1707,7 +1707,14 @@ class Serial206ProductionPrimitiveAdapter:
         ty = threading.Thread(target=run, args=("y",), daemon=False)
         tx.start(); ty.start(); tx.join(); ty.join()
         if home_exceptions:
-            raise home_exceptions[0]
+            exc = home_exceptions[0]
+            exc.motion_evidence = {
+                "source_operation": "ClassControlInterface.HomeXY",
+                "setup": setup, "home": results, "home_errors": errors,
+                "exceptions": [copy.deepcopy(getattr(error, "motion_evidence", None)) for error in home_exceptions],
+                "physical_effect_verified": False,
+            }
+            raise exc
         home_ok = bool(
             not errors
             and all(axis in results for axis in ("x", "y"))
@@ -3553,11 +3560,20 @@ class Serial206ProductionPrimitiveAdapter:
                     wait_for_stop=True,
                 )
             if distances["y"]:
-                commands["y"] = self.y_provider.move_absolute(
-                    target_steps=requested["y"],
-                    wait_for_stop=True,
-                    wait_timeout_s=float(wait_timeout_s),
-                )
+                try:
+                    commands["y"] = self.y_provider.move_absolute(
+                        target_steps=requested["y"],
+                        wait_for_stop=True,
+                        wait_timeout_s=float(wait_timeout_s),
+                    )
+                except Exception as exc:
+                    exc.motion_evidence = {
+                        **receipt, "branch": "near_axis_sequential",
+                        "commands": commands, "failed_axis": "y",
+                        "controller_failure": copy.deepcopy(getattr(exc, "motion_evidence", None)),
+                        "physical_effect_verified": False,
+                    }
+                    raise
             source_calls_completed = all(
                 isinstance(command, Mapping) and command.get("ok") is True
                 for command in commands.values()
@@ -6931,6 +6947,33 @@ class Serial206OemInitializationProvider:
         if missing:
             append_atomic(tuple(missing))
 
+    def _xy_exception_receipt(self, exc, *, lifecycle, values, intent, command_id):
+        """Retain controller failure facts without changing the failed latch."""
+        from .critical_logging import critical_receipt
+        evidence = critical_receipt(getattr(exc, "motion_evidence", None))
+        result = {
+            "ok": False, "axis": "xy", "state": "failed_latched",
+            "failure": f"{'xy' if intent == 'move_xy' else 'homexy'}_intent_exception:{type(exc).__name__}:{exc}",
+            "critical_evidence": copy.deepcopy(dict(evidence)) if isinstance(evidence, Mapping) else None,
+        }
+        if command_id is None:
+            raise RuntimeError("xy_failure_command_identity_unresolved")
+        receipt = {
+            "command_id": command_id,
+            "intent": intent, "status": "failed",
+            "generation": int(self.generation_provider()),
+            "idempotency_key": values.get("idempotency_key"),
+            "result": copy.deepcopy(result),
+            "critical_evidence": result["critical_evidence"],
+        }
+        # The current-authority document is not the wire-evidence store. Keep
+        # its bounded receipt index small; durable child rows own exact facts.
+        lifecycle["receipts"].append({key: value for key, value in receipt.items()
+                                      if key not in {"result", "critical_evidence"}})
+        lifecycle["receipts"] = lifecycle["receipts"][-8:]
+        self._persist_xy_child_receipts(receipt)
+        return {**result, "authority_receipt": receipt}
+
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
         with self._x_interrupt_state_lock:
@@ -6944,6 +6987,7 @@ class Serial206OemInitializationProvider:
             terminal_authority_saved = False
             state: dict[str, Any] = {}
             lifecycle: dict[str, Any] = {}
+            command_id: str | None = None
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
@@ -7031,7 +7075,7 @@ class Serial206OemInitializationProvider:
                         "ok": False,
                         "axis": "xy",
                         "state": lifecycle.get("state"),
-                        "failure": "xy_y_authority_not_current",
+                        "failure": "xy_composite_authority_not_current",
                         "composite_authority": _json_safe(admitted_authority),
                     }
                 admitted_authority.pop("ok", None)
@@ -7123,7 +7167,15 @@ class Serial206OemInitializationProvider:
                         "state": "reconciliation_required",
                         "failure": f"xy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
                     }
-                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}"}
+                try:
+                    failed = self._xy_exception_receipt(exc, lifecycle=lifecycle, values=values, intent="move_xy", command_id=command_id)
+                    self._save_state(state)
+                    return failed
+                except Exception as record_exc:
+                    return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": f"xy_failure_receipt_exception:{type(record_exc).__name__}:{record_exc}",
+                        "critical_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
 
     def execute_homexy_intent(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -7138,6 +7190,7 @@ class Serial206OemInitializationProvider:
             terminal_authority_saved = False
             state: dict[str, Any] = {}
             lifecycle: dict[str, Any] = {}
+            command_id: str | None = None
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
@@ -7224,7 +7277,7 @@ class Serial206OemInitializationProvider:
                         "ok": False,
                         "axis": "xy",
                         "state": lifecycle.get("state"),
-                        "failure": "homexy_y_authority_not_current",
+                        "failure": "homexy_composite_authority_not_current",
                         "composite_authority": _json_safe(admitted_authority),
                     }
                 admitted_authority.pop("ok", None)
@@ -7333,7 +7386,15 @@ class Serial206OemInitializationProvider:
                         "state": "reconciliation_required",
                         "failure": f"homexy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
                     }
-                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}"}
+                try:
+                    failed = self._xy_exception_receipt(exc, lifecycle=lifecycle, values=values, intent="home_xy", command_id=command_id)
+                    self._save_state(state)
+                    return failed
+                except Exception as record_exc:
+                    return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": f"homexy_failure_receipt_exception:{type(record_exc).__name__}:{record_exc}",
+                        "critical_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
     def notify_board_activation(self, board_id: int, ack: Any, *, active: bool | None = None) -> dict[str, Any]:
         """Invalidate axis authority on external board lifecycle changes."""
         if int(board_id) == 5:

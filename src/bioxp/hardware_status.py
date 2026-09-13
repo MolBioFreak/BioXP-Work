@@ -58,6 +58,7 @@ class HardwareStateOwner:
         self._collection_lock = threading.Lock()
         self._epoch = 0
         self._snapshot: dict[str, Any] | None = None
+        self._domain_revisions: dict[str, int] = {}
         self._fresh_for_s = max(0.0, float(fresh_for_s))
         self._ownership = {
             "transport": "unbound",
@@ -127,6 +128,21 @@ class HardwareStateOwner:
             self._snapshot = None
             self._invalidated_at = _utc_now()
             self._invalidation_reason = str(reason)
+
+    def invalidate_domains(self, *domains: str, reason: str) -> None:
+        """Fence selected facts without renewing or discarding unrelated reads.
+
+        Revision checks at publication also exclude rows collected before this
+        invalidation by an in-flight collector. Transport ownership is separate.
+        """
+        unknown = set(domains) - set(CANONICAL_DOMAINS)
+        if unknown:
+            raise ValueError(f"unsupported hardware snapshot domains: {sorted(unknown)}")
+        with self._lock:
+            for domain in domains:
+                self._domain_revisions[domain] = self._domain_revisions.get(domain, 0) + 1
+                if self._snapshot is not None:
+                    self._snapshot["domains"].pop(domain, None)
 
     def completed_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -275,6 +291,7 @@ class HardwareStateOwner:
             with self._lock:
                 epoch = self._epoch
                 ownership = copy.deepcopy(self._ownership)
+                domain_revisions = dict(self._domain_revisions)
             started_at = _utc_now()
             context = CollectionContext(ownership_epoch=epoch, started_at=started_at, allow_recover=False)
             rows: dict[str, Any] = {}
@@ -338,6 +355,9 @@ class HardwareStateOwner:
                         "ownership_epoch": self._epoch,
                         "snapshot": snapshot,
                     }
+                for domain in requested:
+                    if self._domain_revisions.get(domain, 0) != domain_revisions.get(domain, 0):
+                        snapshot["domains"].pop(domain, None)
                 self._snapshot = copy.deepcopy(snapshot)
                 self._invalidation_reason = None
                 self._invalidated_at = None

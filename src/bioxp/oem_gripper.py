@@ -402,7 +402,9 @@ def _gripper_move_to_calibrated(
     opening = field_name != "GripperClosePOS"
     result = {
         "ok": False, "schema": "bioxp.oem_gripper_" + field_name.lower() + ".v1",
-        "oem_source": "ClassControlInterface.btnOpen_Click/OpenGripper" if opening else "ClassControlInterface.btnClose_Click",
+        "oem_source": ("ClassControlInterface.btnOpenWide_Click/OpenGripper" if field_name == "GripperOpenWide"
+                       else "ClassControlInterface.btnOpen_Click/OpenGripper" if opening
+                       else "ClassControlInterface.btnClose_Click"),
         "before": before, "profile": profile, "target_position": target,
         "prepare": [], "restore": {"performed": False, "reason": "manual_handler_retains_parameters"},
         "motion_commanded": False, "physical_effect_verified": False,
@@ -420,7 +422,11 @@ def _gripper_move_to_calibrated(
             if version == 0:
                 result["prepare"].append(tester.motor_set_axis_param(board, 205, 5, motor=motor))
         result["motion_commanded"] = None  # unknown until the primitive returns evidence
-        move = tester.motor_oem_move_absolute(board, target, motor=motor, gripper_recover=opening)
+        # CCI OpenGripper passes (axis, target, true, recover, false):
+        # recover is fourth/stallRecover, ignored by ClassHeadBoard, NOT
+        # fifth/gripperRecover. IL_00db..00de / IL_0128..012b explicitly
+        # push false fifth. Enabling it invents G then Y homing here.
+        move = tester.motor_oem_move_absolute(board, target, motor=motor, gripper_recover=False)
         result["move_to_calibrated"] = move
         result["motion_commanded"] = move.get("command_sent") is True
         result["source_call_completed"] = True

@@ -2164,17 +2164,20 @@ class _OperatorStateReader:
 
 
 class _OperatorPollCache:
-    """One refresh in flight across all polling views; never a work backlog.
+    """One refresh in flight, with coalesced demand per finite polling view.
 
     Only read-only projections run here. The provider and its sole transport
     reader retain ownership/serialization. Cancellation of an HTTP waiter does
     not cancel a refresh or admit a replacement while its worker still runs.
     Cold views may await that one refresh; already cached views never do.
+    The next poll services the oldest requested view, even if a different view
+    made that poll. No worker backlog or autonomous refresh loop is created.
     """
 
     def __init__(self, ownership_generation_provider=None):
         self._generation = ownership_generation_provider or (lambda: None)
-        self._cold_waiting = {}
+        self._observed_generation = self._generation()
+        self._waiting = {}
         self._failures = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-poll")
         self._lock = threading.RLock()
@@ -2204,6 +2207,11 @@ class _OperatorPollCache:
                 if self._closed:
                     raise HTTPException(503, detail="operator_poll_closed")
                 generation = self._generation()
+                if generation != self._observed_generation:
+                    self._observed_generation = generation
+                    self._waiting.clear()
+                    self._cache.clear()
+                    self._failures.clear()
                 cached = self._cache.get(key)
                 if cached is not None:
                     body = cached[0]
@@ -2211,42 +2219,38 @@ class _OperatorPollCache:
                     if generation is not None and cached_generation != generation:
                         self._cache.pop(key, None)
                         cached = None
-                now = time.monotonic()
-                # Give an expired cold demand one free retry turn before a hot
-                # view reclaims the slot. Dropping it first starves clients whose
-                # normal polling round-trip exceeds the 0.5s expiry. This adds
-                # no queued work or extended waiter: abandoned demand is removed
-                # now and can suppress only this one hot refresh.
-                cold_turn_due = bool(self._cold_waiting)
-                self._cold_waiting = {view: requested for view, requested in self._cold_waiting.items()
-                                      if now - requested < 0.5}
-                if cached is None or now - cached[1] >= 15.0:
-                    self._cold_waiting[key] = now
-                # Expired hot views need the same fair refresh turn as cold
-                # views; otherwise a frequently polled catalog can indefinitely
-                # starve the dashboard. This records demand, not queued work.
-                can_refresh = key in self._cold_waiting or not (cold_turn_due or self._cold_waiting)
-                if (self._pending is None or self._pending.done()) and can_refresh:
+                idle = self._pending is None or self._pending.done()
+                if idle or self._pending_key != key:
+                    # One demand per registered view, not one task per request.
+                    # Assignment preserves its original insertion order while
+                    # replacing arguments with this view's latest request.
+                    self._waiting[key] = (fn, args, kwargs, generation)
+                if idle and self._waiting:
+                    refresh_key = next(iter(self._waiting))
+                    refresh_fn, refresh_args, refresh_kwargs, refresh_generation = self._waiting.pop(refresh_key)
+
                     def collect():
                         token = _PASSIVE_OPERATOR_POLL.set(True)
                         try:
-                            result = asyncio.run(fn(*args, **kwargs))
-                            if self._generation() != generation:
+                            result = asyncio.run(refresh_fn(*refresh_args, **refresh_kwargs))
+                            if self._generation() != refresh_generation:
                                 raise HTTPException(503, detail="operator_poll_ownership_changed")
                         except Exception as exc:
                             with self._lock:
-                                self._failures[key] = (exc if isinstance(exc, HTTPException) else
-                                                       HTTPException(503, detail="operator_poll_refresh_failed"))
+                                if self._generation() == refresh_generation:
+                                    self._failures[refresh_key] = (exc if isinstance(exc, HTTPException) else
+                                                           HTTPException(503, detail="operator_poll_refresh_failed"))
                             raise
                         finally:
                             _PASSIVE_OPERATOR_POLL.reset(token)
                         with self._lock:
-                            self._cache[key] = (result, time.monotonic())
-                            self._failures.pop(key, None)
-                            self._cold_waiting.pop(key, None)
+                            if self._generation() != refresh_generation:
+                                raise HTTPException(503, detail="operator_poll_ownership_changed")
+                            self._cache[refresh_key] = (result, time.monotonic())
+                            self._failures.pop(refresh_key, None)
                         return result
                     self._pending = self._executor.submit(collect)
-                    self._pending_key = key
+                    self._pending_key = refresh_key
                 pending = self._pending
                 if key in self._failures:
                     raise self._failures[key]
@@ -2967,6 +2971,7 @@ def install_operator_control_plane(
             "transport_retention_errors": list(row.get("transport_retention_errors") or []),
             "interrupt_evidence": row.get("interrupt_evidence"),
             "z_move": row.get("z_move"),
+            "xy_failure": row.get("xy_failure"),
         }
 
     def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -3769,6 +3774,10 @@ def install_operator_control_plane(
                         or receipt_source.get("outcome_unknown") is True
                         or receipt_source.get("error") == "tester_operation_completion_ambiguous"
                     )
+                    if action_id in {"oem.xy.move_absolute", "oem.xy.move_xy", "oem.xy.home", "oem.xy.home_xy"}:
+                        evidence = receipt_source.get("critical_evidence")
+                        if isinstance(evidence, Mapping):
+                            receipt["xy_failure"] = dict(evidence)
                     authority_receipt = receipt_source.get("authority_receipt")
                     observation_receipt = receipt_source.get("observation_receipt")
                     pipette_truth = response.get("receipt_truth")

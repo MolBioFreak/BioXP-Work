@@ -6244,6 +6244,7 @@ async def _stop_owned_camera_session_locked(*, reason: str) -> dict[str, Any]:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
+    hardware_state.invalidate_domains("camera", reason=f"camera ownership changed: {reason}")
     if session is not None:
         session["provider"].invalidate_stream(session["session_id"])
         viewer_shutdown = session.get("viewer_shutdown_task")
@@ -6259,7 +6260,6 @@ async def _stop_owned_camera_session_locked(*, reason: str) -> dict[str, Any]:
         await _reap_camera_session(session)
         for queue in tuple(session["queues"]):
             _camera_finish_queue(queue)
-    hardware_state.invalidate(reason=f"camera ownership changed: {reason}")
     lifecycle_state.record_camera_evidence(None)
     return {
         **_camera_stream_control_payload(session, state="off", error=reason),
@@ -6347,6 +6347,13 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
         raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg"))
     provider = _camera_provider
     session_id = uuid.uuid4().hex
+    # Fence camera-only facts before begin_stream/spawn can yield to a
+    # concurrent snapshot collector. Failed starts never renew older evidence.
+    with _camera_projection_lock:
+        _camera_projection_epoch += 1
+        _camera_probe_cache = None
+        epoch = _camera_projection_epoch
+    hardware_state.invalidate_domains("camera", reason="camera ownership changed: stream starting")
     try:
         # Fixed card + USB VID/PID + capture-capability admission, off-loop.
         identity = await run_in_threadpool(provider.begin_stream, session_id)
@@ -6364,18 +6371,16 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
         raise
     queues: set[asyncio.Queue[bytes | None]] = set()
     with _camera_projection_lock:
-        _camera_projection_epoch += 1
-        _camera_probe_cache = None
-        epoch = _camera_projection_epoch
         session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queues": queues, "queue_max_frames": 2, "process": proc, "provider": provider, "provider_generation": provider.generation, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
-        _camera_session = session
-    if provider is not _camera_provider:
+        owner_current = provider is _camera_provider and epoch == _camera_projection_epoch
+        if owner_current:
+            _camera_session = session
+    if not owner_current:
         await _reap_camera_session(session)
         raise HTTPException(status_code=503, detail="camera owner changed during stream start")
     if proc.stdout is None:
         await _reap_camera_session(session)
         raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-    hardware_state.invalidate(reason="camera ownership changed: stream started")
     _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "dropped_frames": provider.status().dropped_frames, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
 
     def current():
@@ -8534,8 +8539,8 @@ async def motion_gripper_open():
         lambda: _gripper_success_or_409(
             gripper_open(tester, operator_ack="GRIPPER_OPEN", reason="oem_manual_gripper_open", timeout_s=20.0)
         ),
-        # Original recovery includes G/Y work and its own bounded waits. The
-        # catalog's existing operation limit owns the caller deadline.
+        # Source moveToAbs owns its wait; the catalog owns the caller deadline.
+        # OpenGripper's recover flag is stallRecover, not G/Y home recovery.
         timeout_s=None,
     )
 

@@ -423,6 +423,13 @@ class Serial206YProvider:
             "board_effective_target": effective_target,
             "motor_effective_target": result.get("wire_position", effective_target),
             "near_high_noop": False,
+            # Match the composite XY consumer using actual primitive delivery facts.
+            "command_issued": result.get("command_sent") is True,
+            "physical_motion_commanded": result.get("command_sent") is True,
+            "controller_command_acknowledged": bool(
+                isinstance(result.get("retry_ack") or result.get("ack"), Mapping)
+                and (result.get("retry_ack") or result.get("ack") or {}).get("status") == 100
+            ),
             "motor_command_delivery_count": 1 if result.get("retry_ack") is None else 2,
             "motor_command_reply_valid": isinstance(result.get("ack"), Mapping),
             "motor_command_status_code": (result.get("ack") or {}).get("status") if isinstance(result.get("ack"), Mapping) else None,
