@@ -6884,6 +6884,8 @@ class Serial206OemInitializationProvider:
                 "board_state": y_board.get("state") if isinstance(y_board, Mapping) else None,
                 "pending_ticket": _json_safe(y_axis.get("pending_ticket")) if isinstance(y_axis, Mapping) else None,
                 "interrupt_epoch": y_axis.get("interrupt_epoch") if isinstance(y_axis, Mapping) else None,
+                "software_interrupt_epoch": y_axis.get("software_interrupt_epoch") if isinstance(y_axis, Mapping) else None,
+                "software_interrupt_active": y_axis.get("software_interrupt_active") if isinstance(y_axis, Mapping) else None,
             },
         }
         if not validate:
@@ -6947,12 +6949,12 @@ class Serial206OemInitializationProvider:
         if missing:
             append_atomic(tuple(missing))
 
-    def _xy_exception_receipt(self, exc, *, lifecycle, values, intent, command_id):
-        """Retain controller failure facts without changing the failed latch."""
+    def _xy_exception_receipt(self, exc, *, lifecycle, values, intent, command_id, persist=True, generation=None):
+        """Retain failed command facts separately from coordinate authority."""
         from .critical_logging import critical_receipt
         evidence = critical_receipt(getattr(exc, "motion_evidence", None))
         result = {
-            "ok": False, "axis": "xy", "state": "failed_latched",
+            "ok": False, "axis": "xy", "state": lifecycle.get("state", "reconciliation_required"),
             "failure": f"{'xy' if intent == 'move_xy' else 'homexy'}_intent_exception:{type(exc).__name__}:{exc}",
             "critical_evidence": copy.deepcopy(dict(evidence)) if isinstance(evidence, Mapping) else None,
         }
@@ -6961,7 +6963,7 @@ class Serial206OemInitializationProvider:
         receipt = {
             "command_id": command_id,
             "intent": intent, "status": "failed",
-            "generation": int(self.generation_provider()),
+            "generation": int(self.generation_provider()) if generation is None else generation,
             "idempotency_key": values.get("idempotency_key"),
             "result": copy.deepcopy(result),
             "critical_evidence": result["critical_evidence"],
@@ -6971,8 +6973,145 @@ class Serial206OemInitializationProvider:
         lifecycle["receipts"].append({key: value for key, value in receipt.items()
                                       if key not in {"result", "critical_evidence"}})
         lifecycle["receipts"] = lifecycle["receipts"][-8:]
-        self._persist_xy_child_receipts(receipt)
+        if persist:
+            self._persist_xy_child_receipts(receipt)
         return {**result, "authority_receipt": receipt}
+
+    def _xy_y_only_failure(self, exc, *, admitted, prior_state, prior_reference,
+                           command_id, values):
+        """Classify only the source Y-only absolute nonarrival (Y spec 8.2/9.1).
+
+        Readbacks are command-local, never dashboard observations. They establish
+        stopped coordinates, not arrival or home. No recovery command is issued.
+        Other source branches deliberately retain their existing failure path.
+        """
+        from .usb_driver import OemMotionCompletionError
+        evidence = getattr(exc, "motion_evidence", None)
+        if not (isinstance(exc, OemMotionCompletionError)
+                and isinstance(evidence, Mapping)
+                and evidence.get("branch") == "near_axis_sequential"
+                and evidence.get("failed_axis") == "y"
+                and evidence.get("commands") == {}
+                and (evidence.get("distances") or {}).get("x") == 0):
+            return None
+        store = self.state_store
+        if store is None:
+            return None  # No durable owner exists to publish coherent truth.
+        tester = self.primitives.tester
+        leaf = evidence.get("controller_failure") or {}
+        terminal = {"classification": "reconciliation_required", "readbacks": {}}
+        exc.motion_evidence = {**evidence, "terminal_classification": terminal}
+
+        def finalize(prepare, **kwargs):
+            # Preserve _save_state's local bookkeeping at the same writer
+            # boundary, without a second write or a post-commit stale reload.
+            # A later local Stop owner cannot publish before this completes.
+            with store._lock:
+                result, published = store.finalize_xy_failure(
+                    prepare, command_id=command_id, **kwargs)
+                self._memory_state = copy.deepcopy(published)
+                self.invalidate_deck_authority_cache(reason="provider_state_changed")
+                return result
+
+        def current(state=None):
+            # Inside publication the store supplies a post-BEGIN canonical read.
+            if state is None:
+                state = store.read_oem_serial206_initialization_state()
+            state = self._validate_state(self._upgrade_state(state))
+            lifecycle = state["x_lifecycle"]
+            active = lifecycle.get("active_receipt") or {}
+            snapshot = self._xy_authority_snapshot(lifecycle, validate=False)
+            cursor = tester.novo_router.receive_cursor()
+            window = leaf.get("event_window") or {}
+            receive_current = (isinstance(window.get("receive_owner"), str)
+                               and type(window.get("owner_generation")) is int
+                               and all(cursor.get(k) == window[k] for k in ("receive_owner", "owner_generation")))
+            owned = (active.get("command_id") == command_id
+                     and active.get("generation") == admitted.get("generation")
+                     and lifecycle.get("state") == "executing")
+            valid = (receive_current and owned
+                     and self._xy_authority_fence_matches(admitted, snapshot)
+                     and admitted["y"].get("software_interrupt_active") is False
+                     and type(admitted["y"].get("software_interrupt_epoch")) is int
+                     and tester.oem_no24v_state() is False
+                     and all(tester.motor_oem_axis_board_initialized(a) is True for a in ("x", "y")))
+            return state, lifecycle, valid
+
+        try:
+            _, _, valid = current()
+            if not valid:
+                raise RuntimeError("xy_failure_authority_changed")
+            if not (isinstance(leaf, Mapping) and leaf.get("board") == 4
+                    and leaf.get("motor") == 0 and leaf.get("command_sent") is True
+                    and leaf.get("oem_wait_for_stop") is True
+                    and isinstance(leaf.get("ack"), Mapping)
+                    and leaf["ack"].get("status") == 100
+                    and isinstance(leaf.get("wait"), Mapping)
+                    and leaf["wait"].get("ok") is False
+                    and leaf["wait"].get("failure") == "oem_moveToAbs_target_event_timeout"
+                    and leaf["wait"].get("no24v") is False
+                    and type(leaf.get("requested_position")) is int
+                    and leaf.get("wire_position") == leaf["requested_position"]):
+                raise RuntimeError("xy_failure_not_acknowledged_absolute_nonarrival")
+            for axis, board in (("x", 5), ("y", 4)):
+                position = tester.motor_get_position(board, motor=0)
+                speed = tester.motor_get_speed(board, motor=0)
+                terminal["readbacks"][axis] = {"position": position, "speed": speed}
+                if not (isinstance(position, Mapping) and position.get("ok") is True
+                        and type(position.get("position")) is int
+                        and isinstance(speed, Mapping) and speed.get("ok") is True
+                        and type(speed.get("speed")) is int and speed["speed"] == 0):
+                    raise RuntimeError("xy_failure_stopped_coordinates_unverified")
+            if terminal["readbacks"]["x"]["position"]["position"] != evidence["before"]["x"]:
+                raise RuntimeError("xy_failure_uncommanded_x_changed")
+            def publish(state, observed):
+                state, lifecycle, valid = current(state)
+                if not valid:
+                    raise RuntimeError("xy_failure_authority_changed_before_publication")
+                terminal.update(classification="failed_with_coherent_stopped_coordinates",
+                    observation=observed, authority_unchanged=True,
+                    authority_scope="classified_terminal_epoch_not_current_admission",
+                    admitted_authority=copy.deepcopy(admitted))
+                lifecycle.update(state=prior_state, reference_state=prior_reference,
+                    active_receipt=None, pending_ticket=None,
+                    last_failure=f"xy_intent_exception:{type(exc).__name__}:{exc}")
+                failed = self._xy_exception_receipt(exc, lifecycle=lifecycle,
+                    values=values, intent="move_xy", command_id=command_id, persist=False,
+                    generation=admitted.get("generation"))
+                return state, failed["authority_receipt"]
+
+            return finalize(publish,
+                requested=leaf["requested_position"],
+                observed=terminal["readbacks"]["y"]["position"]["position"])
+        except Exception as classification_exc:
+            terminal.update(classification="reconciliation_required",
+                            classification_failure=f"{type(classification_exc).__name__}:{classification_exc}")
+            for key in ("observation", "authority_unchanged", "authority_scope", "admitted_authority"):
+                terminal.pop(key, None)  # The attempted transaction was rolled back.
+            try:
+                def blocked(state, observed):
+                    state = self._validate_state(self._upgrade_state(state))
+                    lifecycle = state["x_lifecycle"]
+                    active = lifecycle.get("active_receipt") or {}
+                    owns_active = (lifecycle.get("state") == "executing"
+                        and lifecycle.get("generation") == admitted.get("generation")
+                        and lifecycle.get("board_lifecycle_generation") == admitted.get("x", {}).get("board_lifecycle_generation")
+                        and active.get("command_id") == command_id
+                        and active.get("generation") == admitted.get("generation"))
+                    # Never restore or latch a newer owner, even a ready Stop.
+                    receipt_lifecycle = lifecycle if owns_active else copy.deepcopy(lifecycle)
+                    receipt_lifecycle.update(state="failed_latched", active_receipt=None,
+                        pending_ticket=None, last_failure=str(classification_exc))
+                    failed = self._xy_exception_receipt(exc, lifecycle=receipt_lifecycle,
+                        values=values, intent="move_xy", command_id=command_id, persist=False,
+                        generation=admitted.get("generation"))
+                    return state if owns_active else None, failed["authority_receipt"]
+                return finalize(blocked)
+            except Exception as record_exc:
+                return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": str(record_exc),
+                        "critical_evidence": copy.deepcopy(exc.motion_evidence)}
 
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -6987,6 +7126,8 @@ class Serial206OemInitializationProvider:
             terminal_authority_saved = False
             state: dict[str, Any] = {}
             lifecycle: dict[str, Any] = {}
+            admitted_authority: dict[str, Any] = {}
+            prior_state, prior_reference_state = "unprepared", "unknown"
             command_id: str | None = None
             try:
                 state = self._load_state()
@@ -7152,6 +7293,11 @@ class Serial206OemInitializationProvider:
                         "failure": f"xy_authority_load_exception:{type(exc).__name__}:{exc}",
                     }
                 try:
+                    classified = self._xy_y_only_failure(exc, admitted=admitted_authority,
+                        prior_state=prior_state, prior_reference=prior_reference_state,
+                        command_id=command_id, values=values)
+                    if classified is not None:
+                        return classified
                     lifecycle.update({
                         "state": "failed_latched",
                         "reference_state": "desynced",

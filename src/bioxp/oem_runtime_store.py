@@ -4511,8 +4511,7 @@ class OEMRuntimeStore:
             raise ValueError("serial-206 initialization state must be an object")
         return payload
 
-    def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Append current authority, dropping only noncritical logging attachments."""
+    def _serial206_current_payload(self, state):
         payload = dict(state)
         required = {"movement_ledger", "used_approvals", "initialize_motion_ledger"}
         if not required.issubset(payload):
@@ -4536,6 +4535,11 @@ class OEMRuntimeStore:
         encoded_current = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(encoded_current.encode("utf-8")) > 262_144:
             raise ValueError("serial-206 current authority exceeds encoded-byte ceiling")
+        return stored_payload
+
+    def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Append current authority, dropping only noncritical logging attachments."""
+        stored_payload = self._serial206_current_payload(state)
         with self._lock:
             with self._authority_write():
                 self._db.execute("BEGIN IMMEDIATE")
@@ -4545,13 +4549,25 @@ class OEMRuntimeStore:
                 except Exception:
                     self._db.execute("ROLLBACK")
                     raise
-        return payload
+        return dict(state)
 
     def append_serial206_receipts_atomic(
         self,
         receipts: Iterable[tuple[str, dict[str, Any]]],
     ) -> list[dict[str, Any]]:
         """Persist several stream receipts in one SQLite transaction."""
+        with self._lock, self._authority_write():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._append_serial206_receipts_locked(receipts)
+                self._db.execute("COMMIT")
+                return result
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def _append_serial206_receipts_locked(self, receipts):
         normalized: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = []
         for stream, receipt in receipts:
             selected_stream = str(stream).strip().lower()
@@ -4579,52 +4595,80 @@ class OEMRuntimeStore:
             normalized.append((selected_stream, payload, (selected_stream, receipt_id, command_text, idempotency_text, int(replay_enabled), status_text, observed_at, encoded)))
         if not normalized:
             raise ValueError("at least one serial-206 receipt required")
-        with self._lock:
-            self._authority_write_depth += 1
+        for selected_stream, _payload, row in normalized:
+            if selected_stream in {"x", "y", "z"}:
+                self._db.execute(
+                    """
+                    INSERT OR IGNORE INTO serial206_receipts(
+                        stream,receipt_id,command_id,idempotency_key,
+                        idempotency_replay_enabled,status,observed_at,receipt_json
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    row,
+                )
+                existing = self._db.execute(
+                    "SELECT receipt_json FROM serial206_receipts WHERE stream=? AND receipt_id=?",
+                    (row[0], row[1]),
+                ).fetchone()
+                if existing is None or str(existing[0]) != str(row[7]):
+                    raise ValueError("serial-206 provider receipt identity conflicts with immutable receipt")
+            else:
+                self._db.execute(
+                    """
+                    INSERT INTO serial206_receipts(
+                        stream,receipt_id,command_id,idempotency_key,
+                        idempotency_replay_enabled,status,observed_at,receipt_json
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(stream,receipt_id) DO UPDATE SET
+                        command_id=excluded.command_id,
+                        idempotency_key=excluded.idempotency_key,
+                        idempotency_replay_enabled=excluded.idempotency_replay_enabled,
+                        status=excluded.status,
+                        observed_at=excluded.observed_at,
+                        receipt_json=excluded.receipt_json
+                    """,
+                    row,
+                )
+
+        return [payload for _stream, payload, _row in normalized]
+
+    def finalize_xy_failure(self, prepare, *, command_id, requested=None, observed=None):
+        """Publish failed XY children, observation and authority as one unit.
+
+        prepare compares the canonical owner and volatile fences after the real
+        SQLite writer is acquired. It must not perform transport or persistence.
+        No interrupt lock spans writer acquisition, receipt writes or commit.
+        Later interrupt epochs govern admission, not immutable terminal facts.
+        """
+        with self._lock, self._authority_write():
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                for selected_stream, _payload, row in normalized:
-                    if selected_stream in {"x", "y", "z"}:
-                        self._db.execute(
-                            """
-                            INSERT OR IGNORE INTO serial206_receipts(
-                                stream,receipt_id,command_id,idempotency_key,
-                                idempotency_replay_enabled,status,observed_at,receipt_json
-                            ) VALUES(?,?,?,?,?,?,?,?)
-                            """,
-                            row,
-                        )
-                        existing = self._db.execute(
-                            "SELECT receipt_json FROM serial206_receipts WHERE stream=? AND receipt_id=?",
-                            (row[0], row[1]),
-                        ).fetchone()
-                        if existing is None or str(existing[0]) != str(row[7]):
-                            raise ValueError("serial-206 provider receipt identity conflicts with immutable receipt")
-                    else:
-                        self._db.execute(
-                            """
-                            INSERT INTO serial206_receipts(
-                                stream,receipt_id,command_id,idempotency_key,
-                                idempotency_replay_enabled,status,observed_at,receipt_json
-                            ) VALUES(?,?,?,?,?,?,?,?)
-                            ON CONFLICT(stream,receipt_id) DO UPDATE SET
-                                command_id=excluded.command_id,
-                                idempotency_key=excluded.idempotency_key,
-                                idempotency_replay_enabled=excluded.idempotency_replay_enabled,
-                                status=excluded.status,
-                                observed_at=excluded.observed_at,
-                                receipt_json=excluded.receipt_json
-                            """,
-                            row,
-                        )
-
+                current = self.read_oem_serial206_initialization_state()
+                observation = None
+                if observed is not None:
+                    if type(requested) is not int or type(observed) is not int:
+                        raise ValueError("integer XY observation required")
+                    discrepancy = int(observed) - int(requested)
+                    self._db.execute(
+                        "UPDATE serial206_axis_authority SET observed_position_steps=?, "
+                        "last_discrepancy_steps=?, last_receipt_id=?, updated_at=? WHERE axis='y'",
+                        (int(observed), discrepancy, command_id, time.time()),
+                    )
+                    observation = {"ok": True, "axis": self._axis_rows_locked()["y"],
+                                   "discrepancy_steps": discrepancy, "reconciled_to_observed": True}
+                state, receipt = prepare(current, observation)
+                if receipt.get("command_id") != command_id or receipt.get("status") != "failed":
+                    raise ValueError("failed XY terminal receipt required")
+                children = self._append_serial206_receipts_locked((
+                    ("x", receipt), ("y", {**receipt, "stream": "y", "child_axis": "y"})))
+                if state is not None:
+                    self._append_serial206_authority_snapshot_locked(self._serial206_current_payload(state))
                 self._db.execute("COMMIT")
+                return {**children[0]["result"], "authority_receipt": children[0]}, state if state is not None else current
             except Exception:
-                self._db.execute("ROLLBACK")
-                self._authority_write_depth -= 1
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
-            self._authority_write_depth -= 1
-        return [payload for _stream, payload, _row in normalized]
 
     def append_serial206_receipt(self, stream: str, receipt: dict[str, Any]) -> dict[str, Any]:
         """Persist one provider receipt without expanding the current-state file."""
