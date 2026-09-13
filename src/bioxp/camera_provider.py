@@ -204,6 +204,15 @@ class CameraProvider:
             if self._stream_owner != owner or not self._stream_accepting:
                 raise CameraFrameUnavailable("obsolete camera stream owner")
             assert self._stream_identity is not None
+            # Only exact immutable bytes from this owner's retained, validated
+            # frame qualify. Changed/untrusted payloads still receive full decode.
+            latest = self._latest
+            if (type(content) is bytes and latest is not None
+                    and type(latest.content) is bytes
+                    and latest.provider_generation == self._generation
+                    and latest.identity == self._stream_identity
+                    and content == latest.content):
+                return self._publish(latest.content, self._stream_identity)
             try:
                 self._validate_jpeg(content)
             except CameraError:

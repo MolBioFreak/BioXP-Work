@@ -65,21 +65,24 @@ def rig(monkeypatch):
     return api, provider, processes, []
 
 
-@pytest.mark.parametrize("capture_fps", [2, 30])
-def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_path, capture_fps):
+@pytest.mark.parametrize("capture_fps,scene", [(2, "testsrc2"), (30, "testsrc2"), (30, "color")])
+def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_path, capture_fps, scene):
     from src.bioxp.camera_provider import CameraJpegBuffer
 
     api, provider, processes, _ = rig
     spawn = api.asyncio.create_subprocess_exec
     encoded = []
     argv_seen = []
+    from unittest.mock import Mock
+    validation = Mock(wraps=provider._validate_jpeg)
+    monkeypatch.setattr(provider, "_validate_jpeg", validation)
 
     async def synthetic_input(*argv, **kwargs):
         argv_seen.append(argv)
         output_args = list(argv[argv.index("-i") + 2:])
         completed = subprocess.run(
             [os.environ["CAMERA_TEST_FFMPEG"], "-hide_banner", "-loglevel", "error",
-             "-f", "lavfi", "-i", f"testsrc2=size=640x480:rate={capture_fps}:duration=2",
+             "-f", "lavfi", "-i", f"{scene}=size=640x480:rate={capture_fps}:duration=2",
              *output_args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True,
         )
@@ -103,6 +106,12 @@ def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_pat
                    "delivered_parts": len(delivered), "output_args": list(argv_seen[0][argv_seen[0].index("-i")+2:])})
             assert len(encoded) == capture_fps * 2, "fps filter invented fresh capture frames"
             assert status["frame_sequence"] == len(encoded)
+            expected_decodes = 1 + sum(a != b for a, b in zip(encoded, encoded[1:]))
+            print({"scene": scene, "published": len(encoded), "full_decodes": validation.call_count,
+                   "expected_decodes": expected_decodes})
+            assert validation.call_count == expected_decodes
+            if scene == "color":
+                assert expected_decodes == 1
             assert (await api.camera_frame_latest()).body == encoded[-1]
             assert all(content in part for content, part in zip(encoded, delivered))
             # Actual producer multipart bytes cross the unchanged strict proxy parser.
