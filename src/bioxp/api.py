@@ -6330,7 +6330,9 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     device = identity.device
     fps, quality, width, height = 30, 7, 640, 480
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
+    # The V4L2 request sets capture cadence. An output fps filter duplicates
+    # delayed captures, falsely advancing provider sequence/freshness with old pixels.
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except BaseException:
