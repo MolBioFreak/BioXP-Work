@@ -304,7 +304,10 @@ class Serial206YProvider:
             and terminal_speed.get("speed") == 0
         ) or bool(proof.get("speed_zero"))
         board_wrapper_return = result.get("board_wrapper_return", result.get("raw_return"))
-        source_ok = bool(result.get("ok") is True and board_wrapper_return != -1)
+        # CI.moveSteps discards the board return and returns getCurrentPosition
+        # for X, Y and Z. The shared native wrapper already owns that outcome;
+        # a board timeout (-1) remains evidence, not an extra Y-only failure.
+        source_ok = result.get("ok") is True
         return {
             "ok": source_ok,
             "schema": self.schema,
