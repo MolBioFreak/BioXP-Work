@@ -5116,7 +5116,9 @@ class Serial206OemInitializationProvider:
                 raise ValueError("executed row lacks command identity")
 
         json.dumps(state, allow_nan=False)
-        return copy.deepcopy(state)
+        # Every caller supplies the private copy returned by _upgrade_state.
+        # Validation need not copy the populated ledgers again under the lock.
+        return state
 
     @contextmanager
     def projection_scope(self):
@@ -5299,7 +5301,7 @@ class Serial206OemInitializationProvider:
 
     def _save_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
         self.invalidate_deck_authority_cache(reason="provider_state_changed")
-        payload = self._validate_state(self._upgrade_state(copy.deepcopy(dict(state))))
+        payload = self._validate_state(self._upgrade_state(dict(state)))
         if self.state_store is not None and hasattr(self.state_store, "write_oem_serial206_initialization_state"):
             self.state_store.write_oem_serial206_initialization_state(payload)
         elif self.state_store is not None:
