@@ -314,12 +314,14 @@ def compact_response_summary(value: Any, *, max_depth: int = 6, max_items: int =
             return {"omitted": "summary_depth_limit"}
         if isinstance(item, Mapping):
             output: dict[str, Any] = {}
-            # Result scalars and their source stages precede broad preflight
-            # context; the latter must not consume the retained outcome budget.
+            # Reference publication truth precedes nested source stages: a
+            # populated home must not consume its finite outcome budget.
+            # Result scalars and source stages still precede broad preflight.
             ordered = sorted(item.items(), key=lambda row: (
+                -1 if row[0] == "reference_state" else
                 0 if (selected or row[0] in _SUMMARY_FIELDS) and not isinstance(row[1], (Mapping, list, tuple)) else
                 1 if row[0] in {"body", "detail", "result_summary", "home", "home_after", "set_home",
-                              "move_to_calibrated", "move", "position_after", "after", "wait", "stop", "reference_state"} else 2
+                              "move_to_calibrated", "move", "position_after", "after", "wait", "stop"} else 2
             ))
             for raw_key, raw_value in ordered:
                 key = str(raw_key)[:96]
