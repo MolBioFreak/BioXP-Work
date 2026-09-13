@@ -24,7 +24,7 @@ from bioxp.services.reference_service import ReferenceStateStore
 from bioxp.usb_driver import BioXpTester
 from bioxp.novo_router import NovoRouter
 from bioxp.novo_usb_can import novo_decode
-from z_stop_fixtures import HardwareEndpoints, make_app
+from tests.z_stop_fixtures import HardwareEndpoints, make_app
 
 
 @pytest.fixture
@@ -166,6 +166,7 @@ def test_actual_route_and_compact_detail_keep_source_completion_truth(tmp_path, 
     row = response.json()
     assert hardware.stop_writes == 2, row
     assert row['status'] == 'completed', row
+    captures = {}
     for detail in (False, True):
         projected = client.get(row['status_path'], params={'detail': detail}).json()
         assert projected['status'] == 'completed', projected
@@ -195,11 +196,19 @@ def test_actual_route_and_compact_detail_keep_source_completion_truth(tmp_path, 
         fresh = json.loads(subprocess.check_output([sys.executable, '-c', code,
             str(app.state.operator_receipt_store.root), row['command_id'], str(detail)], text=True))
         assert fresh == raw
+        captures['detail' if detail else 'compact'] = {'projected': projected, 'fresh': fresh}
     history = client.get('/operator/actions/history').json()['items']
     saved = next(item for item in history if item['command_id'] == row['command_id'])
     assert saved['status'] == 'completed'
     assert saved['error'] is None
     assert saved['physical_effect_verified'] is False
+
+    export = os.environ.get('BMS_STOP_OUTPUT')
+    if export:
+        with open(export, 'a', encoding='utf-8') as output:
+            output.write(json.dumps({'armed': armed, 'first_ack': first,
+                                     'mutation': row, 'history': saved,
+                                     'captures': captures}) + '\n')
 
 
 def test_next_addressed_stop_delivers_while_prior_sqlite_writer_waits(tmp_path, monkeypatch, producer):
