@@ -3890,7 +3890,10 @@ class BioXpTester:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            events.extend(self.collect_bus_events(duration_s=min(.020, remaining), timeout_ms=8, max_events=32))
+            # The router owns receive/Set/Reset and the cursor-qualified latch.
+            # Polling retained diagnostic queues here reprocesses old frames on
+            # every interval; only consumed completion evidence belongs above.
+            time.sleep(min(.020, remaining))
         return {"ok": failure is None, "failure": failure, "no24v": failure == "No24V",
                 "reached": reached, "events": events, "event_window": event_window,
                 "pending": [] if failure is None else [list(key) for key in sorted(targets)],
