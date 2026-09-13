@@ -1188,7 +1188,7 @@ async def require_durable_release_start_before_readiness(request: Request, call_
     return await call_next(request)
 
 
-def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None, *, defer_reconciliation: bool = False):
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
@@ -1222,12 +1222,26 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     with lease:
         provider_inputs = dict(inputs or {})
         provider_inputs["command_id"] = operator_command_id
-        result = execute(
-            intent,
-            inputs=provider_inputs,
-            expected_generation=expected_generation,
-            idempotency_key=idempotency_key,
-        )
+        if intent == "stop" and defer_reconciliation:
+            reconcile = provider.execute_z_stop_interrupt(
+                inputs=provider_inputs,
+                expected_generation=expected_generation,
+                idempotency_key=idempotency_key,
+                defer_reconciliation=True,
+            )
+            def finish_stop():
+                result = reconcile()
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise HTTPException(status_code=409, detail=result)
+                return result
+            return finish_stop
+        else:
+            result = execute(
+                intent,
+                inputs=provider_inputs,
+                expected_generation=expected_generation,
+                idempotency_key=idempotency_key,
+            )
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise HTTPException(status_code=409, detail=result)
         return result
@@ -5563,15 +5577,19 @@ async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
         ) from exc
 
 
-async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0):
-    """Run a tester-bound interrupt while retaining connection ownership.
+async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *, delivery_only_lease: bool = False):
+    """Retain connection ownership through the complete physical sequence.
 
-    The inner task owns the transition lease. Shielding it is intentional:
-    timing out or cancelling the HTTP waiter must not let release/rebind race a
-    worker thread that cannot itself be cancelled.
+    Only Z Stop can explicitly signal the delivery boundary; its remaining
+    provider work is lifecycle/SQLite reconciliation, with generation checks.
+    Other callers retain the full lease. Timeout/cancellation never cancel the
+    underlying worker or release ownership before delivery actually finishes.
     """
 
+    ownership_lease_released = False
+
     async def leased_interrupt():
+        nonlocal ownership_lease_released
         async with _tester_transition_lock:
             tester = _get_tester()
             loop = asyncio.get_running_loop()
@@ -5580,10 +5598,15 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             def invoke_interrupt():
                 return interrupt_context.run(func, tester)
 
-            return await loop.run_in_executor(
-                _safety_interrupt_executor,
-                invoke_interrupt,
-            )
+            result = await loop.run_in_executor(_safety_interrupt_executor, invoke_interrupt)
+            if not delivery_only_lease:
+                return result
+        ownership_lease_released = True
+        # Only the Z Stop route opts in and returns its no-controller
+        # continuation. Free BOTH the ownership lease and single safety worker
+        # before waiting for ordinary lifecycle/SQLite recording.
+        reconciliation_context = interrupt_context.copy()
+        return await loop.run_in_executor(None, reconciliation_context.run, result)
 
     worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
     try:
@@ -5592,8 +5615,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise
     except asyncio.TimeoutError as exc:
-        # Retrieve a later exception without cancelling the task. The worker
-        # retains the transition lease until its non-cancellable thread exits.
+        # Retrieve a later exception without cancelling delivery or recording.
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise HTTPException(
             status_code=504,
@@ -5601,7 +5623,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                 "error": "safety_interrupt_completion_ambiguous",
                 "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
                 "completion_ambiguous": True,
-                "connection_transition_blocked_until_worker_exit": True,
+                "connection_transition_blocked_until_worker_exit": not ownership_lease_released,
             },
         ) from exc
 
@@ -8134,8 +8156,9 @@ async def motion_oem_z_diagnostic_home_axis():
 async def motion_oem_z_stop():
     return await _run_safety_interrupt_blocking(
         "serial-206 Z stop",
-        lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
+        lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}, defer_reconciliation=True),
         timeout_s=10.0,
+        delivery_only_lease=True,
     )
 
 

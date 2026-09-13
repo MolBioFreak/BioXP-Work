@@ -2326,7 +2326,7 @@ def install_operator_control_plane(
     store = OperatorReceiptStore()
     poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch))
     app.state.operator_poll_cache = poll_cache
-    from contextlib import asynccontextmanager
+    from contextlib import AsyncExitStack, asynccontextmanager
     previous_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -3515,7 +3515,11 @@ def install_operator_control_plane(
                 )
         effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
-        async with action_lock:
+        async with AsyncExitStack() as action_lease:
+            # Z Stop's API ownership lease + single physical worker serialize
+            # delivery. The outer lease is needed only for its reconciliation.
+            if action_id != "oem.z.stop":
+                await action_lease.enter_async_context(action_lock)
             lock_acquired_at = time.time()
             locked_state = None if is_safety_interrupt else await invoke_state_reader.read()
             locked_expected = (
@@ -3866,6 +3870,8 @@ def install_operator_control_plane(
             receipt["duration_ms"] = (finished - started) * 1000.0
             receipt["receipt_persist_started_at"] = time.time()
             if is_safety_interrupt:
+                if action_id == "oem.z.stop":
+                    await action_lease.enter_async_context(interrupt_lock)
                 receipt["interrupt_evidence"] = _interrupt_receipt_evidence(receipt, interrupt_observation)
                 if deck_interrupt_action is not None:
                     delivered = receipt.get("response")

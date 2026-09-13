@@ -15,7 +15,7 @@ import math
 import uuid
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -2363,6 +2363,7 @@ class Serial206ProductionPrimitiveAdapter:
         if callable(present) and not present(4):
             return {
                 "ok": True, "intent": "stop", "source_call_completed": True,
+                "source_return_ok": True,
                 "source_board_return": None, "source_return_code": None,
                 "source_noop": True, "source_noop_reason": "board_null",
                 "controller_command_acknowledged": False,
@@ -2383,6 +2384,7 @@ class Serial206ProductionPrimitiveAdapter:
             "ok": source_return_ok,
             "intent": "stop",
             "source_call_completed": source_completed,
+            "source_return_ok": source_return_ok,
             "source_board_return": None,
             "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None,
             "controller_command_acknowledged": command_acknowledged,
@@ -8194,13 +8196,33 @@ class Serial206OemInitializationProvider:
         return dict(result)
 
     def execute_z_stop_interrupt(
+        self, *, inputs: Mapping[str, Any] | None = None,
+        expected_generation: int, idempotency_key: str, abort: bool = False,
+        defer_reconciliation: bool = False,
+    ):
+        steps = self._z_stop_interrupt_steps(inputs=inputs,
+            expected_generation=expected_generation, idempotency_key=idempotency_key, abort=abort)
+        # The sole yield is after all OEM physical calls and release of the
+        # addressed delivery lease. Keep epoch/count custody until reconciliation.
+        next(steps)
+
+        def reconcile():
+            try:
+                next(steps)
+            except StopIteration as completed:
+                return completed.value
+            raise RuntimeError("unexpected Z Stop reconciliation boundary")
+
+        return reconcile if defer_reconciliation and not abort else reconcile()
+
+    def _z_stop_interrupt_steps(
         self,
         *,
         inputs: Mapping[str, Any] | None = None,
         expected_generation: int,
         idempotency_key: str,
         abort: bool = False,
-    ) -> dict[str, Any]:
+    ):
         """Deliver Z STOP before waiting for the provider lifecycle lock.
 
         A normal Z intent owns ``self._lock`` across controller execution. STOP
@@ -8222,7 +8244,9 @@ class Serial206OemInitializationProvider:
         # Software Abort has no controller sequence to serialize. In particular,
         # another invocation must not wait behind persistence or a reentrant
         # provider owner. Addressed Stop retains its existing dispatch lease.
-        with nullcontext() if abort else self._z_interrupt_dispatch_lock:
+        with ExitStack() as delivery_lease:
+            if not abort:
+                delivery_lease.enter_context(self._z_interrupt_dispatch_lock)
             with self._z_interrupt_state_lock:
                 self._z_interrupt_epoch += 1
                 interrupt_epoch = self._z_interrupt_epoch
@@ -8260,6 +8284,12 @@ class Serial206OemInitializationProvider:
                     "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
+                # Serialize only the addressed OEM sequence. SQLite/lifecycle
+                # reconciliation must not fence the next explicit Stop delivery.
+                delivery_lease.close()
+                # Resume only persistence/reference reconciliation, never
+                # controller calls, outside the API's physical-delivery worker.
+                yield
                 if abort:
                     reconciliation = self._reconcile_aggregate_software_abort(
                         str(command_id), invalidate_x=True,
@@ -8431,8 +8461,8 @@ class Serial206OemInitializationProvider:
                         "ok": False,
                         "axis": "z",
                         "intent": interrupt_intent,
-                        "source_call_completed": True,
-                        "source_return_ok": result.get("ok") is True,
+                        "source_call_completed": result.get("source_call_completed") is True,
+                        "source_return_ok": result.get("source_return_ok", result.get("ok")) is True,
                         "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
                         "controller_terminal_state_verified": result.get("controller_terminal_state_verified") is True,
                         "physical_effect_verified": False,

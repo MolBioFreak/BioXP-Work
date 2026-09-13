@@ -1,0 +1,126 @@
+{
+  "body": {
+    "detail": {
+      "authority_receipt": {
+        "command_id": "operator_1789260618343_2437046384ee",
+        "controller_command_acknowledged": true,
+        "controller_terminal_state_verified": false,
+        "finished_at": 1789260619.288445,
+        "inputs": {
+          "command_id": "operator_1789260618343_2437046384ee"
+        },
+        "physical_effect_verified": false,
+        "result": {
+          "controller_command_acknowledged": true,
+          "controller_terminal_state_verified": false,
+          "failure": null,
+          "ok": false,
+          "physical_effect_verified": false,
+          "reference_desync": {
+            "ok": true,
+            "state": "desynced"
+          },
+          "source_call_completed": true,
+          "stop": {
+            "ack": {
+              "omitted": "summary_depth_limit"
+            },
+            "controller_command_acknowledged": true,
+            "double_stop_acknowledged": true,
+            "first_delivery": {
+              "omitted": "summary_depth_limit"
+            },
+            "ok": true,
+            "second_delivery": {
+              "omitted": "summary_depth_limit"
+            },
+            "source_call_completed": true
+          }
+        },
+        "started_at": 1789260618.6187775,
+        "status": "failed"
+      },
+      "ok": false,
+      "result": {
+        "controller_command_acknowledged": true,
+        "controller_terminal_state_verified": false,
+        "failure": null,
+        "ok": false,
+        "physical_effect_verified": false,
+        "reference_desync": {
+          "ok": true,
+          "state": "desynced"
+        },
+        "source_call_completed": true,
+        "stop": {
+          "ack": {
+            "status": 100
+          },
+          "controller_command_acknowledged": true,
+          "double_stop_acknowledged": true,
+          "ok": true,
+          "source_call_completed": true
+        }
+      },
+      "z_lifecycle": {
+        "last_failure": {
+          "reason": "z_safety_stop_unverified",
+          "receipt": {
+            "command_id": "operator_1789260618343_2437046384ee",
+            "controller_command_acknowledged": true,
+            "controller_terminal_state_verified": false,
+            "finished_at": 1789260619.288445,
+            "inputs": {
+              "omitted": "summary_depth_limit"
+            },
+            "physical_effect_verified": false,
+            "result": {
+              "omitted": "summary_depth_limit"
+            },
+            "started_at": 1789260618.6187775,
+            "status": "failed"
+          }
+        },
+        "latest_receipt": {
+          "command_id": "operator_1789260618343_2437046384ee",
+          "controller_command_acknowledged": true,
+          "controller_terminal_state_verified": false,
+          "finished_at": 1789260619.288445,
+          "physical_effect_verified": false,
+          "started_at": 1789260618.6187775,
+          "status": "failed"
+        },
+        "prepared_receipt": {
+          "authority": {
+            "axis": {
+              "omitted": "summary_depth_limit"
+            },
+            "board": {
+              "omitted": "summary_depth_limit"
+            },
+            "ok": true
+          },
+          "ok": true,
+          "reference_state": "desynced"
+        },
+        "reference_state": "desynced",
+        "state": "failed_latched",
+        "terminal_state": {
+          "authority": "serial206_terminal_register_readback",
+          "left_switch_disabled": false,
+          "left_switch_state": 0,
+          "observed_at": 1789260606.7169602,
+          "position_steps": 65000,
+          "right_switch_disabled": true,
+          "right_switch_state": 1,
+          "source_command_id": "operator_1789260602477_d087cb499e12",
+          "speed_steps_s": 0,
+          "switch_mask_policy": "observed_only_oem_source_omits_z_writes",
+          "switch_mask_tuple": {}
+        }
+      },
+      "z_state": "failed_latched"
+    }
+  },
+  "http_status": 409
+}

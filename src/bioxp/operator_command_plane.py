@@ -1003,10 +1003,31 @@ class DeckReconciliationRequest(BaseModel):
     approved_home_state: dict[str, Any] | None = None
 
 
+def _interrupt_source_response(response: Any) -> Mapping[str, Any]:
+    # HTTP conflicts retain the actual provider result, just like the outer
+    # operator receipt consumer. HTTP status is not controller evidence.
+    source = response if isinstance(response, Mapping) else {}
+    for _ in range(3):
+        nested = source.get("detail") if isinstance(source.get("detail"), Mapping) else source.get("result")
+        if not isinstance(nested, Mapping):
+            break
+        source = nested
+    return source
+
+
+def _interrupt_source_return_ok(response: Any) -> bool | None:
+    source = _interrupt_source_response(response)
+    value = source.get("source_return_ok")
+    if type(value) is bool:
+        return value
+    # Legacy direct source responses used ok; enveloped lifecycle ok is a
+    # different authority and must not stand in for the OEM return.
+    return source.get("ok") is True if source is response else None
+
+
 def _interrupt_stop_acknowledged(action_id: str, response: Any) -> bool:
     return bool(action_id not in {"oem.abort_all", "oem.z.abort"}
-                and isinstance(response, Mapping)
-                and response.get("controller_command_acknowledged") is True)
+                and _interrupt_source_response(response).get("controller_command_acknowledged") is True)
 
 
 def _interrupt_invocation_evidence(action_id: str, *, attempted: bool) -> dict[str, Any]:
@@ -6273,7 +6294,8 @@ class OperatorCommandStore:
                 current["idempotent_replay"] = True
                 return current
             controller_acknowledged = _interrupt_stop_acknowledged(str(saved["action_id"]), response)
-            source_return_ok = bool(isinstance(response, Mapping) and response.get("ok") is True)
+            source_return_ok = _interrupt_source_return_ok(response)
+            interrupt_succeeded = bool(isinstance(response, Mapping) and response.get("ok") is True)
             exact_response_evidence = self._store_interrupt_evidence(
                 conn,
                 interrupt_attempt_id=interrupt_attempt_id,
@@ -6287,6 +6309,7 @@ class OperatorCommandStore:
                 "source_call_completed": bool(acknowledged),
                 "source_return_ok": source_return_ok,
                 "controller_stop_acknowledged": controller_acknowledged,
+                "controller_terminal_state_verified": _interrupt_source_response(response).get("controller_terminal_state_verified") is True,
                 "physical_effect_verified": False,
                 "controller_response": _bounded_json(response, 131072),
                 "controller_response_evidence": exact_response_evidence,
@@ -6298,13 +6321,13 @@ class OperatorCommandStore:
             for active_id in active_ids:
                 row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (str(active_id),)).fetchone()
                 if row is not None and str(row["status"]) in {"dispatched", "stop_requested", "abort_requested"}:
-                    final_state = terminal_state if source_return_ok else "ambiguous"
+                    final_state = terminal_state if interrupt_succeeded else "ambiguous"
                     terminal_payload = {"interrupt_id": interrupt_id, "source_call_completed": bool(acknowledged), "source_return_ok": source_return_ok, "controller_acknowledged": controller_acknowledged, "error": error}
                     conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,finished_at=?,updated_at=?,terminal_json=?,controller_acknowledged=? WHERE command_id=?", (final_state, _now(), _now(), _canonical(terminal_payload), int(controller_acknowledged), str(active_id)))
                     if row["method_id"]:
                         affected_method_ids.add(str(row["method_id"]))
                     self._update_z_home_authority(conn, command_id=str(active_id), ownership_generation=int(row["ownership_generation"]), status=final_state, payload=terminal_payload, source_noop=False)
-                    canonical_state = "interrupted" if source_return_ok else "ambiguous"
+                    canonical_state = "interrupted" if interrupt_succeeded else "ambiguous"
                     conn.execute("UPDATE serial206_movement_commands SET state=?,state_version=state_version+1,finished_at=?,terminal_receipt_id=? WHERE command_id=? AND state='interrupting'", (canonical_state, _now(), interrupt_id, str(active_id)))
                     transition = self._insert_transition(conn, event_kind="interrupt_terminal", command_id=str(active_id), method_id=row["method_id"], state=final_state, payload={"interrupt_id": interrupt_id, "source_call_completed": bool(acknowledged), "source_return_ok": source_return_ok, "controller_acknowledged": controller_acknowledged, "error": error})
                     current.setdefault("terminal_transition_sequences", []).append(transition)
@@ -7605,8 +7628,8 @@ class OperatorCommandPlane:
                 interrupt_attempt_id=interrupt_attempt_id,
             )
             http_success = 200 <= int(status_code) < 300
-            source_call_field = response.get("source_call_completed") if isinstance(response, Mapping) else None
-            acknowledged = bool(http_success and isinstance(response, Mapping) and (source_call_field is True if type(source_call_field) is bool else type(response.get("ok")) is bool))
+            source_call_field = _interrupt_source_response(response).get("source_call_completed")
+            acknowledged = source_call_field is True if type(source_call_field) is bool else bool(http_success and isinstance(response, Mapping) and type(response.get("ok")) is bool)
             if not http_success:
                 error = f"controller_interrupt_http_{status_code}"
             elif not acknowledged:
@@ -7631,7 +7654,7 @@ class OperatorCommandPlane:
                 "interrupt_attempt_id": interrupt_attempt_id,
                 **_interrupt_invocation_evidence(action_id, attempted=True),
                 "source_call_completed": acknowledged,
-                "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
+                "source_return_ok": _interrupt_source_return_ok(response),
                 "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                 "controller_response": _bounded_json(response, 131072),
                 "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
@@ -7662,9 +7685,8 @@ class OperatorCommandPlane:
                     else:
                         status_code, response = controller_delivery
                     http_success = 200 <= int(status_code) < 300
-                    source_call_field = response.get("source_call_completed") if isinstance(response, Mapping) else None
-                    acknowledged = bool(http_success and isinstance(response, Mapping) and
-                                        (source_call_field is True if type(source_call_field) is bool else response.get("ok") is True))
+                    source_call_field = _interrupt_source_response(response).get("source_call_completed")
+                    acknowledged = source_call_field is True if type(source_call_field) is bool else bool(http_success and isinstance(response, Mapping) and response.get("ok") is True)
                     if not http_success:
                         error = f"controller_interrupt_http_{status_code}"
                     elif not acknowledged:
@@ -7690,7 +7712,7 @@ class OperatorCommandPlane:
                         "observed_board_epoch_by_board": dict(payload.get("observed_board_epoch_by_board") or {}),
                         **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
-                        "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
+                        "source_return_ok": _interrupt_source_return_ok(response),
                         "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "physical_effect_verified": False,
@@ -7895,7 +7917,7 @@ class OperatorCommandPlane:
                         "interrupt_attempt_id": interrupt_attempt_id,
                         **_interrupt_invocation_evidence(action_id, attempted=True),
                         "source_call_completed": acknowledged,
-                        "source_return_ok": bool(isinstance(response, Mapping) and response.get("ok") is True),
+                        "source_return_ok": _interrupt_source_return_ok(response),
                         "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
                         "controller_response": _bounded_json(response, 131072),
                         "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
