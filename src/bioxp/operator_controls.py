@@ -3701,6 +3701,7 @@ def install_operator_control_plane(
                 "idempotency_key": payload.idempotency_key,
                 "expected_ownership_generation": payload.expected_generation,
                 "action_id": action_id,
+                "caller_class": "manual_operator",
             })
             linked_pipette_finalization = None
             deck_interrupt_action = None
@@ -3770,6 +3771,7 @@ def install_operator_control_plane(
                     detail = response.get("detail")
                     if isinstance(detail, Mapping):
                         receipt_source = detail
+                    receipt["completion_class"] = receipt_source.get("completion_class")
                     completion_ambiguous = bool(
                         receipt_source.get("completion_ambiguous") is True
                         or receipt_source.get("outcome_unknown") is True
@@ -3880,7 +3882,9 @@ def install_operator_control_plane(
                     "physical_effect_verified": bool(
                         isinstance(response, Mapping) and response.get("physical_effect_verified") is True
                     ),
-                    "machine_assessment": "unverified" if completion_ambiguous else "pass" if ok else "fail",
+                    "machine_assessment": "unverified" if (
+                        completion_ambiguous or receipt.get("completion_class") == "oem_manual_timeout_report"
+                    ) else "pass" if ok else "fail",
                     "response": full_response,
                     "error": (
                         "Action outcome unknown; reconciliation required and retry forbidden"

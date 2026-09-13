@@ -515,6 +515,28 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
         result = provider.execute_xy_intent(int(payload.pop("x")), int(payload.pop("y")), payload)
     else:
         result = provider.execute_x_intent(intent, payload)
+    if (intent == "move_xy" and context.get("caller_class") == "manual_operator"
+            and isinstance(result, Mapping) and result.get("ok") is False):
+        evidence = result.get("critical_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        terminal = evidence.get("terminal_classification")
+        terminal = terminal if isinstance(terminal, Mapping) else {}
+        leaf = evidence.get("controller_failure")
+        leaf = leaf if isinstance(leaf, Mapping) else {}
+        wait = leaf.get("wait")
+        wait = wait if isinstance(wait, Mapping) else {}
+        if (terminal.get("classification") == "failed_with_coherent_stopped_coordinates"
+                and wait.get("failure") == "oem_moveToAbs_target_event_timeout"
+                and wait.get("no24v") is False):
+            # CI.btnLOC1_Click catches the moveTo -> moveXY exception and
+            # reports it, then returns to the operator. The primitive/child
+            # receipt stays failed; only this manual caller returned normally.
+            # Automated methods retain the throwing/fail-fast path below.
+            return {**dict(result), "ok": True,
+                    "completion_class": "oem_manual_timeout_report",
+                    "source_call_completed": False, "source_return_ok": False,
+                    "controller_completion_verified": False,
+                    "physical_effect_verified": False}
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=dict(result) if isinstance(result, Mapping) else {"error": "serial206_motion_intent_failed"})
     return dict(result)
