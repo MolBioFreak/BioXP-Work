@@ -4678,6 +4678,15 @@ class OperatorCommandStore:
         deck_detail = self._deck_command_detail(str(row["command_id"]))
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
+            # A retained post-delivery exception can lack the outer class even
+            # though the canonical deck row records ambiguous recovery. Expose
+            # that existing disposition; never turn it into completion or alter
+            # the saved terminal evidence / recovery hold.
+            if (response["completion_class"] is None
+                    and response["status"] == "ambiguous"
+                    and response["finished_at"] is not None
+                    and deck_detail.get("ambiguity_state") == "recovery_required"):
+                response["completion_class"] = "recovery_required"
         return response
 
     def _method_response(self, row: sqlite3.Row) -> dict[str, Any]:
