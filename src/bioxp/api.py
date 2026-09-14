@@ -6561,6 +6561,10 @@ def _collect_and_publish_hardware_snapshot(
     def yield_requested():
         active = getattr(app.state, "operator_normal_action_active", None)
         return bool(automatic and callable(active) and active())
+    # Admission/dispatch can start after the HTTP precheck but before this
+    # worker runs. Yield before invalidating an in-flight deck observation.
+    if yield_requested():
+        return {"ok": False, "published": False, "reason": "operator_action_pending"}
     def before_query():
         if yield_requested():
             from .hardware_status import HardwareCollectionPreempted

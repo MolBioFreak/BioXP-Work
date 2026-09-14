@@ -2375,7 +2375,13 @@ def install_operator_control_plane(
     # Retain one direct owner, not a new motion queue. Competing normal actions
     # receive a prompt busy response; interrupts retain their separate lane.
     direct_requests: dict[str, tuple[dict[str, Any], asyncio.Future, asyncio.Task]] = {}
-    app.state.operator_normal_action_active = lambda: bool(direct_requests) or invoke_lock.locked()
+    pending_named_admissions = 0
+    # Query-refresh priority only; SQLite and the existing execution fences
+    # remain authoritative for admission, scheduling and motor delivery.
+    app.state.operator_normal_action_active = lambda: (
+        bool(direct_requests) or invoke_lock.locked() or pending_named_admissions > 0
+        or bool(command_plane.store.live_command_worker_ids())
+    )
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
 
     def machine_state() -> dict[str, Any]:
@@ -3190,6 +3196,7 @@ def install_operator_control_plane(
 
     @router.post("/v2/actions/{action_id}")
     async def invoke_action_v2(action_id: str, payload: OperatorActionRequestV2 | OperatorInterruptRequestV1) -> dict[str, Any]:
+        nonlocal pending_named_admissions
         if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all"}:
             if not isinstance(payload, OperatorInterruptRequestV1):
                 raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
@@ -3199,26 +3206,30 @@ def install_operator_control_plane(
         if action_id == "oem.deck.move_to_location":
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
-            state = await admission_state_reader.read()
-            assessment = deck_contract(state, target=payload.inputs.get("target"))
-            selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
-            if selected is None or selected["enabled"] is not True:
-                assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
-            if not assessment["enabled"]:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": assessment["disabled_reason"],
-                        "reason": assessment["disabled_reason"],
-                    },
+            pending_named_admissions += 1
+            try:
+                state = await admission_state_reader.read()
+                assessment = deck_contract(state, target=payload.inputs.get("target"))
+                selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
+                if selected is None or selected["enabled"] is not True:
+                    assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
+                if not assessment["enabled"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": assessment["disabled_reason"],
+                            "reason": assessment["disabled_reason"],
+                        },
+                    )
+                admitted = await asyncio.to_thread(
+                    command_plane.store.admit_command,
+                    {**payload.model_dump(), "action_id": action_id},
+                    state=state,
+                    assessment=assessment,
                 )
-            admitted = await asyncio.to_thread(
-                command_plane.store.admit_command,
-                {**payload.model_dump(), "action_id": action_id},
-                state=state,
-                assessment=assessment,
-            )
-            return _v2_compact_receipt(admitted)
+                return _v2_compact_receipt(admitted)
+            finally:
+                pending_named_admissions -= 1
         action = by_id.get(action_id)
         if (
             isinstance(payload, OperatorActionRequestV2)
