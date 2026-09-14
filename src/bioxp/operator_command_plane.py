@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -1070,6 +1070,7 @@ class OperatorCommandStore:
         self._internal_admission = threading.local()
         self._interrupt_spool_write_depth = 0
         self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
+        self._deck_owner_authority_scope: Callable[[], AbstractContextManager[Any]] = nullcontext
         self.owner_id = uuid.uuid4().hex
         self._owner_acquired = False
         self._configure_interrupt_spool()
@@ -1091,10 +1092,16 @@ class OperatorCommandStore:
         if self._owner_acquired:
             self._startup_recover()
 
-    def bind_deck_owner_authority_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
+    def bind_deck_owner_authority_reader(
+        self, reader: Callable[[], Mapping[str, Any]], *,
+        scope: Callable[[], AbstractContextManager[Any]],
+    ) -> None:
         if not callable(reader):
             raise TypeError("deck owner authority reader must be callable")
+        if not callable(scope):
+            raise TypeError("deck owner authority scope must be callable")
         self._deck_owner_authority_reader = reader
+        self._deck_owner_authority_scope = scope
 
     def _start_command_worker(
         self, worker: threading.Thread, command_id: str,
@@ -3385,7 +3392,7 @@ class OperatorCommandStore:
         if operation != "remove_group" and group_index is not None:
             raise ValueError("group_index is only valid for remove_group")
 
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             self._validate_deck_owner_authority(
                 ownership_generation=ownership_generation,
                 board_epoch_4=board_epoch_4,
@@ -3563,7 +3570,7 @@ class OperatorCommandStore:
         except ValueError as exc:
             raise ValueError("deck bootstrap movable plate state is not authoritative") from exc
 
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             current = conn.execute(
                 "SELECT semantic_state_revision,ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
@@ -3667,7 +3674,7 @@ class OperatorCommandStore:
         if not upstream_id.strip():
             raise ValueError("source command identity is required")
 
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             self._validate_deck_owner_authority(
                 ownership_generation=ownership_generation,
                 board_epoch_4=board_epoch_4,
@@ -3735,7 +3742,7 @@ class OperatorCommandStore:
     ) -> int:
         if int(value) not in {500, 65000}:
             raise ValueError("pseudo Z home must be 500 or 65000")
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             self._validate_deck_owner_authority(
                 ownership_generation=ownership_generation,
                 board_epoch_4=board_epoch_4,
@@ -3789,7 +3796,7 @@ class OperatorCommandStore:
         self, command_id: str, *, work_kind: str, work_identity: str,
         plan_digest: str, authority_stamps: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             command = conn.execute(
                 "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,"
                 "s.board_epoch_4,s.board_epoch_5 "
@@ -3833,7 +3840,7 @@ class OperatorCommandStore:
         ).fetchone()[0] == 1
 
     def create_wp8_background_task(self, command_id: str, child_order: int, *, task_id: str, task_kind: str, plan_digest: str, authority_stamps: Mapping[str, Any]) -> dict[str, Any]:
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             command = conn.execute(
                 """
                 SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,

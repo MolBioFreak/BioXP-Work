@@ -4463,7 +4463,7 @@ class Serial206OemInitializationProvider:
         owner = getattr(publisher, "__self__", None)
         binder = getattr(owner, "bind_deck_owner_authority_reader", None)
         if callable(binder):
-            binder(self.deck_owner_authority_stamps)
+            binder(self.deck_owner_authority_stamps, scope=self.deck_owner_authority_scope)
         bootstrap = getattr(owner, "bootstrap_deck_semantic_state", None)
         if callable(bootstrap):
             self.bind_deck_semantic_bootstrap_publisher(bootstrap)
@@ -4541,6 +4541,13 @@ class Serial206OemInitializationProvider:
     def deck_semantic_bootstrap_diagnostic(self) -> dict[str, Any]:
         """Cached producer result; no hardware or SQLite access for diagnostics."""
         return dict(getattr(self, "_deck_semantic_bootstrap_diagnostic", {"status": "not_attempted"}))
+
+    @contextmanager
+    def deck_owner_authority_scope(self):
+        # SQL authority callbacks must reenter provider before runtime writer.
+        # Unlike projection_scope, this does not memoize authority reads.
+        with self._lock:
+            yield
 
     def deck_owner_authority_stamps(self) -> dict[str, int]:
         ownership_generation = int(self.generation_provider())

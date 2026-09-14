@@ -163,7 +163,6 @@ def retained_rig(monkeypatch, tmp_path):
     store = OperatorCommandStore(root)
     provider.bind_deck_semantic_state_reader(store.deck_semantic_state)
     provider.bind_deck_semantic_state_publisher(store.publish_deck_owner_state)
-    store.bind_deck_owner_authority_reader(provider.deck_owner_authority_stamps)
     yield provider, primitive, runtime, references, store, root
     store.stop()
     runtime.close()
