@@ -137,23 +137,23 @@ def test_automatic_query_refresh_resumes_when_idle(installed_retained, monkeypat
     assert result == {'ok': False} and called == [True]
 
 
-def test_admission_metadata_timeout_remains_fail_closed(installed_retained, monkeypatch):
+def test_admission_preview_metadata_timeout_remains_fail_closed(installed_retained, monkeypatch):
     app, provider, primitives, references, root = installed_retained
-    reader = app.state.operator_admission_state_reader
+    reader = app.state.operator_preview_state_reader
     entered, release = threading.Event(), threading.Event()
     def blocked_state():
         entered.set()
         assert release.wait(3)
         raise RuntimeError('offline read released after caller timed out')
     monkeypatch.setattr(reader, '_collect', blocked_state)
-    body = request(provider, 'metadata-timeout')
+    body = {'expected_generation': int(provider.generation_provider()), 'inputs': {}}
     results = []
     thread = threading.Thread(target=lambda: results.append(TestClient(app).post(
-        '/operator/v2/actions/oem.deck.move_to_location', json=body)))
+        '/operator/actions/oem.deck.move_to_location/admission', json=body)))
     thread.start()
     try:
         assert entered.wait(2)
-        assert app.state.operator_normal_action_active() is True
+        assert app.state.operator_normal_action_active() is False
         thread.join(1.5)
         assert not thread.is_alive(), 'existing bounded metadata timeout was removed'
         assert results[0].status_code == 503
