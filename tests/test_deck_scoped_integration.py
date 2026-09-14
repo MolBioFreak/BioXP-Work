@@ -24,7 +24,7 @@ def qualify_full_predecessor(retained_rig):
     store.publish_tip_tray_transition(tray_id=0, transition='construct', operation_id='fixture-only-construction',
         command_id='fixture-only-construction', provenance={'source': 'explicit test predecessor'},
         **provider.deck_owner_authority_stamps())
-    snapshot = provider.deck_authority_snapshot(expected_generation=3, target='LOC_PARK')
+    snapshot = provider.deck_authority_snapshot(expected_generation=int(provider.generation_provider()), target='LOC_PARK')
     assert snapshot['machine_state_revision'] == 1
     assert snapshot['current_location_id'] == 'LOC_PARK' and snapshot['latch_status'] is True
     assert sum(c[0] == 'latch' for c in primitive.calls) == 1
@@ -40,6 +40,19 @@ def installed_retained(retained_rig, monkeypatch):
     from bioxp import operator_controls as controls, api, runtime_audit_store
     provider, primitive, runtime, references, prior_store, root = retained_rig
     prior_store.stop()
+    # The copied controller lifecycle belongs to its recorded generation.
+    # An unrelated synthetic generation would correctly invalidate it in the
+    # real API projection, before the cache contract under test is reached.
+    generation = provider._load_state()['x_lifecycle']['generation']
+    assert type(generation) is int
+    monkeypatch.setattr(provider, 'generation_provider', lambda: generation)
+    from bioxp.serial206_y_provider import Serial206YProvider
+    y_provider = Serial206YProvider(primitive, state_store=runtime,
+        generation_provider=lambda: generation, reference_store=references)
+    # Y's configuration display is outside this fixture's hardware scope;
+    # board/axis authority and the API projection remain their real owners.
+    monkeypatch.setattr(y_provider, 'profile', lambda: {})
+    provider.y_provider = y_provider
     monkeypatch.setattr(runtime_audit_store, 'CANONICAL_RUNTIME_ROOT', root)
     import src.bioxp.runtime_audit_store as other_runtime
     monkeypatch.setattr(other_runtime, 'CANONICAL_RUNTIME_ROOT', root)
@@ -49,16 +62,15 @@ def installed_retained(retained_rig, monkeypatch):
     monkeypatch.setattr(controls, 'current_authority_identity', lambda: {
         'evidence_lock_identity_verified': True, 'evidence_lock_sha256': '3'*64})
     monkeypatch.setattr(controls, 'current_registry_sha256', lambda: '4'*64)
-    monkeypatch.setattr(type(controls.hardware_state), 'ownership_epoch', property(lambda self: 3))
+    monkeypatch.setattr(type(controls.hardware_state), 'ownership_epoch', property(lambda self: generation))
     monkeypatch.setattr(controls.hardware_state, 'project', lambda *a, **k: {
         'domains': {}, 'freshness': {'state': 'stale', 'age_s': 90, 'fresh_for_s': 30}})
-    monkeypatch.setattr(controls.hardware_state, 'ownership_projection', lambda: {'ownership_epoch': 3,
+    monkeypatch.setattr(controls.hardware_state, 'ownership_projection', lambda: {'ownership_epoch': generation,
         'ownership': {'transport': 'owned', 'usb': 'service', 'router': 'running', 'CAN_READY': True}})
-    def projection():
-        stamps = provider.deck_owner_authority_stamps()
-        return {'x_authority': {'active_board_epoch': stamps['board_epoch_5'],
-                'current_board_lifecycle_generation': stamps['board_epoch_5']},
-                'board4_authority': {'active_board_epoch': stamps['board_epoch_4']}}
+    # Exercise the real API owner projection. It does not publish the invented
+    # board4_authority/active_board_epoch fields used by the former fixture.
+    monkeypatch.setattr(api, '_serial206_oem_initialization_provider', provider)
+    projection = api.serial206_oem_initialization_provider_status
     from bioxp.oem_compat.position_table import load_bound_oem_position_table
     app = FastAPI()
     app.add_api_route('/hardware/snapshot/collect', api.hardware_snapshot_collect, methods=['POST'])
@@ -97,7 +109,7 @@ def test_actual_collection_cached_catalog_and_durable_dispatch(installed_retaine
     assert catalog_action(app)['enabled'] is False
     qualify_test_references(references)
     collected = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='isolated-explicit-refresh')
-    assert collected['deck_authority']['enabled'] is True, collected
+    assert collected['deck_authority']['enabled'] is True, json.dumps(collected['deck_authority'])
     before = list(primitive.calls)
     scoped_catalog = catalog_payload(app)
     catalog = next(r for r in scoped_catalog['actions'] if r['action_id'] == 'oem.deck.move_to_location')
@@ -109,7 +121,7 @@ def test_actual_collection_cached_catalog_and_durable_dispatch(installed_retaine
     assert all(r['enabled'] for r in catalog['destination_options'] if r['target'] != 'LOC_PARK')
     client = TestClient(app)
     body = {'schema_version': 'bioxp.operator_action_request.v2', 'idempotency_key': 'installed-first',
-        'expected_ownership_generation': 3, 'expected_board_epoch_by_board': catalog['expected_board_epoch_by_board'],
+        'expected_ownership_generation': int(provider.generation_provider()), 'expected_board_epoch_by_board': catalog['expected_board_epoch_by_board'],
         'inputs': {'target': 'LOC_OC', 'camera_offset': False}}
     rejected = client.post('/operator/v2/actions/oem.deck.move_to_location', json={**body, 'inputs': {'target': 'LOC_PARK', 'camera_offset': False}})
     assert rejected.status_code == 409, rejected.text
@@ -156,9 +168,12 @@ def test_actual_park_noop_fresh_process_export(installed_retained, retained_rig)
     import subprocess, sys
     from bioxp import api
     app, provider, primitive, references, root = installed_retained
+    # Settle actual cold lifecycle projection before supplying fresh isolated
+    # reference evidence, as the operator must do on the live owner.
+    assert catalog_action(app)['enabled'] is False
     qualify_test_references(references)
     collected = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='isolated-scoped-refresh')
-    assert collected['deck_authority']['enabled'] is True
+    assert collected['deck_authority']['enabled'] is True, json.dumps(collected['deck_authority'])
     scoped_catalog = catalog_payload(app)
     action = next(r for r in scoped_catalog['actions'] if r['action_id'] == 'oem.deck.move_to_location')
     assert next(r for r in action['destination_options'] if r['target'] == 'LOC_OC')['enabled']
@@ -172,7 +187,7 @@ def test_actual_park_noop_fresh_process_export(installed_retained, retained_rig)
     client = TestClient(app)
     admitted = client.post('/operator/v2/actions/oem.deck.move_to_location', json={
         'schema_version': 'bioxp.operator_action_request.v2', 'idempotency_key': 'actual-park-noop',
-        'expected_ownership_generation': 3,
+        'expected_ownership_generation': int(provider.generation_provider()),
         'expected_board_epoch_by_board': action['expected_board_epoch_by_board'],
         'inputs': {'target': 'LOC_PARK', 'camera_offset': False}})
     assert admitted.status_code == 200, admitted.text

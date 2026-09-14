@@ -2682,10 +2682,20 @@ def install_operator_control_plane(
                             )
                             for axis, version in (snapshot.get("reference_versions") or {}).items()
                         )
-                        initialization = state.get("serial206_initialization_provider") or {}
-                        for key, owner in (("board_epoch_4", "board4_authority"), ("board_epoch_5", "x_authority")):
-                            epoch = (initialization.get(owner) or {}).get("active_board_epoch")
-                            changed = changed or (epoch is None and real_semantic_authority) or (epoch is not None and epoch != snapshot.get(key))
+                        if scoped:
+                            # Compare the actual independent operational owners,
+                            # not diagnostic API projections whose fields differ.
+                            owner_reader = getattr(provider, "deck_owner_authority_stamps", None)
+                            stamps = owner_reader() if callable(owner_reader) else None
+                            changed = changed or not isinstance(stamps, Mapping)
+                            for key in ("ownership_generation", "board_epoch_4", "board_epoch_5"):
+                                current = stamps.get(key) if isinstance(stamps, Mapping) else None
+                                changed = changed or type(current) is not int or current != snapshot.get(key)
+                        else:
+                            initialization = state.get("serial206_initialization_provider") or {}
+                            for key, owner in (("board_epoch_4", "board4_authority"), ("board_epoch_5", "x_authority")):
+                                epoch = (initialization.get(owner) or {}).get("active_board_epoch")
+                                changed = changed or (epoch is None and real_semantic_authority) or (epoch is not None and epoch != snapshot.get(key))
                         if snapshot.get("semantic_state_provenance_digest") is not None:
                             semantic = command_plane.store.deck_semantic_state()
                             changed = changed or (
