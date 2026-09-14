@@ -4165,7 +4165,7 @@ class Serial206ProductionPrimitiveAdapter:
         column: int = 0,
         row: int = 0,
         well: int | None = None,
-        position_flag: int = 1,
+        position_flag: int = 0,
         run_in_parallel: bool = True,
         tip_loaded: bool,
         tip_dirty: bool,
@@ -10406,7 +10406,7 @@ class Serial206OemInitializationProvider:
         if well is not None:
             well = int(well)
         line = int(row.pop("row", 0))
-        position_flag = int(row.pop("positionflag", row.pop("position_flag", 1)))
+        position_flag = int(row.pop("positionflag", row.pop("position_flag", 0)))
         run_parallel = bool(row.pop("runInParallel", row.pop("run_in_parallel", True)))
         expected_digest = row.pop("expected_script_plan_digest", None)
         source_plan = row.pop("source_plan", None)

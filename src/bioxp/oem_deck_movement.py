@@ -735,7 +735,7 @@ def compile_mov_execution(
         translation = {"kind": "plate", "source": current, "resolved": resolved_destination, "synthetic_plate": None}
     column, row = well_id % 12, well_id // 12
     steps_list = [
-        MovExecutionStep(0, "scriptmoveTo", "movExecution:scriptmoveTo", {"destination": resolved_destination, "column": column, "row": row, "positionflag": 1, "runInParallel": True}, children, "Task.WaitAll" if children else None),
+        MovExecutionStep(0, "scriptmoveTo", "movExecution:scriptmoveTo", {"destination": resolved_destination, "column": column, "row": row, "positionflag": 0, "runInParallel": True}, children, "Task.WaitAll" if children else None),
         MovExecutionStep(1, "updateLocation", "movExecution:updateLocation", {"location_id": resolved_destination, "well_id": well_id}, semantic_transition={"current_location": resolved_destination, "current_well": well_id}),
         MovExecutionStep(2, "updatePlateLocation", "movExecution:updatePlateLocation", {"plate_name": plate, "location_id": resolved_destination}, semantic_transition={"plate_name": plate, "plate_location": resolved_destination}),
     ]
