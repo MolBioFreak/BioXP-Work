@@ -412,19 +412,30 @@ async def _run_transport_call(
                 raise
         raise
     except PipetteError as exc:
-        status = "rejected" if stage == "admission" else "failed"
-        _persist_failure(
-            receipt_store=receipt_store,
-            claim_record=failure_claim_record,
-            operation_name=operation_name or label,
-            failure_code=exc.code,
-            message=exc.message,
-            status=status,
-            requested_inputs=requested_for_receipt,
-            runtime_binding=effective_runtime_binding,
-            outcome_may_have_occurred=stage == "dispatch",
-        )
-        raise _pipette_error_to_http_exception(exc) from exc
+        if (operation_name in {"tip_status", "query_tip_status", "query_all_pipette_tip_states"} and stage == "dispatch"
+                and isinstance(exc.details.get("observed_channels"), list)):
+            # Retain every actual return, including strict-invalid rows. Only
+            # genuine source exceptions stop progression before later channels.
+            result = {**exc.to_payload(), "channels": exc.details["observed_channels"],
+                **{key: exc.details[key] for key in (
+                    "source_return_completed", "source_exception", "source_return", "source_tip_exists"
+                ) if key in exc.details},
+                "partial_query": True, "hardware_query_verified": False,
+                "hardware_truth_level": "hardware_query"}
+        else:
+            status = "rejected" if stage == "admission" else "failed"
+            _persist_failure(
+                receipt_store=receipt_store,
+                claim_record=failure_claim_record,
+                operation_name=operation_name or label,
+                failure_code=exc.code,
+                message=exc.message,
+                status=status,
+                requested_inputs=requested_for_receipt,
+                runtime_binding=effective_runtime_binding,
+                outcome_may_have_occurred=stage == "dispatch",
+            )
+            raise _pipette_error_to_http_exception(exc) from exc
     except ValueError as exc:
         failure_code = "validation_error" if stage == "admission" else "malformed_response"
         status = "rejected" if stage == "admission" else "failed"
@@ -557,6 +568,12 @@ async def _run_transport_call(
             }
             if exc.linked_finalization is not None:
                 detail[_LINKED_FINALIZATION_KEY] = exc.linked_finalization
+            if operation_name in {"tip_status", "query_tip_status", "query_all_pipette_tip_states"} and claim_record is not None:
+                # Actual collected evidence survives failure to write its receipt.
+                # The command claim exists; no receipt ID or persistence is invented.
+                detail["query_observation"] = {**result,
+                    "command_id": claim_record["command_id"],
+                    "source_identity": receipt_store._source_identity()}
             raise HTTPException(
                 status_code=503,
                 detail=detail,

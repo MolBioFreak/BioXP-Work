@@ -557,31 +557,36 @@ def _run_serial206_pipette_audit(
         del _label, timeout_s
         return callback()
 
-    return asyncio.run(
-        run_pipette_operation(
-            operation_name,
-            operation,
-            get_transport=_get_pipette_transport,
-            run_blocking=inline_run,
-            timeout_s=1800.0,
-            receipt_store=_pipette_receipts,
-            requested_inputs=dict(requested_inputs),
-            runtime_binding={
-                "owner": "shared_bioxp_tester_pipette",
-                "transport_owner_bound": True,
-                "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
-                "caller_class": "lifecycle",
-                "control_class": (
-                    "hardware_query"
-                    if str(operation_name).lower() in READ_ONLY_PIPETTE_OPERATIONS
-                    else "pipette_state_command"
-                ),
-                "lifecycle_stage_id": lifecycle_stage_id,
-                "lifecycle_attempt_id": lifecycle_attempt_id,
-                "idempotency_key": lifecycle_idempotency_key,
-            },
+    def audited_query():
+        return asyncio.run(
+            run_pipette_operation(
+                operation_name,
+                operation,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                timeout_s=1800.0,
+                receipt_store=_pipette_receipts,
+                requested_inputs=dict(requested_inputs),
+                runtime_binding={
+                    "owner": "shared_bioxp_tester_pipette",
+                    "transport_owner_bound": True,
+                    "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
+                    "caller_class": "lifecycle",
+                    "control_class": (
+                        "hardware_query"
+                        if str(operation_name).lower() in READ_ONLY_PIPETTE_OPERATIONS
+                        else "pipette_state_command"
+                    ),
+                    "lifecycle_stage_id": lifecycle_stage_id,
+                    "lifecycle_attempt_id": lifecycle_attempt_id,
+                    "idempotency_key": lifecycle_idempotency_key,
+                },
+            )
         )
-    )
+
+    if operation_name in {"tip_status", "query_tip_status", "query_all_pipette_tip_states"}:
+        return _run_pipette_tip_query_with_deck_owner(audited_query, _get_pipette_transport())
+    return audited_query()
 
 
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
@@ -10007,17 +10012,82 @@ async def liquid_error_log(req: PipetteErrorLogRequest):
     )
 
 
+def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        return audited_query()
+    # One tester worker owns query, durable audit and handoff. Provider-before-
+    # writer order and the existing transport lock exclude intervening owners.
+    with provider.deck_owner_authority_scope(), transport._transaction_lock:
+        try:
+            authority = provider.deck_owner_authority_stamps()
+        except RuntimeError:
+            authority = None
+        interrupt_epoch = transport._interrupt_epoch
+        semantic_revision = provider._deck_semantic_state_reader()["semantic_state_revision"]
+        # Capture the live reader object/generation, not cached tip status.
+        readers = tuple(getattr(getattr(channel._get_driver(), "bus", None), "router", None)
+                        for channel in transport._transports)
+        reader_generations = tuple(getattr(reader, "reader_generation", None) for reader in readers)
+        query_started_at = time.monotonic()
+        receipt_error = None
+        try:
+            result = audited_query()
+        except HTTPException as exc:
+            observation = exc.detail.get("query_observation") if isinstance(exc.detail, dict) else None
+            if not isinstance(observation, dict):
+                raise
+            receipt_error, result = exc, observation
+        if result.get("replayed"):
+            if result.get("ok") is False:
+                raise HTTPException(status_code=502, detail=result)
+            return result  # A retained query is never a new observation.
+        try:
+            current_readers = tuple(getattr(getattr(channel._get_driver(), "bus", None), "router", None)
+                                    for channel in transport._transports)
+            if (authority is None or transport._interrupt_epoch != interrupt_epoch
+                    or semantic_revision != provider._deck_semantic_state_reader()["semantic_state_revision"]
+                    or any(current is not prior for current, prior in zip(current_readers, readers))
+                    or reader_generations != tuple(getattr(reader, "reader_generation", None) for reader in current_readers)
+                    or any(type(generation) is not int for generation in reader_generations)
+                    or any(row.get("result", {}).get("reader_generation") != reader_generations[row["channel"]]
+                           for row in result.get("channels", [])
+                           if row.get("result", {}).get("semantic_ok") is True)):
+                raise RuntimeError("pipette_query_owner_changed")
+            published = provider.publish_pipette_query_observation(
+                result, expected_authority=authority, query_started_at=query_started_at,
+                receipt_unavailable=receipt_error is not None,
+            )
+            result["deck_state_publication"] = {"status": "published",
+                "semantic_state_revision": published["semantic_state_revision"]}
+        except Exception as exc:
+            # Query truth/receipt remains intact; failed publication grants no authority.
+            result["deck_state_publication"] = {"status": "blocked", "reason": str(exc)}
+        if receipt_error is not None:
+            raise receipt_error
+        if result.get("ok") is False:
+            raise HTTPException(status_code=502, detail=result)
+        return result
+
+
 @app.post("/liquid/tip-status")
 async def liquid_tip_status():
-    return await run_pipette_operation(
-        "tip_status",
-        lambda transport: transport.query_tip_status_all(),
-        get_transport=_get_pipette_transport,
-        run_blocking=_run_blocking,
-        timeout_s=120.0,
-        receipt_store=_pipette_receipts,
-        requested_inputs={},
-    )
+    def query_and_publish():
+        transport = _get_pipette_transport()
+
+        async def inline_run(_label, callback, *, timeout_s):
+            return callback()
+
+        def audited_query():
+            return asyncio.run(run_pipette_operation(
+                "tip_status", lambda owned: owned.query_tip_status_all(),
+                get_transport=lambda: transport, run_blocking=inline_run,
+                timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
+            ))
+
+        return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
+
+    return await _run_blocking("Pipette tip status", query_and_publish, timeout_s=120.0)
 
 
 @app.get("/liquid/data", include_in_schema=False)

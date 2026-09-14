@@ -2704,7 +2704,8 @@ class Serial206ProductionPrimitiveAdapter:
         if any(type(value) is not bool for value in channels):
             return {"ok": False, "channels": None, "raw": _json_safe(raw)}
         self._last_tip_channels = [index for index, loaded in enumerate(channels) if loaded]
-        return {"ok": True, "channels": channels, "controller_evidence": _json_safe(raw)}
+        # This is a live consumer handoff, not a bounded diagnostic attachment.
+        return {"ok": True, "channels": channels, "controller_evidence": dict(raw)}
 
     def query_all_pipette_tip_states(
         self,
@@ -4684,7 +4685,7 @@ class Serial206OemInitializationProvider:
         return {str(key): value for key, value in result.items()}
 
     def publish_pipette_owner_state(
-        self, *, tip_loaded: bool, tip_dirty: bool, tip_location: int, source_command_id: str
+        self, *, tip_loaded: bool, tip_dirty: bool | None, tip_location: int | None, source_command_id: str
     ) -> dict[str, Any]:
         return self._publish_deck_owner_state(
             source_operation="pipette_owner", source_command_id=source_command_id,
@@ -4700,31 +4701,124 @@ class Serial206OemInitializationProvider:
         )
         if not isinstance(observed, Mapping) or observed.get("ok") is not True:
             raise RuntimeError("pipette owner query failed")
+        return {"ok": True, "observation": dict(observed),
+                "semantic_state": self._publish_observed_tip_presence(
+                    observed.get("tip_exists"), source_command_id=source_command_id)}
+
+    def publish_pipette_query_observation(
+        self, observed: Mapping[str, Any], *, expected_authority: Mapping[str, int],
+        query_started_at: float, receipt_unavailable: bool = False,
+    ) -> dict[str, Any]:
+        """Consume a newly audited query under the query owner's serialization."""
+        from .pipette.transport import FourPipetteTransport
+
+        with self.deck_owner_authority_scope():
+            if dict(expected_authority) != self.deck_owner_authority_stamps():
+                raise RuntimeError("pipette_query_owner_changed")
+            identity = observed.get("source_identity")
+            partial = (observed.get("partial_query") is True
+                and observed.get("ok") is False
+                and observed.get("hardware_query_verified") is False
+                and observed.get("semantic_query_response_verified") is False)
+            if ((not partial and (observed.get("ok") is not True
+                or observed.get("semantic_query_response_verified") is not True
+                or observed.get("hardware_query_verified") is not True))
+                or observed.get("hardware_truth_level") != "hardware_query"
+                or observed.get("replayed")
+                or any(not isinstance(observed.get(key), str) or not observed[key].strip()
+                       for key in (("command_id",) if receipt_unavailable else ("receipt_id", "command_id")))
+                or not isinstance(identity, Mapping)
+                or identity.get("authority_verified") is not True
+                or not isinstance(identity.get("release_identity"), Mapping)
+                or identity["release_identity"].get("verified") is not True):
+                raise RuntimeError("pipette_query_not_authoritative")
+            rows = observed.get("channels")
+            if not isinstance(rows, list) or (not partial and len(rows) != 4):
+                raise RuntimeError("pipette_query_channels_malformed")
+            if partial and (not 0 < len(rows) <= 4
+                    or not any(row.get("tip_loaded") is True for row in rows if isinstance(row, Mapping))):
+                raise RuntimeError("pipette_partial_query_has_no_verified_presence")
+            transactions: set[str] = set()
+            reader_generations: set[int] = set()
+            verified_rows = []
+            for channel, row in enumerate(rows):
+                result = row.get("result") if isinstance(row, Mapping) else None
+                if not isinstance(result, Mapping) or type(row.get("channel")) is not int or row["channel"] != channel:
+                    raise RuntimeError("pipette_query_channels_malformed")
+                # Invalid proof is not absence. A different valid positive is
+                # independently sufficient for existence, never all-tip absence.
+                if partial and (result.get("ok") is not True or result.get("semantic_ok") is not True
+                        or type(result.get("tip_loaded")) is not bool):
+                    continue
+                if (not isinstance(result, Mapping) or type(row.get("channel")) is not int
+                    or row.get("channel") != channel
+                    or type(row.get("tip_loaded")) is not bool
+                    or result.get("tip_loaded") is not row["tip_loaded"]
+                    or result.get("query_response_correlated") is not True
+                    or result.get("semantic_ok") is not True
+                    or result.get("ok") is not True
+                    or result.get("hardware_truth_level") != "hardware_query"
+                    or type(result.get("observed_at")) not in (int, float)
+                    or not 0 <= time.time() - result["observed_at"] <= FourPipetteTransport.TIP_STATUS_FRESHNESS_S):
+                    raise RuntimeError("pipette_query_channels_not_authoritative")
+                provenance = result.get("provenance")
+                if (not isinstance(provenance, Mapping)
+                    or provenance.get("channel") != channel
+                    or type(result.get("reader_generation")) is not int
+                    or provenance.get("owner_generation") != result["reader_generation"]
+                    or not isinstance(provenance.get("transaction_id"), str)
+                    or not provenance["transaction_id"]
+                    or type(provenance.get("tx_timestamp")) not in (int, float)
+                    or type(provenance.get("receive_timestamp")) not in (int, float)
+                    or not query_started_at <= provenance["tx_timestamp"]
+                        <= provenance["receive_timestamp"] <= time.monotonic()):
+                    raise RuntimeError("pipette_query_response_identity_not_current")
+                transactions.add(provenance["transaction_id"])
+                reader_generations.add(result["reader_generation"])
+                verified_rows.append(row)
+            if len(transactions) != len(verified_rows) or len(reader_generations) != 1:
+                raise RuntimeError("pipette_query_response_identity_not_current")
+            if partial and not any(row["tip_loaded"] for row in verified_rows):
+                raise RuntimeError("pipette_partial_query_has_no_verified_presence")
+            try:
+                if receipt_unavailable:
+                    raise RuntimeError("pipette_query_receipt_unavailable")
+                return self._publish_observed_tip_presence(
+                    any(row["tip_loaded"] for row in verified_rows),
+                    source_command_id=str(observed["command_id"]),
+                )
+            except Exception:
+                # Recording failure is not OEM motor desynchronization or a Home request.
+                if any(row["tip_loaded"] for row in rows):
+                    self.invalidate_deck_authority_cache(reason="pipette_observation_persistence_failed")
+                raise
+
+    def _publish_observed_tip_presence(self, loaded: Any, *, source_command_id: str) -> dict[str, Any]:
         reader = getattr(self, "_deck_semantic_state_reader", None)
         if not callable(reader):
             raise RuntimeError("deck_semantic_state_reader_not_bound")
         semantic = reader()
         if not isinstance(semantic, Mapping):
             raise RuntimeError("deck semantic state is malformed")
-        loaded = observed.get("tip_exists")
         if type(loaded) is not bool:
             raise RuntimeError("pipette owner query is malformed")
-        tip_location = semantic["tip_location"] if loaded else -1
-        tip_dirty = semantic["tip_dirty"] if loaded else False
-        if loaded and (
-            type(tip_location) is not int or tip_location not in {-1, 0, 1, 2, 3}
-            or type(tip_dirty) is not bool
-        ):
-            raise RuntimeError("loaded_tip_authoritative_location_unavailable")
-        published = self.publish_pipette_owner_state(
-            tip_loaded=loaded, tip_dirty=tip_dirty, tip_location=tip_location,
+        # Presence alone says nothing about newly loaded tips' condition/location.
+        # Reuse ancillary facts only from the same current, unambiguous loaded owner.
+        known_loaded = (semantic.get("tip_loaded") is True
+            and semantic.get("ambiguity_state") == "none"
+            and all(semantic.get(key) == value
+                    for key, value in self.deck_owner_authority_stamps().items()))
+        tip_location = semantic.get("tip_location") if known_loaded else None
+        tip_dirty = semantic.get("tip_dirty") if known_loaded else None
+        if type(tip_location) is not int or tip_location not in {-1, 0, 1, 2, 3}:
+            tip_location = None
+        if type(tip_dirty) is not bool:
+            tip_dirty = None
+        return self.publish_pipette_owner_state(
+            tip_loaded=loaded, tip_dirty=tip_dirty if loaded else False,
+            tip_location=tip_location if loaded else -1,
             source_command_id=source_command_id,
         )
-        return {
-            "ok": True,
-            "observation": dict(observed),
-            "semantic_state": published,
-        }
 
     def _clean_path_from_tip_tray_authority(
         self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
@@ -4867,7 +4961,7 @@ class Serial206OemInitializationProvider:
             return "full"
         from .oem_deck_catalog import DeckCatalog
         destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(target)
-        return "full" if destination.branch == "park" else "offset.v1"
+        return "park.full" if destination.branch == "park" else "offset.v1"
 
     def _deck_gripper_confirmed(self) -> bool:
         return self._observed_gripper_confirmation(getattr(self.primitives, "tester", None))
@@ -4957,7 +5051,7 @@ class Serial206OemInitializationProvider:
             dict(provenance), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return semantic
 
-    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False) -> dict[str, Any]:
+    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False) -> dict[str, Any]:
         reader = self._deck_semantic_state_reader
         if not callable(reader):
             raise RuntimeError("deck_semantic_state_reader_not_bound")
@@ -5005,6 +5099,12 @@ class Serial206OemInitializationProvider:
             "machine_latch_closed": bool,
             "latch_observation_id": str,
         }
+        # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
+        # verified absence skips tip cleanup and never consults tray CleanPath.
+        # Keep absence explicit and all other full-state/owner fences intact.
+        clean_path_not_applicable = no_tip_park and semantic.get("tip_loaded") is False
+        if clean_path_not_applicable:
+            branch_types.pop("clean_path")
         for key, expected_type in branch_types.items():
             if type(semantic.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
@@ -5037,7 +5137,8 @@ class Serial206OemInitializationProvider:
             "tip_loaded": bool(semantic["tip_loaded"]),
             "tip_dirty": bool(semantic["tip_dirty"]),
             "tip_location": tip_location,
-            "clean_path": bool(semantic["clean_path"]),
+            "clean_path": None if clean_path_not_applicable else semantic["clean_path"],
+            "required_facts": tuple(branch_types),
             "plate_on_gantry": plate,
             "pseudo_z_home": int(semantic["pseudo_z_home"]),
             "ownership_generation": int(semantic["ownership_generation"]),
@@ -8246,7 +8347,7 @@ class Serial206OemInitializationProvider:
         initial_latch = None
         reader = self._deck_semantic_state_reader
         current = reader() if callable(reader) else {}
-        if scope == "full" and current.get("semantic_state_revision") == 0 and current.get("ambiguity_state") == "none":
+        if scope != "offset.v1" and current.get("semantic_state_revision") == 0 and current.get("ambiguity_state") == "none":
             initial_latch = self._fresh_deck_latch_observation()
             if cache_epoch is not self._deck_authority_cache_epoch:
                 raise RuntimeError("deck_authority_changed_during_collection")
@@ -8256,8 +8357,8 @@ class Serial206OemInitializationProvider:
             cache_epoch = self._deck_authority_cache_epoch
         gripper_confirmed = self._deck_gripper_confirmed()
         semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
-                    if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
-        clean_path = None if scope == "offset.v1" else self._clean_path_from_tip_tray_authority(
+                    if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
+        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["tip_loaded"] is False) else self._clean_path_from_tip_tray_authority(
             ownership_generation=int(semantic["ownership_generation"]),
             board_epoch_4=int(semantic["board_epoch_4"]),
             board_epoch_5=int(semantic["board_epoch_5"]),
@@ -8298,7 +8399,7 @@ class Serial206OemInitializationProvider:
         if any(type(value) is not int for value in coordinates.values()):
             raise RuntimeError("deck_controller_positions_not_authoritative")
         latch = initial_latch if initial_latch is not None else self._fresh_deck_latch_observation()
-        if scope == "full" and (
+        if scope != "offset.v1" and (
             semantic["ownership_generation"] != observed_generation
             or semantic["board_epoch_4"] != board_epoch_4
             or semantic["board_epoch_5"] != board_epoch_5
@@ -8342,13 +8443,13 @@ class Serial206OemInitializationProvider:
             "latch_status": bool(latch["latch_status"]),
             "machine_latch_closed": bool(latch["machine_latch_closed"]),
         }
-        snapshot.update(dependency_scope=scope, gripper_confirmed=gripper_confirmed,
+        snapshot.update(dependency_scope="full" if scope == "park.full" else scope, gripper_confirmed=gripper_confirmed,
                         required_facts=semantic.get("required_facts", ()),
                         consumed_state_digest=semantic.get("consumed_state_digest"))
         final_stamps = self.deck_owner_authority_stamps()
         final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
         final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
-                          if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
+                          if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         if (
             final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
             cache_epoch is not self._deck_authority_cache_epoch
@@ -10501,10 +10602,10 @@ class Serial206OemInitializationProvider:
                     or current["consumed_state_digest"] != authority["consumed_state_digest"]):
                 raise RuntimeError("deck_execution_semantic_authority_changed")
 
-    def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None, *, no_tip_park: bool = False) -> dict[str, Any]:
         self.invalidate_deck_authority_cache(reason="deck_execution_started")
         if authority_snapshot is None:
-            result = self._canonical_deck_semantic_state()
+            result = self._canonical_deck_semantic_state(no_tip_park=no_tip_park)
             result["gripper_confirmed"] = self._deck_gripper_confirmed()
             return result
         if not isinstance(authority_snapshot, Mapping):
@@ -10534,6 +10635,8 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("deck_authority_changed_before_first_tx")
         elif authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")
+        if no_tip_park and authority_snapshot.get("tip_loaded") is False:
+            required_types.pop("clean_path")
         for key, expected_type in required_types.items():
             if type(authority_snapshot.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
@@ -11965,7 +12068,7 @@ class Serial206OemInitializationProvider:
 
         if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")
-        semantics = self._deck_execution_semantics(authority_snapshot)
+        semantics = self._deck_execution_semantics(authority_snapshot, no_tip_park=True)
         current_location_name = str(semantics["current_location_id"])
         if current_location_name == "LOC_PARK":
             return {

@@ -308,7 +308,9 @@ class CanPipetteTransport:
             )
         return result
 
-    def _safe_query_tip_status(self, driver: Any, *, required: bool = False) -> dict[str, Any] | None:
+    def _safe_query_tip_status(
+        self, driver: Any, *, required: bool = False, source_continue: bool = False,
+    ) -> dict[str, Any] | None:
         query_fn = getattr(driver, "query_tip_status", None)
         if not callable(query_fn):
             if required:
@@ -338,9 +340,13 @@ class CanPipetteTransport:
             result["reader_generation"] = reader_generation
             self._reader_generation = reader_generation
             self._last_tip_status = result
-            if result.get("ok") and "tip_loaded" in result:
+            if type(result.get("source_tip_loaded")) is bool:
+                self._tip_loaded = result["source_tip_loaded"]
+            elif result.get("ok") and "tip_loaded" in result:
                 self._tip_loaded = bool(result.get("tip_loaded"))
-            elif required:
+            if not result.get("ok") and required and not (
+                source_continue and result.get("source_return_completed") is True
+            ):
                 raise PipetteCommandError(
                     "Pipette hardware tip-status query did not return a successful readback.",
                     details={"hardware_tip_status": result},
@@ -2220,12 +2226,22 @@ class FourPipetteTransport:
         }
 
     def query_tip_status_all(self) -> dict[str, Any]:
-        """Return exact four-channel OEM `?31` hardware readback."""
+        """Query in OEM order; strict readback rejection is not a source throw."""
         with self._transaction_lock:
             channels: list[dict[str, Any]] = []
+            invalid_channels: list[int] = []
             for channel, transport in enumerate(self._transports):
-                driver = transport._get_driver()
-                result = transport._safe_query_tip_status(driver, required=True)
+                try:
+                    driver = transport._get_driver()
+                    result = transport._safe_query_tip_status(driver, required=True, source_continue=True)
+                except Exception as exc:
+                    # Earlier setters and observations survive an actual unwind.
+                    details = {"observed_channels": channels, "failed_channel": channel,
+                        "source_return_completed": False, "source_exception": True}
+                    if isinstance(exc, PipetteCommandError):
+                        exc.details.update(details)
+                        raise
+                    raise PipetteCommandError(str(exc), details={**details, "exception": repr(exc)}) from exc
                 if (
                     not isinstance(result, dict)
                     or result.get("ok") is not True
@@ -2233,14 +2249,24 @@ class FourPipetteTransport:
                     or result.get("hardware_truth_level") != "hardware_query"
                     or type(result.get("tip_loaded")) is not bool
                 ):
-                    raise PipetteCommandError(
-                        "Pipette hardware tip-status query did not return exact four-channel readback.",
-                        details={"channel": channel, "result": result},
-                    )
-                loaded = result["tip_loaded"]
+                    invalid_channels.append(channel)
+                loaded = result.get("tip_loaded") if isinstance(result, dict) else None
                 channels.append({"channel": channel, "tip_loaded": loaded, "result": result})
+            source_result = {
+                "source_return_completed": True,
+                "source_exception": False,
+                "source_tip_exists": any(transport._tip_loaded for transport in self._transports),
+                "source_return": sum(row["result"].get("source_return") == 1 for row in channels),
+            }
+            if invalid_channels:
+                raise PipetteCommandError(
+                    "OEM tip query returned; strict hardware readback verification failed.",
+                    details={"observed_channels": channels, "invalid_channels": invalid_channels,
+                        **source_result},
+                )
             loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
             return {
+                **source_result,
                 "ok": True,
                 "tip_count": len(loaded_channels),
                 "channels_with_tips": loaded_channels,

@@ -205,7 +205,9 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
     admitted = store.admit_command(request, state=state, assessment={'enabled': True})
     claimed = store.claim_next()
     assert claimed['command_id'] == admitted['command_id']
-    assert store.connection.execute('PRAGMA user_version').fetchone()[0] == 8
+    from bioxp.oem_runtime_store import canonical_runtime_migration_registry
+    assert store.connection.execute('PRAGMA user_version').fetchone()[0] == max(
+        migration.version for migration in canonical_runtime_migration_registry())
     assert store.connection.execute('SELECT deck_owner_authority_current(?,?,?)', (3, stamps['board_epoch_4'], stamps['board_epoch_5'])).fetchone()[0] == 1
     execute = make_deck_command_executor(provider_getter=lambda: provider,
         position_table_provider=load_bound_oem_position_table, command_store=store)

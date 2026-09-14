@@ -3654,9 +3654,15 @@ class OperatorCommandStore:
             raise ValueError("deck semantic producer fields are not permitted")
         if "tip_loaded" in values and type(values["tip_loaded"]) is not bool:
             raise ValueError("tip_loaded must be boolean")
-        if "tip_dirty" in values and type(values["tip_dirty"]) is not bool:
-            raise ValueError("tip_dirty must be boolean")
-        if "tip_location" in values and (type(values["tip_location"]) is not int or values["tip_location"] not in {-1, 0, 1, 2, 3}):
+        if "tip_dirty" in values and not (
+            type(values["tip_dirty"]) is bool
+            or (operation == "pipette_owner" and values["tip_dirty"] is None)
+        ):
+            raise ValueError("tip_dirty must be boolean or an unknown pipette observation")
+        if "tip_location" in values and not (
+            type(values["tip_location"]) is int and values["tip_location"] in {-1, 0, 1, 2, 3}
+            or (operation == "pipette_owner" and values["tip_location"] is None)
+        ):
             raise ValueError("tip_location is outside the source domain")
         if "clean_path" in values and type(values["clean_path"]) is not bool:
             raise ValueError("clean_path must be boolean")
@@ -3696,7 +3702,9 @@ class OperatorCommandStore:
             }
             merged.update(values)
             if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
-                raise ValueError("loaded tip requires a valid tip location")
+                if not (operation == "pipette_owner" and "tip_location" in values
+                        and values["tip_location"] is None):
+                    raise ValueError("loaded tip requires a valid tip location")
             before = int(current["semantic_state_revision"])
             after = before + 1
             command_id = str(uuid.uuid4())

@@ -136,7 +136,7 @@ def test_park_final_source_caller_keeps_flag_two(rig, monkeypatch):
     provider, primitive, _, _, table = rig
     semantics = dict(current_location_id="LOC_OC", current_well_id=0,
                      pseudo_z_home=500, tip_loaded=False, plate_on_gantry=None)
-    monkeypatch.setattr(provider, "_deck_execution_semantics", lambda authority: semantics)
+    monkeypatch.setattr(provider, "_deck_execution_semantics", lambda authority, **kwargs: semantics)
     calls = []
     def record(**kw):
         calls.append(kw)

@@ -997,9 +997,19 @@ class BioXpCanDriver:
 
     def query_tip_status(self):
         result = self._send_pipette_command("?31", address="report", ack_mode="query", command_name="query_tip_status")
-        tip_loaded = self._parse_tip_loaded(result)
-        ack = result.get("ack", {}) if isinstance(result, dict) else {}
+        # ClassPipette.QueryTipStatus assigns this channel before returning 1/2.
+        # A returned null is false software state, not verified hardware absence.
+        # Nonnull short replies raise before this setter; earlier/asynchronous
+        # channel updates are not rolled back. Do not catch propagated exceptions.
+        result = result if result is not None else {}
+        ack = result.get("ack", {})
         reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
+        data = ack.get("data") if reply_received else None
+        source_tip_loaded = data[2] == ord("1") if data is not None else False
+        self._pipette_message_state = {
+            **getattr(self, "_pipette_message_state", {}), "tip_loaded": source_tip_loaded,
+        }
+        tip_loaded = self._parse_tip_loaded(result) if data is not None else None
         semantic_ok = tip_loaded is not None
         if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"
@@ -1009,6 +1019,9 @@ class BioXpCanDriver:
             "reply_received": reply_received,
             "error": result.get("error") if semantic_ok else "malformed_tip_status_reply",
             "tip_loaded": tip_loaded,
+            "source_tip_loaded": source_tip_loaded,
+            "source_return": 1 if source_tip_loaded else 2,
+            "source_return_completed": True,
             "semantic_ok": semantic_ok,
             "hardware_truth_level": "hardware_query" if reply_received and tip_loaded is not None else ("unparsed_hardware_reply" if reply_received else "no_readback"),
             "oem_source_anchor": "ClassPipette.QueryTipStatus: ?31",
