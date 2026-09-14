@@ -315,7 +315,10 @@ class ReferenceStateStore:
                     record = AxisReferenceRecord(
                         axis=previous.axis,
                         state=previous.state,
-                        state_version=previous.state_version + 1,
+                        # Motion bookkeeping does not replace reference authority.
+                        # Keep the version fenced by admitted deck commands; only
+                        # reference/desync/recovery transitions advance it.
+                        state_version=previous.state_version,
                         origin_position_steps=previous.origin_position_steps,
                         source=previous.source,
                         note=previous.note,
