@@ -4517,7 +4517,9 @@ class OperatorCommandStore:
             for row in results
         ):
             raise ValueError("deck semantic state requires verified controller completion")
-        with self._transaction() as conn:
+        # Final owner validation is live, just like pre-TX and reconciliation.
+        # Match passive projection's provider -> writer order at this boundary.
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             if expected_authority is not None:
                 self.assert_deck_execution_current(command_id, boundary="atomic_semantic_commit")
                 semantic = self.deck_semantic_state()

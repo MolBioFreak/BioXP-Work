@@ -96,6 +96,10 @@ def run_named(rig, execute, target, key):
         'board4_authority': {'active_board_epoch': epochs['4']}}}, assessment={'enabled': True})
     claimed = store.claim_next()
     assert claimed['command_id'] == admitted['command_id']
+    # The real dispatcher renews while it owns queued/running work. This
+    # synchronous test helper must not silently let a 23-command sequence
+    # outlive that same unchanged lease without its normal owner heartbeat.
+    assert store._renew_owner()
     result = execute(command_id=admitted['command_id'], target=target, camera_offset=False,
         expected_ownership_generation=3, expected_board_epoch_by_board=epochs)
     if not result['ok']:
