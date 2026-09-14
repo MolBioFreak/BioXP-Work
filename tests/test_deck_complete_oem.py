@@ -98,15 +98,15 @@ def test_ordinary_camera_checkbox_native(retained_rig, monkeypatch, target):
     y = row.base_coordinates['y'] + camera.base_coordinates['y']
     export(target + '-camera-probe', {'x': x, 'y': y, 'moves': leaf.moves, 'result': result})
     if y < 0:
-        # Characterize, do NOT qualify this option as completed or change bounds.
-        # Board source clamps negative target to zero; aggregate still compares
-        # against the pre-board target. Parent must disposition this conflict.
+        # Preserve the OEM lower clamp and qualify its actual effective target.
+        # Raw caller intent is retained; no source dispatch or limits change.
         assert target == 'LOC_OC_COVER_STORAGE' and y == -1687
-        assert result['ok'] and not result['controller_completion_verified']
-        assert leaf.positions[(4, 0)] == 0
+        assert result['ok'] and result['controller_completion_verified']
+        assert result['raw_requested_y_steps'] == result['oem_requested_y_steps'] == y
+        assert result['oem_effective_y_steps'] == leaf.positions[(4, 0)] == 0
         export(target + '-camera', {'requested': {'x': x, 'y': y, 'z': 0},
             'wire_expected': {'x': x, 'y': 0, 'z': 0},
-            'qualification': 'UNRESOLVED negative camera target; not accepted', 'result': result})
+            'qualification': 'offline native provider; OEM lower-clamped target verified', 'result': result})
         return
     assert result['ok'] and result['controller_completion_verified']
     assert leaf.positions == {(5, 0): 90213 if x > 90263 else x,
