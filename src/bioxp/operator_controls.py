@@ -2114,6 +2114,29 @@ async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: 
 _PASSIVE_OPERATOR_POLL: ContextVar[bool] = ContextVar("operator_passive_poll", default=False)
 
 
+async def _drain_operator_work(pending):
+    """Retain an off-loop owner through cancellation; never replay its work."""
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(pending)
+            break
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise
+            cancelled = True
+            # Repeated HTTP cancellation cannot relinquish execution
+            # ownership while the provider still owns its state mutex.
+            continue
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 class _OperatorStateReader:
     """Bounded off-loop state collection, never an execution queue.
 
@@ -2148,25 +2171,7 @@ class _OperatorStateReader:
                 return await asyncio.wait_for(asyncio.shield(pending), timeout=0.5)
             except asyncio.TimeoutError:
                 raise HTTPException(503, detail="operator_state_warming") from None
-        cancelled = False
-        while True:
-            try:
-                result = await asyncio.shield(pending)
-                break
-            except asyncio.CancelledError:
-                if pending.cancelled():
-                    raise
-                cancelled = True
-                # Repeated HTTP cancellation cannot relinquish execution
-                # ownership while the provider still owns its state mutex.
-                continue
-            except BaseException:
-                if cancelled:
-                    raise asyncio.CancelledError from None
-                raise
-        if cancelled:
-            raise asyncio.CancelledError
-        return result
+        return await _drain_operator_work(pending)
 
 
 class _OperatorPollCache:
@@ -2365,6 +2370,7 @@ def install_operator_control_plane(
         finally:
             poll_cache.close()
             admission_state_reader.close()
+            preview_state_reader.close()
             invoke_state_reader.close()
             reconciliation_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -2586,9 +2592,12 @@ def install_operator_control_plane(
         app.state.oem_mov_execution_admitter = admit_mov_execution
         app.state.oem_wp8_operation_admitter = admit_wp8_operation
 
-    admission_state_reader = _OperatorStateReader(machine_state, metadata=True)
+    # Named admission is owned command work, not a short-lived metadata view.
+    admission_state_reader = _OperatorStateReader(machine_state)
+    preview_state_reader = _OperatorStateReader(machine_state, metadata=True)
     invoke_state_reader = _OperatorStateReader(machine_state)
     app.state.operator_admission_state_reader = admission_state_reader
+    app.state.operator_preview_state_reader = preview_state_reader
     app.state.operator_invoke_state_reader = invoke_state_reader
 
     def deck_contract(state: Mapping[str, Any], *, target: str | None = None) -> dict[str, Any]:
@@ -3206,30 +3215,39 @@ def install_operator_control_plane(
         if action_id == "oem.deck.move_to_location":
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
-            pending_named_admissions += 1
-            try:
-                state = await admission_state_reader.read()
-                assessment = deck_contract(state, target=payload.inputs.get("target"))
-                selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
-                if selected is None or selected["enabled"] is not True:
-                    assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
-                if not assessment["enabled"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "error": assessment["disabled_reason"],
-                            "reason": assessment["disabled_reason"],
-                        },
-                    )
-                admitted = await asyncio.to_thread(
-                    command_plane.store.admit_command,
-                    {**payload.model_dump(), "action_id": action_id},
-                    state=state,
-                    assessment=assessment,
-                )
-                return _v2_compact_receipt(admitted)
-            finally:
-                pending_named_admissions -= 1
+            # One fresh normal owner, never a backlog of command waiters.
+            # Preview reads keep their separate bounded metadata lifecycle.
+            if direct_requests or invoke_lock.locked():
+                raise HTTPException(409, detail={"error": "operator_action_busy",
+                    "physical_motion_commanded": False, "automatic_retry": False})
+            async with invoke_lock:
+                pending_named_admissions += 1
+                try:
+                    state = await admission_state_reader.read()
+                    assessment = await _drain_operator_work(asyncio.create_task(
+                        asyncio.to_thread(deck_contract, state, target=payload.inputs.get("target"))))
+                    selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
+                    if selected is None or selected["enabled"] is not True:
+                        assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
+                    if not assessment["enabled"]:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": assessment["disabled_reason"],
+                                "reason": assessment["disabled_reason"],
+                            },
+                        )
+                    # Once SQLite admission starts, drain its actual outcome
+                    # before releasing refresh priority, including on disconnect.
+                    admitted = await _drain_operator_work(asyncio.create_task(asyncio.to_thread(
+                        command_plane.store.admit_command,
+                        {**payload.model_dump(), "action_id": action_id},
+                        state=state,
+                        assessment=assessment,
+                    )))
+                    return _v2_compact_receipt(admitted)
+                finally:
+                    pending_named_admissions -= 1
         action = by_id.get(action_id)
         if (
             isinstance(payload, OperatorActionRequestV2)
@@ -3413,7 +3431,7 @@ def install_operator_control_plane(
     async def action_admission(action_id: str, payload: AdmissionRequest) -> dict[str, Any]:
         if not _ACTION_RE.fullmatch(action_id) or action_id not in by_id:
             raise HTTPException(status_code=404, detail="unknown operator action_id")
-        state = await admission_state_reader.read()
+        state = await preview_state_reader.read()
         if payload.expected_generation != int(state["ownership_generation"]):
             raise HTTPException(status_code=409, detail="ownership generation mismatch")
         target = dispatch.get(action_id, {})
@@ -3569,7 +3587,7 @@ def install_operator_control_plane(
         if not is_safety_interrupt and payload.expected_generation != expected:
             raise HTTPException(status_code=409, detail="ownership generation mismatch")
         if target is None:
-            assessment = _assess_action(action, await admission_state_reader.read(), payload.inputs)
+            assessment = _assess_action(action, await preview_state_reader.read(), payload.inputs)
             raise HTTPException(status_code=409, detail={"error": "action_unavailable", "reason": assessment["disabled_reason"], "dependencies": assessment["dependencies"]})
         unknown_inputs = set(payload.inputs) - set(target["inputs"])
         if unknown_inputs:
