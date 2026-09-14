@@ -4359,6 +4359,7 @@ class Serial206OemInitializationProvider:
         self._wp8_stop_event = threading.Event()
         self._wp8_stop_event.set()
         self._deck_owner_id = "serial206-oem-initialization-provider"
+        self._home_recovery_owner_id = uuid.uuid4().hex
         self._deck_semantic_state_reader: Callable[[], Mapping[str, Any]] | None = None
         self._tip_tray_state_reader: Callable[[int], Mapping[str, Any]] | None = None
         self._tip_tray_state_publisher: Callable[..., Mapping[str, Any]] | None = None
@@ -5404,6 +5405,7 @@ class Serial206OemInitializationProvider:
                 and callable(getattr(self.preparation_provider, "current_board_lifecycle_generation", None))
                 and x_lifecycle["board_lifecycle_generation"] == self.preparation_provider.current_board_lifecycle_generation()
             ):
+                reference_before = self.reference_store.snapshot(("x",))["rows"]["x"]["state_version"]
                 reference = self.reference_store.mark_referenced(
                     MarkAxisReferencedCommand(
                         axis="x",
@@ -5423,6 +5425,11 @@ class Serial206OemInitializationProvider:
                     "awaiting_observation_receipt_id": None,
                     "last_failure": None if reference_ok else _json_safe(reference),
                 })
+                recovery_home = completed_awaiting_x_home.get("recovery_home")
+                if (reference_ok and isinstance(recovery_home, dict)
+                    and recovery_home.get("owner_id") == self._home_recovery_owner_id
+                    and recovery_home.get("reference_version_before") == reference_before):
+                    recovery_home["reference_version"] = reference["state_version"]
                 payload = self._save_state(payload)
             if x_lifecycle.get("state") == "executing":
                 if self.reference_store is not None:
@@ -6509,6 +6516,9 @@ class Serial206OemInitializationProvider:
                 "enable_xy_current", "enable_xyz_current",
             }
             motion_intents = {"move_absolute", "move_steps", "wait_for_motor", "move_to"}
+            home_started_at = time.time()
+            home_reference_before = (self.reference_store.snapshot(("x",))["rows"]["x"]["state_version"]
+                                     if selected == "manual_panel_home" and self.reference_store is not None else None)
             home_intents = {"startup_home", "home_axis", "manual_panel_home", "move_to_origin_home", "caught_plate_recovery_home", "set_home"}
             move_to_all_zero = bool(
                 selected == "move_to"
@@ -6772,6 +6782,20 @@ class Serial206OemInitializationProvider:
                 if selected == "enable_xyz_current":
                     latest["z_lifecycle"] = z_lifecycle
                 state = latest
+            if (receipt is not None and selected == "manual_panel_home"
+                and receipt.get("status") == "completed" and not cached_home_noop
+                and result.get("controller_home_proof_verified") is True
+                and result.get("controller_command_acknowledged") is True
+                and result.get("controller_terminal_state_verified") is True
+                and type(home_reference_before) is int and self.state_store is not None):
+                receipt["recovery_home"] = {
+                    "ownership_generation": generation,
+                    "board_epoch_4": self.state_store.board4_authority_projection()["board"]["active_board_epoch"],
+                    "board_epoch_5": lifecycle["board_lifecycle_generation"],
+                    "owner_id": self._home_recovery_owner_id,
+                    "command_id": command_id, "started_at": home_started_at, "finished_at": time.time(),
+                    "reference_version_before": home_reference_before, "interrupt_epoch": admitted_interrupt_epoch,
+                }
             self._save_state(state)
             if (
                 receipt is not None
@@ -8241,6 +8265,94 @@ class Serial206OemInitializationProvider:
             self._deck_authority_cache = (sample_started, cache_epoch, copy.deepcopy(snapshot))
         return snapshot
 
+    def deck_home_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Read native, current-owner home receipts; never home or infer a location."""
+        if self.reference_store is None or self.state_store is None or not callable(self._deck_semantic_state_reader):
+            raise RuntimeError("deck_home_authority_unavailable")
+        sample_started = time.time()
+        stamps = self.deck_owner_authority_stamps()
+        if stamps["ownership_generation"] != expected_generation:
+            raise RuntimeError("deck_home_generation_changed")
+        state = self._load_state()
+        semantic = dict(self._deck_semantic_state_reader())
+        references = self.reference_store.snapshot(("x", "y", "z", "g"))["rows"]
+        versions = {}
+        for axis, row in references.items():
+            if row.get("state") != "referenced" or type(row.get("state_version")) is not int:
+                raise RuntimeError("deck_home_reference_unavailable:" + axis)
+            versions[axis] = row["state_version"]
+        board4 = self.state_store.board4_authority_projection()
+        y_axis = board4.get("axes", {}).get("y", {})
+        if (board4.get("board", {}).get("state") != "active"
+            or y_axis.get("lifecycle_state") != "referenced_ready"
+            or y_axis.get("prepared_board_epoch") != stamps["board_epoch_4"]):
+            raise RuntimeError("deck_home_y_authority_unavailable")
+        homes = {}
+        for axis in ("x", "y", "z"):
+            if axis == "y":
+                receipt = self._durable_serial206_receipt("y", str(y_axis.get("last_receipt_id"))) or {}
+                owner = getattr(self.y_provider, "_home_recovery_owner_id", None)
+                interrupt = self.state_store.axis_interrupt_snapshot("y")
+                epoch = interrupt["epoch"]
+                active = interrupt["active"]
+            else:
+                lifecycle = state[axis + "_lifecycle"]
+                if (lifecycle.get("state") != "referenced_ready"
+                    or lifecycle.get("generation") != expected_generation
+                    or lifecycle.get("board_lifecycle_generation") != stamps["board_epoch_5"]):
+                    raise RuntimeError("deck_home_lifecycle_unavailable:" + axis)
+                receipt = next((r for r in reversed(lifecycle.get("receipts", []))
+                                if isinstance(r, Mapping) and isinstance(r.get("recovery_home"), Mapping)), {})
+                owner = self._home_recovery_owner_id
+                epoch = getattr(self, "_" + axis + "_interrupt_epoch")
+                active = getattr(self, "_" + axis + "_interrupt_active")
+            evidence = receipt.get("recovery_home")
+            if (not isinstance(evidence, Mapping) or receipt.get("status") != "completed"
+                or not owner or evidence.get("owner_id") != owner or active
+                or evidence.get("interrupt_epoch") != epoch
+                or evidence.get("ownership_generation") != expected_generation
+                or evidence.get("board_epoch_4") != stamps["board_epoch_4"]
+                or (axis != "y" and evidence.get("board_epoch_5") != stamps["board_epoch_5"])
+                or evidence.get("reference_version") != versions.get(axis)
+                or references[axis].get("origin_position_steps") != 0):
+                raise RuntimeError("deck_home_receipt_not_current:" + axis)
+            homes[axis] = dict(evidence)
+        tester = getattr(self.primitives, "tester", None)
+        for axis, board, motor in (("x", 5, 0), ("y", 4, 0), ("z", 4, 1)):
+            for method, field, expected in (("motor_get_position", "position", 0),
+                                             ("motor_get_speed", "speed", 0),
+                                             ("motor_query_home_switch", "home", True)):
+                value = getattr(tester, method)(board, motor=motor)
+                if (not isinstance(value, Mapping) or value.get("ok") is not True
+                    or type(value.get(field)) is not type(expected) or value[field] != expected
+                    or not isinstance(value.get("ack"), Mapping)
+                    or type(value["ack"].get("status")) is not int or value["ack"]["status"] != 100
+                    or (field == "home" and value.get("reply_valid") is not True)):
+                    raise RuntimeError("deck_home_current_readback_unverified:" + axis + ":" + field)
+        latch = self._fresh_deck_latch_observation()
+        if (time.time() - sample_started > 5
+            or self._home_recovery_owner_id != homes["x"]["owner_id"]
+            or getattr(self.y_provider, "_home_recovery_owner_id", None) != homes["y"]["owner_id"]
+            or any(getattr(self, "_" + a + "_interrupt_active")
+                   or getattr(self, "_" + a + "_interrupt_epoch") != homes[a]["interrupt_epoch"] for a in ("x", "z"))
+            or self.state_store.axis_interrupt_snapshot("y") != interrupt
+            or any(self._load_state()[a + "_lifecycle"] != state[a + "_lifecycle"] for a in ("x", "z"))
+            or self.state_store.board4_authority_projection() != board4
+            or self.deck_owner_authority_stamps() != stamps
+            or self.reference_store.snapshot(("x", "y", "z", "g"))["rows"] != references
+            or dict(self._deck_semantic_state_reader()) != semantic):
+            raise RuntimeError("deck_home_authority_changed_during_observation")
+        return {**stamps, "provider_owner_id": self._home_recovery_owner_id,
+            "position_table_sha256": load_bound_oem_position_table().digest,
+            "machine_state_revision": semantic["semantic_state_revision"],
+            "reference_versions": versions, "recovery_home_evidence": homes,
+            "latch_status": latch["latch_status"], "machine_latch_closed": latch["machine_latch_closed"],
+            "latch_observation_id": latch["latch_observation_id"],
+            "current_x": 0, "current_y": 0, "current_z": 0,
+            "observed_location_id": None, "observed_well_id": None,
+            "controller_position_observation_id": hashlib.sha256(b'{"x":0,"y":0,"z":0}').hexdigest(),
+            "captured_at": time.time()}
+
     def deck_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
         """Bind exact semantic observation to current controller coordinates; never infer nearest."""
         reader = getattr(self.primitives, "read_deck_semantic_observation", None)
@@ -8364,6 +8476,8 @@ class Serial206OemInitializationProvider:
     def _append_z_receipt(self, z: dict[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
         receipts = list(z.get("receipts") or [])
         bounded = _json_safe(dict(receipt))
+        if isinstance(receipt.get("recovery_home"), Mapping):
+            bounded["recovery_home"] = copy.deepcopy(dict(receipt["recovery_home"]))
         # Preserve decision-grade evidence outside the deeply bounded result.
         # A large TMCL trace must not consume the global item budget before the
         # failure, endpoint, or controller-event fields are serialized.
@@ -9697,6 +9811,24 @@ class Serial206OemInitializationProvider:
                 # not overwrite it with this Z operation's earlier snapshot.
                 state["x_lifecycle"] = self._load_state()["x_lifecycle"]
                 x_recovery_receipt = None
+            if (intent == "manual_home" and ok and reference_published
+                and result.get("controller_command_acknowledged") is True
+                and result.get("controller_terminal_state_verified") is True
+                and isinstance(result.get("home_summary"), Mapping)
+                and result["home_summary"].get("controller_home_proof_verified") is True
+                and result.get("completion_class") != "source_cached_noop"
+                and result.get("source_noop") is not True
+                and self.reference_store is not None and self.state_store is not None):
+                receipt["recovery_home"] = {
+                    "ownership_generation": observed_generation,
+                    "board_epoch_4": self.state_store.board4_authority_projection()["board"]["active_board_epoch"],
+                    "board_epoch_5": state["x_lifecycle"]["board_lifecycle_generation"],
+                    "owner_id": self._home_recovery_owner_id,
+                    "command_id": command_id, "started_at": receipt["started_at"],
+                    "finished_at": receipt["finished_at"],
+                    "reference_version": reference["state_version"],
+                    "interrupt_epoch": admitted_interrupt_epoch,
+                }
             durable_receipt = self._append_z_receipt(z, receipt)
             try:
                 state = self._save_state(state)

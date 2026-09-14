@@ -4608,7 +4608,25 @@ class OperatorCommandStore:
             "SELECT * FROM operator_plane_deck_stages WHERE command_id=? ORDER BY stage_order",
             (str(command_id),),
         ).fetchall()
+        recovery_resolution = None
+        resolution = self.connection.execute(
+            "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
+            (str(command_id),),
+        ).fetchone()
+        if resolution is not None:
+            decision = _json_load(resolution["decision_json"], {})
+            receipt = _json_load(resolution["receipt_json"], {})
+            if (isinstance(decision, dict) and isinstance(receipt, dict)
+                and decision.get("command_id") == receipt.get("command_id") == str(command_id)
+                and decision.get("decision_id") == resolution["decision_id"]
+                and isinstance(receipt.get("reconciliation_decision"), dict)
+                and receipt["reconciliation_decision"].get("decision_id") == resolution["decision_id"]
+                and all(type(receipt.get(k)) is int and receipt[k] >= 1 for k in ("semantic_state_revision", "transition_sequence"))):
+                recovery_resolution = {"command_id": str(command_id), "decision_id": str(resolution["decision_id"]),
+                    "semantic_state_revision": receipt["semantic_state_revision"],
+                    "transition_sequence": receipt["transition_sequence"]}
         return {
+            "recovery_resolution": recovery_resolution,
             "target": str(row["target"]), "target_label": str(row["target_label"]),
             "source_branch": str(row["source_branch"]), "resolved_location_id": int(row["resolved_location_id"]),
             "destination_catalog_revision": str(row["destination_catalog_revision"]),
@@ -5515,7 +5533,7 @@ class OperatorCommandStore:
             "position_table_sha256", "machine_state_revision", "latch_status",
             "machine_latch_closed", "latch_observation_id",
             "controller_position_observation_id", "current_x", "current_y", "current_z",
-            "observed_location_id", "observed_well_id",
+            "observed_location_id", "observed_well_id", "reference_versions", "recovery_home_evidence",
         )
         def resampled_fence(payload: Mapping[str, Any]) -> dict[str, Any]:
             from .oem_deck_movement import _latch_owner_identity
@@ -5532,7 +5550,7 @@ class OperatorCommandStore:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             semantic = conn.execute("SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
             command = conn.execute(
-                "SELECT c.status,c.action_id,c.ownership_generation,c.stream_sequence,c.dispatch_attempt_id,"
+                "SELECT c.status,c.action_id,c.ownership_generation,c.stream_sequence,c.dispatch_attempt_id,c.finished_at,"
                 "d.target,d.position_table_revision,d.destination_catalog_revision,d.authority_snapshot_digest,"
                 "d.plan_digest,d.ambiguity_state,m.expected_board_epochs_json "
                 "FROM operator_plane_commands c JOIN operator_plane_deck_commands d USING(command_id) "
@@ -5555,6 +5573,10 @@ class OperatorCommandStore:
                 "current_location": current_location,
                 "current_well": current_well,
             }
+            if decision_identity is not None and approved_home_state is not None:
+                decision_identity["approved_home_state"] = dict(approved_home_state)
+                decision_identity["recovery_home_evidence"] = authority.get("recovery_home_evidence")
+                decision_identity["provider_owner_id"] = authority["provider_owner_id"]
             existing_decision = conn.execute(
                 "SELECT decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE decision_id=?",
                 (str(reconciliation_decision["decision_id"]),),
@@ -5580,16 +5602,43 @@ class OperatorCommandStore:
             ):
                 raise ValueError("deck catalog or PositionTable revision conflict")
             admitted_epochs = _json_load(command["expected_board_epochs_json"], {})
-            if (
+            if approved_home_state is None and (
                 int(command["ownership_generation"]) != int(authority["ownership_generation"])
                 or admitted_epochs != observation["board_epoch_by_board"]
             ):
                 raise ValueError("deck authority identity conflict")
+            def validate_home(payload: Mapping[str, Any]) -> None:
+                if approved_home_state is None:
+                    return
+                captured = payload.get("captured_at")
+                homes = payload.get("recovery_home_evidence")
+                versions = payload.get("reference_versions")
+                if (type(captured) not in {int, float} or not 0 <= _now() - captured <= 5
+                    or any(type(payload.get("current_" + a)) is not int or payload["current_" + a] != 0 for a in ("x", "y", "z"))
+                    or not isinstance(homes, Mapping) or set(homes) != {"x", "y", "z"}
+                    or not isinstance(versions, Mapping) or command["finished_at"] is None):
+                    raise ValueError("fresh server home recovery evidence required")
+                for axis, home in homes.items():
+                    if (not isinstance(home, Mapping)
+                        or not isinstance(home.get("command_id"), str) or not home["command_id"]
+                        or not isinstance(home.get("owner_id"), str) or not home["owner_id"]
+                        or type(home.get("started_at")) not in {int, float}
+                        or type(home.get("finished_at")) not in {int, float}
+                        or not float(command["finished_at"]) < home["started_at"] <= home["finished_at"] <= captured
+                        or home.get("ownership_generation") != payload["ownership_generation"]
+                        or home.get("board_epoch_4") != payload["board_epoch_4"]
+                        or (axis != "y" and (home.get("board_epoch_5") != payload["board_epoch_5"]
+                            or home.get("owner_id") != payload["provider_owner_id"]))
+                        or type(home.get("reference_version")) is not int
+                        or home["reference_version"] != versions.get(axis)):
+                        raise ValueError("home recovery evidence is stale or not bound to current authority:" + axis)
+            validate_home(authority)
             if not callable(final_authority_reader):
                 raise ValueError("final current provider authority fence is required")
             final_authority = final_authority_reader()
             if not isinstance(final_authority, Mapping):
                 raise ValueError("final current provider authority is malformed")
+            validate_home(final_authority)
             final_fence = resampled_fence(final_authority)
             if final_fence != initial_fence:
                 raise ValueError("deck authority changed before reconciliation commit")
@@ -5612,6 +5661,9 @@ class OperatorCommandStore:
                 "controller_position_observation": observation,
                 "reconciliation_decision": reconciliation_decision,
                 "approved_home_state": dict(approved_home_state) if approved_home_state is not None else None,
+                "recovery_home_evidence": authority.get("recovery_home_evidence"),
+                "historical_ownership_generation": int(command["ownership_generation"]),
+                "historical_board_epochs": admitted_epochs,
                 "latch_status": bool(authority["latch_status"]),
                 "machine_latch_closed": bool(authority["machine_latch_closed"]),
                 "latch_observation_id": str(authority["latch_observation_id"]),
@@ -7488,7 +7540,7 @@ class OperatorCommandPlane:
                 raise HTTPException(status_code=422, detail={"error": "reconciliation_dispositions_are_mutually_exclusive"})
             provider = self._current_deck_provider()
             table_provider = getattr(self.app.state, "oem_deck_position_table_provider", None)
-            snapshot_reader = getattr(provider, "deck_reconciliation_snapshot", None)
+            snapshot_reader = getattr(provider, "deck_home_reconciliation_snapshot" if approved_home_state is not None else "deck_reconciliation_snapshot", None)
             lease_factory = getattr(provider, "movement_lease", None)
             if not callable(snapshot_reader) or not callable(lease_factory) or not callable(table_provider):
                 raise HTTPException(status_code=503, detail={"error": "deck_reconciliation_provider_truth_unavailable"})
@@ -7505,6 +7557,8 @@ class OperatorCommandPlane:
                 catalog_revision = DeckCatalog.from_position_table(table).revision
 
                 def final_authority_reader() -> Mapping[str, Any]:
+                    if self._current_deck_provider() is not provider or self._state().get("ownership_generation") != generation:
+                        raise ValueError("deck recovery provider owner changed")
                     current = snapshot_reader(expected_generation=generation)
                     if not isinstance(current, Mapping):
                         raise ValueError("final provider reconciliation snapshot is not a mapping")

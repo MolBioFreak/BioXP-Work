@@ -55,6 +55,8 @@ def test_exact_first_move_recovery_does_not_replay(stopped_failure, monkeypatch)
     assert dict(store.connection.execute('SELECT * FROM operator_plane_commands WHERE command_id=?',(data['command_id'],)).fetchone()) == stored_before
     # The separate reconciliation advances the disclosure sequence, not the
     # original command outcome or its stored stages/terminal payload.
+    assert after['deck_movement']['recovery_resolution']['command_id'] == data['command_id']
+    after['deck_movement']['recovery_resolution'] = before['deck_movement']['recovery_resolution']
     assert {k:v for k,v in after.items() if k!='transition_sequence'} == {k:v for k,v in before.items() if k!='transition_sequence'}
     assert sum(row[0]=='move' for row in primitive.calls)==count and leaf.moves==[]
     assert store._deck_recovery_blocker(store.connection) is None

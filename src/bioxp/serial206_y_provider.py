@@ -645,6 +645,11 @@ class Serial206YProvider:
 
     @_interrupt_fenced
     def home(self, mode: str, *, command_id: str | None = None, wait_timeout_s: float = 30.0) -> dict[str, Any]:
+        started_at = time.time()
+        admitted_generation = int(self.generation_provider())
+        owner_id = getattr(self, "_home_recovery_owner_id", None)
+        if owner_id is None:
+            owner_id = self._home_recovery_owner_id = uuid.uuid4().hex
         mode = str(mode)
         if mode not in self._HOME_MODES:
             return {"ok": False, "axis": self.axis, "failure": "unsupported_y_home_source_mode", "source_mode": mode}
@@ -731,6 +736,27 @@ class Serial206YProvider:
                     expected_software_interrupt_epoch=self._operation_interrupt_epoch.get(),
                 )
                 reference_published = bool(isinstance(reference, Mapping) and reference.get("ok") is True)
+        if (mode == "manual_panel" and source_home_ok and proof_ok and reference_published
+            and self.reference_store is not None and self.state_store is not None
+            and int(self.generation_provider()) == admitted_generation
+            and isinstance(reference, Mapping) and reference["board"]["active_board_epoch"] == board_authority.get("active_board_epoch")
+            and not self._operation_interrupted()):
+            from .services.reference_service import MarkAxisReferencedCommand
+            published = self.reference_store.mark_referenced(MarkAxisReferencedCommand(
+                axis="y", source="serial206.y.controller_verified_home", motion_kind="home"))
+            if (published.get("ok") is True and published.get("durable_clean") is True
+                and not self._operation_interrupted() and int(self.generation_provider()) == admitted_generation):
+                self.state_store.append_serial206_receipt("y", {
+                    "command_id": command_id, "intent": "manual_panel_home", "status": "completed",
+                    "recovery_home": {
+                        "owner_id": owner_id, "command_id": command_id,
+                        "ownership_generation": int(self.generation_provider()),
+                        "board_epoch_4": reference["board"]["active_board_epoch"],
+                        "started_at": started_at, "finished_at": time.time(),
+                        "reference_version": published["state_version"],
+                        "interrupt_epoch": self._operation_interrupt_epoch.get(),
+                    },
+                })
         return {
             "ok": source_home_ok,
             "schema": self.schema,
