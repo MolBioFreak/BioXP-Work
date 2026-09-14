@@ -1256,6 +1256,10 @@ class Serial206ProductionPrimitiveAdapter:
         events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=128) if required_axes else []
         evidence: dict[str, Any] = {}
         fresh_after: dict[str, int] = dict(after)
+        # Board lower clamps precede their exact-position return. Keep the
+        # caller's raw request; expected targets come from issue-time tickets,
+        # never from a later position observation.
+        effective_target = dict(receipt["requested"])
         for axis in required_axes:
             command = commands.get(axis)
             moved = isinstance(command, Mapping) and command.get("command_issued") is True
@@ -1296,7 +1300,11 @@ class Serial206ProductionPrimitiveAdapter:
                     for key in ("receive_owner", "owner_generation") if key in window
                 ))
             ) else []
-            position_delta = (position_value - receipt["requested"][axis]) if type(position_value) is int else None
+            target = command.get("target_position_steps") if isinstance(command, Mapping) else None
+            target_known = type(target) is int
+            if target_known:
+                effective_target[axis] = target
+            position_delta = (position_value - target) if target_known and type(position_value) is int else None
             if axis == "x":
                 position_ok = bool(
                     isinstance(position, Mapping)
@@ -1306,15 +1314,26 @@ class Serial206ProductionPrimitiveAdapter:
                     and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
                 )
             else:
-                position_ok = self._x_readback_verified(position, receipt["requested"][axis])
+                position_ok = target_known and self._x_readback_verified(position, target)
             speed_ok = bool(isinstance(speed, Mapping) and speed.get("ok") is True and self._x_tmcl_success(speed.get("ack")) and type(speed_value) is int and speed_value == 0)
-            event_ok = bool(not moved or (targets and not errors))
-            axis_ok = bool(command_ok and wait_ok and event_ok and speed_ok)
+            native = command.get("move") if isinstance(command, Mapping) else None
+            noop_verified = bool(
+                not moved and command_ok and target_known
+                and isinstance(native, Mapping) and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"
+                and native.get("command_sent") is False
+                and command.get("controller_command_acknowledged") is False
+                and self._x_readback_verified(native.get("before"), target)
+                and self._x_readback_verified(position, target) and speed_ok
+            )
+            event_ok = bool(moved and targets and not errors)
+            axis_ok = bool(noop_verified or (moved and command_ok and wait_ok and event_ok and speed_ok))
             if axis != "x":
                 axis_ok = bool(axis_ok and position_ok)
             evidence[axis] = {
                 "source_call_completed": command_ok,
-                "command_acknowledged": command_acknowledged,
+                "source_noop_verified": noop_verified,
+                "command_acknowledged": bool(moved and command_acknowledged),
                 "wait_accepted": wait_ok,
                 "source_wait_signaled": bool(isinstance(wait, Mapping) and wait.get("ok") is True),
                 "target_event_128_observed": bool(targets) if moved else False,
@@ -1327,7 +1346,11 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": axis_ok,
             }
         source_calls_completed = all(evidence[axis]["source_call_completed"] for axis in required_axes)
-        command_acknowledged = all(evidence[axis]["command_acknowledged"] for axis in required_axes)
+        command_acknowledged = any(evidence[axis]["command_acknowledged"] for axis in required_axes) and all(
+            evidence[axis]["command_acknowledged"] or evidence[axis]["source_noop_verified"]
+            for axis in required_axes
+        )
+        receipt["effective_target"] = effective_target
         terminal_ok = all(evidence[axis]["ok"] for axis in required_axes)
         target_ok = all(evidence[axis]["position_verified"] for axis in required_axes)
         restore_ok = all(isinstance(restore.get(axis), Mapping) and self._x_tmcl_success(restore[axis].get("ack")) for axis in ("x", "y"))
@@ -1335,6 +1358,10 @@ class Serial206ProductionPrimitiveAdapter:
         receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
         moved_axes = tuple(axis for axis in required_axes if isinstance(commands.get(axis), Mapping) and commands[axis].get("command_issued") is True)
         receipt["moved_axes"] = list(moved_axes)
+        if required_axes and all(evidence[axis]["source_noop_verified"] for axis in required_axes):
+            receipt.update(source_noop=True, source_noop_verified=True,
+                command_issued=False, physical_motion_commanded=False,
+                target_event_128_observed=False, physical_effect_verified=False)
         if ok and self.reference_store is not None and moved_axes:
             if len(moved_axes) == 1:
                 metadata = self.reference_store.record_motion(moved_axes[0], "move_xy")
@@ -2889,6 +2916,28 @@ class Serial206ProductionPrimitiveAdapter:
         """Normalize only explicit production ACK/terminal evidence for one child."""
         if not isinstance(result, Mapping):
             return {"command_required": True, "acknowledged": False, "terminal": False}
+        # The native Y provider retains board exact-noop evidence under result;
+        # it does not claim a motor ACK for its source-only completion.
+        native = result.get("result")
+        target = result.get("motor_effective_target")
+        source_noop_wrapper = (result.get("schema") == "bioxp.serial206_y_provider.v2"
+            and result.get("completion_class") == "oem_source_noop")
+        if result.get("source_mode") == "moveXY.near_axis.moveX":
+            native = result.get("move")
+            target = result.get("target_position_steps")
+            source_noop_wrapper = result.get("source_noop") is True
+        if (source_noop_wrapper and isinstance(native, Mapping)
+                and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"):
+            return {
+                "command_required": False,
+                "acknowledged": False,
+                "terminal": bool(result.get("ok") is True
+                    and native.get("short_circuit") == "current_position_equals_target"
+                    and native.get("command_sent") is False and native.get("ack") is None
+                    and type(target) is int
+                    and self._x_readback_verified(native.get("before"), target)),
+            }
         source_noop = result.get("source_noop") is True
         before = result.get("before")
         requested = result.get("effective_position", result.get("requested_position"))
@@ -2900,7 +2949,7 @@ class Serial206ProductionPrimitiveAdapter:
             and before.get("position") == requested
         )
         if source_noop and result.get("source_operation") == "ClassControlInterface.moveXY":
-            xy_requested = result.get("requested")
+            xy_requested = result.get("effective_target", result.get("requested"))
             after = result.get("after")
             noop_terminal = bool(
                 result.get("source_noop_verified") is True
@@ -3412,6 +3461,9 @@ class Serial206ProductionPrimitiveAdapter:
             "before": current,
             "pseudo_z_home": pseudo,
             "operations": _json_safe(results),
+            "effective_xy_target": next((dict(row.get("effective_target", row["requested"]))
+                for row in reversed(results) if isinstance(row, Mapping)
+                and row.get("source_operation") == "ClassControlInterface.moveXY"), None),
             "controller_child_evidence": _json_safe(child_evidence),
             "source_noop": controller_completion_verified and not commanded,
             "controller_command_acknowledged": controller_acknowledged,
@@ -3603,6 +3655,22 @@ class Serial206ProductionPrimitiveAdapter:
                 row["terminal"] and (row["acknowledged"] or not row["command_required"])
                 for row in child_evidence
             )
+            effective = dict(requested)
+            for axis, command in commands.items():
+                if isinstance(command, Mapping):
+                    effective[axis] = command.get("motor_effective_target", command.get("target_position_steps"))
+            receipt["effective_target"] = effective
+            if child_evidence and all(not row["command_required"] for row in child_evidence):
+                after_rows = {axis: self.tester.motor_get_position(board, motor=0)
+                              for axis, board in (("x", 5), ("y", 4))}
+                noop_verified = terminal and all(
+                    type(effective[axis]) is int
+                    and self._x_readback_verified(before_rows[axis], effective[axis])
+                    and self._x_readback_verified(after_rows[axis], effective[axis])
+                    for axis in ("x", "y")
+                )
+                receipt.update(source_noop=True, source_noop_verified=noop_verified,
+                    effective_target=effective, after={axis: self._x_value(row) for axis, row in after_rows.items()})
             receipt.update({
                 "ok": source_calls_completed,
                 "branch": "near_axis_sequential",
@@ -3618,7 +3686,7 @@ class Serial206ProductionPrimitiveAdapter:
                     isinstance(command, Mapping) and command.get("physical_motion_commanded") is True
                     for command in commands.values()
                 ),
-                "controller_command_acknowledged": all(
+                "controller_command_acknowledged": any(row["command_required"] for row in child_evidence) and all(
                     not isinstance(command, Mapping)
                     or command.get("command_issued") is not True
                     or command.get("controller_command_acknowledged") is True
@@ -10538,7 +10606,16 @@ class Serial206OemInitializationProvider:
         ok = isinstance(result, Mapping) and result.get("ok") is True
         source_noop = bool(ok and result.get("source_noop") is True
                            and result.get("controller_completion_verified") is True)
+        effective = result.get("effective_xy_target") if isinstance(result, Mapping) else None
+        effective = effective if isinstance(effective, Mapping) else {}
         return {
+            # Critical coordinate facts survive bounded nested diagnostics.
+            "raw_requested_x_steps": int(target.base_coordinates["x"]) + offset_x,
+            "raw_requested_y_steps": int(target.base_coordinates["y"]) + offset_y,
+            "oem_requested_x_steps": coordinates["x"],
+            "oem_requested_y_steps": coordinates["y"],
+            "oem_effective_x_steps": effective.get("x"),
+            "oem_effective_y_steps": effective.get("y"),
             "ok": ok,
             "source_noop": source_noop,
             "delivery_attempted": not source_noop,
