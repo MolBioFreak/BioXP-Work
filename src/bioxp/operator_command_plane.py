@@ -4617,6 +4617,31 @@ class OperatorCommandStore:
             "SELECT * FROM operator_plane_deck_stages WHERE command_id=? ORDER BY stage_order",
             (str(command_id),),
         ).fetchall()
+        # A process can stop after durable native stage completion but before
+        # final semantic publication. Project those motor facts without editing
+        # failed history or treating source-only ForceToHighHome as motor I/O.
+        motor_stages = [
+            (str(stage["terminal_state"]), _json_load(stage["terminal_evidence_json"], {}) or {})
+            for stage in stages
+            if str(stage["operation"]) not in {
+                "ForceToHighHome", "check_latch_status", "check_machine_latch_closed"
+            }
+        ]
+        stage_delivery = any(evidence.get("delivery_attempted") is True
+                             for _, evidence in motor_stages)
+        motor_facts = {"delivery_attempted": bool(row["delivery_attempted"]) or stage_delivery}
+        for fact in ("controller_command_acknowledged", "controller_completion_verified"):
+            # One completed child cannot attest a later planned/failed motor
+            # stage. A genuine source no-op adds no controller claim itself.
+            stage_proven = stage_delivery and all(
+                (fact == "controller_command_acknowledged" or state == "completed") and (
+                    evidence.get(fact) is True
+                    or (isinstance(evidence.get("provider_evidence"), Mapping)
+                        and evidence["provider_evidence"].get("source_noop") is True)
+                )
+                for state, evidence in motor_stages
+            )
+            motor_facts[fact] = bool(row[fact]) or stage_proven
         recovery_resolution = None
         resolution = self.connection.execute(
             "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
@@ -4643,9 +4668,7 @@ class OperatorCommandStore:
             "authority_snapshot_digest": str(row["authority_snapshot_digest"]),
             "complete_authority_digest": str(row["complete_authority_digest"]),
             "plan_digest": str(row["plan_digest"]), "source_anchors": _json_load(row["source_anchors_json"], []),
-            "delivery_attempted": bool(row["delivery_attempted"]),
-            "controller_command_acknowledged": bool(row["controller_command_acknowledged"]),
-            "controller_completion_verified": bool(row["controller_completion_verified"]),
+            **motor_facts,
             "hardware_postcondition_verified": bool(row["hardware_postcondition_verified"]),
             "semantic_state_committed": bool(row["semantic_state_committed"]),
             "physical_observation_verified": bool(row["physical_observation_verified"]),
