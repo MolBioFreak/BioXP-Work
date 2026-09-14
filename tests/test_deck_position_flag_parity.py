@@ -26,6 +26,10 @@ def rig(monkeypatch):
     monkeypatch.setattr(oem_machine_bundle, "_active_snapshot", snapshot)
     table = load_bound_oem_position_table()
     primitive = object.__new__(native.Serial206ProductionPrimitiveAdapter)
+    # H09 now requires actual primitive query evidence; the flag-only fixture
+    # supplies that hardware leaf rather than bypassing the provider predicate.
+    primitive.tester = SimpleNamespace(
+        motor_query_home_switch=lambda board, motor: {"reply_valid": True, "home": True})
     xyz = dict(x=1000, y=1000, z=70000)
     monkeypatch.setattr(primitive, "_read_axis_position", lambda axis: xyz[axis])
     provider = object.__new__(native.Serial206OemInitializationProvider)
