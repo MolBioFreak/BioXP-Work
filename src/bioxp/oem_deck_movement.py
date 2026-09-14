@@ -241,18 +241,22 @@ class DeckAuthoritySnapshot:
     current_x: int
     current_y: int
     current_z: int
-    current_location_id: str
-    current_well_id: int
+    current_location_id: str | None
+    current_well_id: int | None
     tip_loaded: bool
-    tip_dirty: bool
-    tip_location: int
-    clean_path: bool
+    tip_dirty: bool | None
+    tip_location: int | None
+    clean_path: bool | None
     plate_on_gantry: int | str | None
     pseudo_z_home: int
     device_type: str
     latch_status: bool
     machine_latch_closed: bool
     semantic_state_provenance_digest: str | None = None
+    dependency_scope: str = "full"
+    gripper_confirmed: bool | None = None
+    required_facts: tuple[str, ...] = ()
+    consumed_state_digest: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.captured_at) not in {int, float} or not math.isfinite(float(self.captured_at)):
@@ -262,7 +266,11 @@ class DeckAuthoritySnapshot:
         if set(self.safety_epochs) != {"global", "x", "y", "z"}:
             raise ValueError("safety epochs must contain global,x,y,z")
         # ClassPipetteCollection uses -1 for group/all-channel mode, even loaded.
-        if type(self.tip_location) is not int or self.tip_location not in {-1, 0, 1, 2, 3}:
+        if self.dependency_scope not in {"full", "offset.v1"}:
+            raise ValueError("unknown deck dependency scope")
+        if self.dependency_scope == "offset.v1" and (type(self.tip_loaded) is not bool or type(self.gripper_confirmed) is not bool):
+            raise ValueError("offset consumed predicates are not authoritative")
+        if not (self.dependency_scope == "offset.v1" and self.tip_location is None) and (type(self.tip_location) is not int or self.tip_location not in {-1, 0, 1, 2, 3}):
             raise ValueError("tip_location is outside the source domain")
         if len(self.position_table_sha256) != 64:
             raise ValueError("invalid PositionTable digest")
@@ -338,6 +346,8 @@ class DeckMovementPlan:
 
 def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, table: PositionTable, authority: DeckAuthoritySnapshot) -> DeckMovementPlan:
     destination = catalog.resolve(intent.target)
+    if destination.branch == "park" and authority.dependency_scope != "full":
+        raise ValueError("deck_dependency_scope_mismatch")
     if table.digest != authority.position_table_sha256 or table.digest != catalog.position_table_sha256:
         raise ValueError("position_table_authority_mismatch")
     if destination.branch in {"barcode", "park"} and intent.camera_offset:
@@ -1709,21 +1719,29 @@ def make_deck_command_executor(
         provider = provider_getter()
         if provider is None:
             raise RuntimeError("canonical_deck_provider_unavailable")
-        assert_current = getattr(command_store, "assert_deck_execution_current", None)
-        if not callable(assert_current):
+        store_assert_current = getattr(command_store, "assert_deck_execution_current", None)
+        if not callable(store_assert_current):
             raise RuntimeError("named_deck_durable_store_not_bound")
+        execution_authority: DeckAuthoritySnapshot | None = None
+        def assert_current(command_id: str, *, boundary: str) -> None:
+            store_assert_current(command_id, boundary=boundary)
+            observer = getattr(provider, "assert_deck_observation_current", None)
+            if execution_authority is not None and callable(observer):
+                observer(asdict(execution_authority))
         lease_factory = getattr(provider, "movement_lease", None)
         lease = lease_factory() if callable(lease_factory) else nullcontext()
         with lease:
             snapshot_fn = getattr(provider, "deck_authority_snapshot", None)
             if not callable(snapshot_fn):
                 raise RuntimeError("canonical_deck_authority_snapshot_unavailable")
-            dispatch_authority = DeckAuthoritySnapshot(**dict(
-                snapshot_fn(expected_generation=expected_ownership_generation)
-            ))
-            require_expected_board_epochs(dispatch_authority, phase="before_first_provider_write")
             table = position_table_provider()
             catalog = DeckCatalog.from_position_table(table)
+            catalog.resolve(target)
+            snapshot_arguments: dict[str, Any] = {"expected_generation": expected_ownership_generation}
+            if getattr(provider, "deck_scoped_authority_version", None) == 1:
+                snapshot_arguments["target"] = target
+            dispatch_authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
+            require_expected_board_epochs(dispatch_authority, phase="before_first_provider_write")
             plan = compile_named_location(
                 NamedLocationIntent(target=target, camera_offset=camera_offset),
                 catalog,
@@ -1816,19 +1834,19 @@ def make_deck_command_executor(
                 persist_pseudo(
                     command_id, 500, source_operation="ForceToHighHome", **stamps
                 )
-            authority = DeckAuthoritySnapshot(**dict(snapshot_fn(expected_generation=expected_ownership_generation)))
-            require_expected_board_epochs(authority, phase="planning")
+            if callable(terminalize_stage):
+                terminalize_stage(command_id, plan.steps[0], state="completed",
+                                  result=dict(force_result), reason="source_mutation_completed")
+            try:
+                authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
+                require_expected_board_epochs(authority, phase="planning")
+            except Exception as exc:
+                raise DeckExecutionFailure(str(exc), delivery_attempted=False,
+                                           provider_results=[dict(force_result)]) from exc
             if callable(terminalize_stage):
                 assert_current(
                     command_id,
                     boundary="before_terminalize_stage_0_ForceToHighHome",
-                )
-                terminalize_stage(
-                    command_id,
-                    plan.steps[0],
-                    state="completed",
-                    result=dict(force_result),
-                    reason="source_mutation_completed",
                 )
                 latch_predicates = {
                     "check_latch_status": authority.latch_status,
@@ -1876,12 +1894,13 @@ def make_deck_command_executor(
                         "physical_observation_verified": False,
                     },
                 }
-            revalidated = DeckAuthoritySnapshot(**dict(snapshot_fn(expected_generation=expected_ownership_generation)))
+            revalidated = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
             require_expected_board_epochs(revalidated, phase="before_first_movement_write")
             # Fresh time/sensor transaction evidence is not authority drift.
             # Preserve the full receipt digest and fence every owner/state field.
             if not _same_authority_after_resampling(authority, revalidated):
                 raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
+            execution_authority = revalidated
             results: list[Mapping[str, Any]] = []
             delivery_attempted = False
             record_delivery = getattr(command_store, "record_delivery_attempt", None)
@@ -1954,6 +1973,7 @@ def make_deck_command_executor(
                         delivery_attempted=False,
                     ) from exc
                 delivery_attempted = True
+                result = None
                 try:
                     result = method(
                         **dict(step.arguments or {}),
@@ -1968,16 +1988,21 @@ def make_deck_command_executor(
                 except Exception as exc:
                     try:
                         if callable(terminalize_stage):
-                            terminalize_stage(command_id, step, state="ambiguous", reason=f"provider_stage_exception:{type(exc).__name__}")
+                            terminalize_stage(command_id, step, state="ambiguous", result=result if isinstance(result, Mapping) else None, reason=f"provider_stage_exception:{type(exc).__name__}")
                     except Exception as persistence_exc:
                         raise DeckExecutionFailure(
                             f"stage_persistence_failed:{step.operation}:{type(persistence_exc).__name__}",
                             delivery_attempted=True,
                             provider_results=results,
                         ) from persistence_exc
+                    observed_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
                     raise DeckExecutionFailure(
                         f"provider_stage_exception:{step.operation}:{type(exc).__name__}",
                         delivery_attempted=True,
+                        controller_command_acknowledged=any(r.get("controller_command_acknowledged") is True for r in observed_results),
+                        controller_completion_verified=any(r.get("controller_completion_verified") is True for r in observed_results),
+                        hardware_postcondition_verified=any(r.get("hardware_postcondition_verified") is True for r in observed_results),
+                        provider_results=observed_results,
                     ) from exc
                 current_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
                 terminal_truth = bool(
@@ -2075,7 +2100,10 @@ def make_deck_command_executor(
                 commit = getattr(command_store, "commit_deck_success", None)
                 if callable(commit):
                     try:
-                        commit(command_id, plan, results)
+                        if getattr(provider, "deck_scoped_authority_version", None) == 1:
+                            commit(command_id, plan, results, expected_authority=asdict(revalidated))
+                        else:
+                            commit(command_id, plan, results)
                     except Exception as exc:
                         raise DeckExecutionFailure(
                             f"semantic_commit_failed:{type(exc).__name__}",

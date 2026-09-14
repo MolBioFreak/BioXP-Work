@@ -1954,6 +1954,11 @@ _ROUTE_FAILURE_MESSAGES = {
     "action_outcome_unknown": "Action outcome unknown; reconciliation required and retry forbidden",
 }
 _DECK_DIAGNOSTICS = {
+    "deck_bootstrap_semantic_location_unavailable", "deck_bootstrap_board_epochs_unavailable",
+    "deck_bootstrap_branch_state_unavailable", "deck_bootstrap_latch_or_tip_state_unavailable",
+    "deck_gripper_observation_not_authoritative", "deck_authority_changed_during_collection",
+    "deck_authority_changed_during_observation", "oem_host_latch_status_reader_not_bound",
+    "oem_host_latch_status_observation_failed",
     "source_authority_missing:deck_authority_cached_snapshot",
     "deck_authority_cache_unavailable", "deck_authority_cache_stale",
     "deck_semantic_state_reader_not_bound",
@@ -2264,7 +2269,9 @@ class _OperatorPollCache:
                     # this is not an admission token. Interrupts remain visible.
                     if elapsed >= 15.0:
                         for action in result.get("actions", []):
-                            if action.get("interrupt") is not True and action.get("safety_class") != "stop" and action.get("enabled") is True:
+                            if (action.get("interrupt") is not True and action.get("safety_class") != "stop"
+                                    and action.get("action_id") != "oem.deck.collect_authority"
+                                    and action.get("enabled") is True):
                                 action.update(enabled=False, disabled_reason="cached_projection_stale")
                                 for option in action.get("destination_options", []):
                                     option.update(enabled=False, disabled_reason="cached_projection_stale")
@@ -2471,7 +2478,7 @@ def install_operator_control_plane(
             nonlocal installed_deck_provider
             current_provider = oem_deck_provider()
             if current_provider is installed_deck_provider:
-                if current_provider is not None and not _PASSIVE_OPERATOR_POLL.get():
+                if current_provider is not None and not _PASSIVE_OPERATOR_POLL.get() and getattr(current_provider, "deck_scoped_authority_version", None) != 1:
                     refresh_deck_bootstrap(current_provider)
                 return current_provider
             previous_provider = installed_deck_provider
@@ -2495,7 +2502,7 @@ def install_operator_control_plane(
             if callable(tip_tray_publisher_binder):
                 tip_tray_publisher_binder(command_plane.store.publish_tip_tray_transition)
             installed_deck_provider = current_provider
-            if not _PASSIVE_OPERATOR_POLL.get():
+            if not _PASSIVE_OPERATOR_POLL.get() and getattr(current_provider, "deck_scoped_authority_version", None) != 1:
                 refresh_deck_bootstrap(current_provider)
             return current_provider
 
@@ -2578,7 +2585,7 @@ def install_operator_control_plane(
     app.state.operator_admission_state_reader = admission_state_reader
     app.state.operator_invoke_state_reader = invoke_state_reader
 
-    def deck_contract(state: Mapping[str, Any]) -> dict[str, Any]:
+    def deck_contract(state: Mapping[str, Any], *, target: str | None = None) -> dict[str, Any]:
         disabled_reason: str | None = None
         recovery_disabled_reason: str | None = None
         raw_maintenance = state.get("maintenance")
@@ -2632,62 +2639,72 @@ def install_operator_control_plane(
         table = None
         catalog = None
         snapshot = None
+        scope_reasons: dict[str, str | None] = {}
         if disabled_reason is None:
             try:
                 from .oem_deck_catalog import DeckCatalog
                 table = oem_deck_position_table_provider()  # type: ignore[misc]
                 catalog = DeckCatalog.from_position_table(table)
-                reader_name = "deck_authority_cached_snapshot" if _PASSIVE_OPERATOR_POLL.get() else "deck_authority_snapshot"
-                snapshot_reader = getattr(provider, reader_name, None)
-                if not callable(snapshot_reader):
-                    raise RuntimeError("source_authority_missing:deck_authority_cached_snapshot")
-                snapshot = snapshot_reader(
-                    expected_generation=int(state.get("ownership_generation") or 0)
-                )
-                if not isinstance(snapshot, Mapping):
-                    raise RuntimeError("deck_authority_snapshot_malformed")
-                if snapshot.get("latch_status") is not True or snapshot.get("machine_latch_closed") is not True:
-                    # Same two source predicates as compile_named_location; no new gate.
-                    disabled_reason = "latch_not_closed"
-                if _PASSIVE_OPERATOR_POLL.get() and isinstance(snapshot, Mapping):
-                    # Compare existing owner projections, not fresh device queries.
-                    # An external owner change must not inherit a 15s ready cache.
-                    refs = state.get("references") or {}
-                    rows = refs.get("rows") or {}
-                    real_semantic_authority = snapshot.get("semantic_state_provenance_digest") is not None
-                    changed = any(
-                        (axis not in rows and real_semantic_authority) or (
-                            axis in rows and (
-                                rows[axis].get("state") != "referenced"
-                                or rows[axis].get("state_version") != version
-                            )
-                        )
-                        for axis, version in (snapshot.get("reference_versions") or {}).items()
-                    )
-                    initialization = state.get("serial206_initialization_provider") or {}
-                    for key, owner in (("board_epoch_4", "board4_authority"), ("board_epoch_5", "x_authority")):
-                        epoch = (initialization.get(owner) or {}).get("active_board_epoch")
-                        changed = changed or (epoch is None and real_semantic_authority) or (epoch is not None and epoch != snapshot.get(key))
-                    if snapshot.get("semantic_state_provenance_digest") is not None:
-                        semantic = command_plane.store.deck_semantic_state()
-                        changed = changed or (
-                            semantic.get("semantic_state_revision") != snapshot.get("machine_state_revision")
-                            or hashlib.sha256(json.dumps(
-                                semantic.get("transition_provenance"), sort_keys=True, separators=(",", ":")
-                            ).encode("utf-8")).hexdigest() != snapshot.get("semantic_state_provenance_digest")
-                        )
-                    if changed:
-                        invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
-                        if callable(invalidate):
-                            invalidate(reason="external_owner_projection_changed")
-                        raise RuntimeError("deck_authority_cache_unavailable")
             except Exception as exc:
                 disabled_reason = _deck_authority_diagnostic(exc)
-                diagnostic_reader = getattr(provider, "deck_semantic_bootstrap_diagnostic", None)
-                if str(exc) == "deck_authority_cache_unavailable" and callable(diagnostic_reader):
-                    diagnostic = diagnostic_reader()  # cached host result, no I/O
-                    if isinstance(diagnostic, Mapping) and diagnostic.get("status") == "blocked":
-                        disabled_reason = _deck_authority_diagnostic(RuntimeError(str(diagnostic.get("reason"))))
+        if disabled_reason is None:
+            scoped = getattr(provider, "deck_scoped_authority_version", None) == 1
+            available_snapshot = None
+            scope_targets = (("full", "LOC_PARK"), ("offset.v1", "LOC_MS"))
+            if target is not None:
+                destination = catalog.resolve(target)
+                scope_targets = (("full" if destination.branch == "park" else "offset.v1", target),)
+            for scope, sample_target in scope_targets:
+                try:
+                    reader_name = "deck_authority_cached_snapshot" if _PASSIVE_OPERATOR_POLL.get() else "deck_authority_snapshot"
+                    snapshot_reader = getattr(provider, reader_name, None)
+                    if not callable(snapshot_reader):
+                        raise RuntimeError("source_authority_missing:deck_authority_cached_snapshot")
+                    arguments = {"expected_generation": int(state.get("ownership_generation") or 0)}
+                    if scoped:
+                        arguments["target"] = sample_target
+                    snapshot = snapshot_reader(**arguments)
+                    if not isinstance(snapshot, Mapping):
+                        raise RuntimeError("deck_authority_snapshot_malformed")
+                    scope_reasons[scope] = None if snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True else "latch_not_closed"
+                    if _PASSIVE_OPERATOR_POLL.get() and isinstance(snapshot, Mapping):
+                        # Compare existing owner projections, not fresh device queries.
+                        # An external owner change must not inherit a 15s ready cache.
+                        refs = state.get("references") or {}
+                        rows = refs.get("rows") or {}
+                        real_semantic_authority = snapshot.get("semantic_state_provenance_digest") is not None
+                        changed = any(
+                            (axis not in rows and real_semantic_authority) or (
+                                axis in rows and (
+                                    rows[axis].get("state") != "referenced"
+                                    or rows[axis].get("state_version") != version
+                                )
+                            )
+                            for axis, version in (snapshot.get("reference_versions") or {}).items()
+                        )
+                        initialization = state.get("serial206_initialization_provider") or {}
+                        for key, owner in (("board_epoch_4", "board4_authority"), ("board_epoch_5", "x_authority")):
+                            epoch = (initialization.get(owner) or {}).get("active_board_epoch")
+                            changed = changed or (epoch is None and real_semantic_authority) or (epoch is not None and epoch != snapshot.get(key))
+                        if snapshot.get("semantic_state_provenance_digest") is not None:
+                            semantic = command_plane.store.deck_semantic_state()
+                            changed = changed or (
+                                semantic.get("semantic_state_revision") != snapshot.get("machine_state_revision")
+                                or hashlib.sha256(json.dumps(
+                                    semantic.get("transition_provenance"), sort_keys=True, separators=(",", ":")
+                                ).encode("utf-8")).hexdigest() != snapshot.get("semantic_state_provenance_digest")
+                            )
+                        if changed:
+                            invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
+                            if callable(invalidate):
+                                invalidate(reason="external_owner_projection_changed")
+                            raise RuntimeError("deck_authority_cache_unavailable")
+                    available_snapshot = available_snapshot or snapshot
+                except Exception as exc:
+                    scope_reasons[scope] = _deck_authority_diagnostic(exc)
+            snapshot = available_snapshot
+            if all(reason is not None for reason in scope_reasons.values()):
+                disabled_reason = next(iter(scope_reasons.values()))
         options = []
         if catalog is not None:
             source_anchor_by_branch = {
@@ -2709,8 +2726,10 @@ def install_operator_control_plane(
             ]
         disabled_reason = recovery_disabled_reason or disabled_reason
         options = [
-            {**row, "enabled": disabled_reason is None, "disabled_reason": disabled_reason}
+            {**row, "enabled": reason is None, "disabled_reason": reason}
             for row in options
+            for reason in [recovery_disabled_reason or scope_reasons.get(
+                "full" if row["branch_kind"] == "park" else "offset.v1", disabled_reason)]
         ]
         board_epochs = (
             {"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
@@ -3171,7 +3190,10 @@ def install_operator_control_plane(
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
             state = await admission_state_reader.read()
-            assessment = deck_contract(state)
+            assessment = deck_contract(state, target=payload.inputs.get("target"))
+            selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
+            if selected is None or selected["enabled"] is not True:
+                assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
             if not assessment["enabled"]:
                 raise HTTPException(
                     status_code=409,

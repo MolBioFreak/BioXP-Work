@@ -1491,6 +1491,18 @@ class OperatorCommandStore:
             deterministic=True,
         )
         self.connection.create_function("canonical_json", 1, canonical_json_text, deterministic=True)
+        def deck_owner_authority_current(generation, board4, board5):
+            reader = self._deck_owner_authority_reader
+            if not callable(reader):
+                return 0
+            try:
+                current = reader()
+                return int(isinstance(current, Mapping) and all(
+                    type(current.get(key)) is int and current[key] == value
+                    for key, value in (("ownership_generation", generation), ("board_epoch_4", board4), ("board_epoch_5", board5))))
+            except Exception:
+                return 0
+        self.connection.create_function("deck_owner_authority_current", 3, deck_owner_authority_current)
         self.connection.create_function(
             "authority_write_allowed", 0, lambda: 1 if self._authority_write_depth > 0 else 0
         )
@@ -3790,22 +3802,24 @@ class OperatorCommandStore:
             lane = conn.execute("SELECT owner_id,owner_lease_until FROM operator_plane_lane WHERE singleton=1").fetchone()
             if command is None or not command["dispatch_attempt_id"] or lane is None or lane["owner_id"] != self.owner_id or float(lane["owner_lease_until"] or 0) <= _now():
                 raise RuntimeError("delivery attempt dispatch authority is stale")
-            supplied = dict(authority_stamps or {
-                "ownership_generation": int(command["ownership_generation"]),
-                "board_epoch_4": int(command["board_epoch_4"]),
-                "board_epoch_5": int(command["board_epoch_5"]),
-            })
+            reader = self._deck_owner_authority_reader
+            if not callable(reader):
+                raise RuntimeError("deck_execution_owner_authority_not_bound")
+            current_stamps = reader()
+            if not isinstance(current_stamps, Mapping):
+                raise RuntimeError("deck_execution_owner_authority_not_bound")
+            supplied = dict(authority_stamps or current_stamps)
+            self._validate_deck_owner_authority(**supplied)
             generation = int(supplied.get("ownership_generation", -1))
             if generation != int(command["ownership_generation"]):
                 raise RuntimeError("delivery attempt ownership generation mismatch")
             expected_epochs = _json_load(command["expected_board_epochs_json"], {})
             if (
-                int(supplied.get("board_epoch_4", -1)) != int(command["board_epoch_4"])
-                or int(supplied.get("board_epoch_5", -1)) != int(command["board_epoch_5"])
-                or expected_epochs != {
-                    "4": int(command["board_epoch_4"]),
-                    "5": int(command["board_epoch_5"]),
+                expected_epochs != {
+                    "4": supplied.get("board_epoch_4"),
+                    "5": supplied.get("board_epoch_5"),
                 }
+                or any(type(supplied.get(key)) is not int for key in ("board_epoch_4", "board_epoch_5"))
             ):
                 raise RuntimeError("delivery attempt board epoch mismatch")
             row = conn.execute("INSERT INTO operator_plane_delivery_attempts(command_id,work_kind,work_identity,dispatch_attempt_id,plan_digest,owner_id,ownership_generation,board_epoch_4,board_epoch_5,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING attempt_sequence", (str(command_id), str(work_kind), str(work_identity), str(command["dispatch_attempt_id"]), str(plan_digest), self.owner_id, generation, int(supplied["board_epoch_4"]), int(supplied["board_epoch_5"]), _now())).fetchone()
@@ -4448,11 +4462,15 @@ class OperatorCommandStore:
         """Literal ClassMachineStatus.updateLocation tray mapping (lines 565-653)."""
         loc = str(location).upper()
         movable = {str(key).upper(): str(value).upper() for key, value in movable_plate_locations.items()}
+        if not isinstance(movable_plate_locations.get("POOL_PLATE"), str):
+            return None
         pool = movable.get("POOL_PLATE")
         output = movable.get("OUTPUT_PLATE")
         reagent = movable.get("REAGENT_PLATE")
         if loc == pool or (pool == "LOC_P_TC" and loc == "LOC_TC") or (pool == "LOC_P_MS" and loc == "LOC_MS"):
             return "POOL_PLATE"
+        if not isinstance(movable_plate_locations.get("OUTPUT_PLATE"), str):
+            return None
         if (
             loc == output
             or (output == "LOC_P_TC" and loc == "LOC_TC")
@@ -4460,16 +4478,24 @@ class OperatorCommandStore:
             or (output == "LOC_P_MS" and loc == "LOC_MS")
         ):
             return "OUTPUT_PLATE"
+        if not isinstance(movable_plate_locations.get("REAGENT_PLATE"), str) and loc != "LOC_RC":
+            return None
         if loc == reagent or loc == "LOC_RC":
             return "REAGENT_PLATE"
         if loc in {"TECANRACK1", "TECANRACK2", "TECANRACK3", "TECANRACK4"}:
             return "TIP_TRAY"
         if loc == "LOC_TIP_HOTEL":
             return "TIP_HOTEL"
+        if not isinstance(movable_plate_locations.get("REAGENT_COVER"), str) and loc not in {"LOC_RC_COVER", "LOC_RC_COVER_STORAGE"}:
+            return None
         if loc == movable.get("REAGENT_COVER") or loc in {"LOC_RC_COVER", "LOC_RC_COVER_STORAGE"}:
             return "REAGENT_COVER"
+        if not isinstance(movable_plate_locations.get("OUTPUT_COVER"), str) and loc not in {"LOC_OC_COVER", "LOC_OC_COVER_STORAGE"}:
+            return None
         if loc == movable.get("OUTPUT_COVER") or loc in {"LOC_OC_COVER", "LOC_OC_COVER_STORAGE"}:
             return "OUTPUT_COVER"
+        if not isinstance(movable_plate_locations.get("BIO_SECURITY_COVER"), str):
+            return None
         if loc == movable.get("BIO_SECURITY_COVER"):
             return "BIO_SECURITY_COVER"
         return {
@@ -4477,7 +4503,7 @@ class OperatorCommandStore:
             "LOC_STRIP3": "STRIP_THREE", "LOC_STRIP4": "STRIP_FOUR",
         }.get(loc, current_tray)
 
-    def commit_deck_success(self, command_id: str, plan: Any, results: list[Mapping[str, Any]]) -> None:
+    def commit_deck_success(self, command_id: str, plan: Any, results: list[Mapping[str, Any]], *, expected_authority: Mapping[str, Any] | None = None) -> None:
         if not results or any(
             row.get("source_noop") is not True
             and row.get("controller_completion_verified") is not True
@@ -4485,6 +4511,14 @@ class OperatorCommandStore:
         ):
             raise ValueError("deck semantic state requires verified controller completion")
         with self._transaction() as conn:
+            if expected_authority is not None:
+                self.assert_deck_execution_current(command_id, boundary="atomic_semantic_commit")
+                semantic = self.deck_semantic_state()
+                digest = hashlib.sha256(_canonical(semantic["transition_provenance"]).encode()).hexdigest()
+                if (semantic["ambiguity_state"] != "none"
+                        or semantic["semantic_state_revision"] != expected_authority["machine_state_revision"]
+                        or digest != expected_authority["semantic_state_provenance_digest"]):
+                    raise RuntimeError("deck_semantic_authority_changed_before_commit")
             result_index = 0
             for step in plan.steps:
                 result = None
@@ -4511,6 +4545,13 @@ class OperatorCommandStore:
                 "target": str(plan.target), "current_location": canonical_location,
                 "current_well": int(plan.semantic_transition["current_well_id"]),
                 "current_tray": current_tray,
+                "current_tray_association": (
+                    "unavailable" if self._oem_update_location_current_tray(
+                        canonical_location, _json_load(current[1], {}), "__source_no_match__") is None
+                    else "no_match" if self._oem_update_location_current_tray(
+                        canonical_location, _json_load(current[1], {}), "__source_no_match__") == "__source_no_match__"
+                    else "matched"
+                ),
                 "before_revision": before, "after_revision": after,
                 "ownership_generation": int(plan.semantic_transition["ownership_generation"]),
                 "board_epoch_by_board": {
@@ -6451,10 +6492,16 @@ class OperatorCommandStore:
         if self.action_fenced(str(row["action_id"])):
             raise RuntimeError("deck_execution_interrupt_fence_active")
         expected = _json_load(row["expected_board_epochs_json"], {})
-        observed = {"4": int(row["board_epoch_4"]), "5": int(row["board_epoch_5"])}
-        if expected != observed:
+        reader = self._deck_owner_authority_reader
+        if not callable(reader):
+            raise RuntimeError("deck_execution_owner_authority_not_bound")
+        stamps = reader()
+        if not isinstance(stamps, Mapping):
+            raise RuntimeError("deck_execution_owner_authority_not_bound")
+        observed = {"4": stamps.get("board_epoch_4"), "5": stamps.get("board_epoch_5")}
+        if expected != observed or any(type(value) is not int for value in observed.values()):
             raise RuntimeError("deck_execution_board_epoch_changed")
-        if int(row["ownership_generation"]) != int(row["current_ownership"]):
+        if row["ownership_generation"] != stamps.get("ownership_generation"):
             raise RuntimeError("deck_execution_ownership_generation_changed")
 
     def queue_pending_interrupt_reconciliation(self, record: Mapping[str, Any]) -> None:
@@ -6952,7 +6999,7 @@ class OperatorCommandPlane:
             try:
                 deck_assessment = getattr(self.app.state, "oem_deck_command_assessment", None)
                 assessment = (
-                    deck_assessment(state)
+                    deck_assessment(state, target=requested.get("target"))
                     if action_id == "oem.deck.move_to_location" and callable(deck_assessment)
                     else self._current_assessment(action_id, requested, state)
                 )
@@ -6961,6 +7008,10 @@ class OperatorCommandPlane:
                         status_code=503,
                         detail={"error": "action_assessment_authority_unavailable", "action_id": action_id},
                     )
+                if action_id == "oem.deck.move_to_location" and "destination_options" in assessment:
+                    selected = next((row for row in assessment["destination_options"] if row["target"] == requested.get("target")), None)
+                    if selected is None or selected.get("enabled") is not True:
+                        assessment = {**assessment, "enabled": False, "disabled_reason": selected.get("disabled_reason") if selected else "unknown_target"}
                 self._require_enabled_assessment(action_id, assessment)
             except HTTPException as exc:
                 detail = (

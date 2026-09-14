@@ -72,6 +72,7 @@ OEM_DECK_SCHEMA_VERSION = 6
 OEM_DECK_GROUP_SCHEMA_VERSION = 7
 
 from . import oem_deck_schema_v7 as _deck_v7
+from . import oem_deck_schema_v8 as _deck_v8
 _ACCEPTED_LEGACY_SERIAL206_MIGRATION_DIGESTS = frozenset({
     "dc1dd8a9f051a4a30f745d396c94bd445ea06358c00e9a150ade553602d0255c",
 })
@@ -106,6 +107,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     5: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     6: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     7: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
+    8: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2662,6 +2664,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         operator_command_plane_migration_identity(),
         oem_deck_schema_v6_migration_identity(),
         oem_deck_schema_v7_migration_identity(),
+        _deck_v8.migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -2988,7 +2991,7 @@ def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
     return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
-def canonical_runtime_schema_manifest(*, version: int = OEM_DECK_GROUP_SCHEMA_VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = _deck_v8.VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3022,6 +3025,8 @@ def canonical_runtime_schema_manifest(*, version: int = OEM_DECK_GROUP_SCHEMA_VE
         apply_deck_schema_v6(expected)
         if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
             _deck_v7.apply_deck_schema_v7(expected)
+        if version >= _deck_v8.VERSION:
+            _deck_v8.apply(expected)
         _reinstall_operator_global_triggers(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
@@ -3039,7 +3044,7 @@ def canonical_runtime_schema_manifest(*, version: int = OEM_DECK_GROUP_SCHEMA_VE
 
 
 def verify_canonical_runtime_database(
-    connection: sqlite3.Connection, *, version: int = OEM_DECK_GROUP_SCHEMA_VERSION,
+    connection: sqlite3.Connection, *, version: int | None = None,
     full_data_check: bool = False,
 ) -> None:
     """Check the prepared schema without scanning retained event/history rows.
@@ -3048,7 +3053,8 @@ def verify_canonical_runtime_database(
     constructor/startup prerequisite. Foreign-key enforcement remains enabled
     on writes; the schema/ledger/identity checks below are metadata-bounded.
     """
-    registry = tuple(item for item in canonical_runtime_migration_registry() if item.version <= version)
+    selected_version = int(connection.execute("PRAGMA user_version").fetchone()[0]) if version is None else version
+    registry = tuple(item for item in canonical_runtime_migration_registry() if item.version <= selected_version)
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version != registry[-1].version:
         raise RuntimeError(f"canonical runtime schema is not prepared (found {version})")
@@ -3063,7 +3069,9 @@ def verify_canonical_runtime_database(
     _verify_runtime_release_start(connection)
     if full_data_check:
         _verify_operator_command_plane_schema_v1(connection)
-        if version >= OEM_DECK_GROUP_SCHEMA_VERSION:
+        if version >= _deck_v8.VERSION:
+            _deck_v8.verify(connection)
+        elif version >= OEM_DECK_GROUP_SCHEMA_VERSION:
             _deck_v7.verify_deck_schema_v7(connection)
         else:
             verify_deck_schema_v6(connection)
@@ -3531,7 +3539,7 @@ def _migrate_oem_deck_schema_v7_locked(
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_GROUP_SCHEMA_VERSION:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _deck_v8.VERSION:
         # An already-prepared database needs no migration, lifecycle-exclusive
         # lock, or data audit. Its size must not determine service startup time.
         verify_canonical_runtime_database(connection)
@@ -3656,6 +3664,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
         _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
         _migrate_oem_deck_schema_v7(connection, selected_root, registry[6])
+        _deck_v8.migrate(connection, selected_root, registry[7])
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3786,6 +3795,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_operator_command_plane_schema_v1(connection, selected_root, registry[4])
         _migrate_oem_deck_schema_v6(connection, selected_root, registry[5])
         _migrate_oem_deck_schema_v7(connection, selected_root, registry[6])
+        _deck_v8.migrate(connection, selected_root, registry[7])
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
@@ -3869,7 +3879,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == OEM_DECK_GROUP_SCHEMA_VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _deck_v8.VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():

@@ -4093,6 +4093,7 @@ class Serial206ProductionPrimitiveAdapter:
         tip_dirty: bool,
         timeout_s: float,
         pseudo_home_steps: int = 65000,
+        gripper_confirmed: bool = False,
         plate_on_gantry: int | str | None = None,
         location19_y: int | None = None,
     ) -> dict[str, Any]:
@@ -4116,7 +4117,7 @@ class Serial206ProductionPrimitiveAdapter:
             tip_location=-1,
             clean_path=False,
             device_type="BIOXP",
-            gripper_confirmed=False,
+            gripper_confirmed=gripper_confirmed,
             pseudo_z_home=int(pseudo_home_steps),
             plate_on_gantry=plate_on_gantry,
             location19_y=location19_y,
@@ -4173,8 +4174,13 @@ class Serial206ProductionPrimitiveAdapter:
         clean_path: bool,
         pseudo_home_steps: int,
         plate_on_gantry: int | str | None,
+        gripper_confirmed: bool | None = None,
         location19_y: int | None = None,
     ) -> dict[str, Any]:
+        observed_gripper = Serial206OemInitializationProvider._observed_gripper_confirmation(self.tester)
+        if gripper_confirmed is not None and gripper_confirmed is not observed_gripper:
+            raise RuntimeError("scriptmoveTo_gripper_authority_changed")
+        gripper_confirmed = observed_gripper
         table = load_bound_oem_position_table()
         parity = load_oem_parity_config(None)
         if parity.blockers:
@@ -4190,7 +4196,7 @@ class Serial206ProductionPrimitiveAdapter:
             tip_location=int(tip_location),
             clean_path=bool(clean_path),
             device_type="BIOXP",
-            gripper_confirmed=False,
+            gripper_confirmed=gripper_confirmed,
             pseudo_z_home=int(pseudo_home_steps),
             plate_on_gantry=plate_on_gantry,
             location19_y=location19_y,
@@ -4750,6 +4756,102 @@ class Serial206OemInitializationProvider:
             "source_command_id": f"legacy-runtime-state:{predecessor_digest}",
         })
         return predecessor
+
+    deck_scoped_authority_version = 1
+
+    @staticmethod
+    def _deck_dependency_scope(target: str | None) -> str:
+        if target is None:
+            return "full"
+        from .oem_deck_catalog import DeckCatalog
+        destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(target)
+        return "full" if destination.branch == "park" else "offset.v1"
+
+    def _deck_gripper_confirmed(self) -> bool:
+        return self._observed_gripper_confirmation(getattr(self.primitives, "tester", None))
+
+    @staticmethod
+    def _observed_gripper_confirmation(tester: Any) -> bool:
+        """O-CCI2736-2747; observations, never reference tokens or writes."""
+        query = getattr(tester, "motor_query_home_switch", None)
+        if not callable(query):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        home = query(4, motor=2)
+        if (not isinstance(home, Mapping) or home.get("reply_valid") is not True
+                or type(home.get("home")) is not bool):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        if home["home"]:
+            return True
+        position_reader = getattr(tester, "motor_get_position", None)
+        position = position_reader(4, motor=2) if callable(position_reader) else None
+        ack = position.get("ack") if isinstance(position, Mapping) else None
+        if (not isinstance(position, Mapping) or position.get("ok") is not True
+                or type(position.get("position")) is not int
+                or not isinstance(ack, Mapping) or ack.get("status") != 100
+                or type(ack.get("value")) is not int):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        return position["position"] < 50
+
+    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool) -> dict[str, Any]:
+        """Read only facts consumed by the offset overload; no bootstrap writes.
+
+        The retained machine object remains its source owner for facts that have
+        not yet been published to the canonical row. This projection neither
+        reconstructs that object nor treats revision>0 as completeness.
+        """
+        reader = self._deck_semantic_state_reader
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        raw = reader()
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+        semantic = dict(raw)
+        revision = semantic.get("semantic_state_revision")
+        if type(revision) is not int or revision < 0:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
+        if semantic.get("ambiguity_state") != "none":
+            raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+        provenance = semantic.get("transition_provenance")
+        if not isinstance(provenance, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:provenance")
+        if revision and (not provenance.get("source_operation") or not provenance.get("command_id")
+                or semantic.get("producer_operation") != provenance.get("source_operation")
+                or semantic.get("producer_command_id") != provenance.get("command_id")):
+            raise RuntimeError("deck_semantic_state_not_authoritative:producer_provenance")
+        with self._lock:
+            machine = dict(self._load_state().get("machine_status") or {})
+        sources = {}
+        for field, legacy_key in (("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps")):
+            sources[field] = "canonical"
+            if semantic.get(field) is None:
+                semantic[field] = machine.get(legacy_key)
+                sources[field] = "retained_machine_status"
+        if type(semantic.get("tip_loaded")) is not bool:
+            raise RuntimeError("deck_semantic_state_not_authoritative:tip_loaded")
+        if type(semantic.get("pseudo_z_home")) is not int or semantic["pseudo_z_home"] not in {500, 65000}:
+            raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
+        required = ["tip_loaded", "pseudo_z_home"]
+        # Confirmed/no-tip moveXY never reads PlateOnGantry. Other routes do.
+        if not (gripper_confirmed and semantic["tip_loaded"] is False):
+            required.append("plate_on_gantry")
+            if semantic.get("plate_on_gantry") is None:
+                if "plate_on_gantry" not in machine:
+                    raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry")
+                semantic["plate_on_gantry"] = machine["plate_on_gantry"]
+                sources["plate_on_gantry"] = "retained_machine_status"
+            else:
+                sources["plate_on_gantry"] = "canonical"
+            try:
+                semantic["plate_on_gantry"] = canonical_plate_name(semantic["plate_on_gantry"])
+            except ValueError as exc:
+                raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry") from exc
+        semantic["required_facts"] = tuple(required)
+        semantic["consumed_state_digest"] = hashlib.sha256(json.dumps(
+            {key: {"value": semantic[key], "owner": sources.get(key, "canonical")} for key in required},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        semantic["transition_provenance_digest"] = hashlib.sha256(json.dumps(
+            dict(provenance), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return semantic
 
     def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False) -> dict[str, Any]:
         reader = self._deck_semantic_state_reader
@@ -7957,9 +8059,10 @@ class Serial206OemInitializationProvider:
         """Owner-event hook: no hardware, SQLite, or motion-held mutex."""
         self._deck_authority_cache_epoch = object()
         self._deck_authority_cache = None
+        self._deck_authority_scoped_cache = {}
         self._deck_authority_cache_reason = str(reason)
 
-    def deck_authority_cached_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+    def deck_authority_cached_snapshot(self, *, expected_generation: int, target: str | None = None) -> dict[str, Any]:
         """Passive availability projection of an actual successful active sample.
 
         The existing operator freshness window is 15 seconds, not a controller
@@ -7967,12 +8070,17 @@ class Serial206OemInitializationProvider:
         execution must still use deck_authority_snapshot under its admission lease.
         External reference/board/semantic owners must invalidate on mutations.
         """
-        cached = getattr(self, "_deck_authority_cache", None)
+        scope = self._deck_dependency_scope(target)
+        cached = getattr(self, "_deck_authority_scoped_cache", {}).get(scope)
         if cached is None:
             raise RuntimeError("deck_authority_cache_unavailable")
         sampled_at, epoch, snapshot = cached
         if epoch is not getattr(self, "_deck_authority_cache_epoch", None):
             raise RuntimeError("deck_authority_cache_unavailable")
+        if isinstance(snapshot, Exception):
+            if time.monotonic() - sampled_at >= 15.0:
+                raise RuntimeError("deck_authority_cache_stale")
+            raise snapshot
         if snapshot["ownership_generation"] != expected_generation:
             raise RuntimeError("ownership_generation_changed")
         if time.monotonic() - sampled_at >= 15.0:
@@ -7980,10 +8088,28 @@ class Serial206OemInitializationProvider:
         return copy.deepcopy(snapshot)
 
     def deck_authority_snapshot(
-        self, *, expected_generation: int, _allow_recovery: bool = False
+        self, *, expected_generation: int, _allow_recovery: bool = False, target: str | None = None
     ) -> dict[str, Any]:
-        """Return one complete current-generation named-movement authority snapshot."""
-        self.invalidate_deck_authority_cache(reason="active_snapshot_pending")
+        scope = self._deck_dependency_scope(target)
+        if not hasattr(self, "_deck_authority_cache_epoch"):
+            self.invalidate_deck_authority_cache(reason="first_collection")
+        epoch = self._deck_authority_cache_epoch
+        started = time.monotonic()
+        try:
+            result = self._collect_deck_authority(
+                expected_generation=expected_generation, _allow_recovery=_allow_recovery, scope=scope)
+        except Exception as exc:
+            if not _allow_recovery and epoch is self._deck_authority_cache_epoch:
+                self._deck_authority_scoped_cache[scope] = (started, epoch, exc)
+            raise
+        if not _allow_recovery:
+            self._deck_authority_scoped_cache[scope] = (started, self._deck_authority_cache_epoch, copy.deepcopy(result))
+        return result
+
+    def _collect_deck_authority(
+        self, *, expected_generation: int, _allow_recovery: bool, scope: str
+    ) -> dict[str, Any]:
+        """Explicit active sample; a finite target selects dependencies, not fences."""
         cache_epoch = self._deck_authority_cache_epoch
         sample_started = time.monotonic()
         captured_at = time.time()
@@ -7993,20 +8119,18 @@ class Serial206OemInitializationProvider:
         initial_latch = None
         reader = self._deck_semantic_state_reader
         current = reader() if callable(reader) else {}
-        if current.get("semantic_state_revision") == 0:
-            with self._lock:
-                constructed = bool((self._load_state().get("machine_status") or {}).get("construction_id"))
-            if constructed:
-                # This is the explicit active collection, not a passive GET or
-                # constructor. Use the real observation once; never synthesize
-                # host/sensor latch values to publish software defaults.
-                initial_latch = self._fresh_deck_latch_observation()
-                if cache_epoch is not self._deck_authority_cache_epoch:
-                    raise RuntimeError("deck_authority_changed_during_collection")
-                self.refresh_deck_semantic_bootstrap(
-                    expected_generation=expected_generation, latch_observation=initial_latch)
-        semantic = self._canonical_deck_semantic_state(allow_recovery=_allow_recovery)
-        clean_path = self._clean_path_from_tip_tray_authority(
+        if scope == "full" and current.get("semantic_state_revision") == 0 and current.get("ambiguity_state") == "none":
+            initial_latch = self._fresh_deck_latch_observation()
+            if cache_epoch is not self._deck_authority_cache_epoch:
+                raise RuntimeError("deck_authority_changed_during_collection")
+            self.refresh_deck_semantic_bootstrap(
+                expected_generation=expected_generation, latch_observation=initial_latch)
+            # Eligible bootstrap is itself an owner mutation; bind the new epoch.
+            cache_epoch = self._deck_authority_cache_epoch
+        gripper_confirmed = self._deck_gripper_confirmed()
+        semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
+                    if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
+        clean_path = None if scope == "offset.v1" else self._clean_path_from_tip_tray_authority(
             ownership_generation=int(semantic["ownership_generation"]),
             board_epoch_4=int(semantic["board_epoch_4"]),
             board_epoch_5=int(semantic["board_epoch_5"]),
@@ -8047,10 +8171,10 @@ class Serial206OemInitializationProvider:
         if any(type(value) is not int for value in coordinates.values()):
             raise RuntimeError("deck_controller_positions_not_authoritative")
         latch = initial_latch if initial_latch is not None else self._fresh_deck_latch_observation()
-        if (
-            int(semantic["ownership_generation"]) != observed_generation
-            or int(semantic["board_epoch_4"]) != int(board_epoch_4)
-            or int(semantic["board_epoch_5"]) != int(board_epoch_5)
+        if scope == "full" and (
+            semantic["ownership_generation"] != observed_generation
+            or semantic["board_epoch_4"] != board_epoch_4
+            or semantic["board_epoch_5"] != board_epoch_5
         ):
             raise RuntimeError("deck_semantic_generation_epochs_stale")
         position_observation_id = hashlib.sha256(
@@ -8079,11 +8203,11 @@ class Serial206OemInitializationProvider:
             "current_x": int(coordinates["x"]),
             "current_y": int(coordinates["y"]),
             "current_z": int(coordinates["z"]),
-            "current_location_id": str(semantic["current_location"]),
-            "current_well_id": int(semantic["current_well"]),
-            "tip_loaded": bool(semantic["tip_loaded"]),
-            "tip_dirty": bool(semantic["tip_dirty"]),
-            "tip_location": int(semantic["tip_location"]),
+            "current_location_id": semantic["current_location"],
+            "current_well_id": semantic["current_well"],
+            "tip_loaded": semantic["tip_loaded"],
+            "tip_dirty": semantic["tip_dirty"],
+            "tip_location": semantic["tip_location"],
             "clean_path": clean_path,
             "plate_on_gantry": semantic["plate_on_gantry"],
             "pseudo_z_home": int(semantic["pseudo_z_home"]),
@@ -8091,10 +8215,15 @@ class Serial206OemInitializationProvider:
             "latch_status": bool(latch["latch_status"]),
             "machine_latch_closed": bool(latch["machine_latch_closed"]),
         }
+        snapshot.update(dependency_scope=scope, gripper_confirmed=gripper_confirmed,
+                        required_facts=semantic.get("required_facts", ()),
+                        consumed_state_digest=semantic.get("consumed_state_digest"))
         final_stamps = self.deck_owner_authority_stamps()
         final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
-        final_semantic = self._canonical_deck_semantic_state(allow_recovery=_allow_recovery)
+        final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
+                          if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
         if (
+            final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
             cache_epoch is not self._deck_authority_cache_epoch
             or any(final_stamps[key] != snapshot[key] for key in final_stamps)
             or any(
@@ -10112,10 +10241,33 @@ class Serial206OemInitializationProvider:
             "source_anchor": "DefaultParameters.ForceToHighHome:81-84",
         }
 
+    def assert_deck_observation_current(self, authority: Mapping[str, Any]) -> None:
+        """Recheck independent owner/reference and semantic CAS at source seams.
+
+        Positions are not compared after a successful motion; reference versions
+        and consumed host-state ownership must not silently change underneath it.
+        """
+        stamps = self.deck_owner_authority_stamps()
+        if any(stamps[key] != authority.get(key) for key in stamps):
+            raise RuntimeError("deck_execution_owner_authority_changed")
+        if authority.get("dependency_scope") == "offset.v1":
+            refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+            if any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                   or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                   for axis, version in authority["reference_versions"].items()):
+                raise RuntimeError("deck_execution_reference_authority_changed")
+            current = self._offset_deck_semantic_state(gripper_confirmed=authority["gripper_confirmed"])
+            if (current["semantic_state_revision"] != authority["machine_state_revision"]
+                    or current["transition_provenance_digest"] != authority["semantic_state_provenance_digest"]
+                    or current["consumed_state_digest"] != authority["consumed_state_digest"]):
+                raise RuntimeError("deck_execution_semantic_authority_changed")
+
     def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
         self.invalidate_deck_authority_cache(reason="deck_execution_started")
         if authority_snapshot is None:
-            return self._canonical_deck_semantic_state()
+            result = self._canonical_deck_semantic_state()
+            result["gripper_confirmed"] = self._deck_gripper_confirmed()
+            return result
         if not isinstance(authority_snapshot, Mapping):
             raise RuntimeError("deck_execution_authority_not_authoritative")
         required_types = {
@@ -10132,6 +10284,17 @@ class Serial206OemInitializationProvider:
             "machine_state_revision": int,
             "semantic_state_provenance_digest": str,
         }
+        if authority_snapshot.get("dependency_scope", "full") == "offset.v1":
+            for key in ("tip_dirty", "tip_location", "clean_path", "current_location_id", "current_well_id"):
+                required_types.pop(key)
+            required_types["gripper_confirmed"] = bool
+            current = self._offset_deck_semantic_state(gripper_confirmed=authority_snapshot.get("gripper_confirmed"))
+            if (current["semantic_state_revision"] != authority_snapshot.get("machine_state_revision")
+                    or current["transition_provenance_digest"] != authority_snapshot.get("semantic_state_provenance_digest")
+                    or current["consumed_state_digest"] != authority_snapshot.get("consumed_state_digest")):
+                raise RuntimeError("deck_authority_changed_before_first_tx")
+        elif authority_snapshot.get("dependency_scope", "full") != "full":
+            raise RuntimeError("deck_dependency_scope_mismatch")
         for key, expected_type in required_types.items():
             if type(authority_snapshot.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
@@ -10178,12 +10341,10 @@ class Serial206OemInitializationProvider:
             offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
         semantics = self._deck_execution_semantics(authority_snapshot)
         pseudo_home = int(semantics["pseudo_z_home"])
-        if authority_snapshot is not None:
-            gripper_confirmed = True
-        else:
-            references = self.reference_store.snapshot(("g",)) if self.reference_store is not None else {}
-            g_row = (references.get("rows") or {}).get("g") if isinstance(references, Mapping) else None
-            gripper_confirmed = bool(isinstance(g_row, Mapping) and g_row.get("state") == "referenced")
+        gripper_confirmed = self._deck_gripper_confirmed()
+        if (semantics.get("gripper_confirmed") is not None
+                and semantics["gripper_confirmed"] is not gripper_confirmed):
+            raise RuntimeError("deck_authority_changed_before_first_tx")
         location19 = table.resolve(location_id="LOC_RC_COVER")
         coordinates = target.oem_offset_move_coordinates(
             offset_x=offset_x,
@@ -10424,6 +10585,7 @@ class Serial206OemInitializationProvider:
             tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
             plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            gripper_confirmed=self._deck_gripper_confirmed(),
         )
 
     def scriptmoveTo(self, **arguments: Any) -> dict[str, Any]:
@@ -10436,6 +10598,7 @@ class Serial206OemInitializationProvider:
             tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
             plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            gripper_confirmed=self._deck_gripper_confirmed(),
             expected_plan_digest=None if expected_digest is None else str(expected_digest),
             source_plan=source_plan if isinstance(source_plan, Mapping) else None,
         )
@@ -11548,6 +11711,8 @@ class Serial206OemInitializationProvider:
         """Execute raw-IL ``ControlLib.parkGantry(false)`` with governed early return."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
+        if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
+            raise RuntimeError("deck_dependency_scope_mismatch")
         semantics = self._deck_execution_semantics(authority_snapshot)
         current_location_name = str(semantics["current_location_id"])
         if current_location_name == "LOC_PARK":
@@ -11695,6 +11860,7 @@ class Serial206OemInitializationProvider:
                 target_location=28,
                 target_well=0,
                 position_flag=2,
+                gripper_confirmed=self._deck_gripper_confirmed(),
                 tip_loaded=False,
                 tip_dirty=False,
                 timeout_s=60.0,
