@@ -54,7 +54,7 @@ def test_y_home_common_reference_not_published_on_bad_native_proof(homed_replace
     app, provider, primitive, refs, root, leaf, data = homed_replacement
     y = provider.y_provider
     original = y.tester.motor_oem_go_home
-    before = refs.snapshot(('y',))['axes'][0]
+    before = refs.snapshot(('y',))['rows']['y']
     def home(*args, **kwargs):
         result = original(*args, **kwargs)
         if fault == 'failed': result['ok'] = False
@@ -71,9 +71,49 @@ def test_y_home_common_reference_not_published_on_bad_native_proof(homed_replace
         return result
     monkeypatch.setattr(y.tester, 'motor_oem_go_home', home)
     y.home('manual_panel', command_id='negative-'+fault)
-    after = refs.snapshot(('y',))['axes'][0]
+    after = refs.snapshot(('y',))['rows']['y']
     assert after == before
     assert provider.state_store.read_serial206_receipt('y', 'negative-'+fault) is None
+
+
+@pytest.mark.parametrize('fault', [None, 'position_ack', 'position_cache', 'nonzero', 'speed_ack', 'moving', 'read_error'])
+def test_y_home_observes_zero_after_source_sethome(homed_replacement, monkeypatch, fault):
+    app, provider, primitive, refs, root, leaf, data = homed_replacement
+    y = provider.y_provider
+    raw = native_home()
+    # Exact native goHome contract: position_after precedes SAP1;
+    # the driver deliberately does not produce a post-setHome sample.
+    raw.update(position_after={'ok':True, 'position':-7, 'ack':{'status':100}},
+        position_after_sethome=None, source_return_code=7)
+    before = refs.snapshot(('y',))['rows']['y']
+    calls = []
+    def home(*args, **kwargs):
+        calls.append('home')
+        return copy.deepcopy(raw)
+    def position(*args, **kwargs):
+        calls.append('position')
+        if fault == 'read_error': raise OSError('isolated unavailable readback')
+        return {'ok':fault != 'position_cache', 'position':2 if fault == 'nonzero' else 0,
+            'ack':{'status':1 if fault == 'position_ack' else 100}}
+    def speed(*args, **kwargs):
+        calls.append('speed')
+        return {'ok':True, 'speed':3 if fault == 'moving' else 0,
+            'ack':{'status':1 if fault == 'speed_ack' else 100}}
+    monkeypatch.setattr(y.tester, 'motor_oem_go_home', home)
+    monkeypatch.setattr(y.tester, 'motor_get_position', position)
+    monkeypatch.setattr(y.tester, 'motor_get_speed', speed)
+    result = y.home('manual_panel', command_id='post-source-readback-'+str(fault))
+    assert result['ok'] is True  # native manual source reporting is unchanged
+    assert result['result']['home'] == raw  # no invented source sample
+    assert result['controller_home_proof_verified'] is (fault is None)
+    assert result['reference_published'] is (fault is None)
+    after = refs.snapshot(('y',))['rows']['y']
+    if fault is None:
+        assert after['state_version'] > before['state_version']
+        assert calls == ['home','position','speed']
+        assert y.state_store.read_serial206_receipt('y', 'post-source-readback-None')['recovery_home']
+    else:
+        assert after == before
 
 
 def test_actual_retained_failed_command(homed_replacement):
@@ -98,7 +138,10 @@ def native_home():
         'wait': {'stopped': True, 'speed_reply_valid': True,
             'controller_terminal_state_verified': True, 'last_ack': ack, 'last_speed': 0},
         'set_home': {'controller_command_acknowledged': True, 'ack': ack},
-        'position_after_sethome': {'ok': True, 'position': 0, 'ack': ack}}
+        # Match the actual driver's return: this offset is before SAP1;
+        # post-zero evidence must come from the owner's separate readback.
+        'position_after': {'ok': True, 'position': -7, 'ack': ack},
+        'position_after_sethome': None}
 
 
 @pytest.fixture

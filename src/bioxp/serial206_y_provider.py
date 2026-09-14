@@ -588,9 +588,10 @@ class Serial206YProvider:
             current = current.get(key)
         return current if isinstance(current, Mapping) else None
 
-    def _home_proof(self, result: Mapping[str, Any], authority: Mapping[str, Any]) -> dict[str, bool]:
+    def _home_proof(self, result: Mapping[str, Any], authority: Mapping[str, Any], *,
+                    reference_observation: Mapping[str, Any] | None = None) -> dict[str, bool]:
         home = result.get("home") if isinstance(result.get("home"), Mapping) else result
-        go_home = self._mapping_at(home, "go_home") or home
+        go_home = self._mapping_at(home, "go_home") or home or {}
         home_after = (
             self._mapping_at(go_home, "home_hit")
             or self._mapping_at(home, "home_after")
@@ -618,6 +619,20 @@ class Serial206YProvider:
         zero_readback = bool(not short_circuit_home and zero.get("ok") is True
                              and acknowledged(zero) and type(zero.get("position")) is int
                              and zero["position"] == 0)
+        if go_home.get("position_after_sethome") is None and reference_observation is not None:
+            # The OEM return deliberately has no post-SAP1 position sample.
+            # Keep its pre-zero offset unchanged; consume this owner's separate
+            # query-only observation, never a cached or relabelled source value.
+            observed_position = self._mapping_at(reference_observation, "position") or {}
+            observed_speed = self._mapping_at(reference_observation, "speed") or {}
+            zero_readback = bool(
+                not short_circuit_home and observed_position.get("ok") is True
+                and acknowledged(observed_position)
+                and type(observed_position.get("position")) is int
+                and observed_position["position"] == 0
+                and observed_speed.get("ok") is True and acknowledged(observed_speed)
+                and type(observed_speed.get("speed")) is int and observed_speed["speed"] == 0
+            )
         set_home_valid = bool(
             set_home.get("controller_command_acknowledged") is True
             and acknowledged(set_home)
@@ -714,7 +729,21 @@ class Serial206YProvider:
         source_home_raw = result.get("home")
         source_home = dict(source_home_raw) if isinstance(source_home_raw, Mapping) else {}
         source_home_ok = bool(result.get("ok") is True or source_home.get("ok") is True)
-        proof = self._home_proof(result, authority)
+        source_go_home = self._mapping_at(source_home, "go_home") or source_home
+        reference_observation = None
+        if (source_home_ok and source_go_home.get("source_noop") is not True
+            and source_go_home.get("controller_home_proof_verified") is True
+            and source_go_home.get("position_after_sethome") is None):
+            # goHome's position_after is taken before SAP1 zeros the counter.
+            # Observe afterwards without adding any move, stop, or setHome.
+            try:
+                reference_observation = {
+                    "position": self.tester.motor_get_position(self.board, motor=self.motor),
+                    "speed": self.tester.motor_get_speed(self.board, motor=self.motor),
+                }
+            except Exception as exc:
+                reference_observation = {"failure": "post_home_readback_unavailable", "error": str(exc)}
+        proof = self._home_proof(result, authority, reference_observation=reference_observation)
         proof_ok = all(
             proof[key]
             for key in (
@@ -748,6 +777,7 @@ class Serial206YProvider:
                 and not self._operation_interrupted() and int(self.generation_provider()) == admitted_generation):
                 self.state_store.append_serial206_receipt("y", {
                     "command_id": command_id, "intent": "manual_panel_home", "status": "completed",
+                    "reference_observation": reference_observation,
                     "recovery_home": {
                         "owner_id": owner_id, "command_id": command_id,
                         "ownership_generation": int(self.generation_provider()),
@@ -768,6 +798,7 @@ class Serial206YProvider:
             "source_speed": int(speed),
             "startup": bool(startup),
             "home_proof": proof,
+            "reference_observation": reference_observation,
             "reference_published": reference_published,
             "source_call_completed": isinstance(result, Mapping),
             "source_return_ok": source_home_ok,
