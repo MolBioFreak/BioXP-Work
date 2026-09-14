@@ -13,6 +13,9 @@ from bioxp import oem_serial206_initialization as native
 from bioxp.oem_deck_movement import ClassMoveToIntent, compile_mov_execution
 from bioxp.oem_compat.position_table import load_bound_oem_position_table
 from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
+from tests.test_deck_tip_query_publication import query_rig, query
+from tests.test_deck_scoped_integration import installed_retained
+from tests.test_deck_scoped_authority import retained_rig
 
 
 @pytest.fixture
@@ -132,8 +135,15 @@ def test_real_z_primitive_retains_source_floor(rig, monkeypatch, requested, pseu
     assert calls == [(4, effective, dict(motor=0, wait_for_stop=True, max_position=150000))]
 
 
-def test_park_final_source_caller_keeps_flag_two(rig, monkeypatch):
+def test_park_final_source_caller_keeps_flag_two(rig, query_rig, monkeypatch):
     provider, primitive, _, _, table = rig
+    query(query_rig)
+    provider.bind_pipette_collection_state_reader(query_rig[1]._park_collection_state)
+    from bioxp import oem_machine_bundle
+    snapshot = bind_serial206_oem_snapshot(monkeypatch)
+    snapshot = oem_machine_bundle.load_oem_machine_snapshot(snapshot.bundle_root / 'OEM_EVIDENCE_LOCK.json',
+        operator_label_serial=206, require_operator_label=True)
+    monkeypatch.setattr(oem_machine_bundle, '_active_snapshot', snapshot)
     semantics = dict(current_location_id="LOC_OC", current_well_id=0,
                      pseudo_z_home=500, tip_loaded=False, plate_on_gantry=None)
     monkeypatch.setattr(provider, "_deck_execution_semantics", lambda authority, **kwargs: semantics)

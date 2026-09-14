@@ -4532,9 +4532,35 @@ class OperatorCommandStore:
                 self.assert_deck_execution_current(command_id, boundary="atomic_semantic_commit")
                 semantic = self.deck_semantic_state()
                 digest = hashlib.sha256(_canonical(semantic["transition_provenance"]).encode()).hexdigest()
-                if (semantic["ambiguity_state"] != "none"
-                        or semantic["semantic_state_revision"] != expected_authority["machine_state_revision"]
-                        or digest != expected_authority["semantic_state_provenance_digest"]):
+                changed = (semantic["semantic_state_revision"] != expected_authority["machine_state_revision"]
+                    or digest != expected_authority["semantic_state_provenance_digest"])
+                owned_tip_child = False
+                if changed and plan.source_branch == "park":
+                    # Park's final real query owns exactly one pipette-only
+                    # publication. Accept that child, never arbitrary revision
+                    # drift or a convenient fresh snapshot after movement.
+                    provenance = semantic["transition_provenance"]
+                    stage = "serial206.park_gantry.query_tip_status"
+                    child = conn.execute(
+                        "SELECT * FROM pipette_operations WHERE command_id=?",
+                        (provenance.get("upstream_source_command_id"),),
+                    ).fetchone()
+                    child_receipt = _json_load(child["receipt_json"], {}) if child else {}
+                    owned_tip_child = bool(
+                        provenance.get("source_operation") == "pipette_owner"
+                        and provenance.get("before_revision") == expected_authority["machine_state_revision"]
+                        and provenance.get("after_revision") == expected_authority["machine_state_revision"] + 1
+                        and semantic["semantic_state_revision"] == provenance.get("after_revision")
+                        and provenance.get("updates") == {"tip_loaded": False, "tip_dirty": False, "tip_location": -1}
+                        and child and child["operation"] == "query_all_pipette_tip_states"
+                        and child["status"] == "observed"
+                        and child["ownership_generation"] == expected_authority["ownership_generation"]
+                        and child["lifecycle_stage_id"] == stage
+                        and child["lifecycle_attempt_id"] == f"{command_id}:{stage}"
+                        and child_receipt.get("result", {}).get("hardware_query_verified") is True
+                        and child_receipt.get("truth", {}).get("semantic_query_response_verified") is True
+                    )
+                if semantic["ambiguity_state"] != "none" or (changed and not owned_tip_child):
                     raise RuntimeError("deck_semantic_authority_changed_before_commit")
             result_index = 0
             for step in plan.steps:
@@ -7308,13 +7334,23 @@ class OperatorCommandPlane:
                 self.store.finish(command_id, status="failed", payload={"error": "canonical_deck_executor_unavailable", "delivery_attempted": False}, claimed=claimed)
                 return
             try:
-                response = executor(
-                    command_id=command_id,
-                    target=str(effective["target"]),
-                    camera_offset=bool(effective["camera_offset"]),
-                    expected_ownership_generation=int(claimed["ownership_generation"]),
-                    expected_board_epoch_by_board=dict(claimed["expected_board_epoch_by_board"]),
-                )
+                token = _DISPATCH_CONTEXT.set({
+                    "operator_command_id": command_id,
+                    "idempotency_key": f"dispatch:{claimed['dispatch_attempt_id']}",
+                    "expected_ownership_generation": claimed["ownership_generation"],
+                    "action_id": action_id,
+                    "caller_class": "manual_operator",
+                })
+                try:
+                    response = executor(
+                        command_id=command_id,
+                        target=str(effective["target"]),
+                        camera_offset=bool(effective["camera_offset"]),
+                        expected_ownership_generation=int(claimed["ownership_generation"]),
+                        expected_board_epoch_by_board=dict(claimed["expected_board_epoch_by_board"]),
+                    )
+                finally:
+                    _DISPATCH_CONTEXT.reset(token)
             except DeckExecutionFailure as exc:
                 delivery_attempted = exc.delivery_attempted
                 controller_acknowledged = bool(exc.controller_command_acknowledged)

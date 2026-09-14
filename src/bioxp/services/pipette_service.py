@@ -285,6 +285,18 @@ async def _run_transport_call(
             f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
         )
         binding = effective_runtime_binding
+        source_transport = get_transport()
+        source_identity_reader = getattr(source_transport, "collection_source_identity", None)
+        if callable(source_identity_reader):
+            collection_owner = source_identity_reader()
+            # Revisions change with setters, not the idempotent request identity.
+            binding["collection_owner"] = {**collection_owner, "channels": [
+                {k: row[k] for k in ("reader", "reader_generation")}
+                for row in collection_owner["channels"]]}
+            binding["collection_source_affecting"] = (
+                operation_key not in READ_ONLY_PIPETTE_OPERATIONS
+                or operation_key in {"tip_status", "query_tip_status", "query_all_pipette_tip_states",
+                                     "live_readback", "readback"})
         outer_command_id = dispatch_context.get("operator_command_id")
         # Lifecycle steps have their own keys; only direct pipette actions share the outer claim.
         if outer_command_id and binding.get("caller_class") == "lifecycle":
@@ -520,6 +532,10 @@ async def _run_transport_call(
             status_code=503 if stage != "admission" else 400,
             detail={"error": "pipette_operation_failed", "message": str(exc)},
         ) from exc
+    if isinstance(result, dict) and stage == "dispatch":
+        source_snapshot = getattr(transport, "collection_source_snapshot", None)
+        if callable(source_snapshot):
+            result["collection_source"] = source_snapshot()
     if preflight_payload is not None and isinstance(result, dict):
         result.setdefault("preflight", preflight_payload)
     if isinstance(result, dict):

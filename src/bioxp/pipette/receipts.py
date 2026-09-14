@@ -178,6 +178,84 @@ class PipetteReceiptStore:
         self._lock = self._audit_database.writer_lock
         self.lock = self._lock
 
+    def _collection_claim(self, identity: Mapping[str, Any], generation: int) -> dict[str, Any]:
+        """Resolve issued order, never reconciliation/finalization timestamps."""
+        owner = identity.get("owner")
+        if not owner:
+            raise PipetteReceiptError("pipette_collection_owner_missing")
+        row = self.connection.execute(
+            "SELECT * FROM pipette_operations WHERE "
+            "json_extract(source_identity_json, '$.collection_source_affecting')=1 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is not None and row["status"] in NONTERMINAL_COMMAND_STATES:
+            raise PipetteReceiptError("pipette_collection_receipt_pending")
+        if row is None or not row["receipt_json"]:
+            raise PipetteReceiptError("pipette_collection_receipt_unavailable")
+        source = json.loads(row["source_identity_json"])
+        if any(source.get(k) != v for k, v in _current_replay_identity().items()):
+            raise PipetteReceiptError("pipette_collection_source_identity_changed")
+        claimed = source.get("collection_owner", {})
+        if row["ownership_generation"] != generation or claimed.get("owner") != owner:
+            raise PipetteReceiptError("pipette_collection_owner_changed")
+        if len(claimed.get("channels", [])) != 4 or len(identity.get("channels", [])) != 4:
+            raise PipetteReceiptError("pipette_collection_reader_missing")
+        if (claimed.get("interrupt_epoch") != identity.get("interrupt_epoch")
+                or any(a.get("reader") != b.get("reader") or a.get("reader_generation") != b.get("reader_generation")
+                       for a, b in zip(claimed.get("channels", []), identity.get("channels", [])))):
+            raise PipetteReceiptError("pipette_collection_reader_or_stop_changed")
+        return dict(row)
+
+    def collection_state(self, *, identity: Mapping[str, Any], ownership_generation: int) -> dict[str, Any]:
+        """Authoritative values only from a committed, identity-matched SQLite row."""
+        with self._lock:
+            claim = self._collection_claim(identity, ownership_generation)
+            receipt = json.loads(claim["receipt_json"])
+            snapshot = receipt.get("result", {}).get("collection_source")
+            event_id = None
+            if not isinstance(snapshot, dict) or snapshot.get("identity") != identity:
+                row = self.connection.execute(
+                    "SELECT event_id,event_json FROM runtime_events WHERE event_kind=? LIMIT 1",
+                    ("pipette_collection_source:" + hashlib.sha256(canonical_json([claim["command_id"], dict(identity)]).encode()).hexdigest(),),
+                ).fetchone()
+                event = json.loads(row["event_json"]) if row else {}
+                snapshot = event.get("snapshot")
+                if event.get("command_id") != claim["command_id"] or event.get("ownership_generation") != ownership_generation:
+                    raise PipetteReceiptError("pipette_collection_observation_unavailable")
+                event_id = str(row["event_id"])
+            if not isinstance(snapshot, dict) or snapshot.get("identity") != identity:
+                raise PipetteReceiptError("pipette_collection_source_changed")
+            channels = snapshot.get("channels", [])
+            if len(channels) != 4:
+                raise PipetteReceiptError("pipette_collection_channels_unavailable")
+            positive = any(c.get("tip_loaded") is True and c.get("verified") is True for c in channels)
+            absent = all(c.get("tip_loaded") is False and c.get("verified") is True for c in channels)
+            return {"tip_exists": True if positive else False if absent else None,
+                "identity": dict(identity), "command_id": claim["command_id"],
+                "receipt_id": receipt.get("receipt_id"), "event_id": event_id}
+
+    def publish_collection_source(self, transport: Any, *, ownership_generation: int) -> dict[str, Any]:
+        """Existing active owner publishes changed source state; never a receiver callback."""
+        snapshot = transport.collection_source_snapshot()
+        identity = snapshot["identity"]
+        with self._lock:
+            claim = self._collection_claim(identity, ownership_generation)
+            try:
+                return self.collection_state(identity=identity, ownership_generation=ownership_generation)
+            except PipetteReceiptError:
+                pass
+            if transport.collection_source_identity() != identity:
+                raise PipetteReceiptError("pipette_collection_source_changed_before_commit")
+            self._audit_database.record_event(command_id=claim["command_id"],
+                pipette_operation_id=claim["pipette_operation_id"],
+                event_source="pipette_collection_owner", event_kind=("pipette_collection_source:"
+                    + hashlib.sha256(canonical_json([claim["command_id"], dict(identity)]).encode()).hexdigest()),
+                ownership_generation=ownership_generation,
+                event_payload={"snapshot": snapshot, "command_id": claim["command_id"],
+                               "ownership_generation": ownership_generation})
+            if transport.collection_source_identity() != identity:
+                raise PipetteReceiptError("pipette_collection_source_changed_during_commit")
+            return self.collection_state(identity=identity, ownership_generation=ownership_generation)
+
     def _source_identity(self) -> dict[str, Any]:
         repo = Path(__file__).resolve().parents[3]
         tracked = {

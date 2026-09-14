@@ -969,6 +969,36 @@ class FourPipetteTransport:
             for transport in self._transports:
                 transport._error_callback = self._record_pipette_error
 
+    def collection_source_snapshot(self) -> dict[str, Any]:
+        """Copy existing source state, without querying or constructing a driver."""
+        import uuid
+        owner = self.__dict__.setdefault("_collection_source_owner", uuid.uuid4().hex)
+        states = [getattr(t._driver, "_pipette_message_state", None) for t in self._transports]
+        stamps, channels = [], []
+        transactions = [s.get("tip_source_transaction_id") for s in states if s]
+        for transport, source in zip(self._transports, states):
+            state = source or {}
+            router = getattr(getattr(transport._driver, "bus", None), "router", None)
+            generation = getattr(router, "reader_generation", None)
+            stamps.append({"actor": state.get("tip_source_actor"),
+                "revision": state.get("tip_source_revision"), "reader": id(router),
+                "reader_generation": generation})
+            channels.append({"tip_loaded": state.get("tip_loaded"),
+                "verified": bool(state.get("tip_source_verified") is True
+                    and isinstance(state.get("tip_source_transaction_id"), str)
+                    and transactions.count(state["tip_source_transaction_id"]) == 1
+                    and type(generation) is int and state.get("tip_source_reader") == id(router)
+                    and state.get("tip_source_reader_generation") == generation)})
+        if any(getattr(t._driver, "_pipette_message_state", None) is not state
+               for t, state in zip(self._transports, states)):
+            raise RuntimeError("pipette_source_changed_during_snapshot")
+        return {"identity": {"owner": owner, "interrupt_epoch": self._interrupt_epoch,
+                             "channels": stamps}, "channels": channels}
+
+    def collection_source_identity(self) -> dict[str, Any]:
+        # Only identity metadata may fence a SQLite read; never return a RAM predicate.
+        return self.collection_source_snapshot()["identity"]
+
     def _record_pipette_error(self, channel: int, error_code: int) -> None:
         self._last_error = {
             "channel": int(channel),

@@ -257,6 +257,7 @@ class DeckAuthoritySnapshot:
     gripper_confirmed: bool | None = None
     required_facts: tuple[str, ...] = ()
     consumed_state_digest: str | None = None
+    collection_tip_state: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if type(self.captured_at) not in {int, float} or not math.isfinite(float(self.captured_at)):

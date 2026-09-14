@@ -695,6 +695,27 @@ class BioXpCanDriver:
             interrupt_completion_owner_token=interrupt_completion_owner_token,
         )
 
+    def _set_collection_tip_state(self, loaded: bool, *, verified: bool, source_proof=None) -> None:
+        """Source setter metadata only; the receiver never persists authority."""
+        import threading
+        lock = self.__dict__.setdefault("_pipette_source_lock", threading.RLock())
+        with lock:
+            self._set_collection_tip_state_locked(loaded, verified=verified, source_proof=source_proof)
+
+    def _set_collection_tip_state_locked(self, loaded: bool, *, verified: bool, source_proof=None) -> None:
+        import uuid
+        prior = getattr(self, "_pipette_message_state", {})
+        router = getattr(getattr(self, "bus", None), "router", None)
+        self._pipette_message_state = {
+            **prior, "tip_loaded": loaded,
+            "tip_source_actor": prior.get("tip_source_actor") or uuid.uuid4().hex,
+            "tip_source_revision": int(prior.get("tip_source_revision", 0)) + 1,
+            "tip_source_reader": id(router),
+            "tip_source_reader_generation": getattr(router, "reader_generation", None),
+            "tip_source_verified": verified,
+            "tip_source_transaction_id": (source_proof or {}).get("transaction_id"),
+        }
+
     def process_pipette_message(
         self,
         dlc: int,
@@ -703,7 +724,16 @@ class BioXpCanDriver:
         arbitration_id: int | None = None,
         command_name: str | None = None,
         received_at: float | None = None,
+        source_provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        import threading
+        lock = self.__dict__.setdefault("_pipette_source_lock", threading.RLock())
+        with lock:
+            return self._process_pipette_message_locked(dlc, message,
+                arbitration_id=arbitration_id, command_name=command_name, received_at=received_at,
+                source_provenance=source_provenance)
+
+    def _process_pipette_message_locked(self, dlc, message, *, arbitration_id, command_name, received_at, source_provenance):
         selected = command_name or self._pipette_last_command
         self._pipette_message_state = process_pipette_message(
             dlc,
@@ -713,6 +743,14 @@ class BioXpCanDriver:
             state=getattr(self, "_pipette_message_state", {}),
             received_at=received_at,
         )
+        if selected == "query_tip_status" and dlc > 2 and len(message) == dlc:
+            self._set_collection_tip_state(
+                self._pipette_message_state["tip_loaded"],
+                verified=(len(message) == 3 and list(message[:2]) == [32, 96]
+                          and message[2] in (48, 49)
+                          and self._collection_source_proof(source_provenance, arbitration_id, received_at)),
+                source_proof=source_provenance,
+            )
         callback = getattr(self, "_pipette_error_callback", None)
         event_error_code = self._pipette_message_state.get("event_error_code")
         if callable(callback) and isinstance(event_error_code, int) and event_error_code not in {0, 0x20}:
@@ -721,6 +759,21 @@ class BioXpCanDriver:
             except Exception as exc:  # event publication must not kill the reader owner
                 self._pipette_message_state["error_callback_error"] = repr(exc)
         return dict(self._pipette_message_state)
+
+    def _collection_source_proof(self, provenance, arbitration_id, received_at) -> bool:
+        if not isinstance(provenance, dict):
+            return False
+        router = getattr(getattr(self, "bus", None), "router", None)
+        channel = getattr(self, "pipette_id", None)
+        sent = provenance.get("tx_timestamp")
+        return bool(type(channel) is int and provenance.get("channel") == channel
+            and arbitration_id == (0x506 + 8 * channel)
+            and provenance.get("query_response_correlated") is True
+            and isinstance(provenance.get("transaction_id"), str) and provenance["transaction_id"]
+            and type(getattr(router, "reader_generation", None)) is int
+            and provenance.get("reader_generation", provenance.get("owner_generation")) == router.reader_generation
+            and isinstance(sent, (int, float)) and isinstance(received_at, (int, float))
+            and sent <= received_at <= time.monotonic() and time.monotonic() - received_at <= 5)
 
     def _apply_pipette_provenance(self, provenance: Any, command_name: str | None) -> dict[str, Any]:
         state = dict(getattr(self, "_pipette_message_state", {}))
@@ -733,6 +786,7 @@ class BioXpCanDriver:
                 arbitration_id=frame.get("arbitration_id"),
                 command_name=command_name,
                 received_at=frame.get("received_at"),
+                source_provenance=provenance,
             )
         completion = provenance.get("completion") if isinstance(provenance, dict) else None
         if isinstance(completion, dict) and isinstance(completion.get("data"), list):
@@ -742,6 +796,7 @@ class BioXpCanDriver:
                 arbitration_id=completion.get("observed_rx_id"),
                 command_name=completion.get("command_name") or command_name,
                 received_at=completion.get("receive_timestamp"),
+                source_provenance=provenance,
             )
         return state
 
@@ -866,6 +921,7 @@ class BioXpCanDriver:
             arbitration_id=result.get("observed_rx_id"),
             command_name=result.get("command_name") or self._pipette_last_command,
             received_at=result.get("receive_timestamp"),
+            source_provenance=result,
         )
         event_error = state.get("event_error_code")
         result["pipette_message_state"] = state
@@ -1006,10 +1062,13 @@ class BioXpCanDriver:
         reply_received = bool(ack.get("received")) if isinstance(ack, dict) else False
         data = ack.get("data") if reply_received else None
         source_tip_loaded = data[2] == ord("1") if data is not None else False
-        self._pipette_message_state = {
-            **getattr(self, "_pipette_message_state", {}), "tip_loaded": source_tip_loaded,
-        }
         tip_loaded = self._parse_tip_loaded(result) if data is not None else None
+        provenance = result.get("provenance") or {}
+        proof = {**provenance, "query_response_correlated": result.get("query_response_correlated")}
+        self._set_collection_tip_state(source_tip_loaded, verified=bool(
+            tip_loaded is not None and self._collection_source_proof(
+                proof, ack.get("arbitration_id"), provenance.get("receive_timestamp"))
+        ), source_proof=proof)
         semantic_ok = tip_loaded is not None
         if reply_received and not semantic_ok and isinstance(result.get("provenance"), dict):
             result["provenance"]["outcome"] = "malformed"

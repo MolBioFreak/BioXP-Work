@@ -6556,6 +6556,17 @@ def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
     return True
 
 
+def _pipette_collection_state():
+    if _pipette_transport is None or _pipette_receipts is None:
+        raise RuntimeError("pipette_collection_owner_not_bound")
+    identity = _pipette_transport.collection_source_identity()
+    result = _pipette_receipts.collection_state(identity=identity,
+        ownership_generation=int(hardware_state.ownership_epoch))
+    if _pipette_transport.collection_source_identity() != identity:
+        raise RuntimeError("pipette_collection_owner_changed_during_read")
+    return result
+
+
 def _collect_and_publish_hardware_snapshot(
     requested: list[str],
     *,
@@ -6595,6 +6606,13 @@ def _collect_and_publish_hardware_snapshot(
         result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
         return result
     if deck_requested and result.get("ok") and callable(deck_collect):
+        if _pipette_transport is not None and _pipette_receipts is not None:
+            try:
+                with provider.deck_owner_authority_scope(), _pipette_transport._transaction_lock:
+                    result["pipette_collection"] = _pipette_receipts.publish_collection_source(
+                        _pipette_transport, ownership_generation=int(hardware_state.ownership_epoch))
+            except Exception as exc:
+                result["pipette_collection"] = {"available": False, "reason": str(exc)}
         result["deck_authority"] = deck_collect()
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
     if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):

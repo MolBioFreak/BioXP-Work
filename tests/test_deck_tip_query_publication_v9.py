@@ -60,13 +60,14 @@ store.close()
     db.close()
     runtime = OEMRuntimeStore(root)
     db = runtime._db
-    assert db.execute('PRAGMA user_version').fetchone()[0] == 9
+    assert db.execute('PRAGMA user_version').fetchone()[0] == 10
     verify_canonical_runtime_database(db, full_data_check=True)
     assert {table: [tuple(row) for row in db.execute('SELECT * FROM "' + table + '"').fetchall()]
             for table in before} == before
     assert [tuple(row) for row in db.execute('SELECT * FROM runtime_schema_migrations WHERE version<=8 ORDER BY version')] == ledger
     after_schema = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL"))
-    assert set(schema) == set(after_schema)
+    assert set(after_schema) - set(schema) == {'pipette_collection_claim_idx'}
+    assert not set(schema) - set(after_schema)
     assert [key for key in schema if schema[key] != after_schema[key]] == [v9.TRIGGER]
     assert v9.NEW in after_schema[v9.TRIGGER]
     with pytest.raises(sqlite3.DatabaseError):

@@ -31,6 +31,7 @@ def query_rig(installed_retained, monkeypatch):
     transports = []
     for channel in range(4):
         driver = BioXpCanDriver.__new__(BioXpCanDriver)
+        driver.pipette_id = channel
         from types import SimpleNamespace
         driver.bus = SimpleNamespace(router=SimpleNamespace(reader_generation=1))
         def exchange(command, *, address, ack_mode, command_name, channel=channel):
@@ -53,6 +54,7 @@ def query_rig(installed_retained, monkeypatch):
         monkeypatch.setattr(driver, '_send_pipette_command', exchange)
         transports.append(CanPipetteTransport(driver_factory=lambda driver=driver: driver, pipette_id=channel))
     transport = FourPipetteTransport(transports)
+    monkeypatch.setattr(api, '_pipette_transport', transport)
     monkeypatch.setattr(api, '_get_pipette_transport', lambda: transport)
     # Register query before the real control-plane catalog/dispatch is built.
     # Reuse retained hardware infrastructure; no audit/executor stand-ins.
@@ -228,6 +230,15 @@ def named_move(rig, *, fail=False):
     return path, client.get(path + '?detail=true').json()
 
 
+def bind_collection_test_identity(mp):
+    from bioxp.pipette import receipts
+    mp.setattr(receipts, 'current_release_identity', lambda: {'verified': True,
+        'release_id': 'isolated-deck-fixture', 'source': {'manifest_sha256': '1'*64, 'aggregate_sha256': '2'*64}})
+    mp.setattr(receipts, 'current_authority_identity', lambda: {
+        'evidence_lock_identity_verified': True, 'evidence_lock_sha256': '3'*64})
+    mp.setattr(receipts, 'current_registry_sha256', lambda: '4'*64)
+
+
 def reopen(root, receipt_id, generation):
     from bioxp.pipette.receipts import PipetteReceiptStore
     from bioxp.oem_runtime_store import OEMRuntimeStore
@@ -238,14 +249,19 @@ def reopen(root, receipt_id, generation):
     from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
     with pytest.MonkeyPatch.context() as mp:
         bind_serial206_oem_snapshot(mp)
+        bind_collection_test_identity(mp)
         runtime = OEMRuntimeStore(root)
         store = OperatorCommandStore(root)
         references = ReferenceStateStore(Path(root) / 'bioxp_runtime.db')
         provider = Serial206OemInitializationProvider(Primitive(home=True), state_store=runtime,
             reference_store=references, generation_provider=lambda: generation)
         provider.bind_deck_semantic_state_reader(store.deck_semantic_state)
-        rows = PipetteReceiptStore(root).read(limit=100)
+        receipt_store = PipetteReceiptStore(root)
+        rows = receipt_store.read(limit=100)
         receipt = next(row for row in rows if row['receipt_id'] == receipt_id)
+        identity = receipt['result']['collection_source']['identity']
+        provider.bind_pipette_collection_state_reader(lambda: receipt_store.collection_state(
+            identity=identity, ownership_generation=generation))
         try:
             park = provider.deck_authority_snapshot(expected_generation=generation, target='LOC_PARK')
         except RuntimeError as exc:

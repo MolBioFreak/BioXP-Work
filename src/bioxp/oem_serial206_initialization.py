@@ -2676,7 +2676,15 @@ class Serial206ProductionPrimitiveAdapter:
             raise RuntimeError("pipette_audit_runner_not_bound")
         attempt = getattr(self, "_lifecycle_pipette_attempt", None)
         if not isinstance(attempt, Mapping):
-            raise RuntimeError("lifecycle_pipette_attempt_identity_not_bound")
+            # Native deck cleanup is an independently claimed child of the
+            # already-admitted operator command, not an initialization stage.
+            from .operator_controls import current_operator_dispatch_context
+            context = current_operator_dispatch_context() or {}
+            parent = context.get("operator_command_id")
+            if not isinstance(parent, str) or not parent:
+                raise RuntimeError("lifecycle_pipette_attempt_identity_not_bound")
+            child = f"{parent}:{lifecycle_stage_id}"
+            attempt = {"command_id": child, "idempotency_key": child}
         return runner(
             operation_name,
             operation,
@@ -5102,7 +5110,9 @@ class Serial206OemInitializationProvider:
         # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
         # verified absence skips tip cleanup and never consults tray CleanPath.
         # Keep absence explicit and all other full-state/owner fences intact.
-        clean_path_not_applicable = no_tip_park and semantic.get("tip_loaded") is False
+        collection = self._park_collection_state() if no_tip_park and location != "LOC_PARK" else None
+        clean_path_not_applicable = no_tip_park and (
+            location == "LOC_PARK" or collection["tip_exists"] is False)
         if clean_path_not_applicable:
             branch_types.pop("clean_path")
         for key, expected_type in branch_types.items():
@@ -5137,6 +5147,7 @@ class Serial206OemInitializationProvider:
             "tip_loaded": bool(semantic["tip_loaded"]),
             "tip_dirty": bool(semantic["tip_dirty"]),
             "tip_location": tip_location,
+            "collection_tip_state": collection,
             "clean_path": None if clean_path_not_applicable else semantic["clean_path"],
             "required_facts": tuple(branch_types),
             "plate_on_gantry": plate,
@@ -8313,6 +8324,9 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("ownership_generation_changed")
         if time.monotonic() - sampled_at >= 15.0:
             raise RuntimeError("deck_authority_cache_stale")
+        if scope == "park.full" and snapshot.get("current_location_id") != "LOC_PARK":
+            if self._park_collection_state() != snapshot.get("collection_tip_state"):
+                raise RuntimeError("pipette_collection_owner_changed_after_collection")
         return copy.deepcopy(snapshot)
 
     def deck_authority_snapshot(
@@ -8358,7 +8372,7 @@ class Serial206OemInitializationProvider:
         gripper_confirmed = self._deck_gripper_confirmed()
         semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                     if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
-        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["tip_loaded"] is False) else self._clean_path_from_tip_tray_authority(
+        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["clean_path"] is None) else self._clean_path_from_tip_tray_authority(
             ownership_generation=int(semantic["ownership_generation"]),
             board_epoch_4=int(semantic["board_epoch_4"]),
             board_epoch_5=int(semantic["board_epoch_5"]),
@@ -8434,6 +8448,7 @@ class Serial206OemInitializationProvider:
             "current_location_id": semantic["current_location"],
             "current_well_id": semantic["current_well"],
             "tip_loaded": semantic["tip_loaded"],
+            "collection_tip_state": semantic.get("collection_tip_state"),
             "tip_dirty": semantic["tip_dirty"],
             "tip_location": semantic["tip_location"],
             "clean_path": clean_path,
@@ -8451,6 +8466,7 @@ class Serial206OemInitializationProvider:
         final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                           if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         if (
+            final_semantic.get("collection_tip_state") != semantic.get("collection_tip_state") or
             final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
             cache_epoch is not self._deck_authority_cache_epoch
             or any(final_stamps[key] != snapshot[key] for key in final_stamps)
@@ -10635,8 +10651,13 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("deck_authority_changed_before_first_tx")
         elif authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")
-        if no_tip_park and authority_snapshot.get("tip_loaded") is False:
-            required_types.pop("clean_path")
+        if no_tip_park:
+            collection = (self._park_collection_state()
+                          if authority_snapshot.get("current_location_id") != "LOC_PARK" else None)
+            if collection != authority_snapshot.get("collection_tip_state"):
+                raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
+            if collection is None or collection["tip_exists"] is False:
+                required_types.pop("clean_path")
         for key, expected_type in required_types.items():
             if type(authority_snapshot.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
@@ -12057,6 +12078,18 @@ class Serial206OemInitializationProvider:
             **handler_identity,
         )
 
+    def bind_pipette_collection_state_reader(self, reader) -> None:
+        self._pipette_collection_state_reader = reader
+
+    def _park_collection_state(self) -> dict[str, Any]:
+        reader = getattr(self, "_pipette_collection_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("pipette_collection_owner_not_bound")
+        state = reader()
+        if not isinstance(state, Mapping) or type(state.get("tip_exists")) is not bool:
+            raise RuntimeError("pipette_collection_state_not_authoritative")
+        return dict(state)
+
     def parkGantry(
         self,
         *,
@@ -12101,7 +12134,10 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError(f"park_source_child_failed:{operation}")
             return row
 
-        if semantics["tip_loaded"] is True:
+        collection = self._park_collection_state()
+        if authority_snapshot is not None and authority_snapshot.get("collection_tip_state") != collection:
+            raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
+        if collection["tip_exists"] is True:
             waste = table.resolve(location_id="WASTE_BIN")
             waste_coordinates = waste.oem_offset_move_coordinates(
                 x_high_limit=90263,
@@ -12139,9 +12175,8 @@ class Serial206OemInitializationProvider:
                 "operation": "Thread.Sleep(100)", "discarded_return": False,
                 "result": {"ok": True, "milliseconds": 100},
             })
-            if type(queried.get("tip_exists")) is not bool:
-                raise RuntimeError("park_tip_state_not_authoritative")
-            if queried["tip_exists"] is True:
+            post_query_collection = self._park_collection_state()
+            if post_query_collection["tip_exists"] is True:
                 return {
                     "ok": False,
                     "delivery_attempted": True,
@@ -12190,19 +12225,15 @@ class Serial206OemInitializationProvider:
                     "source_children": source_children,
                     "source_anchor": "ControlLib.parkGantry:7093-7112",
                 }
-            publisher = getattr(self, "_deck_semantic_state_publisher", None)
-            if not callable(publisher):
-                raise RuntimeError("deck_semantic_state_publisher_not_bound")
-            published_tip_state = publisher(
-                source_operation="pipette_owner",
-                source_command_id=f"parkGantry:{time.time_ns()}",
-                updates={"tip_loaded": False, "tip_dirty": False, "tip_location": -1},
-                ownership_generation=int(semantics["ownership_generation"]),
-                board_epoch_4=int(semantics["board_epoch_4"]),
-                board_epoch_5=int(semantics["board_epoch_5"]),
-            )
-            if not isinstance(published_tip_state, Mapping):
-                raise RuntimeError("deck semantic state publisher returned malformed state")
+            # The independently receipted final query already owns this
+            # no-tip transition. Do not mint a second, unlinked clock-named
+            # publication that defeats the parent command's revision fence.
+            published_tip_state = self._deck_semantic_state_reader()
+            if (not isinstance(published_tip_state, Mapping)
+                    or published_tip_state.get("tip_loaded") is not False
+                    or published_tip_state.get("tip_dirty") is not False
+                    or published_tip_state.get("tip_location") != -1):
+                raise RuntimeError("park_tip_query_semantic_publication_unavailable")
 
         script_move = getattr(self.primitives, "oem_initialize_motion_scriptmove_to_waste", None)
         if not callable(script_move):

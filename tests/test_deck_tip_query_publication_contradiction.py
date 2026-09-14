@@ -244,7 +244,9 @@ def test_warm_invalid_prefix_never_overwrites_current_owner(query_rig, monkeypat
     else:
         assert after == before
     if fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale', 'reader', 'reader_replaced', 'interrupt'):
-        assert park_option(rig)['enabled']  # invalid observation is not invented contradiction
+        # MachineStatus stays unchanged; distinct collection source cannot
+        # manufacture verified absence from malformed/default channel returns.
+        assert not park_option(rig)['enabled']
 
 
 @pytest.mark.parametrize('failure', ['publisher', 'receipt'])
@@ -272,9 +274,9 @@ def test_recording_failure_is_not_motor_reference_recovery(query_rig, monkeypatc
         assert detail['deck_state_publication']['status'] == 'blocked'
         opened = reopen(rig, detail['receipt_id'])
         assert opened['receipt']['result']['ok'] is False
-    # No new motor reset/latch is authorized. This retained-owner behavior is
-    # reported as a storage/admission limit, NOT a successful positive handoff.
-    assert park_option(rig)['enabled']
+    # No motor reset/latch: collection presence or unresolved receipt owns
+    # this refusal independently of the unchanged MachineStatus mirror.
+    assert not park_option(rig)['enabled']
 
 
 def submit_named(rig, target, key):
@@ -371,7 +373,7 @@ def test_sqlite_publication_failure_rolls_back_without_motor_reset(query_rig):
     assert calls == [0,1,2,3] * 2
     api._collect_and_publish_hardware_snapshot(['axes', 'latch'], reason='isolated-storage-limit-assessment')
     action = catalog_action(app)
-    assert next(row for row in action['destination_options'] if row['target'] == 'LOC_PARK')['enabled']
+    assert not next(row for row in action['destination_options'] if row['target'] == 'LOC_PARK')['enabled']
     prior_motion = list(primitive.calls)
     admitted = TestClient(app).post('/operator/v2/actions/oem.deck.move_to_location', json={
         'schema_version': 'bioxp.operator_action_request.v2',
@@ -379,9 +381,9 @@ def test_sqlite_publication_failure_rolls_back_without_motor_reset(query_rig):
         'expected_ownership_generation': provider.generation_provider(),
         'expected_board_epoch_by_board': action['expected_board_epoch_by_board'],
         'inputs': {'target': 'LOC_PARK', 'camera_offset': False}})
-    assert admitted.status_code == 200, admitted.text
+    assert admitted.status_code == 409, admitted.text
     assert not any(row[0] == 'move' for row in primitive.calls[len(prior_motion):])
-    assert TestClient(app).get('/operator/v2/actions/receipts/' + admitted.json()['command_id']).json()['status'] == 'queued'
+
     if os.environ.get('DECK_TEST_OUTPUT'):
         Path(os.environ['DECK_TEST_OUTPUT'] + '.storage-limit.json').write_text(json.dumps({
             'query': result, 'retained_owner': before, 'admission': admitted.json(),

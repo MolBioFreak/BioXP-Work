@@ -599,6 +599,12 @@ def request_digest(payload: Mapping[str, Any]) -> str:
         )
         if key in payload
     }
+    if isinstance(identity.get("source_identity"), Mapping):
+        # An observed collection revision is execution evidence, not request
+        # intent. Keep every existing release/source replay fence unchanged.
+        identity["source_identity"] = {
+            k: v for k, v in identity["source_identity"].items() if k != "collection_owner"
+        }
     return hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
 
 
@@ -1294,6 +1300,9 @@ def _expected_foundation_connection() -> sqlite3.Connection:
 def verify_runtime_audit_foundation(connection: sqlite3.Connection) -> None:
     expected = _expected_foundation_connection()
     try:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 10:
+            from .oem_pipette_schema_v10 import apply
+            apply(expected)
         expected_manifest = _foundation_schema_manifest(expected)
     finally:
         expected.close()
