@@ -7350,7 +7350,7 @@ class OperatorCommandPlane:
             delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
             provider_results = response.get("provider_results") if isinstance(response, Mapping) else None
             source_noop = bool(
-                ok and response.get("source_branch") == "park"
+                ok
                 and response.get("delivery_attempted") is False
                 and response.get("semantic_state_committed") is True
                 and isinstance(provider_results, list) and len(provider_results) == 1
@@ -7358,7 +7358,19 @@ class OperatorCommandPlane:
                 and provider_results[0].get("source_noop") is True
                 and provider_results[0].get("ok") is True
                 and provider_results[0].get("delivery_attempted") is False
-                and provider_results[0].get("source_anchor") == "ControlLib.parkGantry:7073-7076"
+                and (
+                    (response.get("source_branch") == "park"
+                     and provider_results[0].get("source_anchor") == "ControlLib.parkGantry:7073-7076")
+                    # Ordinary moveTo can finish at the exact current XY.
+                    # Its provider's terminal no-op proof is not a motor
+                    # completion event; the aggregate correctly remains false.
+                    # Semantic publication alone is never sufficient.
+                    or (response.get("source_branch") == "ordinary"
+                        and response.get("controller_command_acknowledged") is False
+                        and response.get("controller_completion_verified") is False
+                        and provider_results[0].get("controller_command_acknowledged") is False
+                        and provider_results[0].get("controller_completion_verified") is True)
+                )
             )
             completed = bool(ok and response.get("semantic_state_committed") is True
                              and (response.get("controller_completion_verified") is True or source_noop))
@@ -7394,7 +7406,8 @@ class OperatorCommandPlane:
                 status=terminal_status,
                 payload=terminal_payload,
                 source_noop=source_noop,
-                source_noop_reason="already_at_park" if source_noop else None,
+                source_noop_reason=("already_at_park" if response.get("source_branch") == "park"
+                                    else "already_at_target") if source_noop else None,
                 remote_acknowledged=bool(ok and not source_noop),
                 controller_acknowledged=bool(isinstance(response, Mapping) and response.get("controller_command_acknowledged") is True),
                 claimed=claimed,
