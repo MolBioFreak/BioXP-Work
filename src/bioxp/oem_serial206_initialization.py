@@ -4792,7 +4792,7 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("deck_gripper_observation_not_authoritative")
         return position["position"] < 50
 
-    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool) -> dict[str, Any]:
+    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False) -> dict[str, Any]:
         """Read only facts consumed by the offset overload; no bootstrap writes.
 
         The retained machine object remains its source owner for facts that have
@@ -4809,7 +4809,9 @@ class Serial206OemInitializationProvider:
         revision = semantic.get("semantic_state_revision")
         if type(revision) is not int or revision < 0:
             raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
-        if semantic.get("ambiguity_state") != "none":
+        if semantic.get("ambiguity_state") != "none" and not (
+            allow_recovery and semantic.get("ambiguity_state") in {"ambiguous", "recovery_required"}
+        ):
             raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
         provenance = semantic.get("transition_provenance")
         if not isinstance(provenance, Mapping):
@@ -8128,7 +8130,7 @@ class Serial206OemInitializationProvider:
             # Eligible bootstrap is itself an owner mutation; bind the new epoch.
             cache_epoch = self._deck_authority_cache_epoch
         gripper_confirmed = self._deck_gripper_confirmed()
-        semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
+        semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                     if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
         clean_path = None if scope == "offset.v1" else self._clean_path_from_tip_tray_authority(
             ownership_generation=int(semantic["ownership_generation"]),
@@ -8220,7 +8222,7 @@ class Serial206OemInitializationProvider:
                         consumed_state_digest=semantic.get("consumed_state_digest"))
         final_stamps = self.deck_owner_authority_stamps()
         final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
-        final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
+        final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                           if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery))
         if (
             final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
@@ -8241,9 +8243,6 @@ class Serial206OemInitializationProvider:
 
     def deck_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
         """Bind exact semantic observation to current controller coordinates; never infer nearest."""
-        snapshot = self.deck_authority_snapshot(
-            expected_generation=expected_generation, _allow_recovery=True
-        )
         reader = getattr(self.primitives, "read_deck_semantic_observation", None)
         if not callable(reader):
             raise RuntimeError("deck_reconciliation_semantic_observation_unavailable")
@@ -8260,6 +8259,13 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("deck_reconciliation_semantic_location_unavailable") from exc
         if type(well) is not int or not 0 <= well <= 95:
             raise RuntimeError("deck_reconciliation_semantic_well_unavailable")
+        # Recovery observes the exact current calibrated target; it does not
+        # execute a move or require the predecessor location to exist. The
+        # target selects the same dependency scope as normal admission. All
+        # independent reference, generation, epoch, latch and CAS fences remain.
+        snapshot = self.deck_authority_snapshot(
+            expected_generation=expected_generation, _allow_recovery=True, target=location
+        )
         if (
             observed.get("controller_position_observation_id")
             != snapshot["controller_position_observation_id"]
