@@ -2899,6 +2899,19 @@ class Serial206ProductionPrimitiveAdapter:
             and type(requested) is int
             and before.get("position") == requested
         )
+        if source_noop and result.get("source_operation") == "ClassControlInterface.moveXY":
+            xy_requested = result.get("requested")
+            after = result.get("after")
+            noop_terminal = bool(
+                result.get("source_noop_verified") is True
+                and isinstance(before, Mapping) and isinstance(xy_requested, Mapping)
+                and isinstance(after, Mapping)
+                and all(type(before.get(axis)) is int
+                        and type(xy_requested.get(axis)) is int
+                        and type(after.get(axis)) is int
+                        and before[axis] == xy_requested[axis] == after[axis]
+                        for axis in ("x", "y"))
+            )
         acknowledged = result.get("controller_command_acknowledged") is True
         if not source_noop and not acknowledged:
             acknowledged = self._x_tmcl_success(result.get("ack")) or self._x_tmcl_success(
@@ -3400,6 +3413,7 @@ class Serial206ProductionPrimitiveAdapter:
             "pseudo_z_home": pseudo,
             "operations": _json_safe(results),
             "controller_child_evidence": _json_safe(child_evidence),
+            "source_noop": controller_completion_verified and not commanded,
             "controller_command_acknowledged": controller_acknowledged,
             "controller_completion_verified": controller_completion_verified,
             "controller_terminal_state_verified": controller_completion_verified,
@@ -3535,6 +3549,10 @@ class Serial206ProductionPrimitiveAdapter:
                 "branch": "source_noop",
                 "source_noop": True,
                 "noop_reason": "both_axes_already_at_target",
+                "source_noop_verified": all(
+                    present[axis] and self._x_readback_verified(before_rows[axis], requested[axis])
+                    for axis in ("x", "y")
+                ),
                 "command_issued": False,
                 "physical_motion_commanded": False,
                 "controller_command_acknowledged": False,
@@ -3578,12 +3596,20 @@ class Serial206ProductionPrimitiveAdapter:
                 isinstance(command, Mapping) and command.get("ok") is True
                 for command in commands.values()
             )
+            # Consume real child completion before bounding nested diagnostics.
+            child_evidence = [self._oem_controller_child_evidence(command)
+                              for command in commands.values()]
+            terminal = bool(source_calls_completed and child_evidence) and all(
+                row["terminal"] and (row["acknowledged"] or not row["command_required"])
+                for row in child_evidence
+            )
             receipt.update({
                 "ok": source_calls_completed,
                 "branch": "near_axis_sequential",
                 "launch_order": list(commands),
                 "commands": _json_safe(commands),
                 "source_calls_completed": source_calls_completed,
+                "controller_terminal_state_verified": terminal,
                 "command_issued": any(
                     isinstance(command, Mapping) and command.get("command_issued") is True
                     for command in commands.values()
@@ -10510,8 +10536,12 @@ class Serial206OemInitializationProvider:
             source_context="ClassControlInterface.btnLOC1_Click",
         )
         ok = isinstance(result, Mapping) and result.get("ok") is True
+        source_noop = bool(ok and result.get("source_noop") is True
+                           and result.get("controller_completion_verified") is True)
         return {
             "ok": ok,
+            "source_noop": source_noop,
+            "delivery_attempted": not source_noop,
             "provider_command_id": result.get("command_id") if isinstance(result, Mapping) else None,
             "controller_command_acknowledged": bool(
                 isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True

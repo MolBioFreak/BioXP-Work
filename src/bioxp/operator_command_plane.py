@@ -5553,7 +5553,7 @@ class OperatorCommandStore:
 
         initial_fence = resampled_fence(authority)
 
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             semantic = conn.execute("SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
             command = conn.execute(
