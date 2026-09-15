@@ -239,27 +239,86 @@ class ReferenceStateStore:
 
     def mark_referenced_many(self, commands: Iterable[MarkAxisReferencedCommand]) -> dict[str, Any]:
         commands = list(commands)
+        return self._run_mutation([command.axis for command in commands],
+            lambda candidate: self._referenced_candidate(candidate, commands))
 
-        def apply(candidate: dict[str, AxisReferenceRecord]) -> list[AxisReferenceRecord]:
-            proposed: list[AxisReferenceRecord] = []
-            for command in commands:
-                axis = _axis_value(command.axis)
-                previous = candidate.get(axis)
-                record = AxisReferenceRecord(
-                    axis=axis,
-                    state=ReferenceState.REFERENCED,
-                    state_version=1 if previous is None else previous.state_version + 1,
-                    origin_position_steps=int(command.position_steps),
-                    source=_normalize_text(command.source, fallback="manual"),
-                    note=_normalize_optional_text(command.note),
-                    updated_at=_utc_now(),
-                    last_motion_kind=_normalize_optional_text(command.motion_kind),
-                )
-                candidate[axis] = record
-                proposed.append(record)
-            return proposed
+    @staticmethod
+    def _referenced_candidate(candidate, commands):
+        proposed = []
+        for command in commands:
+            axis = _axis_value(command.axis)
+            previous = candidate.get(axis)
+            record = AxisReferenceRecord(
+                axis=axis, state=ReferenceState.REFERENCED,
+                state_version=1 if previous is None else previous.state_version + 1,
+                origin_position_steps=int(command.position_steps),
+                source=_normalize_text(command.source, fallback="manual"),
+                note=_normalize_optional_text(command.note), updated_at=_utc_now(),
+                last_motion_kind=_normalize_optional_text(command.motion_kind))
+            candidate[axis] = record
+            proposed.append(record)
+        return proposed
 
-        return self._run_mutation([command.axis for command in commands], apply)
+    def publish_referenced_many_atomic(self, commands, *, expected_rows, transaction):
+        """Join a canonical runtime transaction without a second SQLite writer.
+
+        This owner retains its normal lock, serializer, versioning and write
+        authorization. The runtime owner must commit/rollback the entire unit.
+        Its callbacks must not re-enter this store while the scope is held.
+        """
+        commands = list(commands)
+        with self._lock, self._state_file_lock(fcntl.LOCK_EX):
+            if self._database_path is None or self._disk_state_dirty or self._authority_untrusted:
+                raise ReferenceStateAuthorityError("reference_state_authority_untrusted")
+            loaded = self._read_rows_from_disk_locked()
+            if loaded is None:
+                raise ReferenceStateAuthorityError("reference_state_disk_unreadable")
+            if {a: loaded.get(a, AxisReferenceRecord(axis=a, state=ReferenceState.UNKNOWN)).to_payload()
+                for a in expected_rows} != expected_rows:
+                raise ReferenceStateAuthorityError("reference_state_changed_before_publication")
+            connection = self._open_database()
+            try:
+                before = connection.execute("SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key='reference_state'").fetchone()
+            finally:
+                connection.close()
+            candidate = dict(loaded)
+            proposed = self._referenced_candidate(candidate, commands)
+            rows = {r.axis: r.to_payload() for r in proposed}
+            encoded = json.dumps({"version": 1, "rows": {a: r.to_payload() for a, r in candidate.items()}},
+                                 sort_keys=True, separators=(",", ":"))
+            def write_reference(db):
+                if not db.in_transaction:
+                    raise ReferenceStateAuthorityError("reference_publication_requires_transaction")
+                database = next(r[2] for r in db.execute("PRAGMA database_list") if r[1] == "main")
+                if Path(database).resolve() != self._database_path.resolve():
+                    raise ReferenceStateAuthorityError("reference_publication_database_mismatch")
+                current = db.execute("SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key='reference_state'").fetchone()
+                if (tuple(current) if current is not None else None) != (tuple(before) if before is not None else None):
+                    raise ReferenceStateAuthorityError("reference_state_changed_at_writer")
+                allowed = [True]
+                db.create_function("reference_write_allowed", 0, lambda: int(allowed[0]))
+                self._authority_write_depth += 1
+                try:
+                    self._write_reference_payload(db, encoded)
+                finally:
+                    allowed[0] = False
+                    self._authority_write_depth -= 1
+                return rows
+            # A rejected/rolled-back coordinated write leaves existing authority
+            # intact. Unlike an uncertain standalone write it need not poison it.
+            result = transaction(write_reference)
+            verified = self._read_rows_from_disk_locked()
+            if verified is None or not self._records_equal(candidate, verified):
+                self._disk_state_dirty = self._authority_untrusted = True
+                raise ReferenceStateAuthorityError("reference_state_durable_reread_mismatch")
+            self._rows = verified
+            return result
+
+    @staticmethod
+    def _write_reference_payload(connection, encoded):
+        connection.execute(
+            "INSERT INTO reference_state_authority(authority_key,payload_json,payload_sha256,updated_at) VALUES(?,?,?,?) ON CONFLICT(authority_key) DO UPDATE SET payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256,updated_at=excluded.updated_at",
+            ("reference_state", encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()))
 
     def mark_desynced(self, command: MarkAxisDesyncedCommand) -> dict[str, Any]:
         result = self.mark_desynced_many([command])
@@ -533,10 +592,7 @@ class ReferenceStateStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 self._authority_write_depth += 1
-                connection.execute(
-                    "INSERT INTO reference_state_authority(authority_key,payload_json,payload_sha256,updated_at) VALUES(?,?,?,?) ON CONFLICT(authority_key) DO UPDATE SET payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256,updated_at=excluded.updated_at",
-                    ("reference_state", encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-                )
+                self._write_reference_payload(connection, encoded)
                 connection.execute("COMMIT")
             finally:
                 self._authority_write_depth = max(0, self._authority_write_depth - 1)

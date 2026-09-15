@@ -145,7 +145,7 @@ def native_home():
 
 
 @pytest.fixture
-def homed_replacement(stopped_failure, monkeypatch):
+def homed_replacement(stopped_failure, monkeypatch, request):
     app, provider, primitive, refs, root, leaf, data = stopped_failure
     # New process owners over the same copied durable database. Only the
     # hardware leaf persists across managed replacement; no authority is copied.
@@ -204,11 +204,19 @@ def homed_replacement(stopped_failure, monkeypatch):
     leaf.motor_oem_go_home = lambda *a, **kw: native_home()
     z = provider.execute_z_intent('manual_home', expected_generation=generation, idempotency_key='fresh-z-home')
     assert z['ok'] is True, z
-    x = provider.execute_x_intent('manual_panel_home', {'command_id':'fresh-x-home'})
-    assert x['ok'] is True, x
-    provider._load_state()  # existing native X reference publication
-    yr = y.home('manual_panel', command_id='fresh-y-home')
-    assert yr['reference_published'] is True, yr
+    if getattr(request, 'param', None) == 'paired_only':
+        # Board-invalidated references: no standalone X/Y Home may seed the
+        # authority that the paired producer is responsible for establishing.
+        from bioxp.services.reference_service import MarkAxisDesyncedCommand
+        refs.mark_desynced_many([MarkAxisDesyncedCommand(a,
+            reason='offline board-invalidation starting state') for a in ('x', 'y')])
+        x = yr = None
+    else:
+        x = provider.execute_x_intent('manual_panel_home', {'command_id':'fresh-x-home'})
+        assert x['ok'] is True, x
+        provider._load_state()  # existing native X reference publication
+        yr = y.home('manual_panel', command_id='fresh-y-home')
+        assert yr['reference_published'] is True, yr
     data['home_results'] = {'x':x, 'y':yr, 'z':z}
     yield app, provider, primitive, refs, root, leaf, data
     app.state.operator_command_plane.stop()

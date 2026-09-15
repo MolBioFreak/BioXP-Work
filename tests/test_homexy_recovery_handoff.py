@@ -67,7 +67,7 @@ def test_paired_native_home_reaches_existing_recovery_without_another_home(paire
     assert outcome['result']['source_return'] == {'x': -30, 'y': 7}
     assert outcome['result']['home'] == data['paired_native']
     assert all(row['position_after_sethome'] is None for row in data['paired_native'].values())
-    assert outcome['state'] == 'prepared_unreferenced'  # no invented generic reference promotion
+    assert outcome['state'] == 'referenced_ready'  # separate acknowledged post-zero proof
     calls = copy.deepcopy(data['paired_calls'])
     recovered = reconcile(paired_home)
     assert recovered.status_code == 200, recovered.text
@@ -191,17 +191,18 @@ def test_canonical_homexy_dispatch_recovery_and_warm_consumers(paired_home):
 
 def test_paired_child_recording_failure_and_replay(paired_home, monkeypatch):
     app, provider, primitive, refs, root, leaf, data = paired_home
-    append = provider.state_store.append_serial206_receipts_atomic
+    append = provider.state_store._append_serial206_receipts_locked
     def fail(_rows):
         raise OSError('isolated paired receipt recording failure')
-    monkeypatch.setattr(provider.state_store, 'append_serial206_receipts_atomic', fail)
+    monkeypatch.setattr(provider.state_store, '_append_serial206_receipts_locked', fail)
     result = run_home(paired_home)
     assert result['ok'] is False
-    assert 'receipt_publication_exception' in result['failure']
+    assert result['failure'] == 'homexy_reference_publication_pending'
+    assert result['authority_receipt']['result']['ok'] is True
     assert provider.state_store.read_serial206_receipt('y', 'paired-home') is None
     calls = copy.deepcopy(data['paired_calls'])
     assert reconcile(paired_home).status_code == 409
-    monkeypatch.setattr(provider.state_store, 'append_serial206_receipts_atomic', append)
+    monkeypatch.setattr(provider.state_store, '_append_serial206_receipts_locked', append)
     replay = run_home(paired_home)
     assert replay['ok'] is True and replay['replayed'] is True
     assert data['paired_calls'] == calls

@@ -4569,13 +4569,15 @@ class OEMRuntimeStore:
             raise ValueError("serial-206 current authority exceeds encoded-byte ceiling")
         return stored_payload
 
-    def write_oem_serial206_initialization_state(self, state: dict[str, Any]) -> dict[str, Any]:
+    def write_oem_serial206_initialization_state(self, state: dict[str, Any], *, expected_current=None) -> dict[str, Any]:
         """Append current authority, dropping only noncritical logging attachments."""
         stored_payload = self._serial206_current_payload(state)
         with self._lock:
             with self._authority_write():
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
+                    if expected_current is not None and self.read_oem_serial206_initialization_state() != expected_current:
+                        raise RuntimeError("serial206_authority_changed_at_writer")
                     self._append_serial206_authority_snapshot_locked(stored_payload)
                     self._db.execute("COMMIT")
                 except Exception:
@@ -4663,6 +4665,38 @@ class OEMRuntimeStore:
                 )
 
         return [payload for _stream, payload, _row in normalized]
+
+    def finalize_homexy_reference(self, write_reference, prepare, finish, *, verify, command_id):
+        """Commit common references, Y/X authority and paired proof together.
+
+        The reference owner holds its normal publication scope. Callbacks are
+        metadata-only and must not re-enter that owner or perform transport.
+        """
+        with self._lock, self._authority_write():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self.read_oem_serial206_initialization_state()
+                prepare(current)
+                references = write_reference(self._db)
+                self._db.execute(
+                    "UPDATE serial206_axis_authority SET lifecycle_state='referenced_ready', "
+                    "reference_state='referenced', origin_position_steps=0, observed_position_steps=0, "
+                    "last_receipt_id=?, state_version=state_version+1, updated_at=? WHERE axis='y'",
+                    (command_id, time.time()))
+                state, receipt = finish(current, references)
+                if receipt.get("intent") != "home_xy" or receipt.get("status") != "completed" or receipt.get("command_id") != command_id:
+                    raise ValueError("completed paired Home receipt required")
+                y_receipt = {**receipt, "stream": "y", "child_axis": "y",
+                             "recovery_home": receipt["child_receipts"]["y"]["recovery_home"]}
+                self._append_serial206_receipts_locked((("x", receipt), ("y", y_receipt)))
+                self._append_serial206_authority_snapshot_locked(self._serial206_current_payload(state))
+                verify()
+                self._db.execute("COMMIT")
+                return state, receipt
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
 
     def finalize_xy_failure(self, prepare, *, command_id, requested=None, observed=None):
         """Publish failed XY children, observation and authority as one unit.
