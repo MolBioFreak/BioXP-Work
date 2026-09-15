@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from tests.test_deck_tip_query_publication import query_rig, named_move
 from tests.test_deck_scoped_integration import installed_retained, catalog_action
 from tests.test_deck_scoped_authority import retained_rig, qualify_test_references
+from tests.test_deck_tip_query_publication_contradiction import assert_park_unready, park_authority, assert_worker_refused
 
 
 def collect(rig, *, automatic=False):
@@ -32,9 +33,15 @@ def test_cold_collection_commits_query_without_inventing_location(query_rig):
     assert after['current_location'] == before['current_location']
     assert result['pipette_collection']['tip_exists'] is False
     park = next(r for r in catalog_action(app)['destination_options'] if r['target'] == 'LOC_PARK')
-    assert not park['enabled']  # A query cannot invent a named-position predecessor.
+    assert park['enabled']  # Intent is selectable; a query cannot invent a predecessor.
+    assert_park_unready(query_rig, 'deck_semantic_state_not_authoritative:location_revision')
     collect(query_rig)
     assert calls == [0, 1, 2, 3]  # No eager repeated query while owners remain valid.
+    app.state.operator_command_plane.start()
+    assert_worker_refused(query_rig, 'cold-park-active-worker',
+                          'deck_semantic_state_not_authoritative:location_revision')
+    assert calls == [0, 1, 2, 3]
+    assert app.state.operator_command_plane.store.deck_semantic_state() == after
 
 
 def test_after_real_worker_move_collection_restores_park_and_persists(query_rig):
@@ -44,6 +51,7 @@ def test_after_real_worker_move_collection_restores_park_and_persists(query_rig)
     assert calls == [0, 1, 2, 3]
     park = next(r for r in catalog_action(app)['destination_options'] if r['target'] == 'LOC_PARK')
     assert park['enabled'], park
+    assert park_authority(query_rig)['current_location_id'] == 'LOC_OC'
     observation = result['park_tip_observation']
     script = ('import json,sys; from tests.test_deck_tip_query_publication import reopen; '
               'print(json.dumps(reopen(sys.argv[1],sys.argv[2],int(sys.argv[3]))))')

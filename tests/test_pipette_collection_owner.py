@@ -14,7 +14,7 @@ from bioxp.pipette.receipts import PipetteReceiptError
 from tests.test_deck_tip_query_publication import query_rig, query, named_move
 from tests.test_deck_scoped_integration import installed_retained
 from tests.test_deck_scoped_authority import retained_rig
-from tests.test_deck_tip_query_publication_contradiction import warm_no_tip, invoke, park_option, submit_named
+from tests.test_deck_tip_query_publication_contradiction import warm_no_tip, invoke, assert_park_unready, assert_worker_refused, submit_named
 
 
 def state(rig):
@@ -104,7 +104,8 @@ def test_pending_real_receipt_write_refusal_cannot_publish_ram(query_rig):
     with pytest.raises(PipetteReceiptError, match='pending'): state(rig)
     result = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='pending-owner-test')
     assert result['pipette_collection']['available'] is False
-    assert not park_option(rig)['enabled']
+    refusal = assert_park_unready(rig, 'pipette_collection_receipt_pending')
+    assert_worker_refused(rig, 'pending-receipt-active-worker', refusal)
 
 
 def test_async_receiver_does_not_wait_on_sql_writer_and_midcommit_drift(query_rig):

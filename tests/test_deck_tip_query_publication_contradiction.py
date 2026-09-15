@@ -123,11 +123,42 @@ def park_option(rig):
     return next(row for row in action['destination_options'] if row['target'] == 'LOC_PARK')
 
 
+def park_authority(rig):
+    """Normal collection followed by passive scoped authority, not intent flags."""
+    assert park_option(rig)['enabled']  # Named intent is independent of readiness.
+    before = list(rig[2].calls)
+    try:
+        return rig[1].deck_authority_cached_snapshot(
+            expected_generation=rig[1].generation_provider(), target='LOC_PARK')
+    finally:
+        assert rig[2].calls == before  # Cached consumer performs no physical queries.
+
+
+def assert_park_unready(rig, match):
+    with pytest.raises(RuntimeError, match=match) as refused:
+        park_authority(rig)
+    # Require fresh negative evidence, not an absent or expired cache.
+    started, epoch, outcome = rig[1]._deck_authority_scoped_cache['park.full']
+    assert epoch is rig[1]._deck_authority_cache_epoch
+    assert time.monotonic() - started < 15.0
+    assert outcome is refused.value
+    assert str(refused.value) == match
+    if os.environ.get('DECK_TEST_OUTPUT'):
+        with Path(os.environ['DECK_TEST_OUTPUT'] + '.physical-refusals.jsonl').open('a') as out:
+            out.write(json.dumps({'test': os.environ.get('PYTEST_CURRENT_TEST'),
+                'reason': str(refused.value), 'age_s': time.monotonic() - started}) + '\n')
+    return str(refused.value)
+
+
 def warm_no_tip(rig):
     named_move(rig)
     query(rig)
-    assert park_option(rig)['enabled']
-    rig[1].deck_authority_cached_snapshot(expected_generation=rig[1].generation_provider(), target='LOC_PARK')
+    authority = park_authority(rig)
+    assert authority['dependency_scope'] == 'full'
+    assert authority['current_location_id'] == 'LOC_OC'
+    assert authority['tip_loaded'] is False
+    assert authority['latch_status'] is True and authority['machine_latch_closed'] is True
+    assert authority['collection_tip_state']['tip_exists'] is False
     return rig[0].state.operator_command_plane.store.deck_semantic_state()
 
 
@@ -179,7 +210,8 @@ def test_failed_positive_prefix_is_durable_not_complete_and_recovers_only_on_new
     for key in ('current_location', 'current_well', 'ambiguity_state', 'clean_path', 'movable_plate_locations'):
         assert after[key] == before[key]
     assert after['transition_provenance']['upstream_source_command_id'] == detail['command_id']
-    assert not park_option(rig)['enabled']
+    assert_park_unready(rig, 'deck_semantic_state_not_authoritative:tip_dirty')
+    assert_worker_refused(rig, 'failed-prefix-'+fault, 'deck_semantic_state_not_authoritative:tip_dirty')
     opened = reopen(rig, detail['receipt_id'])
     assert opened['semantic'] == after
     assert isinstance(opened['park_blocker'], str) and 'tip_dirty' in opened['park_blocker']
@@ -199,7 +231,7 @@ def test_failed_positive_prefix_is_durable_not_complete_and_recovers_only_on_new
     wire.update(data=[[32,96,48] for _ in range(4)], correlated=True)
     fresh = query(rig, key='explicit-recovery-'+fault)
     assert fresh['command_id'] != detail['command_id']
-    assert park_option(rig)['enabled']
+    assert park_authority(rig)['collection_tip_state']['tip_exists'] is False
     assert reopen(rig, detail['receipt_id'])['receipt'] == opened['receipt']
 
 
@@ -246,7 +278,9 @@ def test_warm_invalid_prefix_never_overwrites_current_owner(query_rig, monkeypat
     if fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale', 'reader', 'reader_replaced', 'interrupt'):
         # MachineStatus stays unchanged; distinct collection source cannot
         # manufacture verified absence from malformed/default channel returns.
-        assert not park_option(rig)['enabled']
+        assert_park_unready(rig, 'pipette_collection_reader_or_stop_changed'
+                            if fault in ('reader', 'reader_replaced', 'interrupt')
+                            else 'pipette_collection_state_not_authoritative')
 
 
 @pytest.mark.parametrize('failure', ['publisher', 'receipt'])
@@ -276,10 +310,11 @@ def test_recording_failure_is_not_motor_reference_recovery(query_rig, monkeypatc
         assert opened['receipt']['result']['ok'] is False
     # No motor reset/latch: collection presence or unresolved receipt owns
     # this refusal independently of the unchanged MachineStatus mirror.
-    assert not park_option(rig)['enabled']
+    assert_park_unready(rig, 'deck_semantic_state_not_authoritative:clean_path'
+                        if failure == 'publisher' else 'pipette_collection_receipt_pending')
 
 
-def submit_named(rig, target, key):
+def submit_named(rig, target, key, *, expected_status='completed'):
     from bioxp import api
     app, provider = rig[:2]
     client = TestClient(app)
@@ -294,12 +329,38 @@ def submit_named(rig, target, key):
     assert response.status_code == 200, response.text
     path = '/operator/v2/actions/receipts/' + response.json()['command_id']
     end = time.monotonic()+5
+    result = {}
     while time.monotonic() < end:
         result = client.get(path).json()
         if result['status'] not in ('queued', 'dispatched', 'issued_pending'): break
         time.sleep(.01)
-    assert result['status'] == 'completed', json.dumps(client.get(path+'?detail=true').json())
+    assert result['status'] == expected_status, json.dumps(client.get(path+'?detail=true').json())
     return client.get(path+'?detail=true').json()
+
+
+def assert_worker_refused(rig, key, reason):
+    """Real POST -> active worker -> native executor rejection -> durable GET."""
+    before = len(rig[2].calls)
+    receipt = submit_named(rig, 'LOC_PARK', key, expected_status='failed')
+    assert receipt['terminal'] is True
+    assert [row['to_status'] for row in receipt['transitions']] == ['queued', 'dispatched', 'failed']
+    terminal = receipt['source_receipt']['terminal_evidence']
+    assert terminal['detail'] == reason
+    assert terminal['delivery_attempted'] is False
+    assert receipt['physical_effect_verified'] is False
+    assert receipt['transport_exchanges'] == []
+    leaves = rig[2].calls[before:]
+    assert all(row[0] in ('home', 'position', 'xyz', 'latch') for row in leaves), leaves
+    script = ('import json,sys; from tests.test_deck_scoped_integration import fresh_process_receipts; '
+              'print(json.dumps(fresh_process_receipts(sys.argv[1],sys.argv[2])))')
+    durable = json.loads(subprocess.check_output([sys.executable, '-c', script, str(rig[4]),
+        receipt['command_id']], text=True))
+    assert durable['detail'] == receipt
+    assert durable['compact']['status'] == 'failed'
+    if os.environ.get('DECK_TEST_OUTPUT'):
+        Path(os.environ['DECK_TEST_OUTPUT'] + '.' + key + '.worker.json').write_text(json.dumps({
+            'receipt': receipt, 'fresh_process': durable, 'physical_leaf_calls': leaves}, indent=2))
+    return receipt
 
 
 def test_no_tip_query_then_real_queued_park_and_next_named_command(query_rig, monkeypatch):
@@ -339,13 +400,11 @@ def test_no_tip_query_then_real_queued_park_and_next_named_command(query_rig, mo
 
 
 def test_sqlite_publication_failure_rolls_back_without_motor_reset(query_rig):
-    """Actual SQLite writer failure; retain rather than hide admission limits."""
+    """Actual SQLite refusal: intent accepted, active worker denies delivery."""
     import sqlite3
-    from bioxp import api
     rig = query_rig
     before = warm_no_tip(rig)
     app, provider, primitive, references, root, receipts, calls, wire, _ = rig
-    app.state.operator_command_plane.stop()
     reference_before = references.snapshot(('x', 'y', 'z', 'g'))['rows']
     denied = []
     def deny_tip_update(action, table, column, database, trigger):
@@ -371,20 +430,15 @@ def test_sqlite_publication_failure_rolls_back_without_motor_reset(query_rig):
     assert reopen(rig, result['receipt_id'])['semantic'] == before
     assert not provider._deck_authority_scoped_cache
     assert calls == [0,1,2,3] * 2
-    api._collect_and_publish_hardware_snapshot(['axes', 'latch'], reason='isolated-storage-limit-assessment')
-    action = catalog_action(app)
-    assert not next(row for row in action['destination_options'] if row['target'] == 'LOC_PARK')['enabled']
-    prior_motion = list(primitive.calls)
-    admitted = TestClient(app).post('/operator/v2/actions/oem.deck.move_to_location', json={
-        'schema_version': 'bioxp.operator_action_request.v2',
-        'idempotency_key': 'storage-limit-admission-not-executed',
-        'expected_ownership_generation': provider.generation_provider(),
-        'expected_board_epoch_by_board': action['expected_board_epoch_by_board'],
-        'inputs': {'target': 'LOC_PARK', 'camera_offset': False}})
-    assert admitted.status_code == 409, admitted.text
-    assert not any(row[0] == 'move' for row in primitive.calls[len(prior_motion):])
+    refusal = assert_park_unready(rig, 'deck_semantic_state_not_authoritative:clean_path')
+    prior_motion = len(primitive.calls)
+    admitted = assert_worker_refused(rig, 'storage-limit-active-worker', refusal)
+    leaf_calls = primitive.calls[prior_motion:]
+    assert not any(row[0] == 'move' for row in leaf_calls)
+    assert app.state.operator_command_plane.store.deck_semantic_state() == before
+    assert references.snapshot(('x', 'y', 'z', 'g'))['rows'] == reference_before
 
     if os.environ.get('DECK_TEST_OUTPUT'):
         Path(os.environ['DECK_TEST_OUTPUT'] + '.storage-limit.json').write_text(json.dumps({
-            'query': result, 'retained_owner': before, 'admission': admitted.json(),
+            'query': result, 'retained_owner': before, 'physical_refusal': refusal, 'worker_receipt': admitted, 'leaf_calls': leaf_calls,
             'references_unchanged': True, 'park_executed': False}, indent=2))
