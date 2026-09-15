@@ -114,14 +114,24 @@ def test_real_named_primitive_postmove_fence(retained_rig, monkeypatch, invalida
         assert raw[-1]['branch'] == 'confirmed_gripper_no_tip_moveXY'
         assert raw[-1]['source_return_code'] == 0
         cause = str(exc.__cause__)
+        chain = []
+        current = exc
+        while current is not None:
+            chain.append({'type': type(current).__name__, 'message': str(current)})
+            current = current.__cause__
         if os.environ.get('DECK_TEST_OUTPUT'):
             Path(os.environ['DECK_TEST_OUTPUT'] + '.' + str(invalidation) + '.json').write_text(json.dumps(
-                {'cause': cause, 'raw': raw, 'moves': leaf.moves, 'references': references.snapshot(('x', 'y', 'z', 'g'))}, indent=2))
+                {'cause': cause, 'chain': chain, 'provider_results': exc.provider_results,
+                 'raw': raw, 'moves': leaf.moves, 'references': references.snapshot(('x', 'y', 'z', 'g'))}, indent=2))
         assert exc.controller_completion_verified is True
+        assert exc.delivery_attempted is True
+        assert exc.controller_command_acknowledged is True
+        assert exc.provider_results[-1]['controller_completion_verified'] is True
         assert invalidation is not None, cause
         assert store.deck_semantic_state()['current_location'] is None
         assert store.deck_semantic_state()['pseudo_z_home'] == 500
         assert cause.endswith('_changed')
+        assert not isinstance(exc.__cause__, DeckExecutionFailure)
         return
     assert invalidation is None, 'independent authority change was not fenced'
     assert result['ok'] and result['semantic_state_committed'] and result['controller_completion_verified']

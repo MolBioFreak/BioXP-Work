@@ -57,8 +57,20 @@ def test_finalization_lock_order(retained_rig, monkeypatch, scenario):
     args=dict(command_id=admitted['command_id'],target='LOC_OC',camera_offset=False,expected_ownership_generation=3,expected_board_epoch_by_board=epochs)
     if scenario=='owner_drift':
         with pytest.raises((DeckExecutionFailure,RuntimeError)) as exc:execute(**args)
+        chain=[];current=exc.value
+        while current is not None:
+            chain.append({'type':type(current).__name__,'message':str(current)})
+            current=current.__cause__
+        Path(os.environ['DECK_TEST_OUTPUT']+'.owner-drift.json').write_text(json.dumps(
+            {'chain':chain,'provider_results':exc.value.provider_results,
+             'delivery_attempted':exc.value.delivery_attempted,
+             'controller_completion_verified':exc.value.controller_completion_verified},indent=2))
+        assert exc.value.delivery_attempted is True
+        assert exc.value.controller_completion_verified is True
+        assert exc.value.provider_results[-1]['controller_completion_verified'] is True
         assert str(exc.value)=='semantic_commit_failed:RuntimeError'
         assert any(str(c)=='deck_execution_ownership_generation_changed' for c in (exc.value.__cause__,exc.value.__context__))
+        assert str(exc.value.__cause__)=='deck_execution_ownership_generation_changed'
         with sqlite3.connect(root/'bioxp_runtime.db') as c:
             assert c.execute('SELECT semantic_state_committed FROM operator_plane_deck_commands WHERE command_id=?',(admitted['command_id'],)).fetchone()[0]==0
     else:

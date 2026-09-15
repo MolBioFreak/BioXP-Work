@@ -25,7 +25,7 @@ def test_queued_native_failure_evidence(installed_retained, retained_rig, monkey
     plane = app.state.operator_command_plane
     store = plane.store
     generation = int(provider.generation_provider())
-    assert catalog_action(app)['enabled'] is False
+    assert catalog_action(app)['enabled'] is True  # intent admission, not reference readiness
     qualify_test_references(references)
     snapshot = api._collect_and_publish_hardware_snapshot(['axes', 'latch'],
         reason='isolated-native-fault')

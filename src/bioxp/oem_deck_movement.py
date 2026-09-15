@@ -2193,19 +2193,24 @@ def make_deck_command_executor(
                 for row in [*carried, result]:
                     if isinstance(row, Mapping) and row not in observed:
                         observed.append(dict(row))
-                raise DeckExecutionFailure(
-                    str(exc),
-                    delivery_attempted=delivery_attempted,
-                    controller_command_acknowledged=bool(
-                        getattr(exc, "controller_command_acknowledged", False)
-                        or any(row.get("controller_command_acknowledged") is True for row in observed)),
-                    controller_completion_verified=bool(
-                        getattr(exc, "controller_completion_verified", False)
-                        or any(row.get("controller_completion_verified") is True for row in observed)),
-                    hardware_postcondition_verified=bool(
-                        getattr(exc, "hardware_postcondition_verified", False)
-                        or any(row.get("hardware_postcondition_verified") is True for row in observed)),
-                    provider_results=observed,
-                ) from exc
+                # Enrich an already classified failure without inserting a
+                # redundant wrapper between its caller and the actual cause.
+                failure = exc if isinstance(exc, DeckExecutionFailure) else DeckExecutionFailure(
+                    str(exc), delivery_attempted=delivery_attempted,
+                )
+                failure.delivery_attempted = bool(delivery_attempted)
+                failure.controller_command_acknowledged = bool(
+                    getattr(exc, "controller_command_acknowledged", False)
+                    or any(row.get("controller_command_acknowledged") is True for row in observed))
+                failure.controller_completion_verified = bool(
+                    getattr(exc, "controller_completion_verified", False)
+                    or any(row.get("controller_completion_verified") is True for row in observed))
+                failure.hardware_postcondition_verified = bool(
+                    getattr(exc, "hardware_postcondition_verified", False)
+                    or any(row.get("hardware_postcondition_verified") is True for row in observed))
+                failure.provider_results = [dict(row) for row in observed]
+                if failure is exc:
+                    raise
+                raise failure from exc
 
     return execute
