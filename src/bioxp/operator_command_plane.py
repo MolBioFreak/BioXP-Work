@@ -4820,10 +4820,6 @@ class OperatorCommandStore:
                     "replacement": "/operator/v2/methods",
                 },
             )
-        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
-            blocker = self.deck_recovery_blocker()
-            if blocker is not None:
-                raise HTTPException(status_code=409, detail={"error": blocker})
         inputs = _validate_inputs(action_id, request.get("inputs", {}))
         expected_generation = int(request["expected_ownership_generation"])
         schema_version = str(request.get("schema_version") or COMMAND_SCHEMA)
@@ -4839,12 +4835,14 @@ class OperatorCommandStore:
         if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
-            actual_generation = int(state.get("ownership_generation") or -1)
-            if expected_generation != actual_generation:
-                raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
-            if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
-                raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch", "requested": requested_board_epochs, "observed": observed_board_epochs})
+            raw_board_epochs = request.get("expected_board_epoch_by_board")
+            if (not isinstance(raw_board_epochs, Mapping) or set(raw_board_epochs) != {"4", "5"}
+                    or any(type(value) is not int or value < 0 for value in raw_board_epochs.values())):
+                raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch"})
             expected_board_epochs = dict(requested_board_epochs)
+            # A valid original admission observed exactly the requested epochs.
+            # Reconstruct that immutable binding, not today's owner, for replay.
+            observed_board_epochs = dict(requested_board_epochs)
         canonical_request = {
             "schema_version": schema_version,
             "operation_kind": "command",
@@ -4874,6 +4872,16 @@ class OperatorCommandStore:
                 replay_response = self._command_response(current_row) if current_row is not None else replay
                 replay_response["idempotent_replay"] = True
                 return replay_response
+            if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+                blocker = self._deck_recovery_blocker(conn)
+                if blocker is not None:
+                    raise HTTPException(status_code=409, detail={"error": blocker})
+                actual_generation = int(state.get("ownership_generation") or -1)
+                if expected_generation != actual_generation:
+                    raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
+                observed_board_epochs = _active_board_epochs(state, action_id)
+                if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
+                    raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch", "requested": requested_board_epochs, "observed": observed_board_epochs})
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(inputs).encode("utf-8")) + len(_canonical(canonical_request).encode("utf-8"))
             if count >= COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:
@@ -4885,6 +4893,7 @@ class OperatorCommandStore:
                 "command_id": command_id, "method_id": None, "method_sequence": None,
                 "stream_sequence": sequence, "action_id": action_id, "requested_inputs": inputs,
                 "effective_inputs": effective, "status": "queued", "ownership_generation": expected_generation,
+                "expected_board_epoch_by_board": expected_board_epochs,
                 "queued_at": _now(),
             }
             conn.execute(
@@ -5026,7 +5035,7 @@ class OperatorCommandStore:
         expanded: list[tuple[str, dict[str, Any]]] = []
         for step in request.get("steps", []):
             action_id = str(step.get("action_id") or "")
-            if action_id not in ALLOWED_ACTIONS:
+            if action_id not in ALLOWED_ACTIONS or action_id == "oem.deck.move_to_location":
                 raise HTTPException(status_code=422, detail={"error": "method_action_not_allowed", "action_id": action_id})
             inputs = _validate_inputs(action_id, step.get("inputs", {}))
             repeat = int(step.get("repeat", 1))
@@ -5308,7 +5317,25 @@ class OperatorCommandStore:
             active = self.connection.execute("SELECT * FROM operator_plane_commands WHERE status IN ('dispatched','issued_pending') ORDER BY stream_sequence LIMIT 1").fetchone()
             row = self.connection.execute("SELECT stream_sequence FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted') ORDER BY stream_sequence LIMIT 1").fetchone()
             safety = self.connection.execute("SELECT global_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
-            return {"schema_version": "bioxp.operator_queue.v1", "pending_count": count, "pending_bytes": bytes_used, "capacity_commands": COMMAND_CAPACITY, "capacity_bytes": COMMAND_BYTES_CAPACITY, "active_command": self._command_response(active) if active else None, "next_stream_sequence": int(row[0]) if row else None, "global_safety_epoch": int(safety["global_epoch"]) if safety is not None else 0}
+            pending = self.connection.execute(
+                "SELECT c.command_id,c.stream_sequence,m.state AS status,c.method_id,c.queued_at "
+                "FROM operator_plane_commands c JOIN serial206_movement_commands m USING(command_id) "
+                "WHERE m.state IN ('queued','dispatched','issued_pending','interrupting') "
+                "ORDER BY c.stream_sequence"
+            ).fetchall()
+            resources: dict[str, list[str]] = {}
+            for resource in self.connection.execute(
+                "SELECT r.command_id,r.resource_key FROM serial206_command_resources r "
+                "JOIN serial206_movement_commands m USING(command_id) "
+                "WHERE m.state IN ('queued','dispatched','issued_pending','interrupting') "
+                "ORDER BY r.resource_key"
+            ):
+                resources.setdefault(str(resource["command_id"]), []).append(str(resource["resource_key"]))
+            items = [{"command_id": str(item["command_id"]), "sequence": int(item["stream_sequence"]),
+                "status": str(item["status"]),
+                "method_id": item["method_id"], "resource_keys": resources.get(str(item["command_id"]), []),
+                "accepted_at": float(item["queued_at"])} for item in pending]
+            return {"items": items, "schema_version": "bioxp.operator_queue.v1", "pending_count": count, "pending_bytes": bytes_used, "capacity_commands": COMMAND_CAPACITY, "capacity_bytes": COMMAND_BYTES_CAPACITY, "active_command": self._command_response(active) if active else None, "next_stream_sequence": int(row[0]) if row else None, "global_safety_epoch": int(safety["global_epoch"]) if safety is not None else 0}
 
     def transitions(self, *, after: int, limit: int) -> dict[str, Any]:
         limit = min(max(int(limit), 1), 200)
@@ -7552,6 +7579,8 @@ class OperatorCommandPlane:
             if body_bytes is not None and body_bytes > 1_048_576:
                 raise HTTPException(status_code=413, detail="BioXP method document exceeds the 1 MiB limit")
             body = request.model_dump()
+            if any(step.get("action_id") == "oem.deck.move_to_location" for step in body.get("steps", [])):
+                raise HTTPException(status_code=422, detail={"error": "method_action_not_allowed", "action_id": "oem.deck.move_to_location"})
             state = self._state()
             assessments: list[Mapping[str, Any]] = []
             for step in body.get("steps", []):

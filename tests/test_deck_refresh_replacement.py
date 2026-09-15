@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from tests.test_deck_scoped_authority import rig, retained_rig, qualify_test_references
 from tests.test_deck_scoped_integration import installed_retained, catalog_action
-from tests.test_deck_cache_owner_fences import wait_enabled
+from tests.test_deck_cache_owner_fences import wait_ready
 
 
 def export_status(name, payload):
@@ -83,7 +83,7 @@ def test_warm_catalog_survives_replacement_until_real_outcome(installed_retained
     catalog_action(app)
     qualify_test_references(references)
     assert api._collect_and_publish_hardware_snapshot(['axes', 'latch'], reason='warm')['deck_authority']['enabled']
-    wait_enabled(app, True)
+    wait_ready(app, True)
     epoch = provider._deck_authority_cache_epoch
     entered, release = threading.Event(), threading.Event()
     active = [False]
@@ -117,12 +117,12 @@ def test_warm_catalog_survives_replacement_until_real_outcome(installed_retained
         worker.join(5)
     assert not worker.is_alive() and results
     active[0] = False
-    # Named queued-intent availability is not physical readiness. A missing
-    # sample no longer has to disable submission; test its actual owner.
+    # Intent admission and physical readiness are distinct. Verify the
+    # authoritative owner and its passive public projection without queries.
     assert provider.deck_observation_freshness(
         expected_generation=provider.generation_provider())['available'] is (end in {'success', 'yield'})
     calls = list(primitive.calls)
-    catalog_action(app)
+    wait_ready(app, end in {'success', 'yield'})
     assert primitive.calls == calls
 
 
@@ -260,7 +260,7 @@ def test_idle_refresh_after_real_offline_command_recovers_warm_catalog(installed
     catalog_action(app)
     qualify_test_references(references)
     api._collect_and_publish_hardware_snapshot(list(api.DEFAULT_HARDWARE_SNAPSHOT_DOMAINS), reason='warm')
-    wait_enabled(app, True)
+    wait_ready(app, True)
     client = TestClient(app)
     submitted = client.post('/operator/v2/actions/oem.deck.move_to_location', json=request(provider, 'offline-post-command-refresh'))
     assert submitted.status_code == 200, submitted.text
@@ -270,9 +270,10 @@ def test_idle_refresh_after_real_offline_command_recovers_warm_catalog(installed
     assert app.state.operator_command_plane.store.wait_for_command_workers([command_id], timeout=2)
     assert provider.deck_observation_freshness(
         expected_generation=provider.generation_provider())['available'] is False
+    wait_ready(app, False)
     monkeypatch.setattr(api, '_hardware_collectors', lambda tester, **kwargs: {})
     refreshed = api._collect_and_publish_hardware_snapshot(list(api.DEFAULT_HARDWARE_SNAPSHOT_DOMAINS), reason='idle', automatic=True)
     assert refreshed['deck_authority']['enabled']
     assert provider.deck_observation_freshness(
         expected_generation=provider.generation_provider())['available'] is True
-    wait_enabled(app, True)
+    wait_ready(app, True)

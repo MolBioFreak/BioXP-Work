@@ -106,7 +106,7 @@ def catalog_action(app):
 def test_actual_collection_cached_catalog_and_durable_dispatch(installed_retained):
     from bioxp import api
     app, provider, primitive, references, root = installed_retained
-    assert catalog_action(app)['enabled'] is False
+    assert catalog_action(app)['enabled'] is True  # intent availability, not fresh execution proof
     qualify_test_references(references)
     collected = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='isolated-explicit-refresh')
     assert collected['deck_authority']['enabled'] is True, json.dumps(collected['deck_authority'])
@@ -117,14 +117,14 @@ def test_actual_collection_cached_catalog_and_durable_dispatch(installed_retaine
     assert primitive.calls == before
     assert catalog['enabled'] is True
     park = next(r for r in catalog['destination_options'] if r['target'] == 'LOC_PARK')
-    assert park['enabled'] is False and 'deck_bootstrap_semantic_location_unavailable' in park['disabled_reason']
+    assert park['enabled'] is True  # Park's full predecessor is checked by its executor
+    with pytest.raises(RuntimeError, match='deck_bootstrap_semantic_location_unavailable'):
+        provider.deck_authority_snapshot(expected_generation=int(provider.generation_provider()), target='LOC_PARK')
     assert all(r['enabled'] for r in catalog['destination_options'] if r['target'] != 'LOC_PARK')
     client = TestClient(app)
     body = {'schema_version': 'bioxp.operator_action_request.v2', 'idempotency_key': 'installed-first',
         'expected_ownership_generation': int(provider.generation_provider()), 'expected_board_epoch_by_board': catalog['expected_board_epoch_by_board'],
         'inputs': {'target': 'LOC_OC', 'camera_offset': False}}
-    rejected = client.post('/operator/v2/actions/oem.deck.move_to_location', json={**body, 'inputs': {'target': 'LOC_PARK', 'camera_offset': False}})
-    assert rejected.status_code == 409, rejected.text
     admitted = client.post('/operator/v2/actions/oem.deck.move_to_location', json=body)
     assert admitted.status_code == 200, admitted.text
     command_id = admitted.json()['command_id']
@@ -170,14 +170,15 @@ def test_actual_park_noop_fresh_process_export(installed_retained, retained_rig)
     app, provider, primitive, references, root = installed_retained
     # Settle actual cold lifecycle projection before supplying fresh isolated
     # reference evidence, as the operator must do on the live owner.
-    assert catalog_action(app)['enabled'] is False
+    assert catalog_action(app)['enabled'] is True  # intent availability, not fresh execution proof
     qualify_test_references(references)
     collected = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='isolated-scoped-refresh')
     assert collected['deck_authority']['enabled'] is True, json.dumps(collected['deck_authority'])
     scoped_catalog = catalog_payload(app)
     action = next(r for r in scoped_catalog['actions'] if r['action_id'] == 'oem.deck.move_to_location')
     assert next(r for r in action['destination_options'] if r['target'] == 'LOC_OC')['enabled']
-    assert not next(r for r in action['destination_options'] if r['target'] == 'LOC_PARK')['enabled']
+    assert next(r for r in action['destination_options'] if r['target'] == 'LOC_PARK')['enabled']
+    assert not next(r for r in collected['deck_authority']['destination_options'] if r['target'] == 'LOC_PARK')['enabled']
     # Park qualification has an explicit complete test predecessor, not recovery
     # of the retained null case and not a new production construction event.
     _, _, runtime, _, _, _ = retained_rig

@@ -84,7 +84,7 @@ def query(rig, key='tip-query'):
 def test_real_query_publishes_nonzero_owner_and_full_no_tip_park(query_rig):
     from bioxp import api
     app, provider, primitive, references, root, receipts, calls, wire, transport = query_rig
-    assert catalog_action(app)['enabled'] is False
+    assert catalog_action(app)['enabled'] is True  # finite intent remains selectable before execution readiness
     qualify_test_references(references)
     api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='isolated-before-query')
     store = app.state.operator_command_plane.store

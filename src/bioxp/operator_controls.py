@@ -2604,7 +2604,7 @@ def install_operator_control_plane(
     app.state.operator_preview_state_reader = preview_state_reader
     app.state.operator_invoke_state_reader = invoke_state_reader
 
-    def deck_contract(state: Mapping[str, Any], *, target: str | None = None) -> dict[str, Any]:
+    def deck_contract(state: Mapping[str, Any], *, target: str | None = None, intent_only: bool = False, snapshots: Mapping[str, Any] | None = None, before_query=None) -> dict[str, Any]:
         disabled_reason: str | None = None
         recovery_disabled_reason: str | None = None
         raw_maintenance = state.get("maintenance")
@@ -2666,23 +2666,41 @@ def install_operator_control_plane(
                 catalog = DeckCatalog.from_position_table(table)
             except Exception as exc:
                 disabled_reason = _deck_authority_diagnostic(exc)
-        if disabled_reason is None:
+        if disabled_reason is None and not intent_only:
             scoped = getattr(provider, "deck_scoped_authority_version", None) == 1
             available_snapshot = None
             scope_targets = (("full", "LOC_PARK"), ("offset.v1", "LOC_MS"))
             if target is not None:
                 destination = catalog.resolve(target)
                 scope_targets = (("full" if destination.branch == "park" else "offset.v1", target),)
+            from .hardware_status import HardwareCollectionPreempted
+            batch_reader = getattr(provider, "deck_authority_snapshots", None)
+            if snapshots is None and target is None and not _PASSIVE_OPERATOR_POLL.get() and callable(batch_reader):
+                # Explicit collection only, after host fault/binding checks.
+                # The provider independently validates both scopes while
+                # sharing physical observations within this single call.
+                batch = batch_reader(expected_generation=int(state.get("ownership_generation") or 0),
+                    before_query=before_query)
+                if not isinstance(batch, Mapping):
+                    raise RuntimeError("deck_authority_snapshots_malformed")
+                snapshots = batch
             for scope, sample_target in scope_targets:
                 try:
-                    reader_name = "deck_authority_cached_snapshot" if _PASSIVE_OPERATOR_POLL.get() else "deck_authority_snapshot"
-                    snapshot_reader = getattr(provider, reader_name, None)
-                    if not callable(snapshot_reader):
-                        raise RuntimeError("source_authority_missing:deck_authority_cached_snapshot")
-                    arguments = {"expected_generation": int(state.get("ownership_generation") or 0)}
-                    if scoped:
-                        arguments["target"] = sample_target
-                    snapshot = snapshot_reader(**arguments)
+                    if callable(before_query):
+                        before_query()
+                    if snapshots is not None and not _PASSIVE_OPERATOR_POLL.get():
+                        snapshot = snapshots[sample_target]
+                        if isinstance(snapshot, Exception):
+                            raise snapshot
+                    else:
+                        reader_name = "deck_authority_cached_snapshot" if _PASSIVE_OPERATOR_POLL.get() else "deck_authority_snapshot"
+                        snapshot_reader = getattr(provider, reader_name, None)
+                        if not callable(snapshot_reader):
+                            raise RuntimeError("source_authority_missing:deck_authority_cached_snapshot")
+                        arguments = {"expected_generation": int(state.get("ownership_generation") or 0)}
+                        if scoped:
+                            arguments["target"] = sample_target
+                        snapshot = snapshot_reader(**arguments)
                     if not isinstance(snapshot, Mapping):
                         raise RuntimeError("deck_authority_snapshot_malformed")
                     scope_reasons[scope] = None if snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True else "latch_not_closed"
@@ -2729,6 +2747,8 @@ def install_operator_control_plane(
                                 invalidate(reason="external_owner_projection_changed")
                             raise RuntimeError("deck_authority_cache_unavailable")
                     available_snapshot = available_snapshot or snapshot
+                except HardwareCollectionPreempted:
+                    raise
                 except Exception as exc:
                     scope_reasons[scope] = _deck_authority_diagnostic(exc)
             snapshot = available_snapshot
@@ -2760,10 +2780,15 @@ def install_operator_control_plane(
             for reason in [recovery_disabled_reason or scope_reasons.get(
                 "full" if row["branch_kind"] == "park" else "offset.v1", disabled_reason)]
         ]
+        from .operator_command_plane import _active_board_epochs
         board_epochs = (
-            {"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
-            if isinstance(snapshot, Mapping) else {}
+            _active_board_epochs(state, "oem.deck.move_to_location") if intent_only else
+            ({"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
+             if isinstance(snapshot, Mapping) else {})
         )
+        if intent_only and set(board_epochs) != {"4", "5"}:
+            disabled_reason = disabled_reason or "deck_board_epochs_not_authoritative"
+            options = [{**row, "enabled": False, "disabled_reason": disabled_reason} for row in options]
         return {
             "enabled": disabled_reason is None,
             "disabled_reason": disabled_reason,
@@ -2775,9 +2800,12 @@ def install_operator_control_plane(
             "destination_options": options,
         }
 
-    app.state.oem_deck_command_assessment = deck_contract
+    # Worker checks host fault/binding policy only. The leased executor owns
+    # coherent planning and final pre-TX physical readiness.
+    app.state.oem_deck_command_assessment = lambda state, *, target=None: deck_contract(
+        state, target=target, intent_only=True)
 
-    def collect_deck_authority() -> dict[str, Any]:
+    def collect_deck_authority(*, yield_requested=None) -> dict[str, Any]:
         """Explicit active collection only; never called by metadata polling.
 
         This is readiness collection, not command submission or logging queries.
@@ -2789,8 +2817,16 @@ def install_operator_control_plane(
         lease = getattr(provider, "movement_lease", None)
         if not callable(lease):
             return {"enabled": False, "disabled_reason": "canonical_deck_provider_incomplete"}
+        from .hardware_status import HardwareCollectionPreempted
+        def before_query():
+            if callable(yield_requested) and yield_requested():
+                raise HardwareCollectionPreempted("operator_action_pending")
         with lease():
-            return deck_contract(machine_state())
+            try:
+                before_query()
+                return deck_contract(machine_state(), before_query=before_query)
+            except HardwareCollectionPreempted:
+                return {"enabled": False, "disabled_reason": "operator_action_pending"}
 
     app.state.oem_deck_authority_collector = collect_deck_authority
 
@@ -3101,7 +3137,7 @@ def install_operator_control_plane(
         y_axis["active_command"] = next((row for row in y_rows if not row["terminal"]), None)
         y_axis["latest_compact_receipt"] = y_rows[0] if y_rows else None
         queue_projection = queue_projection or command_plane.store.queue()
-        queue_items = list(queue_projection.get("items") or [])
+        queue_items = list(queue_projection["items"])
         deck_state = command_plane.store.deck_semantic_state()
         deck_authority = deck_contract(state)
         deck = {
@@ -3134,7 +3170,7 @@ def install_operator_control_plane(
         for action in actions:
             if str(action["action_id"]) not in v2_canonical_action_ids:
                 continue
-            assessment = deck_contract(state) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
+            assessment = deck_contract(state, intent_only=True) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
             action_rows.append({
                 "action_id": str(action["action_id"]),
                 "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
@@ -3219,39 +3255,29 @@ def install_operator_control_plane(
         if action_id == "oem.deck.move_to_location":
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
-            # One fresh normal owner, never a backlog of command waiters.
-            # Preview reads keep their separate bounded metadata lifecycle.
-            if direct_requests or invoke_lock.locked():
-                raise HTTPException(409, detail={"error": "operator_action_busy",
-                    "physical_motion_commanded": False, "automatic_retry": False})
-            async with invoke_lock:
-                pending_named_admissions += 1
-                try:
-                    state = await admission_state_reader.read()
-                    assessment = await _drain_operator_work(asyncio.create_task(
-                        asyncio.to_thread(deck_contract, state, target=payload.inputs.get("target"))))
-                    selected = next((row for row in assessment["destination_options"] if row["target"] == payload.inputs.get("target")), None)
-                    if selected is None or selected["enabled"] is not True:
-                        assessment = {**assessment, "enabled": False, "disabled_reason": selected["disabled_reason"] if selected else "unknown_target"}
-                    if not assessment["enabled"]:
-                        raise HTTPException(
-                            status_code=409,
-                            detail={
-                                "error": assessment["disabled_reason"],
-                                "reason": assessment["disabled_reason"],
-                            },
-                        )
-                    # Once SQLite admission starts, drain its actual outcome
-                    # before releasing refresh priority, including on disconnect.
-                    admitted = await _drain_operator_work(asyncio.create_task(asyncio.to_thread(
-                        command_plane.store.admit_command,
-                        {**payload.model_dump(), "action_id": action_id},
-                        state=state,
-                        assessment=assessment,
-                    )))
-                    return _v2_compact_receipt(admitted)
-                finally:
-                    pending_named_admissions -= 1
+            request = {**payload.model_dump(), "action_id": action_id}
+            # Identity recovery is read-only with respect to physical work and
+            # precedes new-intent state/fault gates. The store validates the
+            # immutable original binding and returns its current receipt.
+            existing = await asyncio.to_thread(command_plane.store.idempotency, "command", payload.idempotency_key)
+            if existing is not None:
+                return _v2_compact_receipt(await asyncio.to_thread(
+                    command_plane.store.admit_command, request, state={}))
+            # SQLite owns the only queue. No invoke-lock waiter or controller
+            # sampling is needed to accept another deliberate named intent.
+            pending_named_admissions += 1
+            try:
+                state = await admission_state_reader.read()
+                assessment = await _drain_operator_work(asyncio.create_task(
+                    asyncio.to_thread(deck_contract, state, intent_only=True)))
+                if not assessment["enabled"]:
+                    raise HTTPException(409, detail={"error": assessment["disabled_reason"],
+                        "reason": assessment["disabled_reason"]})
+                admitted = await _drain_operator_work(asyncio.create_task(asyncio.to_thread(
+                    command_plane.store.admit_command, request, state=state)))
+                return _v2_compact_receipt(admitted)
+            finally:
+                pending_named_admissions -= 1
         action = by_id.get(action_id)
         if (
             isinstance(payload, OperatorActionRequestV2)

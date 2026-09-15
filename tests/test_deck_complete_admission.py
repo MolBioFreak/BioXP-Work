@@ -148,8 +148,9 @@ def test_cancelled_sqlite_admission_retains_owner_and_single_identity(installed_
     entered, release = threading.Event(), threading.Event()
     committed = []
     def delayed(*args, **kwargs):
-        entered.set()
-        assert release.wait(5)
+        if args[0]['idempotency_key'] == 'cancel-in-sqlite':
+            entered.set()
+            assert release.wait(5)
         result = original(*args, **kwargs)
         committed.append(result)
         return result
@@ -166,7 +167,7 @@ def test_cancelled_sqlite_admission_retains_owner_and_single_identity(installed_
             try:
                 assert not task.done() and app.state.operator_normal_action_active()
                 busy = await client.post(URL, json={**body, 'idempotency_key': 'competing'})
-                assert busy.status_code == 409 and busy.json()['detail']['error'] == 'operator_action_busy'
+                assert busy.status_code == 200, busy.text  # independent queued intent
                 # Actual metadata route stays reachable while SQLite work waits.
                 assert (await client.get('/operator/v2/control-catalog')).status_code == 200
             finally:
@@ -174,15 +175,16 @@ def test_cancelled_sqlite_admission_retains_owner_and_single_identity(installed_
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert not app.state.operator_normal_action_active()
-            assert len(committed) == 1 and not leaf.moves
+            assert len(committed) == 2 and not leaf.moves
             replay = await client.post(URL, json=body)
             assert replay.status_code == 200
-            assert replay.json()['command_id'] == committed[0]['command_id']
-            assert store.queue()['pending_count'] == 1
+            assert replay.json()['command_id'] == committed[1]['command_id']
+            assert store.queue()['pending_count'] == 2
     asyncio.run(scenario())
     app.state.operator_command_plane.start()
-    row = finish(TestClient(app), committed[0]['command_id'])
-    assert row['status'] == 'completed', row
+    for item in committed:
+        row = finish(TestClient(app), item['command_id'])
+        assert row['status'] == 'completed', row
 
 
 def test_live_reference_loss_during_read_is_not_cached_admission(installed_retained, retained_rig, monkeypatch):
@@ -201,7 +203,10 @@ def test_live_reference_loss_during_read_is_not_cached_admission(installed_retai
         release.set()
         thread.join(8)
     assert not thread.is_alive()
-    assert responses[0].status_code == 409, responses[0].text
+    assert responses[0].status_code == 200, responses[0].text
+    app.state.operator_command_plane.start()
+    row = finish(TestClient(app), responses[0].json()['command_id'])
+    assert row['status'] == 'failed', row
     assert not leaf.moves and not app.state.operator_command_plane.store.queue()['pending_count']
 
 

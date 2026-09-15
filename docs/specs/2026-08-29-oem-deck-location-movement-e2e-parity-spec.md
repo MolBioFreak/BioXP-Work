@@ -613,6 +613,23 @@ A location method also owns ordered child commands. Parent completion requires e
 
 The HTTP submission path returns after the SQLite admission transaction commits and supplies the durable command ID. It does not wait for planning or physical completion. Planning, dispatch, evidence capture, and terminalization run in the robot worker.
 
+Current named-intent interface clarification (isolated candidate, not final OEM
+orchestrator disposition): independently submitted named intents may overlap and
+continue while earlier native operations execute; there is no fixed batch count.
+The existing canonical SQLite stream orders **committed admissions**, not browser
+clicks whose transports can reorder. Intent admission/catalog availability checks
+finite inputs, immutable owner/board binding and genuine host fault policy, not
+current coordinates or readiness sampling. The leased native executor retains
+coherent planning and pre-transmission physical checks. Direct primitive busy
+semantics and independent addressed Stop/Abort remain distinct. Same-key recovery
+validates the original immutable binding; GET idempotency lookup followed by the
+current receipt is the response-loss recovery path. A 404 while admission remains
+in flight is not settled absence and never authorizes an automatic POST retry.
+Dashboard `command_queue` uses the existing `bioxp.oem_command_queue.v1` model;
+item `sequence` is immutable stream order, not the receipt transition sequence.
+Further OEM workflow-orchestrator investigation and final architecture disposition
+remain separate from this targeted queue-interface correction.
+
 ### 11.4 Global ordering
 
 Location movement uses the single global OEM movement stream. Per-axis queues cannot reorder a source sequence such as:
