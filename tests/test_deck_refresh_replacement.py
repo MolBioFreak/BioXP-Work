@@ -117,7 +117,13 @@ def test_warm_catalog_survives_replacement_until_real_outcome(installed_retained
         worker.join(5)
     assert not worker.is_alive() and results
     active[0] = False
-    wait_enabled(app, end in {'success', 'yield'})
+    # Named queued-intent availability is not physical readiness. A missing
+    # sample no longer has to disable submission; test its actual owner.
+    assert provider.deck_observation_freshness(
+        expected_generation=provider.generation_provider())['available'] is (end in {'success', 'yield'})
+    calls = list(primitive.calls)
+    catalog_action(app)
+    assert primitive.calls == calls
 
 
 def test_manual_refresh_alias_uses_normal_full_domains(installed_retained, monkeypatch):
@@ -262,8 +268,11 @@ def test_idle_refresh_after_real_offline_command_recovers_warm_catalog(installed
     command_id = submitted.json()['command_id']
     assert finish(client, command_id)['status'] == 'completed'
     assert app.state.operator_command_plane.store.wait_for_command_workers([command_id], timeout=2)
-    wait_enabled(app, False)
+    assert provider.deck_observation_freshness(
+        expected_generation=provider.generation_provider())['available'] is False
     monkeypatch.setattr(api, '_hardware_collectors', lambda tester, **kwargs: {})
     refreshed = api._collect_and_publish_hardware_snapshot(list(api.DEFAULT_HARDWARE_SNAPSHOT_DOMAINS), reason='idle', automatic=True)
     assert refreshed['deck_authority']['enabled']
+    assert provider.deck_observation_freshness(
+        expected_generation=provider.generation_provider())['available'] is True
     wait_enabled(app, True)

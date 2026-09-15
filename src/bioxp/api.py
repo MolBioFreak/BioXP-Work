@@ -4893,10 +4893,14 @@ def _query_motor(tester: BioXpTester, board: int, command: int, cmd_type: int, m
     return {"ack": ack, "value": None if ack is None else ack.get("value")}
 
 
-def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, Any]:
+def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName, *, before_query=None) -> dict[str, Any]:
     preset = _axis_preset(tester, axis)
     board, motor = int(preset["board"]), int(preset["motor"])
-    params = {param: _query_motor(tester, board, 6, param, motor) for param in (1, 3, 6, 7, 9, 10, 12, 13)}
+    params = {}
+    for param in (1, 3, 6, 7, 9, 10, 12, 13):
+        if before_query is not None:
+            before_query()
+        params[param] = _query_motor(tester, board, 6, param, motor)
     left, right = params[9]["value"], params[10]["value"]
     left_state = int(left) if type(left) is int else None
     right_state = int(right) if type(right) is int else None
@@ -4930,8 +4934,13 @@ def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, A
     }
 
 
-def _query_io_snapshot(tester: BioXpTester) -> dict[int, Any]:
-    return {channel: _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"] for channel in (0, 1, 2, 3)}
+def _query_io_snapshot(tester: BioXpTester, *, before_query=None) -> dict[int, Any]:
+    rows = {}
+    for channel in (0, 1, 2, 3):
+        if before_query is not None:
+            before_query()
+        rows[channel] = _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"]
+    return rows
 
 
 def _query_aux_snapshot(tester: BioXpTester, kind: str, *, before_query=None) -> dict[str, Any]:
@@ -4983,13 +4992,13 @@ def _hardware_collectors(tester: BioXpTester, *, before_query=None) -> dict[str,
     def axes(_: CollectionContext) -> dict[str, Any]:
         nonlocal axes_cache
         if axes_cache is None:
-            axes_cache = {axis.value: _query_axis_for_snapshot(tester, axis) for axis in AxisName}
+            axes_cache = {axis.value: _query_axis_for_snapshot(tester, axis, before_query=before_query) for axis in AxisName}
         return {"axes": [axis.value for axis in AxisName], "rows": axes_cache}
 
     def io() -> dict[int, Any]:
         nonlocal io_cache
         if io_cache is None:
-            io_cache = _query_io_snapshot(tester)
+            io_cache = _query_io_snapshot(tester, before_query=before_query)
         return io_cache
 
     def transport(_: CollectionContext) -> dict[str, Any]:
@@ -6545,7 +6554,11 @@ async def get_status():
 
 
 def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
-    """Require same-snapshot live transport ownership and every board reply."""
+    """Require newly collected transport ownership and every board reply."""
+    # Domain-preserving publication can include older observations. They are
+    # useful display evidence, not a new transport-readiness promotion.
+    if not {"transport", "boards"}.issubset(snapshot.get("requested_domains") or ()):
+        return False
     domains = snapshot.get("domains")
     if not isinstance(domains, Mapping):
         return False
@@ -6642,7 +6655,11 @@ def _collect_and_publish_hardware_snapshot(
         if yield_requested():
             result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
             return result
-        result["deck_authority"] = deck_collect()
+        result["deck_authority"] = (deck_collect(yield_requested=yield_requested)
+                                    if automatic else deck_collect())
+        if result["deck_authority"].get("disabled_reason") == "operator_action_pending":
+            result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+            return result
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
     if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
         return result
@@ -6665,7 +6682,14 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     active = getattr(app.state, "operator_normal_action_active", None)
     if automatic and (_tester_lock.locked() or (callable(active) and active())):
         return {"ok": False, "published": False, "reason": "operator_action_pending"}
-    requested = (payload or {}).get("domains") or list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS)
+    # Deck readiness need not reacquire still-fresh auxiliary diagnostics.
+    # Cold/expired diagnostics keep the normal full observation path: status
+    # consumers still require their own evidence, not invented empty rows.
+    # Subset publication preserves their original timestamps and expiry.
+    auxiliary_fresh = automatic and hardware_state.project("thermal", "chiller").get("cache_state") == "fresh"
+    default_domains = [domain for domain in DEFAULT_HARDWARE_SNAPSHOT_DOMAINS
+                       if not auxiliary_fresh or domain not in {"thermal", "chiller"}]
+    requested = (payload or {}).get("domains") or default_domains
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:

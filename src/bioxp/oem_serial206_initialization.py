@@ -8523,7 +8523,8 @@ class Serial206OemInitializationProvider:
         return copy.deepcopy(snapshot)
 
     def deck_authority_snapshot(
-        self, *, expected_generation: int, _allow_recovery: bool = False, target: str | None = None
+        self, *, expected_generation: int, _allow_recovery: bool = False, target: str | None = None,
+        before_query=None, _shared_observations=None,
     ) -> dict[str, Any]:
         scope = self._deck_dependency_scope(target)
         if not hasattr(self, "_deck_authority_cache_epoch"):
@@ -8532,15 +8533,44 @@ class Serial206OemInitializationProvider:
         started = time.monotonic()
         try:
             result = self._collect_deck_authority(
-                expected_generation=expected_generation, _allow_recovery=_allow_recovery, scope=scope)
+                expected_generation=expected_generation, _allow_recovery=_allow_recovery, scope=scope,
+                before_query=before_query, _shared_observations=_shared_observations)
         except Exception as exc:
+            from .hardware_status import HardwareCollectionPreempted
+            if isinstance(exc, HardwareCollectionPreempted):
+                raise
             if not _allow_recovery and epoch is self._deck_authority_cache_epoch:
                 self._deck_authority_scoped_cache[scope] = (started, epoch, exc)
             raise
         return result
 
+    def deck_authority_snapshots(self, *, expected_generation: int, before_query=None) -> dict[str, Any]:
+        """One leased readiness collection, independently validated finite scopes.
+
+        The caller holds movement_lease. Shared physical observations live only
+        for this call; neither a command pre-TX sample nor an older cache is used.
+        """
+        from .hardware_status import HardwareCollectionPreempted
+        shared: dict[str, Any] = {}
+        snapshots: dict[str, Any] = {}
+        # Park may publish the existing eligible semantic bootstrap. Collect it
+        # first so ordinary readiness is bound to that resulting owner epoch.
+        for target in ("LOC_PARK", "LOC_MS"):
+            if before_query is not None:
+                before_query()
+            try:
+                snapshots[target] = self.deck_authority_snapshot(
+                    expected_generation=expected_generation, target=target,
+                    before_query=before_query, _shared_observations=shared)
+            except HardwareCollectionPreempted:
+                raise
+            except Exception as exc:
+                snapshots[target] = exc
+        return snapshots
+
     def _collect_deck_authority(
-        self, *, expected_generation: int, _allow_recovery: bool, scope: str
+        self, *, expected_generation: int, _allow_recovery: bool, scope: str,
+        before_query=None, _shared_observations=None,
     ) -> dict[str, Any]:
         """Explicit active sample; a finite target selects dependencies, not fences."""
         cache_epoch = self._deck_authority_cache_epoch
@@ -8552,7 +8582,29 @@ class Serial206OemInitializationProvider:
         initial_latch = None
         reader = self._deck_semantic_state_reader
         current = reader() if callable(reader) else {}
+        shared = (_shared_observations or {}).get("snapshot")
+        if shared is not None:
+            stamps = self.deck_owner_authority_stamps()
+            refs = self.reference_store.snapshot(("x", "y", "z", "g")) if self.reference_store else {}
+            safety = shared["safety_epochs"]
+            if (
+                _shared_observations["epoch"] is not cache_epoch
+                or any(stamps[key] != shared[key] for key in stamps)
+                or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                       or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                       for axis, version in shared["reference_versions"].items())
+                or current.get("semantic_state_revision") != shared["machine_state_revision"]
+                or hashlib.sha256(json.dumps(current.get("transition_provenance"),
+                    sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                   != shared["semantic_state_provenance_digest"]
+                or safety["x"] != self._x_interrupt_epoch
+                or safety["y"] != int(getattr(self.y_provider, "interrupt_epoch", 0) or 0)
+                or safety["z"] != self._z_interrupt_epoch
+            ):
+                shared = None
         if scope != "offset.v1" and current.get("semantic_state_revision") == 0 and current.get("ambiguity_state") == "none":
+            if before_query is not None:
+                before_query()
             initial_latch = self._fresh_deck_latch_observation()
             if cache_epoch is not self._deck_authority_cache_epoch:
                 raise RuntimeError("deck_authority_changed_during_collection")
@@ -8560,7 +8612,10 @@ class Serial206OemInitializationProvider:
                 expected_generation=expected_generation, latch_observation=initial_latch)
             # Eligible bootstrap is itself an owner mutation; bind the new epoch.
             cache_epoch = self._deck_authority_cache_epoch
-        gripper_confirmed = self._deck_gripper_confirmed()
+            shared = None
+        if before_query is not None:
+            before_query()
+        gripper_confirmed = shared["gripper_confirmed"] if shared is not None else self._deck_gripper_confirmed()
         semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                     if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["clean_path"] is None) else self._clean_path_from_tip_tray_authority(
@@ -8600,10 +8655,20 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError(f"deck_reference_not_authoritative:{axis}")
             reference_versions[axis] = int(version)
 
-        coordinates = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
+        coordinates = {}
+        for axis in ("x", "y", "z"):
+            if before_query is not None:
+                before_query()
+            coordinates[axis] = shared["current_" + axis] if shared is not None else self.primitives._read_axis_position(axis)
         if any(type(value) is not int for value in coordinates.values()):
             raise RuntimeError("deck_controller_positions_not_authoritative")
-        latch = initial_latch if initial_latch is not None else self._fresh_deck_latch_observation()
+        if before_query is not None:
+            before_query()
+        latch = (shared if shared is not None else initial_latch if initial_latch is not None
+                 else self._fresh_deck_latch_observation())
+        if shared is not None:
+            captured_at = shared["captured_at"]
+            sample_started = _shared_observations["started"]
         if scope != "offset.v1" and (
             semantic["ownership_generation"] != observed_generation
             or semantic["board_epoch_4"] != board_epoch_4
@@ -8657,6 +8722,9 @@ class Serial206OemInitializationProvider:
         final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                           if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         if (
+            (shared is not None and any(snapshot[key] != shared[key] for key in (
+                "ownership_generation", "provider_owner_id", "board_epoch_4", "board_epoch_5",
+                "reference_versions", "safety_epochs", "machine_state_revision", "semantic_state_provenance_digest"))) or
             final_semantic.get("collection_tip_state") != semantic.get("collection_tip_state") or
             final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
             cache_epoch is not self._deck_authority_cache_epoch
@@ -8676,6 +8744,8 @@ class Serial206OemInitializationProvider:
             cached = (sample_started, cache_epoch, copy.deepcopy(snapshot))
             self._deck_authority_cache = cached
             self._deck_authority_scoped_cache[scope] = cached
+            if _shared_observations is not None:
+                _shared_observations.update(snapshot=snapshot, epoch=cache_epoch, started=sample_started)
         return snapshot
 
     def deck_home_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:

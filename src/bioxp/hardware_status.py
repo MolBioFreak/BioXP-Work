@@ -355,6 +355,18 @@ class HardwareStateOwner:
                         "ownership_epoch": self._epoch,
                         "snapshot": snapshot,
                     }
+                # Merge from the current publication under the owner lock, not
+                # a start-of-collection copy: invalidations during the queries
+                # must not resurrect unrequested rows. Their observation times
+                # and provenance remain unchanged; requested errors replace old
+                # successes just like requested observations do.
+                previous = self._snapshot
+                if previous is not None and previous.get("ownership_epoch") == epoch:
+                    snapshot["domains"] = {
+                        **{domain: row for domain, row in previous["domains"].items()
+                           if domain not in requested},
+                        **rows,
+                    }
                 for domain in requested:
                     if self._domain_revisions.get(domain, 0) != domain_revisions.get(domain, 0):
                         snapshot["domains"].pop(domain, None)
