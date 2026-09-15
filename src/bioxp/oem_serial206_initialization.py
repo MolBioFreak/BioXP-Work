@@ -1751,9 +1751,9 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": False,
                 "intent": "home_xy",
                 "command_issued": True,
-                "setup": _json_safe(setup),
+                "setup": copy.deepcopy(setup),
                 "setup_verified": setup_ok,
-                "home": _json_safe(results),
+                "home": copy.deepcopy(results),
                 "source_return": {
                     axis: results[axis].get("source_return_code")
                     if isinstance(results.get(axis), Mapping)
@@ -1790,7 +1790,7 @@ class Serial206ProductionPrimitiveAdapter:
         terminal_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_terminal_state_verified") is True for axis in ("x", "y"))
         home_proof_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y"))
         reference_publication_required = bool(home_proof_verified and all(self._x_readback_verified(positions.get(axis), 0) for axis in ("x", "y")))
-        receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": _json_safe(setup), "setup_verified": setup_ok, "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
+        receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": copy.deepcopy(setup), "setup_verified": setup_ok, "home": copy.deepcopy(results), "source_return": source_return, "home_errors": errors, "positions": copy.deepcopy(positions), "restore": copy.deepcopy(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
         return receipt
 
     def _z_oem_move_preflight(self) -> dict[str, Any]:
@@ -7282,13 +7282,61 @@ class Serial206OemInitializationProvider:
         if self._durable_serial206_receipt("x", command_id) is None:
             missing.append(("x", copy.deepcopy(dict(receipt))))
         if self._durable_serial206_receipt("y", command_id) is None:
-            missing.append(("y", {
+            child = {
                 **copy.deepcopy(dict(receipt)),
                 "stream": "y",
                 "child_axis": "y",
-            }))
+            }
+            home = receipt.get("child_receipts", {}).get("y", {}).get("recovery_home")
+            if isinstance(home, Mapping):
+                child["recovery_home"] = copy.deepcopy(home)
+            missing.append(("y", child))
         if missing:
             append_atomic(tuple(missing))
+
+
+    def _handoff_homexy_recovery(self, receipt, result, context):
+        """Bind native paired Home proof; no new motion, reference promotion or samples."""
+        if not context or receipt.get("status") != "completed" or receipt.get("source_noop"):
+            return
+        proof_fields = ("controller_command_acknowledged", "controller_terminal_state_verified",
+                        "controller_home_proof_verified")
+        children = result.get("home")
+        if (not isinstance(children, Mapping) or any(result.get(k) is not True for k in proof_fields)
+            or any(not isinstance(children.get(a), Mapping) or children[a].get("source_noop")
+                   or any(children[a].get(k) is not True for k in proof_fields) for a in ("x", "y"))):
+            return
+        try:
+            references = self.reference_store.snapshot(("x", "y"))["rows"]
+            if (references != context["references"]
+                or self._home_recovery_owner_id != context["owners"]["x"]
+                or getattr(self.y_provider, "_home_recovery_owner_id", None) != context["owners"]["y"]
+                or self.state_store.axis_interrupt_snapshot("y") != context["y_interrupt"]
+                or context["y_interrupt"]["active"]
+                or any(not context["owners"][a] or references[a].get("state") != "referenced"
+                       or references[a].get("origin_position_steps") != 0
+                       or type(references[a].get("state_version")) is not int for a in ("x", "y"))):
+                return
+            admitted = receipt["composite_authority"]["admitted"]
+            finished_at = time.time()
+            for axis in ("x", "y"):
+                receipt["child_receipts"][axis]["recovery_home"] = {
+                    "ownership_generation": admitted["generation"],
+                    "board_epoch_4": admitted["y"]["active_board_epoch"],
+                    "board_epoch_5": admitted["x"]["current_board_lifecycle_generation"],
+                    "owner_id": context["owners"][axis], "command_id": receipt["command_id"],
+                    "started_at": context["started_at"], "finished_at": finished_at,
+                    "reference_version": references[axis]["state_version"],
+                    "interrupt_epoch": (admitted["x"]["interrupt_epoch"] if axis == "x"
+                                        else context["y_interrupt"]["epoch"]),
+                }
+            receipt["recovery_home"] = copy.deepcopy(receipt["child_receipts"]["x"]["recovery_home"])
+        except Exception:
+            # Missing recovery metadata is not an OEM Home failure or permission
+            # to manufacture evidence. Ordinary recovery rejects its absence.
+            receipt.pop("recovery_home", None)
+            for axis in ("x", "y"):
+                receipt["child_receipts"][axis].pop("recovery_home", None)
 
     def _xy_exception_receipt(self, exc, *, lifecycle, values, intent, command_id, persist=True, generation=None):
         """Retain failed command facts separately from coordinate authority."""
@@ -7736,7 +7784,7 @@ class Serial206OemInitializationProvider:
                             "state": lifecycle.get("state"),
                             "failure": "homexy_replay_authority_or_request_mismatch",
                             "replayed": True,
-                            "authority_receipt": _json_safe(existing),
+                            "authority_receipt": copy.deepcopy(existing),
                         }
 
                     try:
@@ -7748,11 +7796,11 @@ class Serial206OemInitializationProvider:
                             "state": lifecycle.get("state"),
                             "failure": f"homexy_receipt_reconciliation_exception:{type(exc).__name__}:{exc}",
                             "replayed": True,
-                            "authority_receipt": _json_safe(existing),
+                            "authority_receipt": copy.deepcopy(existing),
                         }
                     replayed_result = dict(existing.get("result") or {})
                     replayed_result.setdefault("ok", existing.get("status") == "completed")
-                    replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing)})
+                    replayed_result.update({"replayed": True, "authority_receipt": copy.deepcopy(existing)})
                     return replayed_result
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
@@ -7773,6 +7821,17 @@ class Serial206OemInitializationProvider:
                     "reason": "recovered_oem_homexy_has_no_profile_or_reference_preflight",
                     "source_exact": True,
                 }
+                home_context = {}
+                try:
+                    home_context = {
+                        "references": self.reference_store.snapshot(("x", "y"))["rows"],
+                        "owners": {"x": self._home_recovery_owner_id,
+                                   "y": getattr(self.y_provider, "_home_recovery_owner_id", None)},
+                        "y_interrupt": self.state_store.axis_interrupt_snapshot("y"),
+                        "started_at": time.time(),
+                    }
+                except Exception:
+                    pass  # Do not add a reference-store precondition to native HomeXY.
                 active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
@@ -7786,7 +7845,7 @@ class Serial206OemInitializationProvider:
                     result = {
                         "ok": False,
                         "failure": "homexy_authority_changed_during_command",
-                        "primitive_result": _json_safe(result),
+                        "primitive_result": copy.deepcopy(result),
                     }
                 source_noop = bool(
                     result.get("ok") is True
@@ -7805,7 +7864,7 @@ class Serial206OemInitializationProvider:
                 else:
                     # Source completion is neither a physical attestation nor a
                     # fresh post-setHome readback. Neither gates the next OEM call.
-                    lifecycle.update({"state": "prepared_unreferenced" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if verified_success else _json_safe(result)})
+                    lifecycle.update({"state": "prepared_unreferenced" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if verified_success else copy.deepcopy(result)})
                 terminal_authority = self._xy_authority_snapshot(
                     lifecycle, validate=False
                 )
@@ -7829,19 +7888,20 @@ class Serial206OemInitializationProvider:
                     "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"),
                     "inputs": safe_inputs,
                     "status": "completed" if result.get("ok") is True else "failed",
-                    "result": _json_safe(result),
+                    "result": copy.deepcopy(result),
                     "composite_authority": {
                         "admitted": _json_safe(admitted_authority),
                         "terminal": _json_safe(terminal_authority),
                     },
                     "child_receipts": child_receipts,
                 }
+                self._handoff_homexy_recovery(receipt, result, home_context)
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
                 terminal_authority_saved = True
                 self._persist_xy_child_receipts(receipt)
-                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "authority_receipt": _json_safe(receipt)}
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": copy.deepcopy(result), "generation": generation, "authority_receipt": copy.deepcopy(receipt)}
             except Exception as exc:
                 if terminal_authority_saved:
                     return {
@@ -8506,16 +8566,34 @@ class Serial206OemInitializationProvider:
             or y_axis.get("prepared_board_epoch") != stamps["board_epoch_4"]):
             raise RuntimeError("deck_home_y_authority_unavailable")
         homes = {}
+        x_home = next((r for r in reversed(state["x_lifecycle"].get("receipts", []))
+                       if isinstance(r, Mapping) and isinstance(r.get("recovery_home"), Mapping)), {})
+        paired_y = None
+        if x_home.get("intent") == "home_xy":
+            # Both committed children must exist. Source success or an in-memory
+            # handoff alone cannot qualify a partial receipt write.
+            paired_y = self._durable_serial206_receipt("y", str(x_home.get("command_id")))
+            paired_x = self._durable_serial206_receipt("x", str(x_home.get("command_id")))
+            if (not isinstance(paired_x, Mapping) or not isinstance(paired_y, Mapping)
+                or paired_x.get("recovery_home") != x_home.get("recovery_home")
+                or paired_y.get("status") != "completed" or paired_y.get("intent") != "home_xy"
+                or not isinstance(paired_y.get("recovery_home"), Mapping)
+                or paired_y["recovery_home"] != x_home.get("child_receipts", {}).get("y", {}).get("recovery_home")):
+                raise RuntimeError("deck_home_paired_receipts_unavailable")
         for axis in ("x", "y", "z"):
             if axis == "y":
                 receipt = self._durable_serial206_receipt("y", str(y_axis.get("last_receipt_id"))) or {}
+                if paired_y is not None and paired_y["recovery_home"].get("reference_version") == versions["y"]:
+                    receipt = paired_y
                 owner = getattr(self.y_provider, "_home_recovery_owner_id", None)
                 interrupt = self.state_store.axis_interrupt_snapshot("y")
                 epoch = interrupt["epoch"]
                 active = interrupt["active"]
             else:
                 lifecycle = state[axis + "_lifecycle"]
-                if (lifecycle.get("state") != "referenced_ready"
+                paired_home = axis == "x" and paired_y is not None
+                allowed_states = {"referenced_ready", "prepared_unreferenced"} if paired_home else {"referenced_ready"}
+                if (lifecycle.get("state") not in allowed_states
                     or lifecycle.get("generation") != expected_generation
                     or lifecycle.get("board_lifecycle_generation") != stamps["board_epoch_5"]):
                     raise RuntimeError("deck_home_lifecycle_unavailable:" + axis)
