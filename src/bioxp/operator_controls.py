@@ -2393,28 +2393,21 @@ def install_operator_control_plane(
     def machine_state() -> dict[str, Any]:
         domain_names = ("transport", "boards", "axes", "range", "power", "interlock", "latch", "gripper", "thermal", "chiller", "pipette")
         domains: dict[str, Any] = {}
-        snapshot_id = None
-        snapshot_ids: set[str] = set()
-        freshness_rows: list[dict[str, Any]] = []
         # One coherent observation, not eleven copies of the same snapshot.
         projection = hardware_state.project(*domain_names, independent_domains=True)
+        snapshot_id = projection.get("snapshot_id") or None
+        projected_freshness = projection.get("freshness")
+        freshness: dict[str, Any] = (
+            dict(projected_freshness) if isinstance(projected_freshness, Mapping)
+            else {"state": "missing"}
+        )
+        age = freshness.get("age_s")
+        window = freshness.get("fresh_for_s")
+        freshness["age_s"] = float(age) if isinstance(age, (int, float)) else None
+        freshness["fresh_for_s"] = float(window) if isinstance(window, (int, float)) else 30.0
         for name in domain_names:
             row = (projection.get("domains") or {}).get(name)
             domains[name] = row if isinstance(row, Mapping) else {"status": "unknown", "observation": None, "error": "not reported"}
-            if projection.get("snapshot_id"):
-                snapshot_id = projection.get("snapshot_id")
-                snapshot_ids.add(str(snapshot_id))
-            freshness = projection.get("freshness")
-            if isinstance(freshness, Mapping):
-                freshness_rows.append(dict(freshness))
-        if len(snapshot_ids) > 1:
-            # A collection changed while the domain projections were copied.
-            # Do not advertise a mixed observation under the last domain's ID.
-            snapshot_id = None
-            domains = {name: {"status": "unknown", "observation": None,
-                              "error": "snapshot_changed_during_projection"}
-                       for name in domain_names}
-            freshness_rows = [{"state": "missing", "age_s": None, "fresh_for_s": 30.0}]
         if pipette_status_provider is not None:
             pipette_status = pipette_status_provider()
             if not isinstance(pipette_status, Mapping):
@@ -2425,19 +2418,6 @@ def install_operator_control_plane(
                 "error": None if pipette_status.get("ok") is True else "passive pipette status unavailable",
             }
         ownership_projection = hardware_state.ownership_projection()
-        state_rank = {"fresh": 0, "stale": 1, "missing": 2}
-        freshness = max(
-            freshness_rows,
-            key=lambda row: state_rank.get(str(row.get("state")), 2),
-            default={"state": "missing", "age_s": None, "fresh_for_s": 30.0},
-        )
-        ages = [float(row["age_s"]) for row in freshness_rows if isinstance(row.get("age_s"), (int, float))]
-        windows = [float(row["fresh_for_s"]) for row in freshness_rows if isinstance(row.get("fresh_for_s"), (int, float))]
-        freshness = {
-            **dict(freshness),
-            "age_s": max(ages) if ages else None,
-            "fresh_for_s": min(windows) if windows else 30.0,
-        }
         return {
             "ownership_generation": int(ownership_projection["ownership_epoch"]),
             "ownership": ownership_projection["ownership"],
