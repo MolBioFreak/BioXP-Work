@@ -152,11 +152,19 @@ def test_queued_native_failure_evidence(installed_retained, retained_rig, monkey
         assert detail['deck_movement']['controller_completion_verified'] is False
         assert leaf.moves == []
     plane.stop()
-    script = ('import json,sys; from tests.test_deck_scoped_integration import fresh_process_receipts; '
-              'print(json.dumps(fresh_process_receipts(sys.argv[1],sys.argv[2])))')
+    script = ('import json,sys,sqlite3; from pathlib import Path; '
+              'from bioxp.operator_command_plane import OperatorCommandStore; '
+              'from tests.test_deck_scoped_integration import fresh_process_receipts; '
+              's=OperatorCommandStore(Path(sys.argv[1])); blocker=s.deck_recovery_blocker(); '
+              's.stop(); c=sqlite3.connect(Path(sys.argv[1])/"bioxp_runtime.db"); '
+              'terminal=json.loads(c.execute("SELECT terminal_json FROM operator_plane_commands '
+              'WHERE command_id=?",(sys.argv[2],)).fetchone()[0]); c.close(); '
+              'print(json.dumps({"receipt":fresh_process_receipts(sys.argv[1],sys.argv[2]), '
+              '"recovery_required":blocker is not None,"terminal_json":terminal}))')
     reopened = json.loads(subprocess.check_output([sys.executable, '-c', script, str(root), cid],
                                                  text=True, timeout=12))
-    assert reopened == {'compact': compact, 'detail': detail}
+    assert reopened == {'receipt': {'compact': compact, 'detail': detail},
+                        'recovery_required': delivered, 'terminal_json': terminal}
 
 
 @pytest.mark.parametrize('fault', ['first', 'second', 'both', 'callback'])
