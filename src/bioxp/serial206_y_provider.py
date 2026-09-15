@@ -388,18 +388,27 @@ class Serial206YProvider:
             }
         state = "completed" if wait_for_stop else "issued_pending"
         completion_class = str(result.get("completion_class") or state)
-        if wait_for_stop:
-            after = (
-                result.get("terminal_position")
-                if isinstance(result.get("terminal_position"), Mapping)
-                else result.get("timeout_position")
-                if isinstance(result.get("timeout_position"), Mapping)
-                else self._position()
-            )
-        else:
-            after = None
-        after_value = self._position_value(after)
-        observation = self._record_observation(command_id=command_id, target=effective_target, observed=after_value) if wait_for_stop else None
+        try:
+            if wait_for_stop:
+                after = (
+                    result.get("terminal_position")
+                    if isinstance(result.get("terminal_position"), Mapping)
+                    else result.get("timeout_position")
+                    if isinstance(result.get("timeout_position"), Mapping)
+                    else self._position()
+                )
+            else:
+                after = None
+            after_value = self._position_value(after)
+            observation = self._record_observation(command_id=command_id, target=effective_target, observed=after_value) if wait_for_stop else None
+        except Exception as exc:
+            exc.motion_evidence = {
+                "axis": self.axis,
+                "result": result,
+                "observation_recording_failure": type(exc).__name__,
+                "physical_effect_verified": False,
+            }
+            raise
         proof = result.get("proof") if isinstance(result.get("proof"), Mapping) else {}
         source_completed = bool(
             result.get("ok") is True

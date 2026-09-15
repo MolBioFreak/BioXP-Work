@@ -1355,7 +1355,7 @@ class Serial206ProductionPrimitiveAdapter:
         target_ok = all(evidence[axis]["position_verified"] for axis in required_axes)
         restore_ok = all(isinstance(restore.get(axis), Mapping) and self._x_tmcl_success(restore[axis].get("ack")) for axis in ("x", "y"))
         ok = bool(source_calls_completed)
-        receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
+        receipt.update({"commands": dict(commands), "waits": dict(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
         moved_axes = tuple(axis for axis in required_axes if isinstance(commands.get(axis), Mapping) and commands[axis].get("command_issued") is True)
         receipt["moved_axes"] = list(moved_axes)
         if required_axes and all(evidence[axis]["source_noop_verified"] for axis in required_axes):
@@ -3090,98 +3090,20 @@ class Serial206ProductionPrimitiveAdapter:
         result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s), source_context=source_context)
         if self.y_provider is not None and isinstance(result, Mapping):
             result = dict(result)
-            result["y_authority"] = _json_safe(
-                self.y_provider.record_move_xy_observation(
-                    result,
-                    command_id=f"move-xy-{time.time_ns()}",
+            try:
+                result["y_authority"] = _json_safe(
+                    self.y_provider.record_move_xy_observation(
+                        result,
+                        command_id=f"move-xy-{time.time_ns()}",
+                    )
                 )
-            )
+            except Exception as exc:
+                exc.motion_evidence = {
+                    **result,
+                    "observation_recording_failure": type(exc).__name__,
+                }
+                raise
         return result
-        px = self._axis_profile("x")
-        py = self._axis_profile("y")
-        present = getattr(self.tester, "_oem_board_present", None)
-        x_present = not callable(present) or present(int(px["board"]))
-        y_present = not callable(present) or present(int(py["board"]))
-        if not y_present:
-            move = self.oem_move_axis_absolute("x", int(x), wait_for_stop=True) if x_present else None
-            return {"ok": move is None or move.get("ok") is True, "branch": "y_board_null", "move_x": _json_safe(move)}
-        if not x_present:
-            return {"ok": True, "branch": "x_board_null_literal_moveX_y_noop", "source_noop": "moveX checks the same null board"}
-        current_x = self._read_axis_position("x")
-        current_y = self._read_axis_position("y")
-        target_x, target_y = int(x), int(y)
-        distance_x = abs(target_x - current_x)
-        distance_y = abs(target_y - current_y)
-        commands: dict[str, Any] = {}
-        waits: dict[str, Any] = {}
-        launch_order: list[str] = []
-        if distance_x <= 20 or distance_y <= 20:
-            if distance_x != 0:
-                commands["x"] = self.oem_move_axis_absolute("x", target_x, wait_for_stop=True)
-                launch_order.append("x")
-            if distance_y != 0:
-                commands["y"] = self.oem_move_axis_absolute("y", target_y, wait_for_stop=True)
-                launch_order.append("y")
-            return {
-                "ok": all(commands[key].get("ok") is True for key in launch_order),
-                "targets": {"x": target_x, "y": target_y},
-                "before": {"x": current_x, "y": current_y},
-                "commands": _json_safe(commands),
-                "launch_order": launch_order,
-                "source_anchor": "ClassControlInterface.moveXY:4285-4311",
-            }
-
-        x_acc = 400 if distance_x > 10000 else 350
-        y_acc = 750 if distance_y > 10000 else 400
-        set_acc = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, x_acc, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, y_acc, motor=py.get("motor", 0)),
-        }
-        event_window = self.tester.begin_bus_event_window()
-        if distance_x > distance_y:
-            commands["x"] = self.tester.motor_oem_move_absolute(
-                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
-            )
-            launch_order.append("x")
-            if distance_y > 4000:
-                time.sleep(0.050 * distance_x / distance_y)
-            commands["y"] = self.tester.motor_oem_move_absolute(
-                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
-            )
-            launch_order.append("y")
-        else:
-            commands["y"] = self.tester.motor_oem_move_absolute(
-                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
-            )
-            launch_order.append("y")
-            if distance_x > 4000:
-                time.sleep(0.050 * distance_y / distance_x)
-            commands["x"] = self.tester.motor_oem_move_absolute(
-                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
-            )
-            launch_order.append("x")
-        time.sleep(0.005)
-        waits["pair"] = self.tester.motor_oem_wait_targets_reached(
-            ((px["board"], px.get("motor", 0)), (py["board"], py.get("motor", 0))),
-            timeout_s=5.0,
-            event_window=event_window,
-        )
-        restore_acc = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
-        }
-        return {
-            "ok": isinstance(waits["pair"], Mapping) and waits["pair"].get("ok") is True,
-            "targets": {"x": target_x, "y": target_y},
-            "before": {"x": current_x, "y": current_y},
-            "commands": _json_safe(commands),
-            "waits": _json_safe(waits),
-            "set_acc": _json_safe(set_acc),
-            "restore_acc": _json_safe(restore_acc),
-            "launch_order": launch_order,
-            "source_anchor": "ClassControlInterface.moveXY:4285-4366",
-        }
-
     def oem_move_to(
         self,
         x: int,
@@ -3213,7 +3135,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "branch": branch or "interrupted",
                 "target": target,
                 "pseudo_z_home": pseudo,
-                "operations": _json_safe(results),
+                "operations": list(results),
                 "failure": reason,
                 "interrupted_before_stage": stage,
                 "source_anchor": "ClassControlInterface.moveTo:4463-4620",
@@ -3284,203 +3206,234 @@ class Serial206ProductionPrimitiveAdapter:
                     first_error.append(exc)
             thread = threading.Thread(target=invoke_first, daemon=False)
             thread.start()
-            started.wait()
-            time.sleep(delay_s)
-            interruption = interrupted(second_stage)
-            second_result = interruption if interruption is not None else second()
-            thread.join()
-            if first_error:
-                raise first_error[0]
+            second_result = None
+            second_error = None
+            try:
+                started.wait()
+                time.sleep(delay_s)
+                interruption = interrupted(second_stage)
+                second_result = interruption if interruption is not None else second()
+            except BaseException as exc:
+                second_error = exc
+            finally:
+                # OEM Task.WaitAll settles both children before observing faults.
+                thread.join()
+            if first_error or second_error is not None:
+                error = second_error if second_error is not None else first_error[0]
+                error.motion_evidence = {
+                    "operations": [*results, *first_result,
+                                   *([second_result] if second_result is not None else [])],
+                    "child_failures": [
+                        {"child": child, "error_type": type(exc).__name__,
+                         "motion_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
+                        for child, exc in (("first", first_error[0] if first_error else None),
+                                           ("second", second_error)) if exc is not None
+                    ],
+                    "children_settled": True,
+                    "physical_effect_verified": False,
+                }
+                raise error
+            assert second_result is not None
             return first_result + [second_result]
 
-        if target == {"x": 0, "y": 0, "z": 0}:
-            interruption = interrupted("all_zero_z_home", "all_zero_home")
-            if interruption is not None:
-                return interruption
-            z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
-            xy_results: dict[str, Any] = {}
-            xy_errors: list[str] = []
+        try:
+            if target == {"x": 0, "y": 0, "z": 0}:
+                interruption = interrupted("all_zero_z_home", "all_zero_home")
+                if interruption is not None:
+                    return interruption
+                z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
+                xy_results: dict[str, Any] = {}
+                xy_errors: list[str] = []
 
-            def home_xy_axis(axis: str, speed: int) -> None:
-                try:
-                    interruption = interrupted(f"all_zero_{axis}_home", "all_zero_home")
-                    if interruption is not None:
-                        xy_results[axis] = interruption
-                        return
-                    if axis == "x":
-                        xy_results[axis] = self.x_move_to_origin_home(timeout_s=float(wait_timeout_s))
-                    else:
-                        xy_results[axis] = self.tester.motor_oem_go_home(
-                            axis,
-                            speed=int(speed),
-                            rehome=True,
-                            timeout_s=float(wait_timeout_s),
-                            require_switch_transition=False,
-                        )
-                except Exception as exc:
-                    xy_errors.append(f"{axis}:{type(exc).__name__}:{exc}")
+                def home_xy_axis(axis: str, speed: int) -> None:
+                    try:
+                        interruption = interrupted(f"all_zero_{axis}_home", "all_zero_home")
+                        if interruption is not None:
+                            xy_results[axis] = interruption
+                            return
+                        if axis == "x":
+                            xy_results[axis] = self.x_move_to_origin_home(timeout_s=float(wait_timeout_s))
+                        else:
+                            xy_results[axis] = self.tester.motor_oem_go_home(
+                                axis,
+                                speed=int(speed),
+                                rehome=True,
+                                timeout_s=float(wait_timeout_s),
+                                require_switch_transition=False,
+                            )
+                    except Exception as exc:
+                        xy_errors.append(f"{axis}:{type(exc).__name__}:{exc}")
 
-            if bool(run_in_parallel):
-                tx = threading.Thread(target=home_xy_axis, args=("x", 1700), daemon=False)
-                ty = threading.Thread(target=home_xy_axis, args=("y", 1800), daemon=False)
-                tx.start(); ty.start(); tx.join(); ty.join()
-            else:
-                home_xy_axis("x", 1700)
-                home_xy_axis("y", 1800)
-            xy_ok = not xy_errors and all(
-                isinstance(xy_results.get(axis), Mapping)
-                and xy_results[axis].get("ok") is True
-                for axis in ("x", "y")
-            )
-            # Controller home proof does not publish durable X/Y reference authority.
-            # The provider-owned observation transition must perform the atomic pair
-            # publication after an independently bound observation receipt.
-            reference = {
-                "ok": False,
-                "state": "awaiting_observation",
-                "axes": ["x", "y"],
-                "physical_effect_verified": False,
-            } if xy_ok else None
-            ok = bool(z_home.get("ok") is True and xy_ok)
-            return {
-                "ok": ok,
-                "source_return_code": 0 if ok else 1,
-                "branch": "all_zero_home",
-                "source_home_semantics": {
-                    "z": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
-                    "x": "ClassControlInterface.goHome(true,X,1700,true)",
-                    "y": "ClassControlInterface.goHome(true,Y,1800,true)",
-                },
-                "run_in_parallel": bool(run_in_parallel),
-                "z_home": _json_safe(z_home),
-                "xy_home": _json_safe(xy_results),
-                "xy_errors": xy_errors,
-                "xy_reference_state": _json_safe(reference),
-                "reference_publication_required": bool(xy_ok),
-                "z_home_reference_verified": bool(z_home.get("ok") is True),
-                "home_summary": _json_safe(z_home.get("home_summary")),
-                "controller_command_acknowledged": bool(z_home.get("controller_command_acknowledged") is True),
-                "controller_terminal_state_verified": bool(z_home.get("controller_terminal_state_verified") is True),
-                "physical_motion_commanded": bool(ok),
-                "failure": None if ok else "all_zero_move_to_home_failed",
-                "source_anchor": "ClassControlInterface.moveTo:4463-4506",
-            }
+                if bool(run_in_parallel):
+                    tx = threading.Thread(target=home_xy_axis, args=("x", 1700), daemon=False)
+                    ty = threading.Thread(target=home_xy_axis, args=("y", 1800), daemon=False)
+                    tx.start(); ty.start(); tx.join(); ty.join()
+                else:
+                    home_xy_axis("x", 1700)
+                    home_xy_axis("y", 1800)
+                xy_ok = not xy_errors and all(
+                    isinstance(xy_results.get(axis), Mapping)
+                    and xy_results[axis].get("ok") is True
+                    for axis in ("x", "y")
+                )
+                # Controller home proof does not publish durable X/Y reference authority.
+                # The provider-owned observation transition must perform the atomic pair
+                # publication after an independently bound observation receipt.
+                reference = {
+                    "ok": False,
+                    "state": "awaiting_observation",
+                    "axes": ["x", "y"],
+                    "physical_effect_verified": False,
+                } if xy_ok else None
+                ok = bool(z_home.get("ok") is True and xy_ok)
+                return {
+                    "ok": ok,
+                    "source_return_code": 0 if ok else 1,
+                    "branch": "all_zero_home",
+                    "source_home_semantics": {
+                        "z": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
+                        "x": "ClassControlInterface.goHome(true,X,1700,true)",
+                        "y": "ClassControlInterface.goHome(true,Y,1800,true)",
+                    },
+                    "run_in_parallel": bool(run_in_parallel),
+                    "z_home": _json_safe(z_home),
+                    "xy_home": _json_safe(xy_results),
+                    "xy_errors": xy_errors,
+                    "xy_reference_state": _json_safe(reference),
+                    "reference_publication_required": bool(xy_ok),
+                    "z_home_reference_verified": bool(z_home.get("ok") is True),
+                    "home_summary": _json_safe(z_home.get("home_summary")),
+                    "controller_command_acknowledged": bool(z_home.get("controller_command_acknowledged") is True),
+                    "controller_terminal_state_verified": bool(z_home.get("controller_terminal_state_verified") is True),
+                    "physical_motion_commanded": bool(ok),
+                    "failure": None if ok else "all_zero_move_to_home_failed",
+                    "source_anchor": "ClassControlInterface.moveTo:4463-4506",
+                }
 
-        if type(gripper_confirmed) is not bool or type(tip_loaded) is not bool:
-            raise RuntimeError("moveTo gripper confirmation and TipLoaded authority are required")
-        if plate_on_gantry in {4, 5} and type(location19_y) is not int:
-            raise RuntimeError("moveTo location-19 Y authority is required for loaded plate branch")
-        plate_clear_y = int(location19_y) if type(location19_y) is int else 0
+            if type(gripper_confirmed) is not bool or type(tip_loaded) is not bool:
+                raise RuntimeError("moveTo gripper confirmation and TipLoaded authority are required")
+            if plate_on_gantry in {4, 5} and type(location19_y) is not int:
+                raise RuntimeError("moveTo location-19 Y authority is required for loaded plate branch")
+            plate_clear_y = int(location19_y) if type(location19_y) is int else 0
 
-        current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
-        if current["z"] > pseudo:
-            interruption = interrupted("z_clearance")
-            if interruption is not None:
-                return interruption
-            results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
-        x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
-        y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
+            current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
+            if current["z"] > pseudo:
+                interruption = interrupted("z_clearance")
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+            x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
+            y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
 
-        def move_y_or_home() -> dict[str, Any]:
-            return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
+            def move_y_or_home() -> dict[str, Any]:
+                return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
 
-        if gripper_confirmed and not tip_loaded:
-            interruption = interrupted("move_xy")
-            if interruption is not None:
-                return interruption
-            results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0, source_context=source_context))
-            branch = "confirmed_gripper_no_tip_moveXY"
-        elif target["y"] < current["y"] or target["y"] < 46800:
-            if plate_on_gantry in {4, 5}:
-                if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
-                    interruption = interrupted("plate_clear_y", "descending_y_loaded_plate")
+            if gripper_confirmed and not tip_loaded:
+                interruption = interrupted("move_xy")
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0, source_context=source_context))
+                branch = "confirmed_gripper_no_tip_moveXY"
+            elif target["y"] < current["y"] or target["y"] < 46800:
+                if plate_on_gantry in {4, 5}:
+                    if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
+                        interruption = interrupted("plate_clear_y", "descending_y_loaded_plate")
+                        if interruption is not None:
+                            return interruption
+                        results.append(move_axis("y", plate_clear_y, y_acc))
+                    interruption = interrupted("loaded_plate_x", "descending_y_loaded_plate")
                     if interruption is not None:
                         return interruption
-                    results.append(move_axis("y", plate_clear_y, y_acc))
-                interruption = interrupted("loaded_plate_x", "descending_y_loaded_plate")
-                if interruption is not None:
-                    return interruption
-                results.append(move_axis("x", target["x"], x_acc))
-                time.sleep(0.001)
-                interruption = interrupted("loaded_plate_y", "descending_y_loaded_plate")
-                if interruption is not None:
-                    return interruption
-                results.append(move_y_or_home())
-                branch = "descending_y_loaded_plate"
+                    results.append(move_axis("x", target["x"], x_acc))
+                    time.sleep(0.001)
+                    interruption = interrupted("loaded_plate_y", "descending_y_loaded_plate")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_y_or_home())
+                    branch = "descending_y_loaded_plate"
+                elif run_in_parallel:
+                    interruption = interrupted("descending_parallel_x", "descending_y_parallel_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600, second_stage="descending_parallel_y"))
+                    branch = "descending_y_parallel_x_first"
+                else:
+                    interruption = interrupted("descending_sequential_x", "descending_y_sequential_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_axis("x", target["x"], x_acc))
+                    interruption = interrupted("descending_sequential_y", "descending_y_sequential_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_y_or_home())
+                    branch = "descending_y_sequential_x_first"
             elif run_in_parallel:
-                interruption = interrupted("descending_parallel_x", "descending_y_parallel_x_first")
+                interruption = interrupted("parallel_y", "parallel_y_first")
                 if interruption is not None:
                     return interruption
-                results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600, second_stage="descending_parallel_y"))
-                branch = "descending_y_parallel_x_first"
+                results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300, second_stage="parallel_x"))
+                branch = "parallel_y_first"
             else:
-                interruption = interrupted("descending_sequential_x", "descending_y_sequential_x_first")
-                if interruption is not None:
-                    return interruption
-                results.append(move_axis("x", target["x"], x_acc))
-                interruption = interrupted("descending_sequential_y", "descending_y_sequential_x_first")
+                interruption = interrupted("sequential_y", "sequential_y_first")
                 if interruption is not None:
                     return interruption
                 results.append(move_y_or_home())
-                branch = "descending_y_sequential_x_first"
-        elif run_in_parallel:
-            interruption = interrupted("parallel_y", "parallel_y_first")
-            if interruption is not None:
-                return interruption
-            results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300, second_stage="parallel_x"))
-            branch = "parallel_y_first"
-        else:
-            interruption = interrupted("sequential_y", "sequential_y_first")
-            if interruption is not None:
-                return interruption
-            results.append(move_y_or_home())
-            interruption = interrupted("sequential_x", "sequential_y_first")
-            if interruption is not None:
-                return interruption
-            results.append(move_axis("x", target["x"], x_acc))
-            branch = "sequential_y_first"
+                interruption = interrupted("sequential_x", "sequential_y_first")
+                if interruption is not None:
+                    return interruption
+                results.append(move_axis("x", target["x"], x_acc))
+                branch = "sequential_y_first"
 
-        time.sleep(0.001)
-        time.sleep(0.001)
-        if target["z"] > pseudo:
-            interruption = interrupted("final_z", branch)
+            time.sleep(0.001)
+            time.sleep(0.001)
+            if target["z"] > pseudo:
+                interruption = interrupted("final_z", branch)
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+            px, py = self._axis_profile("x"), self._axis_profile("y")
+            restore = {
+                "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
+                "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
+            }
+            interruption = interrupted("complete", branch)
             if interruption is not None:
-                return interruption
-            results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
-        px, py = self._axis_profile("x"), self._axis_profile("y")
-        restore = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
-        }
-        interruption = interrupted("complete", branch)
-        if interruption is not None:
-            return {**interruption, "restore_acc": _json_safe(restore)}
-        child_evidence = [self._oem_controller_child_evidence(row) for row in results]
-        commanded = [row for row in child_evidence if row["command_required"]]
-        controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
-        controller_completion_verified = bool(child_evidence) and all(
-            row["terminal"] and (row["acknowledged"] or not row["command_required"])
-            for row in child_evidence
-        )
-        return {
-            "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
-            "source_return_code": 0,
-            "branch": branch,
-            "target": target,
-            "before": current,
-            "pseudo_z_home": pseudo,
-            "operations": _json_safe(results),
-            "effective_xy_target": next((dict(row.get("effective_target", row["requested"]))
-                for row in reversed(results) if isinstance(row, Mapping)
-                and row.get("source_operation") == "ClassControlInterface.moveXY"), None),
-            "controller_child_evidence": _json_safe(child_evidence),
-            "source_noop": controller_completion_verified and not commanded,
-            "controller_command_acknowledged": controller_acknowledged,
-            "controller_completion_verified": controller_completion_verified,
-            "controller_terminal_state_verified": controller_completion_verified,
-            "restore_acc": _json_safe(restore),
-            "source_anchor": "ClassControlInterface.moveTo:4463-4620",
-        }
+                return {**interruption, "restore_acc": _json_safe(restore)}
+            child_evidence = [self._oem_controller_child_evidence(row) for row in results]
+            commanded = [row for row in child_evidence if row["command_required"]]
+            controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
+            controller_completion_verified = bool(child_evidence) and all(
+                row["terminal"] and (row["acknowledged"] or not row["command_required"])
+                for row in child_evidence
+            )
+            return {
+                "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
+                "source_return_code": 0,
+                "branch": branch,
+                "target": target,
+                "before": current,
+                "pseudo_z_home": pseudo,
+                "operations": list(results),
+                "effective_xy_target": next((dict(row.get("effective_target", row["requested"]))
+                    for row in reversed(results) if isinstance(row, Mapping)
+                    and row.get("source_operation") == "ClassControlInterface.moveXY"), None),
+                "controller_child_evidence": _json_safe(child_evidence),
+                "source_noop": controller_completion_verified and not commanded,
+                "controller_command_acknowledged": controller_acknowledged,
+                "controller_completion_verified": controller_completion_verified,
+                "controller_terminal_state_verified": controller_completion_verified,
+                "restore_acc": _json_safe(restore),
+                "source_anchor": "ClassControlInterface.moveTo:4463-4620",
+            }
+        except Exception as exc:
+            native = getattr(exc, "motion_evidence", None)
+            exc.motion_evidence = {
+                **(dict(native) if isinstance(native, Mapping) else {}),
+                "prior_operations": list(results),
+                "physical_effect_verified": False,
+            }
+            raise
+
 
     def absolute(
         self,
@@ -3684,7 +3637,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": source_calls_completed,
                 "branch": "near_axis_sequential",
                 "launch_order": list(commands),
-                "commands": _json_safe(commands),
+                "commands": dict(commands),
                 "source_calls_completed": source_calls_completed,
                 "controller_terminal_state_verified": terminal,
                 "command_issued": any(
@@ -3715,48 +3668,64 @@ class Serial206ProductionPrimitiveAdapter:
         commands: dict[str, Any] = {}
         launch_order: list[str] = []
         stagger_ms = 0
-        if distances["x"] > distances["y"]:
-            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_x_first", event_window=event_window)
-            launch_order.append("x")
-            if distances["y"] > 4000:
-                stagger_ms = 50 * distances["x"] // distances["y"]
-                time.sleep(stagger_ms / 1000.0)
-            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
-            launch_order.append("y")
-        else:
-            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
-            launch_order.append("y")
-            if distances["x"] > 4000:
-                stagger_ms = 50 * distances["y"] // distances["x"]
-                time.sleep(stagger_ms / 1000.0)
-            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_y_first", event_window=event_window)
-            launch_order.append("x")
-        shared_event_window = dict(event_window)
-        shared_cursors: dict[str, float] = {}
-        for command in commands.values():
-            command_window = command.get("event_window") if isinstance(command, Mapping) else None
-            cursors = command_window.get("dispatch_cursors") if isinstance(command_window, Mapping) else None
-            if isinstance(cursors, Mapping):
-                for key, value in cursors.items():
-                    if isinstance(key, str) and isinstance(value, (int, float)):
-                        shared_cursors[key] = float(value)
-        if shared_cursors:
-            shared_event_window["dispatch_cursors"] = shared_cursors
-        time.sleep(0.005)
-        many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
-        pair_wait: Any = None
-        if callable(many_wait):
-            pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=sta_sequential)
-            waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
-            if not waits:
-                waits = {"x": pair_wait, "y": pair_wait}
-        else:
-            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
-            waits = {"x": wait_fn(5, motor=0, timeout_s=5.0, event_window=shared_event_window), "y": wait_fn(4, motor=0, timeout_s=5.0, event_window=shared_event_window)}
-        restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
-        after = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
-        receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
-        return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
+        waits: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        pair_wait = None
+        try:
+            if distances["x"] > distances["y"]:
+                commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_x_first", event_window=event_window)
+                launch_order.append("x")
+                if distances["y"] > 4000:
+                    stagger_ms = 50 * distances["x"] // distances["y"]
+                    time.sleep(stagger_ms / 1000.0)
+                commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+                launch_order.append("y")
+            else:
+                commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+                launch_order.append("y")
+                if distances["x"] > 4000:
+                    stagger_ms = 50 * distances["y"] // distances["x"]
+                    time.sleep(stagger_ms / 1000.0)
+                commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_y_first", event_window=event_window)
+                launch_order.append("x")
+            shared_event_window = dict(event_window)
+            shared_cursors: dict[str, float] = {}
+            for command in commands.values():
+                command_window = command.get("event_window") if isinstance(command, Mapping) else None
+                cursors = command_window.get("dispatch_cursors") if isinstance(command_window, Mapping) else None
+                if isinstance(cursors, Mapping):
+                    for key, value in cursors.items():
+                        if isinstance(key, str) and isinstance(value, (int, float)):
+                            shared_cursors[key] = float(value)
+            if shared_cursors:
+                shared_event_window["dispatch_cursors"] = shared_cursors
+            time.sleep(0.005)
+            many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
+            pair_wait: Any = None
+            if callable(many_wait):
+                pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=sta_sequential)
+                waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
+                if not waits:
+                    waits = {"x": pair_wait, "y": pair_wait}
+            else:
+                wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
+                for axis, board in (("x", 5), ("y", 4)):
+                    waits[axis] = wait_fn(board, motor=0, timeout_s=5.0, event_window=shared_event_window)
+            restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
+            for axis in ("x", "y"):
+                after[axis] = self._read_axis_position(axis)
+            receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
+            return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
+        except Exception as exc:
+            exc.motion_evidence = {
+                **receipt, "branch": "parallel", "commands": commands,
+                "launch_order": launch_order, "waits": waits, "after": after,
+                "pair_wait": pair_wait,
+                "controller_failure": copy.deepcopy(getattr(exc, "motion_evidence", None)),
+                "physical_effect_verified": False,
+            }
+            raise
+
 
 
     def parallel(
@@ -11039,7 +11008,7 @@ class Serial206OemInitializationProvider:
                 isinstance(result, Mapping) and result.get("hardware_postcondition_verified") is True
             ),
             "source_anchor": "ClassControlInterface.btnLOC1_Click:1932-1959->moveTo:3691-3716",
-            "primitive_result": _json_safe(result),
+            "primitive_result": result,
         }
 
     @staticmethod

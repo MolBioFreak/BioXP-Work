@@ -1787,7 +1787,7 @@ def make_deck_command_executor(
             except Exception as exc:
                 raise DeckExecutionFailure(
                     str(exc),
-                    delivery_attempted=True,
+                    delivery_attempted=False,
                     controller_command_acknowledged=bool(
                         isinstance(force_result, Mapping)
                         and force_result.get("controller_command_acknowledged") is True
@@ -1816,7 +1816,7 @@ def make_deck_command_executor(
                 return {
                     "ok": False,
                     "admitted": True,
-                    "delivery_attempted": True,
+                    "delivery_attempted": False,
                     "controller_command_acknowledged": bool(
                         isinstance(force_result, Mapping)
                         and force_result.get("controller_command_acknowledged") is True
@@ -1939,237 +1939,273 @@ def make_deck_command_executor(
                 "board_epoch_4": revalidated.board_epoch_4,
                 "board_epoch_5": revalidated.board_epoch_5,
             }
-            for step in plan.steps:
-                if step.operation in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
-                    continue
-                method = getattr(provider, step.operation, None)
-                if not callable(method):
-                    if callable(terminalize_stage):
+            result = None
+            try:
+                for step in plan.steps:
+                    if step.operation in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
+                        continue
+                    result = None
+                    method = getattr(provider, step.operation, None)
+                    if not callable(method):
+                        if callable(terminalize_stage):
+                            try:
+                                terminalize_stage(command_id, step, state="failed", reason=f"source_authority_missing:{step.operation}")
+                            except Exception as exc:
+                                raise DeckExecutionFailure(
+                                    f"stage_persistence_failed:{step.operation}:{type(exc).__name__}",
+                                    delivery_attempted=delivery_attempted,
+                                    controller_command_acknowledged=any(
+                                        row.get("controller_command_acknowledged") is True for row in results
+                                    ),
+                                    controller_completion_verified=any(
+                                        row.get("controller_completion_verified") is True for row in results
+                                    ),
+                                    hardware_postcondition_verified=any(
+                                        row.get("hardware_postcondition_verified") is True for row in results
+                                    ),
+                                    provider_results=results,
+                                ) from exc
+                        raise DeckExecutionFailure(
+                            f"source_authority_missing:{step.operation}", delivery_attempted=delivery_attempted
+                        )
+                    if not callable(record_delivery):
+                        raise DeckExecutionFailure(
+                            "named_delivery_ledger_not_bound", delivery_attempted=False,
+                        )
+                    try:
+                        assert_current(
+                            command_id,
+                            boundary=f"before_provider_stage_{step.order}_{step.operation}",
+                        )
+                    except Exception as exc:
+                        raise DeckExecutionFailure(
+                            str(exc),
+                            delivery_attempted=delivery_attempted,
+                            controller_command_acknowledged=any(
+                                row.get("controller_command_acknowledged") is True for row in results
+                            ),
+                            controller_completion_verified=any(
+                                row.get("controller_completion_verified") is True for row in results
+                            ),
+                            hardware_postcondition_verified=any(
+                                row.get("hardware_postcondition_verified") is True for row in results
+                            ),
+                            provider_results=results,
+                        ) from exc
+                    try:
+                        record_delivery(
+                            command_id,
+                            work_kind="named_stage",
+                            work_identity=f"stage:{step.order}:{step.operation}",
+                            plan_digest=plan.plan_digest,
+                            authority_stamps=authority_stamps,
+                        )
+                    except Exception as exc:
+                        raise DeckExecutionFailure(
+                            f"named_delivery_marker_failed:{step.operation}:{type(exc).__name__}",
+                            delivery_attempted=False,
+                        ) from exc
+                    delivery_attempted = True
+                    result = None
+                    try:
+                        result = method(
+                            **dict(step.arguments or {}),
+                            authority_snapshot=asdict(revalidated),
+                        )
+                        if isinstance(result, Mapping):
+                            delivery_attempted = any(
+                                row.get("source_noop") is not True
+                                and row.get("delivery_attempted") is not False
+                                for row in [*results, result]
+                            )
+                        assert_current(
+                            command_id,
+                            boundary=f"after_provider_stage_{step.order}_{step.operation}",
+                        )
+                    except DeckExecutionFailure:
+                        raise
+                    except Exception as exc:
+                        if not isinstance(result, Mapping):
+                            native = getattr(exc, "motion_evidence", None)
+                            if isinstance(native, Mapping):
+                                result = dict(native)
                         try:
-                            terminalize_stage(command_id, step, state="failed", reason=f"source_authority_missing:{step.operation}")
+                            if callable(terminalize_stage):
+                                terminalize_stage(command_id, step, state="ambiguous", result=result if isinstance(result, Mapping) else None, reason=f"provider_stage_exception:{type(exc).__name__}")
+                        except Exception as persistence_exc:
+                            raise DeckExecutionFailure(
+                                f"stage_persistence_failed:{step.operation}:{type(persistence_exc).__name__}",
+                                delivery_attempted=True,
+                                provider_results=results,
+                            ) from persistence_exc
+                        observed_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
+                        raise DeckExecutionFailure(
+                            f"provider_stage_exception:{step.operation}:{type(exc).__name__}",
+                            delivery_attempted=True,
+                            controller_command_acknowledged=any(r.get("controller_command_acknowledged") is True for r in observed_results),
+                            controller_completion_verified=any(r.get("controller_completion_verified") is True for r in observed_results),
+                            hardware_postcondition_verified=any(r.get("hardware_postcondition_verified") is True for r in observed_results),
+                            provider_results=observed_results,
+                        ) from exc
+                    current_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
+                    terminal_truth = bool(
+                        isinstance(result, Mapping)
+                        and result.get("ok") is True
+                        and _controller_terminal_truth(result)
+                    )
+                    if not terminal_truth:
+                        result_delivery_attempted = bool(
+                            not isinstance(result, Mapping)
+                            or result.get("delivery_attempted") is not False
+                        )
+                        terminal_state = (
+                            "failed"
+                            if not result_delivery_attempted
+                            and isinstance(result, Mapping)
+                            and result.get("controller_command_acknowledged") is not True
+                            else "ambiguous"
+                        )
+                        assert_current(
+                            command_id,
+                            boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
+                        )
+                        try:
+                            if callable(terminalize_stage):
+                                terminalize_stage(command_id, step, state=terminal_state, result=result if isinstance(result, Mapping) else None, reason="provider_terminal_proof_missing")
                         except Exception as exc:
                             raise DeckExecutionFailure(
                                 f"stage_persistence_failed:{step.operation}:{type(exc).__name__}",
-                                delivery_attempted=delivery_attempted,
+                                delivery_attempted=True,
                                 controller_command_acknowledged=any(
-                                    row.get("controller_command_acknowledged") is True for row in results
+                                    row.get("controller_command_acknowledged") is True for row in current_results
                                 ),
                                 controller_completion_verified=any(
-                                    row.get("controller_completion_verified") is True for row in results
+                                    row.get("controller_completion_verified") is True for row in current_results
                                 ),
                                 hardware_postcondition_verified=any(
-                                    row.get("hardware_postcondition_verified") is True for row in results
+                                    row.get("hardware_postcondition_verified") is True for row in current_results
                                 ),
+                                provider_results=current_results,
+                            ) from exc
+                        return {
+                            "ok": False,
+                            "admitted": True,
+                            "delivery_attempted": delivery_attempted,
+                            "provider_results": current_results,
+                            "controller_command_acknowledged": bool(
+                                isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True
+                            ),
+                            "controller_completion_verified": False,
+                            "hardware_postcondition_verified": False,
+                            "semantic_state_committed": False,
+                            "physical_effect_verified": False,
+                            "error": f"provider_stage_failed:{step.operation}",
+                        }
+                    if callable(terminalize_stage):
+                        assert_current(
+                            command_id,
+                            boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
+                        )
+                        try:
+                            terminalize_stage(command_id, step, state="completed", result=result)
+                        except Exception as exc:
+                            raise DeckExecutionFailure(
+                                f"stage_persistence_failed:{step.operation}:{type(exc).__name__}",
+                                delivery_attempted=True,
+                                controller_command_acknowledged=any(
+                                    row.get("controller_command_acknowledged") is True for row in current_results
+                                ),
+                                controller_completion_verified=any(
+                                    row.get("controller_completion_verified") is True for row in current_results
+                                ),
+                                hardware_postcondition_verified=any(
+                                    row.get("hardware_postcondition_verified") is True for row in current_results
+                                ),
+                                provider_results=current_results,
+                            ) from exc
+                    assert isinstance(result, Mapping)
+                    results.append({str(key): value for key, value in result.items()})
+                all_source_noop = bool(results) and all(row.get("source_noop") is True for row in results)
+                controller_ack = bool(results) and not all_source_noop and all(
+                    row.get("source_noop") is True
+                    or row.get("controller_command_acknowledged") is True
+                    for row in results
+                )
+                source_terminal_complete = bool(results) and all(_controller_terminal_truth(row) for row in results)
+                controller_complete = source_terminal_complete and not all_source_noop
+                postcondition = controller_complete and not all_source_noop and all(
+                    row.get("source_noop") is True
+                    or row.get("hardware_postcondition_verified") is True
+                    for row in results
+                )
+                semantic_committed = False
+                if source_terminal_complete:
+                    assert_current(command_id, boundary="before_semantic_commit")
+                    commit = getattr(command_store, "commit_deck_success", None)
+                    if callable(commit):
+                        try:
+                            if getattr(provider, "deck_scoped_authority_version", None) == 1:
+                                commit(command_id, plan, results, expected_authority=asdict(revalidated))
+                            else:
+                                commit(command_id, plan, results)
+                        except Exception as exc:
+                            raise DeckExecutionFailure(
+                                f"semantic_commit_failed:{type(exc).__name__}",
+                                delivery_attempted=not all(row.get("source_noop") is True for row in results),
+                                controller_command_acknowledged=controller_ack,
+                                controller_completion_verified=controller_complete,
+                                hardware_postcondition_verified=postcondition,
                                 provider_results=results,
                             ) from exc
-                    raise DeckExecutionFailure(
-                        f"source_authority_missing:{step.operation}", delivery_attempted=delivery_attempted
-                    )
-                if not callable(record_delivery):
-                    raise DeckExecutionFailure(
-                        "named_delivery_ledger_not_bound", delivery_attempted=False,
-                    )
-                try:
-                    assert_current(
-                        command_id,
-                        boundary=f"before_provider_stage_{step.order}_{step.operation}",
-                    )
-                except Exception as exc:
-                    raise DeckExecutionFailure(
-                        str(exc),
-                        delivery_attempted=delivery_attempted,
-                        controller_command_acknowledged=any(
-                            row.get("controller_command_acknowledged") is True for row in results
-                        ),
-                        controller_completion_verified=any(
-                            row.get("controller_completion_verified") is True for row in results
-                        ),
-                        hardware_postcondition_verified=any(
-                            row.get("hardware_postcondition_verified") is True for row in results
-                        ),
-                        provider_results=results,
-                    ) from exc
-                try:
-                    record_delivery(
-                        command_id,
-                        work_kind="named_stage",
-                        work_identity=f"stage:{step.order}:{step.operation}",
-                        plan_digest=plan.plan_digest,
-                        authority_stamps=authority_stamps,
-                    )
-                except Exception as exc:
-                    raise DeckExecutionFailure(
-                        f"named_delivery_marker_failed:{step.operation}:{type(exc).__name__}",
-                        delivery_attempted=False,
-                    ) from exc
-                delivery_attempted = True
-                result = None
-                try:
-                    result = method(
-                        **dict(step.arguments or {}),
-                        authority_snapshot=asdict(revalidated),
-                    )
-                    assert_current(
-                        command_id,
-                        boundary=f"after_provider_stage_{step.order}_{step.operation}",
-                    )
-                except DeckExecutionFailure:
-                    raise
-                except Exception as exc:
-                    try:
-                        if callable(terminalize_stage):
-                            terminalize_stage(command_id, step, state="ambiguous", result=result if isinstance(result, Mapping) else None, reason=f"provider_stage_exception:{type(exc).__name__}")
-                    except Exception as persistence_exc:
-                        raise DeckExecutionFailure(
-                            f"stage_persistence_failed:{step.operation}:{type(persistence_exc).__name__}",
-                            delivery_attempted=True,
-                            provider_results=results,
-                        ) from persistence_exc
-                    observed_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
-                    raise DeckExecutionFailure(
-                        f"provider_stage_exception:{step.operation}:{type(exc).__name__}",
-                        delivery_attempted=True,
-                        controller_command_acknowledged=any(r.get("controller_command_acknowledged") is True for r in observed_results),
-                        controller_completion_verified=any(r.get("controller_completion_verified") is True for r in observed_results),
-                        hardware_postcondition_verified=any(r.get("hardware_postcondition_verified") is True for r in observed_results),
-                        provider_results=observed_results,
-                    ) from exc
-                current_results = [*results, dict(result)] if isinstance(result, Mapping) else list(results)
-                terminal_truth = bool(
-                    isinstance(result, Mapping)
-                    and result.get("ok") is True
-                    and _controller_terminal_truth(result)
-                )
-                if not terminal_truth:
-                    result_delivery_attempted = bool(
-                        not isinstance(result, Mapping)
-                        or result.get("delivery_attempted") is not False
-                    )
-                    terminal_state = (
-                        "failed"
-                        if not result_delivery_attempted
-                        and isinstance(result, Mapping)
-                        and result.get("controller_command_acknowledged") is not True
-                        else "ambiguous"
-                    )
-                    assert_current(
-                        command_id,
-                        boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
-                    )
-                    try:
-                        if callable(terminalize_stage):
-                            terminalize_stage(command_id, step, state=terminal_state, result=result if isinstance(result, Mapping) else None, reason="provider_terminal_proof_missing")
-                    except Exception as exc:
-                        raise DeckExecutionFailure(
-                            f"stage_persistence_failed:{step.operation}:{type(exc).__name__}",
-                            delivery_attempted=True,
-                            controller_command_acknowledged=any(
-                                row.get("controller_command_acknowledged") is True for row in current_results
-                            ),
-                            controller_completion_verified=any(
-                                row.get("controller_completion_verified") is True for row in current_results
-                            ),
-                            hardware_postcondition_verified=any(
-                                row.get("hardware_postcondition_verified") is True for row in current_results
-                            ),
-                            provider_results=current_results,
-                        ) from exc
-                    return {
-                        "ok": False,
-                        "admitted": True,
-                        "delivery_attempted": result_delivery_attempted,
-                        "controller_command_acknowledged": bool(
-                            isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True
-                        ),
-                        "controller_completion_verified": False,
-                        "hardware_postcondition_verified": False,
-                        "semantic_state_committed": False,
-                        "physical_effect_verified": False,
-                        "error": f"provider_stage_failed:{step.operation}",
-                    }
-                if callable(terminalize_stage):
-                    assert_current(
-                        command_id,
-                        boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
-                    )
-                    try:
-                        terminalize_stage(command_id, step, state="completed", result=result)
-                    except Exception as exc:
-                        raise DeckExecutionFailure(
-                            f"stage_persistence_failed:{step.operation}:{type(exc).__name__}",
-                            delivery_attempted=True,
-                            controller_command_acknowledged=any(
-                                row.get("controller_command_acknowledged") is True for row in current_results
-                            ),
-                            controller_completion_verified=any(
-                                row.get("controller_completion_verified") is True for row in current_results
-                            ),
-                            hardware_postcondition_verified=any(
-                                row.get("hardware_postcondition_verified") is True for row in current_results
-                            ),
-                            provider_results=current_results,
-                        ) from exc
-                assert isinstance(result, Mapping)
-                results.append({str(key): value for key, value in result.items()})
-            all_source_noop = bool(results) and all(row.get("source_noop") is True for row in results)
-            controller_ack = bool(results) and not all_source_noop and all(
-                row.get("source_noop") is True
-                or row.get("controller_command_acknowledged") is True
-                for row in results
-            )
-            source_terminal_complete = bool(results) and all(_controller_terminal_truth(row) for row in results)
-            controller_complete = source_terminal_complete and not all_source_noop
-            postcondition = controller_complete and not all_source_noop and all(
-                row.get("source_noop") is True
-                or row.get("hardware_postcondition_verified") is True
-                for row in results
-            )
-            semantic_committed = False
-            if source_terminal_complete:
-                assert_current(command_id, boundary="before_semantic_commit")
-                commit = getattr(command_store, "commit_deck_success", None)
-                if callable(commit):
-                    try:
-                        if getattr(provider, "deck_scoped_authority_version", None) == 1:
-                            commit(command_id, plan, results, expected_authority=asdict(revalidated))
-                        else:
-                            commit(command_id, plan, results)
-                    except Exception as exc:
-                        raise DeckExecutionFailure(
-                            f"semantic_commit_failed:{type(exc).__name__}",
-                            delivery_attempted=not all(row.get("source_noop") is True for row in results),
-                            controller_command_acknowledged=controller_ack,
-                            controller_completion_verified=controller_complete,
-                            hardware_postcondition_verified=postcondition,
-                            provider_results=results,
-                        ) from exc
-                semantic_committed = True
-            destination = catalog.resolve(plan.target)
-            return {
-                "ok": source_terminal_complete and semantic_committed,
-                "admitted": True,
-                "delivery_attempted": any(
-                    row.get("source_noop") is not True
-                    and row.get("delivery_attempted") is not False
-                    for row in results
-                ),
-                "controller_command_acknowledged": controller_ack,
-                "controller_completion_verified": controller_complete,
-                "hardware_postcondition_verified": postcondition,
-                "semantic_state_committed": semantic_committed,
-                "physical_effect_verified": False,
-                "authority_snapshot_digest": authority.digest,
-                "plan_digest": plan.plan_digest,
-                "source_branch": plan.source_branch,
-                "provider_results": [dict(row) for row in results],
-                "deck_movement": {
-                    "target": plan.target,
-                    "target_label": destination.panel_label,
-                    "source_branch": plan.source_branch,
+                    semantic_committed = True
+                destination = catalog.resolve(plan.target)
+                return {
+                    "ok": source_terminal_complete and semantic_committed,
+                    "admitted": True,
+                    "delivery_attempted": any(
+                        row.get("source_noop") is not True
+                        and row.get("delivery_attempted") is not False
+                        for row in results
+                    ),
+                    "controller_command_acknowledged": controller_ack,
                     "controller_completion_verified": controller_complete,
+                    "hardware_postcondition_verified": postcondition,
                     "semantic_state_committed": semantic_committed,
-                    "physical_observation_verified": False,
-                },
-            }
+                    "physical_effect_verified": False,
+                    "authority_snapshot_digest": authority.digest,
+                    "plan_digest": plan.plan_digest,
+                    "source_branch": plan.source_branch,
+                    "provider_results": [dict(row) for row in results],
+                    "deck_movement": {
+                        "target": plan.target,
+                        "target_label": destination.panel_label,
+                        "source_branch": plan.source_branch,
+                        "controller_completion_verified": controller_complete,
+                        "semantic_state_committed": semantic_committed,
+                        "physical_observation_verified": False,
+                    },
+                }
+            except Exception as exc:
+                # A later marker, reference or recording failure cannot erase
+                # completed motor stages. Host-only ForceToHighHome is excluded.
+                observed = list(results)
+                carried = exc.provider_results if isinstance(exc, DeckExecutionFailure) else []
+                for row in [*carried, result]:
+                    if isinstance(row, Mapping) and row not in observed:
+                        observed.append(dict(row))
+                raise DeckExecutionFailure(
+                    str(exc),
+                    delivery_attempted=delivery_attempted,
+                    controller_command_acknowledged=bool(
+                        getattr(exc, "controller_command_acknowledged", False)
+                        or any(row.get("controller_command_acknowledged") is True for row in observed)),
+                    controller_completion_verified=bool(
+                        getattr(exc, "controller_completion_verified", False)
+                        or any(row.get("controller_completion_verified") is True for row in observed)),
+                    hardware_postcondition_verified=bool(
+                        getattr(exc, "hardware_postcondition_verified", False)
+                        or any(row.get("hardware_postcondition_verified") is True for row in observed)),
+                    provider_results=observed,
+                ) from exc
 
     return execute
