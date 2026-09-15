@@ -1383,9 +1383,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         action_id="oem.deck.collect_authority",
         path="/hardware/snapshot/collect",
         label="Refresh deck readiness (query only)",
-        description="Explicitly collect axes and latch, then refresh source-owned deck readiness. Does not activate, home, move, or invent semantic state.",
+        description="Explicitly collect the normal full hardware snapshot, then refresh source-owned deck readiness. Does not activate, home, move, or invent semantic state.",
         source_anchor="hardware_snapshot_collect; Serial206OemInitializationProvider.deck_authority_snapshot",
-        fixed_inputs={"body": {"domains": ["axes", "latch"]}},
+        fixed_inputs={"body": {}},
     )
     for action in actions:
         if action["action_id"] == "oem.deck.collect_authority":
@@ -3171,7 +3171,7 @@ def install_operator_control_plane(
             if retained[0] != binding:
                 raise HTTPException(409, detail="idempotency_key already bound to different action request")
             return await asyncio.shield(retained[1])
-        if direct_requests or invoke_lock.locked():
+        if direct_requests or invoke_lock.locked() or command_plane.store.live_command_worker_ids():
             raise HTTPException(409, detail={"error": "operator_action_busy",
                 "message": "A normal action is active; observe its receipt before submitting another.",
                 "physical_motion_commanded": False, "automatic_retry": False})
@@ -3650,6 +3650,22 @@ def install_operator_control_plane(
                 )
         effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
         action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
+        # From this check through acquisition there is no scheduling suspension:
+        # AsyncExitStack.__aenter__ and an uncontended asyncio.Lock.acquire return
+        # inline. _admitted is a private closure argument, never an HTTP field.
+        if not is_safety_interrupt and (
+            invoke_lock.locked() or (_admitted is None and direct_requests)
+            or command_plane.store.live_command_worker_ids()
+        ):
+            # Legacy manual controls share the same single normal owner as V2.
+            # Waiting here used to accumulate unadmitted clicks behind a native
+            # move/Home (and then behind one another), prolonging busy displays
+            # and suppressing query refresh long after the original call ended.
+            # Same-key durable reconciliation above remains read-only; a retained
+            # V2 owner may enter its own lane, but never another owner's lock.
+            raise HTTPException(409, detail={"error": "operator_action_busy",
+                "message": "A normal action is active; observe its receipt before submitting another.",
+                "physical_motion_commanded": False, "automatic_retry": False})
         async with AsyncExitStack() as action_lease:
             # Z Stop's API ownership lease + single physical worker serialize
             # delivery. The outer lease is needed only for its reconciliation.

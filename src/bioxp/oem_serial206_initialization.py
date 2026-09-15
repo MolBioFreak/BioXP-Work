@@ -8453,6 +8453,47 @@ class Serial206OemInitializationProvider:
         self._deck_authority_scoped_cache = {}
         self._deck_authority_cache_reason = str(reason)
 
+    def deck_observation_freshness(self, *, expected_generation: int) -> dict[str, Any]:
+        """Passive ordinary-scope scheduling evidence, not command permission.
+
+        A current failed observation has fresh negative evidence; a Park-only
+        failure must not make the ordinary scope look unobserved.
+        """
+        cached = getattr(self, "_deck_authority_scoped_cache", {}).get("offset.v1")
+        state, age, available, outcome = "missing", None, False, "missing"
+        if cached is not None:
+            started, epoch, snapshot = cached
+            if epoch is getattr(self, "_deck_authority_cache_epoch", None):
+                age = max(0.0, time.monotonic() - started)
+                state = "stale" if age >= 15.0 else "fresh"
+                outcome = "failed" if isinstance(snapshot, Exception) else "observed"
+                if not isinstance(snapshot, Exception):
+                    stamps = self.deck_owner_authority_stamps()
+                    if self.reference_store is None or not callable(self._deck_semantic_state_reader):
+                        return {"available": False, "outcome": "missing",
+                                "freshness": {"state": "missing", "age_s": None, "fresh_for_s": 15.0}}
+                    refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+                    semantic = self._deck_semantic_state_reader()
+                    changed = (
+                        snapshot["ownership_generation"] != expected_generation
+                        or any(stamps.get(key) != snapshot.get(key) for key in
+                               ("ownership_generation", "board_epoch_4", "board_epoch_5"))
+                        or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                               or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                               for axis, version in snapshot["reference_versions"].items())
+                        or semantic.get("semantic_state_revision") != snapshot["machine_state_revision"]
+                        or hashlib.sha256(json.dumps(semantic.get("transition_provenance"),
+                            sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                           != snapshot["semantic_state_provenance_digest"]
+                        or epoch is not self._deck_authority_cache_epoch
+                    )
+                    if changed:
+                        state, age, outcome = "missing", None, "invalidated"
+                    else:
+                        available = state == "fresh" and snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True
+        return {"available": available, "outcome": outcome,
+                "freshness": {"state": state, "age_s": age, "fresh_for_s": 15.0}}
+
     def deck_authority_cached_snapshot(self, *, expected_generation: int, target: str | None = None) -> dict[str, Any]:
         """Passive availability projection of an actual successful active sample.
 
@@ -8496,8 +8537,6 @@ class Serial206OemInitializationProvider:
             if not _allow_recovery and epoch is self._deck_authority_cache_epoch:
                 self._deck_authority_scoped_cache[scope] = (started, epoch, exc)
             raise
-        if not _allow_recovery:
-            self._deck_authority_scoped_cache[scope] = (started, self._deck_authority_cache_epoch, copy.deepcopy(result))
         return result
 
     def _collect_deck_authority(
@@ -8632,7 +8671,11 @@ class Serial206OemInitializationProvider:
         ):
             raise RuntimeError("deck_authority_changed_during_observation")
         if not _allow_recovery:
-            self._deck_authority_cache = (sample_started, cache_epoch, copy.deepcopy(snapshot))
+            # Publish the epoch actually validated above, including an eligible
+            # bootstrap's owner change. Never restamp at the caller's return.
+            cached = (sample_started, cache_epoch, copy.deepcopy(snapshot))
+            self._deck_authority_cache = cached
+            self._deck_authority_scoped_cache[scope] = cached
         return snapshot
 
     def deck_home_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:

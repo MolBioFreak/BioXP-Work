@@ -1839,7 +1839,36 @@ def make_deck_command_executor(
                 terminalize_stage(command_id, plan.steps[0], state="completed",
                                   result=dict(force_result), reason="source_mutation_completed")
             try:
-                authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
+                semantic_reader = getattr(provider, "_offset_deck_semantic_state", None)
+                if (dispatch_authority.dependency_scope == "offset.v1"
+                        and callable(persist_pseudo) and callable(semantic_reader)):
+                    # ForceToHighHome is a host-only pseudo-home mutation, not a
+                    # motor operation. Read its committed owner rather than query
+                    # gripper, XYZ and latch a redundant third time. Retain every
+                    # other dispatch fence and the final active pre-TX sample.
+                    semantic = semantic_reader(gripper_confirmed=dispatch_authority.gripper_confirmed)
+                    if not isinstance(semantic, Mapping):
+                        raise MovementAuthorityChanged("deck_pseudo_home_publication_unavailable")
+                    provenance = semantic.get("transition_provenance", {})
+                    revision = dispatch_authority.machine_state_revision + 1
+                    if (not isinstance(provenance, Mapping)
+                            or provenance.get("source_operation") != "ForceToHighHome"
+                            or provenance.get("command_id") != command_id
+                            or provenance.get("before_revision") != dispatch_authority.machine_state_revision
+                            or provenance.get("after_revision") != revision
+                            or provenance.get("pseudo_z_home") != 500
+                            or semantic.get("semantic_state_revision") != revision
+                            or semantic.get("pseudo_z_home") != 500):
+                        raise MovementAuthorityChanged("deck_pseudo_home_publication_changed")
+                    authority = replace(
+                        dispatch_authority,
+                        machine_state_revision=revision,
+                        semantic_state_provenance_digest=semantic["transition_provenance_digest"],
+                        pseudo_z_home=500,
+                        consumed_state_digest=semantic["consumed_state_digest"],
+                    )
+                else:
+                    authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
                 require_expected_board_epochs(authority, phase="planning")
             except Exception as exc:
                 raise DeckExecutionFailure(str(exc), delivery_attempted=False,

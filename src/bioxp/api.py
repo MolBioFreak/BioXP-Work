@@ -4828,8 +4828,19 @@ def _status_payload() -> dict:
     )
     lifecycle = lifecycle_state.projection()
     serial206_initialization = serial206_oem_initialization_provider_status()
+    admission = hardware_state.project("transport", "boards", "power", "interlock", "latch", "axes", "gripper")
+    deck_freshness = getattr(_serial206_oem_initialization_provider, "deck_observation_freshness", None)
+    deck_observation = {"available": False, "freshness": {"state": "missing", "age_s": None}}
+    if callable(deck_freshness):
+        try:
+            deck_observation = deck_freshness(expected_generation=int(hardware_state.ownership_epoch))
+        except Exception:
+            # An unavailable passive owner must not blank the status envelope.
+            pass
     return {
         **projection,
+        "admission_observation": {key: admission.get(key) for key in ("available", "cache_state", "freshness")},
+        "deck_authority": deck_observation,
         "runtime_identity": public_release_identity(current_release_identity()),
         "receiver_audit": _receiver_audit_health(),
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
@@ -6578,7 +6589,7 @@ def _collect_and_publish_hardware_snapshot(
         active = getattr(app.state, "operator_normal_action_active", None)
         return bool(automatic and callable(active) and active())
     # Admission/dispatch can start after the HTTP precheck but before this
-    # worker runs. Yield before invalidating an in-flight deck observation.
+    # worker runs. Yield before starting any further device observation.
     if yield_requested():
         return {"ok": False, "published": False, "reason": "operator_action_pending"}
     def before_query():
@@ -6586,16 +6597,26 @@ def _collect_and_publish_hardware_snapshot(
             from .hardware_status import HardwareCollectionPreempted
             raise HardwareCollectionPreempted("operator_action_pending")
     deck_requested = {"axes", "latch"}.issubset(requested)
-    if deck_requested:
-        provider = getattr(app.state, "oem_deck_provider", None)
-        invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
-        if callable(invalidate):
-            invalidate(reason="explicit_hardware_collection_started")
+    # Starting a query is not an owner mutation. Keep the preceding sample
+    # under its original expiry/fences while its replacement is collected.
+    provider = getattr(app.state, "oem_deck_provider", None)
     if automatic:
         result = hardware_state.collect(requested, _hardware_collectors(tester, before_query=before_query),
                                         yield_requested=yield_requested)
     else:
         result = hardware_state.collect(requested, _hardware_collectors(tester))
+    # A failed observation withdraws prior authority; preemption alone does
+    # not. Domain errors can coexist with an atomically published ok result.
+    snapshot = result.get("snapshot") or {}
+    rows = snapshot.get("domains") or {}
+    failed = (not result.get("ok") and result.get("reason") != "operator_action_pending") or any(
+        isinstance(rows.get(domain), Mapping) and rows[domain].get("status") == "error"
+        for domain in ("axes", "latch", "gripper")
+    )
+    if deck_requested and failed:
+        invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
+        if callable(invalidate):
+            invalidate(reason="hardware_observation_failed")
     # Only the existing explicit query collection path may warm deck readiness.
     # Never attach this to GET/status, and never turn a failed collection into
     # fresh authority. The source reader performs its own current-owner checks.
@@ -6609,10 +6630,18 @@ def _collect_and_publish_hardware_snapshot(
         if _pipette_transport is not None and _pipette_receipts is not None:
             try:
                 with provider.deck_owner_authority_scope(), _pipette_transport._transaction_lock:
+                    # Full readiness includes the pipette domain; axes/latch-only
+                    # diagnostics must not silently acquire additional devices.
+                    if "pipette" in requested:
+                        before_query()
+                        result["park_tip_observation"] = _observe_park_tip_prerequisite(provider)
                     result["pipette_collection"] = _pipette_receipts.publish_collection_source(
                         _pipette_transport, ownership_generation=int(hardware_state.ownership_epoch))
             except Exception as exc:
                 result["pipette_collection"] = {"available": False, "reason": str(exc)}
+        if yield_requested():
+            result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+            return result
         result["deck_authority"] = deck_collect()
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
     if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
@@ -10088,24 +10117,62 @@ def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
         return result
 
 
+def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
+    """Shared query owner; called only inside the existing tester worker."""
+    transport = _get_pipette_transport()
+
+    async def inline_run(_label, callback, *, timeout_s):
+        return callback()
+
+    def audited_query():
+        return asyncio.run(run_pipette_operation(
+            "tip_status", lambda owned: owned.query_tip_status_all(),
+            get_transport=lambda: transport, run_blocking=inline_run,
+            timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
+            runtime_binding=runtime_binding,
+        ))
+
+    return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
+
+
+def _observe_park_tip_prerequisite(provider):
+    """Fill missing source observations, never infer MachineStatus from TipExist.
+
+    Caller owns provider-before-transport serialization. Valid committed source
+    observations are reused by their existing identities, not a new TTL/cache.
+    A changed reader/interrupt/source owner or unknown presence requires one
+    audited query. Loaded tips' unknown ancillary facts cannot be queried here.
+    """
+    try:
+        collection = _pipette_collection_state()
+        semantic = provider._deck_semantic_state_reader()
+        if (type(collection.get("tip_exists")) is bool
+                and type(semantic.get("tip_loaded")) is bool
+                and collection["tip_exists"] == semantic["tip_loaded"]
+                and all(semantic.get(key) == value
+                        for key, value in provider.deck_owner_authority_stamps().items())):
+            return {"available": True, "queried": False, "reason": "committed_source_observation_current"}
+    except Exception as exc:
+        # A pending source operation is not permission to interleave a query.
+        if str(exc) == "pipette_collection_receipt_pending":
+            return {"available": False, "queried": False, "reason": "pipette_collection_receipt_pending"}
+    try:
+        # Reuse lifecycle child binding: a Refresh/admission parent must not be
+        # overwritten by the pipette receipt, or replayed as a fresh observation.
+        return _query_and_publish_pipette_tip_status(runtime_binding={
+            "caller_class": "lifecycle", "entrypoint_id": "hardware.snapshot.park_tip_observation",
+            "idempotency_key": "readiness-tip-query:" + uuid.uuid4().hex,
+        })
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+        return {"available": False, "queried": True, "reason": "park_tip_query_unavailable",
+                "status_code": exc.status_code, "receipt_id": detail.get("receipt_id"),
+                "command_id": detail.get("command_id")}
+
+
 @app.post("/liquid/tip-status")
 async def liquid_tip_status():
-    def query_and_publish():
-        transport = _get_pipette_transport()
-
-        async def inline_run(_label, callback, *, timeout_s):
-            return callback()
-
-        def audited_query():
-            return asyncio.run(run_pipette_operation(
-                "tip_status", lambda owned: owned.query_tip_status_all(),
-                get_transport=lambda: transport, run_blocking=inline_run,
-                timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
-            ))
-
-        return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
-
-    return await _run_blocking("Pipette tip status", query_and_publish, timeout_s=120.0)
+    return await _run_blocking("Pipette tip status", _query_and_publish_pipette_tip_status, timeout_s=120.0)
 
 
 @app.get("/liquid/data", include_in_schema=False)
