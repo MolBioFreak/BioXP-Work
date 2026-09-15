@@ -665,13 +665,5 @@ def _normalize_reference_state(value: Any) -> ReferenceState | None:
         return None
 
 
-def _record_is_newer_or_equal(local_record: AxisReferenceRecord, disk_record: AxisReferenceRecord | None) -> bool:
-    if disk_record is None:
-        return True
-    local_updated_at = _normalize_optional_text(local_record.updated_at) or ""
-    disk_updated_at = _normalize_optional_text(disk_record.updated_at) or ""
-    return local_updated_at >= disk_updated_at
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()

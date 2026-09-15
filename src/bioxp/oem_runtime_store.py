@@ -4426,17 +4426,6 @@ class OEMRuntimeStore:
         finally:
             self._lock.release()
 
-    def _serial206_receipt_set_locked(self) -> tuple[str, str]:
-        rows = self._db.execute(
-            "SELECT stream,receipt_id,receipt_json FROM serial206_receipts ORDER BY stream,receipt_id"
-        ).fetchall()
-        receipt_set = [
-            [str(row["stream"]), str(row["receipt_id"]), hashlib.sha256(str(row["receipt_json"]).encode("utf-8")).hexdigest()]
-            for row in rows
-        ]
-        encoded = json.dumps(receipt_set, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
     def _append_serial206_authority_snapshot_locked(self, state: Mapping[str, Any]) -> None:
         state_json = json.dumps(dict(state), sort_keys=True, separators=(",", ":"), allow_nan=False)
         latest = self._db.execute(
@@ -4458,13 +4447,6 @@ class OEMRuntimeStore:
                 time.time(),
             ),
         )
-
-    def _rebind_latest_serial206_authority_snapshot_locked(self) -> None:
-        latest = self._db.execute(
-            "SELECT state_json FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
-        if latest is not None:
-            self._append_serial206_authority_snapshot_locked(json.loads(str(latest["state_json"])))
 
     @contextmanager
     def serial206_projection_scope(self):
