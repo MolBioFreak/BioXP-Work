@@ -10,7 +10,15 @@ def helpers(args):
     return build_oem_pipette_lifecycle_helpers(
         before_native_entry=args['before_native_entry'],pipette_call=args['pipette_call'],
         source_bindings=args['source_bindings'],settings=args['settings'],
-        move_to_waste=args['move_to_waste'],sweep_handler=lambda a,s:{'ok':True,'source_occurrence_id':a.source_occurrence_id})
+        move_to_waste=args['move_to_waste'],sweep_handler=lambda a,s,*,clearall=False:{'ok':True,'source_occurrence_id':a.source_occurrence_id,'clearall':clearall})
+
+
+def test_epilogue_sweep_explicit_clearall_and_original_identity():
+    args, state, *_ = composite_bindings()
+    result = helpers(args)['epilogue_sweep'](state, source_occurrence_id='lifecycle:sweep:7')
+    assert result['clearall'] is True
+    assert result['source_occurrence_id'] == 'lifecycle:sweep:7'
+    assert result['source_return'] is None
 
 
 def test_three_prologue_baselines_require_three_explicit_source_substep_keys():

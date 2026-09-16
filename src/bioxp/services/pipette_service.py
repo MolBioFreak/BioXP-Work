@@ -1487,7 +1487,8 @@ def build_oem_pipette_lifecycle_helpers(
 
     def sweep(state, *, source_occurrence_id):
         body = frame(state, source_occurrence_id)
-        result = sweep_handler(body.action, state)
+        # ControlLib normal epilogue selects any rm member, unlike sweep().
+        result = sweep_handler(body.action, state, clearall=True)
         return {**result, "source_return": None}
 
     return {"pressure_baseline": baseline, "run_job_tip_prefix": run_job_prefix,
@@ -1625,8 +1626,8 @@ def build_oem_pipette_handlers(
         return {**_oem_source_result(action, steps), "ok": True,
                 "source_init_return": 0, "source_model_updated": True}
 
-    def sweep(action: Any, state: Any) -> dict[str, Any]:
-        """ControlLib.sweep:7012-7049 and its distinct loadTip:4844-4863."""
+    def sweep(action: Any, state: Any, *, clearall: bool = False) -> dict[str, Any]:
+        """ControlLib.sweep:7012-7049; clearall is an internal caller option."""
         steps: list[dict[str, Any]] = []
         pause_scripts = False
         def step(name: str, operation: Callable) -> dict[str, Any]:
@@ -1635,7 +1636,7 @@ def build_oem_pipette_handlers(
             step_id = f"{action.source_occurrence_id}:{len(steps)}:{name}"
             return step(name, lambda: cast(Callable, pipette_call)(name, operation, action, state, step_id))
         for tray in range(4):
-            locations = state.source_model.sweep_locations(tray, False)
+            locations = state.source_model.sweep_locations(tray, clearall)
             if locations is None:
                 continue
             for well in locations:
