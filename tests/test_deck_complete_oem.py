@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import pytest
 from tests.test_deck_scoped_authority import retained_rig, qualify_test_references
+from tests.test_deck_scoped_integration import installed_retained
+from tests.test_deck_tip_query_publication import query_rig, query
 from tests.test_deck_near_terminal import NearUSB, named_rig
 from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
 from bioxp.oem_compat.position_table import load_bound_oem_position_table
@@ -133,8 +135,11 @@ def test_all25_named_native_terminal(retained_rig, monkeypatch, target):
         'native': raw, 'result': result, 'qualification': 'offline native + leaf doubles; not physical'})
 
 
-def test_park_native_source_z_and_already_parked(retained_rig, monkeypatch):
-    provider, observations, runtime, refs, store, _ = retained_rig
+def test_park_native_source_z_and_already_parked(query_rig, monkeypatch):
+    _, provider, observations, refs, _, _, _, _, _ = query_rig
+    # Park reads the independently owned pipette collection predicate. Populate
+    # it through the existing real query/receipt fixture, not a tip Boolean shim.
+    query(query_rig)
     qualify_test_references(refs)
     # Existing source fixture pattern: validate the isolated bundle with its
     # synthetic label; never remove blockers or access physical hardware.
@@ -158,7 +163,8 @@ def test_park_native_source_z_and_already_parked(retained_rig, monkeypatch):
     authority = dict(tip_loaded=False, tip_dirty=False, tip_location=-1, clean_path=False,
         pseudo_z_home=500, ownership_generation=3, board_epoch_4=7, board_epoch_5=9,
         current_location_id='LOC_OC', current_well_id=0, machine_state_revision=1,
-        semantic_state_provenance_digest='a'*64, plate_on_gantry=None, gripper_confirmed=True)
+        semantic_state_provenance_digest='a'*64, plate_on_gantry=None, gripper_confirmed=True,
+        collection_tip_state=provider._park_collection_state())
     result = provider.parkGantry(authority_snapshot=authority)
     table = load_bound_oem_position_table()
     target = table.resolve(location_id='LOC_PARK')
@@ -166,7 +172,8 @@ def test_park_native_source_z_and_already_parked(retained_rig, monkeypatch):
     assert leaf.positions == {(5, 0): target.base_coordinates['x'], (4, 0): target.base_coordinates['y'], (4, 1): target.z_low}
     assert target.z_low == 114092
     before = list(leaf.moves)
-    noop = provider.parkGantry(authority_snapshot={**authority, 'current_location_id': 'LOC_PARK'})
+    noop = provider.parkGantry(authority_snapshot={**authority, 'current_location_id': 'LOC_PARK',
+                                                 'collection_tip_state': None})
     assert noop['source_noop'] and not noop['delivery_attempted']
     assert not noop['controller_command_acknowledged'] and not noop['controller_completion_verified']
     assert leaf.moves == before

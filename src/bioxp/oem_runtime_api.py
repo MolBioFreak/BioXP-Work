@@ -163,6 +163,9 @@ def _retire_legacy_live_z_queue(name: str, req: RuntimeCommandRequest) -> None:
 
 
 def _enqueue(name: str, req: RuntimeCommandRequest) -> dict:
+    if req.mode == "live":
+        raise HTTPException(status_code=409, detail={"error": "legacy_runtime_execution_retired",
+                            "command": name, "replacement": "/protocol/execute"})
     _retire_legacy_live_z_queue(name, req)
     _, worker, _, _ = _require_runtime()
     try:
@@ -397,6 +400,13 @@ def runtime_commands_history(limit: int = 50):
 
 @router.get("/commands/{command_id}")
 def runtime_command_result(command_id: str):
+    from .api import app
+    plane = getattr(app.state, "operator_command_plane", None)
+    if plane is not None:
+        workflow = plane.store.get_workflow(command_id)
+        if workflow is not None:
+            return {"ok": True, "state": workflow["command"]["status"], "canonical_job": workflow,
+                    "status_path": workflow["command"]["status_path"]}
     if _store is None or _worker is None:
         return _runtime_unavailable("command_result")
     for row in reversed(_store.read_journal("command_history.jsonl", limit=500)):
@@ -408,7 +418,8 @@ def runtime_command_result(command_id: str):
         return {"ok": True, "state": "running", "command": active.to_dict()}
     for command in reversed(_store.read_journal("command_queue.jsonl", limit=500)):
         if isinstance(command, dict) and command.get("command_id") == command_id:
-            return {"ok": True, "state": "queued", "command": command}
+            return {"ok": False, "state": "reconciling", "historical": True,
+                    "error": "retired_queue_entry_not_replayed", "command": command}
     raise HTTPException(status_code=404, detail="OEM runtime command id was not found")
 
 

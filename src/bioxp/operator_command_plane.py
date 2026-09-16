@@ -1068,6 +1068,10 @@ class OperatorCommandStore:
         self._shutdown_guard_recover = False
         self._authority_write_depth = 0
         self._internal_admission = threading.local()
+        self._workflow_dispatcher: Callable | None = None
+        self._workflow_controls: dict[str, Callable] = {}
+        self._workflow_interrupt_notified: set[str] = set()
+        self._workflow_child_waiters: dict[str, Any] = {}
         self._interrupt_spool_write_depth = 0
         self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
         self._deck_owner_authority_scope: Callable[[], AbstractContextManager[Any]] = nullcontext
@@ -2712,6 +2716,13 @@ class OperatorCommandStore:
             (event_kind, command_id, method_id, state, _canonical(payload or {}), _now()),
         ).fetchone()
         assert row is not None
+        if command_id:
+            movement = conn.execute("SELECT 1 FROM serial206_movement_commands WHERE command_id=?", (command_id,)).fetchone()
+            plane = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
+            if movement is not None and plane is not None:
+                receipt = self._command_response(plane, transition_sequence=int(row[0]))
+                conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
+                             (receipt["status"], _canonical(receipt), _now(), receipt["finished_at"], command_id))
         return int(row[0])
 
     def _store_evidence(
@@ -2780,6 +2791,21 @@ class OperatorCommandStore:
 
     def _startup_recover(self) -> None:
         with self._transaction() as conn:
+            # Retained pre-workflow stores reconcile stopped leaf commands
+            # before the schema owner's quiesced migration can proceed.
+            lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
+            workflow_id = dict(lane).get("workflow_command_id") if lane else None
+            if workflow_id:
+                command_id = workflow_id
+                row = conn.execute("SELECT receipt_json FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
+                payload = _json_load(row[0], {}) if row else {}
+                runtime = payload.setdefault("execution", {}).setdefault("runtime_state", {})
+                state = runtime.setdefault("workflow", {"command_id": command_id})
+                state.update(phase="reconciling", held_reason="workflow_owner_lost")
+                conn.execute("UPDATE operator_commands SET status='ambiguous',receipt_json=?,updated_at=? WHERE command_id=? AND status IN ('dispatched','interrupting')",
+                             (_canonical(payload), _now(), command_id))
+                conn.execute("UPDATE operator_plane_commands SET status='ambiguous',terminal_json=?,version=version+1,updated_at=? WHERE command_id=? AND status IN ('dispatched','stop_requested','abort_requested')",
+                             (_canonical(payload), _now(), command_id))
             safety = conn.execute(
                 "SELECT * FROM operator_plane_safety WHERE singleton=1"
             ).fetchone()
@@ -3161,6 +3187,318 @@ class OperatorCommandStore:
             ),
         )
 
+    def _insert_plane_claim(self, conn, *, command_id, key, action_id, inputs,
+                            generation, kind, status, binding=None, digest=""):
+        conn.execute(
+            "INSERT INTO operator_commands(command_id,idempotency_key,canonical_request_sha256,operation,command_kind,"
+            "entrypoint_id,caller_class,control_class,action_id,status,ownership_generation,requested_inputs_json,"
+            "effective_inputs_json,source_identity_json,started_at,receipt_json,updated_at,parent_command_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (command_id, key, digest, action_id, kind, "operator_command_plane", "canonical_dispatcher",
+             "host_control" if kind == "protocol_control" else "physical_command", action_id, status,
+             generation, _canonical(inputs), "{}", "{}", str(_now()), "{}", _now(),
+             binding["parent_command_id"] if binding else None),
+        )
+
+    def bind_workflow_dispatcher(self, dispatch: Callable[[dict[str, Any]], None]) -> None:
+        self._workflow_dispatcher = dispatch
+
+    def admit_workflow(self, *, command_id: str, idempotency_key: str, plan_fingerprint: str,
+                       requested_inputs: Mapping[str, Any], ownership_generation: int,
+                       resources: Sequence[str], board_epochs: Mapping[str, int]) -> dict[str, Any]:
+        request = {"inputs": dict(requested_inputs), "plan_fingerprint": plan_fingerprint,
+                   "resources": sorted(set(resources)), "board_epochs": dict(board_epochs),
+                   "ownership_generation": ownership_generation}
+        digest = _digest(request)
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT command_id,canonical_request_sha256 FROM operator_commands WHERE idempotency_key=?",
+                                    (idempotency_key,)).fetchone()
+            if existing:
+                if existing["canonical_request_sha256"] != digest:
+                    raise ValueError("idempotency key conflict")
+                return self.get_workflow(existing["command_id"])
+            if conn.execute("SELECT 1 FROM operator_commands WHERE command_kind='protocol_workflow' "
+                            "AND status IN ('queued','dispatched','interrupting','ambiguous') LIMIT 1").fetchone():
+                raise ValueError("workflow_busy")
+            safety = dict(conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone())
+            footprint = {"global_epoch": safety["global_epoch"],
+                         **{f"{axis}_epoch": safety[f"{axis}_epoch"] for axis in ("x", "y", "z")
+                            if f"axis:{axis}" in resources}}
+            captured = {**dict(requested_inputs), "plan_fingerprint": plan_fingerprint,
+                        "workflow_footprint": {"resources": request["resources"], "safety_epochs": footprint,
+                                               "board_epochs": dict(board_epochs)}}
+            self._insert_plane_claim(conn, command_id=command_id, key=idempotency_key,
+                action_id="protocol.execute", inputs=captured, generation=ownership_generation,
+                kind="protocol_workflow", status="queued", digest=digest)
+            sequence = conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0]
+            conn.execute("INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,"
+                         "status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,'queued',1,?,?,?)",
+                         (command_id, sequence, "protocol.execute", _canonical(captured), "{}", ownership_generation, _now(), _now()))
+            self._insert_transition(conn, event_kind="workflow_admitted", state="queued", command_id=command_id)
+        self._wake.set()
+        return self.get_workflow(command_id)
+
+    def get_workflow(self, command_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute("SELECT c.*,p.version FROM operator_commands c JOIN operator_plane_commands p USING(command_id) "
+                "WHERE c.command_id=? AND c.command_kind='protocol_workflow'", (command_id,)).fetchone()
+            if row is None:
+                return None
+            inputs = _json_load(row["requested_inputs_json"], {})
+            payload = _json_load(row["receipt_json"], {}) or inputs.get("bundle", {})
+            return {**payload, "job_id": command_id, "status": row["status"], "command": {
+                "command_id": command_id, "idempotency_key": row["idempotency_key"],
+                "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
+                "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
+                "status_path": f"/protocol/jobs/{command_id}"}}
+
+    def list_workflows(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            ids = self.connection.execute("SELECT command_id FROM operator_commands WHERE command_kind='protocol_workflow' "
+                "ORDER BY sequence DESC LIMIT ?", (limit,)).fetchall()
+            return [self.get_workflow(row[0]) for row in ids]
+
+    def _workflow_current(self, conn, command_id, *, check_safety=True):
+        row = conn.execute("SELECT p.*,c.command_kind FROM operator_plane_commands p JOIN operator_commands c USING(command_id) "
+                           "WHERE p.command_id=?", (command_id,)).fetchone()
+        lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
+        if (row is None or row["command_kind"] != "protocol_workflow" or row["status"] not in {"dispatched", "stop_requested", "abort_requested"}
+                or lane["workflow_command_id"] != command_id or lane["owner_id"] != self.owner_id
+                or float(lane["owner_lease_until"] or 0) <= _now()
+                or row["dispatcher_epoch"] != lane["dispatcher_epoch"]):
+            raise ValueError("workflow_authority_lost")
+        if not check_safety:
+            return row
+        footprint = _json_load(row["requested_json"], {})["workflow_footprint"]
+        safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
+        if self._priority_fence.is_set() or any(safety[key] != value for key, value in footprint["safety_epochs"].items()):
+            raise ValueError("workflow_interrupted")
+        for axis, fence in self._axis_priority_fences.items():
+            if f"axis:{axis}" in footprint["resources"] and fence.is_set():
+                raise ValueError("workflow_interrupted")
+        for board, epoch in footprint["board_epochs"].items():
+            if str(board) == "5":
+                # The provider's X generation lives in the persisted OEM state,
+                # not the legacy board-5 projection. Read on this transaction's
+                # connection: never acquire the provider lock beneath a writer.
+                snapshot = conn.execute(
+                    "SELECT state_json,state_sha256 FROM serial206_authority_snapshots "
+                    "ORDER BY sequence DESC LIMIT 1").fetchone()
+                state = _json_load(snapshot[0], {}) if snapshot else {}
+                if snapshot and (snapshot[0] != json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                        or hashlib.sha256(snapshot[0].encode("utf-8")).hexdigest() != snapshot[1]):
+                    raise ValueError("workflow_board_epoch_changed")
+                actual = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
+            else:
+                table = "serial206_board_authority" if str(board) == "4" else "operator_plane_board_authority"
+                selected = conn.execute(f"SELECT active_board_epoch FROM {table} WHERE board_id=?", (int(board),)).fetchone()
+                actual = selected[0] if selected else None
+            if type(actual) is not int or actual != epoch:
+                raise ValueError("workflow_board_epoch_changed")
+        return row
+
+    def assert_workflow_current(self, command_id: str) -> None:
+        with self._lock:
+            self._workflow_current(self.connection, command_id)
+
+    @contextmanager
+    def workflow_context(self, command_id: str, *, source_occurrence_id: str):
+        from .runtime_audit_store import _WORKFLOW_CONTEXT
+        with self._lock:
+            row = self._workflow_current(self.connection, command_id)
+            inputs = _json_load(row["requested_json"], {})
+            binding = {"parent_command_id": command_id, "parent_attempt": row["dispatch_attempt_id"],
+                       "dispatcher_epoch": row["dispatcher_epoch"], "plan_fingerprint": inputs["plan_fingerprint"],
+                       "source_occurrence_id": source_occurrence_id}
+        token = _WORKFLOW_CONTEXT.set((self, binding))
+        try:
+            yield binding
+        finally:
+            _WORKFLOW_CONTEXT.reset(token)
+
+    def _workflow_child_publication(self, conn, command_id, payload):
+        # Canonical admission order, never native completion/callback order.
+        # Called only within the parent's existing writer transaction.
+        payload = json.loads(_canonical(payload))
+        workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault(
+            "workflow", {"command_id": command_id})
+        workflow["child_command_ids"] = [row[0] for row in conn.execute(
+            "SELECT command_id FROM operator_commands WHERE parent_command_id=? "
+            "AND command_kind<>'protocol_control' ORDER BY rowid", (command_id,))]
+        return payload
+
+    def publish_workflow(self, command_id: str, *, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._transaction() as conn:
+            self._workflow_current(conn, command_id, check_safety=False)
+            payload = self._workflow_child_publication(conn, command_id, payload)
+            conn.execute("UPDATE operator_commands SET receipt_json=?,updated_at=? WHERE command_id=? AND status IN ('dispatched','interrupting')",
+                         (_canonical(payload), _now(), command_id))
+            conn.execute("UPDATE operator_plane_commands SET version=version+1,updated_at=? WHERE command_id=?", (_now(), command_id))
+        return self.get_workflow(command_id)
+
+    def finish_workflow(self, command_id: str, *, status: str, payload: Mapping[str, Any],
+                        lifecycle_settled: bool) -> dict[str, Any]:
+        if status not in {"completed", "failed", "interrupted", "cleared", "ambiguous"}:
+            raise ValueError(status)
+        with self._transaction() as conn:
+            row = conn.execute("SELECT status FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
+            if row and row[0] in {"completed","failed","interrupted","cleared","ambiguous"}:
+                return self.get_workflow(command_id)
+            self._workflow_current(conn, command_id, check_safety=False)
+            from .runtime_audit_store import TERMINAL_COMMAND_STATES
+            # Unknown terminal receipts retain custody; ordinary query observations
+            # and every known canonical/plane terminal outcome settle their child.
+            settled = sorted((TERMINAL_COMMAND_STATES | COMMAND_TERMINAL)
+                             - {"ambiguous", "outcome_unknown", "reconciliation_required"})
+            pending = conn.execute(
+                "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
+                "WHERE c.parent_command_id=? AND COALESCE(m.state,c.status) NOT IN ("
+                + ",".join("?" for _ in settled) + ") LIMIT 1", (command_id, *settled)).fetchone()
+            if pending or not lifecycle_settled:
+                status = "ambiguous"
+            if status == "ambiguous":
+                payload = json.loads(_canonical(payload))
+                workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault("workflow", {"command_id": command_id})
+                workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown")
+            if status == "completed":
+                try:
+                    self._workflow_current(conn, command_id)
+                except ValueError:
+                    status = "interrupted"
+            payload = self._workflow_child_publication(conn, command_id, payload)
+            conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
+                         (status, _canonical(payload), _now(), str(_now()), command_id))
+            conn.execute("UPDATE operator_plane_commands SET status=?,terminal_json=?,version=version+1,finished_at=?,updated_at=? WHERE command_id=?",
+                         (status, _canonical(payload), _now(), _now(), command_id))
+            if status != "ambiguous":
+                conn.execute("UPDATE operator_plane_lane SET workflow_command_id=NULL WHERE singleton=1 AND workflow_command_id=?", (command_id,))
+            self._insert_transition(conn, event_kind="workflow_terminal", state=status, command_id=command_id)
+        self._wake.set()
+        return self.get_workflow(command_id)
+
+    @contextmanager
+    def normal_mutation_scope(self, *, resources: Sequence[str]):
+        from .runtime_audit_store import workflow_claim_context, _normal_claim_eligibility
+        from .operator_controls import current_operator_dispatch_context
+        binding = workflow_claim_context()
+        dispatch = current_operator_dispatch_context() or {}
+        enclosing = dispatch.get("operator_command_id")
+        command_id = str(enclosing or f"direct-{uuid.uuid4().hex}")
+        with self._transaction() as conn:
+            _normal_claim_eligibility(conn, binding=binding, resources=resources, command_id=enclosing)
+            if not enclosing:
+                self._insert_plane_claim(conn, command_id=command_id, key=command_id, action_id="normal_mutation",
+                    inputs={"workflow_binding": binding} if binding else {},
+                    generation=(conn.execute("SELECT ownership_generation FROM operator_commands WHERE command_id=?", (binding["parent_command_id"],)).fetchone()[0] if binding else 0),
+                    kind="operator", status="dispatched", binding=binding)
+                conn.executemany("INSERT INTO serial206_command_resources(command_id,resource_key) VALUES(?,?)",
+                                 [(command_id, resource) for resource in resources])
+        try:
+            yield command_id
+        except BaseException:
+            if not enclosing:
+                with self._transaction() as conn:
+                    conn.execute("UPDATE operator_commands SET status='ambiguous',updated_at=? WHERE command_id=?", (_now(), command_id))
+            raise
+        else:
+            if not enclosing:
+                with self._transaction() as conn:
+                    conn.execute("UPDATE operator_commands SET status='completed',updated_at=? WHERE command_id=?", (_now(), command_id))
+
+    def workflow_child_completion(self, command_id: str):
+        from concurrent.futures import Future
+        with self._lock:
+            future = self._workflow_child_waiters.setdefault(command_id, Future())
+        self._wake.set()
+        return future
+
+    def _settle_workflow_child_waiters(self) -> None:
+        ready = []
+        with self._lock:
+            for command_id, future in list(self._workflow_child_waiters.items()):
+                receipt = self.get_command(command_id)
+                if receipt is not None and receipt["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
+                    ready.append((future, {"ok": receipt["status"] == "completed", "command_id": command_id,
+                                           "status": receipt["status"], "receipt": receipt}))
+                    del self._workflow_child_waiters[command_id]
+        for future, result in ready:
+            future.set_result(result)
+
+    def _notify_workflow_interrupt(self) -> None:
+        callback = None
+        with self._lock:
+            lane = self.connection.execute("SELECT workflow_command_id FROM operator_plane_lane WHERE singleton=1").fetchone()
+            command_id = lane[0] if lane else None
+            if command_id not in self._workflow_controls or command_id in self._workflow_interrupt_notified:
+                return
+            try:
+                self._workflow_current(self.connection, command_id)
+            except ValueError as exc:
+                if str(exc) != "workflow_interrupted":
+                    return
+                interrupt = self.connection.execute("SELECT interrupt_attempt_id FROM operator_plane_interrupt_attempts ORDER BY attempt_sequence DESC LIMIT 1").fetchone()
+                control_id = str(interrupt[0]) if interrupt else command_id
+                callback = self._workflow_controls[command_id]
+                self._workflow_interrupt_notified.add(command_id)
+        if callback is not None:
+            try:
+                callback(control_id, {"action": "_addressed_stop"})
+            except Exception:
+                self.finish_workflow(command_id, status="ambiguous", payload=self.get_workflow(command_id) or {}, lifecycle_settled=False)
+
+    def bind_workflow_controls(self, command_id: str, callback: Callable) -> None:
+        with self._lock:
+            self._workflow_controls[command_id] = callback
+
+    def unbind_workflow_controls(self, command_id: str) -> None:
+        with self._lock:
+            self._workflow_controls.pop(command_id, None)
+
+    def control_workflow(self, command_id: str, *, request: Mapping[str, Any]) -> dict[str, Any]:
+        key, digest = str(request["idempotency_key"]), _digest({"target": command_id, **dict(request)})
+        with self._transaction() as conn:
+            existing = conn.execute("SELECT canonical_request_sha256,receipt_json,status FROM operator_commands WHERE idempotency_key=?", (key,)).fetchone()
+            if existing:
+                if existing[0] != digest:
+                    raise ValueError("idempotency key conflict")
+                if existing[2] == "reserved":
+                    raise ValueError("workflow_control_reconciling")
+                return _json_load(existing[1], {})
+            row = self._workflow_current(conn, command_id)
+            if request["command_id"] != command_id or request["expected_ownership_generation"] != row["ownership_generation"]:
+                raise ValueError("workflow_generation_mismatch")
+            callback = self._workflow_controls.get(command_id)
+            if callback is None:
+                raise ValueError("workflow_task_unavailable")
+            control_id = "protocol-control-" + _digest({"key": key})
+            self._insert_plane_claim(conn, command_id=control_id, key=key, action_id="protocol.control",
+                inputs=request, generation=row["ownership_generation"], kind="protocol_control", status="reserved",
+                binding={"parent_command_id": command_id}, digest=digest)
+        # Callback only signals the existing executor; never invoke a native operation here.
+        refusal = None
+        try:
+            workflow = dict(callback(control_id, request))
+        except Exception as exc:
+            refusal = exc
+            bundle = self.get_workflow(command_id)
+            workflow = bundle.get("execution", {}).get("runtime_state", {}).get("workflow") or {}
+        current = self.get_workflow(command_id)["command"]
+        response = {"control_command_id": control_id, "idempotency_key": key, "command_id": command_id,
+                    "job_id": command_id, "ownership_generation": current["ownership_generation"],
+                    "state_version": current["state_version"], "accepted": refusal is None,
+                    "reached": workflow.get("reached_control_id") == control_id, "phase": workflow.get("phase"),
+                    "gate": workflow.get("gate"), "gate_id": workflow.get("gate_id"), "status_path": current["status_path"]}
+        with self._transaction() as conn:
+            conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=? WHERE command_id=?",
+                         ("rejected" if refusal else "completed", _canonical(response), _now(), control_id))
+            if refusal is None and request["action"] in {"abort", "safe_stop"}:
+                conn.execute("UPDATE operator_commands SET status='interrupting',updated_at=? WHERE command_id=? AND status='dispatched'", (_now(), command_id))
+                conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,updated_at=? WHERE command_id=? AND status='dispatched'",
+                             ("abort_requested" if request["action"] == "abort" else "stop_requested", _now(), command_id))
+        if refusal is not None:
+            raise refusal
+        return response
+
     def _insert_canonical_command(
         self,
         conn: sqlite3.Connection,
@@ -3190,6 +3528,11 @@ class OperatorCommandStore:
             if axis in motor_by_axis
             else {}
         )
+        from .runtime_audit_store import workflow_claim_context
+        binding = workflow_claim_context()
+        canonical_inputs = {**dict(inputs), **({"workflow_binding": binding} if binding else {})}
+        self._insert_plane_claim(conn, command_id=command_id, key=idempotency_key, action_id=action_id,
+            inputs=canonical_inputs, generation=ownership_generation, kind="operator", status="queued", binding=binding)
         canonical_hash = _digest(dict(inputs))
         expected_epochs = dict(expected_board_epochs or {}) if axis in motor_by_axis or composite_xy or composite_xyz or deck_movement else {}
         safety = conn.execute("SELECT x_epoch,y_epoch,z_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
@@ -3504,9 +3847,16 @@ class OperatorCommandStore:
             row = self.connection.execute(
                 "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
+            # The source software flag has no hardware-state column. Its existing
+            # canonical transition survives unrelated semantic publications.
+            door = self.connection.execute(
+                "SELECT transition_json FROM operator_plane_deck_semantic_transitions "
+                "WHERE source_operation='updateThermalDoorOpen' ORDER BY transition_revision DESC LIMIT 1"
+            ).fetchone()
         assert row is not None
         provenance = _json_load(row["transition_provenance_json"], {})
         return {
+            **({"thermal_door_open": _json_load(door[0], {})["updates"]["thermal_door_open"]} if door else {}),
             "current_location": row["current_location"],
             "current_well": row["current_well"],
             "current_tray": row["current_tray"],
@@ -3641,17 +3991,48 @@ class OperatorCommandStore:
         board_epoch_5: int,
     ) -> dict[str, Any]:
         """Publish one successful production-owner mutation into canonical SQLite."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
         allowed = {
             "pipette_owner": {"tip_loaded", "tip_dirty", "tip_location"},
             "clean_path_calculation": {"clean_path"},
             "GantryLoad": {"tip_loaded", "plate_on_gantry", "pseudo_z_home"},
             "LoadGantry": {"tip_loaded", "plate_on_gantry", "pseudo_z_home"},
             "plate_operation": {"current_tray", "plate_on_gantry", "movable_plate_locations"},
+            "updateLocation": {"current_location", "current_well"},
+            "updatePlateLocation": {"movable_plate_locations"},
+            "updateThermalDoorOpen": {"thermal_door_open"},
+            "sourceImageGantryLoad": {"pseudo_z_home"},
+            "clearTipLoaded": {"tip_loaded"},
+            "sourceWellPierced": {"well_pierced"},
+            "sourceUnlatch": {"latch_closed"},
         }
         operation = str(source_operation)
         values = dict(updates)
         if operation not in allowed or not values or set(values) - allowed[operation]:
             raise ValueError("deck semantic producer fields are not permitted")
+        if operation == "updateLocation" and (
+            set(values) != allowed[operation]
+            or values["current_location"] not in LOCATION_ID_TO_NAME.values()
+            or type(values["current_well"]) is not int
+        ):
+            raise ValueError("source current location/well is not authoritative")
+        if "thermal_door_open" in values and type(values["thermal_door_open"]) is not bool:
+            raise ValueError("thermal_door_open must be boolean")
+        if operation == "sourceUnlatch" and values["latch_closed"] is not False:
+            raise ValueError("sourceUnlatch must publish an open latch")
+        if operation == "clearTipLoaded" and values["tip_loaded"] is not False:
+            raise ValueError("clearTipLoaded must clear tip_loaded")
+        pierced_key = ""
+        if "well_pierced" in values:
+            key = values["well_pierced"]
+            if (not isinstance(key, (list, tuple)) or len(key) != 3
+                    or type(key[1]) is not int or key[2] not in {0, 1, "strip"}):
+                raise ValueError("source pierced well is not authoritative")
+            plate = canonical_plate_name(key[0])
+            if plate is None or (key[2] == "strip") != (plate in {7, 8, 9, 10}):
+                raise ValueError("source pierced well plate is not authoritative")
+            pierced_key = f"{plate}:{key[1]}:{key[2]}"
         if "tip_loaded" in values and type(values["tip_loaded"]) is not bool:
             raise ValueError("tip_loaded must be boolean")
         if "tip_dirty" in values and not (
@@ -3691,6 +4072,9 @@ class OperatorCommandStore:
             ).fetchone()
             assert current is not None
             merged = {
+                "current_location": current["current_location"],
+                "current_well": current["current_well"],
+                "well_pierced": _json_load(current["well_pierced_json"], {}),
                 "current_tray": current["current_tray"],
                 "tip_loaded": None if current["tip_loaded"] is None else bool(current["tip_loaded"]),
                 "tip_dirty": None if current["tip_dirty"] is None else bool(current["tip_dirty"]),
@@ -3700,7 +4084,12 @@ class OperatorCommandStore:
                 "movable_plate_locations": _json_load(current["movable_plate_locations_json"], {}),
                 "pseudo_z_home": int(current["pseudo_z_home"]),
             }
-            merged.update(values)
+            merged.update({key: value for key, value in values.items() if key != "well_pierced"})
+            if "well_pierced" in values:
+                merged["well_pierced"][pierced_key] = True
+            if operation == "updateLocation":
+                merged["current_tray"] = self._oem_update_location_current_tray(
+                    merged["current_location"], merged["movable_plate_locations"], merged["current_tray"])
             if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
                 if not (operation == "pipette_owner" and "tip_location" in values
                         and values["tip_location"] is None):
@@ -3733,10 +4122,14 @@ class OperatorCommandStore:
                 "machine_latch_closed": prior.get("machine_latch_closed"),
                 "latch_observation_id": prior.get("latch_observation_id"),
             }
-            conn.execute(
-                "UPDATE operator_plane_deck_semantic_state SET current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
-                (merged["current_tray"], None if merged["tip_loaded"] is None else int(merged["tip_loaded"]), None if merged["tip_dirty"] is None else int(merged["tip_dirty"]), merged["tip_location"], None if merged["clean_path"] is None else int(merged["clean_path"]), plate_name_for_storage(merged["plate_on_gantry"]), _canonical(dict(merged["movable_plate_locations"])), int(merged["pseudo_z_home"]), after, operation, command_id, ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), now),
-            )
+            if operation == "sourceUnlatch":
+                provenance.update(latch_status=False, machine_latch_closed=False,
+                                  latch_observation_id=upstream_id)
+            with self._authority_write():
+                conn.execute(
+                    "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,well_pierced_json=?,current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
+                    (merged["current_location"], merged["current_well"], _canonical(merged["well_pierced"]), merged["current_tray"], None if merged["tip_loaded"] is None else int(merged["tip_loaded"]), None if merged["tip_dirty"] is None else int(merged["tip_dirty"]), merged["tip_location"], None if merged["clean_path"] is None else int(merged["clean_path"]), plate_name_for_storage(merged["plate_on_gantry"]), _canonical(dict(merged["movable_plate_locations"])), int(merged["pseudo_z_home"]), after, operation, command_id, ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), now),
+                )
             conn.execute(
                 "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,?,?,?,?,?)",
                 (command_id, operation, before, after, _canonical(provenance), now),
@@ -4821,6 +5214,12 @@ class OperatorCommandStore:
                 },
             )
         inputs = _validate_inputs(action_id, request.get("inputs", {}))
+        prepared_plan = getattr(self._internal_admission, "prepared_plan", None)
+        if internal and action_id == "oem.deck._finite_operation" and prepared_plan is not None:
+            from .runtime_audit_store import workflow_claim_context
+            if workflow_claim_context() is None:
+                raise ValueError("prepared_plan_requires_workflow_context")
+            inputs["prepared_plan"] = _json_load(_canonical(prepared_plan), {})
         expected_generation = int(request["expected_ownership_generation"])
         schema_version = str(request.get("schema_version") or COMMAND_SCHEMA)
         if action_id.startswith("oem.y.") and schema_version != ACTION_REQUEST_SCHEMA:
@@ -4971,6 +5370,7 @@ class OperatorCommandStore:
         inputs: Mapping[str, Any],
         state: Mapping[str, Any],
         idempotency_key: str | None = None,
+        prepared_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Admit one finite source-owned deck operation from trusted workflow code."""
         allowed_intent_keys = WP8_OPERATION_INTENT_KEYS.get(operation)
@@ -5012,10 +5412,13 @@ class OperatorCommandStore:
         }
         depth = int(getattr(self._internal_admission, "depth", 0))
         self._internal_admission.depth = depth + 1
+        previous_plan = getattr(self._internal_admission, "prepared_plan", None)
+        self._internal_admission.prepared_plan = prepared_plan
         try:
             return self.admit_command(request, state=epoch_state, assessment=None)
         finally:
             self._internal_admission.depth = depth
+            self._internal_admission.prepared_plan = previous_plan
 
     def admit_method(
         self,
@@ -5886,6 +6289,31 @@ class OperatorCommandStore:
             row = None
             canonical = None
             for candidate in queued_rows:
+                identity = conn.execute("SELECT command_kind,parent_command_id FROM operator_commands WHERE command_id=?",
+                                        (candidate["command_id"],)).fetchone()
+                active_parent = lane["workflow_command_id"]
+                if active_parent:
+                    if identity is None or identity["parent_command_id"] != active_parent:
+                        continue
+                    self._workflow_current(conn, active_parent)
+                if identity and identity["command_kind"] == "protocol_workflow":
+                    if self._workflow_dispatcher is None:
+                        return None
+                    if conn.execute("SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
+                        "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
+                        "('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') LIMIT 1",
+                        (candidate["command_id"],)).fetchone():
+                        return None
+                    attempt = str(uuid.uuid4())
+                    conn.execute("UPDATE operator_plane_commands SET status='dispatched',version=version+1,dispatch_attempt_id=?,"
+                        "dispatcher_epoch=?,dispatched_at=?,updated_at=? WHERE command_id=?",
+                        (attempt,lane["dispatcher_epoch"],now,now,candidate["command_id"]))
+                    conn.execute("UPDATE operator_commands SET status='dispatched',updated_at=? WHERE command_id=?", (now,candidate["command_id"]))
+                    conn.execute("UPDATE operator_plane_lane SET workflow_command_id=? WHERE singleton=1", (candidate["command_id"],))
+                    return {"command_id": candidate["command_id"], "command_kind": "protocol_workflow",
+                        "action_id": candidate["action_id"], "dispatch_attempt_id": attempt,
+                        "dispatcher_epoch": lane["dispatcher_epoch"], "ownership_generation": candidate["ownership_generation"],
+                        "requested_inputs": _json_load(candidate["requested_json"], {})}
                 if self.action_fenced(str(candidate["action_id"])):
                     return None
                 candidate_canonical = conn.execute(
@@ -5921,11 +6349,12 @@ class OperatorCommandStore:
                     FROM serial206_command_resources requested
                     JOIN serial206_command_resources active_resource
                       ON active_resource.resource_key=requested.resource_key
-                    JOIN serial206_movement_commands active
+                    JOIN operator_commands active
                       ON active.command_id=active_resource.command_id
+                    LEFT JOIN serial206_movement_commands active_movement ON active_movement.command_id=active.command_id
                     WHERE requested.command_id=?
                       AND active.command_id<>requested.command_id
-                      AND active.state IN ('dispatched','issued_pending','interrupting')
+                      AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous')
                     LIMIT 1
                     """,
                     (candidate["command_id"],),
@@ -6622,6 +7051,10 @@ class OperatorCommandStore:
         return any(self._axis_priority_fences[axis].is_set() for axis in self._axes_for_action(action_id))
 
     def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> None:
+        with self._lock:
+            parent = self.connection.execute("SELECT parent_command_id FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
+            if parent and parent[0]:
+                self._workflow_current(self.connection, parent[0])
         """Fence every provider child against STOP/Abort and authority drift."""
         del boundary
         with self._lock:
@@ -6779,6 +7212,7 @@ class OperatorCommandStore:
 
     def _shutdown_owner_guard(self) -> None:
         while True:
+            self._settle_workflow_child_waiters()
             with self._worker_lock:
                 live_workers = [worker for worker in self._workers if worker.is_alive()]
             if self._thread is not None and self._thread.is_alive():
@@ -6892,6 +7326,8 @@ class OperatorCommandStore:
                     break
                 next_renewal = _now() + 1.0
 
+            self._settle_workflow_child_waiters()
+            self._notify_workflow_interrupt()
             spawned = False
             claimed: dict[str, Any] | None = None
             try:
@@ -6934,7 +7370,21 @@ class OperatorCommandStore:
 
     def _dispatch_worker(self, dispatch_one: Callable[[dict[str, Any]], None], claimed: dict[str, Any]) -> None:
         try:
-            dispatch_one(claimed)
+            if claimed.get("command_kind") == "protocol_workflow":
+                try:
+                    self._workflow_dispatcher(claimed)
+                except Exception:
+                    self.finish_workflow(claimed["command_id"], status="ambiguous",
+                        payload={"error": "workflow_dispatcher_exception", "outcome_unknown": True}, lifecycle_settled=False)
+                return
+            parent = self.connection.execute("SELECT parent_command_id,requested_inputs_json FROM operator_commands WHERE command_id=?",
+                                             (claimed["command_id"],)).fetchone()
+            if parent and parent["parent_command_id"]:
+                occurrence = _json_load(parent["requested_inputs_json"], {})["workflow_binding"]["source_occurrence_id"]
+                with self.workflow_context(parent["parent_command_id"], source_occurrence_id=occurrence):
+                    dispatch_one(claimed)
+            else:
+                dispatch_one(claimed)
         except Exception:
             try:
                 if str(claimed.get("action_id")) == "oem.deck.move_to_location":
@@ -7195,18 +7645,20 @@ class OperatorCommandPlane:
             try:
                 operation = str(effective["operation"])
                 operation_inputs = dict(effective["operation_inputs"])
-                snapshot_reader = getattr(provider, "wp8_operation_machine_state", None)
-                if not callable(snapshot_reader):
-                    raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
-                machine_inputs = snapshot_reader(operation, operation_inputs)
-                if not isinstance(machine_inputs, Mapping):
-                    raise RuntimeError("wp8_operation_machine_state_invalid")
-                plan = compile_finite_plate_operation(
-                    operation,
-                    source_leaf_available=callable(getattr(provider, "execute_wp8_child", None)),
-                    **dict(machine_inputs),
-                    **operation_inputs,
-                )
+                plan = effective.get("prepared_plan")
+                if plan is None:
+                    snapshot_reader = getattr(provider, "wp8_operation_machine_state", None)
+                    if not callable(snapshot_reader):
+                        raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
+                    machine_inputs = snapshot_reader(operation, operation_inputs)
+                    if not isinstance(machine_inputs, Mapping):
+                        raise RuntimeError("wp8_operation_machine_state_invalid")
+                    plan = compile_finite_plate_operation(
+                        operation,
+                        source_leaf_available=callable(getattr(provider, "execute_wp8_child", None)),
+                        **dict(machine_inputs),
+                        **operation_inputs,
+                    )
                 raw_response = executor(command_id=command_id, plan=plan)
                 if not isinstance(raw_response, Mapping):
                     raise RuntimeError("wp8_operation_executor_returned_invalid_payload")
@@ -7221,13 +7673,26 @@ class OperatorCommandPlane:
                     ) or self.store.has_delivery_attempt(command_id)
                 except Exception:
                     delivery_attempted = self.store.has_delivery_attempt(command_id)
+                # The native failure carries source returns/partial children;
+                # stringifying it loses the Park pause/error callback boundary.
+                failure = exc if isinstance(exc, DeckExecutionFailure) else None
+                if failure is not None:
+                    delivery_attempted = delivery_attempted or failure.delivery_attempted
+                response = ({
+                    "ok": False,
+                    "delivery_attempted": delivery_attempted,
+                    "controller_command_acknowledged": failure.controller_command_acknowledged,
+                    "controller_completion_verified": failure.controller_completion_verified,
+                    "hardware_postcondition_verified": failure.hardware_postcondition_verified,
+                    "provider_results": failure.provider_results,
+                } if failure is not None else {})
                 if delivery_attempted:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500],
-                        controller_command_acknowledged=False,
-                        controller_completion_verified=False,
-                        hardware_postcondition_verified=False,
-                        provider_results=None,
+                        controller_command_acknowledged=bool(response.get("controller_command_acknowledged")),
+                        controller_completion_verified=bool(response.get("controller_completion_verified")),
+                        hardware_postcondition_verified=bool(response.get("hardware_postcondition_verified")),
+                        provider_results=failure.provider_results if failure is not None else None,
                     )
                 self.store.finish(
                     command_id,
@@ -7236,8 +7701,10 @@ class OperatorCommandPlane:
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
+                        **({"response": response} if failure is not None else {}),
                         **({"outcome_unknown": True} if delivery_attempted else {}),
                     },
+                    controller_acknowledged=bool(response.get("controller_command_acknowledged")),
                     claimed=claimed,
                 )
                 return

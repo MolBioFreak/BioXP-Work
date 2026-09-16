@@ -485,11 +485,12 @@ class ClassMoveToIntent:
     well: str | int | None = None
     material: str | None = None
     continuation: str | None = None
+    old_well: bool = False
 
     def __post_init__(self) -> None:
         if type(self.script_line) is not int:
             raise ValueError("script_line must be an integer")
-        if (self.plate_name is None) == (self.location_id is None):
+        if not self.old_well and (self.plate_name is None) == (self.location_id is None):
             raise ValueError("exactly one destination is required")
         if self.plate_name is not None:
             object.__setattr__(self, "plate_name", canonical_plate_name(self.plate_name))
@@ -499,6 +500,41 @@ class ClassMoveToIntent:
             raise ValueError("material must be text")
         if self.continuation is not None and type(self.continuation) is not str:
             raise ValueError("continuation must be text")
+
+
+def prepared_class_move_to_intent(arguments: Mapping[str, Any], *, script_line: int) -> ClassMoveToIntent:
+    """Lossless finite ClassMoveTo handoff to the existing mov compiler.
+
+    Numeric destination enums require their captured type; plateName and
+    locationID have overlapping ordinals and must never be guessed.
+    """
+    from .oem_compat.pathing import LOCATION_ID_TO_NAME
+    known = {"m_destination", "m_well", "m_piersOption", "m_oldWell", "m_material"}
+    if set(arguments) - known:
+        raise ValueError("ClassMoveTo_unknown_fields")
+    old = arguments.get("m_oldWell", False)
+    if type(old) is not bool:
+        raise ValueError("ClassMoveTo_oldWell_boolean_required")
+    destination = arguments.get("m_destination")
+    plate = location = None
+    if destination is not None:
+        if not isinstance(destination, Mapping) or set(destination) != {"enum_type", "value"}:
+            raise ValueError("ClassMoveTo_destination_enum_type_required")
+        kind, value = destination["enum_type"], destination["value"]
+        if kind == "plateName":
+            plate = canonical_plate_name(value)
+        elif kind == "locationID":
+            names = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+            location = value if type(value) is int else names[value]
+        else:
+            raise ValueError("ClassMoveTo_destination_enum_type_invalid")
+    option = arguments.get("m_piersOption")
+    if option is not None and (not isinstance(option, Mapping) or set(option) != {"m_piercoption"}):
+        raise ValueError("ClassMoveTo_piercing_option_invalid")
+    continuation = None if option is None else option["m_piercoption"]
+    return ClassMoveToIntent(script_line=script_line, plate_name=plate, location_id=location,
+                            well=arguments.get("m_well"), material=arguments.get("m_material"),
+                            continuation=continuation, old_well=old)
 
 
 @dataclass(frozen=True)
@@ -697,7 +733,7 @@ def compile_mov_execution(
     plate = requested_plate if requested_plate is not None else (21 if intent.location_id == 6 else 11)
     assert plate is not None
     save_tip = bool(_state_value(machine_state, "save_tip", "m_savetip", default=False))
-    old_well = bool(_state_value(machine_state, "old_well", "m_oldWell", default=False))
+    old_well = intent.old_well or bool(_state_value(machine_state, "old_well", "m_oldWell", default=False))
     forced_old = save_tip and requested_plate == 21
     if forced_old:
         old_well = True
@@ -1052,10 +1088,39 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
     return plan
 
 
+# Finite ControlLib pipette/lifecycle leaves. These are internal compiler
+# operations, never a public arbitrary-method dispatch surface.
+OEM_PIPETTE_LEAVES = {
+    "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),
+    "pipette_location": ("updateLocation", ("destination", "well")),
+    "pipette_tip_state": ("sourceTipState", ("changes",)),
+    "pipette_tip_transition": ("sourceTipTransition", ("tray_id", "well_ids", "transition")),
+    "pipette_pierce": ("sourceWellPierced", ("plate", "well", "single")),
+    "pipette_lift": ("sourceLiftTo", ("location", "height")),
+    "pipette_lower": ("sourceLowerTo", ("location",)),
+    "pipette_move_z": ("sourceMoveZ", ("value",)),
+    "pipette_move_x": ("sourceMoveX", ("value",)),
+    "pipette_move_xy": ("sourceMoveXY", ("x", "y")),
+    "pipette_position": ("sourcePosition", ()),
+    "pipette_home": ("sourceHomeZ", ("rehome",)),
+    "pipette_current": ("sourceZCurrent", ("value",)),
+    "pipette_stall": ("sourceZStall", ("value",)),
+    "pipette_lower_pipette": ("sourceLowerPipette", ("location",)),
+    "pipette_lift_pipette": ("sourceLiftPipette", ("location",)),
+    "pipette_snapshot": ("SnapshotImage", ("name",)),
+    "pipette_color": ("sourceColor", ("r", "g", "b")),
+    "pipette_led2": ("led2On", ()),
+    "pipette_waste": ("sourceMoveTo", ("location", "offset_x", "offset_y", "run_in_parallel")),
+    "pipette_hotel": ("sourceWellMoveTo", ("location", "column", "row", "high_pos", "run_in_parallel")),
+    "unlatch": ("sourceUnlatch", ()),
+    "confirm_gripper": ("sourceConfirmGripper", ()),
+    "home_gripper": ("sourceHomeGripper", ()),
+}
+
 FINITE_PLATE_OPERATIONS = frozenset({
     "catch_plate", "release_plate", "park_gantry", "waste_sequence",
     "press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup",
-    "move_plate",
+    "move_plate", "script_snapshot", "cut_seal", "shakeoff", "ordinary_pause_prepare", "critical_item_images",
 })
 
 WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
@@ -1069,6 +1134,11 @@ WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
     "send_z_and_gripper_home": frozenset({"run_in_parallel"}),
     "thermal_door": frozenset({"open"}),
     "cleanup": frozenset(),
+    "script_snapshot": frozenset(),
+    "ordinary_pause_prepare": frozenset(),
+    "critical_item_images": frozenset(),
+    "cut_seal": frozenset({"count"}),
+    "shakeoff": frozenset({"count"}),
 }
 
 WP8_COMPILED_CHILD_OPERATIONS = frozenset({
@@ -1085,7 +1155,14 @@ WP8_COMPILED_CHILD_OPERATIONS = frozenset({
     "setGripperCurrent", "setGripperVMax", "setZCurrent31", "setZaxisCurrentmax100",
     "startGripperHomeAndUnlock", "startMoveZPseudoHome", "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
     "waitMoveZOnly", "waitStop", "waitZ",
+    "sourceMoveTo", "sourceImageGantryLoad", "sourceMoveX", "sourceMoveZ", "sourceSetZAcc", "sourceRestoreZAcc", "sourceLowerPipette",
 })
+
+
+FINITE_PLATE_OPERATIONS |= frozenset(OEM_PIPETTE_LEAVES) | {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}
+WP8_OPERATION_INTENT_KEYS.update({name: frozenset(keys) for name, (_, keys) in OEM_PIPETTE_LEAVES.items()})
+WP8_OPERATION_INTENT_KEYS.update({name: frozenset() for name in ("pipette_shift_camera", "pipette_script_waste", "pipette_unlock")})
+WP8_COMPILED_CHILD_OPERATIONS |= frozenset(leaf for leaf, _ in OEM_PIPETTE_LEAVES.values()) | {"sourceRelativeX", "sourceRelativeY"}
 
 
 def _compile_finite_plate_operation_unchecked(
@@ -1097,6 +1174,24 @@ def _compile_finite_plate_operation_unchecked(
     if not source_leaf_available:
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
+
+    if operation in OEM_PIPETTE_LEAVES:
+        leaf, keys = OEM_PIPETTE_LEAVES[operation]
+        _wp8_child(children, leaf, arguments={key: inputs[key] for key in keys})
+        return _wp8_plan(operation, children)
+    if operation == "pipette_shift_camera":
+        _wp8_child(children, "sourceHomeZ", arguments={"rehome": False})
+        _wp8_child(children, "sourceRelativeX", arguments={"steps": 2832})
+        _wp8_child(children, "sourceRelativeY", arguments={"steps": -1888})
+        return _wp8_plan(operation, children)
+    if operation == "pipette_script_waste":
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": 6, "column": 0, "row": 0})
+        _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0})
+        return _wp8_plan(operation, children)
+    if operation == "pipette_unlock":
+        _wp8_child(children, "doorOpen", arguments={"open": True})
+        _wp8_child(children, "sourceUnlatch")
+        return _wp8_plan(operation, children, source_stop_scripts=True)
 
     if operation == "move_plate":
         plate = canonical_plate_name(inputs.get("plate"))
@@ -1126,6 +1221,79 @@ def _compile_finite_plate_operation_unchecked(
             ignored_return=True,
         )
         return _wp8_plan(operation, children, exception_policy="propagate")
+
+    if operation == "cut_seal":
+        count = inputs.get("count", 4)
+        x, z = int(inputs["cut_x"]), int(inputs["cut_z"])
+        if not inputs["thermal_door_open"]:
+            _wp8_child(children, "doorOpen", arguments={"open": True}, ignored_return=True)
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": 23, "well": 0, "position_flag": 0}, ignored_return=True)
+        _wp8_child(children, "updateLocation", arguments={"destination": 23, "well": 0}, state_mutation={"current_location": 23, "current_well": 0})
+        _wp8_child(children, "CloseGripper")
+        # Source integer division (including negative counts); zero is not
+        # normalized into a default or silently skipped.
+        spacing = (abs(3700) // abs(count)) * (1 if count > 0 else -1)
+        for start in (x + 7500, x - 3800 - 600):
+            for index in range(count):
+                _wp8_child(children, "sourceMoveX", arguments={"value": start - spacing * index})
+                _wp8_child(children, "setZCurrent31", arguments={"current": 31})
+                _wp8_child(children, "sourceMoveZ", arguments={"value": z})
+                _wp8_child(children, "getG")
+                _wp8_child(children, "sourceMoveZ", arguments={"value": z - 20000})
+        _wp8_child(children, "sendZandGripperHome", arguments={"run_in_parallel": True})
+        return _wp8_plan(operation, children, parent_return_allows_background_pending=True)
+
+    if operation == "shakeoff":
+        for _ in range(inputs["count"]):
+            _wp8_child(children, "Sleep", arguments={"milliseconds": 500})
+            _wp8_child(children, "sourceMoveZ", arguments={"value": 500})
+            _wp8_child(children, "sourceSetZAcc", arguments={"value": 500})
+            _wp8_child(children, "sourceMoveZ", arguments={"value": inputs["z_position"]})
+            _wp8_child(children, "sourceRestoreZAcc")
+        _wp8_child(children, "sourceLowerPipette", arguments={"location": inputs["current_location"]})
+        _wp8_child(children, "MoveZHome")
+        return _wp8_plan(operation, children)
+
+    if operation == "critical_item_images":
+        if inputs["job_name"] is None:
+            return _wp8_plan(operation, children, source_noop=True)
+        cx, cy, cz = inputs["camera_x_offset"], inputs["camera_y_offset"], inputs["camera_z_offset"]
+        _wp8_child(children, "sourceImageGantryLoad", state_mutation={"pseudo_z_home": 500})
+        # ControlLib.collectCriticalItemImages:5691-5743; the trough has
+        # no updateLocation call and tip-tray order is 1,2,4,3.
+        positions = (
+            (0, 1895, -710, 17395, "magnetic-station", True),
+            (1, 1895, -710, 17395, "output-station", True),
+            (3, -23930, 7582, 0, "reagent-station", True),
+            (16, 0, 7991, -7841, "trough", False),
+            (11, -3198, 4264, None, "strip-wells", True),
+            (7, 2369, 0, None, "tip-tray-1", True),
+            (8, 2369, 0, None, "tip-tray-2", True),
+            (10, 2369, 0, None, "tip-tray-4", True),
+            (9, 2369, 0, None, "tip-tray-3", True),
+        )
+        for location, x, y, z, name, update in positions:
+            _wp8_child(children, "sourceMoveTo", arguments={"location": location, "offset_x": x + cx, "offset_y": y + cy}, ignored_return=True)
+            if z is not None:
+                _wp8_child(children, "sourceMoveZ", arguments={"value": z + cz})
+            if update:
+                _wp8_child(children, "updateLocation", arguments={"destination": location, "well": 0}, state_mutation={"current_location": location, "current_well": 0})
+            _wp8_child(children, "SnapshotImage", arguments={"name": name}, ignored_return=True)
+        return _wp8_plan(operation, children)
+
+    if operation == "ordinary_pause_prepare":
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": 6, "well": 0}, ignored_return=True)
+        _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0}, state_mutation={"current_location": 6, "current_well": 0})
+        return _wp8_plan(operation, children)
+
+    if operation == "script_snapshot":
+        # ControlLib.takeAspirateImage:1683-1692. The null image owner
+        # does not remove the preceding move, model update or source sleep.
+        _wp8_child(children, "scriptmoveTo", arguments={"destination": 6, "well": 0, "position_flag": 2}, ignored_return=True)
+        _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0}, state_mutation={"current_location": 6, "current_well": 0})
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 2000})
+        _wp8_child(children, "SnapshotImage", arguments={"name": "aspirate_image"}, ignored_return=True)
+        return _wp8_plan(operation, children)
 
     if operation == "park_gantry":
         _wp8_child(children, "parkGantry", arguments={"rehome": bool(inputs.get("rehome", False))}, ignored_return=True)
@@ -1276,8 +1444,9 @@ def _compile_finite_plate_operation_unchecked(
             return _wp8_plan(
                 operation, children, source_noop=True,
                 success_return=False if board_test else True,
+                script_running=bool(inputs.get("script_running", False)), opening=opening,
             )
-        _wp8_child(children, "parkGantry", arguments={"rehome": False}, ignored_return=True)
+        _wp8_child(children, "parkGantry", arguments={"rehome": bool(inputs.get("script_running", False))}, ignored_return=True)
         motion = "moveDoorOpen" if opening else "moveDoorClosed"
         for name in ("setDoorStallThresholdPlus2", "setDoorMaxCurrent", motion, "readDoorSensors"):
             _wp8_child(children, name, arguments={"open": opening})
@@ -1307,7 +1476,7 @@ def _compile_finite_plate_operation_unchecked(
             state_mutation={"thermal_door_open": opening},
             source_condition=update_condition,
         )
-        return _wp8_plan(operation, children, sensor_success_predicate="openSensor && !closedSensor" if opening else "!openSensor && closedSensor", null_board_return=True, success_return=False if board_test else True, failure_policy="throw" if board_test else ("home_and_retry_once" if opening else "image_log_and_home_no_retry"), normal_state_update_unconditional=not board_test)
+        return _wp8_plan(operation, children, script_running=bool(inputs.get("script_running", False)), opening=opening, sensor_success_predicate="openSensor && !closedSensor" if opening else "!openSensor && closedSensor", null_board_return=True, success_return=False if board_test else True, failure_policy="throw" if board_test else ("home_and_retry_once" if opening else "image_log_and_home_no_retry"), normal_state_update_unconditional=not board_test)
 
     # ControlLib.cleanup: distinct cleanup waste prelude, then output/reagent cover storage.
     _wp8_child(children, "waitStop")
@@ -1436,8 +1605,25 @@ def execute_finite_plate_operation(
                 continue
             result = invoke_child(child)
             completed.append({"order": child["order"], "operation": child["operation"], "result": result})
+    source_return: dict[str, Any] = {}
+    if plan.get("operation") == "thermal_door" and plan.get("script_running"):
+        # Script caller consumes doorOpen's sensor bool; ordinary/manual
+        # result semantics stay unchanged. A null-board/no-op true remains true.
+        sensors = [row["result"] for row in completed if row["operation"] == "readDoorSensors"
+                   and not row["result"].get("source_branch_skipped")]
+        source_return["source_return"] = (
+            sensors[-1].get("door_open" if plan["opening"] else "door_closed")
+            if sensors else plan.get("success_return")
+        )
+    if plan.get("operation") in OEM_PIPETTE_LEAVES and completed:
+        leaf_result = completed[-1]["result"]
+        if isinstance(leaf_result, Mapping):
+            source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z") if key in leaf_result})
+    if plan.get("source_stop_scripts"):
+        source_return["source_stop_scripts"] = True
     return {
         "ok": failed is None,
+        **source_return,
         "exception_suppressed": suppressed,
         "failed_child": failed,
         "completed_children": completed,
@@ -1489,7 +1675,11 @@ def make_wp8_operation_executor(
                 if not callable(dispatch):
                     raise RuntimeError("source_authority_missing:execute_wp8_child")
                 operation = str(child["operation"])
-                if not bool(child.get("awaited", True)):
+                # Tray publication has durable plan/completion fences, but no
+                # controller delivery or delivery identity to record.
+                source_publication = operation == "sourceTipTransition"
+                delivery_marker = None
+                if not source_publication and not bool(child.get("awaited", True)):
                     suffix = "z-home" if operation == "startMoveZPseudoHome" else "gripper-home"
                     delivery_marker = command_store.create_wp8_background_task(
                         command_id, order,
@@ -1497,23 +1687,24 @@ def make_wp8_operation_executor(
                         task_kind=operation, plan_digest=str(plan["plan_digest"]),
                         authority_stamps=stamps,
                     )
-                else:
+                elif not source_publication:
                     delivery_marker = command_store.record_delivery_attempt(
                         command_id, work_kind="wp8_child",
                         work_identity=f"child:{order}:{operation}",
                         plan_digest=str(plan["plan_digest"]), authority_stamps=stamps,
                     )
-                child_dispatch_attempt_id = str(delivery_marker["dispatch_attempt_id"])
+                child_dispatch_attempt_id = (
+                    str(delivery_marker["dispatch_attempt_id"]) if delivery_marker is not None else None
+                )
                 try:
-                    dispatch_child = {
-                        **dict(child),
-                        "_delivery_identity": {
+                    dispatch_child = dict(child)
+                    if delivery_marker is not None:
+                        dispatch_child["_delivery_identity"] = {
                             "dispatch_attempt_id": child_dispatch_attempt_id,
                             "ownership_generation": int(stamps["ownership_generation"]),
                             "board_epoch_4": int(stamps["board_epoch_4"]),
                             "board_epoch_5": int(stamps["board_epoch_5"]),
-                        },
-                    }
+                        }
                     result = dispatch(
                         dispatch_child,
                         command_id=command_id,
@@ -1529,7 +1720,7 @@ def make_wp8_operation_executor(
                     child_delivery_attempted = (
                         exc.delivery_attempted
                         if isinstance(exc, DeckExecutionFailure)
-                        else True
+                        else not source_publication
                     )
                     delivery_attempted = delivery_attempted or child_delivery_attempted
                     command_store.assert_deck_execution_current(
@@ -1569,6 +1760,7 @@ def make_wp8_operation_executor(
                     raise DeckExecutionFailure(
                         f"wp8 child failed: {child['operation']}",
                         delivery_attempted=child_delivery_attempted,
+                        provider_results=[dict(result)],
                     )
                 if not bool(child.get("awaited", True)):
                     if (

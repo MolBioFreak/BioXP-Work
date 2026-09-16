@@ -2573,6 +2573,46 @@ def install_operator_control_plane(
                 idempotency_key=idempotency_key,
             )
 
+        def execute_workflow_plan(plan: Mapping[str, Any], action: Any, state: Any) -> dict[str, Any]:
+            from .runtime_audit_store import workflow_claim_context
+            binding = workflow_claim_context()
+            if binding is None:
+                raise ValueError("prepared_plan_requires_workflow_context")
+            identity = f"{binding['parent_command_id']}:{binding['source_occurrence_id']}:{plan['plan_digest']}"
+            admitted = command_plane.store.admit_internal_wp8_operation(
+                str(plan["operation"]), inputs={}, state=command_plane._state(),
+                idempotency_key="workflow-leaf-" + hashlib.sha256(identity.encode()).hexdigest(),
+                prepared_plan=plan,
+            )
+            command_id = admitted["command_id"]
+            workflow = state.workflow
+            if workflow is not None and command_id not in workflow.child_command_ids:
+                workflow.child_command_ids.append(command_id)
+            while True:
+                receipt = command_plane.store.get_command(command_id)
+                if receipt is None:
+                    raise RuntimeError("workflow_child_receipt_missing")
+                status = receipt["status"]
+                if status == "issued_pending":
+                    from .protocols.executor import OwnedOperation
+                    evidence = receipt.get("terminal_evidence") or {}
+                    response = dict(evidence.get("response") or {})
+                    return {**response, "command_id": command_id, "status": status,
+                            "owned_children": (OwnedOperation(
+                                command_plane.store.workflow_child_completion(command_id),
+                                domains=("Gripper",), command_id=command_id),)}
+                if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
+                    evidence = receipt.get("terminal_evidence") or {}
+                    response = dict(evidence.get("response") or {})
+                    return {**response, "ok": status == "completed", "command_id": command_id,
+                            "status": status, "receipt": receipt}
+                if command_plane.store._stop.is_set():
+                    raise RuntimeError("workflow_child_owner_lost")
+                # The existing dispatcher renews/executes; this is only the
+                # source handler's wait for its original admitted child.
+                command_plane.store._stop.wait(0.02)
+
+        app.state.oem_workflow_plan_executor = execute_workflow_plan
         app.state.oem_mov_execution_admitter = admit_mov_execution
         app.state.oem_wp8_operation_admitter = admit_wp8_operation
 
@@ -3572,6 +3612,27 @@ def install_operator_control_plane(
         if len(encoded_inputs) > _MAX_INPUT_BYTES:
             raise HTTPException(status_code=413, detail="action inputs exceed bounded limit")
         existing = None
+        workflow_route = str(target.get("path") or "") if target is not None else ""
+        if workflow_route in {"/protocol/execute", "/protocol/jobs/{job_id}/control", "/protocol/jobs/{job_id}/review"}:
+            # These routes already admit the one canonical workflow/control.
+            # Do not hold invoke_lock or manufacture an outer command receipt.
+            wire = dict(payload.inputs)
+            body = dict(wire["body"]) if isinstance(wire.get("body"), Mapping) else wire
+            if body.get("idempotency_key", payload.idempotency_key) != payload.idempotency_key:
+                raise HTTPException(status_code=409, detail="workflow idempotency key mismatch")
+            body["idempotency_key"] = payload.idempotency_key
+            if workflow_route != "/protocol/execute":
+                body["expected_ownership_generation"] = payload.expected_generation
+            elif payload.expected_generation != int(hardware_state.ownership_epoch):
+                known = await asyncio.to_thread(store.by_idempotency, payload.idempotency_key, include_evidence=False)
+                if known is None:
+                    raise HTTPException(status_code=409, detail="ownership generation mismatch")
+            if "body" in wire:
+                wire["body"] = body
+            status_code, response = await _dispatch_asgi(app, target["method"], workflow_route, wire, target["locations"])
+            if status_code >= 400:
+                raise HTTPException(status_code=status_code, detail=response.get("detail", response))
+            return response
         if not is_safety_interrupt:
             existing = await asyncio.to_thread(
                 store.by_idempotency,

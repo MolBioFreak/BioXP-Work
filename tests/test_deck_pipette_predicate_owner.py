@@ -39,13 +39,18 @@ def test_park_uses_pipette_owner_after_deck_publication_refusal(query_rig, monke
             denied.append((table, column))
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
-    connection = app.state.operator_command_plane.store.connection
-    connection.set_authorizer(authorizer)
+    owner = app.state.operator_command_plane.store
+    connection = owner.connection
+    # sqlite3.set_authorizer holds the GIL while taking the SQLite mutex. Do
+    # not race its replacement with the live dispatcher executing a callback.
+    with owner._lock:
+        connection.set_authorizer(authorizer)
     wire['data'][0] = [32,96,49 if tip_present else 48]
     try:
         response = invoke(rig, 'predicate-owner-publication-refusal')
     finally:
-        connection.set_authorizer(None)
+        with owner._lock:
+            connection.set_authorizer(None)
     assert denied
     assert response.status_code == 200, response.text
     observed = response.json()

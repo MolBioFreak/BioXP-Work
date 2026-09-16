@@ -112,6 +112,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     8: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     9: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     10: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
+    11: "84349706004c22ee2a99c4b2cce1550f549f3ebd6f2a57f9d7ea3ee304046489",
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2207,8 +2208,20 @@ def _operator_global_trigger_sources() -> dict[str, str]:
     return sources
 
 
-def _reinstall_operator_global_triggers(connection: sqlite3.Connection) -> None:
+def _workflow_global_trigger_sources() -> dict[str, str]:
     sources = _operator_global_trigger_sources()
+    name = "operator_plane_transitions_authorized_coherent_insert_v4"
+    sources[name] = sources[name].replace(
+        "OR (NEW.command_id IS NOT NULL AND NOT EXISTS(",
+        "OR (NEW.command_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM operator_commands c "
+        "JOIN operator_plane_commands p USING(command_id) WHERE c.command_id=NEW.command_id "
+        "AND c.command_kind='protocol_workflow' AND c.status=p.status) AND NOT EXISTS(")
+    return sources
+
+
+def _reinstall_operator_global_triggers(connection: sqlite3.Connection) -> None:
+    sources = (_workflow_global_trigger_sources() if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+               else _operator_global_trigger_sources())
     if set(sources) != set(DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS):
         raise RuntimeError("authoritative operator global trigger manifest is incomplete")
     for name in sorted(sources):
@@ -2217,7 +2230,8 @@ def _reinstall_operator_global_triggers(connection: sqlite3.Connection) -> None:
 
 
 def _verify_operator_global_triggers(connection: sqlite3.Connection) -> None:
-    sources = _operator_global_trigger_sources()
+    sources = (_workflow_global_trigger_sources() if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+               else _operator_global_trigger_sources())
     expected = {
         name: normalize_sql_definition(source).replace("IFNOTEXISTS", "", 1)
         for name, source in sources.items()
@@ -2489,6 +2503,17 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
             for name, statement in zip(_OPERATOR_COMMAND_PLANE_TRIGGER_NAMES, _OPERATOR_COMMAND_PLANE_TRIGGER_DDL, strict=True)
         },
     }
+    workflow_schema = connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+    if workflow_schema:
+        reference = sqlite3.connect(":memory:")
+        try:
+            index = _OPERATOR_COMMAND_PLANE_TABLE_NAMES.index("operator_plane_lane")
+            reference.execute(_OPERATOR_COMMAND_PLANE_TABLE_DDL[index])
+            reference.execute(_WORKFLOW_DDL[0])
+            expected_sql["operator_plane_lane"] = ("table", normalize_sql_definition(reference.execute(
+                "SELECT sql FROM sqlite_master WHERE name='operator_plane_lane'").fetchone()[0]))
+        finally:
+            reference.close()
     actual_rows = connection.execute(
         "SELECT type,name,sql FROM sqlite_master WHERE name IN (%s) ORDER BY type,name"
         % ",".join("?" for _ in expected_sql),
@@ -2500,7 +2525,9 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
     }
     legacy_compatibility = (
         legacy_operator_command_plane_schema_sha256(connection)
-        == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
+        == ("e51702a068cbc60899c91ac6d15365d7e291d64c8c48139d3e3e3f5aa449d623"
+            if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+            else LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256)
     )
     if actual_sql != expected_sql:
         missing = sorted(set(expected_sql) - set(actual_sql))
@@ -2513,7 +2540,7 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
             and mismatched == ["operator_plane_interrupt_history"]
         ):
             raise RuntimeError(
-                f"operator command-plane schema object attestation failed: missing={missing},unexpected={unexpected},mismatched={mismatched}"
+                f"operator command-plane schema object attestation failed: missing={missing},unexpected={unexpected},mismatched={mismatched},legacy_sha256={legacy_operator_command_plane_schema_sha256(connection)}"
             )
     for table, expected in _OPERATOR_COMMAND_PLANE_EXPECTED_COLUMNS.items():
         actual = tuple(
@@ -2521,6 +2548,8 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
             for row in connection.execute(f"PRAGMA table_info({table})")
         )
         accepted = expected
+        if table == "operator_plane_lane" and workflow_schema:
+            accepted = (*expected, ("workflow_command_id", "TEXT", 0, 0))
         if table == "operator_plane_interrupt_history" and legacy_compatibility:
             accepted = (
                 ("record_sha256", "TEXT", 1, 1),
@@ -2550,6 +2579,9 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
         ("operator_commands", "command_id", "command_id", "NO ACTION", "NO ACTION", "NONE"),
         ("pipette_operations", "pipette_operation_id", "pipette_operation_id", "NO ACTION", "NO ACTION", "NONE"),
     )
+    if workflow_schema:
+        expected_foreign_keys["operator_plane_lane"] = (
+            ("operator_commands", "workflow_command_id", "command_id", "NO ACTION", "NO ACTION", "NONE"),)
     for table, expected in expected_foreign_keys.items():
         actual = tuple(
             (str(row[2]), str(row[3]), str(row[4]), str(row[5]), str(row[6]), str(row[7]))
@@ -2659,6 +2691,75 @@ def _verify_runtime_release_start(connection: sqlite3.Connection) -> None:
     if actual_triggers != expected_triggers:
         raise RuntimeError("canonical runtime release append-only trigger attestation failed")
 
+WORKFLOW_SCHEMA_VERSION = 11
+_WORKFLOW_DDL = (
+    "ALTER TABLE operator_plane_lane ADD COLUMN workflow_command_id TEXT REFERENCES operator_commands(command_id)",
+    "ALTER TABLE operator_commands ADD COLUMN parent_command_id TEXT REFERENCES operator_commands(command_id)",
+    "CREATE INDEX operator_commands_parent_idx ON operator_commands(parent_command_id)",
+    "CREATE TRIGGER operator_commands_parent_immutable BEFORE UPDATE OF parent_command_id ON operator_commands "
+    "WHEN OLD.parent_command_id IS NOT NEW.parent_command_id BEGIN SELECT RAISE(ABORT,'immutable workflow parent'); END",
+    "CREATE TABLE workflow_resource_migration (command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE CASCADE, "
+    "resource_key TEXT NOT NULL, PRIMARY KEY(command_id,resource_key)) WITHOUT ROWID",
+    "INSERT INTO workflow_resource_migration SELECT command_id,resource_key FROM serial206_command_resources",
+    "DROP TABLE serial206_command_resources",
+    "ALTER TABLE workflow_resource_migration RENAME TO serial206_command_resources",
+    "CREATE INDEX serial206_command_resources_lookup_idx ON serial206_command_resources(resource_key,command_id)",
+)
+
+
+def workflow_migration_identity() -> RuntimeMigrationIdentity:
+    return RuntimeMigrationIdentity(version=WORKFLOW_SCHEMA_VERSION, name="protocol_workflow_custody_v11",
+        ddl_sha256=hashlib.sha256(("\n".join(_WORKFLOW_DDL) + inspect.getsource(_workflow_global_trigger_sources)).encode()).hexdigest())
+
+
+def _apply_workflow_schema(connection: sqlite3.Connection) -> None:
+    missing = connection.execute("SELECT r.command_id FROM serial206_command_resources r "
+        "LEFT JOIN operator_commands c USING(command_id) WHERE c.command_id IS NULL LIMIT 1").fetchone()
+    if missing is not None:
+        raise RuntimeError("workflow migration requires explicit disposition of missing canonical movement membership")
+    for statement in _WORKFLOW_DDL:
+        connection.execute(statement)
+    for name, statement in _workflow_global_trigger_sources().items():
+        if name.startswith("serial206_command_resources_") or name == "operator_plane_transitions_authorized_coherent_insert_v4":
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+            connection.execute(statement)
+
+
+def _migrate_workflow_schema(connection: sqlite3.Connection, root: Path) -> None:
+    identity = workflow_migration_identity()
+    lifecycle = (connection.exclusive_lifecycle() if isinstance(connection, RuntimeLifecycleConnection)
+                 else runtime_lifecycle_lock(root, exclusive=True))
+    with lifecycle:
+        if assert_migration_slot(connection, identity):
+            verify_canonical_runtime_database(connection)
+            return
+        if connection.execute("PRAGMA user_version").fetchone()[0] != 10:
+            raise RuntimeError("workflow migration requires exact v1-v10 prefix")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            verify_canonical_runtime_database(connection, version=10, full_data_check=True)
+            if connection.execute("SELECT 1 FROM operator_plane_commands WHERE status IN "
+                "('queued','dispatched','issued_pending','stop_requested','abort_requested') LIMIT 1").fetchone():
+                raise RuntimeError("workflow migration requires quiesced mutation admission")
+            backup = sqlite3.connect(root / "bioxp_runtime.db", timeout=2, isolation_level=None)
+            try:
+                digest = _verified_sqlite_backup(backup, root, lifecycle_lock_held=True)
+            finally:
+                backup.close()
+            started = time.time()
+            _apply_workflow_schema(connection)
+            _record_runtime_migration(connection, identity=identity, backup_sha256=digest,
+                source_digests={}, started_at=started, finished_at=time.time())
+            connection.execute("UPDATE runtime_store_identity SET schema_version=11,updated_at=? WHERE identity_id=1", (time.time(),))
+            connection.execute("PRAGMA user_version=11")
+            verify_canonical_runtime_database(connection, full_data_check=True)
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+
 def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ...]:
     registry = (
         runtime_audit_migration_identity(),
@@ -2671,6 +2772,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         _deck_v8.migration_identity(),
         _deck_v9.migration_identity(),
         _pipette_v10.migration_identity(),
+        workflow_migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -2729,6 +2831,10 @@ def _verify_exact_v2_objects(connection: sqlite3.Connection) -> None:
     expected.execute("PRAGMA foreign_keys=ON")
     try:
         _create_v2_authority_schema(expected)
+        if connection.execute("PRAGMA user_version").fetchone()[0] >= WORKFLOW_SCHEMA_VERSION:
+            expected.execute("PRAGMA foreign_keys=OFF")
+            for statement in _WORKFLOW_DDL[4:]:
+                expected.execute(statement)
         expected_objects = expected.execute(
             """
             SELECT type,name,sql FROM sqlite_master
@@ -2905,6 +3011,9 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
             ("depends_on_command_id", "serial206_movement_commands", "command_id", "NO ACTION", "CASCADE", "NONE"),
         },
     }
+    if connection.execute("PRAGMA user_version").fetchone()[0] >= WORKFLOW_SCHEMA_VERSION:
+        expected_fks["serial206_command_resources"] = {
+            ("command_id", "operator_commands", "command_id", "NO ACTION", "CASCADE", "NONE")}
     for table, expected in expected_fks.items():
         rows = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
         actual = {
@@ -2997,7 +3106,7 @@ def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
     return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
-def canonical_runtime_schema_manifest(*, version: int = _pipette_v10.VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = WORKFLOW_SCHEMA_VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3037,6 +3146,9 @@ def canonical_runtime_schema_manifest(*, version: int = _pipette_v10.VERSION) ->
             _deck_v9.apply(expected)
         if version >= _pipette_v10.VERSION:
             _pipette_v10.apply(expected)
+        if version >= WORKFLOW_SCHEMA_VERSION:
+            _apply_workflow_schema(expected)
+        expected.execute(f"PRAGMA user_version={version}")
         _reinstall_operator_global_triggers(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
@@ -3108,7 +3220,9 @@ def verify_canonical_runtime_database(
         )
         legacy_compatibility = (
             legacy_operator_command_plane_schema_sha256(connection)
-            == LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256
+            == ("e51702a068cbc60899c91ac6d15365d7e291d64c8c48139d3e3e3f5aa449d623"
+            if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+            else LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256)
         )
         compatibility_objects_are_bound = True
         for object_type, object_name in unexpected:
@@ -3551,18 +3665,19 @@ def _migrate_oem_deck_schema_v7_locked(
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _pipette_v10.VERSION:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == WORKFLOW_SCHEMA_VERSION:
         # An already-prepared database needs no migration, lifecycle-exclusive
         # lock, or data audit. Its size must not determine service startup time.
         verify_canonical_runtime_database(connection)
         return
     coordinator = runtime_write_coordinator(root)
     with coordinator.lock:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_deck_v8.VERSION, _deck_v9.VERSION):
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_deck_v8.VERSION, _deck_v9.VERSION, _pipette_v10.VERSION):
             selected_root = Path(root).expanduser().resolve(strict=False)
             if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _deck_v8.VERSION:
                 _deck_v9.migrate(connection, selected_root, canonical_runtime_migration_registry()[8])
             _pipette_v10.migrate(connection, selected_root, canonical_runtime_migration_registry()[9])
+            _migrate_workflow_schema(connection, selected_root)
         else:
             _migrate_runtime_database_v2_locked(connection, root)
 
@@ -3685,6 +3800,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _deck_v8.migrate(connection, selected_root, registry[7])
         _deck_v9.migrate(connection, selected_root, registry[8])
         _pipette_v10.migrate(connection, selected_root, registry[9])
+        _migrate_workflow_schema(connection, selected_root)
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3818,6 +3934,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _deck_v8.migrate(connection, selected_root, registry[7])
         _deck_v9.migrate(connection, selected_root, registry[8])
         _pipette_v10.migrate(connection, selected_root, registry[9])
+        _migrate_workflow_schema(connection, selected_root)
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
@@ -3901,7 +4018,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _pipette_v10.VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == WORKFLOW_SCHEMA_VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():

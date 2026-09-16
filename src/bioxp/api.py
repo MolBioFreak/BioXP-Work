@@ -18,11 +18,11 @@ import logging
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, Mapping, Optional, Protocol, cast
+from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, Optional, Protocol, cast
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -143,6 +143,8 @@ from .services.pipette_service import (
 )
 from .services.protocol_service import (
     ProtocolLiveContractError,
+    bind_protocol_dispatcher,
+    control_protocol_job,
     create_protocol_job,
     get_protocol_job,
     list_protocol_jobs,
@@ -2801,6 +2803,7 @@ class BarcodeReadRequest(BaseModel):
 
 
 class ProtocolCompileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     source_type: str = Field("native", pattern=r"^(native|oem_xml)$")
     document: Optional[dict[str, Any]] = None
     xml_path: Optional[str] = None
@@ -2827,9 +2830,55 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     snapshot_refs: list[str] = Field(default_factory=list)
 
 
-class ProtocolReviewRequest(BaseModel):
+class ProtocolControlTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    idempotency_key: StrictStr = Field(..., min_length=1, max_length=256)
+    command_id: StrictStr = Field(..., min_length=1)
+    expected_ownership_generation: StrictInt = Field(..., ge=0)
+
+    @field_validator("idempotency_key", "command_id")
+    @classmethod
+    def nonblank_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("identity must not be blank")
+        return value
+
+
+class ProtocolPauseRequest(ProtocolControlTarget):
+    action: Literal["pause"]
+    mode: Literal["ordinary", "deferred"]
+
+
+class ProtocolWakeRequest(ProtocolControlTarget):
+    action: Literal["wake"]
+    gate_id: StrictStr = Field(..., min_length=1)
+
+
+class ProtocolContinueRequest(ProtocolControlTarget):
+    action: Literal["continue"]
+    gate: Literal["ordinary_pause", "deferred_pause", "delaypoint"]
+    gate_id: StrictStr = Field(..., min_length=1)
+
+
+class ProtocolSafeStopRequest(ProtocolControlTarget):
+    action: Literal["safe_stop"]
+
+
+class ProtocolAbortRequest(ProtocolControlTarget):
+    action: Literal["abort"]
+
+
+ProtocolControlRequest = Annotated[
+    ProtocolPauseRequest | ProtocolWakeRequest | ProtocolContinueRequest | ProtocolSafeStopRequest | ProtocolAbortRequest,
+    Field(discriminator="action"),
+]
+
+
+class ProtocolReviewRequest(ProtocolControlTarget):
     reviewer: str = Field("operator", min_length=1, max_length=120)
     note: Optional[str] = Field(None, max_length=4000)
+    stage_id: StrictStr = Field(..., min_length=1)
+    action_id: StrictStr | None = None
 
 
 class LedRgbRequest(BaseModel):
@@ -5620,6 +5669,29 @@ class UsbSniffManager:
 _usb_sniff_manager = UsbSniffManager()
 
 
+_PROTOCOL_NORMAL_MUTATIONS = {
+    "Thermal baseline": ("thermal",), "Thermal setpoint": ("thermal",),
+    "Thermal pedestal setpoint": ("thermal",), "Thermal fan": ("thermal",),
+    "Thermal PWM": ("thermal",), "Thermal rates": ("thermal",),
+    "Thermal fast profile": ("thermal",), "Thermal hard reset": ("thermal",),
+    "Chiller baseline": ("thermal",), "Chiller setpoint": ("thermal",),
+    "Chiller fan": ("thermal",), "Chiller PWM": ("thermal",),
+    "Chiller rates": ("thermal",), "Chiller hard reset": ("thermal",),
+}
+
+
+@contextmanager
+def _protocol_mutation_scope(label):
+    resources = _PROTOCOL_NORMAL_MUTATIONS.get(label)
+    with ExitStack() as stack:
+        if resources is not None:
+            try:
+                stack.enter_context(_protocol_command_store().normal_mutation_scope(resources=resources))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail={"error": "workflow_mutation_refused", "reason": str(exc)}) from exc
+        yield
+
+
 async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
     def invoke():
         from bioxp.operator_controls import current_operator_dispatch_context
@@ -5630,8 +5702,9 @@ async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
         return func()
 
     async def leased_operation():
-        async with _tester_lock:
-            return await run_in_threadpool(invoke)
+        with _protocol_mutation_scope(label):
+            async with _tester_lock:
+                return await run_in_threadpool(invoke)
 
     worker = asyncio.create_task(leased_operation(), name=f"bioxp-tester:{label}")
     try:
@@ -5712,9 +5785,10 @@ async def _run_tester_transition(label: str, operation, timeout_s: float | None 
     """Run one complete tester ownership transition under cancellation-safe leases."""
 
     async def leased_transition():
-        async with _tester_lock:
-            async with _tester_transition_lock:
-                return await operation()
+        with _protocol_mutation_scope(label):
+            async with _tester_lock:
+                async with _tester_transition_lock:
+                    return await operation()
 
     worker = asyncio.create_task(leased_transition(), name=f"bioxp-transition:{label}")
     try:
@@ -10631,15 +10705,247 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     }
 
 
+def _protocol_command_store():
+    plane = getattr(app.state, "operator_command_plane", None)
+    if plane is None:
+        raise HTTPException(status_code=503, detail={"error": "canonical_workflow_owner_unavailable"})
+    return plane.store
+
+
+def _protocol_authority(document):
+    from .operator_command_plane import _active_board_epochs
+    from .services.protocol_service import _workflow_resources
+    resources = _workflow_resources(document)
+    epochs = {}
+    if any(resource.startswith("axis:") for resource in resources):
+        epochs = _active_board_epochs(app.state.operator_command_plane._state(), "oem.deck._finite_operation")
+        if set(epochs) != {"4", "5"}:
+            raise ProtocolLiveContractError("Selected workflow board epochs are unavailable.")
+    return int(hardware_state.ownership_epoch), epochs
+
+
+def _protocol_source_pipette_call(operation_name, operation, action, state, step_id):
+    from .services.pipette_service import run_pipette_operation, _OemLifecycleContext
+    from .protocols.models import _payload
+    lifecycle = isinstance(action, _OemLifecycleContext)
+    action_id = action.source_occurrence_id if lifecycle else action.action_id
+    stage_id = action.source_occurrence_id if lifecycle else action.stage_id
+    opcode = "lifecycle" if lifecycle else action.oem_opcode
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=step_id):
+        store.assert_workflow_current(state.job_id)
+        async def run_inline(label, call, *, timeout_s):
+            store.assert_workflow_current(state.job_id)
+            return call()
+        # Source method spelling differs from the existing audited query
+        # vocabulary. Keep its read-only/source-affecting finalizer semantics.
+        receipt_operation = {"query_tip_status_all": "query_all_pipette_tip_states",
+                             "query_tip_status_for_oem_script": "query_tip_status"}.get(operation_name, operation_name)
+        return asyncio.run(run_pipette_operation(
+            receipt_operation, operation, get_transport=_get_pipette_transport,
+            run_blocking=run_inline, receipt_store=_pipette_receipts,
+            requested_inputs={"source_occurrence_id": step_id, "oem_opcode": opcode,
+                              "arguments": _payload(action.params["arguments"])},
+            runtime_binding={"idempotency_key": f"protocol:{state.job_id}:{step_id}",
+                             "entrypoint_id": "protocol.oem_operation", "caller_class": "lifecycle",
+                             "protocol_job_id": state.job_id, "protocol_action_id": action_id,
+                             "lifecycle_stage_id": stage_id},
+        ))
+
+
+def _protocol_source_mov(intent, action, state):
+    """Prepared ClassMoveTo uses the existing canonical mov owner, unchanged."""
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=action.source_occurrence_id):
+        store.assert_workflow_current(state.job_id)
+        admitted = app.state.oem_mov_execution_admitter(
+            intent, idempotency_key=f"protocol:{state.job_id}:{action.source_occurrence_id}:mov",
+        )
+        command_id = admitted["command_id"]
+        if state.workflow is not None and command_id not in state.workflow.child_command_ids:
+            state.workflow.child_command_ids.append(command_id)
+        while True:
+            receipt = store.get_command(command_id)
+            if receipt["status"] in COMMAND_TERMINAL:
+                response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
+                return {**response, "ok": receipt["status"] == "completed",
+                        "command_id": command_id, "receipt": receipt}
+            if store._stop.wait(0.02):
+                raise RuntimeError("workflow_child_owner_lost")
+
+
+def _protocol_bindings(bundle, *, source_executor=None):
+    from contextvars import ContextVar
+    from threading import Lock
+    from .protocols.models import ProtocolDocument
+    from .protocols.validators import validate_oem_selected_dependencies
+    from .pipette.transport import FourPipetteTransport
+    from dataclasses import replace
+    from .services.pipette_service import build_oem_pipette_handlers, build_oem_pipette_lifecycle_helpers
+    store = _protocol_command_store()
+    metadata = bundle["protocol"]["document"].get("metadata", {})
+    native = {}
+    lifecycle = {}
+    if metadata.get("input_mode") != "oem_prepared":
+        return _protocol_live_handlers(), {}, {}
+    capabilities = set()
+    if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
+        capabilities.add("dispense_air_for_oem_script")
+    if callable(getattr(FourPipetteTransport, "aspirate_for_oem_script", None)):
+        capabilities.add("aspirate_pressure_stream")
+    if callable(getattr(FourPipetteTransport, "dispense_for_oem_script", None)):
+        capabilities.add("dispense_pressure_stream")
+    if callable(getattr(FourPipetteTransport, "query_tip_status_for_oem_script", None)):
+        capabilities.add("query_tip_status_single")
+    validate_oem_selected_dependencies(
+        ProtocolDocument.from_payload(bundle["protocol"]["document"]), capabilities=capabilities,
+    )
+    provider = _serial206_oem_initialization_provider
+    canonical_plan = getattr(app.state, "oem_workflow_plan_executor", None)
+    # Per-source-call counters are child identity, not scheduling or custody.
+    # Identical repeated plans must never reconcile to an earlier physical leaf.
+    counts, count_lock = {}, Lock()
+    source_step = ContextVar("protocol_source_step", default=None)
+    def before_entry(identity, state):
+        store.assert_workflow_current(state.job_id)
+        source_step.set(identity)
+    def execute_plan(plan, action, state):
+        occurrence = action if isinstance(action, str) else action.source_occurrence_id
+        step = source_step.get()
+        if not isinstance(step, str) or not step.startswith(occurrence + ":"):
+            step = occurrence
+        with count_lock:
+            ordinal = counts.get(step, 0)
+            counts[step] = ordinal + 1
+        with store.workflow_context(state.job_id, source_occurrence_id=f"{step}:native:{ordinal}"):
+            store.assert_workflow_current(state.job_id)
+            result = canonical_plan(plan, action, state)
+            # Preserve the finite native source callback flags carried by a
+            # failed child; its canonical status remains failed/ambiguous.
+            if isinstance(result, dict):
+                for row in result.get("provider_results", ()):
+                    for field in ("source_pause_scripts", "source_error_event", "source_error_hold",
+                                  "source_stop_scripts", "source_board_error_event"):
+                        if field in row:
+                            result[field] = row[field]
+            return result
+    callbacks = {}
+    settings = metadata.get("source_settings", {})
+    def executor():
+        if source_executor is None:
+            raise RuntimeError("workflow_source_executor_unavailable")
+        return source_executor()
+    def start_child(name, operation):
+        from .runtime_audit_store import workflow_claim_context
+        domains = {"ejt.ejection": ("Tip",), "ejt.motion": ("General", "Gripper")}[name]
+        binding = workflow_claim_context()
+        if binding is None:
+            raise RuntimeError("workflow_source_child_requires_context")
+        identity = f"{binding['source_occurrence_id']}:{name}"
+        return executor().start_child(identity, operation, domains=domains)
+    def pipette_plan(plan, action, state):
+        result = execute_plan(plan, action, state)
+        if result.get("ok") is not True:
+            from .oem_deck_movement import DeckExecutionFailure
+            raise DeckExecutionFailure(
+                "OEM pipette native child failed", delivery_attempted=bool(result.get("delivery_attempted")),
+                controller_command_acknowledged=bool(result.get("controller_command_acknowledged")),
+                controller_completion_verified=bool(result.get("controller_completion_verified")),
+                provider_results=[result],
+            )
+        return result
+    if provider is not None and canonical_plan is not None:
+        callbacks = provider.build_oem_pipette_source_callbacks(
+            execute_plan=pipette_plan, start_child=start_child,
+            stopped=lambda: executor().source_stopped(), settings=settings,
+            rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+        )
+        callbacks.pop("settings")  # The same captured mapping is passed below.
+        # D's sweep uses source MoveZHome() (default), while the full native
+        # binding also represents explicit rehome=False/True calls.
+        callbacks["move_z_home"] = lambda action, state: callbacks["source_bindings"].home(None, action, state)
+        callbacks["source_bindings"] = replace(callbacks["source_bindings"],
+            source_capabilities=callbacks["source_bindings"].source_capabilities.intersection(capabilities))
+        native = provider.build_oem_native_handlers(
+            settings=settings, execute_plan=execute_plan,
+            execute_mov=_protocol_source_mov if callable(getattr(app.state, "oem_mov_execution_admitter", None)) else None,
+            rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+        )
+    def publish_tip_transition(tray_id, well_ids, action, state):
+        if not well_ids:
+            # Source ReTip only writes selected empty Reuse wells.
+            return {"ok": True, "source_noop": True, "delivery_attempted": False}
+        identity = source_step.get()
+        if not identity:
+            raise RuntimeError("source_publication_requires_step_identity")
+        with store.workflow_context(state.job_id, source_occurrence_id=identity):
+            store.assert_workflow_current(state.job_id)
+            with store.normal_mutation_scope(resources=("pipette",)) as command_id:
+                store.assert_workflow_current(state.job_id)
+                published = provider.publish_tip_tray_transition(
+                    tray_id=int(tray_id), transition="retip", well_ids=list(well_ids),
+                    operation_id=f"{state.job_id}:{identity}", command_id=command_id,
+                    provenance={"source_occurrence_id": identity, "source_operation": "retip"},
+                )
+                if state.workflow is not None and command_id not in state.workflow.child_command_ids:
+                    state.workflow.child_command_ids.append(command_id)
+                return {"ok": True, "command_id": command_id, "published_tip_tray": published,
+                        "delivery_attempted": False, "physical_effect_verified": False}
+    # A source-only retip remains available without a motion binding; with
+    # R3 connected, its finite canonical publisher is the sole callback.
+    if not callbacks and provider is not None:
+        callbacks["publish_tip_transition"] = publish_tip_transition
+    pipette = build_oem_pipette_handlers(
+        before_native_entry=before_entry, pipette_call=_protocol_source_pipette_call,
+        settings=settings, **callbacks,
+    )
+    if "source_bindings" in callbacks:
+        helpers = build_oem_pipette_lifecycle_helpers(
+            before_native_entry=before_entry, pipette_call=_protocol_source_pipette_call,
+            source_bindings=callbacks["source_bindings"], settings=settings,
+            move_to_waste=callbacks["move_to_waste"], sweep_handler=pipette["sweep"],
+        )
+        def lifecycle_pipette(name, state):
+            occurrence = "lifecycle:" + name
+            with count_lock:
+                ordinal = counts.get(occurrence, 0)
+                counts[occurrence] = ordinal + 1
+            return helpers[name](state, source_occurrence_id=f"{occurrence}:{ordinal}")
+        def lifecycle_plan(operation, state):
+            from .oem_deck_movement import compile_finite_plate_operation
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True)
+            return execute_plan(plan, "lifecycle:" + operation, state)
+        lifecycle = provider.build_oem_lifecycle_handlers(
+            settings=settings, execute_plan=execute_plan,
+            pressure_baseline=lambda state: lifecycle_pipette("pressure_baseline", state),
+            run_job_tip_prefix=lambda state: lifecycle_pipette("run_job_tip_prefix", state),
+            unlatch=lambda state: lifecycle_plan("unlatch", state),
+            confirm_gripper=lambda state: lifecycle_plan("confirm_gripper", state),
+            home_gripper=lambda state: lifecycle_plan("home_gripper", state),
+        )
+        lifecycle["epilogue_sweep"] = lambda state: lifecycle_pipette("epilogue_sweep", state)
+        # cleanup_pipette_prefix is NOT a complete cleanup hook: its preceding
+        # stop/door guards and following thermal effects remain deferred.
+    if set(native).intersection(pipette):
+        raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
+    return _protocol_live_handlers(), {**native, **pipette}, lifecycle
+
+
 @app.post("/protocol/execute")
 async def protocol_execute(req: ProtocolExecuteRequest):
     try:
-        return await run_in_threadpool(
+        command_store = None if req.dry_run else _protocol_command_store()
+        if command_store is not None:
+            bind_protocol_dispatcher(command_store, binding_factory=_protocol_bindings)
+        result = await run_in_threadpool(
             create_protocol_job,
             req.model_dump(exclude_none=True),
-            dry_run=bool(req.dry_run),
-            handlers=None if req.dry_run else _protocol_live_handlers(),
+            dry_run=bool(req.dry_run), command_store=command_store,
+            binding_factory=None if req.dry_run else _protocol_bindings,
+            authority_factory=None if req.dry_run else _protocol_authority,
         )
+        status = 200 if req.dry_run or result["command"]["terminal"] else 202
+        return JSONResponse(status_code=status, content=result)
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
@@ -10649,16 +10955,27 @@ async def protocol_execute(req: ProtocolExecuteRequest):
 @app.get("/protocol/jobs")
 async def protocol_jobs(limit: int = Query(20, ge=1, le=100)):
     return {
-        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit),
+        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, command_store=_protocol_command_store()),
     }
 
 
 @app.get("/protocol/jobs/{job_id}")
 async def protocol_job_detail(job_id: str):
     try:
-        return await run_in_threadpool(get_protocol_job, job_id)
+        return await run_in_threadpool(get_protocol_job, job_id, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/protocol/jobs/{job_id}/control")
+async def protocol_job_control(job_id: str, req: ProtocolControlRequest):
+    try:
+        return await run_in_threadpool(control_protocol_job, job_id,
+                                       req.model_dump(exclude_none=True), command_store=_protocol_command_store())
+    except ProtocolLiveContractError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": "workflow_control_refused", "reason": str(exc)}) from exc
 
 
 @app.post("/protocol/jobs/{job_id}/review")
@@ -10669,7 +10986,8 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
             job_id,
             reviewer=req.reviewer,
             note=req.note,
-            handlers=_protocol_live_handlers(),
+            command_store=_protocol_command_store(),
+            request=req.model_dump(exclude_none=True),
         )
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc

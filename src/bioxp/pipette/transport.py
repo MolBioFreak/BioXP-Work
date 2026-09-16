@@ -1983,6 +1983,267 @@ class FourPipetteTransport:
         )
         return {**result, "volume_ul": volume, "dispense_type": selected_type, "planned_command": f"D{volume},{selected_type}R"}
 
+    def dispense_air_for_oem_script(
+        self, volume_ul: float, front_air: bool, pressure_stream: bool = False,
+        *, enabled_channels: tuple[int, ...] = (0, 1, 2, 3),
+    ) -> dict[str, Any]:
+        """ClassPipetteCollection.DispenseAir:915–985, worker WaitAll branch.
+
+        A false completion wait is deliberately a source return, not verified
+        completion. The diagnostic enable mask is not queried tip occupancy.
+        Generic/manual dispense_air and its stricter completion policy are intact.
+        """
+        enabled = set(enabled_channels)
+        if any(type(ch) is not int or ch not in self.CHANNELS for ch in enabled_channels):
+            raise ValueError("enabled_channels must contain integer channel IDs 0..3")
+        volume = float(volume_ul)
+        selected_type = 1 if front_air else 2
+        rows: list[dict[str, Any]] = []
+        queries: list[dict[str, Any]] = []
+        streams: list[dict[str, Any]] = []
+        epoch = self._interrupt_epoch
+        try:
+            with self._transaction_lock:
+                epoch = self._interrupt_epoch
+                selected = [ch for ch in self._tip_location_channels() if ch in enabled]
+                for ch, transport in enumerate(self._transports):
+                    query = transport._safe_query_tip_status(
+                        transport._get_driver(), required=True, source_continue=True,
+                    )
+                    queries.append({"channel": ch, "result": query})
+                count = sum(row["result"].get("source_return") == 1 for row in queries)
+                if (self._tip_location == -1 and count != 4) or count == 0:
+                    lost = next((ch for ch in selected if not self._transports[ch]._tip_loaded), None)
+                    if lost is not None and self._error_callback is not None:
+                        self._record_pipette_error(lost, 42)
+                        raise PipetteTipStateError("Lost tip", details={"channel": lost})
+                speed_channel = self._tip_location if self._tip_location != -1 else 0
+                timeout_ms = self._oem_timeout_ms(
+                    volume, self._transports[speed_channel]._top_speed, 4_000,
+                )
+                if pressure_stream:
+                    for ch, transport in enumerate(self._transports):
+                        streams.append({"channel": ch, "enabled": True,
+                            "result": transport._get_driver().enable_pressure_stream(True)})
+                    self._sleep(0.200)
+                for ch in selected:
+                    transport = self._transports[ch]
+                    transport._require_initialized()
+                    if volume <= 5.0:
+                        self._sleep(0.005)
+                    # The collection already queried all four tips. Calling the
+                    # manual wrapper here would add another query/stronger guard.
+                    native = transport._assert_driver_result("dispense_air",
+                        transport._get_driver().dispense_air(
+                            volume, dispense_type=selected_type, wait_for_completion=False))
+                    result = {"driver_result": native, "volume_ul": volume,
+                        "dispense_type": selected_type, **transport._driver_evidence(native)}
+                    rows.append({"channel": ch, "result": result,
+                        "completion_owner_token": self._completion_owner_token(transport)})
+            # Source sets unselected events: only issued channels require waits.
+            # Never hold the send lock across completion; addressed Stop owns its
+            # existing independent path and cannot satisfy an old owner token.
+            deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+            for row in rows:
+                transport = self._transports[row["channel"]]
+                completion = self._wait_channel_completion(transport,
+                    max(0.0, deadline - time.monotonic()),
+                    owner_token=row["completion_owner_token"])
+                row["completion"] = completion
+                with self._transaction_lock:
+                    verified = completion.get("ok") is True and self._interrupt_epoch == epoch
+                    row["result"]["completion_verified"] = verified
+                    row["result"]["state_reconciled"] = False
+                    if verified:
+                        row["result"].update(transport.apply_completed_effect("dispense_air", row["result"]))
+            wait_ok = all(row["completion"].get("ok") is True for row in rows)
+            if not wait_ok:
+                self._sleep(1.000)
+            with self._transaction_lock:
+                interrupted = self._interrupt_epoch != epoch
+                # An affected addressed Stop forbids new native entry, including
+                # stream shutdown; do not invent cleanup on this path or a throw.
+                if pressure_stream and not interrupted:
+                    for ch, transport in enumerate(self._transports):
+                        streams.append({"channel": ch, "enabled": False,
+                            "result": transport._get_driver().enable_pressure_stream(False)})
+                result = {
+                    "ok": not interrupted, "operation": "dispense_air_for_oem_script",
+                    "source_return": 0, "source_return_completed": not interrupted,
+                    "volume_ul": volume, "front_air": bool(front_air),
+                    "dispense_type": selected_type, "channels": rows,
+                    "before_tip_status": queries, "pressure_stream": streams,
+                    "timeout_ms": timeout_ms, "source_wait_return": wait_ok,
+                    "completion_verified": wait_ok and not interrupted,
+                    "delivery_verified": all(row["result"].get("delivery_verified") is True for row in rows),
+                    "controller_acknowledged": all(row["result"].get("controller_acknowledged") is True for row in rows),
+                    "state_reconciled": not interrupted and all(row["result"].get("state_reconciled") is True for row in rows),
+                    "interrupted_by_terminate": interrupted,
+                    "operation_interrupt_epoch": epoch, "terminal_interrupt_epoch": self._interrupt_epoch,
+                    "physical_effect_verified": False,
+                    "wait_policy": "oem_worker_shared_deadline_false_wait_sleep_then_source_return",
+                    "oem_source_anchor": "ClassPipetteCollection.DispenseAir:915-985",
+                }
+                self._last_group_transaction = result
+                return dict(result)
+        except Exception as exc:
+            partial = {"channels": rows, "before_tip_status": queries,
+                "pressure_stream": streams, "source_return_completed": False}
+            self._last_error = {"operation": "dispense_air_for_oem_script", **partial}
+            details = getattr(exc, "details", None)
+            if isinstance(details, dict):
+                details.update(partial)
+            setattr(exc, "oem_partial_results", partial)
+            raise
+
+    def query_tip_status_for_oem_script(self, pipette: int) -> dict[str, Any]:
+        """Source single-channel queryTipStatus:1349–1357; no group query."""
+        if type(pipette) is not int or pipette not in self.CHANNELS:
+            raise ValueError("pipette must be an integer channel ID 0..3")
+        with self._transaction_lock:
+            transport = self._transports[pipette]
+            query = transport._safe_query_tip_status(
+                transport._get_driver(), required=True, source_continue=True,
+            )
+            return {
+                "ok": True, "source_return_completed": True,
+                "source_return": 1 if query.get("source_return") == 1 else 0,
+                "channel": pipette, "result": query,
+                "hardware_postcondition_verified": bool(
+                    query.get("ok") is True and query.get("semantic_ok") is True
+                    and query.get("hardware_truth_level") == "hardware_query"
+                ),
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1349-1357",
+            }
+
+    def aspirate_for_oem_script(
+        self, volume_ul: float, *, pressure_stream: bool = True,
+    ) -> dict[str, Any]:
+        """Exact standard Aspirate overload, including per-channel streaming."""
+        if self._forceabort():
+            raise PipetteCommandError("Stopped by user or force abort")
+        return self._standard_liquid_for_oem_script("aspirate", volume_ul, pressure_stream)
+
+    def dispense_for_oem_script(
+        self, volume_ul: float, *, pressure_stream: bool = True,
+    ) -> dict[str, Any]:
+        """Exact standard Dispense overload (not DispenseAir or manual dispense)."""
+        return self._standard_liquid_for_oem_script("dispense", volume_ul, pressure_stream)
+
+    def _standard_liquid_for_oem_script(
+        self, operation: str, volume_ul: float, pressure_stream: bool,
+    ) -> dict[str, Any]:
+        # Finite private sharing for the two source overloads only. Existing
+        # generic/manual guards and group completion semantics remain untouched.
+        aspirating = operation == "aspirate"
+        volume = float(volume_ul)
+        rows: list[dict[str, Any]] = []
+        queries: list[dict[str, Any]] = []
+        streams: list[dict[str, Any]] = []
+        epoch = self._interrupt_epoch
+        try:
+            with self._transaction_lock:
+                epoch = self._interrupt_epoch
+                selected = self._tip_location_channels()
+                for ch, transport in enumerate(self._transports):
+                    query = transport._safe_query_tip_status(
+                        transport._get_driver(), required=True, source_continue=True,
+                    )
+                    queries.append({"channel": ch, "result": query})
+                count = sum(row["result"].get("source_return") == 1 for row in queries)
+                if (self._tip_location == -1 and count != 4) or count == 0:
+                    lost = next((ch for ch in selected if not self._transports[ch]._tip_loaded), None)
+                    if lost is not None and self._error_callback is not None:
+                        self._record_pipette_error(lost, 42)
+                        raise PipetteTipStateError("Lost tip", details={"channel": lost})
+                speed = self._transports[self._tip_location if self._tip_location != -1 else 0]._top_speed
+                timeout_ms = (self._oem_timeout_ms(volume, speed, 4_000) if aspirating
+                              else self._oem_standard_dispense_timeout_ms(volume, speed))
+                if aspirating:
+                    self._allow_to_stop = False
+                elif pressure_stream:
+                    for ch, transport in enumerate(self._transports):
+                        streams.append({"channel": ch, "enabled": True,
+                            "result": transport._get_driver().enable_pressure_stream(True)})
+                    self._sleep(0.200)
+                for ch, transport in enumerate(self._transports):
+                    if aspirating and pressure_stream:
+                        streams.append({"channel": ch, "enabled": True,
+                            "result": transport._get_driver().enable_pressure_stream(True)})
+                        self._sleep(0.200)
+                    if ch not in selected:
+                        continue
+                    transport._require_initialized()
+                    if not aspirating and volume <= 5.0:
+                        self._sleep(0.005)
+                    driver = transport._get_driver()
+                    native = transport._assert_driver_result(operation,
+                        driver.aspirate(volume, tip_pressure_profile="1R", wait_for_completion=False)
+                        if aspirating else driver.dispense(volume, tip_pressure_profile="1R",
+                            blow_out=False, dispense_type=0, wait_for_completion=False))
+                    transport._pressure_profile = "1R"
+                    transport._last_command = operation
+                    result = {"driver_result": native, "volume_ul": volume,
+                        "dispense_type": 0, **transport._driver_evidence(native)}
+                    rows.append({"channel": ch, "result": result,
+                        "completion_owner_token": self._completion_owner_token(transport)})
+                    self._sleep(0.010)
+            # Worker WaitAll uses one deadline; addressed Stop can enter while
+            # waiting and must not satisfy an earlier liquid completion owner.
+            deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+            for row in rows:
+                transport = self._transports[row["channel"]]
+                completion = self._wait_channel_completion(transport,
+                    max(0.0, deadline - time.monotonic()),
+                    owner_token=row["completion_owner_token"])
+                row["completion"] = completion
+                with self._transaction_lock:
+                    verified = completion.get("ok") is True and self._interrupt_epoch == epoch
+                    row["result"]["completion_verified"] = verified
+                    row["result"]["state_reconciled"] = False
+                    if verified:
+                        row["result"].update(transport.apply_completed_effect(operation, row["result"]))
+            wait_ok = all(row["completion"].get("ok") is True for row in rows)
+            if not wait_ok:
+                self._sleep(1.000)
+            with self._transaction_lock:
+                interrupted = self._interrupt_epoch != epoch
+                if pressure_stream and not interrupted:
+                    for ch, transport in enumerate(self._transports):
+                        streams.append({"channel": ch, "enabled": False,
+                            "result": transport._get_driver().enable_pressure_stream(False)})
+                result = {
+                    "ok": not interrupted, "operation": operation + "_for_oem_script",
+                    "source_return": None if aspirating else 0,
+                    "source_return_completed": not interrupted,
+                    "volume_ul": volume, "channels": rows,
+                    "before_tip_status": queries, "pressure_stream": streams,
+                    "timeout_ms": timeout_ms, "source_wait_return": wait_ok,
+                    "allow_to_stop": self._allow_to_stop,
+                    "completion_verified": wait_ok and not interrupted,
+                    "delivery_verified": all(row["result"].get("delivery_verified") is True for row in rows),
+                    "controller_acknowledged": all(row["result"].get("controller_acknowledged") is True for row in rows),
+                    "state_reconciled": not interrupted and all(row["result"].get("state_reconciled") is True for row in rows),
+                    "interrupted_by_terminate": interrupted,
+                    "operation_interrupt_epoch": epoch, "terminal_interrupt_epoch": self._interrupt_epoch,
+                    "physical_effect_verified": False,
+                    "wait_policy": "oem_worker_shared_deadline_false_wait_sleep_then_source_return",
+                    "oem_source_anchor": ("ClassPipetteCollection.Aspirate:778-842" if aspirating
+                                          else "ClassPipetteCollection.Dispense:988-1053"),
+                }
+                self._last_group_transaction = result
+                return dict(result)
+        except Exception as exc:
+            partial = {"channels": rows, "before_tip_status": queries,
+                "pressure_stream": streams, "source_return_completed": False}
+            self._last_error = {"operation": operation + "_for_oem_script", **partial}
+            details = getattr(exc, "details", None)
+            if isinstance(details, dict):
+                details.update(partial)
+            setattr(exc, "oem_partial_results", partial)
+            raise
+
     def mix_all(self, count: int, vol: float, vigorous: int = 100) -> dict[str, Any]:
         if self._forceabort():
             raise PipetteCommandError("Stopped by user or force abort")

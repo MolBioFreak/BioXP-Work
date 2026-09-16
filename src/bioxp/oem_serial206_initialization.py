@@ -4330,6 +4330,13 @@ class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceMoveTo": "wp8_source_move_to",
+        "sourceImageGantryLoad": "wp8_source_image_gantry_load",
+        "sourceMoveX": "wp8_source_move_x",
+        "sourceMoveZ": "wp8_source_move_z",
+        "sourceSetZAcc": "wp8_source_set_z_acc",
+        "sourceRestoreZAcc": "wp8_source_restore_z_acc",
+        "sourceLowerPipette": "wp8_source_lower_pipette",
         "CloseGripper": "wp8_close_gripper",
         "HomeAxisD": "wp8_home_axis_d",
         "LoadGantry": "wp8_load_gantry",
@@ -4388,6 +4395,24 @@ class Serial206OemInitializationProvider:
         "waitMoveZOnly": "wp8_wait_move_z_only",
         "waitStop": "wp8_wait_stop",
         "waitZ": "wp8_wait_z",
+        "sourceTipState": "wp8_pipette_source_leaf",
+        "sourceTipTransition": "wp8_pipette_source_leaf",
+        "sourceWellPierced": "wp8_pipette_source_leaf",
+        "sourceLiftTo": "wp8_pipette_source_leaf",
+        "sourceLowerTo": "wp8_pipette_source_leaf",
+        "sourceMoveXY": "wp8_pipette_source_leaf",
+        "sourcePosition": "wp8_pipette_source_leaf",
+        "sourceHomeZ": "wp8_pipette_source_leaf",
+        "sourceZCurrent": "wp8_pipette_source_leaf",
+        "sourceZStall": "wp8_pipette_source_leaf",
+        "sourceLiftPipette": "wp8_pipette_source_leaf",
+        "sourceColor": "wp8_pipette_source_leaf",
+        "sourceWellMoveTo": "wp8_pipette_source_leaf",
+        "sourceUnlatch": "wp8_pipette_source_leaf",
+        "sourceConfirmGripper": "wp8_pipette_source_leaf",
+        "sourceHomeGripper": "wp8_pipette_source_leaf",
+        "sourceRelativeX": "wp8_pipette_source_leaf",
+        "sourceRelativeY": "wp8_pipette_source_leaf",
     }
 
     @classmethod
@@ -4428,6 +4453,7 @@ class Serial206OemInitializationProvider:
         self._wp8_task_lock = threading.Lock()
         self._wp8_tasks: dict[str, dict[str, Any]] = {}
         self._wp8_background_task_settler: Callable[..., None] | None = None
+        self._oem_source_rgb: tuple[int, ...] | None = None
         self._wp8_stop_event = threading.Event()
         self._wp8_stop_event.set()
         self._deck_owner_id = "serial206-oem-initialization-provider"
@@ -4514,9 +4540,11 @@ class Serial206OemInitializationProvider:
         if not callable(publisher):
             raise RuntimeError("tip_tray_state_publisher_not_bound")
         self.invalidate_deck_authority_cache(reason="tray_owner_publication")
+        # Source restoration is the canonical publisher's nonphysical retip
+        # transition. Keep the callback vocabulary out of the SQLite contract.
         published = publisher(
             tray_id=tray_id,
-            transition=transition,
+            transition="retip" if transition == "restore" else transition,
             operation_id=operation_id,
             command_id=command_id,
             provenance=provenance,
@@ -11123,6 +11151,11 @@ class Serial206OemInitializationProvider:
 
         if operation not in WP8_OPERATION_INTENT_KEYS:
             raise RuntimeError(f"source_authority_missing:{operation}")
+        from .oem_deck_movement import OEM_PIPETTE_LEAVES
+        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}:
+            # These literal leaves resolve only their selected source facts at
+            # native entry. Do not introduce a gripper GAP into every leaf.
+            return {}
         state = dict(self.mov_execution_machine_state())
         manifest = build_machine_calibration_manifest(serial_number=206)
         if manifest.get("ok") is not True:
@@ -11385,9 +11418,17 @@ class Serial206OemInitializationProvider:
         del operation, arguments
         return self.MoveZHome()
 
-    def wp8_park_gantry(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+    def wp8_park_gantry(self, operation: str, arguments: Mapping[str, Any], **context: Any) -> Any:
         del operation
-        return self.parkGantry(rehome=bool(arguments.get("rehome", False)))
+        rehome = bool(arguments.get("rehome", False))
+        checker = None
+        if rehome:
+            checker = self._wp8_execution_fence_checker
+            command_id = context["command_id"]
+            def before_entry(boundary: str) -> None:
+                checker(command_id, boundary=boundary)
+            return self.parkGantry(rehome=True, before_native_entry=before_entry)
+        return self.parkGantry(rehome=False)
 
     def wp8_scriptmove_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
         del operation
@@ -11711,6 +11752,536 @@ class Serial206OemInitializationProvider:
         if row.get("state") != "completed":
             raise RuntimeError(f"wp8_z_background_task_failed:{row.get('error')}")
         return {"ok": True, "delivery_attempted": False, "background_task_id": task_id, "result": row.get("result")}
+
+    @staticmethod
+    def _oem_int32(value: Any) -> int:
+        if not isinstance(value, str) or not value.strip() or any(c not in "+-0123456789" for c in value.strip()):
+            raise ValueError("oem_int32_invalid")
+        result = int(value)
+        if not -(2 ** 31) <= result < 2 ** 31:
+            raise ValueError("oem_int32_overflow")
+        return result
+
+    @classmethod
+    def _oem_enum(cls, value: str, names: Mapping[str, int], *, ignore_case: bool = True) -> int | None:
+        # Enum.TryParse accepts numeric (including undefined) enum values.
+        text = value.strip()
+        for name, ordinal in names.items():
+            if text.casefold() == name.casefold() if ignore_case else text == name:
+                return ordinal
+        try:
+            return cls._oem_int32(text)
+        except ValueError:
+            return None
+
+    def build_oem_pipette_source_callbacks(
+        self, *, execute_plan: Callable, start_child: Callable, stopped: Callable,
+        rgb_writer: Callable | None = None, source_error_event: Callable | None = None,
+        settings: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Bind D's finite source bodies to canonical WP8 execution, not RAM prep.
+
+        The caller carries a distinct trusted occurrence through execute_plan
+        for every invocation (including repeated identical plans). Child task
+        creation and stop disposition stay with the existing executor owner.
+        """
+        from .services.pipette_service import OemPipetteSourceBindings
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        from .oem_compat.position_table import well_id_from_label
+        from .oem_deck_movement import _pierced
+
+        captured = copy.deepcopy(dict(settings or {}))
+        if rgb_writer is not None:
+            self._oem_pipette_rgb_writer = rgb_writer
+
+        def run(operation, action, state, **inputs):
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True, **inputs)
+            return execute_plan(plan, action, state)
+
+        def leaf(operation, keys):
+            def call(*args):
+                *values, action, state = args
+                if len(values) != len(keys):
+                    raise TypeError(f"{operation}: wrong source arguments")
+                return run(operation, action, state, **dict(zip(keys, values)))
+            return call
+
+        def facts(action, state):
+            machine = self.mov_execution_machine_state()
+            semantic = self._canonical_deck_semantic_state()
+            status = self.primitives.pipette_transport.get_status()  # cached source values only
+            channel = status["channels"][0]  # ClassPipetteCollection.Speed/FluidLevel
+            location = machine["current_location"]
+            name = LOCATION_ID_TO_NAME[location]
+            row = load_bound_oem_position_table().resolve(location_id=name)
+            return {"current_location": location, "current_well": machine["current_well"],
+                    "current_tray": semantic["current_tray"], "tip_type": status["tip_type"],
+                    "tip_location": machine["tip_location"], "fluid_level": channel["liquid_level_ul"],
+                    "speed": channel["top_speed"], "current_location_name": name, "z_high": row.z_high}
+
+        def script_move(location, column, row, action, state, *, flag=0, parallel=True):
+            return run("pipette_script_move", action, state, destination=location, column=column,
+                       row=row, position_flag=flag, run_in_parallel=parallel)
+
+        def transition(tray, wells, change, label, zone, action, state):
+            # Labels and zones are D/B source inventory; occupancy has one owner.
+            return run("pipette_tip_transition", action, state, tray_id=int(tray),
+                       well_ids=list(wells), transition=change)
+
+        def lift_air(action, state):
+            location = facts(action, state)["current_location"]
+            height = 64503 if location == 16 else 54425 if location == 3 else 38299 if location in (11, 12, 13, 14) else 28220
+            return run("pipette_lift", action, state, location=location, height=height)
+
+        def is_pierced(plate, well, single, action, state):
+            return _pierced({**self.mov_execution_machine_state(), "tip_location": 0 if single else -1}, plate, well)
+
+        def remove_tip(tray, well, action, state):
+            first = well_id_from_label(well)
+            return transition(tray, [first + 24 * i for i in range(4)], "remove", None, None, action, state)
+
+        def move_waste(action, state):
+            return run("pipette_waste", action, state, location=6, offset_x=0, offset_y=0,
+                       run_in_parallel=False)
+
+        def hotel(action, state):
+            return run("pipette_hotel", action, state, location=15, column=0, row=1,
+                       high_pos=True, run_in_parallel=False)
+
+        native = OemPipetteSourceBindings(
+            facts=facts, lift_to=leaf("pipette_lift", ("location", "height")),
+            lower_to=leaf("pipette_lower", ("location",)), move_xy=leaf("pipette_move_xy", ("x", "y")),
+            position=leaf("pipette_position", ()), home=leaf("pipette_home", ("rehome",)),
+            tip_state=leaf("pipette_tip_state", ("changes",)), is_pierced=is_pierced,
+            pierce=leaf("pipette_pierce", ("plate", "well", "single")),
+            z_low=lambda location, action, state: load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[location]).z_low,
+            set_color=leaf("pipette_color", ("r", "g", "b")), stall_guard=leaf("pipette_stall", ("value",)),
+            lower_pipette=leaf("pipette_lower_pipette", ("location",)),
+            lift_pipette=leaf("pipette_lift_pipette", ("location",)), snapshot=leaf("pipette_snapshot", ("name",)),
+            shift_camera=leaf("pipette_shift_camera", ()), unlock=leaf("pipette_unlock", ()),
+            hotel_move=hotel, tip_transition=transition,
+            tip_exists=lambda action, state: self._park_collection_state()["tip_exists"],
+            start_child=lambda name, call, action, state: start_child(name, call),
+            stopped=lambda action, state: stopped(), script_move=script_move,
+            publish_location=leaf("pipette_location", ("destination", "well")),
+            move_z=leaf("pipette_move_z", ("value",)), move_x=leaf("pipette_move_x", ("value",)),
+            set_z_current_max=leaf("pipette_current", ("value",)), source_error_event=source_error_event,
+            led2_on=leaf("pipette_led2", ()), take_aspirate_image=leaf("script_snapshot", ()),
+            source_capabilities=frozenset(name for name, method in (
+                ("aspirate_pressure_stream", "aspirate_for_oem_script"),
+                ("dispense_pressure_stream", "dispense_for_oem_script"),
+                ("query_tip_status_single", "query_tip_status_for_oem_script"))
+                if callable(getattr(self.primitives.pipette_transport, method, None))),
+            sleep=self.sleep,
+        )
+        return dict(source_bindings=native, settings=captured,
+            script_move=lambda location, row, action, state: script_move(location, 0, row, action, state),
+            publish_location=native.publish_location,
+            publish_tip_transition=lambda tray, wells, action, state: transition(tray, wells, "restore", None, None, action, state),
+            lift_for_air=lift_air, move_to_waste=move_waste, move_z=native.move_z, move_x=native.move_x,
+            tip_load_move=lambda location, column, row, action, state: script_move(location, column, row, action, state, flag=2, parallel=False),
+            move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
+            remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
+
+    def wp8_pipette_source_leaf(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """Literal finite source adapters; native policy and returns stay native."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        def publish(name, updates):
+            return self._wp8_publish_semantic(operation=name, command_id=command_id,
+                child_order=child_order, plan_digest=plan_digest, updates=updates)
+
+        if operation == "sourceTipState":
+            changes = dict(arguments["changes"])
+            if not changes or set(changes) - {"tip_loaded", "tip_dirty", "tip_location"}:
+                raise ValueError("invalid source tip-state fields")
+            return publish("pipette_owner", changes)
+        if operation == "sourceWellPierced":
+            marker = "strip" if arguments["plate"] in (7, 8, 9, 10) else int(arguments["single"])
+            return publish(operation, {"well_pierced": [arguments["plate"], arguments["well"], marker]})
+        if operation == "sourceTipTransition":
+            identity = self._wp8_identity(command_id, child_order, plan_digest)
+            result = self.publish_tip_tray_transition(tray_id=arguments["tray_id"],
+                transition=arguments["transition"], operation_id=identity, command_id=command_id,
+                provenance={"source_operation": operation, "source_child": identity}, well_ids=list(arguments["well_ids"]))
+            return {"ok": True, "delivery_attempted": False, "published": result}
+        if operation in {"sourceLiftTo", "sourceLowerTo"}:
+            row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+            height = arguments.get("height")
+            target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
+            if type(target) is not int:
+                raise RuntimeError("source_pipette_z_calibration_missing")
+            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0}
+        if operation == "sourceMoveXY":
+            return self.primitives.oem_move_xy(arguments["x"], arguments["y"])
+        if operation == "sourcePosition":
+            positions = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
+            return {"ok": True, "delivery_attempted": True, **positions}
+        if operation == "sourceHomeZ":
+            rehome = arguments["rehome"]
+            result = self.primitives.tester.motor_oem_move_z_home(rehome=True if rehome is None else rehome, timeout_s=30.0)
+            if isinstance(result.get("set_z_current_param6"), Mapping) and result["set_z_current_param6"].get("ok") is True:
+                self.primitives._z_profile_overrides[6] = 31
+            source_return = result.get("source_return_code")
+            if source_return is None and isinstance(result.get("home"), Mapping):
+                source_return = result["home"].get("source_return_code")
+            return {**dict(result), "source_return": source_return, "delivery_attempted": not bool(result.get("source_noop"))}
+        if operation == "sourceZCurrent":
+            return self.primitives.z_set_current_max(arguments["value"])
+        if operation == "sourceZStall":
+            value = arguments["value"]
+            if value in (None, 0):
+                value = self.primitives.tester._motion_oem_axis_profile("z")["stall_guard"]
+            return self.primitives._z_set_profile_parameter(param=205, value=value,
+                intent="source_set_stall_guard", source_method="ClassControlInterface.setStallGuard:4869-4907")
+        if operation == "sourceLiftPipette":
+            return self.primitives.z_pipette_position(location_id=LOCATION_ID_TO_NAME[arguments["location"]], operation="lift_pipette")
+        if operation in {"sourceRelativeX", "sourceRelativeY"}:
+            axis = "x" if operation == "sourceRelativeX" else "y"
+            board, motor = (5, 0) if axis == "x" else (4, 0)
+            return self.primitives.tester.motor_oem_board_move_steps(board, arguments["steps"], motor=motor, axis=axis)
+        if operation == "sourceWellMoveTo":
+            table = load_bound_oem_position_table()
+            row = table.resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+            xyz = row.oem_move_to_coordinates(column=arguments["column"], row=arguments["row"], high_pos=arguments["high_pos"])
+            state = self.mov_execution_machine_state()
+            return self.primitives.oem_move_to(xyz["x"], xyz["y"], xyz["z"],
+                pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments["run_in_parallel"],
+                gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+                plate_on_gantry=state.get("plate_on_gantry"),
+                location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]))
+        if operation == "sourceConfirmGripper":
+            return {"ok": True, "source_return": self._deck_gripper_confirmed(), "delivery_attempted": True}
+        if operation == "sourceHomeGripper":
+            return self.primitives.tester.motor_oem_home_axis_board_test("g", timeout_s=30.0)
+        if operation == "sourceUnlatch":
+            result = self.primitives.tester.deck_io_set_type(2, 0)
+            if not isinstance(result, Mapping) or result.get("ok") is not True:
+                return {"ok": False, "delivery_attempted": True, "primitive_result": result}
+            return {**publish(operation, {"latch_closed": False}), "delivery_attempted": True, "primitive_result": result}
+        if operation == "sourceColor":
+            writer = getattr(self, "_oem_pipette_rgb_writer", None)
+            if not callable(writer):
+                raise RuntimeError("source_authority_missing:RGB")
+            rgb = tuple(max(0, min(255, arguments[key])) for key in ("r", "g", "b"))
+            if self._oem_source_rgb == rgb:
+                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            result = writer(*rgb)
+            self._oem_source_rgb = rgb
+            if not isinstance(result, Mapping):
+                raise RuntimeError("source_authority_invalid:RGB")
+            return dict(result)
+        raise RuntimeError(f"source_authority_missing:{operation}")
+
+    def build_oem_native_handlers(
+        self, *, settings: Mapping[str, Any], execute_plan: Callable[..., Any],
+        execute_mov: Callable[..., Any] | None = None,
+        rgb_writer: Callable[..., Any] | None = None,
+        rgb_board_present: bool = True,
+        barcode_reader: Callable[[], str] | None = None,
+    ) -> dict[str, Callable[..., Any]]:
+        """Finite source bindings; execute_plan is the existing canonical WP8 owner.
+
+        It receives (compiled_plan, action, runtime_state), owns admitted native
+        children and returns their explicit outcome/owned_children unchanged.
+        No public method selection, default handler or independent worker exists.
+        """
+        from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        captured = copy.deepcopy(dict(settings))
+        location_names = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+
+        def plan(operation: str, inputs: Mapping[str, Any], action: Any, state: Any) -> Any:
+            machine = self.wp8_operation_machine_state(operation, inputs)
+            if operation == "cut_seal":
+                row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[24])
+                if row.z_low is None:
+                    raise RuntimeError("source_authority_missing:cut_zLow")
+                machine.update(cut_x=int(row.base_coordinates["x"]), cut_z=int(row.z_low) - captured["CutZ_Offset"])
+            if operation == "shakeoff":
+                machine["current_location"] = self.mov_execution_machine_state()["current_location"]
+                reply = self.primitives.motor_get_position(4, motor=1)
+                if not isinstance(reply, Mapping):
+                    raise RuntimeError("source_authority_missing:getZPosition")
+                machine["z_position"] = self.primitives._position_value(reply)
+            compiled = compile_finite_plate_operation(operation, source_leaf_available=True, **{**machine, **dict(inputs)})
+            return execute_plan(compiled, action, state)
+
+        def raw(action: Any) -> tuple[str, ...]:
+            args = action.params["arguments"]
+            if not isinstance(args, (list, tuple)) or not all(isinstance(v, str) for v in args):
+                raise ValueError("oem_raw_arguments_required")
+            return tuple(args)
+
+        def park(action: Any, state: Any) -> Any:
+            return plan("park_gantry", {"rehome": True}, action, state)
+
+        def catch(action: Any, state: Any) -> Any:
+            plate = self._oem_enum(raw(action)[0], OEM_PLATE_NAME_ORDINALS)
+            if plate is None:
+                raise ValueError("Need to specify plate name to catch it")
+            state.source_model.allow_to_stop = False
+            result = plan("catch_plate", {"plate": plate, "run_in_parallel": True}, action, state)
+            if "plate_on_gantry" in result.get("residual_state", {}):
+                state.source_model.carried_plate_present = result["residual_state"]["plate_on_gantry"] is not None
+            return {**result, "source_allow_to_stop": False}
+
+        def release(action: Any, state: Any) -> Any:
+            args = raw(action)
+            plate = self._oem_enum(args[0], OEM_PLATE_NAME_ORDINALS)
+            if plate is not None:
+                location = self.mov_execution_machine_state()["plate_locations"][plate]
+            else:
+                location = self._oem_enum(args[0], location_names, ignore_case=False)
+                if location is None:
+                    raise ValueError("oem_location_enum_invalid")
+            result = plan("release_plate", {"destination": location, "press_plate": len(args) > 1 and args[1] == "pressplate", "run_in_parallel": True}, action, state)
+            state.source_model.allow_to_stop = True
+            if "plate_on_gantry" in result.get("residual_state", {}):
+                state.source_model.carried_plate_present = result["residual_state"]["plate_on_gantry"] is not None
+            return {**result, "source_allow_to_stop": True}
+
+        def press(action: Any, state: Any) -> Any:
+            # Ignored TryParse failure writes the enum default, not omission.
+            plates = [self._oem_enum(v, OEM_PLATE_NAME_ORDINALS) for v in raw(action)]
+            return plan("press_plates", {"plates": [0 if p is None else p for p in plates], "run_in_parallel": True}, action, state)
+
+        def cutseal(action: Any, state: Any) -> Any:
+            args = raw(action)
+            return plan("cut_seal", {"count": self._oem_int32(args[0]) if args else 4}, action, state)
+
+        def shakeoff(action: Any, state: Any) -> Any:
+            return plan("shakeoff", {"count": self._oem_int32(raw(action)[0])}, action, state)
+
+        def door(action: Any, state: Any, opening: bool) -> Any:
+            inspect = opening and captured["DeckInspection"] and captured["StartMode"] in (1, 2)
+            if inspect and barcode_reader is None:
+                raise RuntimeError("source_authority_missing:ReadBarcode")
+            result = dict(plan("thermal_door", {"open": opening, "script_running": True}, action, state))
+            if type(result.get("source_return")) is not bool:
+                raise RuntimeError("source_authority_missing:doorOpen_return")
+            if not result["source_return"]:
+                result.update(source_stop_scripts=True, source_board_error_event="Could not verify door open sensor" if opening else "Could not verify door close sensor")
+            if inspect:
+                assert barcode_reader is not None
+                barcode = barcode_reader()
+                if barcode in ("", "BLACK"):
+                    barcode = barcode_reader()
+                    if barcode == "" or barcode != "BLACK":
+                        result.update(source_error_hold=True, source_error_event="Barcode read error during TC door open")
+            return result
+
+        def snapshot(action: Any, state: Any) -> Any:
+            if not captured["CheckSnapTips"]:
+                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            return plan("script_snapshot", {}, action, state)
+
+        def led(action: Any, state: Any) -> Any:
+            args = raw(action)
+            rgb = tuple(max(0, min(255, self._oem_int32(v))) for v in args[:3])
+            if len(rgb) != 3:
+                raise ValueError("oem_rgb_arguments_required")
+            self._oem_source_rgb = rgb  # Source cache changes before the native call.
+            if not rgb_board_present:
+                return {"ok": True, "source_noop": "m_board_null", "rgb": rgb, "delivery_attempted": False}
+            assert rgb_writer is not None
+            result = rgb_writer(*rgb)
+            if not isinstance(result, Mapping) or type(result.get("ok")) is not bool:
+                raise RuntimeError("source_authority_missing:setColor_return")
+            return {**result, "rgb": rgb}
+
+        handlers = {"park": park, "catchPlate": catch, "catch": catch,
+                    "releasePlate": release, "release": release, "pressp": press,
+                    "cutseal": cutseal, "so": shakeoff,
+                    "dopen": lambda a, s: door(a, s, True),
+                    "dclose": lambda a, s: door(a, s, False), "snapshot": snapshot}
+        if rgb_writer is not None or not rgb_board_present:
+            handlers["led"] = led
+        if execute_mov is not None:
+            def mov(action: Any, state: Any) -> Any:
+                from .oem_deck_movement import prepared_class_move_to_intent
+                # Displayed source line is not occurrence/custody identity.
+                key = action.source_key
+                line = key if type(key) is int else self._oem_int32(key) if isinstance(key, str) else 0
+                intent = prepared_class_move_to_intent(action.params["arguments"], script_line=line)
+                return execute_mov(intent, action, state)
+            handlers["mov"] = mov
+        return handlers
+
+    def build_oem_lifecycle_handlers(
+        self, *, execute_plan: Callable[..., Any],
+        settings: Mapping[str, Any] | None = None,
+        unlatch: Callable[..., Any] | None = None,
+        initial_check: Callable[..., Any] | None = None,
+        initialize_motors: Callable[..., Any] | None = None,
+        restore_door_model: Callable[..., Any] | None = None,
+        resume_temperature: Callable[..., Any] | None = None,
+        run_job_tip_prefix: Callable[..., Any] | None = None,
+        confirm_gripper: Callable[..., Any] | None = None,
+        home_gripper: Callable[..., Any] | None = None,
+        pressure_baseline: Callable[..., Any] | None = None,
+        collect_critical_images: Callable[..., Any] | None = None,
+    ) -> dict[str, Callable[..., Any]]:
+        """Source mechanical lifecycle sequences, conditional on exact leaves.
+
+        Leaf callbacks take runtime_state (restore_door_model also takes the
+        boolean value). They must be canonically admitted/fenced by F/C and
+        return explicit native outcomes. Thermal and CV leaves are NOT supplied
+        by this provider. Missing leaves omit the affected hook at preflight.
+        """
+        def finite(name: str, operation: str, inputs: Mapping[str, Any], state: Any) -> Any:
+            machine = self.wp8_operation_machine_state(operation, inputs)
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True, **{**machine, **dict(inputs)})
+            return execute_plan(plan, "lifecycle:" + name, state)
+
+        def outcome(value: Any) -> dict[str, Any]:
+            if not isinstance(value, Mapping) or type(value.get("ok")) is not bool:
+                raise RuntimeError("oem_lifecycle_explicit_outcome_required")
+            return dict(value)
+
+        def combined(rows: list[dict[str, Any]], **facts: Any) -> dict[str, Any]:
+            return {"ok": all(row["ok"] for row in rows), "source_children": rows,
+                    "owned_children": tuple(child for row in rows for child in row.get("owned_children", ())), **facts}
+
+        def park(state: Any) -> Any:
+            return finite("epilogue_park", "park_gantry", {"rehome": False}, state)
+
+        def ordinary_prepare(state: Any) -> Any:
+            return finite("ordinary_pause_prepare", "ordinary_pause_prepare", {}, state)
+
+        handlers = {"epilogue_park": park, "ordinary_pause_prepare": ordinary_prepare}
+
+        if unlatch is not None:
+            def deferred_enter(state: Any) -> Any:
+                parked = outcome(finite("deferred_pause_enter", "park_gantry", {"rehome": False}, state))
+                if not parked["ok"]:
+                    return parked
+                return combined([parked, outcome(unlatch(state))], source_user_pause_action="Open Door")
+            handlers["deferred_pause_enter"] = deferred_enter
+
+        if all(leaf is not None for leaf in (initial_check, initialize_motors, restore_door_model, resume_temperature)):
+            def wake(state: Any) -> Any:
+                assert initial_check is not None and initialize_motors is not None
+                assert restore_door_model is not None and resume_temperature is not None
+                # App:2104-2129 ignores initialCheck's source bool. Explicit
+                # native/claim failure is separate from that returned bool.
+                checked = outcome(initial_check(state))
+                if not checked["ok"]:
+                    return checked
+                was_open = self.mov_execution_machine_state()["thermal_door_open"]
+                if type(was_open) is not bool:
+                    raise RuntimeError("source_authority_missing:ThermalDoorOpen")
+                rows = [checked, outcome(initialize_motors(state))]
+                if not rows[-1]["ok"]:
+                    return combined(rows)
+                self.sleep(0.040)
+                if was_open:
+                    rows.append(outcome(restore_door_model(False, state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(finite("wake", "thermal_door", {"open": was_open}, state)))
+                if not rows[-1]["ok"]:
+                    return combined(rows)
+                rows.append(outcome(resume_temperature(state)))
+                return combined(rows, source_wake_ready=rows[-1]["ok"])
+            handlers["wake"] = wake
+
+        if all(leaf is not None for leaf in (run_job_tip_prefix, confirm_gripper, home_gripper)):
+            def run_job(state: Any) -> Any:
+                assert run_job_tip_prefix is not None and confirm_gripper is not None and home_gripper is not None
+                rows = [outcome(run_job_tip_prefix(state))]
+                if not rows[-1]["ok"] or rows[-1].get("source_pause_scripts"):
+                    return rows[-1]
+                confirmed = outcome(confirm_gripper(state))
+                rows.append(confirmed)
+                if not confirmed["ok"]:
+                    return combined(rows)
+                if type(confirmed.get("source_return")) is not bool:
+                    raise RuntimeError("source_authority_missing:confirmAxis_gripper")
+                if not confirmed["source_return"]:
+                    rows.append(outcome(home_gripper(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(finite("run_job", "thermal_door", {"open": True}, state)))
+                return combined(rows)
+            handlers["run_job"] = run_job
+
+        if collect_critical_images is None and settings is not None and "JobName" in settings:
+            captured = copy.deepcopy(dict(settings))
+            def source_critical_images(state: Any) -> Any:
+                inputs = {"job_name": captured["JobName"]}
+                if captured["JobName"] is not None:
+                    inputs.update(camera_x_offset=captured["CameraXOffset"],
+                                  camera_y_offset=captured["CameraYOffset"], camera_z_offset=captured["CameraZOffset"])
+                return finite("script_prologue", "critical_item_images", inputs, state)
+            collect_critical_images = source_critical_images
+
+        if pressure_baseline is not None and collect_critical_images is not None:
+            def script_prologue(state: Any) -> Any:
+                rows = []
+                # Core:5252-5253,5306-5307,5313-5314: three reads and
+                # source addPressureBase calls, not one cached observation.
+                for _ in range(3):
+                    rows.append(outcome(pressure_baseline(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(collect_critical_images(state)))
+                return combined(rows)
+            handlers["script_prologue"] = script_prologue
+        return handlers
+
+    def wp8_source_image_gantry_load(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        # DefaultParameters.GantryLoad(null, REAGENT_PLATE) changes only
+        # pseudo-home; it is not MachineStatus.LoadGantry/plate custody.
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"pseudo_z_home": 500},
+        )
+
+    def wp8_source_move_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        table = load_bound_oem_position_table()
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+        coordinates = row.oem_offset_move_coordinates(
+            offset_x=arguments["offset_x"], offset_y=arguments["offset_y"],
+            x_high_limit=90263, y_high_limit=102956,
+        )
+        state = self.mov_execution_machine_state()
+        return self._deck_primitive_receipt(self.primitives.oem_move_to(
+            coordinates["x"], coordinates["y"], state["pseudo_z_home"],
+            pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments.get("run_in_parallel", True),
+            gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+            plate_on_gantry=state.get("plate_on_gantry"),
+            location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+        ), source_anchor="ClassControlInterface.moveTo:3691-3715")
+
+    def wp8_source_move_x(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self._deck_primitive_receipt(
+            self.primitives.x_move_absolute(position_steps=arguments["value"]),
+            source_anchor="ControlLib.cut:8532-8539",
+        )
+
+    def wp8_source_move_z(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.moveZ(arguments["value"])
+
+    def wp8_source_set_z_acc(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.primitives.z_set_max_acc(arguments["value"])
+
+    def wp8_source_restore_z_acc(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.primitives.z_set_max_acc()
+
+    def wp8_source_lower_pipette(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        return self.primitives.z_pipette_position(
+            location_id=LOCATION_ID_TO_NAME[arguments["location"]], operation="lower_pipette",
+        )
 
     def wp8_move_z_to_location(
         self, operation: str, arguments: Mapping[str, Any], **_: Any,
@@ -12347,8 +12918,9 @@ class Serial206OemInitializationProvider:
         *,
         rehome: bool = False,
         authority_snapshot: Mapping[str, Any] | None = None,
+        before_native_entry: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        """Execute raw-IL ``ControlLib.parkGantry(false)`` with governed early return."""
+        """Source Park variants; manual false and governed early return retained."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
         if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
@@ -12490,6 +13062,49 @@ class Serial206OemInitializationProvider:
         script_move = getattr(self.primitives, "oem_initialize_motion_scriptmove_to_waste", None)
         if not callable(script_move):
             raise RuntimeError("source_authority_missing:scriptmoveTo")
+        if rehome:
+            # ControlLib.parkGantry:7099-7119. The first move omits the
+            # position flag (source default 0); HomeXY returns lost steps,
+            # not position-after-home and not a physical-success boolean.
+            if before_native_entry is not None:
+                before_native_entry("script_park_approach")
+            approach = record(
+                "scriptmoveTo(current,well,28,0,0)",
+                script_move(
+                    current_location=name_to_id[current_location_name],
+                    current_well=int(semantics["current_well_id"]),
+                    target_location=28, target_well=0, position_flag=0,
+                    gripper_confirmed=self._deck_gripper_confirmed(),
+                    tip_loaded=False, tip_dirty=False, timeout_s=60.0,
+                    pseudo_home_steps=pseudo_home,
+                    plate_on_gantry=semantics.get("plate_on_gantry"),
+                    location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                ),
+                discarded_return=True,
+            )
+            controller_rows.append(approach)
+            if before_native_entry is not None:
+                before_native_entry("script_park_home_xy")
+            home = record("HomeXY()", self.primitives.home_xy(), discarded_return=False)
+            controller_rows.append(home)
+            lost_steps = home.get("source_return")
+            if not isinstance(lost_steps, Mapping) or any(
+                type(lost_steps.get(axis)) is not int for axis in ("x", "y")
+            ):
+                raise RuntimeError("park_homexy_source_return_unavailable")
+            for axis in ("x", "y"):
+                if abs(lost_steps[axis]) > 100:
+                    return {
+                        "ok": False, "delivery_attempted": True,
+                        "source_pause_scripts": True,
+                        "source_error_event": f"Axis {axis} lost steps exceeded 100",
+                        "semantic_location_commit_allowed": False,
+                        "source_children": source_children,
+                        "source_anchor": "ControlLib.parkGantry:7099-7119",
+                    }
+
+        if before_native_entry is not None:
+            before_native_entry("script_park_final_move")
         final_row = record(
             "scriptmoveTo(current,well,28,0,0,2,true)",
             script_move(

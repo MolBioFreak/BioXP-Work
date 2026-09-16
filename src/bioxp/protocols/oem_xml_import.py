@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from hashlib import sha256
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 import xml.etree.ElementTree as ET
 
 from .models import ProtocolAction, ProtocolActionKind, ProtocolDocument, ProtocolStage
-from .validators import infer_required_capability
+from .validators import infer_required_capability, validate_protocol_document
 from ..oem_compat.scripts import OemScriptCommand, OemScriptTranslator
 
 
@@ -373,7 +374,7 @@ def _inventory_metadata(root: ET.Element) -> dict[str, Any]:
             "attributes": dict(child.attrib),
         }
         for child in root
-        if child.tag.startswith("strip")
+        if isinstance(child.tag, str) and child.tag.startswith("strip")
     ]
     return {
         "tip_count": len(list(tips)) if tips is not None else 0,
@@ -387,7 +388,7 @@ def _inventory_metadata(root: ET.Element) -> dict[str, Any]:
 def _stage_id_for_step(step_value: str | None, *, ordinal: int) -> str:
     normalized = str(step_value).strip() if step_value is not None else ""
     if normalized.isdigit():
-        return f"step-{int(normalized):02d}"
+        return f"step-{int(normalized):02d}-occurrence-{ordinal}"
     return f"stage-{ordinal:02d}-{_slugify(normalized, fallback='unnamed')}"
 
 
@@ -548,6 +549,8 @@ def _compile_supported_action(
         params=params,
         description=description,
         required_capability=infer_required_capability(kind),
+        source_occurrence_id=f"xml:{script_position}",
+        source_key=int(node.tag[4:]),
         review_required=review_required,
         pause_message=pause_message,
         metadata={
@@ -560,11 +563,29 @@ def _compile_supported_action(
 
 def import_oem_xml_protocol(path: str | Path) -> ImportedOemProtocol:
     source_path = Path(path).expanduser().resolve()
-    tree = ET.parse(source_path)
-    root = tree.getroot()
+    source_bytes = source_path.read_bytes()
+    root = ET.fromstring(source_bytes, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
     script = root.find("./script")
     if script is None:
         raise ValueError(f"OEM XML file '{source_path}' does not contain a <script> section")
+
+    ordered_nodes = []
+    source_map = []
+    keys = set()
+    for physical_ordinal, node in enumerate(script, 1):
+        if node.tag is ET.Comment:
+            source_map.append({"physical_ordinal": physical_ordinal, "comment": node.text})
+            continue
+        try:
+            key = int(node.tag[4:])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid OEM XML numeric source key '{node.tag}'") from exc
+        if key in keys:
+            raise ValueError(f"Duplicate OEM XML source key {key}")
+        keys.add(key)
+        ordered_nodes.append((key, node))
+        source_map.append({"physical_ordinal": physical_ordinal, "source_key": key, "tag": node.tag, "attributes": dict(node.attrib), "text": node.text})
+    ordered_nodes.sort(key=lambda entry: entry[0])
 
     experiment = _experiment_metadata(root)
     inventory = _inventory_metadata(root)
@@ -604,23 +625,7 @@ def import_oem_xml_protocol(path: str | Path) -> ImportedOemProtocol:
         if current_stage_unsupported:
             stage_metadata["unsupported_commands"] = list(current_stage_unsupported)
             stage_metadata["unsupported_command_count"] = len(current_stage_unsupported)
-        if not current_actions and current_stage_unsupported:
-            current_actions = [
-                ProtocolAction(
-                    action_id=f"{current_stage_id}-unsupported-summary",
-                    stage_id=current_stage_id,
-                    kind=ProtocolActionKind.NOTE,
-                    params={"unsupported_command_count": len(current_stage_unsupported)},
-                    description="Stage contains unsupported OEM commands that require manual translation",
-                    review_required=True,
-                    pause_message="Manual review required: unsupported OEM commands present in stage",
-                    metadata={
-                        "source": "oem_xml_unsupported_stage",
-                        "unsupported_commands": list(current_stage_unsupported),
-                    },
-                )
-            ]
-        if current_actions:
+        if current_stage_id is not None:
             stages.append(
                 ProtocolStage(
                     stage_id=current_stage_id,
@@ -636,7 +641,7 @@ def import_oem_xml_protocol(path: str | Path) -> ImportedOemProtocol:
         current_stage_unsupported = []
         current_step_value = None
 
-    for script_position, node in enumerate(list(script), start=1):
+    for script_position, (_source_key, node) in enumerate(ordered_nodes, start=1):
         step_value = node.attrib.get("step")
         if step_value is not None:
             step_markers_total += 1
@@ -716,6 +721,10 @@ def import_oem_xml_protocol(path: str | Path) -> ImportedOemProtocol:
         stages=tuple(stages),
         metadata={
             "source_type": "oem_xml",
+            "input_mode": "oem_xml",
+            "requires_generator_expansion": True,
+            "source_sha256": sha256(source_bytes).hexdigest(),
+            "source_map": source_map,
             "source_file": source_path.name,
             "source_path": str(source_path),
             "experiment": experiment,
@@ -724,7 +733,7 @@ def import_oem_xml_protocol(path: str | Path) -> ImportedOemProtocol:
         },
     )
     return ImportedOemProtocol(
-        document=document,
+        document=validate_protocol_document(document),
         coverage=coverage,
         source_path=str(source_path),
         experiment=experiment,

@@ -11,6 +11,46 @@ import time
 import uuid
 import fcntl
 from contextlib import contextmanager
+from contextvars import ContextVar
+
+# Set only by the canonical dispatcher; public payloads never confer lineage.
+_WORKFLOW_CONTEXT: ContextVar[Any] = ContextVar("bioxp_workflow_context", default=None)
+
+
+def workflow_claim_context() -> dict[str, Any] | None:
+    context = _WORKFLOW_CONTEXT.get()
+    if context is None:
+        return None
+    store, binding = context
+    with store._lock:
+        row = store._workflow_current(store.connection, binding["parent_command_id"])
+        captured = json.loads(row["requested_json"])
+        if (row["dispatch_attempt_id"] != binding["parent_attempt"]
+                or row["dispatcher_epoch"] != binding["dispatcher_epoch"]
+                or captured["plan_fingerprint"] != binding["plan_fingerprint"]
+                or not binding["source_occurrence_id"]):
+            raise ValueError("workflow_binding_changed")
+    return dict(binding)
+
+
+def _normal_claim_eligibility(connection, *, binding, resources, command_id=None):
+    lane = connection.execute("SELECT workflow_command_id FROM operator_plane_lane WHERE singleton=1").fetchone()
+    active = lane[0] if lane else None
+    if active and (not binding or binding["parent_command_id"] != active):
+        raise ValueError("workflow_busy")
+    if binding and active != binding["parent_command_id"]:
+        raise ValueError("workflow_parent_not_active")
+    for resource in resources:
+        busy = connection.execute(
+            "SELECT 1 FROM serial206_command_resources r JOIN operator_commands c USING(command_id) "
+            "LEFT JOIN serial206_movement_commands m USING(command_id) "
+            "WHERE r.resource_key=? AND c.command_id<>? "
+            "AND COALESCE(m.state,c.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') LIMIT 1",
+            (resource, command_id or ""),
+        ).fetchone()
+        if busy:
+            raise ValueError("normal_resource_busy")
+
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -1303,6 +1343,10 @@ def verify_runtime_audit_foundation(connection: sqlite3.Connection) -> None:
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 10:
             from .oem_pipette_schema_v10 import apply
             apply(expected)
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 11:
+            from .oem_runtime_store import _WORKFLOW_DDL
+            for statement in _WORKFLOW_DDL[1:4]:
+                expected.execute(statement)
         expected_manifest = _foundation_schema_manifest(expected)
     finally:
         expected.close()
@@ -1561,6 +1605,8 @@ class RuntimeAuditDatabase:
                 check_same_thread=False,
             )
             configure_connection(self.connection)
+            self._claim_resource_write = False
+            self.connection.create_function("authority_write_allowed", 0, lambda: int(self._claim_resource_write))
             if initialize_schema:
                 raise RuntimeAuditStoreError(
                     "constructor-owned migration is retired; call the explicit canonical migration utility"
@@ -1623,6 +1669,18 @@ class RuntimeAuditDatabase:
         missing = [name for name in required if not str(payload.get(name, "")).strip() and name != "ownership_generation"]
         if missing:
             raise ValueError(f"runtime claim missing fields: {missing}")
+        binding = workflow_claim_context()
+        payload = dict(payload)
+        requested = dict(payload.get("requested_inputs") or {})
+        if "workflow_binding" in requested and requested["workflow_binding"] != binding:
+            raise ValueError("untrusted workflow binding")
+        if binding:
+            requested["workflow_binding"] = binding
+            payload["requested_inputs"] = requested
+        resources = tuple(payload.get("resources") or (("pipette",) if pipette else ()))
+        normal_mutation = str(payload.get("control_class")) not in {
+            "hardware_query", "read_only", "safety_interrupt", "physical_interrupt", "host_control"
+        }
         digest = request_digest(payload)
         command_id = str(payload["command_id"])
         idempotency_key = str(payload["idempotency_key"])
@@ -1727,6 +1785,8 @@ class RuntimeAuditDatabase:
                 self._commit_write(owns_transaction)
                 return projection, False
 
+            if normal_mutation:
+                _normal_claim_eligibility(connection, binding=workflow_claim_context(), resources=resources, command_id=command_id)
             receipt_json = canonical_json(
                 {
                     "command_id": command_id,
@@ -1753,8 +1813,8 @@ class RuntimeAuditDatabase:
                     command_id,idempotency_key,canonical_request_sha256,operation,command_kind,entrypoint_id,
                     caller_class,control_class,idempotency_replay_enabled,action_id,status,
                     safety_class,ownership_generation,connection_generation,source_identity_json,requested_inputs_json,
-                    effective_inputs_json,started_at,receipt_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    effective_inputs_json,started_at,receipt_json,updated_at,parent_command_id
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     command_id,
@@ -1777,8 +1837,15 @@ class RuntimeAuditDatabase:
                     started_at,
                     receipt_json,
                     now,
+                    binding["parent_command_id"] if binding else None,
                 ),
             )
+            self._claim_resource_write = True
+            try:
+                connection.executemany("INSERT INTO serial206_command_resources(command_id,resource_key) VALUES(?,?)",
+                    [(command_id, resource) for resource in resources] if normal_mutation else [])
+            finally:
+                self._claim_resource_write = False
             connection.execute(
                 "INSERT INTO operator_transitions(command_id,state,observed_at,detail_json) VALUES(?,?,?,?)",
                 (command_id, "reserved", now, canonical_json({"claim_digest": digest})),

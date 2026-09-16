@@ -23,8 +23,8 @@ class OEMRuntimeEventRouter:
             if door_closed and latch_closed:
                 actions.extend([
                     "door_close_observed_while_paused",
-                    "full_oem_wakefrompause_not_implemented",
-                    "use_explicit_z_resume_after_abort_for_z_recovery_only",
+                    "canonical_workflow_target_required",
+                    "use_job_targeted_wake_then_separate_continue",
                 ])
             else:
                 actions.append("operator_close_door_required")
@@ -45,9 +45,9 @@ class OEMRuntimeEventRouter:
         return {"ok": True, "event": row, "actions_taken": actions, "queued": queued, "lifecycle": lifecycle}
 
     def handle_pause(self, *, source: str = "api") -> dict[str, Any]:
-        lifecycle = lifecycle_state.transition("paused", reason=f"pause:{source}")
-        row = self.store.append_event(OEMRuntimeEvent(event_type="pause", source=source, actions_taken=["user_paused=true"]).to_dict())
-        return {"ok": True, "event": row, "runtime_state": lifecycle["operation_state"], "lifecycle": lifecycle}
+        lifecycle = lifecycle_state.projection()
+        return {"ok": False, "queued": False, "error": "job_target_required",
+                "replacement": "/protocol/jobs/{job_id}/control", "lifecycle": lifecycle}
 
     def handle_resume(
         self,
@@ -58,8 +58,8 @@ class OEMRuntimeEventRouter:
     ) -> dict[str, Any]:
         lifecycle = lifecycle_state.projection()
         actions = [
-            "full_oem_wakefrompause_not_implemented",
-            "use_explicit_z_resume_after_abort_for_z_recovery_only",
+            "canonical_workflow_target_required",
+            "use_job_targeted_wake_then_separate_continue",
         ]
         row = self.store.append_event(
             OEMRuntimeEvent(event_type="resume", source=source, actions_taken=actions).to_dict()
@@ -68,8 +68,8 @@ class OEMRuntimeEventRouter:
             "ok": False,
             "event": row,
             "queued": False,
-            "blockers": ["full_oem_wakefrompause_not_implemented"],
-            "replacement_z_action": "/motion/oem/z/resume_after_abort",
+            "blockers": ["canonical_workflow_target_required"],
+            "replacement": "/protocol/jobs/{job_id}/control",
             "runtime_state": lifecycle["operation_state"],
             "lifecycle": lifecycle,
         }

@@ -132,6 +132,8 @@ def _build_live_execution_contract(
     payload: Mapping[str, Any],
     compiled: CompiledProtocolSource,
     handlers: Mapping[ProtocolActionKind | str, ActionHandler] | None,
+    oem_handlers: Mapping[str, ActionHandler] | None = None,
+    validate: bool = True,
 ) -> dict[str, Any]:
     live_payload = _as_mapping(payload.get("live_execution") or payload.get("live_contract"))
 
@@ -188,6 +190,9 @@ def _build_live_execution_contract(
             action.kind.value
             for action in actions
             if action.kind not in handler_kinds
+            and action.kind not in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW}
+            and not (action.kind is ProtocolActionKind.OEM_OPERATION and
+                     action.oem_opcode in ({"step", "delaypoint", "wait"} | set(oem_handlers or {})))
         }
     )
     reference_axes_verified = _reference_axes_from_snapshot(reference_snapshot)
@@ -211,7 +216,7 @@ def _build_live_execution_contract(
     if reference_required_action_kinds and not reference_snapshot:
         missing_contract_fields.append("preflight.reference_snapshot")
 
-    if missing_contract_fields or missing_reference_axes or missing_live_handlers:
+    if validate and (missing_contract_fields or missing_reference_axes or missing_live_handlers):
         raise ProtocolLiveContractError(
             "Live protocol execution requires an explicit operator contract, verified preflight, artifacts, and registered hardware handlers.",
             details={
@@ -229,8 +234,8 @@ def _build_live_execution_contract(
         "mode": "live",
         "created_at": _utc_now_iso(),
         "operator_id": operator_id,
-        "live_execution_ack": True,
-        "physical_console_verified": True,
+        "live_execution_ack": live_ack,
+        "physical_console_verified": physical_console_verified,
         "protocol_id": compiled.document.protocol_id,
         "source_type": compiled.source_type,
         "action_count": len(actions),
@@ -256,6 +261,14 @@ def _utc_now_iso() -> str:
 
 
 def _job_status_from_state(state: ProtocolRuntimeState) -> str:
+    if state.workflow is not None:
+        if state.workflow.phase == "queued":
+            return "queued"
+        if state.workflow.phase == "reconciling":
+            return "ambiguous"
+        if state.workflow.phase != "terminal":
+            requested = state.workflow.requested_control or {}
+            return "interrupting" if requested.get("action") in {"safe_stop", "abort"} else "dispatched"
     if state.completed:
         return "completed"
     if any(stage.status is StageExecutionStatus.FAILED for stage in state.stage_states.values()):
@@ -270,7 +283,10 @@ def _pending_review_payload(state: ProtocolRuntimeState) -> dict[str, Any] | Non
         return None
     action_id = None
     if state.current_stage_id and state.current_stage_id in state.stage_states:
-        action_id = state.stage_states[state.current_stage_id].pause_marker_action_id
+        stage = state.stage_states[state.current_stage_id]
+        action_id = stage.pause_marker_action_id
+        if state.workflow is not None and state.workflow.gate == "review":
+            action_id = None if state.workflow.gate_id == state.current_stage_id else stage.current_action_id
     return {
         "stage_id": state.current_stage_id,
         "action_id": action_id,
@@ -360,13 +376,6 @@ class ProtocolOperatorBundleStore:
                 os.close(directory_fd)
         finally:
             temporary_path.unlink(missing_ok=True)
-
-    def save_live_reservation(self, reservation: Mapping[str, Any]) -> dict[str, Any]:
-        payload = dict(reservation)
-        job_id = str(payload["job_id"])
-        path = self._reservation_path(job_id)
-        self._save_json_atomically(path, payload)
-        return payload
 
     def save(self, bundle: Mapping[str, Any]) -> dict[str, Any]:
         job_id = str(bundle["job_id"])
@@ -523,104 +532,116 @@ def _idempotency_recovery_error(job_id: str, message: str) -> ProtocolLiveContra
     )
 
 
-def _validate_terminal_live_replay(
-    *,
-    job_id: str,
-    key_digest: str,
-    request_fingerprint: str,
-    reservation: Mapping[str, Any],
-    bundle: Any,
-) -> dict[str, Any]:
-    if (
-        reservation.get("schema_version") != PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION
-        or reservation.get("job_id") != job_id
-        or reservation.get("idempotency_key_digest") != key_digest
-        or not isinstance(reservation.get("request_fingerprint"), str)
-    ):
-        raise _idempotency_recovery_error(
-            job_id,
-            "The live protocol idempotency reservation is invalid; operator recovery is required.",
+def _workflow_resources(document: ProtocolDocument) -> list[str]:
+    # OEM lifecycle includes future Park/door/pipette work, not only current leaf.
+    if document.metadata.get("input_mode") == "oem_prepared":
+        return ["axis:x", "axis:y", "axis:z", "axis:g", "axis:door",
+                "motor:4:0", "motor:4:1", "motor:5:0", "pipette", "thermal"]
+    resources: set[str] = set()
+    for action in _iter_document_actions(document):
+        if action.kind in REFERENCE_REQUIRED_ACTION_KINDS or action.kind is ProtocolActionKind.THERMAL_DOOR:
+            resources.update(("axis:x", "axis:y", "axis:z", "axis:g", "axis:door",
+                              "motor:4:0", "motor:4:1", "motor:5:0"))
+        if action.kind.value.startswith("pipette") or action.kind is ProtocolActionKind.TIP_EJECT:
+            resources.add("pipette")
+        if action.kind.value.startswith("thermal"):
+            resources.add("thermal")
+    return sorted(resources)
+
+
+def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=None) -> None:
+    """Register on the existing dispatch owner; no service worker or active registry."""
+    def dispatch(command):
+        job_id = command["command_id"]
+        bundle = command["requested_inputs"]["bundle"]
+        document = ProtocolDocument.from_payload(bundle["protocol"]["document"])
+        executor = None
+        handlers, oem_handlers, lifecycle_handlers = binding_factory(bundle, source_executor=lambda: executor)
+        state = ProtocolRuntimeState.from_payload(bundle["execution"]["runtime_state"])
+        reviews = list(bundle["operator"]["reviews"])
+
+        def publish(current):
+            bundle["execution"]["runtime_state"] = current.to_payload()
+            bundle["status"] = _job_status_from_state(current)
+            bundle["updated_at"] = _utc_now_iso()
+            bundle["operator"].update(manual_review_required=current.awaiting_review,
+                                       pending_review=_pending_review_payload(current), reviews=reviews)
+            canonical = command_store.publish_workflow(job_id, payload=bundle)
+            current.workflow.child_command_ids[:] = canonical["execution"]["runtime_state"]["workflow"]["child_command_ids"]
+
+        def wrap_action(handler):
+            def invoke(action, current):
+                identity = action.source_occurrence_id or action.action_id
+                with command_store.workflow_context(job_id, source_occurrence_id=identity):
+                    command_store.assert_workflow_current(job_id)
+                    return handler(action, current)
+            return invoke
+
+        def wrap_lifecycle(name, handler):
+            def invoke(current):
+                with command_store.workflow_context(job_id, source_occurrence_id=f"lifecycle:{name}"):
+                    command_store.assert_workflow_current(job_id)
+                    return handler(current)
+            return invoke
+
+        executor = ProtocolExecutor(
+            dry_run=False, job_id=job_id,
+            handlers={key: wrap_action(handler) for key, handler in handlers.items()},
+            oem_handlers={key: wrap_action(handler) for key, handler in oem_handlers.items()},
+            lifecycle_handlers={key: wrap_lifecycle(key, handler) for key, handler in lifecycle_handlers.items()},
+            on_state_change=publish,
+            before_native_entry=lambda identity, current: command_store.assert_workflow_current(job_id),
         )
-    if not isinstance(bundle, Mapping):
-        raise _idempotency_recovery_error(
-            job_id,
-            "The live protocol operator bundle is invalid; operator recovery is required.",
-        )
-    execution = bundle.get("execution")
-    if not isinstance(execution, Mapping):
-        raise _idempotency_recovery_error(
-            job_id,
-            "The live protocol operator bundle execution record is invalid; operator recovery is required.",
-        )
-    runtime_state = execution.get("runtime_state")
-    live_contract = execution.get("live_contract")
-    binding = execution.get("idempotency_binding")
-    protocol = bundle.get("protocol")
-    protocol_document = protocol.get("document") if isinstance(protocol, Mapping) else None
-    stage_states = runtime_state.get("stage_states") if isinstance(runtime_state, Mapping) else None
-    action_results = runtime_state.get("action_results") if isinstance(runtime_state, Mapping) else None
-    failed_stage_ids = {
-        str(stage_id)
-        for stage_id, stage_state in stage_states.items()
-        if isinstance(stage_state, Mapping) and stage_state.get("status") == "failed"
-    } if isinstance(stage_states, Mapping) else set()
-    has_failed_action_result = (
-        isinstance(action_results, list)
-        and any(
-            isinstance(result, Mapping)
-            and result.get("stage_id") in failed_stage_ids
-            and result.get("ok") is not True
-            for result in action_results
-        )
-    )
-    completed_terminal = (
-        bundle.get("status") == "completed"
-        and isinstance(runtime_state, Mapping)
-        and runtime_state.get("completed") is True
-    )
-    failed_terminal = (
-        bundle.get("status") == "failed"
-        and isinstance(runtime_state, Mapping)
-        and runtime_state.get("completed") is False
-        and runtime_state.get("paused") is False
-        and runtime_state.get("awaiting_review") is False
-        and bool(failed_stage_ids)
-        and has_failed_action_result
-    )
-    if (
-        bundle.get("schema_version") != PROTOCOL_OPERATOR_BUNDLE_SCHEMA_VERSION
-        or bundle.get("job_id") != job_id
-        or not (completed_terminal or failed_terminal)
-        or execution.get("dry_run") is not False
-        or not isinstance(runtime_state, Mapping)
-        or runtime_state.get("job_id") != job_id
-        or runtime_state.get("dry_run") is not False
-        or not isinstance(protocol, Mapping)
-        or not isinstance(protocol_document, Mapping)
-        or runtime_state.get("protocol_id") != protocol_document.get("protocol_id")
-        or not isinstance(live_contract, Mapping)
-        or not isinstance(binding, Mapping)
-    ):
-        raise _idempotency_recovery_error(
-            job_id,
-            "The live protocol operator bundle is not a terminal bound execution; operator recovery is required.",
-        )
-    persisted_fingerprint = _request_fingerprint(protocol, live_contract)
-    if (
-        binding.get("idempotency_key_digest") != key_digest
-        or binding.get("request_fingerprint") != persisted_fingerprint
-        or reservation.get("request_fingerprint") != persisted_fingerprint
-    ):
-        raise _idempotency_recovery_error(
-            job_id,
-            "The live protocol replay artifacts do not share one request binding; operator recovery is required.",
-        )
-    if request_fingerprint != persisted_fingerprint:
-        raise ProtocolLiveContractError(
-            "The live protocol idempotency key is already bound to different execution intent.",
-            details={"idempotency_conflict": True, "job_id": job_id},
-        )
-    return dict(bundle)
+
+        def control(control_id, request):
+            if request["action"] == "_addressed_stop":
+                executor.interrupt(control_id=control_id, affected=True)
+            elif request["action"] == "review":
+                pending = _pending_review_payload(state)
+                if not pending or pending["stage_id"] != request.get("stage_id") or pending["action_id"] != request.get("action_id"):
+                    raise ProtocolLiveContractError("Review occurrence is not current.")
+                executor.acknowledge_review(control_id=control_id, gate_id=state.workflow.gate_id)
+                reviews.append({"reviewed_at": _utc_now_iso(), "reviewer": request["reviewer"],
+                                "note": request.get("note"), "stage_id": request["stage_id"],
+                                "action_id": request.get("action_id"), "control_command_id": control_id})
+            else:
+                executor.request_control(request["action"], control_id=control_id,
+                                         **{key: request[key] for key in ("mode", "gate", "gate_id") if key in request})
+            return state.workflow.to_payload()
+
+        command_store.bind_workflow_controls(job_id, control)
+        try:
+            executor.execute(document, state=state)
+            publish(state)
+            bundle["status"] = executor.outcome
+            bundle = command_store.finish_workflow(
+                job_id, status=executor.outcome, payload=bundle,
+                lifecycle_settled=state.workflow.phase == "terminal",
+            )
+            state.workflow.child_command_ids[:] = bundle["execution"]["runtime_state"]["workflow"]["child_command_ids"]
+            try:
+                (artifact_store or ProtocolOperatorBundleStore()).save(bundle)
+            except Exception:
+                # Canonical SQLite custody is already settled; an artifact-copy
+                # failure does not undo or retry native execution.
+                pass
+        finally:
+            command_store.unbind_workflow_controls(job_id)
+    command_store.bind_workflow_dispatcher(dispatch)
+
+
+def control_protocol_job(job_id: str, request: Mapping[str, Any], *, command_store) -> dict[str, Any]:
+    variants = {"pause": {"mode"}, "wake": {"gate_id"}, "continue": {"gate", "gate_id"},
+                "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id"}}
+    action = request.get("action")
+    common = {"action", "idempotency_key", "command_id", "expected_ownership_generation"}
+    if action not in variants or set(request) - (common | variants[action]):
+        raise ProtocolLiveContractError("Invalid finite workflow control.")
+    if type(request.get("expected_ownership_generation")) is not int or not isinstance(request.get("idempotency_key"), str) or not request["idempotency_key"].strip():
+        raise ProtocolLiveContractError("Control requires canonical generation and idempotency key.")
+    if request.get("command_id") != job_id:
+        raise ProtocolLiveContractError("Control target does not match URL job.", details={"target_mismatch": True})
+    return command_store.control_workflow(job_id, request=dict(request))
 
 
 def create_protocol_job(
@@ -629,14 +650,25 @@ def create_protocol_job(
     dry_run: bool = True,
     store: ProtocolOperatorBundleStore | None = None,
     handlers: Mapping[ProtocolActionKind | str, ActionHandler] | None = None,
+    oem_handlers: Mapping[str, ActionHandler] | None = None,
+    lifecycle_handlers: Mapping[str, Callable] | None = None,
+    command_store=None,
+    ownership_generation: int | None = None,
+    board_epochs: Mapping[str, int] | None = None,
+    binding_factory=None,
+    authority_factory=None,
 ) -> dict[str, Any]:
     compiled = compile_protocol_source(payload)
     live_contract = None
     if not dry_run:
-        live_contract = _build_live_execution_contract(payload=payload, compiled=compiled, handlers=handlers)
+        if command_store is None:
+            raise ProtocolLiveContractError("Canonical workflow custody is unavailable.", details={"reconciliation_required": True})
+        live_contract = _build_live_execution_contract(
+            payload=payload, compiled=compiled, handlers=handlers, oem_handlers=oem_handlers, validate=False,
+        )
     created_at = _utc_now_iso()
-    active_store = store or ProtocolOperatorBundleStore()
     if dry_run:
+        active_store = store or ProtocolOperatorBundleStore()
         job_id = f"protocol-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
         state = ProtocolExecutor(dry_run=True, job_id=job_id, handlers=handlers).execute(compiled.document)
         bundle = _build_operator_bundle(
@@ -664,57 +696,84 @@ def create_protocol_job(
     job_id = f"protocol-live-{key_digest}"
     request_fingerprint = _request_fingerprint(compiled.to_payload(), dict(live_contract or {}))
 
-    with active_store.live_creation_lock(job_id):
-        reservation = active_store.load_live_reservation(job_id)
-        if reservation is not None:
-            try:
-                replay_bundle = active_store.load(job_id)
-            except Exception as exc:
-                raise _idempotency_recovery_error(
-                    job_id,
-                    "A matching live protocol execution is reserved but its bundle is unreadable or incomplete; operator recovery is required.",
-                ) from exc
-            return _validate_terminal_live_replay(
-                job_id=job_id,
-                key_digest=key_digest,
-                request_fingerprint=request_fingerprint,
-                reservation=reservation,
-                bundle=replay_bundle,
-            )
+    retained = command_store.get_workflow(job_id)
+    if retained is not None:
+        binding = retained["execution"]["idempotency_binding"]
+        if binding["request_fingerprint"] != request_fingerprint:
+            raise ProtocolLiveContractError("The idempotency key is bound to different execution intent.",
+                                            details={"idempotency_conflict": True, "job_id": job_id})
+        return retained
+    if authority_factory is not None:
+        ownership_generation, board_epochs = authority_factory(compiled.document)
+    if binding_factory is not None:
+        handlers, oem_handlers, lifecycle_handlers = binding_factory({"protocol": compiled.to_payload()})
+    if ownership_generation is None:
+        raise ProtocolLiveContractError("Current canonical ownership is unavailable.")
+    _build_live_execution_contract(payload=payload, compiled=compiled, handlers=handlers, oem_handlers=oem_handlers)
+    executor = ProtocolExecutor(dry_run=False, handlers=handlers, oem_handlers=oem_handlers,
+                                lifecycle_handlers=lifecycle_handlers,
+                                before_native_entry=lambda identity, state: command_store.assert_workflow_current(state.job_id))
+    support = executor.preflight(compiled.document)
+    if support["ok"] is not True:
+        raise ProtocolLiveContractError("Selected source dependencies are unbound.", details={"support": support})
+    from ..protocols.validators import validate_protocol_support
+    validate_protocol_support(compiled.document, handlers=handlers or {}, oem_handlers=oem_handlers or {},
+                              lifecycle_handlers=lifecycle_handlers or {},
+                              required_lifecycle=executor.required_lifecycle(compiled.document))
+    if "epilogue_sweep" in executor.required_lifecycle(compiled.document):
+        # Source sweep indexes four captured 96-well tip trays. Reject incomplete
+        # preparation before native entry; never manufacture empty inventory.
+        from ..protocols.runtime_state import ProtocolSourceModel
+        model = ProtocolSourceModel.from_payload(compiled.document.to_payload()["metadata"].get("source_model", {}))
+        trays_needed = 5 if any(
+            action.oem_opcode == "ldtip" and len(action.params["arguments"]) > 3
+            and action.params["arguments"][3] == "H"
+            for action in _iter_document_actions(compiled.document)
+        ) else 4
+        if len(model.tip_trays) < trays_needed or any(len(tray.wells) < 96 for tray in model.tip_trays[:trays_needed]):
+            raise ProtocolLiveContractError("Prepared source model lacks required captured tip-tray wells.")
+    # Historical file custody is not permission to reissue under the new owner.
+    active_store = store or ProtocolOperatorBundleStore()
+    if active_store.load_live_reservation(job_id) is not None or active_store._bundle_path(job_id).exists():
+        raise _idempotency_recovery_error(job_id, "Historical live custody requires reconciliation; it cannot be replayed.")
+    from ..protocols.runtime_state import ProtocolWorkflowState, ProtocolSourceModel
+    state = ProtocolRuntimeState.from_document(compiled.document, job_id=job_id, dry_run=False)
+    if compiled.document.metadata.get("source_model") is not None:
+        state.source_model = ProtocolSourceModel.from_payload(compiled.document.to_payload()["metadata"]["source_model"])
+    state.workflow = ProtocolWorkflowState(command_id=job_id, phase="queued")
+    bundle = _build_operator_bundle(
+        job_id=job_id, compiled=compiled, state=state, dry_run=False,
+        created_at=created_at, live_contract=live_contract,
+        idempotency_binding={"idempotency_key_digest": key_digest, "request_fingerprint": request_fingerprint},
+    )
+    command_store.admit_workflow(
+        command_id=job_id, idempotency_key=idempotency_key, plan_fingerprint=request_fingerprint,
+        requested_inputs={"bundle": bundle, "plan_fingerprint": request_fingerprint},
+        ownership_generation=ownership_generation, resources=_workflow_resources(compiled.document),
+        board_epochs=dict(board_epochs or {}),
+    )
+    return command_store.get_workflow(job_id)
 
-        active_store.save_live_reservation(
-            {
-                "schema_version": PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION,
-                "job_id": job_id,
-                "idempotency_key_digest": key_digest,
-                "request_fingerprint": request_fingerprint,
-                "reserved_at": created_at,
-            }
-        )
-        state = ProtocolExecutor(dry_run=False, job_id=job_id, handlers=handlers).execute(compiled.document)
-        bundle = _build_operator_bundle(
-            job_id=job_id,
-            compiled=compiled,
-            state=state,
-            dry_run=False,
-            created_at=created_at,
-            live_contract=live_contract,
-        )
-        bundle["execution"]["idempotency_binding"] = {
-            "idempotency_key_digest": key_digest,
-            "request_fingerprint": request_fingerprint,
-        }
-        return active_store.save(bundle)
 
-
-def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None = None) -> dict[str, Any]:
+def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> dict[str, Any]:
+    if command_store is not None:
+        canonical = command_store.get_workflow(job_id)
+        if canonical is not None:
+            return canonical
     active_store = store or ProtocolOperatorBundleStore()
     return active_store.load(job_id)
 
 
-def list_protocol_jobs(*, limit: int = 20, store: ProtocolOperatorBundleStore | None = None) -> list[dict[str, Any]]:
-    active_store = store or ProtocolOperatorBundleStore()
-    return active_store.list(limit=limit)
+def list_protocol_jobs(*, limit: int = 20, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
+    canonical = command_store.list_workflows(limit=limit) if command_store is not None else []
+    seen = {row["job_id"] for row in canonical}
+    try:
+        historical = (store or ProtocolOperatorBundleStore()).list(limit=limit)
+    except OSError:
+        if not canonical:
+            raise
+        historical = []
+    return (canonical + [row for row in historical if row["job_id"] not in seen])[:limit]
 
 
 def _review_protocol_job_locked(
@@ -728,6 +787,8 @@ def _review_protocol_job_locked(
     loaded_bundle = active_store.load(job_id)
     bundle = _as_mapping(loaded_bundle)
     execution = _as_mapping(bundle.get("execution"))
+    if execution.get("dry_run") is False:
+        raise _idempotency_recovery_error(job_id, "Historical live review cannot reconstruct an executor; reconcile canonical custody.")
     operator = _as_mapping(bundle.get("operator"))
     protocol = _as_mapping(bundle.get("protocol"))
     runtime_state_payload = _as_mapping(execution.get("runtime_state"))
@@ -772,43 +833,6 @@ def _review_protocol_job_locked(
     if bundle.get("status") != "awaiting_review" or not state.awaiting_review:
         raise ValueError(f"Protocol job '{job_id}' is not awaiting review.")
 
-    if execution.get("dry_run") is False:
-        live_contract = execution.get("live_contract")
-        idempotency_binding = execution.get("idempotency_binding")
-        reservation = active_store.load_live_reservation(job_id)
-        if (
-            not isinstance(live_contract, Mapping)
-            or not isinstance(idempotency_binding, Mapping)
-            or not isinstance(reservation, Mapping)
-            or live_contract.get("schema_version")
-            != PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION
-            or reservation.get("schema_version")
-            != PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION
-            or reservation.get("job_id") != job_id
-        ):
-            raise _idempotency_recovery_error(
-                job_id,
-                "The live protocol review artifacts are incomplete; operator recovery is required.",
-            )
-        persisted_fingerprint = _request_fingerprint(protocol, live_contract)
-        key_digest = reservation.get("idempotency_key_digest")
-        if (
-            not isinstance(key_digest, str)
-            or len(key_digest) != 64
-            or any(character not in "0123456789abcdef" for character in key_digest)
-            or live_contract.get("protocol_id")
-            != _as_mapping(protocol.get("document")).get("protocol_id")
-            or idempotency_binding.get("idempotency_key_digest") != key_digest
-            or job_id != f"protocol-live-{key_digest}"
-            or reservation.get("request_fingerprint") != persisted_fingerprint
-            or idempotency_binding.get("request_fingerprint")
-            != persisted_fingerprint
-        ):
-            raise _idempotency_recovery_error(
-                job_id,
-                "The live protocol review bundle does not match its reserved request; operator recovery is required.",
-            )
-
     stage_id = state.current_stage_id
     if stage_id and stage_id in state.stage_states:
         stage_state = state.stage_states[stage_id]
@@ -841,34 +865,6 @@ def _review_protocol_job_locked(
         ) from exc
     dry_run = bool(execution.get("dry_run", True))
     idempotency_binding: Mapping[str, Any] | None = None
-    if not dry_run:
-        live_contract = _as_mapping(execution.get("live_contract"))
-        if live_contract.get("schema_version") != PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION:
-            raise ProtocolLiveContractError(
-                "Stored live protocol contract is unavailable or unsupported.",
-                details={"missing_contract_fields": ["execution.live_contract"]},
-            )
-        idempotency_binding = _as_mapping(
-            execution.get("idempotency_binding")
-        )
-        if not idempotency_binding:
-            raise ProtocolLiveContractError(
-                "Stored live protocol idempotency binding is unavailable.",
-                details={"missing_contract_fields": ["execution.idempotency_binding"]},
-            )
-        handler_kinds = _normalized_handler_kinds(handlers)
-        missing_live_handlers = sorted(
-            {
-                action.kind.value
-                for action in _iter_document_actions(compiled.document)
-                if action.kind not in handler_kinds
-            }
-        )
-        if missing_live_handlers:
-            raise ProtocolLiveContractError(
-                "Live protocol review requires the validated handler registry.",
-                details={"missing_live_handlers": missing_live_handlers},
-            )
     claim_id = uuid4().hex
     claimed_bundle = dict(bundle)
     claimed_bundle["status"] = "review_dispatching"
@@ -920,7 +916,14 @@ def review_protocol_job(
     note: str | None = None,
     store: ProtocolOperatorBundleStore | None = None,
     handlers: Mapping[Any, Any] | None = None,
+    command_store=None,
+    request: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if command_store is not None and command_store.get_workflow(job_id) is not None:
+        if request is None:
+            raise ProtocolLiveContractError("Live review requires canonical target, generation, key and occurrence.")
+        control_protocol_job(job_id, {**dict(request), "action": "review", "reviewer": reviewer, "note": note}, command_store=command_store)
+        return command_store.get_workflow(job_id)
     active_store = store or ProtocolOperatorBundleStore()
     with active_store.live_creation_lock(job_id):
         return _review_protocol_job_locked(
