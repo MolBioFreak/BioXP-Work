@@ -10782,7 +10782,9 @@ def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[st
         raise RuntimeError("workflow_initial_check_generation_unavailable")
     class WorkflowHardware(_LifecycleHardware):
         def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
-            return begin_generation(deactivation=deactivation, activation=activation)
+            # LifecycleHardware wraps the raw board ACK maps; the native
+            # generation owner validates those maps, not the wrapper status.
+            return begin_generation(deactivation=deactivation["acks"], activation=activation["acks"])
     provider = _serial206_oem_initialization_provider
     if provider is None:
         raise RuntimeError("workflow_initial_check_provider_unavailable")
