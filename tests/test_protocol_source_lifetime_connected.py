@@ -37,7 +37,7 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
     bindings = api._protocol_bindings({"protocol": {"document": payload["document"]}})
     assert callable(bindings.source_script_begin) and callable(bindings.source_script_returned)
     ordinary, native, lifecycle = bindings
-    assert "cleanup" not in lifecycle and "source_error" not in lifecycle and "script_finally" not in lifecycle
+    assert "cleanup" in lifecycle and "source_error" not in lifecycle and "script_finally" not in lifecycle
     assert "source_script_begin" not in lifecycle and "source_script_returned" not in native
     mount_protocol_routes(app)
     client = TestClient(app)

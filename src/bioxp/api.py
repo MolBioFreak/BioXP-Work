@@ -10924,9 +10924,9 @@ def _protocol_bindings(bundle, *, source_executor=None):
             home_gripper=lambda state: lifecycle_plan("home_gripper", state),
         )
         lifecycle["epilogue_sweep"] = lambda state: lifecycle_pipette("epilogue_sweep", state)
-        # cleanup_pipette_prefix is NOT a complete cleanup hook. Cleanup itself
-        # is nonthermal, but its source-stop lifetime and full mechanical
-        # composition are not bound here; control callers retain deferred thermal work.
+        # Cleanup uses the complete canonical mechanical plan, after this
+        # attempt's source-return callback. Thermal-dependent control bodies
+        # remain absent; cleanup_pipette_prefix is not used as a substitute.
     if set(native).intersection(pipette):
         raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
     from .services.protocol_service import ProtocolBindings

@@ -71,7 +71,7 @@ def test_all_nonthermal_composites_bound_without_preflight_native_reads(rig):
     assert {"run_job", "script_prologue", "epilogue_sweep", "epilogue_park",
             "deferred_pause_enter", "ordinary_pause_prepare"} <= set(lifecycle)
     assert "sp" not in handlers and "splid" not in handlers
-    assert "wake" not in lifecycle and "cleanup" not in lifecycle
+    assert "wake" not in lifecycle and "cleanup" in lifecycle
     with pytest.raises(ValueError, match="lifecycle"):
         validate_protocol_support(doc, handlers=ordinary, oem_handlers=handlers,
             lifecycle_handlers=lifecycle, required_lifecycle=ProtocolExecutor.required_lifecycle(doc))

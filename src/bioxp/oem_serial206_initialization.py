@@ -5168,6 +5168,7 @@ class Serial206OemInitializationProvider:
             "clean_path": None if clean_path_not_applicable else semantic["clean_path"],
             "required_facts": tuple(branch_types),
             "plate_on_gantry": plate,
+            "movable_plate_locations": dict(semantic.get("movable_plate_locations") or {}),
             "pseudo_z_home": int(semantic["pseudo_z_home"]),
             "ownership_generation": int(semantic["ownership_generation"]),
             "board_epoch_4": int(semantic["board_epoch_4"]),
@@ -12173,7 +12174,18 @@ class Serial206OemInitializationProvider:
         def ordinary_prepare(state: Any) -> Any:
             return finite("ordinary_pause_prepare", "ordinary_pause_prepare", {}, state)
 
-        handlers = {"epilogue_park": park, "ordinary_pause_prepare": ordinary_prepare}
+        def cleanup(state: Any) -> Any:
+            parent = getattr(getattr(state, "workflow", None), "command_id", None)
+            # The initial set event is not an entered script's return. Only the
+            # paired host callbacks can qualify this attempt for cleanup.
+            with self._lock:
+                if (not parent or parent != getattr(self, "_wp8_source_script_owner", None)
+                        or not getattr(self, "_wp8_source_script_returned", False)):
+                    raise RuntimeError("cleanup_source_script_not_returned")
+            return finite("cleanup", "cleanup", {}, state)
+
+        handlers = {"epilogue_park": park, "ordinary_pause_prepare": ordinary_prepare,
+                    "cleanup": cleanup}
 
         if unlatch is not None:
             def deferred_enter(state: Any) -> Any:
