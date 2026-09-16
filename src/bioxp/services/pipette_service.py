@@ -289,18 +289,6 @@ async def _run_transport_call(
             f"pipette-callback:{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}",
         )
         binding = effective_runtime_binding
-        source_transport = get_transport()
-        source_identity_reader = getattr(source_transport, "collection_source_identity", None)
-        if callable(source_identity_reader):
-            collection_owner = source_identity_reader()
-            # Revisions change with setters, not the idempotent request identity.
-            binding["collection_owner"] = {**collection_owner, "channels": [
-                {k: row[k] for k in ("reader", "reader_generation")}
-                for row in collection_owner["channels"]]}
-            binding["collection_source_affecting"] = (
-                operation_key not in READ_ONLY_PIPETTE_OPERATIONS
-                or operation_key in {"tip_status", "query_tip_status", "query_all_pipette_tip_states",
-                                     "live_readback", "readback"})
         outer_command_id = dispatch_context.get("operator_command_id")
         # Lifecycle steps have their own keys; only direct pipette actions share the outer claim.
         if outer_command_id and binding.get("caller_class") == "lifecycle":
@@ -321,6 +309,22 @@ async def _run_transport_call(
                     "retry_forbidden": True,
                 },
             )
+        source_transport = get_transport()
+        source_identity_reader = getattr(source_transport, "prepare_collection_source_identity", None)
+        if not callable(source_identity_reader):
+            source_identity_reader = getattr(source_transport, "collection_source_identity", None)
+        if callable(source_identity_reader):
+            collection_owner = source_identity_reader()
+            if not isinstance(collection_owner, Mapping):
+                raise PipetteReceiptError("pipette_collection_owner_invalid")
+            # Revisions change with setters, not the idempotent request identity.
+            binding["collection_owner"] = {**collection_owner, "channels": [
+                {k: row[k] for k in ("reader", "reader_generation")}
+                for row in collection_owner["channels"]]}
+            binding["collection_source_affecting"] = (
+                operation_key not in READ_ONLY_PIPETTE_OPERATIONS
+                or operation_key in {"tip_status", "query_tip_status", "query_all_pipette_tip_states",
+                                     "live_readback", "readback"})
         claim_arguments: dict[str, Any] = dict(
                 operation=str(operation_name or label),
                 requested_inputs=requested_for_receipt,

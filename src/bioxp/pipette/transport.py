@@ -999,6 +999,17 @@ class FourPipetteTransport:
         # Only identity metadata may fence a SQLite read; never return a RAM predicate.
         return self.collection_source_snapshot()["identity"]
 
+    def prepare_collection_source_identity(self) -> dict[str, Any]:
+        """Bind the real lazy readers before an operation claims their identity.
+
+        Driver construction registers the existing CAN reader; it sends no
+        pipette command. Passive identity/snapshot reads remain nonconstructing.
+        """
+        with self._transaction_lock:
+            for transport in self._transports:
+                transport._get_driver()
+            return self.collection_source_identity()
+
     def _record_pipette_error(self, channel: int, error_code: int) -> None:
         self._last_error = {
             "channel": int(channel),
