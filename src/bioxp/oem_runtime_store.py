@@ -112,7 +112,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     8: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     9: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     10: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
-    11: "84349706004c22ee2a99c4b2cce1550f549f3ebd6f2a57f9d7ea3ee304046489",
+    11: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2525,7 +2525,7 @@ def _verify_operator_command_plane_schema_v1(connection: sqlite3.Connection) -> 
     }
     legacy_compatibility = (
         legacy_operator_command_plane_schema_sha256(connection)
-        == ("e51702a068cbc60899c91ac6d15365d7e291d64c8c48139d3e3e3f5aa449d623"
+        == ("fb9e7bc96102389ba34637c778ae522705535a712759ba8b486dfaaf5b3026f9"
             if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
             else LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256)
     )
@@ -2698,7 +2698,9 @@ _WORKFLOW_DDL = (
     "CREATE INDEX operator_commands_parent_idx ON operator_commands(parent_command_id)",
     "CREATE TRIGGER operator_commands_parent_immutable BEFORE UPDATE OF parent_command_id ON operator_commands "
     "WHEN OLD.parent_command_id IS NOT NEW.parent_command_id BEGIN SELECT RAISE(ABORT,'immutable workflow parent'); END",
-    "CREATE TABLE workflow_resource_migration (command_id TEXT NOT NULL REFERENCES operator_commands(command_id) ON DELETE CASCADE, "
+    # SQLite has no foreign key to a union. The membership/owner triggers below
+    # retain real legacy movement identities without inventing canonical claims.
+    "CREATE TABLE workflow_resource_migration (command_id TEXT NOT NULL, "
     "resource_key TEXT NOT NULL, PRIMARY KEY(command_id,resource_key)) WITHOUT ROWID",
     "INSERT INTO workflow_resource_migration SELECT command_id,resource_key FROM serial206_command_resources",
     "DROP TABLE serial206_command_resources",
@@ -2707,17 +2709,47 @@ _WORKFLOW_DDL = (
 )
 
 
+_WORKFLOW_RESOURCE_TRIGGER_DDL = (
+    "CREATE TRIGGER serial206_command_resources_membership_insert_v11 "
+    "BEFORE INSERT ON serial206_command_resources "
+    "WHEN NOT EXISTS(SELECT 1 FROM operator_commands WHERE command_id=NEW.command_id) "
+    "AND NOT EXISTS(SELECT 1 FROM serial206_movement_commands WHERE command_id=NEW.command_id) "
+    "BEGIN SELECT RAISE(ABORT,'command resource owner is missing'); END",
+    # Preserve FK-style deletion through the existing resource deletion guards,
+    # but keep membership when the other real owner still exists.
+    *(f"CREATE TRIGGER {table}_resource_owner_delete_v11 AFTER DELETE ON {table} "
+      "BEGIN DELETE FROM serial206_command_resources WHERE command_id=OLD.command_id "
+      "AND NOT EXISTS(SELECT 1 FROM operator_commands WHERE command_id=OLD.command_id) "
+      "AND NOT EXISTS(SELECT 1 FROM serial206_movement_commands WHERE command_id=OLD.command_id); END"
+      for table in ("operator_commands", "serial206_movement_commands")),
+    *(f"CREATE TRIGGER {table}_resource_owner_update_v11 BEFORE UPDATE OF command_id ON {table} "
+      "WHEN OLD.command_id IS NOT NEW.command_id "
+      "AND EXISTS(SELECT 1 FROM serial206_command_resources WHERE command_id=OLD.command_id) "
+      f"AND NOT EXISTS(SELECT 1 FROM {other} WHERE command_id=OLD.command_id) "
+      "BEGIN SELECT RAISE(ABORT,'command resource owner is missing'); END"
+      for table, other in (("operator_commands", "serial206_movement_commands"),
+                           ("serial206_movement_commands", "operator_commands"))),
+)
+
+
 def workflow_migration_identity() -> RuntimeMigrationIdentity:
     return RuntimeMigrationIdentity(version=WORKFLOW_SCHEMA_VERSION, name="protocol_workflow_custody_v11",
-        ddl_sha256=hashlib.sha256(("\n".join(_WORKFLOW_DDL) + inspect.getsource(_workflow_global_trigger_sources)).encode()).hexdigest())
+        ddl_sha256=hashlib.sha256(("\n".join(_WORKFLOW_DDL + _WORKFLOW_RESOURCE_TRIGGER_DDL)
+            + inspect.getsource(_workflow_global_trigger_sources)).encode()).hexdigest())
+
+
+def _verify_workflow_resource_membership(connection: sqlite3.Connection) -> None:
+    missing = connection.execute("SELECT r.command_id FROM serial206_command_resources r "
+        "LEFT JOIN operator_commands c USING(command_id) "
+        "LEFT JOIN serial206_movement_commands m USING(command_id) "
+        "WHERE c.command_id IS NULL AND m.command_id IS NULL LIMIT 1").fetchone()
+    if missing is not None:
+        raise RuntimeError("workflow resource membership has no movement or canonical owner")
 
 
 def _apply_workflow_schema(connection: sqlite3.Connection) -> None:
-    missing = connection.execute("SELECT r.command_id FROM serial206_command_resources r "
-        "LEFT JOIN operator_commands c USING(command_id) WHERE c.command_id IS NULL LIMIT 1").fetchone()
-    if missing is not None:
-        raise RuntimeError("workflow migration requires explicit disposition of missing canonical movement membership")
-    for statement in _WORKFLOW_DDL:
+    _verify_workflow_resource_membership(connection)
+    for statement in _WORKFLOW_DDL + _WORKFLOW_RESOURCE_TRIGGER_DDL:
         connection.execute(statement)
     for name, statement in _workflow_global_trigger_sources().items():
         if name.startswith("serial206_command_resources_") or name == "operator_plane_transitions_authorized_coherent_insert_v4":
@@ -3012,8 +3044,7 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         },
     }
     if connection.execute("PRAGMA user_version").fetchone()[0] >= WORKFLOW_SCHEMA_VERSION:
-        expected_fks["serial206_command_resources"] = {
-            ("command_id", "operator_commands", "command_id", "NO ACTION", "CASCADE", "NONE")}
+        expected_fks["serial206_command_resources"] = set()
     for table, expected in expected_fks.items():
         rows = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
         actual = {
@@ -3190,6 +3221,8 @@ def verify_canonical_runtime_database(
     _verify_report_identity_metadata_v1(connection)
     _verify_runtime_release_start(connection)
     if full_data_check:
+        if version >= WORKFLOW_SCHEMA_VERSION:
+            _verify_workflow_resource_membership(connection)
         _verify_operator_command_plane_schema_v1(connection)
         if version >= _deck_v9.VERSION:
             _deck_v9.verify(connection)
@@ -3220,7 +3253,7 @@ def verify_canonical_runtime_database(
         )
         legacy_compatibility = (
             legacy_operator_command_plane_schema_sha256(connection)
-            == ("e51702a068cbc60899c91ac6d15365d7e291d64c8c48139d3e3e3f5aa449d623"
+            == ("fb9e7bc96102389ba34637c778ae522705535a712759ba8b486dfaaf5b3026f9"
             if connection.execute("PRAGMA user_version").fetchone()[0] >= 11
             else LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256)
         )
