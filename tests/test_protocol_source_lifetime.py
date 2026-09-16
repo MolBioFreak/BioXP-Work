@@ -16,13 +16,9 @@ def provider():
 
 def connected(doc, p, *, overrides=None, handlers=None, publish=None, returned=None):
     old, trace = engine(doc, overrides=overrides, handlers=handlers, publish=publish)
-    executor = ProtocolExecutor(
-        dry_run=False, job_id="canonical-parent", lifecycle_handlers=old._lifecycle_handlers,
-        oem_handlers=handlers or {}, before_native_entry=lambda i, s: None,
-        on_state_change=publish,
-        source_script_begin=lambda s: p.wp8_source_script_begin(command_id=s.workflow.command_id),
-        source_script_returned=returned or (lambda s: p.wp8_source_script_returned(command_id=s.workflow.command_id)),
-    )
+    executor = old
+    executor._source_script_begin = lambda s: p.wp8_source_script_begin(command_id=s.workflow.command_id)
+    executor._source_script_returned = returned or (lambda s: p.wp8_source_script_returned(command_id=s.workflow.command_id))
     return executor, trace
 
 
@@ -89,7 +85,7 @@ def test_delayed_flattened_wrapper_blocks_signal_not_cancelled(boundary, diversi
     assert p._wp8_stop_event.is_set()
     assert "original-wrapper-child" in state.workflow.child_command_ids
     assert executor.outcome == ("interrupted" if diversion == "interrupt" else "ambiguous")
-    assert "cleanup" not in trace and "script_finally" not in trace
+    assert "cleanup" not in trace and trace.count("script_finally") == 1
 
 
 def test_returned_wrapper_signals_while_native_child_custody_remains():
@@ -148,7 +144,7 @@ def test_failed_return_notification_is_once_ambiguous_and_no_cleanup():
     assert calls == ["canonical-parent"]
     assert not state.completed and executor.outcome == "ambiguous"
     assert not p._wp8_stop_event.is_set()
-    assert "cleanup" not in trace and "script_finally" not in trace
+    assert "cleanup" not in trace and trace.count("script_finally") == 1
 
 
 def test_normal_begin_after_run_job_and_return_before_finally():
@@ -207,6 +203,7 @@ def test_behavioral_initial_event_is_cleared_at_actual_prologue_entry():
                   "source_script_returned": lambda s: p.wp8_source_script_returned(command_id=s.workflow.command_id)}
     executor = ProtocolExecutor(dry_run=False, job_id="parent", lifecycle_handlers=old._lifecycle_handlers,
         before_native_entry=lambda i, s: None, **kwargs)
+    executor._lifecycle_handlers["script_finally"] = executor.finalize_source_host
     assert executor.execute(doc).completed
     assert observations == [False], "construction-time signal is not source-return proof"
 

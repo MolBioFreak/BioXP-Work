@@ -37,9 +37,8 @@ def rig(monkeypatch):
             trace.append(("claim", self.occurrence, resources))
             yield "publication-child"
     store = Store()
-    provider = object.__new__(Provider)
     from bioxp.pipette.transport import FourPipetteTransport
-    provider.primitives = SimpleNamespace(pipette_transport=object.__new__(FourPipetteTransport))
+    provider = Provider(primitives=SimpleNamespace(pipette_transport=object.__new__(FourPipetteTransport)))
     provider.wp8_operation_machine_state = lambda operation, inputs: {}
     provider.sleep = lambda seconds: trace.append(("sleep", seconds))
     def execute(plan, action, state):
@@ -160,14 +159,16 @@ def test_api_eject_uses_same_executor_owned_tasks_with_source_identity(rig, monk
     doc = document("ejt", settings={"CheckSnapTips": False, "JobName": None})
     from bioxp.protocols.runtime_state import SourceTray, SourceWell
     state.source_model.tip_trays = [SourceTray(str(i), 7 + i, [SourceWell("Reuse", 0, 0, False) for _ in range(96)]) for i in range(4)]
-    ordinary, handlers, lifecycle = api._protocol_bindings({"protocol": {"document": doc.to_payload()}}, source_executor=lambda: executor)
+    bindings = api._protocol_bindings({"protocol": {"document": doc.to_payload()}}, source_executor=lambda: executor)
+    ordinary, handlers, lifecycle = bindings
     # Explicit missing thermal/lifecycle leaf doubles only for host orchestration.
     doubled = []
     for name in ProtocolExecutor.required_lifecycle(doc):
         if name not in lifecycle:
             lifecycle[name] = lambda runtime, name=name: doubled.append(name) or {"ok": True, "offline_leaf_double": name}
     executor = ProtocolExecutor(dry_run=False, job_id=state.job_id, handlers=ordinary, oem_handlers=handlers,
-        lifecycle_handlers=lifecycle, before_native_entry=lambda identity, runtime: trace.append(("entry", identity)))
+        lifecycle_handlers=lifecycle, before_native_entry=lambda identity, runtime: trace.append(("entry", identity)),
+        source_script_begin=bindings.source_script_begin, source_script_returned=bindings.source_script_returned)
     result = executor.execute(doc, state=state)
     import json
     assert executor.outcome == "completed", json.dumps(result.to_payload(), default=str)

@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from dataclasses import replace
 from threading import Event, Thread
 from time import monotonic
+from types import SimpleNamespace
+from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
 
 import pytest
 
@@ -27,10 +29,13 @@ def document(*opcodes, **metadata):
 
 def engine(doc, *, handlers=None, overrides=None, publish=None, entry=None):
     trace = []
+    provider = Serial206OemInitializationProvider(primitives=SimpleNamespace())
 
     def hook(name):
         def run(state):
             trace.append(name)
+            if name == "script_finally":
+                return executor.finalize_source_host(state)
             if name == "script_prologue":
                 state.source_model.logical_tip_present = False
                 state.source_model.carried_plate_present = False
@@ -44,6 +49,8 @@ def engine(doc, *, handlers=None, overrides=None, publish=None, entry=None):
         dry_run=False, job_id="canonical-parent", oem_handlers=handlers or {},
         lifecycle_handlers=hooks, before_native_entry=entry or (lambda identity, state: None),
         on_state_change=publish,
+        source_script_begin=lambda state: provider.wp8_source_script_begin(command_id=state.workflow.command_id),
+        source_script_returned=lambda state: provider.wp8_source_script_returned(command_id=state.workflow.command_id),
     )
     return executor, trace
 
@@ -402,7 +409,7 @@ def test_source_control_effect_not_stranded_behind_active_native_child(false_abo
     child = Future()
     entered = Event()
     executor, trace = engine(doc, handlers={"splid": lambda a, s: (entered.set() or child)})
-    hook_name = "abort_false" if false_abort else "source_error"
+    hook_name = "abort_false" if false_abort else "source_error_request"
 
     def control(state):
         trace.append(hook_name)
@@ -514,7 +521,7 @@ def test_stop_during_cleanup_preserves_entered_piece_without_finally_entry():
     child.set_result({"ok": True, "cleanup_piece": "returned"})
     state = finish(run)
     assert executor.outcome == "interrupted"
-    assert "script_finally" not in trace
+    assert trace.count("script_finally") == 1
     assert next(r for r in state.action_results if r.get("cleanup_piece"))["ok"] is True
 
 

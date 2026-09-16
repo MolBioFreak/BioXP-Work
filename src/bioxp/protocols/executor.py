@@ -32,8 +32,8 @@ ALL_DOMAINS = (*MOTION_DOMAINS, "TC")
 LIFECYCLE_HOOKS = frozenset({
     "prepare", "run_job", "script_prologue", "ordinary_pause_prepare",
     "ordinary_pause_restore", "deferred_pause_request", "deferred_pause_enter",
-    "wake", "safe_stop_exit", "abort_true_prefix", "abort_true_finish",
-    "abort_false", "source_error", "cleanup", "epilogue_sweep",
+    "wake", "safe_stop_request", "safe_stop_exit", "abort_true_prefix", "abort_true_finish",
+    "abort_false", "source_error_request", "source_error", "cleanup", "epilogue_sweep",
     "epilogue_lid", "epilogue_park", "script_finally",
 })
 
@@ -91,6 +91,10 @@ class ProtocolExecutor:
         self._source_entered = False
         self._source_return_notified = False
         self._source_returned = False
+        self._source_cancelled = False
+        self._source_stop_requested = False
+        self._source_host_finalized = False
+        self._source_workflow = None
         self._source_wrappers: list[Future] = []
         self._condition = Condition()
         self._state: ProtocolRuntimeState | None = None
@@ -108,6 +112,7 @@ class ProtocolExecutor:
         self._review_released = False
         self._hooks_done: set[str] = set()
         self._servicing = False
+        self._settling = False
         self._active = False
         self._oem = False
         self.outcome: str | None = None
@@ -268,7 +273,7 @@ class ProtocolExecutor:
         if not oem:
             return ()
         # Control/termination exits belong to the selected job even before a
-        # control is requested. Thermal-containing bindings remain deferred.
+        # control is requested. Physical leaves are supplied by the canonical factory.
         required = LIFECYCLE_HOOKS - {"prepare", "ordinary_pause_restore"}
         if document.metadata.get("oem_prepare") is True:
             required = required | {"prepare"}
@@ -278,6 +283,8 @@ class ProtocolExecutor:
         validate_protocol_document(document)
         required = self.required_lifecycle(document)
         missing = ["lifecycle:" + key for key in required if key not in self._lifecycle_handlers]
+        if required and not self.dry_run and self._source_script_begin is None:
+            missing.extend(("source_script_begin", "source_script_returned"))
         for stage in document.stages:
             for action in stage.actions:
                 if action.kind.value == "oem_operation":
@@ -344,7 +351,8 @@ class ProtocolExecutor:
                 raise ValueError("Workflow control has no eligible active owner")
             workflow = self._state.workflow
             if action == "pause":
-                if self._termination or workflow.gate or self._pause or mode not in {"ordinary", "deferred"}:
+                if (self._termination or (workflow.gate and not (workflow.gate == "delaypoint" and mode == "deferred"))
+                        or self._pause or mode not in {"ordinary", "deferred"}):
                     raise ValueError("Pause is not eligible")
                 if not self._oem:
                     raise ValueError("OEM pause requires OEM lifecycle")
@@ -410,7 +418,7 @@ class ProtocolExecutor:
     def source_error(self, *, false_abort: bool = False) -> None:
         with self._condition:
             self._failed = True
-            if self._termination not in {"source_error", "abort_false"}:
+            if false_abort or self._termination not in {"source_error", "abort_false"}:
                 self._termination = "abort_false" if false_abort else "source_error"
             self._condition.notify_all()
 
@@ -442,7 +450,40 @@ class ProtocolExecutor:
     def source_stopped(self) -> bool:
         """Existing source stop condition; not a new cancellation mechanism."""
         with self._condition:
-            return bool(self._termination or self._interrupted or self._unknown or self._recording_failed)
+            return bool(self._source_stop_requested or self._source_cancelled
+                        or self._interrupted or self._unknown or self._recording_failed)
+
+    def _validate_source_owner(self, state: ProtocolRuntimeState) -> None:
+        if (state is not self._state or not self._active or not self._source_entered
+                or state.workflow is not self._source_workflow
+                or state.workflow.command_id != self.job_id):
+            raise ValueError("Source callback has no matching active attempt")
+
+    def cancel_source(self, state: ProtocolRuntimeState) -> dict[str, Any]:
+        """Mechanical safe-exit token intent; never a native completion signal."""
+        with self._condition:
+            self._validate_source_owner(state)
+            if self._termination not in {"abort", "abort_false", "safe_stop", "source_error"}:
+                raise ValueError("Source cancellation has no selected active termination")
+            self._source_cancelled = True
+            self._source_stop_requested = True
+            self._condition.notify_all()
+            return {"ok": True, "source_stop_scripts": True}
+
+    def finalize_source_host(self, state: ProtocolRuntimeState) -> dict[str, Any]:
+        """Parent's script_finally binding: host gates only, no IO or signal."""
+        with self._condition:
+            self._validate_source_owner(state)
+            if not self._source_return_notified:
+                raise ValueError("Source host finalization precedes actual wrapper return")
+            self._source_host_finalized = True
+            self._pause = self._wake_control = self._release_gate = None
+            self._wake_complete = self._review_released = False
+            state.workflow.gate = state.workflow.gate_id = None
+            state.paused = state.awaiting_review = False
+            state.pause_reason = None
+            self._condition.notify_all()
+            return {"ok": True, "delivery_attempted": False, "source_script_finalized": True}
 
     def register_child(self, command_id: str) -> None:
         """Canonical owner calls at actual admission, preserving admission order."""
@@ -472,14 +513,28 @@ class ProtocolExecutor:
             child_result = {"kind": "owned_child", "parent_action_id": result.get("action_id"), "pending": True}
             self._state.action_results.append(child_result)
             self._retain(child, child_result)
-        if payload.get("source_error_hold"):
+        if payload.get("source_board_error_event") and self._source_entered:
+            self.source_error(false_abort=True)
+        elif payload.get("source_error_hold"):
             self._failed = True
             self._state.workflow.held_reason = "source_error_hold"
             self._state.workflow.source_occurrence_id = result.get("source_occurrence_id") or result.get("action_id")
         elif payload.get("source_error_event"):
             self.source_error()
-        if payload.get("source_stop_scripts") and self._termination is None:
-            self._termination = "safe_stop"
+        if payload.get("source_stop_scripts") is True:
+            self._source_stop_requested = True
+            if self._termination is None:
+                self._termination = "safe_stop"
+        if payload.get("source_unlock_completed") is True:
+            # Genuine successful unlatch can precede a failed LED. The provider
+            # owns door/latch publication; retain this host status without
+            # clearing tip/plate custody or making a failed parent successful.
+            self._source_stop_requested = True
+            self._pause = self._wake_control = self._release_gate = None
+            self._wake_complete = self._review_released = False
+            self._state.workflow.gate = self._state.workflow.gate_id = None
+            self._state.paused = self._state.awaiting_review = False
+            self._state.pause_reason = None
         if type(payload.get("source_allow_to_stop")) is bool:
             self._state.source_model.allow_to_stop = payload["source_allow_to_stop"]
         if payload.get("source_pause_scripts") and self._pause is None:
@@ -488,6 +543,7 @@ class ProtocolExecutor:
             self._unknown = True
         if payload.get("ok") is not True:
             self._failed = True
+        self._notify()
         self._publish()
 
     def _reap(self) -> None:
@@ -526,7 +582,7 @@ class ProtocolExecutor:
                 break
             with self._condition:
                 self._condition.wait(0.05)
-        if self._failed and not self._servicing:
+        if self._failed and not (self._servicing or self._settling):
             if self._state.workflow.held_reason == "source_error_hold" and not self._termination:
                 self._gate("error_hold", self._state.workflow.source_occurrence_id)
             raise _Diversion()
@@ -537,6 +593,10 @@ class ProtocolExecutor:
         if self._termination and name in {"prepare", "run_job", "script_prologue", "ordinary_pause_prepare", "deferred_pause_enter", "wake"}:
             raise _Diversion()
         self.wait_for_domains(domains)
+        if name == "source_error" and self._termination != "source_error":
+            raise _Diversion()
+        if name == "cleanup" and self._termination not in {"abort", "safe_stop"}:
+            raise _Diversion()
         self._entry("lifecycle:" + name)
         if once:
             self._hooks_done.add(name)  # Never retry a partially entered hook.
@@ -568,24 +628,74 @@ class ProtocolExecutor:
             raise _Diversion()
         return result
 
+    def _inline_hook(self, name: str, *, token: str, host: bool = False) -> dict[str, Any] | None:
+        if token in self._hooks_done:
+            return None
+        if not host:
+            self._entry("lifecycle:" + name)
+        self._hooks_done.add(token)  # entered, never success proof or retry permission
+        result = {"kind": "lifecycle", "action_id": "lifecycle:" + name, "hook": name}
+        self._state.action_results.append(result)
+        try:
+            value = self._lifecycle_handlers[name](self._state)
+        except Exception as exc:
+            value = {"ok": False, "error": "source_hook_failed", "error_type": type(exc).__name__}
+            if hasattr(exc, "oem_partial_results"):
+                value["oem_partial_results"] = exc.oem_partial_results
+            if isinstance(getattr(exc, "detail", None), Mapping):
+                value["detail"] = dict(exc.detail)
+        if isinstance(value, Future):
+            # Invalid finite callback, but an already-entered child still owns
+            # custody. Never cancel it or wait inline behind a saturated pool.
+            result.update(pending=True, hook_contract_error="finite_hook_returned_future")
+            self._retain(OwnedOperation(value, ()), result)
+            if self._source_entered and not self._source_return_notified:
+                self._source_wrappers.append(value)
+            self._unknown = True
+            self._notify()
+        else:
+            if isinstance(value, Mapping) and value.get("owned_children"):
+                value = {**value, "ok": False, "uncertain": True,
+                         "hook_contract_error": "finite_hook_returned_children"}
+            self._consume(value, result)
+        if host and result.get("ok") is not True:
+            self._unknown = True
+        if result.get("ok") is not True:
+            raise _Diversion()
+        return result
+
+    def _request_hook(self, name: str, *, token: str) -> dict[str, Any] | None:
+        result = self._inline_hook(name, token=token)
+        if result is not None and name in {"safe_stop_request", "abort_true_prefix", "abort_false", "source_error_request"}:
+            with self._condition:
+                # Accepted intent is not the source flag. Shutdown/request
+                # effects return first, then native stop consumers may unwind.
+                self._source_stop_requested = True
+                self._condition.notify_all()
+        return result
+
+    def _finalize_script_host(self) -> None:
+        if self._source_entered and self._source_return_notified:
+            self._inline_hook("script_finally", token="script_finally", host=True)
+
     def _service_requests(self) -> None:
         if self._servicing or self._interrupted or self._recording_failed or self._unknown:
             return
         self._servicing = True
         try:
-            if self._failed and self._termination in {"abort", "safe_stop"}:
+            if (self._source_entered and self._failed
+                    and (self._termination in {"abort", "safe_stop"}
+                         or (self._termination is None and self._state.workflow.held_reason != "source_error_hold"))):
                 self._termination = "source_error"
             if self._termination == "abort" and self._oem:
-                self._hook("abort_true_prefix", once=True)
+                self._request_hook("abort_true_prefix", token="abort_true_prefix")
             elif self._termination in {"abort_false", "source_error"} and self._oem:
-                # Source false Abort is an immediate control effect, not a
-                # setter queued behind the child it is intended to terminate.
-                self._hook(self._termination, once=True)
+                name = "source_error_request" if self._termination == "source_error" else "abort_false"
+                self._request_hook(name, token=name)
+            elif self._termination == "safe_stop" and self._oem:
+                self._request_hook("safe_stop_request", token="safe_stop_request")
             elif self._pause and self._pause[0] == "deferred" and not self._termination:
-                token = "deferred_request:" + self._pause[1]
-                if token not in self._hooks_done:
-                    self._hooks_done.add(token)
-                    self._hook("deferred_pause_request")
+                self._request_hook("deferred_pause_request", token="deferred_request:" + self._pause[1])
         finally:
             self._servicing = False
 
@@ -687,8 +797,11 @@ class ProtocolExecutor:
         # source work can still enter; there is no blanket interpreter mutex.
         with self._condition:
             while True:
-                if self._interrupted or self._termination or self._recording_failed:
+                if self._interrupted or self._source_stop_requested or self._recording_failed or self._unknown or self._source_cancelled:
                     reason = "interruption" if self._interrupted else "termination"
+                    break
+                if self._pause and self._pause[0] == "deferred":
+                    reason = "deferred_request"
                     break
                 if self._release_gate:
                     reason = "normal"
@@ -718,7 +831,7 @@ class ProtocolExecutor:
             while True:
                 if self._interrupted:
                     return {"ok": True, "host_exit": "interruption"}
-                if self._termination or self._recording_failed:
+                if self._source_stop_requested or self._recording_failed or self._unknown or self._source_cancelled:
                     return {"ok": True, "host_exit": "termination"}
                 if self._pause and self._pause[0] == "deferred":
                     return {"ok": True, "host_exit": "deferred_request"}
@@ -816,9 +929,10 @@ class ProtocolExecutor:
                     self._gate("error_hold", "lifecycle:run_job")
                     raise _Diversion()
                 if self._source_script_begin is not None:
-                    if self.source_stopped():
+                    if self._termination or self.source_stopped():
                         raise _Diversion()
                     self._source_lifetime_call(self._source_script_begin)
+                    self._source_workflow = state.workflow
                     self._source_entered = True
                 self._hook("script_prologue", once=True)
             self._publish("executing")
@@ -863,6 +977,11 @@ class ProtocolExecutor:
                 self._return_source()
             except _Diversion:
                 pass
+            finally:
+                try:
+                    self._finalize_script_host()
+                except _Diversion:
+                    pass
         # Final aggregation is deliberately AFTER the chosen lifecycle return.
         # Stop never cancels an entered Future or substitutes its own ACK.
         while self._owned:
@@ -930,6 +1049,10 @@ class ProtocolExecutor:
         # children handed back by them or started via start_child.
         while any(not future.done() for future in self._source_wrappers):
             self._reap()
+            try:
+                self._service_requests()
+            except _Diversion:
+                pass  # still drain every entered wrapper after request failure
             with self._condition:
                 self._condition.wait(0.05)
         self._reap()
@@ -937,43 +1060,58 @@ class ProtocolExecutor:
         self._source_lifetime_call(self._source_script_returned, returned=True)
         self._source_returned = True
 
+    def _hook_succeeded(self, name: str) -> bool:
+        return any(row.get("hook") == name and row.get("ok") is True
+                   and not row.get("pending") and not row.get("hook_contract_error")
+                   for row in self._state.action_results)
+
     def _finish_source(self) -> None:
-        if self._interrupted or self._unknown or self._recording_failed:
-            self._return_source()
+        if not self._oem or not self._source_entered:
             return
-        self._service_requests()
-        if not self._oem:
-            return
-        # Failed explicit source outcomes select source error, not false Abort.
         if self._failed and self._termination not in {"source_error", "abort_false"}:
             self._termination = "source_error"
-        self._servicing = True
-        try:
-            if self._termination in {"source_error", "abort_false"}:
-                self._publish("cleanup")
-                self._hook(self._termination, once=True)
-                self._return_source()
-            elif self._termination in {"abort", "safe_stop"}:
-                if not self._safe_boundary() and not (self._pause and self._pause[0] == "deferred"):
+        if not (self._interrupted or self._unknown or self._recording_failed):
+            self._service_requests()
+            if self._termination in {"abort", "safe_stop"} and not self._source_return_notified:
+                deferred_break = self._pause and self._pause[0] == "deferred"
+                if not self._safe_boundary() and not deferred_break:
                     self._unknown = True
                     self._publish("reconciling", held_reason="termination_boundary_unreached")
-                    return
+                elif not deferred_break:
+                    self._hook("safe_stop_exit", MOTION_DOMAINS, once=True)
+        try:
+            self._return_source()
+        finally:
+            self._finalize_script_host()
+        if self._interrupted or self._unknown or self._recording_failed or not self._source_returned:
+            return
+        # Requests may have arrived while a flattened wrapper was returning.
+        if self._failed and self._termination not in {"source_error", "abort_false"}:
+            self._termination = "source_error"
+        self._service_requests()
+        self._settling = True
+        try:
+            if self._termination == "source_error":
+                if not self._hook_succeeded("source_error_request"):
+                    raise _Diversion()
+                self._publish("cleanup")
+                self._hook("source_error", ALL_DOMAINS, once=True)
+            elif self._termination in {"abort", "safe_stop"}:
                 if self._termination == "abort":
-                    if (self._safe_boundary() and not (self._pause and self._pause[0] == "deferred")
-                            and not self._source_return_notified):
-                        self._hook("safe_stop_exit", MOTION_DOMAINS, once=True)
-                    self._return_source()
+                    if not self._hook_succeeded("abort_true_prefix"):
+                        raise _Diversion()
                     self._hook("abort_true_finish", once=True)
-                self._return_source()
-                if self._source_script_begin is not None and not self._source_returned:
+                    if not self._hook_succeeded("abort_true_finish"):
+                        raise _Diversion()
+                elif not self._hook_succeeded("safe_stop_request"):
+                    raise _Diversion()
+                if "safe_stop_exit" in self._hooks_done and not self._hook_succeeded("safe_stop_exit"):
                     raise _Diversion()
                 self._publish("cleanup")
                 self._hook("cleanup", MOTION_DOMAINS, once=True)
-            self._return_source()
-            self._hook("script_finally", once=True)
+            # False Abort has no application cleanup tail.
         finally:
-            self._servicing = False
-            self._return_source()
+            self._settling = False
 
     def _ensure_stage_states(self, document: ProtocolDocument, state: ProtocolRuntimeState) -> None:
         for stage in document.stages:

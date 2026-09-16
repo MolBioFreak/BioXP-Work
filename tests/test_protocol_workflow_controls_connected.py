@@ -18,7 +18,8 @@ def gated_workflow(installed_retained, monkeypatch, tmp_path):
     from bioxp import api
     from bioxp.protocols.executor import ProtocolExecutor
     from bioxp.protocols.models import ProtocolDocument
-    app, *_ = installed_retained
+    app, provider, *_ = installed_retained
+    from bioxp.services.protocol_service import ProtocolBindings
     monkeypatch.setenv("BIOXP_PROTOCOL_JOBS_ROOT", str(tmp_path / "artifacts"))
     trace = []
     def bindings(bundle, **kwargs):
@@ -29,11 +30,14 @@ def gated_workflow(installed_retained, monkeypatch, tmp_path):
         def hook(name):
             def call(state):
                 trace.append(name)
+                if name == "script_finally":
+                    return kwargs["source_executor"]().finalize_source_host(state)
                 return {"ok": True, "fixture_only": True, "physical_effect_verified": False}
             return call
-        return {}, {"led": native}, {
+        return ProtocolBindings({}, {"led": native}, {
             name: hook(name) for name in ProtocolExecutor.required_lifecycle(doc)
-        }
+        }, source_script_begin=lambda state: provider.wp8_source_script_begin(command_id=state.workflow.command_id),
+            source_script_returned=lambda state: provider.wp8_source_script_returned(command_id=state.workflow.command_id))
     monkeypatch.setattr(api, "_protocol_bindings", bindings)
     mount_protocol_routes(app)
     app.add_api_route("/protocol/jobs/{job_id}/control", api.protocol_job_control, methods=["POST"])
@@ -131,7 +135,7 @@ def test_affected_stop_diverts_held_owner_without_cleanup_or_new_native_entry(ga
     store._notify_workflow_interrupt()
     done = await_job(client, gate["job_id"], lambda j: j["command"]["terminal"])
     assert done["command"]["status"] == "interrupted", done
-    assert trace == prior
+    assert trace == prior + ["script_finally"]
     export_control("stopped", done)
     assert client.post("/protocol/execute", json=payload).json()["job_id"] == gate["job_id"]
-    assert trace == prior
+    assert trace == prior + ["script_finally"]

@@ -596,6 +596,10 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
             return invoke
 
         def wrap_lifecycle(name, handler):
+            if name == "script_finally":
+                # Host lifetime only. An external interrupt/failed authority
+                # must not suppress bookkeeping after actual source return.
+                return handler
             def invoke(current):
                 with command_store.workflow_context(job_id, source_occurrence_id=f"lifecycle:{name}"):
                     command_store.assert_workflow_current(job_id)
