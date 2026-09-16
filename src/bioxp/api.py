@@ -10774,6 +10774,27 @@ def _protocol_source_mov(intent, action, state):
                 raise RuntimeError("workflow_child_owner_lost")
 
 
+def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[str, Any]:
+    """Actual initialCheck body, admitted only by the canonical wake child."""
+    tester = _get_tester()
+    begin_generation = getattr(tester, "oem_begin_board_lifecycle_generation", None)
+    if not callable(begin_generation):
+        raise RuntimeError("workflow_initial_check_generation_unavailable")
+    class WorkflowHardware(_LifecycleHardware):
+        def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
+            return begin_generation(deactivation=deactivation, activation=activation)
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise RuntimeError("workflow_initial_check_provider_unavailable")
+    return lifecycle_state.run_workflow_wake_initial_check(
+        WorkflowHardware(tester), validate_current=validate_current,
+        can_ready=_can_ready_observation, sleep=provider.sleep,
+    )
+
+
+app.state.oem_workflow_initial_check = _protocol_workflow_initial_check
+
+
 def _protocol_bindings(bundle, *, source_executor=None):
     from contextvars import ContextVar
     from threading import Lock
@@ -10802,6 +10823,7 @@ def _protocol_bindings(bundle, *, source_executor=None):
     )
     provider = _serial206_oem_initialization_provider
     canonical_plan = getattr(app.state, "oem_workflow_plan_executor", None)
+    canonical_control = getattr(app.state, "oem_workflow_lifecycle_control_executor", None)
     # Per-source-call counters are child identity, not scheduling or custody.
     # Identical repeated plans must never reconcile to an earlier physical leaf.
     counts, count_lock = {}, Lock()
@@ -10829,6 +10851,29 @@ def _protocol_bindings(bundle, *, source_executor=None):
                         if field in row:
                             result[field] = row[field]
             return result
+    def execute_thermal(operation, arguments, action, state):
+        """Finite native thermal/control child on the existing claim owner."""
+        from .runtime_audit_store import workflow_claim_context
+        if not callable(canonical_control):
+            raise RuntimeError("workflow_lifecycle_control_executor_unavailable")
+        binding = workflow_claim_context()
+        occurrence = (action if isinstance(action, str) else
+                      action.source_occurrence_id if action is not None else
+                      (binding or {}).get("source_occurrence_id", "lifecycle:" + operation))
+        step = source_step.get()
+        if not isinstance(step, str) or not step.startswith(occurrence + ":"):
+            step = occurrence
+        with count_lock:
+            ordinal = counts.get(step, 0)
+            counts[step] = ordinal + 1
+        identity = f"{step}:native:{ordinal}"
+        with store.workflow_context(state.job_id, source_occurrence_id=identity):
+            store.assert_workflow_current(state.job_id)
+            return canonical_control(
+                operation, state, source_occurrence_id=identity,
+                arguments=dict(arguments),
+                control_id=state.workflow.last_control_id if state.workflow is not None else None,
+            )
     callbacks = {}
     settings = metadata.get("source_settings", {})
     def executor():
@@ -10868,6 +10913,7 @@ def _protocol_bindings(bundle, *, source_executor=None):
             source_capabilities=callbacks["source_bindings"].source_capabilities.intersection(capabilities))
         native = provider.build_oem_native_handlers(
             settings=settings, execute_plan=execute_plan,
+            execute_thermal=execute_thermal if callable(canonical_control) else None,
             execute_mov=_protocol_source_mov if callable(getattr(app.state, "oem_mov_execution_admitter", None)) else None,
             rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
         )
@@ -10915,6 +10961,41 @@ def _protocol_bindings(bundle, *, source_executor=None):
             from .oem_deck_movement import compile_finite_plate_operation
             plan = compile_finite_plate_operation(operation, source_leaf_available=True)
             return execute_plan(plan, "lifecycle:" + operation, state)
+        thermal_lifecycle = {}
+        if callable(canonical_control):
+            def control(operation, state, arguments=None):
+                return execute_thermal(operation, arguments or {}, None, state)
+            def shutdown_temperature(state):
+                return control("shutdown_temperature", state)
+            def safe_stop_request(state):
+                # ControlLib.safeStopScripts: one source Sleep(1), then shutdown.
+                provider.sleep(0.001)
+                return shutdown_temperature(state)
+            def abort_false(state):
+                rows = []
+                for callback in (shutdown_temperature, executor().cancel_source,
+                                 lambda value: control("software_abort", value)):
+                    result = dict(callback(state))
+                    rows.append(result)
+                    if result.get("ok") is not True:
+                        return {**result, "source_children": rows}
+                return {"ok": True, "source_children": rows}
+            def abort_true_finish(state):
+                allowed = state.source_model.allow_to_stop
+                if type(allowed) is not bool:
+                    raise RuntimeError("source_authority_missing:AllowToStop")
+                if allowed:
+                    return control("software_abort", state)
+                return {"ok": True, "source_allow_to_stop": False,
+                        "source_software_abort_called": False}
+            thermal_lifecycle = {
+                "safe_stop_tip_exit": lambda state: lifecycle_pipette("safe_stop_tip_exit", state),
+                "cancel_source": lambda state: executor().cancel_source(state),
+                "shutdown_temperature": shutdown_temperature,
+                "wake_prepare": lambda state: control("wake_prepare", state),
+                "restore_door_model": lambda value, state: control("restore_door_model", state, {"value": value}),
+                "resume_temperature": lambda state: control("resume_temperature", state),
+            }
         lifecycle = provider.build_oem_lifecycle_handlers(
             settings=settings, execute_plan=execute_plan,
             pressure_baseline=lambda state: lifecycle_pipette("pressure_baseline", state),
@@ -10922,11 +11003,22 @@ def _protocol_bindings(bundle, *, source_executor=None):
             unlatch=lambda state: lifecycle_plan("unlatch", state),
             confirm_gripper=lambda state: lifecycle_plan("confirm_gripper", state),
             home_gripper=lambda state: lifecycle_plan("home_gripper", state),
+            **thermal_lifecycle,
         )
+        lifecycle["script_finally"] = lambda state: executor().finalize_source_host(state)
+        lifecycle["source_error_request"] = lambda state: executor().cancel_source(state)
+        if callable(canonical_control):
+            lifecycle.update({
+                "safe_stop_request": safe_stop_request,
+                "abort_false": abort_false,
+                "abort_true_prefix": shutdown_temperature,
+                "abort_true_finish": abort_true_finish,
+                "deferred_pause_request": lambda state: control("thermal_bailout", state),
+                "epilogue_lid": lambda state: control("epilogue_lid", state),
+            })
         lifecycle["epilogue_sweep"] = lambda state: lifecycle_pipette("epilogue_sweep", state)
-        # Cleanup uses the complete canonical mechanical plan, after this
-        # attempt's source-return callback. Thermal-dependent control bodies
-        # remain absent; cleanup_pipette_prefix is not used as a substitute.
+        # Cleanup remains the full mechanical plan, consuming this attempt's
+        # actual source-return event, never only a pipette prefix.
     if set(native).intersection(pipette):
         raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
     from .services.protocol_service import ProtocolBindings
