@@ -225,12 +225,6 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     from tests.test_deck_complete_admission import ready
     app, provider, primitive, references, root, _, calls, wire, transport = query_rig
     motor_leaf, raw_moves = ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
-    # Explicit warm transport scope: bind the already-created offline CAN
-    # readers, without sending a query or minting collection/prepared authority.
-    # Cold first-query claim defect is recorded in integration-defects.md.
-    if not getattr(request, 'param', {}).get('cold_transport', False):
-        for channel_transport in transport._transports:
-            channel_transport._get_driver()
     native = NativePhysicalRecorder(monkeypatch)
     # Mechanical motion/readback leaves only. Do not copy the recorder's fixed
     # oem_no24v_state or board-state methods over real native safety owners.
