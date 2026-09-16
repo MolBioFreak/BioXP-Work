@@ -28,6 +28,10 @@ class NativePhysicalRecorder:
     def __init__(self, monkeypatch):
         from bioxp.usb_driver import BioXpTester
         self.tester = object.__new__(BioXpTester)
+        from bioxp.novo_router import NovoRouter
+        from bioxp.usb_driver import novo_decode
+        self.tester.novo_router = NovoRouter(ep_in=object(), ep_out=object(), decode=novo_decode)
+        self.tester._motor_noresp_streak = {}
         self.tester._oem_board_initialized = {b: True for b in (4, 5, 6, 7)}
         self.tester._oem_transport_generation = 3
         self.tester._oem_abort_generation = 0
@@ -62,6 +66,14 @@ class NativePhysicalRecorder:
         if key in self.replies:
             result = self.replies[key]
             return result() if callable(result) else result
+        # initialCheck: ClassIOControl cmd15 and literal cmd64 board cycle.
+        # Only physical replies: native activation/generation owners still run.
+        if board == 5 and command == 15 and typ in (0, 1, 2, 3) and bank == 0 and value == 0:
+            # query24VSensor is a No24V scalar (zero), not millivolts.
+            return {'status': 100, 'value': 0 if typ == 0 else 1,
+                    'command': command, 'module': board}
+        if board in (4, 5, 6, 7) and command == 64 and typ == bank == 0 and value in (0, 1):
+            return {'status': 100, 'value': value, 'command': command, 'module': board}
         # Closed native thermal wire contract (usb_driver._oem_thermal_tx),
         # not a blanket successful controller. Mechanical/wake additions must
         # be evidenced by a delivered source command before joining this set.
@@ -77,6 +89,27 @@ class NativePhysicalRecorder:
         motor_readback = command == 6 and typ in (1, 3) and (board, bank) in self.positions
         if motor_readback:
             return {'status': 100, 'value': self.positions[board, bank] if typ == 1 else 0}
+        if key == (4, 4, 1, 2) and value == 10000:
+            # moveRelative startup gripper preclear; real NovoRouter ingress,
+            # reset identity and native waiter consume the synthetic event.
+            from tests.test_motor_receive_identity import receive
+            self.positions[4, 2] += value
+            receive(self.tester, board=4, motor=2)
+            return {'status': 100, 'value': value}
+        if key == (4, 138, 0, 2) and value == 0:
+            return {'status': 100, 'value': 0}
+        # Delivered initializeMotors Z axisSearchHome frames (serial206
+        # startup speed 1791); SAP1 changes the controller coordinate only.
+        if key == (4, 5, 1, 1) and value == 0:
+            self.positions[4, 1] = 0
+            return {'status': 100, 'value': 0}
+        if key == (4, 6, 9, 1) and value == 0:
+            return {'status': 100, 'value': int(self.positions[4, 1] == 0)}
+        if key == (4, 3, 0, 1) and value == 0:
+            return {'status': 100, 'value': 0}
+        if key == (4, 2, 0, 1) and value == 1791:
+            self.positions[4, 1] = 0
+            return {'status': 100, 'value': 0}
         if key == (5, 14, 2, 0) and value in (0, 1):
             return {'status': 100, 'value': value}
         if key == (4, 3, 0, 2) and value == 0:
@@ -283,8 +316,7 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     # Mechanical motion/readback leaves only. Do not copy the recorder's fixed
     # oem_no24v_state or board-state methods over real native safety owners.
     for name in ('motor_oem_move_absolute', 'motor_wait_target_reached',
-                 'motor_wait_target_reached_many', 'begin_bus_event_window',
-                 'collect_bus_events'):
+                 'motor_wait_target_reached_many'):
         setattr(native.tester, name, getattr(motor_leaf, name))
     motor_leaf.positions.update({(5, 1): 0, (6, 0): 0, (4, 2): 0})
     native.positions = motor_leaf.positions
@@ -372,6 +404,8 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
                 'pipette_errors': pipette_errors, 'pipette_rows': pipette_rows,
                 'pipette_identity': transport.collection_source_identity(),
                 'thermal_wire': native.trace, 'abort_intervals': native.abort_intervals,
+                'initialization_ledger': provider._load_state().get('movement_ledger'),
+                'native_board_generation': native.tester.oem_current_board_lifecycle_generation(),
                 'source_rgb': rig.trace,
                 'no24v': native.tester.oem_no24v_state(),
                 'references': references.snapshot(('x', 'y', 'z', 'g')),
