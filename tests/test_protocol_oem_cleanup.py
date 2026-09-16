@@ -80,7 +80,7 @@ def test_ejection_failure_propagates_without_running_remainder():
 
 
 @pytest.mark.parametrize("door_ok", [False, True])
-def test_cleanup_prefix_canonical_parent_child_store_and_reopen(rig, tmp_path, door_ok):
+def test_cleanup_prefix_canonical_parent_child_store_and_reopen(rig, tmp_path, door_ok, monkeypatch):
     from bioxp.oem_runtime_store import OEMRuntimeStore
     from bioxp.operator_command_plane import OperatorCommandStore
     from bioxp.oem_deck_movement import make_wp8_operation_executor
@@ -95,7 +95,29 @@ def test_cleanup_prefix_canonical_parent_child_store_and_reopen(rig, tmp_path, d
         updates={"tip_loaded": True, "tip_dirty": False, "tip_location": -1}, **stamps)
     # Only physical leaves doubled. Actual door/query/state/gripper wrappers run.
     p.primitives.deck_io_query_type = lambda kind: {"value": (0 if door_ok else 1) if kind == 0 else 0}
-    p.primitives.tester.motor_oem_home_axis = lambda *a, **kw: {"ok": True, "controller_command_acknowledged": True}
+    from tests.protocol_v1_integration_fixture import NativePhysicalRecorder
+    from tests.oem_machine_bundle_test_support import bind_serial206_oem_snapshot
+    from bioxp import oem_machine_bundle
+    snapshot = bind_serial206_oem_snapshot(monkeypatch)
+    monkeypatch.setattr(oem_machine_bundle, '_active_snapshot',
+        oem_machine_bundle.load_oem_machine_snapshot(
+            snapshot.bundle_root / 'OEM_EVIDENCE_LOCK.json',
+            operator_label_serial=206, require_operator_label=True))
+    native = NativePhysicalRecorder(monkeypatch)
+    native.positions = {(4, 2): 0}
+    exchange = native.exchange
+    def wire(board, command, typ, motor, value, **kwargs):
+        if (board, command, typ, motor, value) == (4, 4, 0, 2, 10000):
+            from tests.test_motor_receive_identity import receive
+            native.trace.append((board, command, typ, motor, value))
+            native.positions[board, motor] = value
+            receive(native.tester, board=board, motor=motor)
+            return {'status': 100, 'value': value}
+        return exchange(board, command, typ, motor, value, **kwargs)
+    native.tester._send_motor = wire
+    native.tester.send_tmcl_retry = wire
+    monkeypatch.setattr(native.tester, '_motion_oem_gripper_version', lambda: 1)
+    p.primitives.tester.motor_oem_home_axis = native.tester.motor_oem_home_axis
     p._wp8_calibration = lambda: (1, {})  # explicit fixture gripper version
     p.primitives.pipette_audit_runner = lambda name, call, **kw: call(SimpleNamespace(
         query_tip_status_all=lambda: {"channels": [{"tip_loaded": False} for _ in range(4)]}))
@@ -133,6 +155,16 @@ def test_cleanup_prefix_canonical_parent_child_store_and_reopen(rig, tmp_path, d
         assert query["terminal_state"] == "completed"
         import json
         assert bool(json.loads(query["terminal_evidence_json"])["result"].get("source_branch_skipped")) is (not door_ok)
+        home = next(row for row in evidence['children'] if row['operation'] == 'sendGripperHome')
+        result = json.loads(home['terminal_evidence_json'])['result']
+        if door_ok:
+            assert result['source_call_completed'] is True
+            assert result['primitive_result']['home']['source_return_code'] == 0
+            assert native.trace[0] == (4, 5, 6, 2, 31)
+            assert native.trace[-1] == (4, 5, 6, 2, 10)
+        else:
+            assert result['source_branch_skipped'] is True
+            assert native.trace == []
         assert store.finish_workflow("parent", status="completed", payload={}, lifecycle_settled=True)["command"]["status"] == "completed"
     finally:
         store.connection.close()
