@@ -9,6 +9,7 @@ from tests.test_deck_scoped_authority import retained_rig
 from tests.test_deck_scoped_integration import installed_retained, catalog_action
 from tests.test_deck_complete_effective import adapter_rig
 from tests.test_deck_complete_oem import export
+from tests.test_deck_tip_query_publication import query_rig, query
 
 
 def seal_park_fixture(provider, store, monkeypatch, *, loaded=False):
@@ -29,7 +30,9 @@ def seal_park_fixture(provider, store, monkeypatch, *, loaded=False):
     store.publish_tip_tray_transition(tray_id=0, transition='construct', operation_id='fixture-only-construction',
         command_id='fixture-only-construction', provenance={'source': 'explicit test predecessor'},
         **provider.deck_owner_authority_stamps())
-    snapshot = provider.deck_authority_snapshot(expected_generation=int(provider.generation_provider()), target='LOC_PARK')
+    # Bootstrap full predecessor state first. Park's collection-source predicate
+    # is qualified separately through the real query/finalizer, not TipLoaded.
+    snapshot = provider.deck_authority_snapshot(expected_generation=int(provider.generation_provider()))
     assert snapshot['current_location_id'] == 'LOC_OC' and snapshot['tip_loaded'] is loaded
     return snapshot
 
@@ -42,9 +45,9 @@ def seal_park_fixture(provider, store, monkeypatch, *, loaded=False):
     ('LOC_RC_BARCODE', False, (47246, 45094, 3145)),
     ('LOC_PARK', False, (1506, 71, 114092)),
 ])
-def test_canonical_special_and_camera(installed_retained, retained_rig, monkeypatch, target, camera, xyz, start_z, start_y):
+def test_canonical_special_and_camera(query_rig, retained_rig, monkeypatch, target, camera, xyz, start_z, start_y):
     from bioxp import api
-    app, provider, observations, refs, root = installed_retained
+    app, provider, observations, refs, root = query_rig[:5]
     store = app.state.operator_command_plane.store
     generation = int(provider.generation_provider())
     api.serial206_oem_initialization_provider_status()
@@ -74,6 +77,8 @@ def test_canonical_special_and_camera(installed_retained, retained_rig, monkeypa
         adapter.oem_initialize_motion_scriptmove_to_waste, raising=False)
     if target == 'LOC_PARK':
         seal_park_fixture(provider, store, monkeypatch)
+        observed = query(query_rig, key='park-fixture-source-query')
+        assert observed['source_tip_exists'] is False
     assert api._collect_and_publish_hardware_snapshot(['axes', 'latch'],
         reason='isolated-effective-target')['deck_authority']['enabled']
     action = catalog_action(app)
