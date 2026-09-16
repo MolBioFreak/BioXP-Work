@@ -769,6 +769,10 @@ class ProtocolExecutor:
                 self._hook("deferred_pause_enter")
                 if not self._termination:
                     self._gate("deferred_pause", self._pause[1])
+                if self._termination:
+                    # Preserve the deferred stop-break when preparation or the
+                    # reached gate services Stop; do not enter ordinary exit.
+                    raise _Diversion()
         if self._termination in {"abort", "safe_stop"}:
             self.wait_for_domains(ALL_DOMAINS)
             if not self._oem or self._safe_boundary():
