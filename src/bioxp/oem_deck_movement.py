@@ -1115,6 +1115,8 @@ OEM_PIPETTE_LEAVES = {
     "unlatch": ("sourceUnlatch", ()),
     "confirm_gripper": ("sourceConfirmGripper", ()),
     "home_gripper": ("sourceHomeGripper", ()),
+    "lifecycle_door_model": ("updateThermalDoorOpen", ("value",)),
+    "lifecycle_check_door": ("checkDoorStatus", ()),
 }
 
 FINITE_PLATE_OPERATIONS = frozenset({
@@ -1638,7 +1640,7 @@ def execute_finite_plate_operation(
     if plan.get("operation") in OEM_PIPETTE_LEAVES and completed:
         leaf_result = completed[-1]["result"]
         if isinstance(leaf_result, Mapping):
-            source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z") if key in leaf_result})
+            source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z", "door_ok") if key in leaf_result})
     if plan.get("source_stop_scripts"):
         source_return["source_stop_scripts"] = True
     return {

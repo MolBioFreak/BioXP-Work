@@ -12146,6 +12146,10 @@ class Serial206OemInitializationProvider:
         home_gripper: Callable[..., Any] | None = None,
         pressure_baseline: Callable[..., Any] | None = None,
         collect_critical_images: Callable[..., Any] | None = None,
+        safe_stop_tip_exit: Callable[..., Any] | None = None,
+        cancel_source: Callable[..., Any] | None = None,
+        shutdown_temperature: Callable[..., Any] | None = None,
+        wake_prepare: Callable[..., Any] | None = None,
     ) -> dict[str, Callable[..., Any]]:
         """Source mechanical lifecycle sequences, conditional on exact leaves.
 
@@ -12165,8 +12169,25 @@ class Serial206OemInitializationProvider:
             return dict(value)
 
         def combined(rows: list[dict[str, Any]], **facts: Any) -> dict[str, Any]:
+            owned: list[Any] = []
+            uncertain = False
+
+            def retain(value: Any) -> None:
+                nonlocal uncertain
+                if isinstance(value, Mapping):
+                    for child in value.get("owned_children", ()):
+                        if not any(child is prior for prior in owned):
+                            owned.append(child)
+                    uncertain = uncertain or value.get("uncertain") is True or value.get("outcome_unknown") is True or value.get("status") == "ambiguous"
+                    for key in ("source_children", "oem_partial_results", "native_results", "provider_results", "result", "detail"):
+                        retain(value.get(key))
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        retain(item)
+
+            retain(rows)
             return {"ok": all(row["ok"] for row in rows), "source_children": rows,
-                    "owned_children": tuple(child for row in rows for child in row.get("owned_children", ())), **facts}
+                    "owned_children": tuple(owned), **({"uncertain": True} if uncertain else {}), **facts}
 
         def park(state: Any) -> Any:
             return finite("epilogue_park", "park_gantry", {"rehome": False}, state)
@@ -12188,6 +12209,98 @@ class Serial206OemInitializationProvider:
         handlers = {"epilogue_park": park, "ordinary_pause_prepare": ordinary_prepare,
                     "cleanup": cleanup}
 
+        def failure(exc: Exception) -> dict[str, Any]:
+            row: dict[str, Any] = {"ok": False, "error_type": type(exc).__name__,
+                                   "error": str(exc)}
+            for key in ("oem_partial_results", "owned_children", "detail", "provider_results",
+                        "delivery_attempted", "controller_command_acknowledged",
+                        "controller_completion_verified", "hardware_postcondition_verified"):
+                if hasattr(exc, key):
+                    row[key] = getattr(exc, key)
+            return row
+
+        if all(leaf is not None for leaf in (safe_stop_tip_exit, cancel_source, home_gripper)):
+            def safe_exit(state: Any) -> Any:
+                assert safe_stop_tip_exit is not None and cancel_source is not None and home_gripper is not None
+                rows: list[dict[str, Any]] = []
+                try:
+                    rows.append(outcome(safe_stop_tip_exit(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                    rows.append(outcome(cancel_source(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                    stopped = rows[-1].get("source_stop_scripts")
+                    if type(stopped) is not bool:
+                        raise RuntimeError("source_authority_missing:source_stop_scripts")
+                    if stopped:
+                        rows.append(outcome(home_gripper(state)))
+                except Exception as exc:
+                    rows.append(failure(exc))
+                # Only the executor's actual wrapper-return callback signals.
+                return combined(rows)
+            handlers["safe_stop_exit"] = safe_exit
+
+        if shutdown_temperature is not None and unlatch is not None:
+            def source_error(state: Any) -> Any:
+                assert shutdown_temperature is not None and unlatch is not None
+                parent = getattr(getattr(state, "workflow", None), "command_id", None)
+                # stopScript's request/wait belongs to the source owner. Consume
+                # its matching return once, before any physical tail/collection.
+                with self._lock:
+                    if (not parent or parent != getattr(self, "_wp8_source_script_owner", None)
+                            or not getattr(self, "_wp8_source_script_returned", False)
+                            or not self._wp8_stop_event.is_set()):
+                        raise RuntimeError("source_error_source_script_not_returned")
+                    self._wp8_stop_event.clear()
+                rows: list[dict[str, Any]] = []
+                unlocked = False
+
+                def append(value: Any) -> bool:
+                    rows.append(outcome(value))
+                    return rows[-1]["ok"]
+
+                def failed(exc: Exception) -> None:
+                    rows.append(failure(exc))
+
+                def open_door() -> Any:
+                    # stopScript ignores doorOpen's source bool. It is not the
+                    # script dopen opcode and must not manufacture board error.
+                    return finite("source_error", "thermal_door", {"open": True, "script_running": False}, state)
+
+                def body() -> None:
+                    if not append(shutdown_temperature(state)):
+                        return
+                    if not append(finite("source_error", "lifecycle_check_door", {}, state)):
+                        return
+                    door_ok = rows[-1].get("door_ok")
+                    if type(door_ok) is not bool:
+                        raise RuntimeError("source_authority_missing:checkDoorStatus")
+                    if door_ok and not append(finite("source_error", "home_gripper", {}, state)):
+                        return
+                    if not append(open_door()):
+                        return
+                    append(finite("source_error", "park_gantry", {"rehome": False}, state))
+
+                try:
+                    body()
+                except Exception as exc:
+                    # Source suppresses the entire try, but failed native/claim
+                    # evidence remains failed in the canonical parent result.
+                    failed(exc)
+                finally:
+                    try:
+                        # unlockDoor calls doorOpen again. Failure of that call
+                        # or unlatch prevents LED; no independent LED finally.
+                        if append(open_door()) and append(unlatch(state)):
+                            unlocked = True
+                            append(finite("source_error", "pipette_color", {"r": 255, "g": 255, "b": 255}, state))
+                    except Exception as exc:
+                        failed(exc)
+                return combined(rows, source_stop_scripts=unlocked,
+                                source_unlock_completed=unlocked)
+            handlers["source_error"] = source_error
+
         if unlatch is not None:
             def deferred_enter(state: Any) -> Any:
                 parked = outcome(finite("deferred_pause_enter", "park_gantry", {"rehome": False}, state))
@@ -12196,21 +12309,31 @@ class Serial206OemInitializationProvider:
                 return combined([parked, outcome(unlatch(state))], source_user_pause_action="Open Door")
             handlers["deferred_pause_enter"] = deferred_enter
 
-        if all(leaf is not None for leaf in (initial_check, initialize_motors, restore_door_model, resume_temperature)):
+        if (restore_door_model is not None and resume_temperature is not None
+                and (wake_prepare is not None or (initial_check is not None and initialize_motors is not None))):
             def wake(state: Any) -> Any:
-                assert initial_check is not None and initialize_motors is not None
                 assert restore_door_model is not None and resume_temperature is not None
-                # App:2104-2129 ignores initialCheck's source bool. Explicit
-                # native/claim failure is separate from that returned bool.
-                checked = outcome(initial_check(state))
-                if not checked["ok"]:
-                    return checked
-                was_open = self.mov_execution_machine_state()["thermal_door_open"]
-                if type(was_open) is not bool:
-                    raise RuntimeError("source_authority_missing:ThermalDoorOpen")
-                rows = [checked, outcome(initialize_motors(state))]
+                if wake_prepare is not None:
+                    # One canonical child owns initialCheck -> capture door ->
+                    # initializeMotors and its proven board-generation change.
+                    # Its claim is released before any following finite leaf.
+                    rows = [outcome(wake_prepare(state))]
+                    was_open = rows[-1].get("source_prior_door_open")
+                else:
+                    assert initial_check is not None and initialize_motors is not None
+                    # App:2104-2129 ignores initialCheck's source bool, not a
+                    # failed native/claim outcome. Retain legacy injected seam.
+                    checked = outcome(initial_check(state))
+                    if not checked["ok"]:
+                        return checked
+                    was_open = self.mov_execution_machine_state()["thermal_door_open"]
+                    if type(was_open) is not bool:
+                        raise RuntimeError("source_authority_missing:ThermalDoorOpen")
+                    rows = [checked, outcome(initialize_motors(state))]
                 if not rows[-1]["ok"]:
                     return combined(rows)
+                if type(was_open) is not bool:
+                    raise RuntimeError("source_authority_missing:ThermalDoorOpen")
                 self.sleep(0.040)
                 if was_open:
                     rows.append(outcome(restore_door_model(False, state)))

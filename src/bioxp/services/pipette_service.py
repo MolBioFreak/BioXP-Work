@@ -1473,6 +1473,33 @@ def build_oem_pipette_lifecycle_helpers(
         body.tip_state(tip_loaded=False)
         return {**body.result(), "source_return": None}
 
+    def safe_stop_tip_exit(state, *, source_occurrence_id):
+        # ControlLib.executeScript:5440-5462. The executor owns the logical
+        # no-tip/no-plate boundary and motion join; query actual collection here.
+        body = frame(state, source_occurrence_id)
+        try:
+            queried = body.pipette("query_tip_status_all", lambda t: t.query_tip_status_all())
+            if not queried["ok"]:
+                return body.result()
+            body.delay(1000)
+            if source_bindings.tip_exists(body.action, state):
+                for step in (
+                    lambda: body.native("moveToWaste", move_to_waste),
+                    lambda: body.publish_location(6, 96),
+                    lambda: body.eject(True),
+                    lambda: body.tip_state(tip_dirty=False),
+                    lambda: body.native("moveZ", source_bindings.move_z, 80000),
+                    lambda: body.native("moveX", source_bindings.move_x, 79000),
+                ):
+                    if not step()["ok"]:
+                        return body.result()
+            body.tip_state(tip_loaded=False)
+            return {**body.result(), "source_return": None}
+        except Exception as exc:
+            if not hasattr(exc, "oem_partial_results"):
+                setattr(exc, "oem_partial_results", list(body.steps))
+            raise
+
     def cleanup_prefix(state, *, source_occurrence_id):
         # Caller must first execute cleanup10628-10632 stop-wait/door predicate.
         # This is ONLY 10633-10642, never a complete cleanup/thermal hook.
@@ -1492,7 +1519,8 @@ def build_oem_pipette_lifecycle_helpers(
         return {**result, "source_return": None}
 
     return {"pressure_baseline": baseline, "run_job_tip_prefix": run_job_prefix,
-            "cleanup_pipette_prefix": cleanup_prefix, "epilogue_sweep": sweep}
+            "cleanup_pipette_prefix": cleanup_prefix, "epilogue_sweep": sweep,
+            "safe_stop_tip_exit": safe_stop_tip_exit}
 
 
 def build_oem_pipette_handlers(
