@@ -6105,6 +6105,13 @@ class Serial206OemInitializationProvider:
                         ))
                         if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
                             raise RuntimeError("durable X reference invalidation unverified")
+                    for axis in ("y", "g"):
+                        invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                            axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
+                            source="serial206.aggregate.software_abort",
+                        ))
+                        if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                            raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
         except Exception as exc:
             errors["z_lifecycle"] = f"{type(exc).__name__}: {exc}"
         # Keep retry admission fenced until the complete persistence attempt
