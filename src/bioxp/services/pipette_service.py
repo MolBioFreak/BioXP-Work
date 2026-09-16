@@ -1710,9 +1710,12 @@ def build_oem_pipette_handlers(
     if source_settings is not None and type(source_settings.get("LogPressure")) is not bool:
         raise ValueError("OEM source settings require the captured LogPressure boolean")
     handlers = {"la": la}
-    if pipette_call is not None and lift_for_air is not None and source_settings is not None:
+    pressure_source_bound = source_bindings is not None and callable(source_bindings.tip_exists)
+    if (pipette_call is not None and lift_for_air is not None and source_settings is not None
+            and (source_settings["LogPressure"] or pressure_source_bound)):
         handlers["aa"] = aa
-    if pipette_call is not None and move_to_waste is not None and move_z is not None and move_x is not None:
+    if (pipette_call is not None and move_to_waste is not None and move_z is not None
+            and move_x is not None and pressure_source_bound):
         handlers["iniPipette"] = ini_pipette
     if script_move is not None and publish_location is not None:
         handlers["ms"] = ms

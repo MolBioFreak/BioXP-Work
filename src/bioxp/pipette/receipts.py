@@ -472,6 +472,25 @@ class PipetteReceiptStore:
                 command_id=str(command_id),
                 pipette_operation_id=str(pipette_operation_id),
             )
+            # ClassPipetteCollection.readPressure returns its default array
+            # without a query when the committed source collection is empty.
+            # That finite native return completes custody, not hardware truth.
+            empty_pressure_return = (
+                operation == "read_pressure"
+                and result.get("ok") is True
+                and result.get("outcome") == "completed"
+                and result.get("source_return_kind") == "oem_empty_pressure_source_return"
+                and result.get("source_return_completed") is True
+                and result.get("source_noop") is True
+                and result.get("source_return") == [0.0, 0.0, 0.0, 0.0]
+                and result.get("channels") == []
+                and type(result.get("channel_count")) is int and result["channel_count"] == 0
+                and result.get("delivery_attempted") is False
+                and result.get("hardware_truth_level") == "source_model_default"
+                and result.get("hardware_query_verified") is False
+                and not any(value for key, value in receipt["truth"].items()
+                            if key != "physical_effect_claim_suppressed")
+            )
             target_status = (
                 "observed"
                 if (
@@ -479,7 +498,7 @@ class PipetteReceiptStore:
                     or receipt["truth"]["hardware_postcondition_verified"]
                 )
                 else "completed"
-                if receipt["truth"]["completion_verified"]
+                if receipt["truth"]["completion_verified"] or empty_pressure_return
                 else "acknowledged"
                 if receipt["truth"]["controller_acknowledged"]
                 else "dispatched"

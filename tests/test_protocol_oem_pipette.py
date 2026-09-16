@@ -52,9 +52,10 @@ class Native:
         self.calls.append(("air", volume, channels, front_air))
         return {"ok": True, "source": "air"}
 
-    def read_pressure(self):
+    def read_pressure_for_oem_source(self, tip_exists):
+        from tests.pressure_source_v1_support import pressure_source_transport
         self.calls.append(("pressure",))
-        return {"ok": True, "channels": [{"channel": 2, "result": {"pressure": 12.25}}]}
+        return pressure_source_transport(loaded_channel=2 if self.tips else None).read_pressure_for_oem_source(tip_exists)
 
     def reinitialize_pipette(self):
         self.calls.append(("init",))
@@ -98,6 +99,7 @@ def bindings(native=None, settings=None):
                 move_to_waste=lambda a, s: effect("waste"),
                 move_z=lambda value, a, s: effect("z", value),
                 move_x=lambda value, a, s: effect("x", value),
+                source_bindings=SimpleNamespace(tip_exists=lambda a, s: native.tips),
                 settings=settings if settings is not None else {"LogPressure": False})
     return args, state, native, entries, effects
 
@@ -106,7 +108,10 @@ def test_finite_mapping_does_not_advertise_missing_composites():
     handlers = build_oem_pipette_handlers(before_native_entry=lambda *a: None)
     assert set(handlers) == {"la"}
     args, *_ = bindings()
-    assert set(build_oem_pipette_handlers(**args)) == {"la", "ms", "retip", "aa", "iniPipette"}
+    args.pop("source_bindings")
+    assert set(build_oem_pipette_handlers(**args)) == {"la", "ms", "retip"}
+    args["settings"] = {"LogPressure": True}
+    assert set(build_oem_pipette_handlers(**args)) == {"la", "ms", "retip", "aa"}
 
 
 @pytest.mark.parametrize("key", [37, "prepared-key", None])
@@ -218,7 +223,7 @@ def test_init_exact_source_retry_count_and_baseline(prior_failures):
     assert effects == []
     assert result["source_init_return"] == 0
     assert result["ok"] is True
-    assert state.source_model.calls == [("baseline", [0.0, 0.0, 12.25, 0.0])]
+    assert state.source_model.calls == [("baseline", [0.0, 0.0, 0.0, 0.0])]
     assert len(entries) == len(set(entries))
 
 
@@ -239,6 +244,7 @@ def test_init_retry_tip_branch_does_not_substitute_generic_initialize_or_home():
                             ("eject", {"check_missing_tip": True, "wait": True}), ("pressure",)]
     assert effects == [("waste",), ("z", 80000), ("x", 79000)]
     assert state.source_model.logical_tip_present is True
+    assert state.source_model.calls == [("baseline", [0.0, 0.0, 12.25, 0.0])]
 
 
 def test_init_exception_does_not_enter_source_false_return_retry():

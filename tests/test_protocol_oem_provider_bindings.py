@@ -198,9 +198,11 @@ def test_all_fourteen_d_bodies_bind_and_air_executes_real_provider(rig):
     from bioxp.services.pipette_service import build_oem_pipette_handlers
     p,c,trace,plans,_,_=rig
     calls=[]
+    from tests.pressure_source_v1_support import pressure_source_transport
+    pressure_transport = pressure_source_transport()
     def pipette(name, operation, action, state, identity):
         calls.append((name,identity))
-        return operation(SimpleNamespace(set_top_speed=lambda *a,**kw:native(), aspirate_air=lambda *a,**kw:native(), read_pressure=lambda:native(channels=[]), _tip_location_channels=lambda:[0,1,2,3]))
+        return operation(SimpleNamespace(set_top_speed=lambda *a,**kw:native(), aspirate_air=lambda *a,**kw:native(), read_pressure_for_oem_source=pressure_transport.read_pressure_for_oem_source, _tip_location_channels=lambda:[0,1,2,3]))
     handlers=build_oem_pipette_handlers(before_native_entry=lambda *a:None,pipette_call=pipette,**c)
     assert set(handlers) == {"la","ms","retip","aa","da","iniPipette","ldtip","ejt","sweep","masp","dsa","mmix","rmb","ampmix"}
     action=SimpleNamespace(params={"arguments":["5"]},source_key="original",source_occurrence_id="source:4")

@@ -1539,18 +1539,19 @@ class FourPipetteTransport:
                 raise RuntimeError("pipette_collection_owner_changed_during_pressure_read")
             if type(exists) is not bool:
                 raise RuntimeError("pipette_collection_tip_state_unknown")
-            if exists:
-                return self.read_pressure()
-            return {
-                "ok": True, "source_return_completed": True, "source_noop": True,
-                "source_return": [0.0, 0.0, 0.0, 0.0],
-                "channels": [], "channel_count": 0,
-                "outcome": "oem_empty_pressure_source_return",
-                "hardware_truth_level": "source_model_default",
-                "hardware_query_verified": False, "physical_effect_verified": False,
-                "delivery_attempted": False,
-                "oem_source_anchor": "ClassPipetteCollection.readPressure:248-259",
-            }
+            if not exists:
+                return {
+                    "ok": True, "source_return_completed": True, "source_noop": True,
+                    "source_return": [0.0, 0.0, 0.0, 0.0],
+                    "channels": [], "channel_count": 0,
+                    "outcome": "completed",
+                    "source_return_kind": "oem_empty_pressure_source_return",
+                    "hardware_truth_level": "source_model_default",
+                    "hardware_query_verified": False, "physical_effect_verified": False,
+                    "delivery_attempted": False,
+                    "oem_source_anchor": "ClassPipetteCollection.readPressure:248-259",
+                }
+        return self.read_pressure()
 
     def read_pressure(self, channels: list[int] | None = None) -> dict[str, Any]:
         selected, eligibility = self._tip_eligibility(channels)

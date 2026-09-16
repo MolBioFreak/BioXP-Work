@@ -149,8 +149,11 @@ def test_api_eject_uses_same_executor_owned_tasks_with_source_identity(rig, monk
     provider.wp8_operation_machine_state = lambda operation, inputs: {"door_is_open": True} if operation == "thermal_door" else {}
     table = PositionTable([PositionTarget(LOCATION_ID_TO_NAME[6], base_coordinates={"x": 0, "y": 0}, z_low=90000, z_high=30000, inc_factor=1)])
     monkeypatch.setattr("bioxp.oem_serial206_initialization.load_bound_oem_position_table", lambda: table)
+    from tests.pressure_source_v1_support import pressure_source_transport
+    pressure_transport = pressure_source_transport(loaded_channel=None)
     transport = SimpleNamespace(query_tip_status_all=lambda: {"ok": True, "source_return": 0},
-        read_pressure=lambda: {"ok": True, "channels": []}, eject_all_tips=lambda **kw: {"ok": True})
+        read_pressure_for_oem_source=pressure_transport.read_pressure_for_oem_source,
+        eject_all_tips=lambda **kw: {"ok": True})
     monkeypatch.setattr(api, "_protocol_source_pipette_call", lambda name, call, action, runtime, identity: call(transport))
     def execute(plan, action, runtime):
         trace.append(("plan", store.occurrence, plan["operation"]))
@@ -205,9 +208,11 @@ def test_api_real_snapshot_compiler_and_unique_nested_keys(rig):
 
 def test_real_lifecycle_three_pressure_reads_then_image_null_branch(rig, monkeypatch):
     store, provider, state, trace = rig
+    from tests.pressure_source_v1_support import pressure_source_transport
+    transport = pressure_source_transport(value=31.0)
+    provider.bind_pipette_collection_state_reader(lambda: {"tip_exists": True})
     def pipette(name, call, action, runtime, identity):
-        transport = SimpleNamespace(read_pressure=lambda: trace.append(("read_pressure", identity)) or {
-            "ok": True, "channels": [{"channel": 2, "result": {"pressure": 31.0}}]})
+        trace.append((name, identity))
         return call(transport)
     monkeypatch.setattr(api, "_protocol_source_pipette_call", pipette)
     _, _, lifecycle = bind(document("park", settings={"JobName": None}))
