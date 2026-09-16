@@ -4410,7 +4410,14 @@ class OEMRuntimeStore:
         receipt_id: str | None = None,
         expected_interrupt_epoch: int | None = None,
         expected_software_interrupt_epoch: int | None = None,
+        expected_home_board_epoch: int | None = None,
     ) -> dict[str, Any]:
+        """Publish a current home, not a constructor preparation certificate.
+
+        Ordinary prepared callers retain their existing gate. The aggregate
+        initializer supplies its pre-home board/interrupt fence after verifying
+        native completion and zero; no preparation field is modified here.
+        """
         axis = str(axis)
         if axis not in SERIAL206_BOARD4_MEMBERS:
             return {"ok": False, "failure": "unsupported_board4_axis", "axis": axis}
@@ -4420,7 +4427,15 @@ class OEMRuntimeStore:
             if (self._axis_publication_interrupted(axis, expected_software_interrupt_epoch)
                 or (expected_interrupt_epoch is not None and expected_interrupt_epoch != row.get("interrupt_epoch"))):
                 return {"ok": False, "failure": "axis_publication_interrupted", "axis": axis}
-            if board.get("state") != "active" or row.get("prepared_board_epoch") != board.get("active_board_epoch"):
+            current_home = (type(expected_home_board_epoch) is int
+                            and expected_home_board_epoch == board.get("active_board_epoch")
+                            and row.get("ownership_generation") == ownership_generation
+                            and type(expected_interrupt_epoch) is int
+                            and type(expected_software_interrupt_epoch) is int
+                            and row.get("pending_ticket") is None)
+            if (board.get("state") != "active"
+                    or (not current_home if expected_home_board_epoch is not None
+                        else row.get("prepared_board_epoch") != board.get("active_board_epoch"))):
                 return {"ok": False, "failure": "axis_board_epoch_not_current", "axis": axis, "board": board, "axis_state": row}
             now = time.time()
             self._db.execute("BEGIN IMMEDIATE")

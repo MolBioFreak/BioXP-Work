@@ -8083,15 +8083,6 @@ class Serial206OemInitializationProvider:
             state = self._load_state()
             z = state["z_lifecycle"]
             active_receipt = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
-            existing_authority = bool(
-                str(z.get("state") or "unprepared") != "unprepared"
-                or z.get("generation") is not None
-                or z.get("board_lifecycle_generation") is not None
-                or z.get("prepared_receipt") is not None
-                or z.get("active_receipt") is not None
-                or z.get("awaiting_observation_receipt_id") is not None
-                or z.get("reference_state") == "referenced"
-            )
             scope = self._board_transition_scope
             expected_transition = None
             remaining_expected_transitions: list[Any] = []
@@ -8125,7 +8116,7 @@ class Serial206OemInitializationProvider:
                     ack=ack,
                     transition_id=str(active_receipt.get("command_id") or f"board4-{time.time_ns()}"),
                     ownership_generation=int(self.generation_provider()),
-                    invalidate_axes=bool(existing_authority and not provider_owned),
+                    invalidate_axes=not provider_owned,
                     continuity_proven=bool(
                         isinstance(ack, Mapping)
                         and type(ack.get("status")) is int
@@ -13448,7 +13439,7 @@ class Serial206OemInitializationProvider:
         return blockers
 
     def _aggregate_reference_fence(self, state: Mapping[str, Any], axis: str) -> dict[str, Any]:
-        """Existing preparation/interrupt authority only; never prepare by inference."""
+        """Current home execution authority, independent of constructor setup."""
         generation = int(self.generation_provider())
         board_generation = self.preparation_provider.current_board_lifecycle_generation()
         if type(board_generation) is not int:
@@ -13457,14 +13448,17 @@ class Serial206OemInitializationProvider:
             if (self._x_interrupt_active or self._z_interrupt_active
                     or self._x_interrupt_recovery_required or self._z_interrupt_recovery_required):
                 raise RuntimeError("aggregate_reference_interrupted")
+            tester = getattr(self.primitives, "tester", None)
+            if tester is not None and tester.oem_no24v_state():
+                raise RuntimeError("aggregate_reference_no24v")
             fence = {"generation": generation, "board_generation": board_generation,
-                     "x_interrupt": self._x_interrupt_epoch, "z_interrupt": self._z_interrupt_epoch}
+                     "x_interrupt": self._x_interrupt_epoch, "z_interrupt": self._z_interrupt_epoch,
+                     "native_owner": id(tester),
+                     "transport_generation": getattr(tester, "_oem_transport_generation", None),
+                     "abort_generation": getattr(tester, "_oem_abort_generation", None)}
         if axis in {"x", "z"}:
             lifecycle = state[f"{axis}_lifecycle"]
-            if (lifecycle.get("generation") != generation
-                    or lifecycle.get("board_lifecycle_generation") != board_generation
-                    or lifecycle.get("state") not in {"prepared_unreferenced", "referenced_ready"}
-                    or lifecycle.get("active_receipt") is not None
+            if (lifecycle.get("active_receipt") is not None
                     or lifecycle.get("pending_ticket") is not None):
                 raise RuntimeError(f"aggregate_reference_lifecycle_not_current:{axis}")
         if axis != "x":
@@ -13473,9 +13467,7 @@ class Serial206OemInitializationProvider:
             authority = self.state_store.board4_authority_projection()
             board, row = authority["board"], authority["axes"]["gripper" if axis == "g" else axis]
             if (board.get("state") != "active" or type(board.get("active_board_epoch")) is not int
-                    or row.get("prepared_board_epoch") != board["active_board_epoch"]
                     or row.get("ownership_generation") != generation
-                    or row.get("lifecycle_state") not in {"prepared_unreferenced", "referenced_ready"}
                     or row.get("pending_ticket") is not None
                     or row.get("software_interrupt_active") is not False
                     or type(row.get("interrupt_epoch")) is not int
@@ -13547,6 +13539,7 @@ class Serial206OemInitializationProvider:
                     "gripper" if axis == "g" else axis, position_steps=position["position"], ownership_generation=fence["generation"],
                     receipt_id=receipt["command_id"], expected_interrupt_epoch=fence["interrupt_epoch"],
                     expected_software_interrupt_epoch=fence["software_interrupt_epoch"],
+                    expected_home_board_epoch=fence["board_epoch"],
                 )
                 if not isinstance(authority, Mapping) or authority.get("ok") is not True:
                     raise RuntimeError("aggregate_reference_board_publication_failed")
@@ -13554,6 +13547,7 @@ class Serial206OemInitializationProvider:
                 state[f"{axis}_lifecycle"].update(
                     state="referenced_ready", reference_state="referenced", last_failure=None,
                     awaiting_observation_receipt_id=None,
+                    generation=fence["generation"], board_lifecycle_generation=fence["board_generation"],
                 )
             publication["fence"] = dict(fence)
             state["movement_ledger"]["stages"][receipt["stage"]]["result"] = _json_safe(receipt)

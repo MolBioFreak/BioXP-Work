@@ -7479,14 +7479,10 @@ class BioXpTester:
             )
         effective_speed = int(preset.get("home_speed", preset.get("speed", 250))) if speed is None else int(speed)
         if bool(startup) and axis_key_norm in {"x", "y", "z"}:
-            profile = self.motor_oem_require_no_motion_profile(axis_key_norm)
-            prepare = {
-                "ok": True,
-                "profile": profile,
-                "source": "ClassControlInterface.initializeMotors",
-                "source_exact_no_additional_axis_writes": True,
-                "standby_current_param7_written": False,
-            }
+            # initializeMotors calls axisSearchHome directly, including after
+            # initialCheck's board cycle. Constructor setup is a distinct call;
+            # a successful home neither requires nor republishes its receipt.
+            prepare = None
             home = self.motor_oem_axis_search_home(
                 axis_key_norm,
                 speed=effective_speed,
