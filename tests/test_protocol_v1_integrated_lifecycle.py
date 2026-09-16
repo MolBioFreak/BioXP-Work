@@ -135,8 +135,8 @@ def test_real_control_exit_duplicate_control_and_nonreplay(integrated_rig, actio
         assert (stop['board'], stop['motor']) == (4, 2)
         assert stop['oem_double_stop'] is True and stop['source_call_completed'] is True
         assert stop['first_delivery']['status'] == stop['second_delivery']['status'] == 100
-        # Qualify retained custody/nonreplay even while the independent cleanup
-        # classification expectation below remains deliberately unresolved.
+        # Retain custody/nonreplay for the source-required partial cleanup,
+        # including its exact No24V refusal rather than relabelling success.
         assert_reopened(rig, done)
         before = rig.children(job)
         wire = list(rig.native.trace)
@@ -144,10 +144,27 @@ def test_real_control_exit_duplicate_control_and_nonreplay(integrated_rig, actio
         assert replay.status_code == 200 and replay.json() == response.json()
         assert rig.submit(payload).json()['job_id'] == job['job_id']
         assert rig.children(job) == before and rig.native.trace == wire
-        assert done['command']['status'] == 'failed', done
+        assert done['command']['status'] == 'ambiguous', done
+        workflow = done['execution']['runtime_state']['workflow']
+        assert workflow['phase'] == 'reconciling'
+        assert workflow['held_reason'] == 'workflow_settlement_unknown'
         cleanup = [row for row in done['execution']['runtime_state']['action_results']
                    if row.get('hook') == 'cleanup']
         assert len(cleanup) == 1 and cleanup[0]['ok'] is False, cleanup
+        receipt = cleanup[0]['receipt']
+        assert receipt['status'] == 'ambiguous'
+        assert receipt['terminal_evidence'] == {
+            'delivery_attempted': True, 'detail': 'Lost 24V power go home',
+            'error': 'wp8_operation_exception:RuntimeError', 'outcome_unknown': True}
+        # Source sets current31 before goHome's No24V guard. The exception
+        # prevents both home motion and the normal current10 continuation.
+        post_abort = rig.native.trace[rig.native.abort_intervals[0]['end']:]
+        # The retained G position read (GAP type1) is not a mutation. Require
+        # exactly the current31 write and no Home/Stop/current10 continuation.
+        assert all(frame in {(4, 6, 1, 2, 0), (4, 5, 6, 2, 31)} for frame in post_abort)
+        assert [frame for frame in post_abort if frame[1] != 6] == [(4, 5, 6, 2, 31)]
+        assert post_abort[-1] == (4, 5, 6, 2, 31)
+        assert hooks(done)[-4:] == ['safe_stop_exit', 'script_finally', 'abort_true_finish', 'cleanup']
         assert not rig.native_results(done, 'epilogue_lid')
     assert_reopened(rig, done)
     before = rig.children(job)
