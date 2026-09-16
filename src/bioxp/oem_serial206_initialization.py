@@ -31,6 +31,7 @@ from .oem_deck_movement import (
     canonical_movable_object_locations,
     canonical_plate_name,
     compile_finite_plate_operation,
+    compile_cleanup_waste_prelude,
     execute_finite_plate_operation,
     plate_name_for_storage,
 )
@@ -12815,16 +12816,7 @@ class Serial206OemInitializationProvider:
         owner_identity: Mapping[str, Any], **_: Any,
     ) -> dict[str, Any]:
         del operation, arguments
-        machine = self.wp8_operation_machine_state("cleanup", {})
-        full_plan = compile_finite_plate_operation(
-            "cleanup", source_leaf_available=True, **machine,
-        )
-        children: list[dict[str, Any]] = []
-        for child in full_plan["children"]:
-            children.append(dict(child))
-            if child["operation"] == "sendGripperHome":
-                break
-        plan = {**dict(full_plan), "children": children}
+        plan = compile_cleanup_waste_prelude()
         return self._wp8_execute_nested_plan(
             plan=plan, command_id=command_id, owner_identity=owner_identity,
         )

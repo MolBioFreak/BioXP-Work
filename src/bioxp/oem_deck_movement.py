@@ -1479,20 +1479,12 @@ def _compile_finite_plate_operation_unchecked(
         return _wp8_plan(operation, children, script_running=bool(inputs.get("script_running", False)), opening=opening, sensor_success_predicate="openSensor && !closedSensor" if opening else "!openSensor && closedSensor", null_board_return=True, success_return=False if board_test else True, failure_policy="throw" if board_test else ("home_and_retry_once" if opening else "image_log_and_home_no_retry"), normal_state_update_unconditional=not board_test)
 
     # ControlLib.cleanup: distinct cleanup waste prelude, then output/reagent cover storage.
-    _wp8_child(children, "waitStop")
-    _wp8_child(children, "checkDoorStatus")
-    _wp8_child(children, "queryTipStatus", ignored_return=True)
-    if bool(inputs.get("tip_exists", False)):
-        _wp8_child(children, "scriptmoveToWaste", ignored_return=True)
-        _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0}, state_mutation={"current_location": 6, "current_well": 0})
-        _wp8_child(children, "ejectAllTipsCleanup", arguments={"first": False, "second": True}, ignored_return=True)
-        _wp8_child(children, "moveZ80000")
-        _wp8_child(children, "moveX79000")
-        _wp8_child(children, "clearTipLoaded", state_mutation={"tip_loaded": False})
-    _wp8_child(children, "sendGripperHome")
-    cover_locations = dict(inputs.get("cover_locations", {}))
+    children = compile_cleanup_waste_prelude()["children"]
+    cover_locations = dict(inputs.get("cover_locations") or {})
     for plate, destination in ((4, 18), (5, 20)):
-        source_location = int(cover_locations.get(plate, -1))
+        source_location = cover_locations.get(plate)
+        if type(source_location) is not int or source_location < 0:
+            raise ValueError(f"source_authority_missing:cleanup_plate_location:{plate}")
         if source_location == destination:
             continue
         _wp8_child(children, "doorOpen", arguments={"open": False}, ignored_return=True)
@@ -1517,8 +1509,36 @@ def _compile_finite_plate_operation_unchecked(
         "equals": True,
     }
     for child in children[2:]:
-        child["source_condition"] = dict(cleanup_condition)
+        if not child["source_condition"]:
+            child["source_condition"] = dict(cleanup_condition)
     return _wp8_plan(operation, children, exception_policy="propagate", finally_children=[], source_hazards=["destination != 20 || destination != 18", "raw_il_tautology: destination != 20 || destination != 18"])
+
+
+def compile_cleanup_waste_prelude() -> dict[str, Any]:
+    """Compile cleanup's shared stop/door/tip prefix without cover custody.
+
+    The waste_sequence caller ends at gripper home and must not require or
+    invent plate locations for the full cleanup continuation.
+    """
+    children: list[dict[str, Any]] = []
+    _wp8_child(children, "waitStop")
+    _wp8_child(children, "checkDoorStatus")
+    _wp8_child(children, "queryTipStatus", ignored_return=True)
+    # ControlLib reads collection TipExist AFTER queryTipStatus, not the
+    # machine's precompiled TipLoaded. The existing result condition also
+    # skips this branch when the door check skipped the query itself.
+    tip_condition = {"child_order": 2, "result_field": "tip_exists", "equals": True}
+    _wp8_child(children, "scriptmoveToWaste", ignored_return=True, source_condition=tip_condition)
+    _wp8_child(children, "updateLocation", arguments={"destination": 6, "well": 0}, state_mutation={"current_location": 6, "current_well": 0}, source_condition=tip_condition)
+    _wp8_child(children, "ejectAllTipsCleanup", arguments={"first": False, "second": True}, ignored_return=True, source_condition=tip_condition)
+    _wp8_child(children, "moveZ80000", source_condition=tip_condition)
+    _wp8_child(children, "moveX79000", source_condition=tip_condition)
+    _wp8_child(children, "clearTipLoaded", state_mutation={"tip_loaded": False})
+    _wp8_child(children, "sendGripperHome")
+    for child in children[2:]:
+        if not child["source_condition"]:
+            child["source_condition"] = {"child_order": 1, "result_field": "door_ok", "equals": True}
+    return _wp8_plan("cleanup", children, exception_policy="propagate", finally_children=[])
 
 
 def compile_finite_plate_operation(
