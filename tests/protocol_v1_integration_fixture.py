@@ -22,6 +22,9 @@ class NativePhysicalRecorder:
     Never replace forceAbortMotion, thermal wait/tick, initialCheck, generation
     minting, initialize_motors, the canonical adapter or lifecycle hooks.
     """
+    door_open_position: int
+    positions: dict[tuple[int, int], int]
+
     def __init__(self, monkeypatch):
         from bioxp.usb_driver import BioXpTester
         self.tester = object.__new__(BioXpTester)
@@ -31,6 +34,7 @@ class NativePhysicalRecorder:
         self.tester._oem_24v_dropped = False
         self.tester._oem_user_stopped = False
         self.trace, self.replies, self.timers = [], {}, []
+        self.axis_parameters = {}
         self.thermal_wait = threading.Event()
         self.tester.send_tmcl_retry = self.exchange
         self.tester._send_motor = self.exchange
@@ -56,7 +60,35 @@ class NativePhysicalRecorder:
              (command == 10 and typ in (7, 8) and bank in (0, 1)) or
              (command in (140, 144) and typ == 0 and bank in (0, 1))))
         gripper_home_switch = key == (4, 6, 9, 2)
-        assert thermal or chiller or gripper_home_switch, f'unrecorded native physical command: {(*key, value)}'
+        motor_readback = command == 6 and typ in (1, 3) and (board, bank) in self.positions
+        if motor_readback:
+            return {'status': 100, 'value': self.positions[board, bank] if typ == 1 else 0}
+        if key == (5, 14, 2, 0) and value in (0, 1):
+            return {'status': 100, 'value': value}
+        if key == (4, 3, 0, 2) and value == 0:
+            return {'status': 100, 'value': 0}
+        if key == (4, 2, 0, 2) and value == 200:
+            # Synthetic instantaneous arrival at G's mechanical stop.
+            self.positions[4, 2] = 0
+            return {'status': 100, 'value': 0}
+        axis_parameters = command in (5, 6) and (board, bank, typ) in {
+            (6, 0, 6), (6, 0, 205), (4, 2, 1), (4, 2, 4), (4, 2, 6), (4, 2, 205), (4, 0, 6)}
+        door_sensors = board == 6 and bank == 0 and command == 6 and typ in (9, 10, 12, 13)
+        assert thermal or chiller or gripper_home_switch or axis_parameters or door_sensors, f'unrecorded native physical command: {(*key, value)}'
+        if gripper_home_switch:
+            return {'status': 100, 'value': int(self.tester.motor_get_position(4, motor=2)['position'] == 0)}
+        if door_sensors:
+            position = self.tester.motor_get_position(6, motor=0)['position']
+            active = position == (0 if typ == 9 else self.door_open_position)
+            return {'status': 100, 'value': int(active) if typ in (9, 10) else 1}
+        # Synthetic controller register storage for actual SAP/GAP round trips.
+        if axis_parameters:
+            parameter = (board, typ, bank)
+            if command == 5:
+                self.axis_parameters[parameter] = value
+                if typ == 1:
+                    self.positions[board, bank] = value
+            return {'status': 100, 'value': self.axis_parameters.get(parameter, 0)}
         # Synthetic measured temperature/PWM and rate replies, not live proof.
         scalar = 10 if typ == 23 else 25000 if command == 143 or (command == 10 and typ == 4) else 1000 if command == 10 else 0
         return {'status': 100, 'value': scalar}
@@ -226,14 +258,15 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     app, provider, primitive, references, root, _, calls, wire, transport = query_rig
     motor_leaf, raw_moves = ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
     native = NativePhysicalRecorder(monkeypatch)
+    native.door_open_position = provider._wp8_door_config()['open']
     # Mechanical motion/readback leaves only. Do not copy the recorder's fixed
     # oem_no24v_state or board-state methods over real native safety owners.
-    for name in ('motor_get_position', 'motor_get_speed', 'motor_set_axis_param',
-                 'motor_oem_move_absolute', 'motor_wait_target_reached',
+    for name in ('motor_oem_move_absolute', 'motor_wait_target_reached',
                  'motor_wait_target_reached_many', 'begin_bus_event_window',
                  'collect_bus_events'):
         setattr(native.tester, name, getattr(motor_leaf, name))
     motor_leaf.positions.update({(5, 1): 0, (6, 0): 0, (4, 2): 0})
+    native.positions = motor_leaf.positions
     from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
     adapter = Serial206ProductionPrimitiveAdapter(native.tester, None,
         authority_provider=lambda: {}, generation_provider=provider.generation_provider,
