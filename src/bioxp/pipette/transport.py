@@ -1525,6 +1525,33 @@ class FourPipetteTransport:
     def checked_pipette_status(self) -> dict[str, Any]:
         return self.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
 
+    def read_pressure_for_oem_source(self, tip_exists: Callable[[], bool | None]) -> dict[str, Any]:
+        """Source-empty return, not a measured zero or a manual query policy.
+
+        The callback must read the existing committed collection owner. Never
+        substitute cached transport flags or MachineStatus.TipLoaded for it.
+        Loaded tips retain the existing pressure eligibility/parsing path.
+        """
+        with self._transaction_lock:
+            identity = self.collection_source_identity()
+            exists = tip_exists()
+            if self.collection_source_identity() != identity:
+                raise RuntimeError("pipette_collection_owner_changed_during_pressure_read")
+            if type(exists) is not bool:
+                raise RuntimeError("pipette_collection_tip_state_unknown")
+            if exists:
+                return self.read_pressure()
+            return {
+                "ok": True, "source_return_completed": True, "source_noop": True,
+                "source_return": [0.0, 0.0, 0.0, 0.0],
+                "channels": [], "channel_count": 0,
+                "outcome": "oem_empty_pressure_source_return",
+                "hardware_truth_level": "source_model_default",
+                "hardware_query_verified": False, "physical_effect_verified": False,
+                "delivery_attempted": False,
+                "oem_source_anchor": "ClassPipetteCollection.readPressure:248-259",
+            }
+
     def read_pressure(self, channels: list[int] | None = None) -> dict[str, Any]:
         selected, eligibility = self._tip_eligibility(channels)
         rows = [{"channel": channel, "result": self._transports[channel].query_pressure()} for channel in selected]

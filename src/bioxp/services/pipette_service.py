@@ -995,7 +995,8 @@ class _OemPipetteBody:
         self.speed(30.0)
         self.pipette("dispense_air_source", lambda t: t.dispense_air_for_oem_script(float(int(volume)), front_air=True, pressure_stream=self.settings["LogPressure"]))
         if not self.settings["LogPressure"]:
-            self.pipette("read_pressure", lambda t: t.read_pressure())
+            self.pipette("read_pressure", lambda t: t.read_pressure_for_oem_source(
+                lambda: self.n.tip_exists(self.action, self.state)))
         return self.result()
 
     def masp(self):
@@ -1211,7 +1212,8 @@ class _OemPipetteBody:
             self.n.source_error_event(message, self.action, self.state)
 
     def pressure_base(self):
-        pressure = self.pipette("read_pressure", lambda t: t.read_pressure())
+        pressure = self.pipette("read_pressure", lambda t: t.read_pressure_for_oem_source(
+            lambda: self.n.tip_exists(self.action, self.state)))
         values = [0.0, 0.0, 0.0, 0.0]
         for row in pressure["channels"]:
             values[row["channel"]] = row["result"]["pressure"]
@@ -1611,7 +1613,8 @@ def build_oem_pipette_handlers(
             int(volume), channels=transport._tip_location_channels(), front_air=True,
         ))
         if not cast(Mapping, source_settings)["LogPressure"]:
-            pipette("read_pressure", lambda transport: transport.read_pressure())
+            pipette("read_pressure", lambda transport: transport.read_pressure_for_oem_source(
+                lambda: cast(OemPipetteSourceBindings, source_bindings).tip_exists(action, state)))
         return _oem_source_result(action, steps)
 
     def ini_pipette(action: Any, state: Any) -> dict[str, Any]:
@@ -1645,7 +1648,8 @@ def build_oem_pipette_handlers(
         if not initialized["ok"]:
             return {**_oem_source_result(action, steps), "ok": False,
                     "source_error": "could not initialize pipette"}
-        pressure = pipette("read_pressure", lambda t: t.read_pressure())
+        pressure = pipette("read_pressure", lambda t: t.read_pressure_for_oem_source(
+            lambda: cast(OemPipetteSourceBindings, source_bindings).tip_exists(action, state)))
         # ClassPipetteCollection.readPressure initializes all four values to
         # zero, querying only source-present tips. These zeros are model data,
         # not fabricated hardware-query verification.
