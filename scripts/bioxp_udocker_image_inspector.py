@@ -99,11 +99,24 @@ def _image_root(store: Path, image_id: str) -> Path:
     return matches[0]
 
 
-def _materialize_udocker_rootfs(store: Path, tag_root: Path, destination: Path) -> None:
+def _materialize_udocker_rootfs(store: Path, tag_root: Path, destination: Path, config: dict[str, Any]) -> None:
     ancestry = json.loads(_safe_regular(tag_root / "ancestry", "uDocker ancestry"))
     _need(isinstance(ancestry, list) and bool(ancestry), "uDocker ancestry is invalid")
+    rootfs = config.get("rootfs")
+    if not isinstance(rootfs, dict) or rootfs.get("type") != "layers":
+        raise RuntimeError("OCI rootfs is invalid")
+    diff_ids = rootfs.get("diff_ids")
+    if not isinstance(diff_ids, list) or not diff_ids or not all(
+        isinstance(value, str) and IMAGE_ID_RE.fullmatch(value) for value in diff_ids
+    ):
+        raise RuntimeError("OCI layer order is invalid")
+    ordered = [value[7:] for value in diff_ids]
+    _need(all(isinstance(value, str) for value in ancestry) and sorted(ancestry) == sorted(ordered),
+          "uDocker ancestry differs from OCI layer membership")
+    # uDocker ancestry is newest-first; OCI diff_ids is the authenticated
+    # base-to-top application order. Reversing overlays can restore old code.
     destination.mkdir(parents=True, exist_ok=True)
-    for digest in ancestry:
+    for digest in ordered:
         _need(isinstance(digest, str) and HEX64_RE.fullmatch(digest) is not None, "uDocker layer digest is invalid")
         layer = store / "layers" / f"{digest}.layer"
         _need(layer.is_file() and not layer.is_symlink() and sha256_file(layer) == digest, f"uDocker layer is absent or corrupt: {digest}")
@@ -174,7 +187,7 @@ def _measure(store: Path, image_id: str, source_manifest: Path) -> tuple[dict[st
     else:
         temporary = tempfile.TemporaryDirectory(prefix="bioxp-udocker-inspection-")
         rootfs = Path(temporary.name)
-        _materialize_udocker_rootfs(store, root, rootfs)
+        _materialize_udocker_rootfs(store, root, rootfs, config)
     embedded_path = rootfs / EMBEDDED_MANIFEST_PATH.lstrip("/")
     embedded_raw = _safe_regular(embedded_path, "embedded source manifest")
     _need(embedded_raw == external_raw, "embedded source manifest bytes differ from the external manifest")
