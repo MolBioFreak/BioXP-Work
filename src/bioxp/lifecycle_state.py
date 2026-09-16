@@ -14,11 +14,12 @@ from typing import Any, Callable, Mapping
 
 
 PUBLIC_OPERATION_STATES = frozenset({"waiting", "running", "paused", "stopped", "emergency", "error"})
-STARTUP_STAGES = ("constructor_pipette_stage", "initial_check", "initialization_without_motion")
+# ControlLib constructs/configures motors before BioXPMainWindow.initialCheck.
+STARTUP_STAGES = ("constructor_pipette_stage", "initialization_without_motion", "initial_check")
 _PREDECESSOR = {
     "constructor_pipette_stage": None,
-    "initial_check": "constructor_pipette_stage",
-    "initialization_without_motion": "initial_check",
+    "initialization_without_motion": "constructor_pipette_stage",
+    "initial_check": "initialization_without_motion",
 }
 
 
@@ -153,28 +154,8 @@ class CanonicalLifecycleOwner:
                     "evidence": copy.deepcopy(row.get("evidence")),
                     "error": row.get("error"),
                 })
-                successor = self._stages["initialization_without_motion"]
-                if successor.get("state") == "passed":
-                    successor.setdefault("history", []).append(
-                        {
-                            "attempt_id": successor.get("attempt_id"),
-                            "started_at": successor.get("started_at"),
-                            "completed_at": successor.get("completed_at"),
-                            "state": successor.get("state"),
-                            "evidence": copy.deepcopy(successor.get("evidence")),
-                            "error": "invalidated_by_repeat_initial_check",
-                        }
-                    )
-                    successor.update(
-                        {
-                            "state": "blocked",
-                            "attempt_id": None,
-                            "started_at": None,
-                            "completed_at": None,
-                            "evidence": None,
-                            "error": "invalidated_by_repeat_initial_check",
-                        }
-                    )
+                # A repeated initialCheck does not replay/invalidate constructor
+                # configuration. Native cmd64 owns current-generation readiness.
             attempt_id = uuid.uuid4().hex
             row.update({
                 "state": "running",

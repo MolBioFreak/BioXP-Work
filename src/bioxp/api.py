@@ -1508,6 +1508,13 @@ class _LifecycleHardware:
         acks = self.tester.activate_boards(expect_reply=True, fail_fast=True)
         return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
+    def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
+        # The native owner validates raw board ACK maps, not adapter wrappers.
+        begin = getattr(self.tester, "oem_begin_board_lifecycle_generation", None)
+        if not callable(begin):
+            raise RuntimeError("initial_check_generation_unavailable")
+        return begin(deactivation=deactivation["acks"], activation=activation["acks"])
+
 
 def _can_ready_observation() -> bool | None:
     return (hardware_state.ownership_projection().get("ownership") or {}).get("CAN_READY")
@@ -10780,16 +10787,11 @@ def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[st
     begin_generation = getattr(tester, "oem_begin_board_lifecycle_generation", None)
     if not callable(begin_generation):
         raise RuntimeError("workflow_initial_check_generation_unavailable")
-    class WorkflowHardware(_LifecycleHardware):
-        def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
-            # LifecycleHardware wraps the raw board ACK maps; the native
-            # generation owner validates those maps, not the wrapper status.
-            return begin_generation(deactivation=deactivation["acks"], activation=activation["acks"])
     provider = _serial206_oem_initialization_provider
     if provider is None:
         raise RuntimeError("workflow_initial_check_provider_unavailable")
     return lifecycle_state.run_workflow_wake_initial_check(
-        WorkflowHardware(tester), validate_current=validate_current,
+        _LifecycleHardware(tester), validate_current=validate_current,
         can_ready=_can_ready_observation, sleep=provider.sleep,
     )
 

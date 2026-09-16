@@ -5555,6 +5555,7 @@ class BioXpTester:
         if invalid:
             raise ValueError(f"unsupported no-motion components: {sorted(invalid)}")
         transcript = []
+        generation_before = self.oem_current_board_lifecycle_generation()
 
         def emit(label, board, command, cmd_type, motor, value, *, ordinary_motor_retry=False):
             send = self.send_tmcl if ordinary_motor_retry else self.send_tmcl_retry
@@ -5682,11 +5683,13 @@ class BioXpTester:
 
         failures = [row for row in transcript if row.get("ack") is not None and not row.get("ok")]
         no_replies = [row for row in transcript if "ack" in row and row.get("ack") is None]
-        lifecycle_generation = getattr(self, "_oem_active_board_lifecycle_generation", None)
-        generation_bound = type(lifecycle_generation) is int
-        generation_value = lifecycle_generation if type(lifecycle_generation) is int else None
+        generation_value = self.oem_current_board_lifecycle_generation()
+        generation_changed = generation_value != generation_before
+        generation_bound = generation_value is not None and not generation_changed
         report = {
-            "ok": not failures and not no_replies and generation_bound,
+            # Constructor configuration precedes initialCheck's board cycle.
+            # Successful writes are not a generation-bound readiness claim.
+            "ok": not failures and not no_replies and not generation_changed,
             "test_case": "oem.initializeMotorsWithoutMotion.live_parity.v1",
             "test_case_note": "Source-faithful command-sequence test; it does not home or command axis movement.",
             "source_anchor": source_anchor,
@@ -5696,7 +5699,8 @@ class BioXpTester:
             "board_wait": board_wait,
             "board_lifecycle_generation": generation_value,
             "generation_bound": generation_bound,
-            "generation_failure": None if generation_bound else "complete_cmd64_0_to_1_cycle_required",
+            "generation_failure": "board_lifecycle_generation_changed" if generation_changed else None,
+            "generation_binding_note": None if generation_bound else "configuration_is_not_current_generation_readiness",
             "machine_values": {"z_current": z_current, "z_current_source": z_current_source, "z_stall_guard": z_stall, "z_stall_guard_source": z_stall_source, "gripper_version": gripper_version},
             "transcript": transcript,
             "failures": failures,
@@ -5705,9 +5709,7 @@ class BioXpTester:
         ready = set(getattr(self, "_oem_no_motion_profiles_ready", set()))
         generations = dict(getattr(self, "_oem_no_motion_profile_generations", {}))
         fingerprints = dict(getattr(self, "_oem_no_motion_profile_fingerprints", {}))
-        if report["ok"]:
-            if generation_value is None:
-                raise RuntimeError("board lifecycle generation disappeared during profile preparation")
+        if report["ok"] and generation_bound and generation_value is not None:
             prepared = {component for component in selected if component in {"x", "y", "z", "g", "door"}}
             ready.update(prepared)
             for component in prepared:
@@ -5727,42 +5729,30 @@ class BioXpTester:
         self._oem_no_motion_profiles_ready = ready
         self._oem_no_motion_profile_generations = generations
         self._oem_no_motion_profile_fingerprints = fingerprints
-        self._oem_no_motion_profile_ready = bool(report["ok"] and {"x", "y", "z", "g", "door"}.issubset(ready))
+        self._oem_no_motion_profile_ready = bool(report["ok"] and generation_bound and {"x", "y", "z", "g", "door"}.issubset(ready))
         return report
 
     def motor_oem_require_no_motion_profile(self, axis_key=None, *, expected_overrides=None):
-        """Require and verify OEM activation -> profile initialization ordering."""
-        ready = set(getattr(self, "_oem_no_motion_profiles_ready", set()))
-        current_generation = getattr(self, "_oem_active_board_lifecycle_generation", None)
-        generations = dict(getattr(self, "_oem_no_motion_profile_generations", {}))
+        """Verify current native registers without inventing preparation history.
+
+        Constructor configuration precedes initialCheck; cmd64 invalidates its
+        readiness receipt. Only fresh readbacks in a real active cycle may
+        establish a current profile, never a cloned constructor/wake epoch.
+        """
+        current_generation = self.oem_current_board_lifecycle_generation()
+        if current_generation is None:
+            raise RuntimeError("OEM current profile requires an active board lifecycle generation")
         key = None if axis_key is None else str(axis_key).strip().lower()
         if key is None:
-            required = {"x", "y", "z", "g", "door"}
-            generation_ready = bool(
-                type(current_generation) is int
-                and all(generations.get(component) == current_generation for component in required)
-            )
-            profile_ready = bool(
-                getattr(self, "_oem_no_motion_profile_ready", False)
-                and required.issubset(ready)
-                and generation_ready
-            )
-        else:
-            generation_ready = bool(
-                type(current_generation) is int
-                and generations.get(key) == current_generation
-            )
-            profile_ready = key in ready and generation_ready
-        if not profile_ready:
-            raise RuntimeError(
-                "OEM no-motion motor profile is not established in the active board lifecycle generation; "
-                "run /motion/oem/prepare_without_motion before exact OEM movement"
-            )
-        if key is None:
+            profiles = {axis: self.motor_oem_require_no_motion_profile(axis)
+                        for axis in ("x", "y", "z", "g", "door")}
+            if self.oem_current_board_lifecycle_generation() != current_generation:
+                raise RuntimeError("board lifecycle generation changed during profile verification")
             return {
                 "ok": True,
-                "source": "initializeMotorsWithoutMotion",
+                "source": "current_native_profile_readbacks",
                 "board_lifecycle_generation": current_generation,
+                "profiles": profiles,
             }
 
         preset_raw = self._motion_oem_axis_profile(key)
@@ -5815,9 +5805,11 @@ class BioXpTester:
                 f"OEM no-motion profile readback mismatch for {axis_key}: {mismatches}; "
                 "run /motion/oem/prepare_without_motion again"
             )
+        if self.oem_current_board_lifecycle_generation() != current_generation:
+            raise RuntimeError("board lifecycle generation changed during profile verification")
         return {
             "ok": True,
-            "source": "initializeMotorsWithoutMotion",
+            "source": "current_native_profile_readbacks",
             "axis": str(axis_key).strip().lower(),
             "board": board,
             "motor": motor,
