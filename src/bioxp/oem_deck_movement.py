@@ -1758,6 +1758,8 @@ def make_wp8_operation_executor(
                         result={
                             "exception_type": type(exc).__name__, "exception": str(exc),
                             "delivery_attempted": child_delivery_attempted,
+                            **({"provider_results": exc.provider_results}
+                               if isinstance(exc, DeckExecutionFailure) else {}),
                         },
                         dispatch_attempt_id=child_dispatch_attempt_id,
                     )

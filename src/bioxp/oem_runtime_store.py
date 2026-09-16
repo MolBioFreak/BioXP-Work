@@ -113,6 +113,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     9: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     10: "0ce5be874ced2cf3dcf94034c31e9202469517fd7355238fd4b5981e5aad289a",
     11: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",
+    12: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # decision trigger only
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2691,6 +2692,8 @@ def _verify_runtime_release_start(connection: sqlite3.Connection) -> None:
     if actual_triggers != expected_triggers:
         raise RuntimeError("canonical runtime release append-only trigger attestation failed")
 
+from . import oem_deck_recovery_schema_v12 as _recovery_v12
+
 WORKFLOW_SCHEMA_VERSION = 11
 _WORKFLOW_DDL = (
     "ALTER TABLE operator_plane_lane ADD COLUMN workflow_command_id TEXT REFERENCES operator_commands(command_id)",
@@ -2805,6 +2808,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         _deck_v9.migration_identity(),
         _pipette_v10.migration_identity(),
         workflow_migration_identity(),
+        _recovery_v12.migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -3137,7 +3141,7 @@ def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
     return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
-def canonical_runtime_schema_manifest(*, version: int = WORKFLOW_SCHEMA_VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = _recovery_v12.VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3179,6 +3183,8 @@ def canonical_runtime_schema_manifest(*, version: int = WORKFLOW_SCHEMA_VERSION)
             _pipette_v10.apply(expected)
         if version >= WORKFLOW_SCHEMA_VERSION:
             _apply_workflow_schema(expected)
+        if version >= _recovery_v12.VERSION:
+            _recovery_v12.apply(expected)
         expected.execute(f"PRAGMA user_version={version}")
         _reinstall_operator_global_triggers(expected)
         return {
@@ -3224,7 +3230,12 @@ def verify_canonical_runtime_database(
         if version >= WORKFLOW_SCHEMA_VERSION:
             _verify_workflow_resource_membership(connection)
         _verify_operator_command_plane_schema_v1(connection)
-        if version >= _deck_v9.VERSION:
+        if version >= _recovery_v12.VERSION:
+            # The union manifest below attests every table/index/trigger, including
+            # V12's changed decision trigger. Preserve full data FK validation.
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("canonical recovery schema foreign-key check failed")
+        elif version >= _deck_v9.VERSION:
             _deck_v9.verify(connection)
         elif version >= _deck_v8.VERSION:
             _deck_v8.verify(connection)
@@ -3698,19 +3709,20 @@ def _migrate_oem_deck_schema_v7_locked(
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == WORKFLOW_SCHEMA_VERSION:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _recovery_v12.VERSION:
         # An already-prepared database needs no migration, lifecycle-exclusive
         # lock, or data audit. Its size must not determine service startup time.
         verify_canonical_runtime_database(connection)
         return
     coordinator = runtime_write_coordinator(root)
     with coordinator.lock:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_deck_v8.VERSION, _deck_v9.VERSION, _pipette_v10.VERSION):
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_deck_v8.VERSION, _deck_v9.VERSION, _pipette_v10.VERSION, WORKFLOW_SCHEMA_VERSION):
             selected_root = Path(root).expanduser().resolve(strict=False)
             if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _deck_v8.VERSION:
                 _deck_v9.migrate(connection, selected_root, canonical_runtime_migration_registry()[8])
             _pipette_v10.migrate(connection, selected_root, canonical_runtime_migration_registry()[9])
             _migrate_workflow_schema(connection, selected_root)
+            _recovery_v12.migrate(connection, selected_root, canonical_runtime_migration_registry()[11])
         else:
             _migrate_runtime_database_v2_locked(connection, root)
 
@@ -3834,6 +3846,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _deck_v9.migrate(connection, selected_root, registry[8])
         _pipette_v10.migrate(connection, selected_root, registry[9])
         _migrate_workflow_schema(connection, selected_root)
+        _recovery_v12.migrate(connection, selected_root, registry[11])
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3968,6 +3981,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _deck_v9.migrate(connection, selected_root, registry[8])
         _pipette_v10.migrate(connection, selected_root, registry[9])
         _migrate_workflow_schema(connection, selected_root)
+        _recovery_v12.migrate(connection, selected_root, registry[11])
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
@@ -4051,7 +4065,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == WORKFLOW_SCHEMA_VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _recovery_v12.VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():

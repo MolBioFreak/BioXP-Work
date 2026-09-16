@@ -45,7 +45,12 @@ def _normal_claim_eligibility(connection, *, binding, resources, command_id=None
             "SELECT 1 FROM serial206_command_resources r JOIN operator_commands c USING(command_id) "
             "LEFT JOIN serial206_movement_commands m USING(command_id) "
             "WHERE r.resource_key=? AND c.command_id<>? "
-            "AND COALESCE(m.state,c.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') LIMIT 1",
+            "AND COALESCE(m.state,c.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') "
+            # Acknowledgement relinquishes workflow custody, not physical
+            # resource uncertainty. Only the existing governed decision can
+            # dispose an ambiguous movement resource without rewriting it.
+            "AND NOT (m.state='ambiguous' AND c.status IN ('ambiguous','interrupted') "
+            "AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d WHERE d.command_id=c.command_id)) LIMIT 1",
             (resource, command_id or ""),
         ).fetchone()
         if busy:

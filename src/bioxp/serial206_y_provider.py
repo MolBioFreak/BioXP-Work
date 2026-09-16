@@ -82,6 +82,7 @@ class Serial206YProvider:
         self.state_store = state_store
         self.generation_provider = generation_provider
         self.reference_store = reference_store
+        self._home_recovery_owner_id = uuid.uuid4().hex
         self._operation_interrupt_epoch: ContextVar[int | None] = ContextVar(
             "y_operation_interrupt_epoch", default=None
         )

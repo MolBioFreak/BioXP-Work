@@ -3851,6 +3851,14 @@ def install_operator_control_plane(
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
+        # Reconciliation is committed after the immutable terminal receipt.
+        # Keep that receipt authoritative, but disclose the existing deck
+        # owner's current resolution rather than its terminal-time snapshot.
+        if isinstance(row.get("deck_movement"), Mapping):
+            deck_receipt = await asyncio.to_thread(command_plane.store.get_command, command_id)
+            if deck_receipt is not None and isinstance(deck_receipt.get("deck_movement"), Mapping):
+                row = {**row, "deck_movement": {**row["deck_movement"],
+                    "recovery_resolution": deck_receipt["deck_movement"].get("recovery_resolution")}}
         compact["transport_exchanges"] = list(row.get("transport_exchanges") or [])
         compact["source_receipt"] = source_receipt
         raw_return_layers = dict(row.get("raw_return_layers") or {})
