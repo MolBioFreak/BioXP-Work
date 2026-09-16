@@ -59,7 +59,7 @@ def test_nested_source_exception_is_retained_not_lost_in_parent_return():
 
 def test_stop_does_not_cancel_an_entered_nested_task_or_allow_a_new_one():
     doc = document('led')
-    entered, release = Event(), Event()
+    entered, release, published = Event(), Event(), Event()
     futures = []
     def composite(action, state):
         def child():
@@ -67,11 +67,13 @@ def test_stop_does_not_cancel_an_entered_nested_task_or_allow_a_new_one():
             assert release.wait(4)
             return {'ok': True, 'native_return': 'after-stop'}
         futures.append(executor.start_child('source:0:entered', child, domains=('Tip',)))
+        published.set()
         return {'ok': True}
     executor, trace = engine(doc, handlers={'led': composite})
     run = start(executor, doc)
     try:
-        assert entered.wait(3)
+        # The native child may enter before start_child returns its Future.
+        assert entered.wait(3) and published.wait(3)
         executor.interrupt(control_id='addressed-stop')
         with pytest.raises(Exception):
             executor.start_child('source:0:late', lambda: pytest.fail('late entry'), domains=('Tip',))
