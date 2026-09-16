@@ -524,11 +524,19 @@ class CameraProvider:
                 raise CameraFrameUnavailable("inspection capture exceeds bounded frame size")
             buffer = CameraJpegBuffer()
             captured = list(buffer.feed(content))
-            if (len(captured) != frames or buffer.dropped or buffer.buffer
-                    or b"".join(captured) != content):
+            if len(captured) != frames or buffer.dropped or buffer.buffer:
                 raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
+            remaining = content
             for image in captured:
+                if not remaining.startswith(image):
+                    raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
                 self._validate_jpeg(image)
+                # Native UVC copy packets can have zero padding after EOI.
+                # Strip only after each complete verified frame, never within
+                # a JPEG or before the first frame; reject all other bytes.
+                remaining = remaining[len(image):].lstrip(b"\x00")
+            if remaining:
+                raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
             after = self._inspection_controls(identity)
             self._check_inspection_controls(configured, after)
             return CameraInspectionFrame(
