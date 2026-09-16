@@ -41,6 +41,7 @@ from .oem_runtime_store import (
 )
 from .runtime_audit_store import open_runtime_connection
 from .oem_deck_catalog import configured_location_names, public_target_keys
+from .oem_compat.position_table import tip_group_well_ids
 from .oem_deck_movement import (
     ClassMoveToIntent,
     MovExecutionPlan,
@@ -3668,7 +3669,7 @@ class OperatorCommandStore:
                 return {"schema_version": "bioxp.operator_tip_tray_state.v1",
                         "tray_id": tray_id, "occupancy": constructor["occupancy"],
                         "tip_available": constructor["tip_available"],
-                        "available_count": sum(all(constructor["occupancy"][i:i+4]) for i in range(0,96,4)),
+                        "available_count": sum(all(constructor["occupancy"][i] for i in tip_group_well_ids(group)) for group in range(24)),
                         "revision": 0, "constructor_only": True,
                         "operation_id": f"{constructor['construction_id']}:tray:{tray_id}",
                         "command_id": constructor["construction_id"],
@@ -3773,10 +3774,10 @@ class OperatorCommandStore:
                     occupancy[selected[0]] = False
                 elif operation == "remove_group":
                     assert group_index is not None
-                    selected = list(range(group_index * 4, group_index * 4 + 4))
+                    selected = list(tip_group_well_ids(group_index))
                     for well_id in selected:
                         occupancy[well_id] = False
-                    available_count = sum(all(occupancy[group * 4:group * 4 + 4]) for group in range(24))
+                    available_count = sum(all(occupancy[i] for i in tip_group_well_ids(group)) for group in range(24))
                     if group_index == 23:
                         tip_available = False
                 elif operation == "remove_all":
@@ -3786,7 +3787,7 @@ class OperatorCommandStore:
                 elif operation == "camera_missing":
                     for well_id in selected:
                         occupancy[well_id] = False
-                    available_count = sum(all(occupancy[group * 4:group * 4 + 4]) for group in range(24))
+                    available_count = sum(all(occupancy[i] for i in tip_group_well_ids(group)) for group in range(24))
                     if available_count == 0:
                         tip_available = False
                 elif operation in {"add_tip", "retip"}:

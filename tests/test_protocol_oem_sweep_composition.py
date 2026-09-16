@@ -26,7 +26,7 @@ def test_api_sweep_canonical_children_and_sqlite_with_physical_leaves_only(query
     from bioxp.protocols.runtime_state import ProtocolRuntimeState, ProtocolWorkflowState
     from bioxp.operator_command_plane import OperatorCommandStore
     from tests.test_deck_complete_admission import ready
-    app, provider, primitive, references, root, _, calls, _, transport = query_rig
+    app, provider, primitive, references, root, _, calls, wire, transport = query_rig
     ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
     store = app.state.operator_command_plane.store
     stamps = provider.deck_owner_authority_stamps()
@@ -49,8 +49,12 @@ def test_api_sweep_canonical_children_and_sqlite_with_physical_leaves_only(query
         return original(child, **kwargs)
     monkeypatch.setattr(provider, 'execute_wp8_child', execute)
     ejections = []
-    monkeypatch.setattr(transport, 'eject_all_tips', lambda **kw: ejections.append(kw) or {
-        'ok': True, 'delivery_attempted': True, 'controller_command_acknowledged': True})
+    wire['data'] = [[32, 96, 49] for _ in range(4)]
+    def eject_channels(channels, **kwargs):
+        ejections.append((channels, kwargs))
+        wire['data'] = [[32, 96, 48] for _ in range(4)]
+        return []  # physical send/wait leaf only; transport/finalizer stay real
+    monkeypatch.setattr(transport, '_eject_tip_channels_once', eject_channels)
     entered, release = threading.Event(), threading.Event()
     def dispatch(command):
         entered.set()
@@ -75,19 +79,33 @@ def test_api_sweep_canonical_children_and_sqlite_with_physical_leaves_only(query
             import json
             pytest.fail(json.dumps(getattr(exc, 'provider_results', {'error': str(exc)}), default=str))
         assert result['ok'], result
-        assert len(ejections) == 1 and calls == [0, 1, 2, 3] * 2
-        rows = store.connection.execute('SELECT command_id,status FROM operator_commands WHERE parent_command_id=? ORDER BY sequence', ('sweep-parent',)).fetchall()
-        assert len(rows) == 11
-        assert all(row['status'] in ('completed', 'observed') for row in rows)
-        assert len({row['command_id'] for row in rows}) == 11
+        assert len(ejections) == 1 and ejections[0][0] == [0, 1, 2, 3]
+        assert calls == [0, 1, 2, 3] * 4
+        import json
+        rows = store.connection.execute('SELECT command_id,status,action_id,requested_inputs_json FROM operator_commands WHERE parent_command_id=? ORDER BY sequence', ('sweep-parent',)).fetchall()
+        # Source calls and nested semantic publications have separate custody.
+        # Assert their identities/operations rather than guessing a child count.
+        finite = [json.loads(row['requested_inputs_json'])['operation'] for row in rows
+                  if row['action_id'] == 'oem.deck._finite_operation']
+        assert finite == ['pipette_script_move', 'pipette_location', 'pipette_home',
+                          'pipette_current', 'pipette_tip_transition',
+                          'pipette_script_waste', 'pipette_move_z', 'pipette_move_x']
+        assert [row['action_id'] for row in rows if row['action_id'].startswith('pipette.')] == [
+            'pipette.query_all_pipette_tip_states', 'pipette.eject_all_tips',
+            'pipette.query_all_pipette_tip_states']
+        bad = [(row['action_id'], row['status']) for row in rows if row['status'] not in ('completed', 'observed')]
+        assert not bad, json.dumps(bad)
+        assert len({row['command_id'] for row in rows}) == len(rows)
         fresh = OperatorCommandStore(root)
         try:
             tip = fresh.tip_tray_state(0)
             assert all(tip['occupancy'][i] is False for i in (0, 24, 48, 72))
             assert tip['command_id'] in {row['command_id'] for row in rows}
-            assert fresh.get_command('sweep-parent')['status'] == 'dispatched'
-            assert fresh.deck_semantic_state()['current_well'] == 96
-            assert all(fresh.get_command(row['command_id'])['status'] == row['status'] for row in rows)
+            assert fresh.get_workflow('sweep-parent')['command']['status'] == 'dispatched'
+            # ControlLib.sweep:7032 selects destination 6 / wellID 0.
+            assert fresh.deck_semantic_state()['current_well'] == 0
+            persisted = fresh.connection.execute('SELECT command_id,status,action_id,requested_inputs_json FROM operator_commands WHERE parent_command_id=? ORDER BY sequence', ('sweep-parent',)).fetchall()
+            assert [dict(row) for row in persisted] == [dict(row) for row in rows]
         finally:
             fresh.stop()
     finally:

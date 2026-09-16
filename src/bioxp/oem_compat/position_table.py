@@ -41,6 +41,14 @@ def well_id_from_label(value: str | int) -> int:
     return well_id
 
 
+def tip_group_well_ids(group_index: int) -> tuple[int, ...]:
+    """ClassTipTray.removeTip(tipLocation, -1), in canonical wellID order."""
+    if type(group_index) is not int or group_index not in range(24):
+        raise ValueError("tip group index must be in 0..23")
+    column, row = divmod(group_index, 2)
+    return tuple(column + (row + 2 * channel) * 12 for channel in range(4))
+
+
 def well_label_from_id(value: int) -> str:
     well_id = well_id_from_label(value)
     return f"{chr(ord('A') + well_id // 12)}{well_id % 12 + 1}"

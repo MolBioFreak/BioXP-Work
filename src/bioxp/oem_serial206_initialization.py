@@ -4540,9 +4540,26 @@ class Serial206OemInitializationProvider:
         publisher = getattr(self, "_tip_tray_state_publisher", None)
         if not callable(publisher):
             raise RuntimeError("tip_tray_state_publisher_not_bound")
+        # Translate source callbacks to the existing canonical transitions.
+        # Source wellIDs are row-major; tipLocation groups use alternate rows.
+        if transition == "remove":
+            from .oem_compat.position_table import tip_group_well_ids
+            selected = list(well_ids or [])
+            if any(type(well) is not int or well not in range(96) for well in selected):
+                raise ValueError("source tip removal requires canonical well IDs")
+            if group_index is not None:
+                raise ValueError("source tip removal derives its group from source wells")
+            if len(selected) == 1:
+                transition = "remove_well"
+            elif len(selected) == 4 and selected[0] in range(24):
+                group_index = (selected[0] % 12) * 2 + selected[0] // 12
+                if selected != list(tip_group_well_ids(group_index)):
+                    raise ValueError("source tip removal requires one complete OEM group")
+                transition = "remove_group"
+            else:
+                raise ValueError("source tip removal requires one well or one OEM group")
         self.invalidate_deck_authority_cache(reason="tray_owner_publication")
-        # Source restoration is the canonical publisher's nonphysical retip
-        # transition. Keep the callback vocabulary out of the SQLite contract.
+        # Source restoration does not reset the source tray-empty latch.
         published = publisher(
             tray_id=tray_id,
             transition="retip" if transition == "restore" else transition,
