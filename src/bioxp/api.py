@@ -10868,12 +10868,20 @@ def _protocol_bindings(bundle, *, source_executor=None):
             counts[step] = ordinal + 1
         identity = f"{step}:native:{ordinal}"
         owner = executor()
+        control_hooks = {
+            "lifecycle:safe_stop_request", "lifecycle:safe_stop_exit",
+            "lifecycle:abort_true_prefix", "lifecycle:abort_true_finish",
+            "lifecycle:deferred_pause_request", "lifecycle:wake",
+        }
+        parent_occurrence = (binding or {}).get("source_occurrence_id")
+        control_id = (state.workflow.last_control_id
+                      if action is None and parent_occurrence in control_hooks
+                      and state.workflow is not None else None)
         with store.workflow_context(state.job_id, source_occurrence_id=identity):
             store.assert_workflow_current(state.job_id)
             return canonical_control(
                 operation, state, source_occurrence_id=identity,
-                arguments=dict(arguments),
-                control_id=state.workflow.last_control_id if state.workflow is not None else None,
+                arguments=dict(arguments), control_id=control_id,
                 source_error_callback=lambda message: owner.source_error(false_abort=True),
             )
     callbacks = {}
