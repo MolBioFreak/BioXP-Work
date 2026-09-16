@@ -12180,7 +12180,8 @@ class Serial206OemInitializationProvider:
             # paired host callbacks can qualify this attempt for cleanup.
             with self._lock:
                 if (not parent or parent != getattr(self, "_wp8_source_script_owner", None)
-                        or not getattr(self, "_wp8_source_script_returned", False)):
+                        or not getattr(self, "_wp8_source_script_returned", False)
+                        or not self._wp8_stop_event.is_set()):
                     raise RuntimeError("cleanup_source_script_not_returned")
             return finite("cleanup", "cleanup", {}, state)
 

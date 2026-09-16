@@ -91,6 +91,14 @@ def test_actual_api_cleanup_requires_this_source_return_and_persists(query_rig, 
             assert [dict(row) for row in rows] == [dict(row) for row in persisted]
         finally:
             fresh.stop()
+        # A consumed source event is not authority for another cleanup. Guard
+        # must refuse before even collection, not wait for an ignored timeout.
+        monkeypatch.setattr(provider, 'wp8_operation_machine_state',
+            lambda *args: pytest.fail('consumed event reached machine collection'))
+        with pytest.raises(RuntimeError, match='cleanup_source_script_not_returned'):
+            cleanup(state)
+        bindings.source_script_returned(state)
+        assert not provider._wp8_stop_event.is_set()
     finally:
         release.set()
         app.state.operator_command_plane.stop()
