@@ -3423,6 +3423,15 @@ class OperatorCommandStore:
         conn.execute("UPDATE operator_commands SET effective_inputs_json=? WHERE command_id=?",
                      (_canonical(effective), fence["parent_command_id"]))
         self._workflow_current(conn, fence["parent_command_id"])
+        # Native initialization preserves the source's software door model.
+        # Publish that captured value through the existing semantic owner, not
+        # a bootstrap/reset of logical custody. Use the finalizer connection so
+        # child success, parent footprint and semantic lineage settle together.
+        self._publish_deck_owner_state(conn,
+            source_operation="updateThermalDoorOpen", source_command_id=child_id,
+            updates={"thermal_door_open": result["source_prior_door_open"]},
+            ownership_generation=fence["ownership_generation"],
+            board_epoch_4=epochs["4"], board_epoch_5=epochs["5"])
 
     def assert_workflow_current(self, command_id: str) -> None:
         with self._lock:
@@ -4118,6 +4127,19 @@ class OperatorCommandStore:
         board_epoch_5: int,
     ) -> dict[str, Any]:
         """Publish one successful production-owner mutation into canonical SQLite."""
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
+            self._publish_deck_owner_state(conn, source_operation=source_operation,
+                source_command_id=source_command_id, updates=updates,
+                ownership_generation=ownership_generation,
+                board_epoch_4=board_epoch_4, board_epoch_5=board_epoch_5)
+        return self.deck_semantic_state()
+
+    def _publish_deck_owner_state(
+        self, conn, *, source_operation: str, source_command_id: str,
+        updates: Mapping[str, Any], ownership_generation: int,
+        board_epoch_4: int, board_epoch_5: int,
+    ) -> None:
+        """Transaction-local publisher; caller holds provider scope before writer."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
         allowed = {
@@ -4188,81 +4210,79 @@ class OperatorCommandStore:
         if not upstream_id.strip():
             raise ValueError("source command identity is required")
 
-        with self._deck_owner_authority_scope(), self._transaction() as conn:
-            self._validate_deck_owner_authority(
-                ownership_generation=ownership_generation,
-                board_epoch_4=board_epoch_4,
-                board_epoch_5=board_epoch_5,
-            )
-            current = conn.execute(
-                "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
-            ).fetchone()
-            assert current is not None
-            merged = {
-                "current_location": current["current_location"],
-                "current_well": current["current_well"],
-                "well_pierced": _json_load(current["well_pierced_json"], {}),
-                "current_tray": current["current_tray"],
-                "tip_loaded": None if current["tip_loaded"] is None else bool(current["tip_loaded"]),
-                "tip_dirty": None if current["tip_dirty"] is None else bool(current["tip_dirty"]),
-                "tip_location": current["tip_location"],
-                "clean_path": None if current["clean_path"] is None else bool(current["clean_path"]),
-                "plate_on_gantry": canonical_plate_name(current["plate_on_gantry"]),
-                "movable_plate_locations": _json_load(current["movable_plate_locations_json"], {}),
-                "pseudo_z_home": int(current["pseudo_z_home"]),
-            }
-            merged.update({key: value for key, value in values.items() if key != "well_pierced"})
-            if "well_pierced" in values:
-                merged["well_pierced"][pierced_key] = True
-            if operation == "updateLocation":
-                merged["current_tray"] = self._oem_update_location_current_tray(
-                    merged["current_location"], merged["movable_plate_locations"], merged["current_tray"])
-            if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
-                if not (operation == "pipette_owner" and "tip_location" in values
-                        and values["tip_location"] is None):
-                    raise ValueError("loaded tip requires a valid tip location")
-            before = int(current["semantic_state_revision"])
-            after = before + 1
-            command_id = str(uuid.uuid4())
-            now = _now()
-            sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
-            request = {"source_operation": operation, "source_command_id": upstream_id, "updates": values}
+        self._validate_deck_owner_authority(
+            ownership_generation=ownership_generation,
+            board_epoch_4=board_epoch_4,
+            board_epoch_5=board_epoch_5,
+        )
+        current = conn.execute(
+            "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
+        ).fetchone()
+        assert current is not None
+        merged = {
+            "current_location": current["current_location"],
+            "current_well": current["current_well"],
+            "well_pierced": _json_load(current["well_pierced_json"], {}),
+            "current_tray": current["current_tray"],
+            "tip_loaded": None if current["tip_loaded"] is None else bool(current["tip_loaded"]),
+            "tip_dirty": None if current["tip_dirty"] is None else bool(current["tip_dirty"]),
+            "tip_location": current["tip_location"],
+            "clean_path": None if current["clean_path"] is None else bool(current["clean_path"]),
+            "plate_on_gantry": canonical_plate_name(current["plate_on_gantry"]),
+            "movable_plate_locations": _json_load(current["movable_plate_locations_json"], {}),
+            "pseudo_z_home": int(current["pseudo_z_home"]),
+        }
+        merged.update({key: value for key, value in values.items() if key != "well_pierced"})
+        if "well_pierced" in values:
+            merged["well_pierced"][pierced_key] = True
+        if operation == "updateLocation":
+            merged["current_tray"] = self._oem_update_location_current_tray(
+                merged["current_location"], merged["movable_plate_locations"], merged["current_tray"])
+        if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
+            if not (operation == "pipette_owner" and "tip_location" in values
+                    and values["tip_location"] is None):
+                raise ValueError("loaded tip requires a valid tip location")
+        before = int(current["semantic_state_revision"])
+        after = before + 1
+        command_id = str(uuid.uuid4())
+        now = _now()
+        sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
+        request = {"source_operation": operation, "source_command_id": upstream_id, "updates": values}
+        conn.execute(
+            "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (command_id, sequence, None, None, "oem.deck.semantic_state_publication", _canonical(request), _canonical(request), "completed", 1, ownership_generation, now, now, now, _canonical({"delivery_attempted": False, "source_command_id": upstream_id}), now),
+        )
+        self._insert_canonical_command(
+            conn, command_id=command_id, idempotency_key=f"deck-owner:{operation}:{upstream_id}",
+            action_id="oem.deck.semantic_state_publication", inputs=request,
+            ownership_generation=ownership_generation, accepted_at=now,
+        )
+        conn.execute(
+            "UPDATE serial206_movement_commands SET state='completed',state_version=2,dispatched_at=?,finished_at=? WHERE command_id=?",
+            (now, now, command_id),
+        )
+        prior = _json_load(current["transition_provenance_json"], {})
+        provenance = {
+            "source_operation": operation, "command_id": command_id,
+            "upstream_source_command_id": upstream_id, "before_revision": before,
+            "after_revision": after, "updates": values,
+            "latch_status": prior.get("latch_status"),
+            "machine_latch_closed": prior.get("machine_latch_closed"),
+            "latch_observation_id": prior.get("latch_observation_id"),
+        }
+        if operation == "sourceUnlatch":
+            provenance.update(latch_status=False, machine_latch_closed=False,
+                              latch_observation_id=upstream_id)
+        with self._authority_write():
             conn.execute(
-                "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (command_id, sequence, None, None, "oem.deck.semantic_state_publication", _canonical(request), _canonical(request), "completed", 1, ownership_generation, now, now, now, _canonical({"delivery_attempted": False, "source_command_id": upstream_id}), now),
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,well_pierced_json=?,current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
+                (merged["current_location"], merged["current_well"], _canonical(merged["well_pierced"]), merged["current_tray"], None if merged["tip_loaded"] is None else int(merged["tip_loaded"]), None if merged["tip_dirty"] is None else int(merged["tip_dirty"]), merged["tip_location"], None if merged["clean_path"] is None else int(merged["clean_path"]), plate_name_for_storage(merged["plate_on_gantry"]), _canonical(dict(merged["movable_plate_locations"])), int(merged["pseudo_z_home"]), after, operation, command_id, ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), now),
             )
-            self._insert_canonical_command(
-                conn, command_id=command_id, idempotency_key=f"deck-owner:{operation}:{upstream_id}",
-                action_id="oem.deck.semantic_state_publication", inputs=request,
-                ownership_generation=ownership_generation, accepted_at=now,
-            )
-            conn.execute(
-                "UPDATE serial206_movement_commands SET state='completed',state_version=2,dispatched_at=?,finished_at=? WHERE command_id=?",
-                (now, now, command_id),
-            )
-            prior = _json_load(current["transition_provenance_json"], {})
-            provenance = {
-                "source_operation": operation, "command_id": command_id,
-                "upstream_source_command_id": upstream_id, "before_revision": before,
-                "after_revision": after, "updates": values,
-                "latch_status": prior.get("latch_status"),
-                "machine_latch_closed": prior.get("machine_latch_closed"),
-                "latch_observation_id": prior.get("latch_observation_id"),
-            }
-            if operation == "sourceUnlatch":
-                provenance.update(latch_status=False, machine_latch_closed=False,
-                                  latch_observation_id=upstream_id)
-            with self._authority_write():
-                conn.execute(
-                    "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,well_pierced_json=?,current_tray=?,tip_loaded=?,tip_dirty=?,tip_location=?,clean_path=?,plate_on_gantry=?,movable_plate_locations_json=?,pseudo_z_home=?,semantic_state_revision=?,producer_operation=?,producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
-                    (merged["current_location"], merged["current_well"], _canonical(merged["well_pierced"]), merged["current_tray"], None if merged["tip_loaded"] is None else int(merged["tip_loaded"]), None if merged["tip_dirty"] is None else int(merged["tip_dirty"]), merged["tip_location"], None if merged["clean_path"] is None else int(merged["clean_path"]), plate_name_for_storage(merged["plate_on_gantry"]), _canonical(dict(merged["movable_plate_locations"])), int(merged["pseudo_z_home"]), after, operation, command_id, ownership_generation, board_epoch_4, board_epoch_5, _canonical(provenance), now),
-                )
-            conn.execute(
-                "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,?,?,?,?,?)",
-                (command_id, operation, before, after, _canonical(provenance), now),
-            )
-            self._insert_transition(conn, event_kind="deck_owner_state_published", command_id=command_id, state="completed", payload=provenance)
-        return self.deck_semantic_state()
+        conn.execute(
+            "INSERT INTO operator_plane_deck_semantic_transitions(command_id,source_operation,before_revision,after_revision,transition_json,created_at) VALUES(?,?,?,?,?,?)",
+            (command_id, operation, before, after, _canonical(provenance), now),
+        )
+        self._insert_transition(conn, event_kind="deck_owner_state_published", command_id=command_id, state="completed", payload=provenance)
 
     def persist_deck_pseudo_home(
         self, command_id: str, value: int, *, source_operation: str,

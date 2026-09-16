@@ -478,9 +478,18 @@ def make_workflow_lifecycle_control_executor(
                         provider = provider_getter()
                         with provider.deck_owner_authority_scope():
                             _validate_workflow_wake_result(command_store, provider, wake_fence, result)
-                            with db.pipette_finalization_transaction():
-                                finalize()
-                                command_store._accept_workflow_wake_initialization(db.connection, child_id=command_id)
+                            # Semantic publication belongs to the canonical
+                            # connection (including its live-owner SQL guards).
+                            # Lend it to this invocation-local receipt finalizer;
+                            # its existing CAS participates in our transaction.
+                            with command_store._transaction() as conn:
+                                receipt_connection = db.connection
+                                try:
+                                    db.connection = conn
+                                    finalize()
+                                    command_store._accept_workflow_wake_initialization(conn, child_id=command_id)
+                                finally:
+                                    db.connection = receipt_connection
                     except Exception as exc:
                         # The transaction rolled back both result and transition.
                         # Keep native child evidence, but never admit door/heating.
