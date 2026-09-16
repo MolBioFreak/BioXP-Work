@@ -44,8 +44,20 @@ class NativePhysicalRecorder:
         if key in self.replies:
             result = self.replies[key]
             return result() if callable(result) else result
-        # Synthetic controller temperature/PWM, not measured hardware evidence.
-        scalar = 10 if typ == 23 else 25000 if command == 143 or (command == 10 and typ == 4) else 0
+        # Closed native thermal wire contract (usb_driver._oem_thermal_tx),
+        # not a blanket successful controller. Mechanical/wake additions must
+        # be evidenced by a delivered source command before joining this set.
+        thermal = (board == 6 and bank in (0, 1) and
+            ((command == 10 and typ in (4, 7, 8, 23)) or
+             (command == 9 and typ in (7, 8)) or
+             (command in (140, 144) and typ == 0)))
+        chiller = (board == 7 and
+            ((command == 143 and typ == 0 and bank in (0, 3)) or
+             (command == 10 and typ in (7, 8) and bank in (0, 1)) or
+             (command in (140, 144) and typ == 0 and bank in (0, 1))))
+        assert thermal or chiller, f'unrecorded native physical command: {(*key, value)}'
+        # Synthetic measured temperature/PWM and rate replies, not live proof.
+        scalar = 10 if typ == 23 else 25000 if command == 143 or (command == 10 and typ == 4) else 1000 if command == 10 else 0
         return {'status': 100, 'value': scalar}
 
     def schedule(self, callback, delay=1.0):
@@ -212,6 +224,12 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     from tests.test_deck_complete_admission import ready
     app, provider, primitive, references, root, _, calls, wire, transport = query_rig
     motor_leaf, raw_moves = ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
+    # Explicit warm transport scope: bind the already-created offline CAN
+    # readers, without sending a query or minting collection/prepared authority.
+    # Cold first-query claim defect is recorded in integration-defects.md.
+    if not getattr(request, 'param', {}).get('cold_transport', False):
+        for channel_transport in transport._transports:
+            channel_transport._get_driver()
     native = NativePhysicalRecorder(monkeypatch)
     # Mechanical motion/readback leaves only. Do not copy the recorder's fixed
     # oem_no24v_state or board-state methods over real native safety owners.
@@ -220,7 +238,7 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
                  'motor_wait_target_reached_many', 'begin_bus_event_window',
                  'collect_bus_events'):
         setattr(native.tester, name, getattr(motor_leaf, name))
-    motor_leaf.positions.update({(5, 1): 0, (6, 0): 0})
+    motor_leaf.positions.update({(5, 1): 0, (6, 0): 0, (4, 2): 0})
     from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
     adapter = Serial206ProductionPrimitiveAdapter(native.tester, None,
         authority_provider=lambda: {}, generation_provider=provider.generation_provider,
@@ -240,6 +258,14 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
             operation_id=f'integration-fixture-{tray}', command_id=f'integration-fixture-{tray}',
             provenance={'synthetic_test_inventory': True}, **stamps)
     monkeypatch.setattr(provider.primitives, 'pipette_transport', transport, raising=False)
+    pipette_errors = []
+    from bioxp.pipette.receipts import PipetteReceiptError
+    real_error_init = PipetteReceiptError.__init__
+    def observe_receipt_error(error, *args, **kwargs):
+        import traceback
+        pipette_errors.append(''.join(traceback.format_stack()) + repr(args))
+        real_error_init(error, *args, **kwargs)
+    monkeypatch.setattr(PipetteReceiptError, '__init__', observe_receipt_error)
     monkeypatch.setattr(provider.primitives, 'pipette_audit_runner', api._run_serial206_pipette_audit, raising=False)
     monkeypatch.setenv('BIOXP_PROTOCOL_JOBS_ROOT', str(tmp_path / 'artifacts'))
     mount_protocol_routes(app)
@@ -277,9 +303,14 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
         export = os.environ.get('BIOXP_WORKFLOW_EXPORT')
         if export:
             jobs = [store.get_workflow(job_id) for job_id in rig.executors]
+            with store._lock:
+                pipette_rows = [dict(row) for row in store.connection.execute(
+                    "SELECT * FROM pipette_operations ORDER BY rowid")]
             Path(export + '.' + request.node.name + '.json').write_text(json.dumps({
                 'nodeid': request.node.nodeid, 'phase': 'before_teardown',
                 'jobs': jobs, 'children': [rig.child_rows(job) for job in jobs],
+                'pipette_errors': pipette_errors, 'pipette_rows': pipette_rows,
+                'pipette_identity': transport.collection_source_identity(),
                 'thermal_wire': native.trace, 'source_rgb': rig.trace,
                 'no24v': native.tester.oem_no24v_state(),
                 'references': references.snapshot(('x', 'y', 'z', 'g')),
