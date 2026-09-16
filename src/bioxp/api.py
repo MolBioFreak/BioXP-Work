@@ -10867,12 +10867,14 @@ def _protocol_bindings(bundle, *, source_executor=None):
             ordinal = counts.get(step, 0)
             counts[step] = ordinal + 1
         identity = f"{step}:native:{ordinal}"
+        owner = executor()
         with store.workflow_context(state.job_id, source_occurrence_id=identity):
             store.assert_workflow_current(state.job_id)
             return canonical_control(
                 operation, state, source_occurrence_id=identity,
                 arguments=dict(arguments),
                 control_id=state.workflow.last_control_id if state.workflow is not None else None,
+                source_error_callback=lambda message: owner.source_error(false_abort=True),
             )
     callbacks = {}
     settings = metadata.get("source_settings", {})
