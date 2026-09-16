@@ -11,7 +11,7 @@ from tests.test_deck_scoped_integration import installed_retained
 from tests.test_protocol_workflow_connected import mount_protocol_routes, request_payload, await_job
 
 
-def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(installed_retained, monkeypatch, tmp_path):
+def test_actual_factory_forwards_lifetime_and_refuses_missing_control_adapter(installed_retained, monkeypatch, tmp_path):
     from bioxp import api
     from bioxp.pipette.transport import FourPipetteTransport
     from bioxp.protocols.executor import ProtocolExecutor
@@ -21,6 +21,10 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
         def __init__(self, **kwargs):
             constructions.append(kwargs)
             super().__init__(**kwargs)
+        def finalize_source_host(self, state):
+            trace.append("script_finally")
+            assert provider._wp8_source_script_returned and provider._wp8_stop_event.is_set()
+            return super().finalize_source_host(state)
     monkeypatch.setattr(protocol_service, "ProtocolExecutor", ObservedExecutor)
     app, provider, primitive, references, root = installed_retained
     monkeypatch.setenv("BIOXP_PROTOCOL_JOBS_ROOT", str(tmp_path / "artifacts"))
@@ -28,6 +32,7 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
     def forbidden(*args, **kwargs):
         raise AssertionError("No physical plan belongs to this lifetime test")
     monkeypatch.setattr(app.state, "oem_workflow_plan_executor", forbidden, raising=False)
+    monkeypatch.setattr(app.state, "oem_workflow_lifecycle_control_executor", None, raising=False)
     payload = request_payload("source-lifetime", [{"action_id": "body", "stage_id": "one", "kind": "oem_operation",
         "oem_opcode": "step", "source_occurrence_id": "source:body", "params": {"arguments": ["1"]}}])
     payload["document"]["metadata"] = {"input_mode": "oem_prepared", "source_settings": {"JobName": None, "LogPressure": False},
@@ -37,7 +42,8 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
     bindings = api._protocol_bindings({"protocol": {"document": payload["document"]}})
     assert callable(bindings.source_script_begin) and callable(bindings.source_script_returned)
     ordinary, native, lifecycle = bindings
-    assert "cleanup" in lifecycle and "source_error" not in lifecycle and "script_finally" not in lifecycle
+    assert "cleanup" in lifecycle and "source_error" not in lifecycle
+    assert "script_finally" in lifecycle and "source_error_request" in lifecycle
     assert "source_script_begin" not in lifecycle and "source_script_returned" not in native
     mount_protocol_routes(app)
     client = TestClient(app)
@@ -46,8 +52,8 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
     assert provider._wp8_source_script_owner is None
     assert app.state.operator_command_plane.store.list_workflows() == []
 
-    # Full lifecycle doubles ONLY to exercise the actual API factory, active
-    # service dispatcher, executor and canonical finalizer. No readiness claim.
+    # Other lifecycle doubles ONLY to exercise lifetime forwarding and the
+    # actual host finalizer; complete native acceptance has its own fixture.
     entered, release = Event(), Event()
     trace = []
     def hook(name):
@@ -60,14 +66,12 @@ def test_actual_api_factory_forwards_host_callbacks_and_keeps_admission_closed(i
                 assert not provider._wp8_stop_event.is_set()
                 entered.set()
                 assert release.wait(8)
-            if name == "script_finally":
-                assert provider._wp8_source_script_returned and provider._wp8_stop_event.is_set()
             return {"ok": True, "offline_lifecycle_double": name}
         return call
     from bioxp.protocols.models import ProtocolDocument
     doc = ProtocolDocument.from_payload(payload["document"])
     monkeypatch.setattr(provider, "build_oem_lifecycle_handlers", lambda **kw: {
-        name: hook(name) for name in ProtocolExecutor.required_lifecycle(doc)})
+        name: hook(name) for name in ProtocolExecutor.required_lifecycle(doc) if name != "script_finally"})
     accepted = client.post("/protocol/execute", json=payload)
     assert accepted.status_code == 202, accepted.text
     job = accepted.json()["job_id"]
