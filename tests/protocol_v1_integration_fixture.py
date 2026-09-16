@@ -156,6 +156,7 @@ class IntegratedRig:
     native: Any = None
     references: Any = None
     raw_moves: Any = None
+    epilogue_join: Any = field(default_factory=threading.Event)
 
     def safety(self):
         return {
@@ -305,6 +306,17 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
         rig.executors[executor.job_id] = executor
         return original(executor, document, *args, **kwargs)
     monkeypatch.setattr(ProtocolExecutor, 'execute', observe)
+    original_join = ProtocolExecutor.wait_for_domains
+    def observe_join(executor, domains):
+        from bioxp.protocols.executor import MOTION_DOMAINS
+        # Passive acknowledgement of the genuine post-final-boundary join.
+        # Do not block, release, replace or synthesize any source operation.
+        caller = sys._getframe(1)
+        if (caller.f_code is ProtocolExecutor._execute_workflow.__code__
+                and domains == MOTION_DOMAINS):
+            rig.epilogue_join.set()
+        return original_join(executor, domains)
+    monkeypatch.setattr(ProtocolExecutor, 'wait_for_domains', observe_join)
     def rgb(*args, **kwargs):
         rig.trace.append(('rgb', args))
         if args == (0, 0, 0) and rig.body_gate is not None:

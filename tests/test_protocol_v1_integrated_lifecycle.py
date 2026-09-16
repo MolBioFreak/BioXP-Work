@@ -171,7 +171,12 @@ def test_real_deferred_pause_wake_requires_reached_gate(integrated_rig, mode):
         assert continued.status_code == 200, continued.text
         done = rig.terminal(job)
         assert done['command']['status'] == 'completed', done
-        assert 'ordinary_pause_prepare' in hooks(done)
+        # Explicit no-tip source custody reaches the gate without moving to
+        # waste. Ordinary Continue must not invoke wake/thermal restoration.
+        assert gate['execution']['runtime_state']['source_model']['logical_tip_present'] is False
+        assert 'ordinary_pause_prepare' not in hooks(done)
+        assert 'ordinary_pause_restore' not in hooks(done)
+        assert 'wake' not in hooks(done)
         assert rig.control_chain(done) == ['epilogue_lid']
         assert rig.native.tester.oem_current_board_lifecycle_generation() == prior
         assert_reopened(rig, done)
@@ -235,13 +240,36 @@ def test_native_thermal_pending_child_released_by_real_control(integrated_rig, r
 
 def test_native_thermal_deferred_pause_bailout_releases_child(integrated_rig):
     rig = integrated_rig
-    job = rig.start(rig.payload('thermal-deferred', opcode='sp', arguments=['60', '100', '2.5']))
+    from bioxp.protocols.executor import SOURCE_DOMAINS
+    assert SOURCE_DOMAINS['sp'] == ('TC', 'General')
+    assert SOURCE_DOMAINS['led'] == ('General',)
+    payload = rig.payload('thermal-deferred', opcode='sp', arguments=['60', '100', '2.5'])
+    payload['document']['stages'][0]['actions'].append({
+        'action_id': 'after', 'kind': 'oem_operation', 'oem_opcode': 'led',
+        'source_occurrence_id': 'source:after', 'params': {'arguments': ['1', '1', '1']}})
+    job = rig.start(payload)
     assert rig.native.thermal_wait.wait(8)
+    # The actual next dispatch joins General before its _boundary. Pending sp
+    # owns General AND TC, so this is a remaining source boundary, not epilogue.
+    pending = rig.wait(job, lambda row: row['execution']['runtime_state']['workflow']
+                       ['source_occurrence_id'] == 'source:after')
+    assert not pending['command']['terminal']
+    target = [row for row in rig.child_rows(job)
+              if row['action_id'] == 'protocol.oem_lifecycle.set_tc_temperature']
+    assert len(target) == 1 and target[0]['status'] == 'reserved', target
+    assert ('rgb', (1, 1, 1)) not in rig.trace
+    early = rig.control(job, 'thermal-early-wake', action='wake', gate_id='not-reached')
+    assert early.status_code == 409, early.text
     before = rig.safety()
     response = rig.control(job, 'thermal-pause-once', action='pause', mode='deferred')
     assert response.status_code == 200, response.text
     reached = rig.gate(job, 'deferred_pause')
     assert reached['command']['terminal'] is False
+    assert 'deferred_pause_enter' in hooks(reached)
+    assert ('rgb', (1, 1, 1)) not in rig.trace
+    assert not any(row[1] == 3 for row in rig.native.trace), 'bailout must not send Stop'
+    stale = rig.control(job, 'thermal-stale-wake', action='wake', gate_id='old')
+    assert stale.status_code == 409, stale.text
     assert rig.control_chain(job) == ['set_tc_temperature', 'thermal_bailout']
     raw = rig.native_results(job, 'set_tc_temperature')[0]['response']
     assert raw['source_body_returned'] is True and raw['source_wait_satisfied'] is True
@@ -259,3 +287,40 @@ def test_native_thermal_deferred_pause_bailout_releases_child(integrated_rig):
     assert rig.control_chain(done) == ['set_tc_temperature', 'thermal_bailout', 'shutdown_temperature']
     assert 'safe_stop_exit' not in hooks(done)
     assert_reopened(rig, done)
+
+
+def test_native_thermal_late_final_node_pause_accepted_but_unreached(integrated_rig):
+    """Source epilogue services bailout without inventing another loop gate."""
+    rig = integrated_rig
+    payload = rig.payload('thermal-late-pause', opcode='sp', arguments=['60', '100', '2.5'])
+    job = rig.start(payload)
+    assert rig.native.thermal_wait.wait(8)
+    assert rig.epilogue_join.wait(8), 'final source boundary has not returned'
+    target = [row for row in rig.child_rows(job)
+              if row['action_id'] == 'protocol.oem_lifecycle.set_tc_temperature']
+    assert len(target) == 1 and target[0]['status'] == 'reserved', target
+    before = rig.safety()
+    response = rig.control(job, 'late-pause-once', action='pause', mode='deferred')
+    assert response.status_code == 200, response.text
+    done = rig.terminal(job)
+    assert done['command']['status'] == 'completed', done
+    workflow = done['execution']['runtime_state']['workflow']
+    assert workflow['reached_control_id'] is None
+    assert workflow['requested_control'] == {'action': 'pause', 'mode': 'deferred'}
+    assert workflow['last_control_id'] is not None
+    assert workflow['gate'] is None
+    assert 'deferred_pause_request' in hooks(done)
+    assert 'deferred_pause_enter' not in hooks(done)
+    assert 'wake' not in hooks(done)
+    assert rig.control_chain(done) == ['set_tc_temperature', 'thermal_bailout', 'epilogue_lid']
+    raw = rig.native_results(done, 'set_tc_temperature')[0]['response']
+    assert raw['source_body_returned'] is True and raw['source_wait_satisfied'] is True
+    assert not raw.get('source_user_stopped', False)
+    assert rig.native.tester.oem_no24v_state() == before['no24v'] is False
+    assert not any(row[1] == 3 for row in rig.native.trace), 'bailout must not send Stop'
+    assert_reopened(rig, done)
+    children = rig.children(job)
+    replay = rig.control(job, 'late-pause-once', action='pause', mode='deferred')
+    assert replay.status_code == 200 and replay.json() == response.json()
+    assert rig.submit(payload).json()['job_id'] == job['job_id']
+    assert rig.children(job) == children
