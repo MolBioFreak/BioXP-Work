@@ -156,8 +156,8 @@ class NativePhysicalRecorder:
         axis_parameters = command in (5, 6) and (board, bank, typ) in {
             (6, 0, 6), (6, 0, 205), (4, 2, 1), (4, 2, 4), (4, 2, 6), (4, 2, 205), (4, 0, 6),
             # Preparation moveZ supplies its native run-current SAP6/GAP6;
-            # Park sets/restores X/Y native acceleration and maximum velocity.
-            (4, 1, 6), (5, 0, 4), (5, 0, 5), (4, 0, 4), (4, 0, 5)}
+            # Park sets/restores the observed X/Y acceleration registers.
+            (4, 1, 6), (5, 0, 5), (4, 0, 5)}
         door_sensors = board == 6 and bank == 0 and command == 6 and typ in (9, 10, 12, 13)
         assert thermal or chiller or gripper_home_switch or axis_parameters or door_sensors, f'unrecorded native physical command: {(*key, value)}'
         if gripper_home_switch:
