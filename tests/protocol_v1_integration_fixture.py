@@ -154,7 +154,10 @@ class NativePhysicalRecorder:
             self.positions[4, 2] = 0
             return {'status': 100, 'value': 0}
         axis_parameters = command in (5, 6) and (board, bank, typ) in {
-            (6, 0, 6), (6, 0, 205), (4, 2, 1), (4, 2, 4), (4, 2, 6), (4, 2, 205), (4, 0, 6)}
+            (6, 0, 6), (6, 0, 205), (4, 2, 1), (4, 2, 4), (4, 2, 6), (4, 2, 205), (4, 0, 6),
+            # Preparation moveZ supplies its native run-current SAP6/GAP6;
+            # Park sets/restores X/Y native acceleration and maximum velocity.
+            (4, 1, 6), (5, 0, 4), (5, 0, 5), (4, 0, 4), (4, 0, 5)}
         door_sensors = board == 6 and bank == 0 and command == 6 and typ in (9, 10, 12, 13)
         assert thermal or chiller or gripper_home_switch or axis_parameters or door_sensors, f'unrecorded native physical command: {(*key, value)}'
         if gripper_home_switch:
@@ -378,9 +381,29 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     machine = provider._load_state()
     machine['machine_status']['GripperVersion'] = 1
     provider._save_state(machine)  # Synthetic configuration, not observed hardware.
-    qualify_full_predecessor((provider, primitive, retained_rig[2], references, store, root))
-    stamps = provider.deck_owner_authority_stamps()
-    provider.refresh_deck_semantic_bootstrap(expected_generation=stamps['ownership_generation'])
+    if getattr(request, 'param', None) == 'partial-clean-path':
+        # Explicit offline partial predecessor, built through real publishers.
+        # No full bootstrap/backfill: clean_path remains its unknown SQL NULL.
+        from tests.test_deck_scoped_authority import qualify_test_references
+        from bioxp.oem_deck_movement import OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS
+        qualify_test_references(references)
+        stamps = provider.deck_owner_authority_stamps()
+        for operation, updates in (
+            ('updateLocation', {'current_location': 'LOC_PARK', 'current_well': 0}),
+            # A partial-clean-path predecessor still has its source latch event.
+            # Explicit offline input, not a bootstrap or an inferred observation.
+            ('sourceUnlatch', {'latch_closed': False}),
+            ('pipette_owner', {'tip_loaded': False, 'tip_dirty': False, 'tip_location': -1}),
+            ('updatePlateLocation', {'movable_plate_locations': dict(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)}),
+        ):
+            store.publish_deck_owner_state(source_operation=operation,
+                source_command_id='offline-partial-predecessor:' + operation,
+                updates=updates, **stamps)
+        assert store.deck_semantic_state()['clean_path'] is None
+    else:
+        qualify_full_predecessor((provider, primitive, retained_rig[2], references, store, root))
+        stamps = provider.deck_owner_authority_stamps()
+        provider.refresh_deck_semantic_bootstrap(expected_generation=stamps['ownership_generation'])
     for tray in range(1, 4):
         store.publish_tip_tray_transition(tray_id=tray, transition='construct',
             operation_id=f'integration-fixture-{tray}', command_id=f'integration-fixture-{tray}',

@@ -4152,6 +4152,7 @@ class OperatorCommandStore:
             "updatePlateLocation": {"movable_plate_locations"},
             "updateThermalDoorOpen": {"thermal_door_open"},
             "sourceImageGantryLoad": {"pseudo_z_home"},
+            "sourceForceToHighHome": {"pseudo_z_home"},
             "clearTipLoaded": {"tip_loaded"},
             "sourceWellPierced": {"well_pierced"},
             "sourceUnlatch": {"latch_closed"},

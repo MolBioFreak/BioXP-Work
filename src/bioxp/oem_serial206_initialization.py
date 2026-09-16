@@ -4331,6 +4331,7 @@ class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
         "sourceMoveX": "wp8_source_move_x",
@@ -5013,8 +5014,9 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("deck_gripper_observation_not_authoritative")
         return position["position"] < 50
 
-    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False) -> dict[str, Any]:
-        """Read only facts consumed by the offset overload; no bootstrap writes.
+    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False,
+                                    pseudo_home_only: bool = False) -> dict[str, Any]:
+        """Read offset facts, or only pseudo-home for primitive Z; no writes.
 
         The retained machine object remains its source owner for facts that have
         not yet been published to the canonical row. This projection neither
@@ -5044,18 +5046,21 @@ class Serial206OemInitializationProvider:
         with self._lock:
             machine = dict(self._load_state().get("machine_status") or {})
         sources = {}
-        for field, legacy_key in (("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps")):
+        fields = (("pseudo_z_home", "psudo_z_home_steps"),) if pseudo_home_only else (
+            ("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps"))
+        for field, legacy_key in fields:
             sources[field] = "canonical"
             if semantic.get(field) is None:
                 semantic[field] = machine.get(legacy_key)
                 sources[field] = "retained_machine_status"
-        if type(semantic.get("tip_loaded")) is not bool:
+        if not pseudo_home_only and type(semantic.get("tip_loaded")) is not bool:
             raise RuntimeError("deck_semantic_state_not_authoritative:tip_loaded")
         if type(semantic.get("pseudo_z_home")) is not int or semantic["pseudo_z_home"] not in {500, 65000}:
             raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
-        required = ["tip_loaded", "pseudo_z_home"]
+        required = [field for field, _ in fields]
+        # Primitive Z reads neither tip nor gripper/plate state.
         # Confirmed/no-tip moveXY never reads PlateOnGantry. Other routes do.
-        if not (gripper_confirmed and semantic["tip_loaded"] is False):
+        if not pseudo_home_only and not (gripper_confirmed and semantic["tip_loaded"] is False):
             required.append("plate_on_gantry")
             if semantic.get("plate_on_gantry") is None:
                 if "plate_on_gantry" not in machine:
@@ -11174,10 +11179,19 @@ class Serial206OemInitializationProvider:
         if operation not in WP8_OPERATION_INTENT_KEYS:
             raise RuntimeError(f"source_authority_missing:{operation}")
         from .oem_deck_movement import OEM_PIPETTE_LEAVES
-        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}:
+        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
             # These literal leaves resolve only their selected source facts at
             # native entry. Do not introduce a gripper GAP into every leaf.
             return {}
+        if operation == "thermal_door":
+            # Door planning consumes the source door flag and board-test mode.
+            # Its Park child performs its own scoped custody/collection reads.
+            with self._lock:
+                machine = dict(self._load_state().get("machine_status") or {})
+            return {
+                "door_is_open": machine.get("thermal_door_open"),
+                "board_test_mode": bool(machine.get("BoardTestMode", machine.get("board_test_mode", False))),
+            }
         state = dict(self.mov_execution_machine_state())
         manifest = build_machine_calibration_manifest(serial_number=206)
         if manifest.get("ok") is not True:
@@ -11323,7 +11337,9 @@ class Serial206OemInitializationProvider:
 
     def _mov_axis_leaf(self, operation: str, value: int) -> dict[str, Any]:
         key = "y" if operation == "moveY" else "z"
-        state = self.mov_execution_machine_state()
+        # Primitive moveZ consumes pseudo-home, not ClassMoveTo path state.
+        state = (self._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+                 if operation == "moveZ" else self.mov_execution_machine_state())
         execution = _execute_oem_steps_live(
             [{"op": operation, key: int(value)}], self.primitives, wait_timeout_s=60.0,
             speed=None, acc=None, pseudo_z_home_steps=int(state["pseudo_z_home"]),
@@ -12448,6 +12464,27 @@ class Serial206OemInitializationProvider:
             handlers["script_prologue"] = script_prologue
         return handlers
 
+    def wp8_preparation_force_high_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """DefaultParameters.ForceToHighHome: software pseudo-home only.
+
+        Called as a finite canonical child, never by a private preparation path.
+        """
+        if operation != "sourceForceToHighHome" or arguments:
+            raise ValueError("invalid preparation ForceToHighHome child")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"pseudo_z_home": 500},
+        )
+
+    def bind_oem_snapshot_image(self, callback: Callable[..., Any]) -> None:
+        """Bind the existing shared-camera snapshot owner during composition."""
+        if not callable(callback):
+            raise TypeError("OEM snapshot callback must be callable")
+        self._oem_snapshot_image_owner = callback
+
     def wp8_source_image_gantry_load(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, **_: Any,
@@ -12467,11 +12504,14 @@ class Serial206OemInitializationProvider:
             offset_x=arguments["offset_x"], offset_y=arguments["offset_y"],
             x_high_limit=90263, y_high_limit=102956,
         )
-        state = self.mov_execution_machine_state()
+        # This is the offset moveTo overload, not ClassMoveTo/path planning.
+        # Read only its existing scoped facts; clean_path is not consumed here.
+        gripper_confirmed = self._deck_gripper_confirmed()
+        state = self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
         return self._deck_primitive_receipt(self.primitives.oem_move_to(
             coordinates["x"], coordinates["y"], state["pseudo_z_home"],
             pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments.get("run_in_parallel", True),
-            gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+            gripper_confirmed=gripper_confirmed, tip_loaded=state["tip_loaded"],
             plate_on_gantry=state.get("plate_on_gantry"),
             location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
         ), source_anchor="ClassControlInterface.moveTo:3691-3715")
@@ -12832,7 +12872,9 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         del operation
         condition = str(arguments.get("name") or "")
-        owner = getattr(self.primitives, "wp8_snapshot_image", None)
+        owner = getattr(self, "_oem_snapshot_image_owner", None)
+        if not callable(owner):
+            owner = getattr(self.primitives, "wp8_snapshot_image", None)
         if not callable(owner):
             return {
                 "ok": True, "delivery_attempted": False,

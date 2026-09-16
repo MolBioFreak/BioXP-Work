@@ -121,6 +121,9 @@ _WORKFLOW_LIFECYCLE_CONTROLS = {
     "software_abort": ("safety_interrupt", (), ()),
     "wake_prepare": ("physical_command", _WORKFLOW_INITIALIZATION_RESOURCES, ()),
     "restore_door_model": ("physical_command", ("axis:door",), ("value",)),
+    "preparation_camera_initialize": ("physical_command", ("camera",), ()),
+    "preparation_camera_exposure": ("physical_command", ("camera",), ("value",)),
+    "preparation_led": ("physical_command", ("camera",), ("channel", "on")),
 }
 
 
@@ -247,6 +250,7 @@ def _validate_workflow_wake_result(command_store, provider, fence, result):
 def make_workflow_lifecycle_control_executor(
     command_store: Any, provider_getter: Callable[[], Any], *,
     initial_check: Callable[..., Mapping[str, Any]] | None = None,
+    preparation_camera: Any = None,
 ) -> Callable[..., dict[str, Any]]:
     """Direct, independently claimed source controls on the existing owner.
 
@@ -299,7 +303,16 @@ def make_workflow_lifecycle_control_executor(
             raise ValueError("workflow_lifecycle_arguments_invalid")
         if "wait" in args and type(args["wait"]) is not bool:
             raise ValueError("workflow_lifecycle_arguments_invalid")
-        if "value" in args and type(args["value"]) is not bool:
+        if operation == "restore_door_model" and type(args["value"]) is not bool:
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if operation == "preparation_camera_exposure":
+            value = args["value"]
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                raise ValueError("workflow_lifecycle_arguments_invalid")
+        if operation == "preparation_led" and (
+            type(args["channel"]) is not int or args["channel"] not in (1, 2, 3)
+            or type(args["on"]) is not bool
+        ):
             raise ValueError("workflow_lifecycle_arguments_invalid")
         if "bank" in args and (type(args["bank"]) is not int or args["bank"] not in (0, 1)):
             raise ValueError("workflow_lifecycle_arguments_invalid")
@@ -397,6 +410,14 @@ def make_workflow_lifecycle_control_executor(
                         provider = provider_getter()
                         if int(provider.generation_provider()) != generation:
                             return {"ok": False, "failure": "workflow_hardware_owner_changed"}
+                        if operation in {"preparation_camera_initialize", "preparation_camera_exposure", "preparation_led"}:
+                            if preparation_camera is None:
+                                return {"ok": False, "failure": "workflow_preparation_camera_unavailable"}
+                            if operation == "preparation_camera_initialize":
+                                return preparation_camera.initialize_illumination()
+                            if operation == "preparation_camera_exposure":
+                                return preparation_camera.exposure(value=args["value"])
+                            return preparation_camera.led(channel=args["channel"], on=args["on"])
                         if operation == "wake_prepare":
                             return _deliver_workflow_wake_prepare(command_store, provider, state,
                                 child_id=command_id, fence=wake_fence, initial_check=initial_check)
@@ -3086,6 +3107,7 @@ def install_operator_control_plane(
 
         app.state.oem_workflow_lifecycle_control_executor = make_workflow_lifecycle_control_executor(
             command_plane.store, oem_deck_provider, initial_check=workflow_initial_check,
+            preparation_camera=getattr(app.state, "oem_preparation_camera", None),
         )
         app.state.oem_workflow_plan_executor = execute_workflow_plan
         app.state.oem_mov_execution_admitter = admit_mov_execution

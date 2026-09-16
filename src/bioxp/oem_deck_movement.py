@@ -1117,6 +1117,7 @@ OEM_PIPETTE_LEAVES = {
     "home_gripper": ("sourceHomeGripper", ()),
     "lifecycle_door_model": ("updateThermalDoorOpen", ("value",)),
     "lifecycle_check_door": ("checkDoorStatus", ()),
+    "preparation_force_high_home": ("sourceForceToHighHome", ()),
 }
 
 FINITE_PLATE_OPERATIONS = frozenset({
@@ -1177,6 +1178,9 @@ def _compile_finite_plate_operation_unchecked(
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
 
+    if operation == "preparation_force_high_home":
+        _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
+        return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
     if operation in OEM_PIPETTE_LEAVES:
         leaf, keys = OEM_PIPETTE_LEAVES[operation]
         _wp8_child(children, leaf, arguments={key: inputs[key] for key in keys})
@@ -1697,9 +1701,9 @@ def make_wp8_operation_executor(
                 if not callable(dispatch):
                     raise RuntimeError("source_authority_missing:execute_wp8_child")
                 operation = str(child["operation"])
-                # Tray publication has durable plan/completion fences, but no
-                # controller delivery or delivery identity to record.
-                source_publication = operation == "sourceTipTransition"
+                # Source-only publication retains plan/completion fences but
+                # must not invent a controller delivery or delivery identity.
+                source_publication = operation in {"sourceTipTransition", "sourceForceToHighHome"}
                 delivery_marker = None
                 if not source_publication and not bool(child.get("awaited", True)):
                     suffix = "z-home" if operation == "startMoveZPseudoHome" else "gripper-home"
