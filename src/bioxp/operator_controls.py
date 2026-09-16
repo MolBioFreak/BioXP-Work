@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import copy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import wraps
 import threading
 import hashlib
@@ -101,6 +101,460 @@ _DISPATCH_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
 def current_operator_dispatch_context() -> dict[str, Any] | None:
     value = _DISPATCH_CONTEXT.get()
     return dict(value) if isinstance(value, Mapping) else None
+
+
+# This finite roster is internal composition, never a public method selector.
+_WORKFLOW_INITIALIZATION_RESOURCES = (
+    "axis:x", "axis:y", "axis:z", "axis:g", "axis:door",
+    "motor:4:0", "motor:4:1", "motor:5:0", "pipette", "thermal",
+)
+_WORKFLOW_LIFECYCLE_CONTROLS = {
+    "set_tc_temperature": ("physical_command", ("thermal",), ("temp_c", "duration", "rate_c_s")),
+    "set_lid_temperature": ("physical_command", ("thermal",), ("temp_c", "duration", "rate_c_s", "wait")),
+    "set_chiller_temperature": ("physical_command", ("thermal",), ("bank", "temp_c")),
+    "turn_off_heater": ("safety_interrupt", (), ()),
+    "set_chiller_pwm": ("safety_interrupt", (), ("chiller", "pwm")),
+    "shutdown_temperature": ("safety_interrupt", (), ()),
+    "thermal_bailout": ("host_control", (), ()),
+    "resume_temperature": ("physical_command", ("thermal",), ()),
+    "epilogue_lid": ("physical_command", ("thermal",), ()),
+    "software_abort": ("safety_interrupt", (), ()),
+    "wake_prepare": ("physical_command", _WORKFLOW_INITIALIZATION_RESOURCES, ()),
+    "restore_door_model": ("physical_command", ("axis:door",), ("value",)),
+}
+
+
+def _deliver_workflow_wake_prepare(command_store, provider, state, *, child_id, fence, initial_check):
+    """One source initialCheck/rehome prefix; no intermediate normal admission."""
+    tester = provider.primitives.tester
+    before = tester.oem_current_board_lifecycle_generation()
+    counter = getattr(tester, "_oem_board_lifecycle_generation", None)
+    transport = getattr(tester, "_oem_transport_generation", None)
+    abort = getattr(tester, "_oem_abort_generation", None)
+    if (type(before) is not int or type(counter) is not int or type(transport) is not int
+            or before != fence["footprint"]["board_epochs"].get("5")):
+        raise ValueError("workflow_wake_native_generation_unavailable")
+    transitions = []
+    generation_called = False
+
+    def validate_current(phase):
+        nonlocal generation_called
+        if (int(provider.generation_provider()) != fence["ownership_generation"]
+                or getattr(tester, "_oem_transport_generation", None) != transport
+                or getattr(tester, "_oem_abort_generation", None) != abort
+                or getattr(tester, "_oem_24v_dropped", None) is not False):
+            raise ValueError("workflow_wake_native_owner_changed")
+        if current_operator_dispatch_context().get("operator_command_id") != child_id:
+            raise ValueError("workflow_wake_dispatch_changed")
+        expected = counter + 1 if generation_called else None if transitions else before
+        if tester.oem_current_board_lifecycle_generation() != expected:
+            raise ValueError("workflow_wake_unowned_generation_change")
+        with command_store._lock:
+            conn = command_store.connection
+            command_store._validate_workflow_wake(conn, fence, child_id=child_id)
+            observed = conn.execute(
+                "SELECT * FROM serial206_board_transitions WHERE sequence>? ORDER BY sequence",
+                (fence["board4_transition_cursor"],)).fetchall()
+            if ([row["requested_active"] for row in observed] != transitions
+                    or any(row["ownership_generation"] != fence["ownership_generation"]
+                           or row["accepted"] != 1 or row["continuity_proven"] != 1
+                           or row["status_code"] != 100 for row in observed)):
+                raise ValueError("workflow_wake_unowned_board_transition")
+            # Before native initialization the source observer must invalidate X;
+            # an unrelated ready generation cannot be silently adopted.
+            snapshot = conn.execute("SELECT state_json FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1").fetchone()
+            x = (json.loads(snapshot[0]).get("x_lifecycle") or {}) if snapshot else {}
+            if x.get("board_lifecycle_generation") != (None if transitions else before):
+                raise ValueError("workflow_wake_unowned_x_transition")
+        if phase == "deactivate_boards":
+            if transitions or generation_called:
+                raise ValueError("workflow_wake_cycle_repeated")
+            transitions.append(0)
+        elif phase == "activate_boards":
+            if transitions not in ([], [0]) or generation_called:
+                raise ValueError("workflow_wake_cycle_repeated")
+            transitions.append(1)
+        elif phase == "oem_begin_board_lifecycle_generation":
+            if transitions != [0, 1] or generation_called:
+                raise ValueError("workflow_wake_generation_without_cycle")
+            generation_called = True
+        return True
+
+    if initial_check is None:
+        raise RuntimeError("source_authority_missing:initial_check")
+    checked = initial_check(state, validate_current=validate_current)
+    if not isinstance(checked, Mapping) or type(checked.get("ok")) is not bool:
+        raise ValueError("workflow_wake_initial_check_outcome_invalid")
+    rows = [dict(checked)]
+    if not checked["ok"]:
+        return {"ok": False, "source_children": rows}
+    validate_current("initial_check_returned")
+    generation = tester.oem_current_board_lifecycle_generation()
+    cycle = (checked.get("initial_check") or {}).get("board_lifecycle_generation")
+    if generation_called:
+        if (not isinstance(cycle, Mapping) or cycle.get("ok") is not True
+                or cycle.get("board_lifecycle_generation") != generation
+                or cycle.get("transport_generation") != transport
+                or cycle.get("deactivation_complete") is not True or cycle.get("activation_complete") is not True
+                or cycle.get("source_order") != ["cmd64=0", "cmd64=1"]):
+            raise ValueError("workflow_wake_source_cycle_unproven")
+    elif checked.get("source_return") is not False or transitions:
+        raise ValueError("workflow_wake_generation_witness_missing")
+    # Source rehome captures only this host model property after initialCheck.
+    # The broad deck getter also validates now-invalidated motion authority.
+    with provider._lock:
+        prior = provider._load_state()["machine_status"]["thermal_door_open"]
+    if type(prior) is not bool:
+        raise ValueError("workflow_wake_prior_door_unknown")
+    try:
+        initialized = provider.initialize_motors(mode="live")
+    except Exception as exc:
+        return {"ok": False, "outcome_unknown": True, "source_prior_door_open": prior,
+                "source_children": rows + [{"ok": False, "outcome_unknown": True,
+                                             "error_type": type(exc).__name__, "error": str(exc)}]}
+    if not isinstance(initialized, Mapping) or type(initialized.get("ok")) is not bool:
+        raise ValueError("workflow_wake_initialization_outcome_invalid")
+    rows.append(dict(initialized))
+    witness = {"native_generation_before": before, "native_generation_after": generation,
+               "transport_generation": transport, "abort_generation": abort,
+               "board4_transitions": transitions, "cycle": cycle}
+    return {"ok": all(row["ok"] for row in rows), "source_children": rows,
+            "source_prior_door_open": prior, "wake_authority": witness}
+
+
+def _validate_workflow_wake_result(command_store, provider, fence, result):
+    """Called under provider-before-writer scope, after the source returned."""
+    tester = provider.primitives.tester
+    witness = result["wake_authority"]
+    if (int(provider.generation_provider()) != fence["ownership_generation"]
+            or tester.oem_current_board_lifecycle_generation() != witness["native_generation_after"]
+            or getattr(tester, "_oem_transport_generation", None) != witness["transport_generation"]
+            or getattr(tester, "_oem_abort_generation", None) != witness["abort_generation"]
+            or getattr(tester, "_oem_24v_dropped", None) is not False):
+        raise ValueError("workflow_wake_completion_owner_changed")
+    rows = command_store.connection.execute(
+        "SELECT requested_active FROM serial206_board_transitions WHERE sequence>? ORDER BY sequence",
+        (fence["board4_transition_cursor"],)).fetchall()
+    if [row[0] for row in rows] != witness["board4_transitions"]:
+        raise ValueError("workflow_wake_completion_cycle_changed")
+    references = provider.reference_store.snapshot(("x", "y", "z", "g"))
+    if (references.get("durable_clean") is not True
+            or any((references.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                   for axis in ("x", "y", "z", "g"))):
+        raise ValueError("workflow_wake_current_references_missing")
+
+
+def make_workflow_lifecycle_control_executor(
+    command_store: Any, provider_getter: Callable[[], Any], *,
+    initial_check: Callable[..., Mapping[str, Any]] | None = None,
+) -> Callable[..., dict[str, Any]]:
+    """Direct, independently claimed source controls on the existing owner.
+
+    In particular no ordinary FIFO, provider main lock or tester lock surrounds
+    delivery: bailout/Abort must reach a child which is currently holding those.
+    All native lookup is deferred until after canonical admission. Construction
+    and preflight must not access the tester or start native services.
+    """
+    from .runtime_audit_store import RuntimeAuditDatabase, workflow_claim_context
+
+    def explicit(call: Callable[[], Any]) -> dict[str, Any]:
+        try:
+            value = call()
+            if not isinstance(value, Mapping) or type(value.get("ok")) is not bool:
+                raise TypeError("workflow_lifecycle_explicit_outcome_required")
+            return dict(value)
+        except Exception as exc:
+            detail = getattr(exc, "detail", None)
+            result = dict(detail) if isinstance(detail, Mapping) else {}
+            # An exception does not prove that earlier native writes did not run.
+            return {**result, "ok": False, "outcome_unknown": True,
+                    "error_type": type(exc).__name__, "error": str(exc)}
+
+    def uncertain(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return (any(value.get(key) is True for key in (
+                        "outcome_unknown", "unknown_outcome", "reconciliation_required"))
+                    or value.get("status") in {"ambiguous", "outcome_unknown", "reconciliation_required"}
+                    or value.get("state") in {"ambiguous", "outcome_unknown", "reconciliation_required"}
+                    or value.get("physical_outcome") == "unknown"
+                    or value.get("persistence_state") == "recovery_required"
+                    or any(uncertain(child) for child in value.values()))
+        return isinstance(value, (list, tuple)) and any(uncertain(child) for child in value)
+
+    def execute_workflow_lifecycle_control(
+        operation: str, state: Any, *, source_occurrence_id: str,
+        arguments: Mapping[str, Any] | None = None, control_id: str | None = None,
+        source_error_callback: Callable[[str], Any] | None = None,
+    ) -> dict[str, Any]:
+        if operation not in _WORKFLOW_LIFECYCLE_CONTROLS:
+            raise ValueError("unsupported_workflow_lifecycle_control")
+        control_class, resources, keys = _WORKFLOW_LIFECYCLE_CONTROLS[operation]
+        args = dict(arguments or {})
+        if set(args) != set(keys):
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        for key in ("temp_c", "rate_c_s"):
+            if key in args and (type(args[key]) not in (int, float) or not math.isfinite(args[key])):
+                raise ValueError("workflow_lifecycle_arguments_invalid")
+        if "duration" in args and type(args["duration"]) is not int:
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if "wait" in args and type(args["wait"]) is not bool:
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if "value" in args and type(args["value"]) is not bool:
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if "bank" in args and (type(args["bank"]) is not int or args["bank"] not in (0, 1)):
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if operation == "set_chiller_pwm" and (
+            args["chiller"] not in (None, "OC", "RC") or type(args["pwm"]) is not int or args["pwm"] != 0
+        ):
+            raise ValueError("workflow_lifecycle_shutdown_only")
+        if not isinstance(source_occurrence_id, str) or not source_occurrence_id.strip():
+            raise ValueError("workflow_source_occurrence_required")
+        if control_id is not None and (not isinstance(control_id, str) or not control_id.strip()):
+            raise ValueError("workflow_control_identity_invalid")
+        binding = workflow_claim_context()
+        parent = getattr(getattr(state, "workflow", None), "command_id", None)
+        if binding is None or binding["parent_command_id"] != parent:
+            raise ValueError("workflow_lifecycle_requires_current_parent")
+        # The call's substep occurrence is trusted composition, not a new parent
+        # attempt. Preserve the outer context on return, including nested dispatch.
+        with command_store.workflow_context(parent, source_occurrence_id=source_occurrence_id) as binding:
+            identity = json.dumps([parent, binding["parent_attempt"], source_occurrence_id,
+                                   operation, control_id], separators=(",", ":"))
+            command_id = "workflow-lifecycle-" + hashlib.sha256(identity.encode()).hexdigest()
+            with command_store._lock:
+                generation = command_store.connection.execute(
+                    "SELECT ownership_generation FROM operator_commands WHERE command_id=?", (parent,)
+                ).fetchone()[0]
+            db = RuntimeAuditDatabase(command_store.root)
+            try:
+                wake_fence = None
+                if operation == "wake_prepare":
+                    existing = db.connection.execute(
+                        "SELECT requested_inputs_json FROM operator_commands WHERE command_id=?", (command_id,)
+                    ).fetchone()
+                    wake_fence = (json.loads(existing[0])["wake_fence"] if existing
+                                  else command_store._workflow_wake_fence(parent, control_id=control_id))
+                payload = dict(command_id=command_id, idempotency_key=command_id,
+                    action_id="protocol.oem_lifecycle." + operation, operation=operation,
+                    entrypoint_id="protocol.oem_lifecycle", caller_class="lifecycle",
+                    control_class=control_class, ownership_generation=generation,
+                    resources=list(resources), requested_inputs={"operation": operation,
+                        "arguments": args, "control_id": control_id,
+                        "affected_domains": (["software_abort"] if operation == "software_abort"
+                                             else list(resources) or ["thermal"])})
+                if wake_fence is not None:
+                    payload["requested_inputs"]["wake_fence"] = wake_fence
+                claimed, created = db.claim(payload)
+                workflow = state.workflow
+                if command_id not in workflow.child_command_ids:
+                    workflow.child_command_ids.append(command_id)
+                if not created:
+                    row = dict(claimed)
+                    receipt = json.loads(row["receipt_json"] or "{}")
+                    result = json.loads(row["response_summary_json"] or "{}")
+                    replay = {**result, "ok": row["status"] == "completed", "command_id": command_id,
+                              "status": row["status"], "receipt": receipt}
+                    if row["status"] == "dispatched" and result.get("source_timer_pending") is True:
+                        from .protocols.executor import OwnedOperation
+                        replay["owned_children"] = (OwnedOperation(command_store.workflow_child_completion(command_id),
+                            domains=("TC", "General"), command_id=command_id),)
+                    return replay
+
+                token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id,
+                    "idempotency_key": command_id, "action_id": payload["action_id"],
+                    "entrypoint_id": payload["entrypoint_id"], "caller_class": "lifecycle"})
+                error_owner_lock = threading.RLock()
+                error_owner_active = True
+                native_timers: list[Future] = []
+                error_tester = None
+                previous_error_callback = None
+
+                def thermal_error(message: str) -> None:
+                    with error_owner_lock:
+                        if not error_owner_active or source_error_callback is None:
+                            return
+                        if getattr(getattr(state, "workflow", None), "command_id", None) != parent:
+                            return
+                        # Timer threads have no dispatcher ContextVars. Validate
+                        # the frozen attempt directly, never rebind to a new job.
+                        try:
+                            with command_store._lock:
+                                current = command_store._workflow_current(command_store.connection, parent)
+                                child = command_store.connection.execute(
+                                    "SELECT status FROM operator_commands WHERE command_id=?", (command_id,)
+                                ).fetchone()
+                                if (current["dispatch_attempt_id"] != binding["parent_attempt"]
+                                        or current["dispatcher_epoch"] != binding["dispatcher_epoch"]
+                                        or not child or child[0] not in {"reserved", "dispatched"}):
+                                    return
+                        except ValueError:
+                            return
+                        source_error_callback(message)
+
+                try:
+                    def deliver() -> Mapping[str, Any]:
+                        nonlocal error_tester, previous_error_callback
+                        provider = provider_getter()
+                        if int(provider.generation_provider()) != generation:
+                            return {"ok": False, "failure": "workflow_hardware_owner_changed"}
+                        if operation == "wake_prepare":
+                            return _deliver_workflow_wake_prepare(command_store, provider, state,
+                                child_id=command_id, fence=wake_fence, initial_check=initial_check)
+                        if operation == "restore_door_model":
+                            return provider.wp8_update_thermal_door_open(
+                                "updateThermalDoorOpen", args, command_id=command_id,
+                                child_order=0, plan_digest=binding["plan_fingerprint"])
+                        if operation == "software_abort":
+                            return provider.execute_x_stop_interrupt({"command_id": command_id,
+                                "idempotency_key": command_id, "reason": "workflow software Abort"}, abort=True)
+                        tester = provider.primitives.tester
+                        if resources == ("thermal",) and source_error_callback is not None:
+                            error_tester = tester
+                            previous_error_callback = getattr(tester, "_oem_thermal_error_callback", None)
+                            tester._oem_thermal_error_callback = thermal_error
+                        if operation == "shutdown_temperature":
+                            rows = [explicit(lambda: tester.oem_set_chiller_pwm(None, 0))]
+                            if rows[-1]["ok"]:
+                                rows.append(explicit(tester.oem_turn_off_heater))
+                            return {"ok": all(row["ok"] for row in rows), "source_children": rows}
+                        if operation == "epilogue_lid":
+                            return tester.oem_set_lid_temperature(30.0, 0, -20.0, wait=False)
+                        # Closed native dispatch, not getattr(request-provided-name).
+                        if operation == "set_tc_temperature":
+                            return tester.oem_set_tc_temperature(**args)
+                        if operation == "set_lid_temperature":
+                            return tester.oem_set_lid_temperature(**args)
+                        if operation == "set_chiller_temperature":
+                            return tester.oem_chiller_set_temperature(**args)
+                        if operation == "set_chiller_pwm":
+                            return tester.oem_set_chiller_pwm(**args)
+                        if operation == "turn_off_heater":
+                            return tester.oem_turn_off_heater()
+                        if operation == "thermal_bailout":
+                            return tester.oem_thermal_bailout()
+                        return tester.oem_resume_temperature()
+
+                    result = explicit(deliver)
+                    def retain_timers(value):
+                        if isinstance(value, Mapping):
+                            copied = {}
+                            for key, item in value.items():
+                                if key == "source_timer_future":
+                                    if not isinstance(item, Future):
+                                        raise TypeError("native_thermal_timer_future_invalid")
+                                    if item not in native_timers:
+                                        native_timers.append(item)
+                                else:
+                                    copied[key] = retain_timers(item)
+                            return copied
+                        if isinstance(value, (list, tuple)):
+                            return [retain_timers(item) for item in value]
+                        return value
+                    result = retain_timers(result)
+                    if native_timers:
+                        result["source_timer_pending"] = True
+                finally:
+                    with error_owner_lock:
+                        error_owner_active = bool(native_timers)
+                        if error_tester is not None and getattr(error_tester, "_oem_thermal_error_callback", None) is thermal_error:
+                            error_tester._oem_thermal_error_callback = previous_error_callback
+                    _DISPATCH_CONTEXT.reset(token)
+                terminal_status = "ambiguous" if uncertain(result) else "completed" if result["ok"] else "failed"
+                status = "dispatched" if native_timers else terminal_status
+                result = {**result, "ok": terminal_status == "completed", "command_id": command_id, "status": status}
+                receipt = {**payload, "requested_inputs": {**payload["requested_inputs"],
+                           "workflow_binding": binding}, "status": status, "response": result}
+                # Already admitted control settlement is NOT fresh physical
+                # admission. Abort may have just invalidated board authority.
+                def finalize():
+                    db.finalize_claim(command_id=command_id, pipette_operation_id=None,
+                        expected_status="reserved", status=status,
+                        outcome="success" if status == "completed" else status,
+                        failure_code=None if status == "completed" else str(result.get("failure") or operation + "_failed"),
+                        result=result, receipt_json=json.dumps(receipt, allow_nan=False))
+
+                if operation == "wake_prepare" and status == "completed":
+                    try:
+                        provider = provider_getter()
+                        with provider.deck_owner_authority_scope():
+                            _validate_workflow_wake_result(command_store, provider, wake_fence, result)
+                            with db.pipette_finalization_transaction():
+                                finalize()
+                                command_store._accept_workflow_wake_initialization(db.connection, child_id=command_id)
+                    except Exception as exc:
+                        # The transaction rolled back both result and transition.
+                        # Keep native child evidence, but never admit door/heating.
+                        status = "failed"
+                        result.update(ok=False, status=status, failure="workflow_wake_authority_not_accepted",
+                                      authority_error=str(exc))
+                        receipt.update(status=status, response=result)
+                        finalize()
+                else:
+                    finalize()
+                committed = db.connection.execute(
+                    "SELECT receipt_json,response_summary_json FROM operator_commands WHERE command_id=?", (command_id,)
+                ).fetchone()
+                published = {**json.loads(committed[1]), "receipt": json.loads(committed[0])}
+                if native_timers:
+                    from .protocols.executor import OwnedOperation
+                    completion = command_store.workflow_child_completion(command_id)
+                    timer_settlement_lock = threading.Lock()
+                    timer_settled = False
+
+                    def timers_returned(_):
+                        nonlocal timer_settled, error_owner_active
+                        with timer_settlement_lock:
+                            if timer_settled or not all(timer.done() for timer in native_timers):
+                                return
+                            timer_settled = True
+                        with error_owner_lock:
+                            error_owner_active = False
+                        outcomes = [explicit(timer.result) for timer in native_timers]
+                        stopped = all(row.get("ok") is True and row.get("source_timer_stopped") is True
+                                      for row in outcomes)
+                        final_status = terminal_status if stopped else "ambiguous"
+                        final_result = {**result, "status": final_status,
+                            "ok": final_status == "completed", "source_timer_pending": False,
+                            "source_timer_enabled": False if stopped else result.get("source_timer_enabled"),
+                            "source_timer_completion": outcomes}
+                        if not stopped:
+                            final_result["outcome_unknown"] = True
+                        final_receipt = {**receipt, "status": final_status, "response": final_result}
+                        writer = None
+                        try:
+                            writer = RuntimeAuditDatabase(command_store.root)
+                            writer.finalize_claim(command_id=command_id, pipette_operation_id=None,
+                                expected_status="dispatched", status=final_status,
+                                outcome="success" if final_status == "completed" else final_status,
+                                failure_code=None if final_status == "completed" else operation + "_failed",
+                                result=final_result, receipt_json=json.dumps(final_receipt, allow_nan=False))
+                            stored = writer.connection.execute(
+                                "SELECT receipt_json,response_summary_json FROM operator_commands WHERE command_id=?", (command_id,)
+                            ).fetchone()
+                            resolved = {**json.loads(stored[1]), "receipt": json.loads(stored[0])}
+                        except Exception as exc:
+                            # Persistence failure retains the canonical resource;
+                            # executor receives unknown custody, never success.
+                            resolved = {"ok": False, "status": "ambiguous", "outcome_unknown": True,
+                                        "command_id": command_id, "recording_error": str(exc)}
+                        finally:
+                            if writer is not None:
+                                writer.close()
+                        with command_store._lock:
+                            if command_store._workflow_child_waiters.get(command_id) is completion:
+                                command_store._workflow_child_waiters.pop(command_id)
+                        if not completion.done():
+                            completion.set_result(resolved)
+
+                    for timer in native_timers:
+                        timer.add_done_callback(timers_returned)
+                    published["owned_children"] = (OwnedOperation(completion, domains=("TC", "General"),
+                                                                 command_id=command_id),)
+                return published
+            finally:
+                db.close()
+
+    return execute_workflow_lifecycle_control
 
 
 _MAX_INPUT_BYTES = 65_536
@@ -2612,6 +3066,18 @@ def install_operator_control_plane(
                 # source handler's wait for its original admitted child.
                 command_plane.store._stop.wait(0.02)
 
+        def workflow_initial_check(state: Any, *, validate_current: Callable[[str], bool]) -> Mapping[str, Any]:
+            callback = getattr(app.state, "oem_workflow_initial_check", None)
+            if not callable(callback):
+                raise RuntimeError("source_authority_missing:initial_check")
+            result = callback(state, validate_current=validate_current)
+            if not isinstance(result, Mapping):
+                raise RuntimeError("source_authority_invalid:initial_check")
+            return result
+
+        app.state.oem_workflow_lifecycle_control_executor = make_workflow_lifecycle_control_executor(
+            command_plane.store, oem_deck_provider, initial_check=workflow_initial_check,
+        )
         app.state.oem_workflow_plan_executor = execute_workflow_plan
         app.state.oem_mov_execution_admitter = admit_mov_execution
         app.state.oem_wp8_operation_admitter = admit_wp8_operation

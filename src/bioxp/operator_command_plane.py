@@ -3260,7 +3260,7 @@ class OperatorCommandStore:
             return [self.get_workflow(row[0]) for row in ids]
 
     def _workflow_current(self, conn, command_id, *, check_safety=True):
-        row = conn.execute("SELECT p.*,c.command_kind FROM operator_plane_commands p JOIN operator_commands c USING(command_id) "
+        row = conn.execute("SELECT p.*,c.command_kind,c.effective_inputs_json AS workflow_effective_json FROM operator_plane_commands p JOIN operator_commands c USING(command_id) "
                            "WHERE p.command_id=?", (command_id,)).fetchone()
         lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
         if (row is None or row["command_kind"] != "protocol_workflow" or row["status"] not in {"dispatched", "stop_requested", "abort_requested"}
@@ -3270,7 +3270,7 @@ class OperatorCommandStore:
             raise ValueError("workflow_authority_lost")
         if not check_safety:
             return row
-        footprint = _json_load(row["requested_json"], {})["workflow_footprint"]
+        footprint = self._workflow_runtime_footprint(row)
         safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
         if self._priority_fence.is_set() or any(safety[key] != value for key, value in footprint["safety_epochs"].items()):
             raise ValueError("workflow_interrupted")
@@ -3297,6 +3297,132 @@ class OperatorCommandStore:
             if type(actual) is not int or actual != epoch:
                 raise ValueError("workflow_board_epoch_changed")
         return row
+
+    @staticmethod
+    def _workflow_runtime_footprint(row):
+        footprint = _json_load(row["requested_json"], {})["workflow_footprint"]
+        effective = _json_load(row["workflow_effective_json"], {})
+        if "workflow_board_epochs" in effective:
+            if effective.get("wake_parent_attempt") != row["dispatch_attempt_id"]:
+                raise ValueError("workflow_wake_attempt_changed")
+            footprint["board_epochs"] = effective["workflow_board_epochs"]
+        return footprint
+
+    def _workflow_wake_fence(self, parent: str, *, control_id: str) -> dict[str, Any]:
+        """Capture only the executor's reached deferred gate, before native work."""
+        with self._lock:
+            row = self._workflow_current(self.connection, parent)
+            inputs = _json_load(row["requested_json"], {})
+            fence = {"parent_command_id": parent, "parent_attempt": row["dispatch_attempt_id"],
+                     "dispatcher_epoch": row["dispatcher_epoch"], "plan_fingerprint": inputs["plan_fingerprint"],
+                     "ownership_generation": row["ownership_generation"],
+                     "footprint": self._workflow_runtime_footprint(row), "control_id": control_id}
+            workflow = self.get_workflow(parent).get("execution", {}).get("runtime_state", {}).get("workflow", {})
+            fence["gate_id"] = workflow.get("gate_id")
+            fence["board4_transition_cursor"] = self.connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM serial206_board_transitions").fetchone()[0]
+            self._validate_workflow_wake(self.connection, fence)
+            return fence
+
+    def _validate_workflow_wake(self, conn, fence, *, child_id=None):
+        """Private wake settlement fence; never confers normal claim authority."""
+        from .runtime_audit_store import TERMINAL_COMMAND_STATES
+        parent = fence["parent_command_id"]
+        row = self._workflow_current(conn, parent, check_safety=False)
+        inputs = _json_load(row["requested_json"], {})
+        if (row["dispatch_attempt_id"] != fence["parent_attempt"]
+                or row["dispatcher_epoch"] != fence["dispatcher_epoch"]
+                or row["ownership_generation"] != fence["ownership_generation"]
+                or inputs["plan_fingerprint"] != fence["plan_fingerprint"]
+                or self._workflow_runtime_footprint(row) != fence["footprint"]):
+            raise ValueError("workflow_wake_binding_changed")
+        safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
+        if (self._priority_fence.is_set()
+                or any(safety[key] != value for key, value in fence["footprint"]["safety_epochs"].items())
+                or any(event.is_set() and f"axis:{axis}" in fence["footprint"]["resources"]
+                       for axis, event in self._axis_priority_fences.items())):
+            raise ValueError("workflow_interrupted")
+        parent_receipt = conn.execute("SELECT receipt_json FROM operator_commands WHERE command_id=?", (parent,)).fetchone()
+        workflow = _json_load(parent_receipt[0], {}).get("execution", {}).get("runtime_state", {}).get("workflow", {})
+        if (workflow.get("phase") != "waking" or workflow.get("gate") != "deferred_pause"
+                or not fence["gate_id"] or workflow.get("gate_id") != fence["gate_id"]
+                or workflow.get("last_control_id") != fence["control_id"]
+                or (workflow.get("requested_control") or {}).get("action") != "wake"):
+            raise ValueError("workflow_wake_gate_changed")
+        control = conn.execute("SELECT * FROM operator_commands WHERE command_id=?", (fence["control_id"],)).fetchone()
+        request = _json_load(control["requested_inputs_json"], {}) if control else {}
+        if (not control or control["command_kind"] != "protocol_control"
+                or control["parent_command_id"] != parent or control["status"] != "completed"
+                or _json_load(control["receipt_json"], {}).get("accepted") is not True
+                or request.get("action") != "wake" or request.get("gate_id") != fence["gate_id"]):
+            raise ValueError("workflow_wake_control_not_accepted")
+        settled = sorted((TERMINAL_COMMAND_STATES | COMMAND_TERMINAL)
+                         - {"ambiguous", "outcome_unknown", "reconciliation_required"})
+        busy = conn.execute(
+            "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
+            "WHERE c.parent_command_id=? AND c.command_id<>? AND COALESCE(m.state,c.status) NOT IN ("
+            + ",".join("?" for _ in settled) + ") LIMIT 1", (parent, child_id or "", *settled)).fetchone()
+        if busy:
+            raise ValueError("workflow_wake_child_custody_unsettled")
+        if child_id:
+            child = conn.execute("SELECT * FROM operator_commands WHERE command_id=?", (child_id,)).fetchone()
+            requested = _json_load(child["requested_inputs_json"], {}) if child else {}
+            if (not child or child["parent_command_id"] != parent or child["operation"] != "wake_prepare"
+                    or child["entrypoint_id"] != "protocol.oem_lifecycle"
+                    or requested.get("wake_fence") != fence
+                    or child["status"] not in {"reserved", "completed"}):
+                raise ValueError("workflow_wake_child_changed")
+        return row
+
+    def _accept_workflow_wake_initialization(self, conn, *, child_id: str) -> None:
+        """Consume one completed source initialization on its finalizer transaction.
+
+        No new-epoch payload or generic rebase capability. The adapter holds the
+        provider authority scope before this writer and has checked native cycle,
+        ownership and reference snapshots. Named source receipts supply epochs.
+        """
+        child = conn.execute("SELECT * FROM operator_commands WHERE command_id=?", (child_id,)).fetchone()
+        requested = _json_load(child["requested_inputs_json"], {})
+        fence = requested["wake_fence"]
+        row = self._validate_workflow_wake(conn, fence, child_id=child_id)
+        if _json_load(row["workflow_effective_json"], {}).get("wake_child_command_id") == child_id:
+            raise ValueError("workflow_wake_witness_already_consumed")
+        result = _json_load(child["response_summary_json"], {})
+        rows = result.get("source_children") or []
+        if (child["status"] != "completed" or result.get("ok") is not True or len(rows) != 2
+                or any(item.get("ok") is not True for item in rows)):
+            raise ValueError("workflow_wake_completion_missing")
+        witness = result["wake_authority"]
+        publications = rows[1].get("reference_publications") or {}
+        epochs = {}
+        for axis in ("x", "y", "z", "g"):
+            publication = publications.get(axis) or {}
+            native_fence = publication.get("fence") or {}
+            if (publication.get("published") is not True
+                    or native_fence.get("generation") != fence["ownership_generation"]
+                    or native_fence.get("board_generation") != witness["native_generation_after"]):
+                raise ValueError("workflow_wake_reference_not_published")
+            if axis != "x":
+                epoch = native_fence.get("board_epoch")
+                if type(epoch) is not int or ("4" in epochs and epochs["4"] != epoch):
+                    raise ValueError("workflow_wake_reference_epoch_mismatch")
+                epochs["4"] = epoch
+        epochs["5"] = witness["native_generation_after"]
+        if not callable(self._deck_owner_authority_reader):
+            raise ValueError("workflow_wake_owner_reader_missing")
+        self._validate_deck_owner_authority(ownership_generation=fence["ownership_generation"],
+            board_epoch_4=epochs["4"], board_epoch_5=epochs["5"])
+        inputs = _json_load(row["requested_json"], {})
+        if set(inputs["workflow_footprint"]["board_epochs"]) != {"4", "5"}:
+            raise ValueError("workflow_wake_board_roster_invalid")
+        # Request/digest and plane identity remain immutable. Only the existing
+        # canonical effective-input projection carries the admitted transition.
+        effective = _json_load(row["workflow_effective_json"], {})
+        effective.update(workflow_board_epochs=epochs, wake_child_command_id=child_id,
+                         wake_parent_attempt=fence["parent_attempt"])
+        conn.execute("UPDATE operator_commands SET effective_inputs_json=? WHERE command_id=?",
+                     (_canonical(effective), fence["parent_command_id"]))
+        self._workflow_current(conn, fence["parent_command_id"])
 
     def assert_workflow_current(self, command_id: str) -> None:
         with self._lock:
