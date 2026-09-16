@@ -11465,8 +11465,23 @@ class Serial206OemInitializationProvider:
             command_id = context["command_id"]
             def before_entry(boundary: str) -> None:
                 checker(command_id, boundary=boundary)
-            return self.parkGantry(rehome=True, before_native_entry=before_entry)
-        return self.parkGantry(rehome=False)
+            result = self.parkGantry(rehome=True, before_native_entry=before_entry)
+        else:
+            result = self.parkGantry(rehome=False)
+        update = result.get("source_location_update")
+        if (result.get("ok") is True
+                and not result.get("source_pause_scripts")
+                and result.get("semantic_location_commit_allowed") is not False
+                and not result.get("source_noop")
+                and isinstance(update, Mapping)):
+            # Consume only the native successful return, with this same WP8
+            # child's identity. No-op and paused returns establish no location.
+            self.wp8_update_location(
+                "updateLocation",
+                {"destination": update["current_location"], "well": update["current_well"]},
+                **context,
+            )
+        return result
 
     def wp8_scriptmove_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
         del operation
