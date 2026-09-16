@@ -32,6 +32,8 @@ class NativePhysicalRecorder:
         from bioxp.usb_driver import novo_decode
         self.tester.novo_router = NovoRouter(ep_in=object(), ep_out=object(), decode=novo_decode)
         self.tester._motor_noresp_streak = {}
+        self.tester._chiller_last_tx_ts = 0.0
+        self.tester._chiller_noresp_streak = 0
         self.tester._oem_board_initialized = {b: True for b in (4, 5, 6, 7)}
         self.tester._oem_transport_generation = 3
         self.tester._oem_abort_generation = 0
@@ -85,6 +87,14 @@ class NativePhysicalRecorder:
             ((command == 143 and typ == 0 and bank in (0, 3)) or
              (command == 10 and typ in (7, 8) and bank in (0, 1)) or
              (command in (140, 144) and typ == 0 and bank in (0, 1))))
+        # initializeMotors chiller calibration: verified SGP/GGP offsets.
+        # Exact serial206 delivered values, not a generic chiller writer.
+        if board == 7 and bank == 0 and typ in (0, 1):
+            if command == 9 and value == -25:
+                self.axis_parameters[board, typ, bank] = value
+                return {'status': 100, 'value': value}
+            if command == 10 and value == 0 and (board, typ, bank) in self.axis_parameters:
+                return {'status': 100, 'value': self.axis_parameters[board, typ, bank]}
         gripper_home_switch = key == (4, 6, 9, 2)
         motor_readback = command == 6 and typ in (1, 3) and (board, bank) in self.positions
         if motor_readback:
@@ -98,6 +108,23 @@ class NativePhysicalRecorder:
             return {'status': 100, 'value': value}
         if key == (4, 138, 0, 2) and value == 0:
             return {'status': 100, 'value': 0}
+        # Native axisSearchHome/goHome/setHome for X/Y: same SAP1,
+        # GAP9, ROL250 and repeated MST0 as the traced native-09 transcript.
+        # Coordinate writes and movement leaves share one controller model.
+        if (board, bank) in ((5, 0), (4, 0)):
+            if command == 5 and typ == 1 and value == 0:
+                self.positions[board, bank] = 0
+                return {'status': 100, 'value': 0}
+            if command == 6 and typ == 9 and value == 0:
+                return {'status': 100, 'value': int(self.positions[board, bank] == 0)}
+            if command == 2 and typ == 0 and value == 250:
+                self.positions[board, bank] = 0
+                return {'status': 100, 'value': 0}
+            if command == 3 and typ == value == 0:
+                return {'status': 100, 'value': 0}
+        if key == (5, 5, 4, 0) and value == 1700:
+            self.axis_parameters[board, typ, bank] = value
+            return {'status': 100, 'value': value}
         # Delivered initializeMotors Z axisSearchHome frames (serial206
         # startup speed 1791); SAP1 changes the controller coordinate only.
         if key == (4, 5, 1, 1) and value == 0:
@@ -109,6 +136,14 @@ class NativePhysicalRecorder:
             return {'status': 100, 'value': 0}
         if key == (4, 2, 0, 1) and value == 1791:
             self.positions[4, 1] = 0
+            return {'status': 100, 'value': 0}
+        # Thermal.doorSearchHome native ROL50 / MST / SAP1 contract.
+        if key == (6, 2, 0, 0) and value == 50:
+            self.positions[6, 0] = 0
+            return {'status': 100, 'value': 0}
+        if key in ((6, 3, 0, 0), (6, 5, 1, 0)) and value == 0:
+            if command == 5:
+                self.positions[6, 0] = 0
             return {'status': 100, 'value': 0}
         if key == (5, 14, 2, 0) and value in (0, 1):
             return {'status': 100, 'value': value}
@@ -168,6 +203,10 @@ class PrimitiveComposition:
         self.tester = adapter.tester
 
     def __getattr__(self, name):
+        # Native SAP1/home and the retained motion leaves share positions;
+        # publication must read that controller, not stale query-rig telemetry.
+        if name == 'motor_get_position':
+            return self.adapter.motor_get_position
         # Existing fixture's oem_move_to delegates to the actual XY adapter.
         if hasattr(self.observations, name):
             return getattr(self.observations, name)
@@ -311,6 +350,14 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     from tests.test_deck_complete_admission import ready
     app, provider, primitive, references, root, _, calls, wire, transport = query_rig
     motor_leaf, raw_moves = ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
+    # Select the fixture's actual immutable serial206 configuration, as in
+    # the native initializer tests; this is not motor setup/reference evidence.
+    from bioxp import oem_machine_bundle
+    snapshot = oem_machine_bundle.get_active_oem_machine_snapshot()
+    monkeypatch.setattr(oem_machine_bundle, '_active_snapshot',
+        oem_machine_bundle.load_oem_machine_snapshot(
+            snapshot.bundle_root / 'OEM_EVIDENCE_LOCK.json',
+            operator_label_serial=206, require_operator_label=True))
     native = NativePhysicalRecorder(monkeypatch)
     native.door_open_position = provider._wp8_door_config()['open']
     # Mechanical motion/readback leaves only. Do not copy the recorder's fixed
@@ -386,6 +433,9 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     native.tester.set_board_activation_observer(provider.notify_board_activation)
     app.state.oem_workflow_initial_check = api._protocol_workflow_initial_check
     monkeypatch.setattr(provider, 'primitives', PrimitiveComposition(primitive, adapter))
+    # The provider captures this dependency at construction; bind its genuine
+    # generation reader to the same native adapter, never a fixed epoch.
+    monkeypatch.setattr(provider, 'preparation_provider', adapter)
     calls.clear()
     try:
         yield rig
@@ -406,6 +456,10 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
                 'thermal_wire': native.trace, 'abort_intervals': native.abort_intervals,
                 'initialization_ledger': provider._load_state().get('movement_ledger'),
                 'native_board_generation': native.tester.oem_current_board_lifecycle_generation(),
+                'deck_semantic_rows': [dict(row) for row in store.connection.execute(
+                    'SELECT * FROM operator_plane_deck_semantic_state')],
+                'movement_command_rows': [dict(row) for row in store.connection.execute(
+                    'SELECT command_id,expected_board_epochs_json FROM serial206_movement_commands')],
                 'source_rgb': rig.trace,
                 'no24v': native.tester.oem_no24v_state(),
                 'references': references.snapshot(('x', 'y', 'z', 'g')),
