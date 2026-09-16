@@ -12003,6 +12003,7 @@ class Serial206OemInitializationProvider:
         rgb_writer: Callable[..., Any] | None = None,
         rgb_board_present: bool = True,
         barcode_reader: Callable[[], str] | None = None,
+        execute_thermal: Callable[..., Any] | None = None,
     ) -> dict[str, Callable[..., Any]]:
         """Finite source bindings; execute_plan is the existing canonical WP8 owner.
 
@@ -12120,6 +12121,31 @@ class Serial206OemInitializationProvider:
                     "cutseal": cutseal, "so": shakeoff,
                     "dopen": lambda a, s: door(a, s, True),
                     "dclose": lambda a, s: door(a, s, False), "snapshot": snapshot}
+        if execute_thermal is not None:
+            def thermal(action: Any, state: Any, opcode: str) -> Any:
+                if captured.get("MotionOnly", False):
+                    return {"ok": True, "source_noop": "MotionOnly", "delivery_attempted": False}
+                args = raw(action)
+                if opcode == "cc":
+                    try:
+                        temperature = self._oem_int32(args[1])
+                    except (ValueError, OverflowError):
+                        return {"ok": True, "source_noop": "Int32.TryParse", "delivery_attempted": False}
+                    if args[0] not in ("OC", "RC"):
+                        return {"ok": True, "source_noop": "chiller_selector", "delivery_attempted": False}
+                    result = dict(execute_thermal("set_chiller_temperature", {
+                        "bank": 1 if args[0] == "OC" else 0, "temp_c": float(temperature)}, action, state))
+                    if result.get("source_noop") != "m_board_null" and result.get("source_body_returned", True):
+                        result["source_module_updates"] = {args[0]: True}
+                    return result
+                values = {"temp_c": float(args[0]), "duration": self._oem_int32(args[1]),
+                          "rate_c_s": float(args[2])}
+                if opcode == "splid":
+                    values["wait"] = not (len(args) > 3 and args[3] in ("F", "FALSE"))
+                return execute_thermal("set_tc_temperature" if opcode == "sp" else "set_lid_temperature",
+                                       values, action, state)
+            handlers.update({name: (lambda a, s, op=name: thermal(a, s, op))
+                             for name in ("sp", "splid", "cc")})
         if rgb_writer is not None or not rgb_board_present:
             handlers["led"] = led
         if execute_mov is not None:

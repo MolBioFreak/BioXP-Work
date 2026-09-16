@@ -68,6 +68,13 @@ class OemMotionCompletionError(RuntimeError):
         self.motion_evidence = dict(evidence)
 
 
+class _OemThermalResult(dict):
+    """Native result with a non-wire, origin-owned board-error notifier."""
+    def __init__(self, notifier, **values):
+        super().__init__(values)
+        self.notifier = notifier
+
+
 class BioXpTester:
     BOARD_HEAD = 0x04
     BOARD_DECK = 0x05
@@ -1301,7 +1308,7 @@ class BioXpTester:
         service = self._oem_fan_services()[key]
         if not service.get("running"):
             return
-        timer = threading.Timer(5.0, self._oem_fan_tick, args=(key,))
+        timer = threading.Timer(service.get("interval_s", 5.0), self._oem_fan_tick, args=(key,))
         timer.daemon = True
         service["timer"] = timer
         timer.start()
@@ -9235,6 +9242,455 @@ class BioXpTester:
             "verified": verified,
             "ok": self._tmcl_success(ack),
         }
+
+    # Pinned ClassCanLib thermal lifecycle (see thermal-plan.md). These source
+    # bodies intentionally do not call the separately guarded manual setters.
+    def _oem_thermal_state(self, board=None, bank=0):
+        board = self.BOARD_THERMAL if board is None else int(board)
+        states = self.__dict__.setdefault('_oem_thermal_controllers', {})
+        return states.setdefault((board, int(bank)), {
+            'lock': threading.RLock(), 'target': 100.0 if board == self.BOARD_CHILLER else 30.0,
+            'lid_target': 0.0, 'current': 25.0, 'lid_current': 25.0, 'chiller_current': 0.0,
+            'reached': True, 'lid_reached': True, 'satisfied': True, 'lid_satisfied': True,
+            'duration': 0, 'lid_duration': 0, 'start': None, 'lid_start': None,
+            'elapsed': 0, 'lid_elapsed': 0, 'duration_start': 0, 'lid_duration_start': 0,
+            'set_count': 0, 'lid_set_count': 0, 'needed': 0.0, 'lid_needed': 0.0,
+            'set': False, 'lid_set': False, 'lid_start_temp': 0.0,
+            'history': [0.0] * 45, 'lid_history': [0.0] * 45, 'dumped': False,
+        })
+
+    def _oem_thermal_result(self):
+        return _OemThermalResult(getattr(self, '_oem_thermal_error_callback', None),
+            ok=True, delivery_attempted=False, controller_command_acknowledged=False,
+            controller_completion_verified=False, physical_effect_verified=False,
+            source_return=None, owned_children=())
+
+    def _oem_thermal_tx(self, result, board, command, typ, bank, value=0):
+        result['delivery_attempted'] = True
+        ack = self.send_tmcl_retry(board, command, typ, bank, value, attempts=1,
+            wait_reply=True, write_timeout_ms=80, read_timeout_ms=100,
+            max_reads=10, strict_match=True)
+        good = self._tmcl_success(ack)
+        result['controller_command_acknowledged'] = bool(result['ok'] and good)
+        if not good:
+            result['ok'] = False
+            result.setdefault('source_failures', []).append({
+                'board': board, 'command': command, 'type': typ, 'bank': bank, 'ack': ack})
+        return ack
+
+    def _oem_thermal_error(self, result, message):
+        result.update(ok=False, source_board_error_event=message)
+        # Application errorEvent is asynchronous relative to the board wait.
+        # The canonical owner binds this to its existing source-error control,
+        # never to an addressed Stop or an inline blocking cleanup.
+        callback = result.notifier
+        if callable(callback):
+            callback(message)
+
+    @staticmethod
+    def _oem_thermal_elapsed(state, lid=False):
+        prefix = 'lid_' if lid else ''
+        start = state[prefix + 'start']
+        return state[prefix + 'elapsed'] if start is None else int((time.monotonic() - start) * 1000)
+
+    def _oem_thermal_stop_clock(self, state, lid=False, reset=False):
+        prefix = 'lid_' if lid else ''
+        state[prefix + 'elapsed'] = 0 if reset else self._oem_thermal_elapsed(state, lid)
+        state[prefix + 'start'] = None
+
+    @staticmethod
+    def _oem_thermal_needed(delta, rate):
+        # C# double division by zero is IEEE infinity/NaN, not Python's exception.
+        if rate == 0:
+            return float('nan') if delta == 0 else float('inf')
+        return abs(abs(delta) / rate)
+
+    def _oem_thermal_read(self, result, bank):
+        state = self._oem_thermal_state()
+        ack = self._oem_thermal_tx(result, self.BOARD_THERMAL, 10, 4, bank)
+        if ack is None:
+            if bank == 1:
+                # Recovered readLidTemperature dereferences null in its error text.
+                raise RuntimeError('readLidTemperature null source reply')
+            self._oem_thermal_error(result, 'readTemperature communication error!')
+            return state['current']
+        if not self._tmcl_success(ack):
+            return 1.0
+        value = int(ack['value']) / 1000.0
+        prefix = 'lid_' if bank == 1 else ''
+        with state['lock']:
+            state[prefix + 'current'] = value
+            reached = value > state['lid_target'] - 1.0 if bank else abs(state['target'] - value) < 1.0
+            if reached and not state[prefix + 'reached']:
+                state[prefix + 'reached'] = True
+                state[prefix + 'duration_start'] = self._oem_thermal_elapsed(state, bool(bank))
+        return value
+
+    def _oem_thermal_gp(self, result, board, typ, bank):
+        ack = self._oem_thermal_tx(result, board, 10, typ, bank)
+        # ClassThermalControl.readGP defaults to zero for null/nonmatching ACK.
+        return int(ack['value']) if self._tmcl_success(ack) else 0
+
+    def _oem_thermal_pwm_read(self, result, bank):
+        ack = self._oem_thermal_tx(result, self.BOARD_THERMAL, 10, 23, bank)
+        if ack is None:
+            self._oem_thermal_error(result, 'queryPWM communication error!')
+            return 0
+        return (int(ack['value']) & 255) if self._tmcl_success(ack) else 1
+
+    def _oem_thermal_ramp(self, result, bank, rate):
+        # Thermal board nest setters are conditional on m_isinitialized.
+        if bank == 0 and not self._oem_board_state().get(self.BOARD_THERMAL, False):
+            return
+        typ = 7 if rate > 0 else 8
+        state = self._oem_thermal_state()
+        state[('lid_' if bank else '') + ('heat_rate' if typ == 7 else 'cool_rate')] = rate
+        ack = self._oem_thermal_tx(result, self.BOARD_THERMAL, 9, typ, bank, int(rate * 1000))
+        if ack is None:
+            names = {(0, 7): 'setHeatlRamp', (0, 8): 'setCoolRamp',
+                     (1, 7): 'setLidHeatingRamp', (1, 8): 'setLidCoolingRamp'}
+            self._oem_thermal_error(result, names[bank, typ] + ' communication error!')
+
+    def _oem_thermal_target(self, result, bank, temp, duration):
+        state = self._oem_thermal_state()
+        actual = self._oem_thermal_read(result, bank)
+        typ = 7 if bank or temp > actual else 8
+        rate = self._oem_thermal_gp(result, self.BOARD_THERMAL, typ, bank) / 1000.0
+        needed = self._oem_thermal_needed(temp - actual, rate)
+        prefix = 'lid_' if bank else ''
+        with state['lock']:
+            state[prefix + 'needed'] = needed if bank or not needed < 10.0 else 10.0
+            if bank:
+                state['lid_start_temp'] = actual
+            state[prefix + 'target'] = temp if bank else min(temp, 100.0)
+        ack = self._oem_thermal_tx(result, self.BOARD_THERMAL, 140, 0, bank,
+                                   int(state[prefix + 'target'] * 1000))
+        if ack is None and bank:
+            self._oem_thermal_error(result, 'setLidTargetTemperature communication error!')
+        with state['lock']:
+            if ack is not None:
+                state[prefix + 'reached'] = False
+                state[prefix + 'set'] = True
+                if not bank:
+                    state['set_count'] = self._oem_thermal_elapsed(state)
+                state[prefix + 'start'] = time.monotonic()
+                state[prefix + 'elapsed'] = 0
+            state[prefix + 'duration'] = duration
+            if bank:
+                state['lid_set_count'] = self._oem_thermal_elapsed(state, True)
+                state['lid_satisfied'] = duration <= 0
+                if duration <= 0:
+                    state['lid_reached'] = True
+            else:
+                state['satisfied'] = False
+        # Fan resume targets are NOT assigned by either source thermal setter.
+
+    def _oem_thermal_board_sample(self, result, bank):
+        state = self._oem_thermal_state()
+        value = self._oem_thermal_read(result, bank)
+        key = 'lid_history' if bank else 'history'
+        history = state[key]
+        history[:] = history[1:] + [value]
+        if all(x == history[0] for x in history):
+            if not state['dumped']:
+                state['dumped'] = True
+                self._oem_thermal_tx(result, self.BOARD_THERMAL, 153, 0, 0)
+            self._oem_thermal_error(result, 'Read Lid Temperature: Temperature does not change' if bank else 'Read TC Temperature: Temperature does not change')
+        if sum(history) / len(history) > 130.0:
+            self._oem_thermal_error(result, 'Read Lid Temperature: Temperature exceeded 130 degrees' if bank else 'Read TC Temperature: Temperature exceeded 130 degrees')
+
+    def _oem_thermal_timer_process(self, result):
+        state = self._oem_thermal_state()
+        # Literal TimerProcess including strict > and the recovered resend test.
+        for lid in (False, True):
+            p = 'lid_' if lid else ''
+            if not state[p + 'set']:
+                continue
+            elapsed = self._oem_thermal_elapsed(state, lid)
+            if state[p + 'reached']:
+                if elapsed > state[p + 'duration_start'] + state[p + 'duration'] * 1000 and not state[p + 'satisfied']:
+                    state[p + 'satisfied'] = True
+                    self._oem_thermal_stop_clock(state, lid)
+            else:
+                limit = (state['lid_needed'] * 5 + 300) * 1000 if lid else state['set_count'] + state['needed'] * 5000
+                if elapsed > limit:
+                    if not lid:
+                        self._oem_thermal_stop_clock(state, reset=True)
+                    raise RuntimeError('LID took too long to reach target temperature' if lid else 'TC took too long to reach target temperature')
+                if lid and self._oem_thermal_read(result, 1) < state['lid_start_temp'] + 1.0 and state['lid_set_count'] > 0 and (elapsed - state['lid_set_count']) * 1000 > 60:
+                    ack = self._oem_thermal_tx(result, self.BOARD_THERMAL, 140, 0, 1, int(state['lid_target'] * 1000))
+                    if ack is None:
+                        self._oem_thermal_error(result, 'resendSetLidTemp communication error!')
+        # Source combines flag2/flag3 with an initially false flag; never true.
+        return False
+
+    def _oem_thermal_schedule(self, callback, delay=1.0):
+        timer = threading.Timer(delay, callback)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def _oem_thermal_wait(self, result, bank):
+        state = self._oem_thermal_state()
+        p = 'lid_' if bank else ''
+        token = object()
+        timer_lock = threading.RLock()
+        timer_result = self._oem_thermal_result()
+        timer_result.notifier = result.notifier
+        settled = concurrent.futures.Future()
+        state['timer_future'] = settled
+        state['timer_owner'] = token
+        self._oem_thermal_board_timer_enabled = True
+        def tick():
+            with timer_lock:
+                tick_locked()
+        def finish_timer():
+            if not settled.done():
+                replaced = state.get('timer_owner') not in (token, None)
+                settled.set_result({'ok': not replaced, 'source_timer_stopped': not replaced,
+                                    'source_timer_replaced': replaced, 'delivery_attempted': False})
+        def tick_locked():
+            started = time.monotonic()
+            if state.get('timer_owner') is not token or not self._oem_thermal_board_timer_enabled:
+                finish_timer()
+                return
+            try:
+                if state['set']:
+                    self._oem_thermal_board_sample(timer_result, 0)
+                if state['lid_set']:
+                    self._oem_thermal_board_sample(timer_result, 1)
+                self._oem_thermal_timer_process(timer_result)
+            except Exception as exc:
+                if str(exc) in ('TC took too long to reach target temperature', 'LID took too long to reach target temperature'):
+                    self._oem_thermal_error(timer_result, 'THERMAL_CONTROLLERIt takes too long to reach target temperature')
+                else:
+                    timer_result.update(ok=False, source_timer_error=str(exc))
+            finally:
+                time.sleep(0.5)
+            if state.get('timer_owner') is token and self._oem_thermal_board_timer_enabled:
+                state['timer'] = self._oem_thermal_schedule(tick, max(0.0, 1.0 - (time.monotonic() - started)))
+            else:
+                finish_timer()
+        state['timer'] = self._oem_thermal_schedule(tick)
+        try:
+            while not (state[p + 'reached'] and state[p + 'satisfied']):
+                if self.oem_no24v_state():
+                    if getattr(self, '_oem_user_stopped', False):
+                        result['source_user_stopped'] = True
+                        break
+                    raise RuntimeError('Lost 24V power setLidTemperature2' if bank else 'Lost 24V power setTemperature2')
+                # Without a connected application event owner, do not strand a
+                # canonical child forever after a source board-error callback.
+                if (result.get('source_board_error_event') or timer_result.get('source_board_error_event')) and not callable(result.notifier):
+                    raise RuntimeError('source_thermal_error_callback_unbound')
+                time.sleep(0.01)
+            result['source_wait_satisfied'] = bool(state[p + 'reached'] and state[p + 'satisfied'])
+        except Exception:
+            # Source has no finally around this wait: exceptional exit does not
+            # disable the board service. Aggregate Abort remains its real owner.
+            # Snapshot evidence; later board callbacks cannot mutate this receipt.
+            with timer_lock:
+                self._oem_thermal_merge(result, timer_result)
+            result.update(source_timer_enabled=self._oem_thermal_board_timer_enabled,
+                          source_timer_pending=not settled.done(), source_timer_future=settled)
+            raise
+        else:
+            self._oem_thermal_board_timer_enabled = False
+            state['timer_owner'] = None
+            state['timer'].cancel()
+            # Finish an entered board tick before returning the native snapshot.
+            # This lock is distinct from the short predicate lock used by bailout.
+            with timer_lock:
+                self._oem_thermal_merge(result, timer_result)
+                finish_timer()
+
+    def _oem_thermal_set_board(self, temp_c, duration, wait, bank):
+        result = self._oem_thermal_result()
+        try:
+            if self.oem_no24v_state():
+                raise RuntimeError('Lost 24V power setLidTemperature1' if bank else 'Lost 24V power setTemperature 1')
+            self._oem_thermal_pwm_read(result, bank)
+            self._oem_thermal_target(result, bank, float(temp_c), int(duration))
+            time.sleep(1.0)
+            pwm = self._oem_thermal_pwm_read(result, bank)
+            actual = 0.0
+            if bank:
+                self._oem_thermal_state()['lid_history'][:] = [0.0] * 45
+                actual = self._oem_thermal_read(result, 1)
+            if pwm < 5 and (not bank or temp_c > actual):
+                self._oem_thermal_target(result, bank, float(temp_c), int(duration))
+                time.sleep(1.0)
+                self._oem_thermal_pwm_read(result, bank)
+            if wait:
+                self._oem_thermal_wait(result, bank)
+            result['source_body_returned'] = True
+        except Exception as exc:
+            result.update(ok=False, source_body_returned=False, source_exception=str(exc))
+        return result
+
+    def oem_thermal_set_temperature(self, temp_c, duration=0, wait=True):
+        return self._oem_thermal_set_board(temp_c, duration, wait, 0)
+
+    def oem_thermal_set_lid_temperature(self, temp_c, duration=0, wait=True):
+        return self._oem_thermal_set_board(temp_c, duration, wait, 1)
+
+    @staticmethod
+    def _oem_thermal_merge(result, child):
+        result['ok'] = bool(result['ok'] and child['ok'])
+        result['delivery_attempted'] |= child.get('delivery_attempted', False)
+        if child.get('delivery_attempted'):
+            result['controller_command_acknowledged'] = bool(result['ok'] and child.get('controller_command_acknowledged'))
+        for key in ('source_exception', 'source_board_error_event', 'source_timer_error', 'source_wait_satisfied', 'source_user_stopped', 'source_body_returned', 'source_timer_enabled', 'source_timer_pending', 'source_timer_future'):
+            if key in child:
+                result[key] = child[key]
+        if child.get('source_failures'):
+            result.setdefault('source_failures', []).extend(child['source_failures'])
+        return result
+
+    def oem_set_lid_temperature(self, temp_c, duration, rate_c_s, wait=True):
+        result = self._oem_thermal_result()
+        if not self._oem_board_present(self.BOARD_THERMAL):
+            return dict(result, source_noop='m_board_null')
+        self._oem_thermal_ramp(result, 1, rate_c_s)
+        return self._oem_thermal_merge(result, self.oem_thermal_set_lid_temperature(temp_c, duration if wait else 0, wait))
+
+    def oem_set_tc_temperature(self, temp_c, duration, rate_c_s):
+        result = self._oem_thermal_result()
+        if not self._oem_board_present(self.BOARD_THERMAL):
+            return dict(result, source_noop='m_board_null')
+        self._oem_thermal_ramp(result, 0, rate_c_s)
+        time.sleep(0.2)
+        result['source_module_updates'] = {'TC': True}
+        self._oem_thermal_fan_interval(1.0)
+        child = self.oem_thermal_set_temperature(temp_c, duration, True)
+        if child.get('source_body_returned'):
+            self._oem_thermal_fan_interval(5.0)
+        return self._oem_thermal_merge(result, child)
+
+    def _oem_thermal_fan_interval(self, seconds):
+        fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
+        fan['interval_s'] = seconds
+        if fan.get('running'):
+            timer = fan.get('timer')
+            if timer is not None:
+                timer.cancel()
+            self._oem_fan_schedule((self.BOARD_THERMAL, 0))
+
+    def _oem_thermal_fan(self, board, bank):
+        return self._oem_fan_services().setdefault((board, bank), {
+            'pedestal_samples': [0.0] * 5, 'target_c': 30.0, 'current_c': 30.0,
+            'tc_on': False, 'going_down': False, 'accelerate': False, 'error': False,
+            'running': False, 'ticking': False, 'lid_target_c': -99.0})
+
+    def _oem_thermal_pwm(self, result, board, bank, pwm):
+        pwm = max(0, min(100, int(pwm)))
+        ack = self._oem_thermal_tx(result, board, 144, 0, bank, pwm)
+        # Controller writes after null-return are skipped, board wrapper still runs.
+        if ack is None:
+            self._oem_thermal_error(result, 'setPWM communication error!')
+        else:
+            state = self._oem_thermal_state(board, bank if board == self.BOARD_CHILLER else 0)
+            state['target'] = 100 if board == self.BOARD_CHILLER else 30
+            if pwm == 0:
+                self._oem_thermal_fan(board, bank if board == self.BOARD_CHILLER else 0).update(tc_on=False, target_c=30.0)
+        if board == self.BOARD_THERMAL:
+            fan = self._oem_thermal_fan(board, 0)
+            if bank == 0:
+                fan.update(tc_on=False, target_c=30.0)
+            else:
+                fan['lid_target_c'] = -99.0
+
+    def oem_turn_off_heater(self):
+        result = self._oem_thermal_result()
+        if self._oem_board_present(self.BOARD_THERMAL):
+            self._oem_thermal_pwm(result, self.BOARD_THERMAL, 0, 0)
+            self._oem_thermal_pwm(result, self.BOARD_THERMAL, 0, 0)
+            result['source_module_updates'] = {'TC': False}
+        return result
+
+    def oem_set_chiller_pwm(self, chiller=None, pwm=0):
+        result = self._oem_thermal_result()
+        banks = (1, 0) if chiller is None else (1,) if chiller in ('OC', 'oc') else (0,) if chiller in ('RC', 'rc') else ()
+        if self._oem_board_present(self.BOARD_CHILLER):
+            for bank in banks:
+                self._oem_thermal_pwm(result, self.BOARD_CHILLER, bank, pwm)
+                result.setdefault('source_module_updates', {})['OC' if bank else 'RC'] = False
+        return result
+
+    def oem_thermal_bailout(self):
+        if self._oem_board_present(self.BOARD_THERMAL):
+            state = self._oem_thermal_state()
+            with state['lock']:
+                state.update(reached=True, lid_reached=True, satisfied=True, lid_satisfied=True)
+        # ClassChillerBoard inherits empty ClassBaseBoard.bailout.
+        return dict(self._oem_thermal_result(), source_body_returned=True)
+
+    def oem_chiller_set_temperature(self, bank, temp_c):
+        result = self._oem_thermal_result()
+        result['source_return'] = -1
+        if bank not in (0, 1):
+            raise ValueError('OEM chiller bank must be 0 or 1')
+        if not self._oem_board_present(self.BOARD_CHILLER):
+            return dict(result, source_return=0, source_noop='m_board_null', source_body_returned=True)
+        if self.oem_no24v_state():
+            return dict(result, ok=False, source_exception='Lost 24V power setChillerTemp', source_body_returned=False)
+        state = self._oem_thermal_state(self.BOARD_CHILLER, bank)
+        try:
+            ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 143, 0, 0 if bank == 0 else 3)
+            actual = state['chiller_current'] if ack is None else int(ack['value']) / 1000 if self._tmcl_success(ack) else 0.0
+            if ack is not None and self._tmcl_success(ack):
+                state['chiller_current'] = actual
+                if actual < state['target'] and not state['reached']:
+                    state['reached'] = True
+                    self._oem_thermal_stop_clock(state)
+                if not state['reached'] and actual - state['target'] > 2 and self._oem_thermal_elapsed(state) > (state['needed'] + 300) * 1000:
+                    raise RuntimeError('It took too long to cool the ' + ('Reagent Chiller' if bank == 0 else 'Output Nest'))
+            needed = self._oem_thermal_needed(temp_c - actual, self._oem_thermal_gp(result, self.BOARD_CHILLER, 8, bank) / 1000.0) if temp_c < actual else 0.0
+            state['needed'] = 10.0 if needed < 10 else needed
+            state['target'] = float(temp_c)
+            self._oem_thermal_fan(self.BOARD_CHILLER, bank)
+            self._oem_fan_set_target(self.BOARD_CHILLER, bank, temp_c)
+            state['reached'] = False
+            ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 140, 0, bank, int(temp_c * 1000))
+            if ack is None:
+                raise RuntimeError('setChillerTemperature null source reply')
+            result['source_return'] = 0 if self._tmcl_success(ack) else -1
+            state.update(reached=False, set=True, start=time.monotonic(), elapsed=0)
+        except Exception as exc:
+            # ClassChillerBoard catches these and returns -1, except No24V finally.
+            result['source_caught_exception'] = str(exc)
+            result['ok'] = False
+            if str(exc) in ('It takes too long to cool chiller', 'Chiller temperature out of range'):
+                self._oem_thermal_error(result, 'CHILLER_BOARD: ' + str(exc))
+        finally:
+            if self.oem_no24v_state():
+                result.update(ok=False, source_exception='Lost 24V power set chiller temp', source_body_returned=False)
+        result.setdefault('source_body_returned', True)
+        return result
+
+    def oem_resume_temperature(self):
+        result = self._oem_thermal_result()
+        if self._oem_board_present(self.BOARD_THERMAL):
+            fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
+            if fan['tc_on']:
+                child = self.oem_thermal_set_temperature(fan['target_c'], 0, False)
+                self._oem_thermal_merge(result, child)
+                if not child.get('source_body_returned'):
+                    return result
+            if fan.get('lid_target_c', -99.0) != -99.0:
+                child = self.oem_thermal_set_lid_temperature(fan['lid_target_c'], 0, False)
+                self._oem_thermal_merge(result, child)
+                if not child.get('source_body_returned'):
+                    return result
+        if self._oem_board_present(self.BOARD_CHILLER):
+            for bank in (0, 1):
+                if self._oem_thermal_fan(self.BOARD_CHILLER, bank)['tc_on']:
+                    target = self._oem_thermal_fan(self.BOARD_CHILLER, 0)['target_c']
+                    child = self.oem_chiller_set_temperature(bank, target)
+                    self._oem_thermal_merge(result, child)
+                    if not child.get('source_body_returned'):
+                        return result
+        return result
 
     def thermal_set_target_temp(self, bank, temp_c, verify=False):
         bank = int(bank)
