@@ -11601,9 +11601,40 @@ class Serial206OemInitializationProvider:
             "g", speed=600 if version == 0 else 200, timeout_s=30.0,
             startup=False, restore_idle_current=version == 1, oem_exact_current=True,
         )
-        return self._deck_primitive_receipt(
+        receipt = self._deck_primitive_receipt(
             result, source_anchor="ClassControlInterface.sendGripperHome",
         )
+        # sendGripperHome is void: it ignores goHome/setMaxCurrent numerical
+        # returns. Adapt only this native composite, not arbitrary missing-ok
+        # primitives. Raised exceptions still escape unchanged; a represented
+        # source exception is not a normal void return either.
+        row = result if isinstance(result, Mapping) else {}
+        home = row.get("home")
+        board_null = row.get("source_noop") == "board_null"
+        source_completed = bool(
+            row.get("axis") == "g" and isinstance(home, Mapping)
+            and not home.get("source_exception")
+            and (
+                (board_null and home.get("source_noop") is True and home.get("ok") is True)
+                or (
+                    row.get("startup") is False
+                    and isinstance(row.get("prepare"), Mapping)
+                    and (isinstance(row.get("restore_current"), Mapping) if version == 1
+                         else row.get("restore_current") is None)
+                    and type(home.get("source_return_code")) is int
+                )
+            )
+        )
+        return {
+            **receipt,
+            "ok": source_completed,
+            "source_call_completed": source_completed,
+            "source_return_kind": "void",
+            # This is operational source evidence, not a bounded diagnostic.
+            "primitive_result": result,
+            "physical_effect_verified": False,
+            "independent_physical_motion_verified": False,
+        }
 
     def wp8_lock_gripper(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
