@@ -36,6 +36,20 @@ class NativePhysicalRecorder:
         self.trace, self.replies, self.timers = [], {}, []
         self.axis_parameters = {}
         self.thermal_wait = threading.Event()
+        self.abort_intervals = []
+        self.abort_returned = threading.Event()
+        real_abort = self.tester.motor_oem_force_abort_motion
+        def observe_abort(**kwargs):
+            interval = {'start': len(self.trace)}
+            self.abort_intervals.append(interval)
+            try:
+                return real_abort(**kwargs)
+            finally:
+                interval['end'] = len(self.trace)
+                interval['frames'] = self.trace[interval['start']:interval['end']]
+                self.abort_returned.set()
+        monkeypatch.setattr(self.tester, 'motor_oem_force_abort_motion', observe_abort)
+        self.timer_gate = None
         self.tester.send_tmcl_retry = self.exchange
         self.tester._send_motor = self.exchange
         # Keep real native timer processing and time. Timer objects are tracked
@@ -95,13 +109,19 @@ class NativePhysicalRecorder:
 
     def schedule(self, callback, delay=1.0):
         self.thermal_wait.set()
-        timer = threading.Timer(delay, callback)
+        def entered():
+            if self.timer_gate is not None:
+                self.timer_gate.wait()
+            callback()
+        timer = threading.Timer(delay, entered)
         timer.daemon = True
         self.timers.append(timer)
         timer.start()
         return timer
 
     def close(self):
+        if self.timer_gate is not None:
+            self.timer_gate.release.set()
         for timer in self.timers:
             timer.cancel()
         for timer in self.timers:
@@ -351,11 +371,14 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
                 'jobs': jobs, 'children': [rig.child_rows(job) for job in jobs],
                 'pipette_errors': pipette_errors, 'pipette_rows': pipette_rows,
                 'pipette_identity': transport.collection_source_identity(),
-                'thermal_wire': native.trace, 'source_rgb': rig.trace,
+                'thermal_wire': native.trace, 'abort_intervals': native.abort_intervals,
+                'source_rgb': rig.trace,
                 'no24v': native.tester.oem_no24v_state(),
                 'references': references.snapshot(('x', 'y', 'z', 'g')),
                 'raw_moves': rig.raw_moves,
             }, indent=2))
+        if native.timer_gate is not None:
+            native.timer_gate.release.set()
         if rig.body_gate is not None:
             rig.body_gate.release.set()
         # Source event releases test-owned gates without faking parent settlement.

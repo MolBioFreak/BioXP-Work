@@ -44,7 +44,12 @@ def assert_abort_invalidated(rig, done):
     assert rig.native.tester.oem_no24v_state() is True
     rows = rig.references.snapshot(('x', 'y', 'z', 'g'))['rows']
     assert all(row['state'] != 'referenced' for row in rows.values()), rows
-    assert not any(row[1] == 3 for row in rig.native.trace), 'software Abort must not send addressed Stop'
+    assert len(rig.native.abort_intervals) == 1
+    interval = rig.native.abort_intervals[0]
+    assert 'end' in interval
+    assert not any(row[1] == 3 for row in interval['frames']), 'software Abort must not send addressed Stop'
+    if 'safe_stop_exit' not in hooks(done):
+        assert not any(row[1] == 3 for row in rig.native.trace)
     assert rig.provider._wp8_source_script_returned is True
     return raw
 
@@ -117,6 +122,28 @@ def test_real_control_exit_duplicate_control_and_nonreplay(integrated_rig, actio
         # success: the actual software Abort invalidates motion authority first.
         assert_abort_invalidated(rig, done)
         assert rig.control_chain(done) == ['shutdown_temperature', 'software_abort']
+        stops = [(i, row) for i, row in enumerate(rig.native.trace) if row[1] == 3]
+        assert [row for _, row in stops] == [(4, 3, 0, 2, 0)] * 2
+        assert all(i < rig.native.abort_intervals[0]['start'] for i, _ in stops)
+        children = rig.child_rows(done)
+        homes = [json.loads(row['receipt_json']) for row in children
+                 if 'sourceHomeGripper' in row['receipt_json']]
+        assert len(homes) == 1 and homes[0]['status'] == 'completed', homes
+        home = homes[0]['terminal_evidence']['response']['completed_children'][0]
+        assert home['operation'] == 'sourceHomeGripper'
+        stop = home['result']['home']['go_home']['stop']
+        assert (stop['board'], stop['motor']) == (4, 2)
+        assert stop['oem_double_stop'] is True and stop['source_call_completed'] is True
+        assert stop['first_delivery']['status'] == stop['second_delivery']['status'] == 100
+        # Qualify retained custody/nonreplay even while the independent cleanup
+        # classification expectation below remains deliberately unresolved.
+        assert_reopened(rig, done)
+        before = rig.children(job)
+        wire = list(rig.native.trace)
+        replay = rig.control(job, action + '-once', action=action)
+        assert replay.status_code == 200 and replay.json() == response.json()
+        assert rig.submit(payload).json()['job_id'] == job['job_id']
+        assert rig.children(job) == before and rig.native.trace == wire
         assert done['command']['status'] == 'failed', done
         cleanup = [row for row in done['execution']['runtime_state']['action_results']
                    if row.get('hook') == 'cleanup']
@@ -226,16 +253,30 @@ def test_native_thermal_pending_child_released_by_real_control(integrated_rig, r
     assert_abort_invalidated(rig, done)
     receipt = rig.native_results(done, 'set_tc_temperature')[0]
     raw = receipt['response']
-    assert raw['source_body_returned'] is True, raw
-    assert raw['source_user_stopped'] is True and raw['source_wait_satisfied'] is False, raw
-    if release == 'board_error':
-        assert receipt['status'] == 'failed'
-        assert raw['source_board_error_event'] == 'readTemperature communication error!'
-    else:
-        assert receipt['status'] == 'completed'
+    assert_thermal_abort_outcome(receipt, board_error=release == 'board_error')
     assert 'cleanup' not in hooks(done) and 'source_error' not in hooks(done)
     assert rig.native.tester._oem_thermal_board_timer_enabled is False
     assert_reopened(rig, done)
+
+
+def assert_thermal_abort_outcome(receipt, *, board_error=False):
+    raw = receipt['response']
+    if raw['source_body_returned'] is False:
+        assert raw['source_exception'] == 'Lost 24V power setTemperature2', raw
+        assert receipt['status'] == 'failed' and raw['ok'] is False
+        assert 'source_user_stopped' not in raw and 'source_wait_satisfied' not in raw
+        assert raw['source_timer_pending'] is False
+        assert raw['source_timer_enabled'] is False
+        assert raw['source_timer_completion'] == [{'ok': True, 'source_timer_stopped': True,
+            'source_timer_replaced': False, 'delivery_attempted': False}]
+    else:
+        assert raw['source_body_returned'] is True
+        assert raw['source_user_stopped'] is True and raw['source_wait_satisfied'] is False
+        assert 'source_exception' not in raw
+        assert receipt['status'] == ('failed' if board_error else 'completed')
+        assert raw['ok'] is (not board_error)
+    if board_error:
+        assert raw['source_board_error_event'] == 'readTemperature communication error!'
 
 
 def test_native_thermal_deferred_pause_bailout_releases_child(integrated_rig):
