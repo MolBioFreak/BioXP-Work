@@ -10923,6 +10923,9 @@ class Serial206OemInitializationProvider:
         self.invalidate_deck_authority_cache(reason="deck_execution_started")
         if authority_snapshot is None:
             result = self._canonical_deck_semantic_state(no_tip_park=no_tip_park)
+            # Both the fresh and admitted branches expose the same execution keys.
+            result["current_location_id"] = result.pop("current_location")
+            result["current_well_id"] = result.pop("current_well")
             result["gripper_confirmed"] = self._deck_gripper_confirmed()
             return result
         if not isinstance(authority_snapshot, Mapping):
