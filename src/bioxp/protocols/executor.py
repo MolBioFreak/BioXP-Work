@@ -65,6 +65,8 @@ class ProtocolExecutor:
         lifecycle_handlers: Mapping[str, Callable] | None = None,
         on_state_change: Callable[[ProtocolRuntimeState], None] | None = None,
         before_native_entry: Callable[[str, ProtocolRuntimeState], None] | None = None,
+        source_script_begin: Callable[[ProtocolRuntimeState], Mapping[str, Any]] | None = None,
+        source_script_returned: Callable[[ProtocolRuntimeState], Mapping[str, Any]] | None = None,
     ) -> None:
         self.dry_run = bool(dry_run)
         self.job_id = job_id
@@ -80,6 +82,16 @@ class ProtocolExecutor:
             raise ValueError("Unknown lifecycle binding")
         self._on_state_change = on_state_change
         self._before_native_entry = before_native_entry
+        if (source_script_begin is None) != (source_script_returned is None):
+            raise ValueError("Source lifetime callbacks must be supplied as a pair")
+        if source_script_begin is not None and not all(callable(cb) for cb in (source_script_begin, source_script_returned)):
+            raise ValueError("Source lifetime callbacks must be callable")
+        self._source_script_begin = source_script_begin
+        self._source_script_returned = source_script_returned
+        self._source_entered = False
+        self._source_return_notified = False
+        self._source_returned = False
+        self._source_wrappers: list[Future] = []
         self._condition = Condition()
         self._state: ProtocolRuntimeState | None = None
         self._owned: list[tuple[OwnedOperation, dict[str, Any]]] = []
@@ -486,6 +498,8 @@ class ProtocolExecutor:
                 if (owned, result) not in self._owned:
                     continue
                 self._owned.remove((owned, result))
+                if owned.future in self._source_wrappers:
+                    self._source_wrappers.remove(owned.future)
             try:
                 value = owned.future.result()
             except Exception as exc:
@@ -533,6 +547,8 @@ class ProtocolExecutor:
             value = self._lifecycle_handlers[name](self._state)
             return value.result() if isinstance(value, Future) else value
         value = self._pool.submit(copy_context().run, entered)
+        if self._source_entered and not self._source_return_notified:
+            self._source_wrappers.append(value)
         if isinstance(value, Future):
             result["pending"] = True
             owned = OwnedOperation(value, domains)
@@ -740,6 +756,8 @@ class ProtocolExecutor:
         if isinstance(value, Future):
             result["pending"] = True
             self._retain(OwnedOperation(value, domains), result)
+            if self._source_entered and not self._source_return_notified:
+                self._source_wrappers.append(value)
         else:
             self._consume(value, result)
         self._reap()
@@ -797,6 +815,11 @@ class ProtocolExecutor:
                     state.workflow.held_reason = "source_error_hold"
                     self._gate("error_hold", "lifecycle:run_job")
                     raise _Diversion()
+                if self._source_script_begin is not None:
+                    if self.source_stopped():
+                        raise _Diversion()
+                    self._source_lifetime_call(self._source_script_begin)
+                    self._source_entered = True
                 self._hook("script_prologue", once=True)
             self._publish("executing")
             for stage in document.stages:
@@ -835,6 +858,11 @@ class ProtocolExecutor:
             self._finish_source()
         except _Diversion:
             pass
+        finally:
+            try:
+                self._return_source()
+            except _Diversion:
+                pass
         # Final aggregation is deliberately AFTER the chosen lifecycle return.
         # Stop never cancels an entered Future or substitutes its own ACK.
         while self._owned:
@@ -880,8 +908,38 @@ class ProtocolExecutor:
             self.outcome = "ambiguous"
         return state
 
+    def _source_lifetime_call(self, callback, *, returned: bool = False) -> None:
+        # Host facts only; native-entry and persistence guards must not suppress
+        # this notification after an interruption.
+        try:
+            result = self._explicit_result(callback(self._state))
+            if result.get("ok") is not True or (returned and result.get("source_script_returned") is not True):
+                raise ValueError("Source lifetime notification refused")
+        except Exception as exc:
+            self._unknown = True
+            assert self._state is not None
+            self._state.record_event("source_lifetime_failed", detail={
+                "boundary": "returned" if returned else "begin", "error_type": type(exc).__name__,
+            })
+            raise _Diversion() from exc
+
+    def _return_source(self) -> None:
+        if not self._source_entered or self._source_return_notified:
+            return
+        # Source wrappers include flattened Future returns, but not native
+        # children handed back by them or started via start_child.
+        while any(not future.done() for future in self._source_wrappers):
+            self._reap()
+            with self._condition:
+                self._condition.wait(0.05)
+        self._reap()
+        self._source_return_notified = True  # failed notification is not retried
+        self._source_lifetime_call(self._source_script_returned, returned=True)
+        self._source_returned = True
+
     def _finish_source(self) -> None:
         if self._interrupted or self._unknown or self._recording_failed:
+            self._return_source()
             return
         self._service_requests()
         if not self._oem:
@@ -894,20 +952,28 @@ class ProtocolExecutor:
             if self._termination in {"source_error", "abort_false"}:
                 self._publish("cleanup")
                 self._hook(self._termination, once=True)
+                self._return_source()
             elif self._termination in {"abort", "safe_stop"}:
                 if not self._safe_boundary() and not (self._pause and self._pause[0] == "deferred"):
                     self._unknown = True
                     self._publish("reconciling", held_reason="termination_boundary_unreached")
                     return
                 if self._termination == "abort":
-                    if self._safe_boundary() and not (self._pause and self._pause[0] == "deferred"):
+                    if (self._safe_boundary() and not (self._pause and self._pause[0] == "deferred")
+                            and not self._source_return_notified):
                         self._hook("safe_stop_exit", MOTION_DOMAINS, once=True)
+                    self._return_source()
                     self._hook("abort_true_finish", once=True)
+                self._return_source()
+                if self._source_script_begin is not None and not self._source_returned:
+                    raise _Diversion()
                 self._publish("cleanup")
                 self._hook("cleanup", MOTION_DOMAINS, once=True)
+            self._return_source()
             self._hook("script_finally", once=True)
         finally:
             self._servicing = False
+            self._return_source()
 
     def _ensure_stage_states(self, document: ProtocolDocument, state: ProtocolRuntimeState) -> None:
         for stage in document.stages:

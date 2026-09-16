@@ -549,6 +549,23 @@ def _workflow_resources(document: ProtocolDocument) -> list[str]:
     return sorted(resources)
 
 
+class ProtocolBindings(tuple):
+    """Internal factory triple with separate optional host lifetime callbacks.
+
+    Plain legacy triples and existing three-value unpacking remain supported.
+    These attributes never enter the public OEM lifecycle/opcode dictionaries.
+    """
+    source_script_begin: Callable | None
+    source_script_returned: Callable | None
+
+    def __new__(cls, handlers, oem_handlers, lifecycle_handlers, *,
+                source_script_begin=None, source_script_returned=None):
+        value = super().__new__(cls, (handlers, oem_handlers, lifecycle_handlers))
+        value.source_script_begin = source_script_begin
+        value.source_script_returned = source_script_returned
+        return value
+
+
 def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=None) -> None:
     """Register on the existing dispatch owner; no service worker or active registry."""
     def dispatch(command):
@@ -556,7 +573,8 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
         bundle = command["requested_inputs"]["bundle"]
         document = ProtocolDocument.from_payload(bundle["protocol"]["document"])
         executor = None
-        handlers, oem_handlers, lifecycle_handlers = binding_factory(bundle, source_executor=lambda: executor)
+        bindings = binding_factory(bundle, source_executor=lambda: executor)
+        handlers, oem_handlers, lifecycle_handlers = bindings
         state = ProtocolRuntimeState.from_payload(bundle["execution"]["runtime_state"])
         reviews = list(bundle["operator"]["reviews"])
 
@@ -590,6 +608,8 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
             oem_handlers={key: wrap_action(handler) for key, handler in oem_handlers.items()},
             lifecycle_handlers={key: wrap_lifecycle(key, handler) for key, handler in lifecycle_handlers.items()},
             on_state_change=publish,
+            source_script_begin=getattr(bindings, "source_script_begin", None),
+            source_script_returned=getattr(bindings, "source_script_returned", None),
             before_native_entry=lambda identity, current: command_store.assert_workflow_current(job_id),
         )
 
@@ -705,12 +725,16 @@ def create_protocol_job(
         return retained
     if authority_factory is not None:
         ownership_generation, board_epochs = authority_factory(compiled.document)
+    bindings = None
     if binding_factory is not None:
-        handlers, oem_handlers, lifecycle_handlers = binding_factory({"protocol": compiled.to_payload()})
+        bindings = binding_factory({"protocol": compiled.to_payload()})
+        handlers, oem_handlers, lifecycle_handlers = bindings
     if ownership_generation is None:
         raise ProtocolLiveContractError("Current canonical ownership is unavailable.")
     _build_live_execution_contract(payload=payload, compiled=compiled, handlers=handlers, oem_handlers=oem_handlers)
     executor = ProtocolExecutor(dry_run=False, handlers=handlers, oem_handlers=oem_handlers,
+                                source_script_begin=getattr(bindings, "source_script_begin", None),
+                                source_script_returned=getattr(bindings, "source_script_returned", None),
                                 lifecycle_handlers=lifecycle_handlers,
                                 before_native_entry=lambda identity, state: command_store.assert_workflow_current(state.job_id))
     support = executor.preflight(compiled.document)

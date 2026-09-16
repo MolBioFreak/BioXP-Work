@@ -4457,6 +4457,8 @@ class Serial206OemInitializationProvider:
         self._oem_source_rgb: tuple[int, ...] | None = None
         self._wp8_stop_event = threading.Event()
         self._wp8_stop_event.set()
+        self._wp8_source_script_owner: str | None = None
+        self._wp8_source_script_returned = False
         self._deck_owner_id = "serial206-oem-initialization-provider"
         self._home_recovery_owner_id = uuid.uuid4().hex
         self._deck_semantic_state_reader: Callable[[], Mapping[str, Any]] | None = None
@@ -12731,6 +12733,33 @@ class Serial206OemInitializationProvider:
         return self.scriptmoveTo(
             destination=6, well=0, position_flag=1, run_in_parallel=True,
         )
+
+    def wp8_source_script_begin(self, *, command_id: str) -> dict[str, Any]:
+        """Host source entry, not native admission or child settlement."""
+        if not isinstance(command_id, str) or not command_id:
+            raise ValueError("Source script requires canonical parent identity")
+        with self._lock:
+            owner = self._wp8_source_script_owner
+            if owner == command_id:
+                if self._wp8_source_script_returned:
+                    raise RuntimeError("source_script_attempt_already_returned")
+            elif owner is not None and not self._wp8_source_script_returned:
+                raise RuntimeError("source_script_owner_overlap")
+            else:
+                self._wp8_source_script_owner = command_id
+                self._wp8_source_script_returned = False
+                self._wp8_stop_event.clear()
+        return {"ok": True, "delivery_attempted": False}
+
+    def wp8_source_script_returned(self, *, command_id: str) -> dict[str, Any]:
+        """Signal once for this parent; waitStop may already have consumed it."""
+        with self._lock:
+            if not command_id or command_id != self._wp8_source_script_owner:
+                raise RuntimeError("source_script_owner_mismatch")
+            if not self._wp8_source_script_returned:
+                self._wp8_source_script_returned = True
+                self._wp8_stop_event.set()
+        return {"ok": True, "delivery_attempted": False, "source_script_returned": True}
 
     def wp8_wait_stop(
         self, operation: str, arguments: Mapping[str, Any], **_: Any,

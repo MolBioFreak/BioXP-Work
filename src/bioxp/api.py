@@ -10929,7 +10929,17 @@ def _protocol_bindings(bundle, *, source_executor=None):
         # composition are not bound here; control callers retain deferred thermal work.
     if set(native).intersection(pipette):
         raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
-    return _protocol_live_handlers(), {**native, **pipette}, lifecycle
+    from .services.protocol_service import ProtocolBindings
+    lifetime = {}
+    if provider is not None:
+        begin = getattr(provider, "wp8_source_script_begin", None)
+        returned = getattr(provider, "wp8_source_script_returned", None)
+        if callable(begin) and callable(returned):
+            lifetime = {
+                "source_script_begin": lambda state: begin(command_id=state.workflow.command_id),
+                "source_script_returned": lambda state: returned(command_id=state.workflow.command_id),
+            }
+    return ProtocolBindings(_protocol_live_handlers(), {**native, **pipette}, lifecycle, **lifetime)
 
 
 @app.post("/protocol/execute")
