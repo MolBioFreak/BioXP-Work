@@ -55,7 +55,8 @@ class NativePhysicalRecorder:
             ((command == 143 and typ == 0 and bank in (0, 3)) or
              (command == 10 and typ in (7, 8) and bank in (0, 1)) or
              (command in (140, 144) and typ == 0 and bank in (0, 1))))
-        assert thermal or chiller, f'unrecorded native physical command: {(*key, value)}'
+        gripper_home_switch = key == (4, 6, 9, 2)
+        assert thermal or chiller or gripper_home_switch, f'unrecorded native physical command: {(*key, value)}'
         # Synthetic measured temperature/PWM and rate replies, not live proof.
         scalar = 10 if typ == 23 else 25000 if command == 143 or (command == 10 and typ == 4) else 1000 if command == 10 else 0
         return {'status': 100, 'value': scalar}
