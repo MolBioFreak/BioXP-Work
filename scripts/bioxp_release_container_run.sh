@@ -303,6 +303,27 @@ print(matches[0])
 PY
 ) || fail "immutable local uDocker image reference resolution failed"
 
+# uDocker run IMAGE creates another full extraction on every invocation.
+# Reuse its ordinary named container, scoped to the exact immutable image.
+CONTAINER_NAME="bioxp-${IMAGE_ID#sha256:}"
+if [[ ! -e "$UDOCKER_ROOT/store/containers/$CONTAINER_NAME" ]]; then
+  "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" create --name="$CONTAINER_NAME" "$IMAGE_REF" >/dev/null \
+    || fail "local release container creation failed"
+fi
+/usr/bin/python3 - "$UDOCKER_ROOT/store" "$CONTAINER_NAME" "$IMAGE_REF" <<'PY'
+import json, sys
+from pathlib import Path
+store = Path(sys.argv[1])
+container = (store / "containers" / sys.argv[2]).resolve(strict=True)
+if container.parent != store / "containers" or not (container / "ROOT").is_dir():
+    raise SystemExit("release container path is invalid")
+if (container / "imagerepo.name").read_text().strip() != sys.argv[3]:
+    raise SystemExit("release container image reference mismatch")
+repo, tag = sys.argv[3].rsplit(":", 1)
+if json.loads((container / "container.json").read_text()) != json.loads((store / "repos" / repo / tag / "container.json").read_text()):
+    raise SystemExit("release container image metadata mismatch")
+PY
+
 SOURCE_VOLUME=()
 [[ "$SOURCE_MODE" == exact_commit_materialization ]] || fail "unsupported source mode"
 SOURCE_VOLUME=(--volume="$HOST_SOURCE:/app")
@@ -325,5 +346,5 @@ exec "$UDOCKER_BIN" --repo="$UDOCKER_ROOT/store" run \
   --volume=/dev:/dev \
   --volume=/run/udev:/run/udev:ro \
   --workdir=/app \
-  "$IMAGE_REF" \
+  "$CONTAINER_NAME" \
   /bin/sh -lc 'PYTHONPATH=/app/src BIOXP_OEM_MACHINE_BUNDLE_LOCK=/app/.oem_lock/OEM_EVIDENCE_LOCK.json BIOXP_PHYSICAL_LABEL_SERIAL=206 BIOXP_OEM_RUNTIME_ROOT=/app/.oem_runtime_state BIOXP_OEM_RUNTIME_STATE_ROOT=/app/.oem_runtime_state exec python -m uvicorn bioxp.api:app --host 0.0.0.0 --port 8123 --no-access-log --log-level error >/dev/null'
