@@ -10306,8 +10306,16 @@ class Serial206OemInitializationProvider:
                         ),
                     )
                 except Exception as exc:
-                    result["reference_persistence_ok"] = False
-                    result["reference_persistence_error"] = f"{type(exc).__name__}:{exc}"
+                    # Native success is not usable reference authority until its
+                    # durable publication succeeds. Preserve controller evidence,
+                    # but do not report completed/referenced_ready or re-home.
+                    ok = False
+                    result.update(
+                        ok=False,
+                        failure="z_reference_persistence_failed",
+                        reference_persistence_ok=False,
+                        reference_persistence_error=f"{type(exc).__name__}:{exc}",
+                    )
                 else:
                     reference_published = True
                     result["reference_persistence_ok"] = True
@@ -10427,6 +10435,23 @@ class Serial206OemInitializationProvider:
                 z.update({"state": previous_state, "last_failure": None})
             elif intent == "stop":
                 z.update({"state": previous_state, "reference_state": str(z.get("reference_state") or "unknown"), "last_failure": None if ok else _json_safe(result)})
+            elif result.get("reference_persistence_ok") is False:
+                # Reference storage may also reject compensation. Still attempt
+                # to retain a failed lifecycle/receipt in the existing state
+                # owner; never let this second error restore a ready projection.
+                z.update(state="failed_latched", reference_state="desynced",
+                         awaiting_observation_receipt_id=None)
+                try:
+                    self._z_mark_desynced(
+                        "Z reference publication failed; reconciliation is required.",
+                        f"serial206.z.{intent}.reference_publication_failed",
+                    )
+                    result["reference_invalidation_ok"] = True
+                except Exception as exc:
+                    result["reference_invalidation_ok"] = False
+                    result["reference_invalidation_error"] = f"{type(exc).__name__}:{exc}"
+                receipt["result"] = _json_safe(result)
+                z["last_failure"] = _json_safe(receipt)
             else:
                 z.update({
                     "state": "failed_latched",
