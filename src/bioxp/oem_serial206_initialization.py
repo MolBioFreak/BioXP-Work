@@ -8,12 +8,14 @@ authority-bearing ledgers are persisted as one atomic state document.
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import json
 import math
+import uuid
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -22,6 +24,17 @@ from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
+from .oem_deck_movement import (
+    OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
+    WP8_COMPILED_CHILD_OPERATIONS,
+    WP8_OPERATION_INTENT_KEYS,
+    canonical_movable_object_locations,
+    canonical_plate_name,
+    compile_finite_plate_operation,
+    compile_cleanup_waste_prelude,
+    execute_finite_plate_operation,
+    plate_name_for_storage,
+)
 from .oem_serial206_initialization_contract import (
     OEM_INITIALIZE_MOTORS_STAGE_KEYS,
     SERIAL206_INITIALIZE_MOTORS_LEDGER_SCHEMA,
@@ -31,6 +44,40 @@ from .oem_serial206_initialization_contract import (
 from .oem_parity_config import load_oem_parity_config
 from .pipette.models import PipetteInitCommand
 from .services.reference_service import MarkAxisDesyncedCommand, MarkAxisReferencedCommand
+
+
+@dataclass(frozen=True)
+class Wp8GripperLockToken:
+    command_id: str
+    acquiring_identity: str
+    plan_digest: str
+    dispatch_attempt_id: str
+    ownership_generation: int
+    board_epoch_4: int
+    board_epoch_5: int
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "acquiring_identity": self.acquiring_identity,
+            "plan_digest": self.plan_digest,
+            "dispatch_attempt_id": self.dispatch_attempt_id,
+            "ownership_generation": self.ownership_generation,
+            "board_epoch_4": self.board_epoch_4,
+            "board_epoch_5": self.board_epoch_5,
+        }
+
+    @classmethod
+    def from_receipt(cls, value: Mapping[str, Any]) -> "Wp8GripperLockToken":
+        return cls(
+            command_id=str(value["command_id"]),
+            acquiring_identity=str(value["acquiring_identity"]),
+            plan_digest=str(value["plan_digest"]),
+            dispatch_attempt_id=str(value["dispatch_attempt_id"]),
+            ownership_generation=int(value["ownership_generation"]),
+            board_epoch_4=int(value["board_epoch_4"]),
+            board_epoch_5=int(value["board_epoch_5"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -366,11 +413,46 @@ def _json_contract_safe(value: Any) -> Any:
     return projected
 
 
+def _aggregate_executed_controller_evidence(execution: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate explicit controller evidence from executed physical leaf receipts."""
+    leaves: list[Mapping[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if "controller_command_acknowledged" in value:
+                leaves.append(value)
+                return
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(execution.get("execution_results", []))
+    acknowledged = bool(leaves) and all(row.get("controller_command_acknowledged") is True for row in leaves)
+    completed = bool(leaves) and all(
+        row.get("controller_completion_verified") is True
+        or row.get("controller_terminal_state_verified") is True
+        for row in leaves
+    )
+    return {
+        "controller_command_acknowledged": acknowledged,
+        "controller_completion_verified": completed,
+        "hardware_postcondition_verified": completed and all(
+            row.get("hardware_postcondition_verified") is True for row in leaves
+        ),
+        "required_executed_child_count": len(leaves),
+    }
+
+
 class Serial206ProductionPrimitiveAdapter:
     """Source-bound production primitives for both OEM initialization methods."""
 
     _MOTOR_METHODS = (
         "motor_oem_home_axis",
+        "motor_oem_axis_search_home",
+        "motor_oem_board_move_steps",
+        "motor_oem_confirm_thermal_door_closed",
         "motor_set_axis_param",
         "motor_move_relative",
         "motor_wait_stopped",
@@ -632,6 +714,9 @@ class Serial206ProductionPrimitiveAdapter:
         value = getattr(self.tester, "_oem_active_board_lifecycle_generation", None)
         return int(value) if type(value) is int else None
 
+    def motor_get_position(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_get_position(*args, **kwargs)
+
     def motor_set_home(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_home(*args, **kwargs)
 
@@ -641,7 +726,8 @@ class Serial206ProductionPrimitiveAdapter:
             raise RuntimeError("serial-206 X profile unavailable")
         if int(profile.get("board", -1)) != 5 or int(profile.get("motor", -1)) != 0:
             raise RuntimeError("serial-206 X channel identity mismatch")
-        if int(profile.get("axis_min_steps", 0)) != 0 or int(profile.get("axis_max_steps", -1)) != 90263:
+        expected_max, _ = self.tester._machine_config_axis_max("x")
+        if int(profile.get("axis_min_steps", 0)) != 0 or int(profile.get("axis_max_steps", -1)) != int(expected_max):
             raise RuntimeError("serial-206 X limit authority mismatch")
         return profile
 
@@ -688,22 +774,36 @@ class Serial206ProductionPrimitiveAdapter:
         source_method: str,
     ) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "intent": intent,
+                "source_method": source_method,
+                "board": 5,
+                "motor": 0,
+                "parameter": int(parameter),
+                "value": int(value),
+                "source_call_completed": True,
+                "source_noop": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "physical_motion_commanded": False,
+                "physical_effect_verified": False,
+                "failure": None,
+            }
         write = self.tester.motor_set_axis_param(5, int(parameter), int(value), motor=0)
-        readback = self.tester.motor_get_axis_param(5, int(parameter), motor=0)
         acknowledged = bool(
             isinstance(write, Mapping)
-            and write.get("ok") is True
             and self._x_tmcl_success(write.get("ack"))
         )
-        verified = acknowledged and self._x_readback_verified(readback, int(value))
-        if verified:
-            defaults = {4: 1700, 5: 350, 6: 31, 205: 16}
-            if defaults.get(int(parameter)) == int(value):
-                self._x_profile_overrides.pop(int(parameter), None)
-            else:
-                self._x_profile_overrides[int(parameter)] = int(value)
+        defaults = {4: 1700, 5: 350, 6: 31, 205: 16}
+        if defaults.get(int(parameter)) == int(value):
+            self._x_profile_overrides.pop(int(parameter), None)
+        else:
+            self._x_profile_overrides[int(parameter)] = int(value)
         return {
-            "ok": verified,
+            "ok": True,
             "axis": "x",
             "intent": intent,
             "source_method": source_method,
@@ -712,12 +812,14 @@ class Serial206ProductionPrimitiveAdapter:
             "parameter": int(parameter),
             "value": int(value),
             "write": _json_safe(write),
-            "readback": _json_safe(readback),
+            "source_call_completed": True,
+            "source_return_code": write.get("source_return_code") if isinstance(write, Mapping) else None,
             "controller_command_acknowledged": acknowledged,
-            "controller_terminal_state_verified": verified,
+            "controller_terminal_state_verified": acknowledged,
             "physical_motion_commanded": False,
             "physical_effect_verified": False,
-            "failure": None if verified else "x_profile_parameter_readback_mismatch",
+            "failure": None,
+            "controller_evidence_failure": None if acknowledged else "x_profile_parameter_write_not_acknowledged",
         }
 
     def x_set_max_speed(self, value: int = 0) -> dict[str, Any]:
@@ -741,16 +843,21 @@ class Serial206ProductionPrimitiveAdapter:
             parameter=4,
             value=1700,
             intent="restore_original_speed",
-            source_method="ClassControlInterface.restoreOriginalXSpeed",
+            source_method="ClassControlInterface.restoreOriginalSpeed(x)",
         )
 
     def x_set_stall_guard(self, value: int = 0) -> dict[str, Any]:
-        return self._x_profile_parameter(
+        requested = 16 if int(value) == 0 else int(value)
+        effective = requested & 0xFF
+        result = self._x_profile_parameter(
             parameter=205,
-            value=16 if int(value) == 0 else int(value),
+            value=effective,
             intent="set_stall_guard",
             source_method="ClassControlInterface.setStallGuard(x)",
         )
+        result["requested_value"] = requested
+        result["source_byte_value"] = effective
+        return result
 
     def x_terminal_status(self) -> dict[str, Any]:
         rows = {
@@ -799,7 +906,7 @@ class Serial206ProductionPrimitiveAdapter:
         return {
             "ok": False,
             "axis": "x",
-            "intent": "reconcile_switch_masks",
+            "intent": "verify_switch_masks",
             "source_exact": False,
             "retired": True,
             "physical_motion_commanded": False,
@@ -838,7 +945,16 @@ class Serial206ProductionPrimitiveAdapter:
             return result
         return {"ok": False, "desync": result, "recovery": self.reference_store.recover_untrusted_authority(f"X desynchronization failed: {reason}")}
 
-    def _x_issue_absolute(self, requested: int, *, source_mode: str, clamp_low: int = 0, acceleration: int | None = None, event_window: Any = None) -> dict[str, Any]:
+    def _x_issue_absolute(
+        self,
+        requested: int,
+        *,
+        source_mode: str,
+        clamp_low: int = 0,
+        acceleration: int | None = None,
+        event_window: Any = None,
+        wait_for_stop: bool = True,
+    ) -> dict[str, Any]:
         preflight = self._x_oem_move_preflight()
         if preflight.get("ok") is not True:
             return {
@@ -848,69 +964,101 @@ class Serial206ProductionPrimitiveAdapter:
                 "command_issued": False,
                 "physical_motion_commanded": False,
             }
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "source_mode": source_mode,
+                "requested_position_steps": int(requested),
+                "source_return_code": 0,
+                "source_call_completed": True,
+                "source_noop": True,
+                "source_noop_reason": "board_null",
+                "command_issued": False,
+                "physical_motion_commanded": False,
+                "controller_command_acknowledged": False,
+            }
         if self.tester.oem_no24v_state():
             raise RuntimeError("Lost 24V power move abs1. moveToAbs()")
         if not bool(self.tester._oem_board_state().get(5, False)):
             return {"ok": False, "failure": "board_not_initialized", "source_return_code": 1, "command_issued": False}
-        before = self.tester.motor_get_position(5, motor=0)
-        before_value = self._x_value(before)
-        if type(before_value) is not int:
-            return {"ok": False, "failure": "x_position_before_unavailable", "command_issued": False, "before": _json_safe(before)}
-        target = max(int(clamp_low), int(requested))
-        result: dict[str, Any] = {"ok": False, "axis": "x", "source_mode": source_mode, "requested_position_steps": int(requested), "target_position_steps": target, "before": _json_safe(before), "before_position_steps": before_value, "preflight": _json_safe(preflight), "command_issued": False, "source_noop": False, "physical_motion_commanded": False, "controller_command_acknowledged": False}
+        acceleration_write = None
         if acceleration is not None:
-            setup = self.tester.motor_set_axis_param(5, 5, int(acceleration), motor=0)
-            result["acceleration_set"] = _json_safe(setup)
-            result["acceleration_setup_verified"] = bool(
-                isinstance(setup, Mapping)
-                and setup.get("ok") is True
-                and isinstance(setup.get("readback"), Mapping)
-                and setup["readback"].get("value") == int(acceleration)
+            acceleration_write = self.tester.motor_set_axis_param(
+                5, 5, int(acceleration), motor=0
             )
-        result["event_window"] = event_window if event_window is not None else self.tester.begin_bus_event_window()
-        move = self.tester.motor_oem_move_absolute(5, target, motor=0, wait_for_stop=False, max_position=90263)
-        result["event_window"] = _json_safe(move.get("event_window")) if isinstance(move, Mapping) and isinstance(move.get("event_window"), Mapping) else result["event_window"]
-        if isinstance(move, Mapping) and move.get("ok") is True and move.get("source_noop") is True:
-            after = self.tester.motor_get_position(5, motor=0)
-            speed = self.tester.motor_get_speed(5, motor=0)
-            after_value = self._x_value(after)
-            speed_value = speed.get("speed") if isinstance(speed, Mapping) else None
-            terminal = bool(
-                self._x_readback_verified(after, after_value)
-                and isinstance(speed, Mapping)
-                and speed.get("ok") is True
-                and self._x_tmcl_success(speed.get("ack"))
-                and type(speed_value) is int
-                and speed_value == 0
-            )
-            result.update({
-                "ok": True,
-                "source_noop": True,
-                "noop_reason": str(move.get("short_circuit") or "transport_source_noop"),
-                "move": _json_safe(move),
-                "target_position_steps": after_value,
-                "after": _json_safe(after),
-                "after_position_steps": after_value,
-                "terminal_speed": _json_safe(speed),
-                "command_issued": False,
-                "physical_motion_commanded": False,
-                "controller_command_acknowledged": False,
-                "controller_terminal_state_verified": terminal,
-                "target_event_128_observed": False,
-                "target_position_verified": terminal,
-                "physical_effect_verified": False,
-                "failure": None,
-            })
-            return result
+        profile = self._x_profile()
+        source_high = int(profile["axis_max_steps"])
+        source_request = max(int(clamp_low), int(requested))
+        target = min(source_request, source_high)
+        primitive_wait = bool(wait_for_stop and event_window is None)
+        move = self.tester.motor_oem_move_absolute(
+            5,
+            source_request,
+            motor=0,
+            wait_for_stop=primitive_wait,
+            max_position=source_high,
+        )
+        source_completed = bool(isinstance(move, Mapping) and move.get("ok") is True)
+        command_issued = bool(isinstance(move, Mapping) and move.get("command_sent") is True)
         command_acknowledged = bool(
             isinstance(move, Mapping)
-            and move.get("ok") is True
-            and self._x_tmcl_success(move.get("ack"))
+            and (
+                self._x_tmcl_success(move.get("ack"))
+                or self._x_tmcl_success(move.get("retry_ack"))
+            )
         )
-        source_completed = isinstance(move, Mapping) and move.get("ok") is True
-        result.update({"move": _json_safe(move), "command_issued": True, "physical_motion_commanded": True, "controller_command_acknowledged": command_acknowledged, "ok": source_completed})
-        if result["ok"] is not True:
-            result["failure"] = "x_move_source_call_failed"
+        before = move.get("before") if isinstance(move, Mapping) else None
+        before_value = self._x_value(before)
+        wait = move.get("wait") if isinstance(move, Mapping) else None
+        terminal = bool(
+            primitive_wait
+            and isinstance(wait, Mapping)
+            and wait.get("ok") is True
+            and isinstance(wait.get("event"), Mapping)
+            and wait["event"].get("status") == 128
+        )
+        result: dict[str, Any] = {
+            "ok": source_completed,
+            "axis": "x",
+            "source_mode": source_mode,
+            "requested_position_steps": int(requested),
+            "source_requested_position_steps": source_request,
+            "target_position_steps": target,
+            "source_axis_max_steps": source_high,
+            "before": _json_safe(before),
+            "before_position_steps": before_value,
+            "preflight": _json_safe(preflight),
+            # Completion consumes the raw wait; bound diagnostics only afterward.
+            "move": move,
+            "event_window": _json_safe(
+                move.get("event_window")
+                if isinstance(move, Mapping) and isinstance(move.get("event_window"), Mapping)
+                else event_window
+            ),
+            "wait": _json_safe(wait),
+            "source_call_completed": isinstance(move, Mapping),
+            "source_return_code": move.get("source_return_code") if isinstance(move, Mapping) else None,
+            "source_noop": bool(isinstance(move, Mapping) and move.get("source_noop") is True),
+            "command_issued": command_issued,
+            "physical_motion_commanded": command_issued,
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal,
+            "completion_class": move.get("completion_class") if isinstance(move, Mapping) else None,
+            "pending_motion": bool(command_issued and not primitive_wait),
+            "physical_effect_verified": False,
+            "failure": None if source_completed else "x_move_source_call_failed",
+        }
+        if result["source_noop"]:
+            result["noop_reason"] = str(
+                move.get("short_circuit") or "transport_source_noop"
+            )
+        if acceleration is not None:
+            result["acceleration_write"] = _json_safe(acceleration_write)
+            result["acceleration_command_acknowledged"] = bool(
+                isinstance(acceleration_write, Mapping)
+                and self._x_tmcl_success(acceleration_write.get("ack"))
+            )
         return result
 
     def _x_finalize(self, ticket: Mapping[str, Any], *, timeout_s: float, motion_kind: str, publish: bool = True) -> dict[str, Any]:
@@ -922,62 +1070,61 @@ class Serial206ProductionPrimitiveAdapter:
         if result.get("ok") is not True:
             result["physical_effect_ambiguous"] = True
         else:
-            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
-            wait = wait_fn(5, motor=0, timeout_s=float(timeout_s), event_window=result.get("event_window"))
-            wait_events = (
-                list(wait.get("events") or [])
-                if isinstance(wait, Mapping) and isinstance(wait.get("events"), list)
-                else []
-            )
-            trailing_events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
-            events = wait_events + list(trailing_events)
-            after = self.tester.motor_get_position(5, motor=0)
-            speed = self.tester.motor_get_speed(5, motor=0)
-            after_value = self._x_value(after)
-            event_window = result.get("event_window")
-            after_sequence = event_window.get("after_sequence") if isinstance(event_window, Mapping) else None
-            addressed_events = [
-                event for event in events
-                if isinstance(event, Mapping)
-                and event.get("board") == 5
-                and event.get("motor") == 0
-                and type(event.get("event_sequence")) is int
-                and type(after_sequence) is int
-                and event["event_sequence"] > after_sequence
-                and self._x_event_fresh(event, event_window)
-            ]
-            addressed_errors = [event for event in addressed_events if event.get("status") in {13, 14, 130}]
-            target_events = [event for event in addressed_events if event.get("status") == 128]
-            terminal_event = bool(target_events)
-            target_value = int(result["target_position_steps"])
-            position_delta = (after_value - target_value) if type(after_value) is int else None
-            position_verified = bool(
-                isinstance(after, Mapping)
-                and type(position_delta) is int
-                and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
-            )
-            speed_zero = bool(
-                isinstance(speed, Mapping)
-                and type(speed.get("speed")) is int
-                and speed.get("speed") == 0
-            )
+            move = result.get("move")
+            wait = move.get("wait") if isinstance(move, Mapping) else None
+            if not (
+                isinstance(move, Mapping)
+                and move.get("oem_wait_for_stop") is True
+            ):
+                wait_fn = getattr(
+                    self.tester,
+                    "motor_wait_target_reached",
+                    None,
+                ) or getattr(self.tester, "motor_oem_wait_target_reached")
+                wait = wait_fn(
+                    5,
+                    motor=0,
+                    timeout_s=float(timeout_s),
+                    event_window=result.get("event_window"),
+                )
             wait_ok = bool(
                 isinstance(wait, Mapping)
                 and wait.get("ok") is True
                 and wait.get("target_reached") is True
             )
-            timeout_target_equal = False
-            source_completed = bool(wait_ok)
-            failure = None if source_completed else str(
-                wait.get("failure")
-                if isinstance(wait, Mapping) and wait.get("failure")
-                else "x_source_move_completion_not_observed"
+            wait_event = wait.get("event") if isinstance(wait, Mapping) else None
+            target_event = bool(
+                isinstance(wait_event, Mapping)
+                and wait_event.get("status") == 128
             )
-            completion_class = "event_128" if terminal_event and position_verified else "event_128_target_mismatch" if terminal_event else "oem_timeout_target_equal" if timeout_target_equal else None
-            result.update({"wait": _json_safe(wait), "wait_verified": wait_ok, "events": _json_safe(events), "after": _json_safe(after), "after_position_steps": after_value, "target_position_delta_steps": position_delta, "terminal_speed": _json_safe(speed), "terminal_speed_zero": speed_zero, "controller_error_events": _json_safe(addressed_errors), "target_events": _json_safe(target_events), "target_event_128_verified": terminal_event, "target_event_128_observed": terminal_event, "target_position_verified": position_verified, "completion_class": completion_class, "controller_terminal_state_verified": source_completed})
-            result["ok"] = bool(result.get("ok") is True and source_completed)
+            completion_class = (
+                move.get("completion_class")
+                if isinstance(move, Mapping)
+                else None
+            ) or (
+                wait.get("completion_class") if isinstance(wait, Mapping) else None
+            ) or ("event_128" if target_event else None)
+            result.update(
+                {
+                    "wait": _json_safe(wait),
+                    "wait_verified": wait_ok,
+                    "target_event_128_observed": target_event,
+                    "completion_class": completion_class,
+                    "controller_terminal_state_verified": wait_ok and target_event,
+                    "pending_motion": False,
+                }
+            )
+            result["source_wait_signaled"] = bool(isinstance(wait, Mapping) and wait.get("ok") is True)
+            result["ok"] = bool(result.get("ok") is True and result["source_wait_signaled"])
             if not result["ok"]:
-                result["failure"] = str(result.get("failure") or failure or "x_absolute_terminal_evidence_not_accepted")
+                result["failure"] = str(
+                    result.get("failure")
+                    or (
+                        wait.get("failure")
+                        if isinstance(wait, Mapping) and wait.get("failure")
+                        else "x_source_move_completion_not_observed"
+                    )
+                )
         if result.get("ok") is True and result.get("command_issued") is True and publish and self.reference_store is not None:
             metadata = self.reference_store.record_motion("x", motion_kind)
             result["reference_state"] = _json_safe(metadata)
@@ -990,14 +1137,12 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_move_absolute(self, *, position_steps: int, acceleration: int | None = None, wait_for_stop: bool = True, wait_timeout_s: float = 20.0, source_mode: str = "ClassControlInterface.moveX", clamp_low_to_60: bool = True, publish_motion_metadata: bool = True) -> dict[str, Any]:
         reference = self._reference_snapshot(("x",), source_mode)
-        acceleration_write = None
-        if acceleration is not None:
-            acceleration_write = self.tester.motor_set_axis_param(5, 5, int(acceleration), motor=0)
         ticket = self._x_issue_absolute(
             int(position_steps),
             source_mode=source_mode,
             clamp_low=60 if clamp_low_to_60 else 0,
-            acceleration=None,
+            acceleration=acceleration,
+            wait_for_stop=bool(wait_for_stop),
         )
         if not wait_for_stop and ticket.get("command_issued") is True:
             ticket.update({"pending_motion": True, "physical_motion": True, "reference_before": _json_safe(reference)})
@@ -1006,12 +1151,10 @@ class Serial206ProductionPrimitiveAdapter:
             result = self._x_finalize(ticket, timeout_s=wait_timeout_s, motion_kind="absolute", publish=publish_motion_metadata)
         if acceleration is not None:
             restore = self.tester.motor_set_axis_param(5, 5, 350, motor=0)
-            result["acceleration_write"] = _json_safe(acceleration_write)
             result["acceleration_restore"] = _json_safe(restore)
-            result["acceleration_restore_verified"] = bool(
+            result["acceleration_restore_acknowledged"] = bool(
                 isinstance(restore, Mapping)
-                and isinstance(restore.get("readback"), Mapping)
-                and self._x_value(restore["readback"]) == 350
+                and self._x_tmcl_success(restore.get("ack"))
             )
         result["reference_before"] = _json_safe(reference)
         result["physical_motion"] = bool(result.get("command_issued"))
@@ -1114,6 +1257,10 @@ class Serial206ProductionPrimitiveAdapter:
         events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=128) if required_axes else []
         evidence: dict[str, Any] = {}
         fresh_after: dict[str, int] = dict(after)
+        # Board lower clamps precede their exact-position return. Keep the
+        # caller's raw request; expected targets come from issue-time tickets,
+        # never from a later position observation.
+        effective_target = dict(receipt["requested"])
         for axis in required_axes:
             command = commands.get(axis)
             moved = isinstance(command, Mapping) and command.get("command_issued") is True
@@ -1128,7 +1275,6 @@ class Serial206ProductionPrimitiveAdapter:
             sequence = window.get("after_sequence") if isinstance(window, Mapping) else None
             addressed = [row for row in events if isinstance(row, Mapping) and row.get("board") == board and row.get("motor") == motor and type(row.get("event_sequence")) is int and type(sequence) is int and row["event_sequence"] > sequence and self._x_event_fresh(row, window)]
             errors = [row for row in addressed if row.get("status") in {13, 14, 130}]
-            targets = [row for row in addressed if row.get("status") == 128]
             command_ok = bool(
                 isinstance(command, Mapping)
                 and command.get("ok") is True
@@ -1136,7 +1282,30 @@ class Serial206ProductionPrimitiveAdapter:
             command_acknowledged = bool(not moved or (isinstance(command, Mapping) and command.get("controller_command_acknowledged") is True))
             wait = waits.get(axis)
             wait_ok = bool(isinstance(wait, Mapping) and wait.get("ok") is True and wait.get("target_reached") is True)
-            position_delta = (position_value - receipt["requested"][axis]) if type(position_value) is int else None
+            # The wait already performed the owned, axis-local consumption.
+            # Collector rows are diagnostics, not another opportunity to Set it.
+            # Bind to the historical window, never to the router's current
+            # generation: a later reader change does not undo a completed wait.
+            event = wait.get("event") if isinstance(wait, Mapping) else None
+            targets = [event] if (
+                wait_ok and isinstance(event, Mapping)
+                and event.get("source") == "novo_router_async"
+                and event.get("latch_disposition") == "consumed"
+                and event.get("board") == board and event.get("motor") == motor
+                and event.get("status") == 128
+                and type(event.get("event_sequence")) is int
+                and isinstance(event.get("receive_owner"), str)
+                and type(event.get("owner_generation")) is int
+                and (not isinstance(window, Mapping) or all(
+                    event.get(key) == window[key]
+                    for key in ("receive_owner", "owner_generation") if key in window
+                ))
+            ) else []
+            target = command.get("target_position_steps") if isinstance(command, Mapping) else None
+            target_known = type(target) is int
+            if target_known:
+                effective_target[axis] = target
+            position_delta = (position_value - target) if target_known and type(position_value) is int else None
             if axis == "x":
                 position_ok = bool(
                     isinstance(position, Mapping)
@@ -1146,16 +1315,28 @@ class Serial206ProductionPrimitiveAdapter:
                     and abs(position_delta) <= X_TARGET_TERMINAL_TOLERANCE_STEPS
                 )
             else:
-                position_ok = self._x_readback_verified(position, receipt["requested"][axis])
+                position_ok = target_known and self._x_readback_verified(position, target)
             speed_ok = bool(isinstance(speed, Mapping) and speed.get("ok") is True and self._x_tmcl_success(speed.get("ack")) and type(speed_value) is int and speed_value == 0)
-            event_ok = bool(not moved or (targets and not errors))
-            axis_ok = bool(command_ok and wait_ok and event_ok and speed_ok)
+            native = command.get("move") if isinstance(command, Mapping) else None
+            noop_verified = bool(
+                not moved and command_ok and target_known
+                and isinstance(native, Mapping) and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"
+                and native.get("command_sent") is False
+                and command.get("controller_command_acknowledged") is False
+                and self._x_readback_verified(native.get("before"), target)
+                and self._x_readback_verified(position, target) and speed_ok
+            )
+            event_ok = bool(moved and targets and not errors)
+            axis_ok = bool(noop_verified or (moved and command_ok and wait_ok and event_ok and speed_ok))
             if axis != "x":
                 axis_ok = bool(axis_ok and position_ok)
             evidence[axis] = {
                 "source_call_completed": command_ok,
-                "command_acknowledged": command_acknowledged,
+                "source_noop_verified": noop_verified,
+                "command_acknowledged": bool(moved and command_acknowledged),
                 "wait_accepted": wait_ok,
+                "source_wait_signaled": bool(isinstance(wait, Mapping) and wait.get("ok") is True),
                 "target_event_128_observed": bool(targets) if moved else False,
                 "controller_error_events": _json_safe(errors),
                 "position": _json_safe(position),
@@ -1166,14 +1347,22 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": axis_ok,
             }
         source_calls_completed = all(evidence[axis]["source_call_completed"] for axis in required_axes)
-        command_acknowledged = all(evidence[axis]["command_acknowledged"] for axis in required_axes)
+        command_acknowledged = any(evidence[axis]["command_acknowledged"] for axis in required_axes) and all(
+            evidence[axis]["command_acknowledged"] or evidence[axis]["source_noop_verified"]
+            for axis in required_axes
+        )
+        receipt["effective_target"] = effective_target
         terminal_ok = all(evidence[axis]["ok"] for axis in required_axes)
         target_ok = all(evidence[axis]["position_verified"] for axis in required_axes)
-        restore_ok = all(isinstance(restore.get(axis), Mapping) and restore[axis].get("ok") is True and isinstance(restore[axis].get("readback"), Mapping) and restore[axis]["readback"].get("value") == (350 if axis == "x" else 400) for axis in ("x", "y"))
+        restore_ok = all(isinstance(restore.get(axis), Mapping) and self._x_tmcl_success(restore[axis].get("ack")) for axis in ("x", "y"))
         ok = bool(source_calls_completed)
-        receipt.update({"commands": _json_safe(commands), "waits": _json_safe(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
+        receipt.update({"commands": dict(commands), "waits": dict(waits), "events": _json_safe(events), "axis_evidence": _json_safe(evidence), "after": _json_safe(fresh_after), "acceleration_restore": _json_safe(restore), "source_calls_completed": source_calls_completed, "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal_ok, "target_position_verified": target_ok, "acceleration_restore_verified": restore_ok, "ok": ok})
         moved_axes = tuple(axis for axis in required_axes if isinstance(commands.get(axis), Mapping) and commands[axis].get("command_issued") is True)
         receipt["moved_axes"] = list(moved_axes)
+        if required_axes and all(evidence[axis]["source_noop_verified"] for axis in required_axes):
+            receipt.update(source_noop=True, source_noop_verified=True,
+                command_issued=False, physical_motion_commanded=False,
+                target_event_128_observed=False, physical_effect_verified=False)
         if ok and self.reference_store is not None and moved_axes:
             if len(moved_axes) == 1:
                 metadata = self.reference_store.record_motion(moved_axes[0], "move_xy")
@@ -1194,25 +1383,67 @@ class Serial206ProductionPrimitiveAdapter:
 
 
     def x_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        base = {
+            "ok": True,
+            "axis": "x",
+            "intent": "stop",
+            "source_call_completed": True,
+            "source_return_ok": True,
+            "controller_command_acknowledged": False,
+            "controller_terminal_state_verified": False,
+            "timeout_s_omitted_by_source": float(timeout_s),
+            "physical_motion": False,
+            "physical_effect_verified": False,
+            "failure": None,
+        }
+        if not self.tester._oem_board_present(5):
+            return {**base, "source_noop": "board_null"}
+        if self.tester.oem_no24v_state():
+            raise RuntimeError("Lost 24V power stopMotor 1. stopMotor() axis: X")
+        if not bool(self.tester._oem_board_state().get(5, False)):
+            return {**base, "source_noop": "board_not_initialized"}
         stop = self.tester.motor_oem_board_stop(5, motor=0, axis_name="x")
         source_completed = isinstance(stop, Mapping) and stop.get("source_call_completed") is True
-        source_return_ok = bool(source_completed and stop.get("source_return_code") == 0)
+        # ClassDeckBoard.stopMotor is void: completed caller execution is the
+        # outer source success. The leaf return and second ACK remain evidence.
+        source_return_ok = source_completed
         acknowledged = bool(
             isinstance(stop, Mapping)
             and self._x_tmcl_success(stop.get("second_delivery"))
         )
-        return {"ok": source_return_ok, "axis": "x", "intent": "stop", "stop": _json_safe(stop), "wait": None, "source_call_completed": source_completed, "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None, "controller_command_acknowledged": acknowledged, "controller_terminal_state_verified": False, "timeout_s_omitted_by_source": float(timeout_s), "physical_motion": False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_stop_source_return_failure" if source_completed else "x_stop_source_call_failed"}
+        return {
+            **base,
+            "ok": source_return_ok,
+            "stop": _json_safe(stop),
+            "wait": None,
+            "source_call_completed": source_completed,
+            "source_return_ok": source_return_ok,
+            "source_return_code": (
+                stop.get("source_return_code") if isinstance(stop, Mapping) else None
+            ),
+            "controller_command_acknowledged": acknowledged,
+            "failure": (
+                None
+                if source_return_ok
+                else "x_stop_source_return_failure"
+                if source_completed
+                else "x_stop_source_call_failed"
+            ),
+        }
 
     def x_abort(self, *, reason: str = "forceAbortMotion") -> dict[str, Any]:
-        abort = physical_aggregate_stop(
-            self.tester,
-            Serial206MotionAuthority.from_active_snapshot(),
-            terminal_timeout_s=3.0,
-        )
+        abort = self.tester.motor_oem_force_abort_motion(reason=reason)
         desync = self._x_desync(reason, "abort") if self.reference_store is not None else None
         source_completed = isinstance(abort, Mapping)
         source_return_ok = bool(source_completed and abort.get("ok") is True)
-        return {"ok": source_return_ok, "axis_context": "x", "intent": "aggregate_oem_abort", "physical_scope": "aggregate_oem_all_present_boards", "x_only": False, "logical_abort": _json_safe(abort), "x_terminal_stop": None, "reference_desync": _json_safe(desync), "source_call_completed": source_completed, "source_return_ok": source_return_ok, "controller_command_acknowledged": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "controller_terminal_state_verified": abort.get("controller_terminal_state_verified") is True if isinstance(abort, Mapping) else False, "physical_effect_verified": False, "failure": None if source_return_ok else "x_abort_source_return_failure" if source_completed else "x_abort_source_call_failed"}
+        return {"ok": source_return_ok, "axis_context": "x", "intent": "aggregate_oem_abort",
+                "physical_scope": "none_software_flags_and_waiters", "x_only": False,
+                "software_abort": True, "invocation_attempted": True, "stop_delivery_attempted": False,
+                "logical_abort": _json_safe(abort), "x_terminal_stop": None,
+                "reference_desync": _json_safe(desync), "source_call_completed": source_completed,
+                "source_return_ok": source_return_ok, "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False, "physical_effect_verified": False,
+                "failure": None if source_return_ok else "x_abort_source_call_failed"}
 
     def prepare_x(self, *, expected_generation: int) -> dict[str, Any]:
         result = self.prepare_for_initialize_motors(
@@ -1223,7 +1454,7 @@ class Serial206ProductionPrimitiveAdapter:
         result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_prepare_result_not_mapping"}
         if result.get("ok") is True:
             self._x_profile_overrides.clear()
-        result.update({"axis": "x", "physical_motion": False, "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195", "source_exact": True, "literal_switch_mask_writes": []})
+        result.update({"axis": "x", "physical_motion": False, "source_method": "ClassControlInterface.initializeMotorsWithoutMotion", "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195", "source_exact": False, "initializer_source_exact": True, "literal_switch_mask_writes": [], "reference_state": "desynced"})
         return result
 
     def x_set_home(self) -> dict[str, Any]:
@@ -1231,36 +1462,45 @@ class Serial206ProductionPrimitiveAdapter:
         before = self.tester.motor_get_position(5, motor=0)
         set_home = self.tester.motor_set_home(5, motor=0)
         after = self.tester.motor_get_position(5, motor=0)
+        source_call_completed = bool(
+            isinstance(set_home, Mapping)
+            and set_home.get("source_call_completed") is True
+        )
+        source_return_ok = bool(
+            source_call_completed
+            and set_home.get("source_return_code") == 0
+        )
         acknowledged = bool(
             isinstance(set_home, Mapping)
-            and set_home.get("ok") is True
-            and (
-                self._x_tmcl_success(set_home.get("ack"))
-                or set_home.get("readback_verified") is True
-            )
+            and set_home.get("controller_command_acknowledged") is True
         )
         terminal = bool(acknowledged and self._x_readback_verified(after, 0))
         return {
-            "ok": True,
+            "ok": source_return_ok,
             "axis": "x",
             "intent": "set_home",
             "source_method": "ClassMotor.setHome (SAP1=0); recovery-only; no motion",
-            "source_anchor": "ClassMotor.cs:492-516; ClassHeadBoard.cs:121-124",
+            "source_anchor": "ClassMotor.cs:492-516; ClassDeckBoard.cs:134-137",
             "before": _json_safe(before),
             "set_home": _json_safe(set_home),
             "after": _json_safe(after),
-            "source_call_completed": True,
+            "source_call_completed": source_call_completed,
+            "source_return_ok": source_return_ok,
+            "source_return_code": set_home.get("source_return_code") if isinstance(set_home, Mapping) else None,
             "controller_command_acknowledged": acknowledged,
             "controller_terminal_state_verified": terminal,
             "reference_publication_required": terminal,
             "physical_motion_commanded": False,
             "physical_effect_verified": False,
-            "failure": None,
+            "failure": None if source_return_ok else "x_set_home_source_return_failure",
         }
 
     def x_enable_xy_current_mode(self, *, enabled: bool) -> dict[str, Any]:
         result = self.tester.motor_oem_set_xy_current_mode(bool(enabled))
-        if isinstance(result, Mapping) and result.get("ok") is True:
+        writes = result.get("writes") if isinstance(result, Mapping) else None
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "x" for row in writes
+        ):
             self._x_profile_overrides[6] = 31 if bool(enabled) else 1
         return dict(result) if isinstance(result, Mapping) else {
             "ok": False,
@@ -1270,9 +1510,17 @@ class Serial206ProductionPrimitiveAdapter:
 
     def x_enable_xyz_current_mode(self, *, enabled: bool, z_current_up: int = 31) -> dict[str, Any]:
         result = self.tester.motor_oem_set_xyz_current_mode(bool(enabled), z_current_up=int(z_current_up))
-        if isinstance(result, Mapping) and result.get("ok") is True:
+        writes = result.get("writes") if isinstance(result, Mapping) else None
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "x" for row in writes
+        ):
             self._x_profile_overrides[6] = 31 if bool(enabled) else 1
-            self._z_profile_overrides[6] = int(z_current_up) if bool(enabled) else 1
+        if isinstance(writes, list) and any(
+            isinstance(row, Mapping) and row.get("axis") == "z" for row in writes
+        ):
+            self._z_profile_overrides[6] = (
+                int(result.get("z_current_up", z_current_up)) if bool(enabled) else 1
+            )
         return dict(result) if isinstance(result, Mapping) else {
             "ok": False,
             "failure": "enableXYZ_result_not_mapping",
@@ -1283,18 +1531,23 @@ class Serial206ProductionPrimitiveAdapter:
         return self._x_finalize(pending_ticket, timeout_s=float(wait_timeout_s), motion_kind="absolute", publish=True)
 
     def _x_home_result(self, home: Any, *, intent: str, source_method: str) -> dict[str, Any]:
-        position = self.tester.motor_get_position(5, motor=0)
-        speed = self.tester.motor_get_speed(5, motor=0)
         source_return = home.get("source_return_code") if isinstance(home, Mapping) else None
         short_circuit = home.get("source_noop") is True if isinstance(home, Mapping) else False
+        board_null = bool(
+            isinstance(home, Mapping)
+            and home.get("source_noop_reason") == "board_null"
+        )
+        position = None if board_null else self.tester.motor_get_position(5, motor=0)
+        speed = None if board_null else self.tester.motor_get_speed(5, motor=0)
         source_returned = bool(isinstance(home, Mapping) and home.get("ok") is True)
         command_acknowledged = bool(
             isinstance(home, Mapping)
-            and (home.get("controller_command_acknowledged") is True or short_circuit)
+            and home.get("controller_command_acknowledged") is True
         )
         terminal = bool(
             isinstance(home, Mapping)
             and home.get("controller_terminal_state_verified") is True
+            and isinstance(speed, Mapping)
             and type(speed.get("speed")) is int
             and speed.get("speed") == 0
         )
@@ -1304,18 +1557,61 @@ class Serial206ProductionPrimitiveAdapter:
             and home.get("controller_home_proof_verified") is True
             and self._x_value(position) == 0
         )
-        return {"ok": source_returned, "axis": "x", "intent": intent, "source_method": source_method, "home": _json_safe(home), "source_return": source_return, "position": _json_safe(position), "terminal_speed": _json_safe(speed), "controller_command_acknowledged": command_acknowledged, "controller_terminal_state_verified": terminal, "controller_home_proof_verified": home_proof, "reference_publication_required": home_proof, "physical_motion_commanded": not short_circuit, "physical_effect_verified": False, "failure": None if source_returned else "x_home_source_exception"}
+        return {
+            "ok": source_returned,
+            "axis": "x",
+            "intent": intent,
+            "source_method": source_method,
+            "home": _json_safe(home),
+            "source_return": source_return,
+            "position": _json_safe(position),
+            "terminal_speed": _json_safe(speed),
+            "controller_command_acknowledged": command_acknowledged,
+            "controller_terminal_state_verified": terminal,
+            "controller_home_proof_verified": home_proof,
+            "reference_publication_required": home_proof,
+            "physical_motion_commanded": not short_circuit,
+            "physical_effect_verified": False,
+            "failure": None if source_returned else "x_home_source_exception",
+        }
 
     def _x_go_home(self, *, speed: int, rehome: bool, timeout_s: float, intent: str, source_method: str) -> dict[str, Any]:
         self._x_require_motion_preflight()
-        home = self.tester.motor_oem_go_home("x", speed=int(speed), rehome=bool(rehome), timeout_s=max(30.0, float(timeout_s)), require_switch_transition=False)
+        if not self.tester._oem_board_present(5):
+            return self._x_home_result(
+                {
+                    "ok": True,
+                    "source_return_code": 0,
+                    "source_noop": True,
+                    "source_noop_reason": "board_null",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "controller_home_proof_verified": False,
+                },
+                intent=intent,
+                source_method=source_method,
+            )
+        home = self.tester.motor_oem_go_home("x", speed=int(speed), rehome=bool(rehome), timeout_s=30.0, require_switch_transition=False)
         return self._x_home_result(home, intent=intent, source_method=source_method)
 
     def x_startup_home(self, *, timeout_s: float) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return {
+                "ok": True,
+                "axis": "x",
+                "intent": "startup_home",
+                "source_method": "ClassControlInterface.initializeMotors X branch",
+                "source_call_completed": True,
+                "source_noop": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "controller_home_proof_verified": False,
+                "physical_motion_commanded": False,
+                "physical_effect_verified": False,
+                "failure": None,
+            }
         home = self.tester.motor_oem_axis_search_home("x", speed=250, timeout_s=float(timeout_s), max_search_abs_delta=None)
-        if not isinstance(home, Mapping) or home.get("ok") is not True:
-            return self._x_home_result(home, intent="startup_home", source_method="axisSearchHome(x,250)")
         self.__dict__.get("sleep", time.sleep)(0.020)
         set_home = self.tester.motor_set_home(5, motor=0)
         home_evidence = self._x_home_result(home, intent="startup_home", source_method="axisSearchHome(x,250);setHome")
@@ -1323,11 +1619,69 @@ class Serial206ProductionPrimitiveAdapter:
         self.__dict__.get("sleep", time.sleep)(0.040)
         park_ticket = self._x_issue_absolute(6000, source_mode="initializeMotors.x_park_6000", clamp_low=60)
         park = self._x_finalize(park_ticket, timeout_s=float(timeout_s), motion_kind="startup_park", publish=False)
-        ok = bool(home_evidence.get("ok") is True and isinstance(set_home, Mapping) and set_home.get("ok") is True and speed.get("ok") is True and park.get("ok") is True)
-        return {"ok": ok, "axis": "x", "intent": "startup_home", "source_method": "axisSearchHome(250);20ms;setHome;SAP4=1700;40ms;moveX(6000)", "home": _json_safe(home), "home_evidence": _json_safe(home_evidence), "set_home": _json_safe(set_home), "speed_restore": _json_safe(speed), "park": _json_safe(park), "controller_command_acknowledged": ok, "controller_terminal_state_verified": ok, "controller_position_steps": park.get("after_position_steps"), "oem_display_position_steps": 0, "reference_publication_required": ok, "physical_motion_commanded": True, "physical_effect_verified": False, "failure": None if ok else "x_startup_home_sequence_failed"}
+        source_returned = bool(
+            isinstance(home, Mapping)
+            and isinstance(set_home, Mapping)
+            and set_home.get("source_call_completed") is True
+            and speed.get("source_call_completed") is True
+            and park.get("source_call_completed") is True
+        )
+        park_acknowledged = bool(
+            park.get("command_issued") is not True
+            or park.get("controller_command_acknowledged") is True
+        )
+        controller_acknowledged = bool(
+            home_evidence.get("controller_command_acknowledged") is True
+            and isinstance(set_home, Mapping)
+            and set_home.get("controller_command_acknowledged") is True
+            and speed.get("controller_command_acknowledged") is True
+            and park_acknowledged
+        )
+        terminal_verified = bool(
+            home_evidence.get("controller_terminal_state_verified") is True
+            and park.get("controller_terminal_state_verified") is True
+        )
+        home_proof = home_evidence.get("controller_home_proof_verified") is True
+        return {
+            "ok": source_returned,
+            "axis": "x",
+            "intent": "startup_home",
+            "source_method": "axisSearchHome(250);20ms;setHome;SAP4=1700;40ms;moveX(6000)",
+            "home": _json_safe(home),
+            "home_evidence": _json_safe(home_evidence),
+            "set_home": _json_safe(set_home),
+            "speed_restore": _json_safe(speed),
+            "park": _json_safe(park),
+            "controller_command_acknowledged": controller_acknowledged,
+            "controller_terminal_state_verified": terminal_verified,
+            "controller_home_proof_verified": home_proof,
+            "controller_position_steps": park.get("after_position_steps"),
+            "oem_display_position_steps": 0,
+            "reference_publication_required": home_proof,
+            "physical_motion_commanded": bool(
+                home_evidence.get("physical_motion_commanded") is True
+                or park.get("physical_motion_commanded") is True
+            ),
+            "physical_effect_verified": False,
+            "failure": None if source_returned else "x_startup_home_sequence_failed",
+        }
 
     def x_home_axis(self, *, timeout_s: float) -> dict[str, Any]:
         self._x_require_motion_preflight()
+        if not self.tester._oem_board_present(5):
+            return self._x_home_result(
+                {
+                    "ok": True,
+                    "source_return_code": 0,
+                    "source_noop": True,
+                    "source_noop_reason": "board_null",
+                    "controller_command_acknowledged": False,
+                    "controller_terminal_state_verified": False,
+                    "controller_home_proof_verified": False,
+                },
+                intent="diagnostic_home_axis",
+                source_method="ClassControlInterface.HomeAxis(x)->axisSearchHome(250)",
+            )
         home = self.tester.motor_oem_axis_search_home("x", speed=250, timeout_s=float(timeout_s), max_search_abs_delta=None)
         return self._x_home_result(home, intent="diagnostic_home_axis", source_method="ClassControlInterface.HomeAxis(x)->axisSearchHome(250)")
 
@@ -1370,7 +1724,7 @@ class Serial206ProductionPrimitiveAdapter:
         errors: list[str] = []
         home_exceptions: list[Exception] = []
         restore: dict[str, Any] = {}
-        setup_ok = all(isinstance(row, Mapping) and row.get("ok") is True for row in setup.values())
+        setup_ok = all(isinstance(row, Mapping) and self._x_tmcl_success(row.get("ack")) for row in setup.values())
         def run(axis: str) -> None:
             try:
                 results[axis] = self.tester.motor_oem_go_home(axis, speed=200, rehome=False, timeout_s=30.0, require_switch_transition=False)
@@ -1381,7 +1735,14 @@ class Serial206ProductionPrimitiveAdapter:
         ty = threading.Thread(target=run, args=("y",), daemon=False)
         tx.start(); ty.start(); tx.join(); ty.join()
         if home_exceptions:
-            raise home_exceptions[0]
+            exc = home_exceptions[0]
+            exc.motion_evidence = {
+                "source_operation": "ClassControlInterface.HomeXY",
+                "setup": setup, "home": results, "home_errors": errors,
+                "exceptions": [copy.deepcopy(getattr(error, "motion_evidence", None)) for error in home_exceptions],
+                "physical_effect_verified": False,
+            }
+            raise exc
         home_ok = bool(
             not errors
             and all(axis in results for axis in ("x", "y"))
@@ -1391,9 +1752,9 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": False,
                 "intent": "home_xy",
                 "command_issued": True,
-                "setup": _json_safe(setup),
+                "setup": copy.deepcopy(setup),
                 "setup_verified": setup_ok,
-                "home": _json_safe(results),
+                "home": copy.deepcopy(results),
                 "source_return": {
                     axis: results[axis].get("source_return_code")
                     if isinstance(results.get(axis), Mapping)
@@ -1419,22 +1780,18 @@ class Serial206ProductionPrimitiveAdapter:
             "y_acc": self.tester.motor_set_axis_param(4, 5, 400, motor=0),
         }
         expected_restore = {"x_speed": 1700, "x_acc": 350, "y_speed": 1800, "y_acc": 400}
-        restore_ok = all(isinstance(restore[name], Mapping) and restore[name].get("ok") is True for name in expected_restore)
-        positions = {"x": self.tester.motor_get_position(5, motor=0), "y": self.tester.motor_get_position(4, motor=0)}
+        restore_ok = all(isinstance(restore[name], Mapping) and self._x_tmcl_success(restore[name].get("ack")) for name in expected_restore)
+        # CI.HomeXY returns child scalars after restore; no extra GAP queries.
+        # Reuse existing child observations only, never reinterpret scalar0 as proof.
+        positions = {axis: results[axis]["position_after_sethome"] for axis in ("x", "y")
+                     if isinstance(results.get(axis), Mapping)
+                     and isinstance(results[axis].get("position_after_sethome"), Mapping)}
         source_return = {axis: results[axis].get("source_return_code") if isinstance(results.get(axis), Mapping) else None for axis in ("x", "y")}
         controller_acknowledged = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_command_acknowledged") is True for axis in ("x", "y"))
         terminal_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_terminal_state_verified") is True for axis in ("x", "y"))
         home_proof_verified = all(isinstance(results.get(axis), Mapping) and results[axis].get("controller_home_proof_verified") is True for axis in ("x", "y"))
-        reference_publication_required = bool(home_proof_verified and all(self._x_value(positions[axis]) == 0 for axis in ("x", "y")))
-        receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": _json_safe(setup), "setup_verified": setup_ok, "home": _json_safe(results), "source_return": source_return, "home_errors": errors, "positions": _json_safe(positions), "restore": _json_safe(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
-        y_provider = getattr(self, "y_provider", None)
-        if reference_publication_required and y_provider is not None:
-            child_publication = y_provider.publish_home_xy_reference(
-                receipt,
-                command_id=f"homexy-{time.time_ns()}",
-            )
-            receipt["y_child_authority"] = _json_safe(child_publication)
-            receipt["y_child_authority_published"] = child_publication.get("ok") is True
+        reference_publication_required = bool(home_proof_verified and all(self._x_readback_verified(positions.get(axis), 0) for axis in ("x", "y")))
+        receipt = {"ok": home_ok, "intent": "home_xy", "command_issued": True, "setup": copy.deepcopy(setup), "setup_verified": setup_ok, "home": copy.deepcopy(results), "source_return": source_return, "home_errors": errors, "positions": copy.deepcopy(positions), "restore": copy.deepcopy(restore), "restore_verified": restore_ok, "controller_command_acknowledged": controller_acknowledged, "controller_terminal_state_verified": terminal_verified, "controller_home_proof_verified": home_proof_verified, "reference_publication_required": reference_publication_required, "physical_effect_verified": False, "failure": None if home_ok else "homexy_source_exception", "source_anchor": "ClassControlInterface.HomeXY:5054-5069"}
         return receipt
 
     def _z_oem_move_preflight(self) -> dict[str, Any]:
@@ -1637,77 +1994,45 @@ class Serial206ProductionPrimitiveAdapter:
     def _z_finalize_position_move(
         self,
         *,
-        profile: Mapping[str, Any],
         before: Mapping[str, Any],
         target: int,
         move: Mapping[str, Any],
-        wait_timeout_s: float,
         pre_command_event_window: Mapping[str, Any],
         event_window: Mapping[str, Any],
-        allow_timeout_target_equal: bool = False,
     ) -> dict[str, Any]:
-        board = int(profile["board"])
-        motor = int(profile["motor"])
-        wait = self.tester.motor_wait_stopped(
-            board,
-            motor=motor,
-            timeout_s=float(wait_timeout_s),
-            require_seen_nonzero=True,
-            target_position=int(target),
-        )
-        events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=96)
-        after_sequence = event_window.get("after_sequence") if isinstance(event_window, Mapping) else None
-        axis_events = [
-            row for row in events if isinstance(row, Mapping)
-            and row.get("board") == board
-            and row.get("motor") == motor
-            and type(row.get("event_sequence")) is int
-            and type(after_sequence) is int
-            and int(row["event_sequence"]) > int(after_sequence)
-        ]
-        target_events = [row for row in axis_events if row.get("status") == 128]
-        error_events = [row for row in axis_events if row.get("status") in {13, 14, 130}]
-        after = self.tester.motor_get_position(board, motor=motor)
-        before_value = self._z_value(before)
-        after_value = self._z_value(after)
-        source_call_completed = isinstance(move, Mapping) and move.get("ok") is True
-        move_ack = bool(
-            source_call_completed
-            and self._z_tmcl_success(move.get("ack"))
-        )
-        terminal = self._z_terminal_zero_verified(wait)
-        event_completed = bool(target_events)
-        timeout_target_equal = bool(
-            allow_timeout_target_equal
-            and not event_completed
-            and type(after_value) is int
-            and after_value == int(target)
-        )
-        source_completed = bool(source_call_completed and (event_completed or timeout_target_equal))
-        failure = None if source_completed else (
-            "z_move_source_call_failed" if not source_call_completed
-            else "z_source_move_completion_not_observed"
-        )
-        ok = source_completed
+        # moveToAbs owns its single synchronous OEM latch wait and timeout
+        # exception. Consume that receipt; never wait or infer completion again.
+        source_wait = move.get("wait") if isinstance(move, Mapping) else None
+        source_completed = isinstance(move, Mapping) and move.get("ok") is True
+        timeout_position = move.get("timeout_position") if isinstance(move, Mapping) else None
+        consumed = source_wait.get("event") if isinstance(source_wait, Mapping) else None
         return {
-            "ok": ok,
-            "failure": failure,
+            "ok": source_completed,
+            "failure": None if source_completed else "z_move_source_call_failed",
             "robot_http_acknowledged": True,
-            "controller_command_acknowledged": move_ack,
-            "controller_terminal_state_verified": terminal,
-            "completion_class": "event_128" if target_events else "oem_timeout_target_equal" if timeout_target_equal else None,
+            "source_return_ok": source_completed,
+            "source_return_code": move.get("source_return_code"),
+            "controller_command_acknowledged": bool(
+                self._z_tmcl_success(move.get("ack"))
+                or self._z_tmcl_success(move.get("retry_ack"))
+            ),
+            "controller_terminal_state_verified": False,
+            "completion_class": move.get("completion_class"),
             "physical_effect_verified": False,
+            "command_issued": move.get("command_sent") is True,
+            "physical_motion_commanded": move.get("command_sent") is True,
             "pre_command_event_window": _json_safe(pre_command_event_window),
             "event_window": _json_safe(event_window),
-            "target_events": _json_safe(target_events),
-            "controller_error_events": _json_safe(error_events),
+            "target_events": [_json_safe(consumed)] if isinstance(consumed, Mapping) else [],
             "before": _json_safe(before),
-            "after": _json_safe(after),
-            "before_position_steps": before_value,
+            "after": _json_safe(timeout_position),
+            "before_position_steps": self._z_value(before),
             "target_position_steps": int(target),
-            "after_position_steps": after_value,
+            "after_position_steps": self._z_value(timeout_position),
+            "timeout_position": _json_safe(timeout_position),
             "move": _json_safe(move),
-            "wait": _json_safe(wait),
+            "wait": _json_safe(source_wait),
+            "source_wait": _json_safe(source_wait),
         }
 
     def z_move_steps(self, *, steps: int, wait_timeout_s: float = 20.0) -> dict[str, Any]:
@@ -1752,7 +2077,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "physical_motion_commanded": False,
             }
         requested = int(requested_position_steps)
-        effective = max(int(pseudo_home_steps), requested)
+        effective = Serial206OemInitializationProvider.z_absolute_target(requested, int(pseudo_home_steps))
         before = self.tester.motor_get_position(4, motor=1)
         before_value = self._z_value(before)
         if before_value is None:
@@ -1767,13 +2092,29 @@ class Serial206ProductionPrimitiveAdapter:
         current_write = self.tester.motor_set_axis_param(4, 6, int(profile["run_current"]), motor=1)
         current_readback = self.tester.motor_get_axis_param(4, 6, motor=1)
         pre_command_event_window = self.tester.begin_bus_event_window()
-        move = self.tester.motor_oem_move_absolute(
-            4,
-            effective,
-            motor=1,
-            wait_for_stop=False,
-            max_position=160000,
-        )
+        try:
+            move = self.tester.motor_oem_move_absolute(
+                4,
+                effective,
+                motor=1,
+                wait_for_stop=True,
+                max_position=160000,
+            )
+        except Exception as exc:
+            # Preserve actual pre-call inputs and the driver's attached timeout
+            # evidence without changing the source exception or adding a read.
+            failed_move = getattr(exc, "motion_evidence", None)
+            failed = self._z_finalize_position_move(
+                before=before, target=failed_move.get("wire_position", effective), move={**failed_move, "ok": False},
+                pre_command_event_window=pre_command_event_window,
+                event_window=pre_command_event_window,
+            ) if isinstance(failed_move, Mapping) else {"before_position_steps": before_value}
+            failed.update(requested_position_steps=requested,
+                effective_position_steps=failed_move.get("wire_position") if isinstance(failed_move, Mapping) else None,
+                pseudo_home_steps=int(pseudo_home_steps), coordinate_mode="absolute", source_return_ok=False)
+            failed["target_clamped"] = failed["effective_position_steps"] != requested if type(failed["effective_position_steps"]) is int else None
+            exc.critical_z_evidence = Serial206OemInitializationProvider._critical_z_result_evidence(failed)
+            raise
         if isinstance(move, Mapping) and move.get("source_noop") is True:
             return {
                 "ok": True,
@@ -1781,8 +2122,19 @@ class Serial206ProductionPrimitiveAdapter:
                 "axis": "z",
                 "intent": "move_absolute",
                 "source_noop": True,
+                "noop_reason": move.get("short_circuit"),
+                "short_circuit": move.get("short_circuit"),
+                "completion_class": "source_noop",
+                "source_return_ok": move.get("ok") is True,
+                "source_return_code": move.get("source_return_code"),
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
                 "requested_position_steps": requested,
-                "effective_position_steps": move.get("effective_position", before_value),
+                "effective_position_steps": move.get("source_return_code"),
+                "coordinate_mode": "absolute",
+                "target_clamped": move.get("source_return_code") != requested,
+                "before_position_steps": before_value,
+                "after_position_steps": None,
                 "pseudo_home_steps": int(pseudo_home_steps),
                 "source_anchor": "ClassControlInterface.moveZ:4254-4265",
                 "preflight": _json_safe(preflight),
@@ -1798,16 +2150,16 @@ class Serial206ProductionPrimitiveAdapter:
         if not isinstance(move_event_window, Mapping):
             move_event_window = pre_command_event_window
         result = self._z_finalize_position_move(
-            profile=profile, before=before, target=effective, move=move,
-            wait_timeout_s=wait_timeout_s,
+            before=before, target=move.get("wire_position", effective), move=move,
             pre_command_event_window=pre_command_event_window,
             event_window=move_event_window,
-            allow_timeout_target_equal=True,
         )
         result.update({
             "intent": "move_absolute",
             "requested_position_steps": requested,
-            "effective_position_steps": effective,
+            "effective_position_steps": move.get("wire_position", effective),
+            "coordinate_mode": "absolute",
+            "target_clamped": move.get("wire_position", effective) != requested,
             "pseudo_home_steps": int(pseudo_home_steps),
             "source_anchor": "ClassControlInterface.moveZ:4254-4265",
             "preflight": _json_safe(preflight),
@@ -1859,11 +2211,7 @@ class Serial206ProductionPrimitiveAdapter:
             and home_evidence.get("short_circuit") == "MotorHome_and_CurrentPosition_zero"
         )
         command_acknowledged = (
-            bool(
-                isinstance(home_evidence, Mapping)
-                and home_evidence.get("controller_home_proof_verified") is True
-                and home_evidence.get("controller_terminal_state_verified") is True
-            )
+            False
             if source_short_circuit
             else bool(
                 isinstance(move_home, Mapping)
@@ -1872,11 +2220,7 @@ class Serial206ProductionPrimitiveAdapter:
             )
         )
         terminal_verified = (
-            bool(
-                isinstance(home_evidence, Mapping)
-                and home_evidence.get("controller_terminal_state_verified") is True
-                and home_evidence.get("controller_home_proof_verified") is True
-            )
+            False
             if source_short_circuit
             else bool(self._z_stop_acknowledged(stop) and self._z_terminal_zero_verified(wait))
         )
@@ -1900,6 +2244,9 @@ class Serial206ProductionPrimitiveAdapter:
         )
         home_summary = {
             "failure": failure,
+            "completion_class": "source_cached_noop" if source_short_circuit else None,
+            "source_return_ok": ok,
+            "search_stop_set_home_inapplicable": source_short_circuit,
             "short_circuit": (
                 home_evidence.get("short_circuit")
                 if isinstance(home_evidence, Mapping) and isinstance(home_evidence.get("short_circuit"), str)
@@ -1938,6 +2285,10 @@ class Serial206ProductionPrimitiveAdapter:
             "source_anchor": source_anchor,
             "interlock": interlock,
             "home_summary": home_summary,
+            "source_noop": source_short_circuit,
+            "completion_class": "source_cached_noop" if source_short_circuit else None,
+            "source_return_ok": ok,
+            "search_stop_set_home_inapplicable": source_short_circuit,
             "home": _json_safe(home),
             "controller_command_acknowledged": command_acknowledged,
             "controller_terminal_state_verified": terminal_verified,
@@ -2064,9 +2415,24 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_stop(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
+        # CI.stopMotor's board-null branch precedes Head.stopMotor's guards.
+        present = getattr(self.tester, "_oem_board_present", None)
+        if callable(present) and not present(4):
+            return {
+                "ok": True, "intent": "stop", "source_call_completed": True,
+                "source_return_ok": True,
+                "source_board_return": None, "source_return_code": None,
+                "source_noop": True, "source_noop_reason": "board_null",
+                "controller_command_acknowledged": False,
+                "controller_terminal_state_verified": False,
+                "physical_effect_verified": False, "failure": None,
+                "stop": None, "wait": None,
+                "timeout_s_omitted_by_source": float(timeout_s),
+            }
         stop = self.tester.motor_oem_board_stop(4, motor=1, axis_name="z")
         source_completed = isinstance(stop, Mapping) and stop.get("source_call_completed") is True
-        source_return_ok = bool(source_completed and stop.get("source_return_code") == 0)
+        # Head.stopMotor is void; leaf scalar/ACK are evidence, not its return.
+        source_return_ok = source_completed
         command_acknowledged = bool(
             isinstance(stop, Mapping)
             and self._z_tmcl_success(stop.get("second_delivery"))
@@ -2075,7 +2441,12 @@ class Serial206ProductionPrimitiveAdapter:
             "ok": source_return_ok,
             "intent": "stop",
             "source_call_completed": source_completed,
+            "source_return_ok": source_return_ok,
+            "source_board_return": None,
             "source_return_code": stop.get("source_return_code") if isinstance(stop, Mapping) else None,
+            # Keep both scalar ACK facts outside bounded transport diagnostics.
+            "first_stop_acknowledged": bool(isinstance(stop, Mapping) and self._z_tmcl_success(stop.get("first_delivery"))),
+            "second_stop_acknowledged": command_acknowledged,
             "controller_command_acknowledged": command_acknowledged,
             "controller_terminal_state_verified": False,
             "timeout_s_omitted_by_source": float(timeout_s),
@@ -2086,14 +2457,15 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
     def z_abort(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
-        abort = self.tester.motor_oem_force_abort_motion(reason="oem.z.abort")
+        abort = self.tester.motor_oem_force_abort_motion(reason="oem.abort_all")
         source_completed = isinstance(abort, Mapping)
         return {
             "ok": source_completed,
             "intent": "full_machine_force_abort_from_z_recovery_context",
             "source_method": "ClassControlInterface.forceAbortMotion",
             "source_anchor": "ClassControlInterface.cs:5095-5121",
-            "physical_scope": "all_present_motor_boards",
+            "physical_scope": "none_software_flags_and_waiters",
+            "software_abort": True, "stop_delivery_attempted": False,
             "z_only": False,
             "abort": _json_safe(abort),
             "stop": None,
@@ -2204,6 +2576,12 @@ class Serial206ProductionPrimitiveAdapter:
             return self.z_startup_home(timeout_s=float(kwargs.get("timeout_s", 30.0)))
         return self.tester.motor_oem_home_axis(axis, *args, **kwargs)
 
+    def motor_oem_axis_search_home(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_axis_search_home(*args, **kwargs)
+
+    def motor_oem_move_absolute(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_move_absolute(*args, **kwargs)
+
     def motor_set_axis_param(self, *args: Any, **kwargs: Any) -> Any:
         return self.tester.motor_set_axis_param(*args, **kwargs)
 
@@ -2220,6 +2598,12 @@ class Serial206ProductionPrimitiveAdapter:
 
     def motor_thermal_door_status(self) -> Any:
         return self.tester.motor_thermal_door_status()
+
+    def motor_oem_confirm_thermal_door_closed(self) -> Any:
+        return self.tester.motor_oem_confirm_thermal_door_closed()
+
+    def motor_oem_board_move_steps(self, *args: Any, **kwargs: Any) -> Any:
+        return self.tester.motor_oem_board_move_steps(*args, **kwargs)
 
     def _machine_config_bundle(self) -> Any:
         return self.tester._machine_config_bundle()
@@ -2291,18 +2675,36 @@ class Serial206ProductionPrimitiveAdapter:
         runner = self.pipette_audit_runner
         if not callable(runner):
             raise RuntimeError("pipette_audit_runner_not_bound")
+        attempt = getattr(self, "_lifecycle_pipette_attempt", None)
+        if not isinstance(attempt, Mapping):
+            # Native deck cleanup is an independently claimed child of the
+            # already-admitted operator command, not an initialization stage.
+            from .operator_controls import current_operator_dispatch_context
+            context = current_operator_dispatch_context() or {}
+            parent = context.get("operator_command_id")
+            if not isinstance(parent, str) or not parent:
+                raise RuntimeError("lifecycle_pipette_attempt_identity_not_bound")
+            child = f"{parent}:{lifecycle_stage_id}"
+            attempt = {"command_id": child, "idempotency_key": child}
         return runner(
             operation_name,
             operation,
             requested_inputs=dict(requested_inputs or {}),
             lifecycle_stage_id=lifecycle_stage_id,
+            lifecycle_attempt_id=str(attempt["command_id"]),
+            lifecycle_idempotency_key=str(attempt["idempotency_key"]),
         )
 
-    def query_tip_status(self) -> dict[str, Any]:
+    def query_tip_status(
+        self,
+        *,
+        operation_name: str = "query_tip_status",
+        lifecycle_stage_id: str = "serial206.query_tip_status",
+    ) -> dict[str, Any]:
         raw = self._run_audited_pipette(
-            "query_tip_status",
+            operation_name,
             lambda transport: transport.query_tip_status_all(),
-            lifecycle_stage_id="serial206.query_tip_status",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
         rows = raw.get("channels") if isinstance(raw, Mapping) else None
         if not isinstance(rows, list) or len(rows) != 4:
@@ -2311,10 +2713,18 @@ class Serial206ProductionPrimitiveAdapter:
         if any(type(value) is not bool for value in channels):
             return {"ok": False, "channels": None, "raw": _json_safe(raw)}
         self._last_tip_channels = [index for index, loaded in enumerate(channels) if loaded]
-        return {"ok": True, "channels": channels, "controller_evidence": _json_safe(raw)}
+        # This is a live consumer handoff, not a bounded diagnostic attachment.
+        return {"ok": True, "channels": channels, "controller_evidence": dict(raw)}
 
-    def query_all_pipette_tip_states(self) -> dict[str, Any]:
-        result = self.query_tip_status()
+    def query_all_pipette_tip_states(
+        self,
+        *,
+        lifecycle_stage_id: str = "serial206.query_all_pipette_tip_states",
+    ) -> dict[str, Any]:
+        result = self.query_tip_status(
+            operation_name="query_all_pipette_tip_states",
+            lifecycle_stage_id=lifecycle_stage_id,
+        )
         channels = result.get("channels")
         loaded = [index for index, value in enumerate(channels or []) if value is True]
         return {
@@ -2324,6 +2734,19 @@ class Serial206ProductionPrimitiveAdapter:
             "channels": channels,
             "controller_evidence": result.get("controller_evidence"),
         }
+
+    def eject_all_tips_for_oem_park(self) -> Any:
+        """Execute source ``ejectAllTips(true,true)`` for parkGantry."""
+        return self._run_audited_pipette(
+            "eject_all_tips_for_oem_park",
+            lambda transport: transport.eject_all_tips(
+                check_missing_tip=True,
+                wait=True,
+                channels=None,
+            ),
+            requested_inputs={"check_missing_tip": True, "wait": True, "channels": None},
+            lifecycle_stage_id="serial206.eject_all_tips_for_oem_park",
+        )
 
     def eject_all_tips(self) -> Any:
         if self._last_tip_channels is None:
@@ -2368,20 +2791,30 @@ class Serial206ProductionPrimitiveAdapter:
             lifecycle_stage_id="serial206.initiate_pipette_group",
         )
 
-    def initiate_pipette_group_for_oem_initialize_motion(self, *, cycle: str) -> Any:
+    def initiate_pipette_group_for_oem_initialize_motion(
+        self,
+        *,
+        cycle: str,
+        lifecycle_stage_id: str,
+    ) -> Any:
         return self._run_audited_pipette(
             "initialize_group",
             lambda transport: transport.initiate_group_once_for_oem_initialize_motion(cycle=cycle),
             requested_inputs={"cycle": cycle},
-            lifecycle_stage_id="serial206.initiate_pipette_group_for_oem_initialize_motion",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
 
-    def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> Any:
+    def checked_pipette_status_for_oem_initialize_motion(
+        self,
+        *,
+        attempt: str,
+        lifecycle_stage_id: str,
+    ) -> Any:
         return self._run_audited_pipette(
             "checked_status",
             lambda transport: transport.checked_pipette_status_for_oem_initialize_motion(attempt=attempt),
             requested_inputs={"attempt": attempt},
-            lifecycle_stage_id="serial206.checked_pipette_status_for_oem_initialize_motion",
+            lifecycle_stage_id=lifecycle_stage_id,
         )
 
     @staticmethod
@@ -2404,6 +2837,46 @@ class Serial206ProductionPrimitiveAdapter:
         return self._position_value(
             self.tester.motor_get_position(profile["board"], motor=profile.get("motor", 0))
         )
+
+    def deck_io_query_type(self, io_type: int) -> Mapping[str, Any]:
+        query = getattr(self.tester, "deck_io_query_type", None)
+        if not callable(query):
+            raise RuntimeError("deck_latch_sensor_reader_not_bound")
+        result = query(int(io_type))
+        if not isinstance(result, Mapping):
+            raise RuntimeError("deck_latch_sensor_observation_malformed")
+        return result
+
+    def read_oem_latch_status(self) -> Mapping[str, Any]:
+        reader = getattr(self.tester, "read_oem_latch_status", None)
+        if not callable(reader):
+            raise RuntimeError("oem_host_latch_status_reader_not_bound")
+        result = reader()
+        if not isinstance(result, Mapping):
+            raise RuntimeError("oem_host_latch_status_observation_malformed")
+        return result
+
+    def read_deck_semantic_observation(self) -> dict[str, Any]:
+        """Observe only exact canonical-well-zero PositionTable coordinates."""
+        coordinates = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
+        observation_id = hashlib.sha256(
+            json.dumps(coordinates, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        matches = [
+            row for row in load_bound_oem_position_table().rows()
+            if int(row["base_coordinates"]["x"]) == coordinates["x"]
+            and int(row["base_coordinates"]["y"]) == coordinates["y"]
+        ]
+        if not matches:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable")
+        if len(matches) != 1:
+            raise RuntimeError("deck_reconciliation_semantic_location_ambiguous")
+        return {
+            "location_id": str(matches[0]["location_id"]),
+            "well_id": 0,
+            **coordinates,
+            "controller_position_observation_id": observation_id,
+        }
 
     def _prepare_path_axis(
         self,
@@ -2449,6 +2922,85 @@ class Serial206ProductionPrimitiveAdapter:
             )
         return self.oem_move_axis_absolute(axis_key, int(position), wait_for_stop=True)
 
+    def _oem_controller_child_evidence(self, result: Any) -> dict[str, bool]:
+        """Normalize only explicit production ACK/terminal evidence for one child."""
+        if not isinstance(result, Mapping):
+            return {"command_required": True, "acknowledged": False, "terminal": False}
+        # The native Y provider retains board exact-noop evidence under result;
+        # it does not claim a motor ACK for its source-only completion.
+        native = result.get("result")
+        target = result.get("motor_effective_target")
+        source_noop_wrapper = (result.get("schema") == "bioxp.serial206_y_provider.v2"
+            and result.get("completion_class") == "oem_source_noop")
+        if result.get("source_mode") == "moveXY.near_axis.moveX":
+            native = result.get("move")
+            target = result.get("target_position_steps")
+            source_noop_wrapper = result.get("source_noop") is True
+        if (source_noop_wrapper and isinstance(native, Mapping)
+                and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"):
+            return {
+                "command_required": False,
+                "acknowledged": False,
+                "terminal": bool(result.get("ok") is True
+                    and native.get("short_circuit") == "current_position_equals_target"
+                    and native.get("command_sent") is False and native.get("ack") is None
+                    and type(target) is int
+                    and self._x_readback_verified(native.get("before"), target)),
+            }
+        source_noop = result.get("source_noop") is True
+        before = result.get("before")
+        requested = result.get("effective_position", result.get("requested_position"))
+        noop_terminal = bool(
+            source_noop
+            and isinstance(before, Mapping)
+            and type(before.get("position")) is int
+            and type(requested) is int
+            and before.get("position") == requested
+        )
+        if source_noop and result.get("source_operation") == "ClassControlInterface.moveXY":
+            xy_requested = result.get("effective_target", result.get("requested"))
+            after = result.get("after")
+            noop_terminal = bool(
+                result.get("source_noop_verified") is True
+                and isinstance(before, Mapping) and isinstance(xy_requested, Mapping)
+                and isinstance(after, Mapping)
+                and all(type(before.get(axis)) is int
+                        and type(xy_requested.get(axis)) is int
+                        and type(after.get(axis)) is int
+                        and before[axis] == xy_requested[axis] == after[axis]
+                        for axis in ("x", "y"))
+            )
+        acknowledged = result.get("controller_command_acknowledged") is True
+        if not source_noop and not acknowledged:
+            acknowledged = self._x_tmcl_success(result.get("ack")) or self._x_tmcl_success(
+                result.get("retry_ack")
+            )
+        terminal = bool(
+            result.get("controller_terminal_state_verified") is True
+            or result.get("controller_completion_verified") is True
+            or result.get("completion_verified") is True
+        )
+        wait = result.get("wait")
+        completion_class = result.get("completion_class")
+        if not terminal and isinstance(wait, Mapping) and wait.get("ok") is True:
+            terminal = completion_class == "event_128"
+        if not terminal and completion_class == "oem_timeout_target_equal":
+            timeout_position = result.get("timeout_position")
+            terminal = bool(
+                isinstance(timeout_position, Mapping)
+                and type(timeout_position.get("position")) is int
+                and type(result.get("requested_position")) is int
+                and timeout_position.get("position") == result.get("requested_position")
+            )
+        if source_noop:
+            terminal = noop_terminal
+        return {
+            "command_required": not source_noop,
+            "acknowledged": bool(acknowledged),
+            "terminal": bool(terminal),
+        }
+
     def oem_move_axis_absolute(
         self,
         axis: str,
@@ -2465,11 +3017,15 @@ class Serial206ProductionPrimitiveAdapter:
             wait_for_stop=bool(wait_for_stop),
             max_position=profile.get("axis_max_steps"),
         )
+        evidence = self._oem_controller_child_evidence(move)
         return {
             "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
             "axis": str(axis).lower(),
             "target": int(position),
             "move": _json_safe(move),
+            "controller_command_acknowledged": evidence["acknowledged"],
+            "controller_terminal_state_verified": evidence["terminal"],
+            "controller_command_required": evidence["command_required"],
             "source_anchor": "ClassHeadBoard.moveToAbs; ClassControlInterface.moveX/moveY",
         }
 
@@ -2507,6 +3063,7 @@ class Serial206ProductionPrimitiveAdapter:
             wait_for_stop=bool(wait_for_stop),
             max_position=profile.get("axis_max_steps"),
         )
+        evidence = self._oem_controller_child_evidence(move)
         return {
             "ok": bool(isinstance(move, Mapping) and move.get("ok") is True),
             "axis": "z",
@@ -2516,6 +3073,9 @@ class Serial206ProductionPrimitiveAdapter:
             "motor_current": int(motor_current),
             "current_set": _json_safe(current_set),
             "move": _json_safe(move),
+            "controller_command_acknowledged": evidence["acknowledged"],
+            "controller_terminal_state_verified": evidence["terminal"],
+            "controller_command_required": evidence["command_required"],
             "source_anchor": "ClassControlInterface.moveZ:4254-4265",
         }
 
@@ -2525,103 +3085,26 @@ class Serial206ProductionPrimitiveAdapter:
         y: int,
         *,
         wait_timeout_s: float = 5.0,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
         """ClassControlInterface.moveXY source ordering and acceleration."""
-        result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
+        result = self.move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s), source_context=source_context)
         if self.y_provider is not None and isinstance(result, Mapping):
             result = dict(result)
-            result["y_authority"] = _json_safe(
-                self.y_provider.record_move_xy_observation(
-                    result,
-                    command_id=f"move-xy-{time.time_ns()}",
+            try:
+                result["y_authority"] = _json_safe(
+                    self.y_provider.record_move_xy_observation(
+                        result,
+                        command_id=f"move-xy-{time.time_ns()}",
+                    )
                 )
-            )
+            except Exception as exc:
+                exc.motion_evidence = {
+                    **result,
+                    "observation_recording_failure": type(exc).__name__,
+                }
+                raise
         return result
-        px = self._axis_profile("x")
-        py = self._axis_profile("y")
-        present = getattr(self.tester, "_oem_board_present", None)
-        x_present = not callable(present) or present(int(px["board"]))
-        y_present = not callable(present) or present(int(py["board"]))
-        if not y_present:
-            move = self.oem_move_axis_absolute("x", int(x), wait_for_stop=True) if x_present else None
-            return {"ok": move is None or move.get("ok") is True, "branch": "y_board_null", "move_x": _json_safe(move)}
-        if not x_present:
-            return {"ok": True, "branch": "x_board_null_literal_moveX_y_noop", "source_noop": "moveX checks the same null board"}
-        current_x = self._read_axis_position("x")
-        current_y = self._read_axis_position("y")
-        target_x, target_y = int(x), int(y)
-        distance_x = abs(target_x - current_x)
-        distance_y = abs(target_y - current_y)
-        commands: dict[str, Any] = {}
-        waits: dict[str, Any] = {}
-        launch_order: list[str] = []
-        if distance_x <= 20 or distance_y <= 20:
-            if distance_x != 0:
-                commands["x"] = self.oem_move_axis_absolute("x", target_x, wait_for_stop=True)
-                launch_order.append("x")
-            if distance_y != 0:
-                commands["y"] = self.oem_move_axis_absolute("y", target_y, wait_for_stop=True)
-                launch_order.append("y")
-            return {
-                "ok": all(commands[key].get("ok") is True for key in launch_order),
-                "targets": {"x": target_x, "y": target_y},
-                "before": {"x": current_x, "y": current_y},
-                "commands": _json_safe(commands),
-                "launch_order": launch_order,
-                "source_anchor": "ClassControlInterface.moveXY:4285-4311",
-            }
-
-        x_acc = 400 if distance_x > 10000 else 350
-        y_acc = 750 if distance_y > 10000 else 400
-        set_acc = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, x_acc, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, y_acc, motor=py.get("motor", 0)),
-        }
-        event_window = self.tester.begin_bus_event_window()
-        if distance_x > distance_y:
-            commands["x"] = self.tester.motor_oem_move_absolute(
-                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
-            )
-            launch_order.append("x")
-            if distance_y > 4000:
-                time.sleep(0.050 * distance_x / distance_y)
-            commands["y"] = self.tester.motor_oem_move_absolute(
-                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
-            )
-            launch_order.append("y")
-        else:
-            commands["y"] = self.tester.motor_oem_move_absolute(
-                py["board"], target_y, motor=py.get("motor", 0), wait_for_stop=False, max_position=py.get("axis_max_steps")
-            )
-            launch_order.append("y")
-            if distance_x > 4000:
-                time.sleep(0.050 * distance_y / distance_x)
-            commands["x"] = self.tester.motor_oem_move_absolute(
-                px["board"], target_x, motor=px.get("motor", 0), wait_for_stop=False, max_position=px.get("axis_max_steps")
-            )
-            launch_order.append("x")
-        time.sleep(0.005)
-        waits["pair"] = self.tester.motor_oem_wait_targets_reached(
-            ((px["board"], px.get("motor", 0)), (py["board"], py.get("motor", 0))),
-            timeout_s=5.0,
-            event_window=event_window,
-        )
-        restore_acc = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
-        }
-        return {
-            "ok": isinstance(waits["pair"], Mapping) and waits["pair"].get("ok") is True,
-            "targets": {"x": target_x, "y": target_y},
-            "before": {"x": current_x, "y": current_y},
-            "commands": _json_safe(commands),
-            "waits": _json_safe(waits),
-            "set_acc": _json_safe(set_acc),
-            "restore_acc": _json_safe(restore_acc),
-            "launch_order": launch_order,
-            "source_anchor": "ClassControlInterface.moveXY:4285-4366",
-        }
-
     def oem_move_to(
         self,
         x: int,
@@ -2635,11 +3118,29 @@ class Serial206ProductionPrimitiveAdapter:
         tip_loaded: bool | None = None,
         plate_on_gantry: int | None = None,
         location19_y: int | None = None,
+        interrupt_reason: Callable[[], str | None] | None = None,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
         """Literal ClassControlInterface.moveTo branch ordering."""
         pseudo = int(pseudo_home_steps)
         target = {"x": int(x), "y": int(y), "z": int(z)}
         results: list[dict[str, Any]] = []
+
+        def interrupted(stage: str, branch: str | None = None) -> dict[str, Any] | None:
+            reason = interrupt_reason() if callable(interrupt_reason) else None
+            if not isinstance(reason, str) or not reason:
+                return None
+            return {
+                "ok": False,
+                "source_return_code": 1,
+                "branch": branch or "interrupted",
+                "target": target,
+                "pseudo_z_home": pseudo,
+                "operations": list(results),
+                "failure": reason,
+                "interrupted_before_stage": stage,
+                "source_anchor": "ClassControlInterface.moveTo:4463-4620",
+            }
 
         def home_axis(axis: str, speed: int) -> dict[str, Any]:
             profile = self._axis_profile(axis)
@@ -2680,11 +3181,21 @@ class Serial206ProductionPrimitiveAdapter:
                     profile["board"], 5, 350 if axis == "x" else 400,
                     motor=profile.get("motor", 0),
                 )
+            evidence = self._oem_controller_child_evidence(move)
             return {"ok": isinstance(move, Mapping) and move.get("ok") is True,
                     "axis": axis, "target": effective, "set_acc": _json_safe(set_acc),
-                    "move": _json_safe(move), "restore_acc": _json_safe(restore)}
+                    "move": _json_safe(move), "restore_acc": _json_safe(restore),
+                    "controller_command_acknowledged": evidence["acknowledged"],
+                    "controller_terminal_state_verified": evidence["terminal"],
+                    "controller_command_required": evidence["command_required"]}
 
-        def run_pair(first: Callable[[], dict[str, Any]], second: Callable[[], dict[str, Any]], delay_s: float) -> list[dict[str, Any]]:
+        def run_pair(
+            first: Callable[[], dict[str, Any]],
+            second: Callable[[], dict[str, Any]],
+            delay_s: float,
+            *,
+            second_stage: str,
+        ) -> list[dict[str, Any]]:
             first_result: list[dict[str, Any]] = []
             first_error: list[BaseException] = []
             started = threading.Event()
@@ -2696,139 +3207,234 @@ class Serial206ProductionPrimitiveAdapter:
                     first_error.append(exc)
             thread = threading.Thread(target=invoke_first, daemon=False)
             thread.start()
-            started.wait()
-            time.sleep(delay_s)
-            second_result = second()
-            thread.join()
-            if first_error:
-                raise first_error[0]
+            second_result = None
+            second_error = None
+            try:
+                started.wait()
+                time.sleep(delay_s)
+                interruption = interrupted(second_stage)
+                second_result = interruption if interruption is not None else second()
+            except BaseException as exc:
+                second_error = exc
+            finally:
+                # OEM Task.WaitAll settles both children before observing faults.
+                thread.join()
+            if first_error or second_error is not None:
+                error = second_error if second_error is not None else first_error[0]
+                error.motion_evidence = {
+                    "operations": [*results, *first_result,
+                                   *([second_result] if second_result is not None else [])],
+                    "child_failures": [
+                        {"child": child, "error_type": type(exc).__name__,
+                         "motion_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
+                        for child, exc in (("first", first_error[0] if first_error else None),
+                                           ("second", second_error)) if exc is not None
+                    ],
+                    "children_settled": True,
+                    "physical_effect_verified": False,
+                }
+                raise error
+            assert second_result is not None
             return first_result + [second_result]
 
-        if target == {"x": 0, "y": 0, "z": 0}:
-            z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
-            xy_results: dict[str, Any] = {}
-            xy_errors: list[str] = []
+        try:
+            if target == {"x": 0, "y": 0, "z": 0}:
+                interruption = interrupted("all_zero_z_home", "all_zero_home")
+                if interruption is not None:
+                    return interruption
+                z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
+                xy_results: dict[str, Any] = {}
+                xy_errors: list[str] = []
 
-            def home_xy_axis(axis: str, speed: int) -> None:
-                try:
-                    if axis == "x":
-                        xy_results[axis] = self.x_move_to_origin_home(timeout_s=float(wait_timeout_s))
-                    else:
-                        xy_results[axis] = self.tester.motor_oem_go_home(
-                            axis,
-                            speed=int(speed),
-                            rehome=True,
-                            timeout_s=float(wait_timeout_s),
-                            require_switch_transition=False,
-                        )
-                except Exception as exc:
-                    xy_errors.append(f"{axis}:{type(exc).__name__}:{exc}")
+                def home_xy_axis(axis: str, speed: int) -> None:
+                    try:
+                        interruption = interrupted(f"all_zero_{axis}_home", "all_zero_home")
+                        if interruption is not None:
+                            xy_results[axis] = interruption
+                            return
+                        if axis == "x":
+                            xy_results[axis] = self.x_move_to_origin_home(timeout_s=float(wait_timeout_s))
+                        else:
+                            xy_results[axis] = self.tester.motor_oem_go_home(
+                                axis,
+                                speed=int(speed),
+                                rehome=True,
+                                timeout_s=float(wait_timeout_s),
+                                require_switch_transition=False,
+                            )
+                    except Exception as exc:
+                        xy_errors.append(f"{axis}:{type(exc).__name__}:{exc}")
 
-            if bool(run_in_parallel):
-                tx = threading.Thread(target=home_xy_axis, args=("x", 1700), daemon=False)
-                ty = threading.Thread(target=home_xy_axis, args=("y", 1800), daemon=False)
-                tx.start(); ty.start(); tx.join(); ty.join()
-            else:
-                home_xy_axis("x", 1700)
-                home_xy_axis("y", 1800)
-            xy_ok = not xy_errors and all(
-                isinstance(xy_results.get(axis), Mapping)
-                and xy_results[axis].get("ok") is True
-                for axis in ("x", "y")
-            )
-            # Controller home proof does not publish durable X/Y reference authority.
-            # The provider-owned observation transition must perform the atomic pair
-            # publication after an independently bound observation receipt.
-            reference = {
-                "ok": False,
-                "state": "awaiting_observation",
-                "axes": ["x", "y"],
-                "physical_effect_verified": False,
-            } if xy_ok else None
-            ok = bool(z_home.get("ok") is True and xy_ok)
-            return {
-                "ok": ok,
-                "source_return_code": 0 if ok else 1,
-                "branch": "all_zero_home",
-                "source_home_semantics": {
-                    "z": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
-                    "x": "ClassControlInterface.goHome(true,X,1700,true)",
-                    "y": "ClassControlInterface.goHome(true,Y,1800,true)",
-                },
-                "run_in_parallel": bool(run_in_parallel),
-                "z_home": _json_safe(z_home),
-                "xy_home": _json_safe(xy_results),
-                "xy_errors": xy_errors,
-                "xy_reference_state": _json_safe(reference),
-                "reference_publication_required": bool(xy_ok),
-                "z_home_reference_verified": bool(z_home.get("ok") is True),
-                "home_summary": _json_safe(z_home.get("home_summary")),
-                "controller_command_acknowledged": bool(z_home.get("controller_command_acknowledged") is True),
-                "controller_terminal_state_verified": bool(z_home.get("controller_terminal_state_verified") is True),
-                "physical_motion_commanded": bool(ok),
-                "failure": None if ok else "all_zero_move_to_home_failed",
-                "source_anchor": "ClassControlInterface.moveTo:4463-4506",
-            }
+                if bool(run_in_parallel):
+                    tx = threading.Thread(target=home_xy_axis, args=("x", 1700), daemon=False)
+                    ty = threading.Thread(target=home_xy_axis, args=("y", 1800), daemon=False)
+                    tx.start(); ty.start(); tx.join(); ty.join()
+                else:
+                    home_xy_axis("x", 1700)
+                    home_xy_axis("y", 1800)
+                xy_ok = not xy_errors and all(
+                    isinstance(xy_results.get(axis), Mapping)
+                    and xy_results[axis].get("ok") is True
+                    for axis in ("x", "y")
+                )
+                # Controller home proof does not publish durable X/Y reference authority.
+                # The provider-owned observation transition must perform the atomic pair
+                # publication after an independently bound observation receipt.
+                reference = {
+                    "ok": False,
+                    "state": "awaiting_observation",
+                    "axes": ["x", "y"],
+                    "physical_effect_verified": False,
+                } if xy_ok else None
+                ok = bool(z_home.get("ok") is True and xy_ok)
+                return {
+                    "ok": ok,
+                    "source_return_code": 0 if ok else 1,
+                    "branch": "all_zero_home",
+                    "source_home_semantics": {
+                        "z": "ClassControlInterface.MoveZHome -> goHome(true,1791)",
+                        "x": "ClassControlInterface.goHome(true,X,1700,true)",
+                        "y": "ClassControlInterface.goHome(true,Y,1800,true)",
+                    },
+                    "run_in_parallel": bool(run_in_parallel),
+                    "z_home": _json_safe(z_home),
+                    "xy_home": _json_safe(xy_results),
+                    "xy_errors": xy_errors,
+                    "xy_reference_state": _json_safe(reference),
+                    "reference_publication_required": bool(xy_ok),
+                    "z_home_reference_verified": bool(z_home.get("ok") is True),
+                    "home_summary": _json_safe(z_home.get("home_summary")),
+                    "controller_command_acknowledged": bool(z_home.get("controller_command_acknowledged") is True),
+                    "controller_terminal_state_verified": bool(z_home.get("controller_terminal_state_verified") is True),
+                    "physical_motion_commanded": bool(ok),
+                    "failure": None if ok else "all_zero_move_to_home_failed",
+                    "source_anchor": "ClassControlInterface.moveTo:4463-4506",
+                }
 
-        if type(gripper_confirmed) is not bool or type(tip_loaded) is not bool:
-            raise RuntimeError("moveTo gripper confirmation and TipLoaded authority are required")
-        if plate_on_gantry in {4, 5} and type(location19_y) is not int:
-            raise RuntimeError("moveTo location-19 Y authority is required for loaded plate branch")
-        plate_clear_y = int(location19_y) if type(location19_y) is int else 0
+            if type(gripper_confirmed) is not bool or type(tip_loaded) is not bool:
+                raise RuntimeError("moveTo gripper confirmation and TipLoaded authority are required")
+            if plate_on_gantry in {4, 5} and type(location19_y) is not int:
+                raise RuntimeError("moveTo location-19 Y authority is required for loaded plate branch")
+            plate_clear_y = int(location19_y) if type(location19_y) is int else 0
 
-        current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
-        if current["z"] > pseudo:
-            results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
-        x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
-        y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
+            current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
+            if current["z"] > pseudo:
+                interruption = interrupted("z_clearance")
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+            x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
+            y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
 
-        def move_y_or_home() -> dict[str, Any]:
-            return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
+            def move_y_or_home() -> dict[str, Any]:
+                return home_axis("y", 1800) if target["y"] == 0 else move_axis("y", target["y"], y_acc)
 
-        if gripper_confirmed and not tip_loaded:
-            results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0))
-            branch = "confirmed_gripper_no_tip_moveXY"
-        elif target["y"] < current["y"] or target["y"] < 46800:
-            if plate_on_gantry in {4, 5}:
-                if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
-                    results.append(move_axis("y", plate_clear_y, y_acc))
-                results.append(move_axis("x", target["x"], x_acc))
-                time.sleep(0.001)
-                results.append(move_y_or_home())
-                branch = "descending_y_loaded_plate"
+            if gripper_confirmed and not tip_loaded:
+                interruption = interrupted("move_xy")
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_xy(target["x"], target["y"], wait_timeout_s=5.0, source_context=source_context))
+                branch = "confirmed_gripper_no_tip_moveXY"
+            elif target["y"] < current["y"] or target["y"] < 46800:
+                if plate_on_gantry in {4, 5}:
+                    if current["y"] < plate_clear_y and (current["x"] > 66400 or target["x"] > 66400) and abs(current["x"] - target["x"]) > 10000:
+                        interruption = interrupted("plate_clear_y", "descending_y_loaded_plate")
+                        if interruption is not None:
+                            return interruption
+                        results.append(move_axis("y", plate_clear_y, y_acc))
+                    interruption = interrupted("loaded_plate_x", "descending_y_loaded_plate")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_axis("x", target["x"], x_acc))
+                    time.sleep(0.001)
+                    interruption = interrupted("loaded_plate_y", "descending_y_loaded_plate")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_y_or_home())
+                    branch = "descending_y_loaded_plate"
+                elif run_in_parallel:
+                    interruption = interrupted("descending_parallel_x", "descending_y_parallel_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600, second_stage="descending_parallel_y"))
+                    branch = "descending_y_parallel_x_first"
+                else:
+                    interruption = interrupted("descending_sequential_x", "descending_y_sequential_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_axis("x", target["x"], x_acc))
+                    interruption = interrupted("descending_sequential_y", "descending_y_sequential_x_first")
+                    if interruption is not None:
+                        return interruption
+                    results.append(move_y_or_home())
+                    branch = "descending_y_sequential_x_first"
             elif run_in_parallel:
-                results.extend(run_pair(lambda: move_axis("x", target["x"], x_acc), move_y_or_home, 0.600))
-                branch = "descending_y_parallel_x_first"
+                interruption = interrupted("parallel_y", "parallel_y_first")
+                if interruption is not None:
+                    return interruption
+                results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300, second_stage="parallel_x"))
+                branch = "parallel_y_first"
             else:
-                results.extend((move_axis("x", target["x"], x_acc), move_y_or_home()))
-                branch = "descending_y_sequential_x_first"
-        elif run_in_parallel:
-            results.extend(run_pair(move_y_or_home, lambda: move_axis("x", target["x"], x_acc), 0.300))
-            branch = "parallel_y_first"
-        else:
-            results.extend((move_y_or_home(), move_axis("x", target["x"], x_acc)))
-            branch = "sequential_y_first"
+                interruption = interrupted("sequential_y", "sequential_y_first")
+                if interruption is not None:
+                    return interruption
+                results.append(move_y_or_home())
+                interruption = interrupted("sequential_x", "sequential_y_first")
+                if interruption is not None:
+                    return interruption
+                results.append(move_axis("x", target["x"], x_acc))
+                branch = "sequential_y_first"
 
-        time.sleep(0.001)
-        time.sleep(0.001)
-        if target["z"] > pseudo:
-            results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
-        px, py = self._axis_profile("x"), self._axis_profile("y")
-        restore = {
-            "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
-            "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
-        }
-        return {
-            "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
-            "source_return_code": 0,
-            "branch": branch,
-            "target": target,
-            "before": current,
-            "pseudo_z_home": pseudo,
-            "operations": _json_safe(results),
-            "restore_acc": _json_safe(restore),
-            "source_anchor": "ClassControlInterface.moveTo:4463-4620",
-        }
+            time.sleep(0.001)
+            time.sleep(0.001)
+            if target["z"] > pseudo:
+                interruption = interrupted("final_z", branch)
+                if interruption is not None:
+                    return interruption
+                results.append(self.oem_move_z(target["z"], pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+            px, py = self._axis_profile("x"), self._axis_profile("y")
+            restore = {
+                "x": self.tester.motor_set_axis_param(px["board"], 5, 350, motor=px.get("motor", 0)),
+                "y": self.tester.motor_set_axis_param(py["board"], 5, 400, motor=py.get("motor", 0)),
+            }
+            interruption = interrupted("complete", branch)
+            if interruption is not None:
+                return {**interruption, "restore_acc": _json_safe(restore)}
+            child_evidence = [self._oem_controller_child_evidence(row) for row in results]
+            commanded = [row for row in child_evidence if row["command_required"]]
+            controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
+            controller_completion_verified = bool(child_evidence) and all(
+                row["terminal"] and (row["acknowledged"] or not row["command_required"])
+                for row in child_evidence
+            )
+            return {
+                "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
+                "source_return_code": 0,
+                "branch": branch,
+                "target": target,
+                "before": current,
+                "pseudo_z_home": pseudo,
+                "operations": list(results),
+                "effective_xy_target": next((dict(row.get("effective_target", row["requested"]))
+                    for row in reversed(results) if isinstance(row, Mapping)
+                    and row.get("source_operation") == "ClassControlInterface.moveXY"), None),
+                "controller_child_evidence": _json_safe(child_evidence),
+                "source_noop": controller_completion_verified and not commanded,
+                "controller_command_acknowledged": controller_acknowledged,
+                "controller_completion_verified": controller_completion_verified,
+                "controller_terminal_state_verified": controller_completion_verified,
+                "restore_acc": _json_safe(restore),
+                "source_anchor": "ClassControlInterface.moveTo:4463-4620",
+            }
+        except Exception as exc:
+            native = getattr(exc, "motion_evidence", None)
+            exc.motion_evidence = {
+                **(dict(native) if isinstance(native, Mapping) else {}),
+                "prior_operations": list(results),
+                "physical_effect_verified": False,
+            }
+            raise
+
 
     def absolute(
         self,
@@ -2895,7 +3501,15 @@ class Serial206ProductionPrimitiveAdapter:
         speed: int | None = None,
         acc: int | None = None,
         wait_timeout_s: float,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
+        # Source context, not the Linux worker thread: App.Main is STA and
+        # btnLOC1_Click calls both moveTo overloads then moveXY synchronously
+        # (BioXPControlLib IL_075c -> IL_007c -> IL_01e6). Other callers have
+        # not yet been sealed; retain their legacy WaitAll without claiming MTA.
+        if source_context not in (None, "ClassControlInterface.btnLOC1_Click"):
+            raise ValueError("unsealed_moveXY_source_context")
+        sta_sequential = source_context == "ClassControlInterface.btnLOC1_Click"
         requested = {"x": int(x), "y": int(y)}
         present_fn = getattr(self.tester, "motor_oem_axis_board_present", None)
         if callable(present_fn):
@@ -2910,6 +3524,9 @@ class Serial206ProductionPrimitiveAdapter:
             "board_present": present,
             "ignored_compatibility_inputs": {"speed": speed, "acc": acc, "wait_timeout_s": float(wait_timeout_s)},
             "oem_wait_timeout_ms": 5000,
+            "source_context": source_context,
+            "source_context_sealed": source_context is not None,
+            "wait_schedule": "STA_WaitAny_X_then_Y" if sta_sequential else "unsealed_legacy_WaitAll",
         }
         if not present["y"]:
             fallback = self.x_move_absolute(position_steps=requested["x"], source_mode="moveXY.missing_y.moveX", clamp_low_to_60=True)
@@ -2928,9 +3545,10 @@ class Serial206ProductionPrimitiveAdapter:
             })
             return receipt
         reference = self._reference_snapshot(("x", "y"), "ClassControlInterface.moveXY")
+        # CI.moveXY IL_0081 then IL_00b8: Y before X.
         before_rows = {
-            "x": self.tester.motor_get_position(5, motor=0),
             "y": self.tester.motor_get_position(4, motor=0),
+            "x": self.tester.motor_get_position(5, motor=0),
         }
         x_before = self._x_value(before_rows["x"])
         y_before = self._x_value(before_rows["y"])
@@ -2946,6 +3564,10 @@ class Serial206ProductionPrimitiveAdapter:
                 "branch": "source_noop",
                 "source_noop": True,
                 "noop_reason": "both_axes_already_at_target",
+                "source_noop_verified": all(
+                    present[axis] and self._x_readback_verified(before_rows[axis], requested[axis])
+                    for axis in ("x", "y")
+                ),
                 "command_issued": False,
                 "physical_motion_commanded": False,
                 "controller_command_acknowledged": False,
@@ -2971,22 +3593,54 @@ class Serial206ProductionPrimitiveAdapter:
                     wait_for_stop=True,
                 )
             if distances["y"]:
-                commands["y"] = self.y_provider.move_absolute(
-                    target_steps=requested["y"],
-                    wait_for_stop=True,
-                    wait_timeout_s=float(wait_timeout_s),
-                    acceleration_override=None,
-                )
+                try:
+                    commands["y"] = self.y_provider.move_absolute(
+                        target_steps=requested["y"],
+                        wait_for_stop=True,
+                        wait_timeout_s=float(wait_timeout_s),
+                    )
+                except Exception as exc:
+                    exc.motion_evidence = {
+                        **receipt, "branch": "near_axis_sequential",
+                        "commands": commands, "failed_axis": "y",
+                        "controller_failure": copy.deepcopy(getattr(exc, "motion_evidence", None)),
+                        "physical_effect_verified": False,
+                    }
+                    raise
             source_calls_completed = all(
                 isinstance(command, Mapping) and command.get("ok") is True
                 for command in commands.values()
             )
+            # Consume real child completion before bounding nested diagnostics.
+            child_evidence = [self._oem_controller_child_evidence(command)
+                              for command in commands.values()]
+            terminal = bool(source_calls_completed and child_evidence) and all(
+                row["terminal"] and (row["acknowledged"] or not row["command_required"])
+                for row in child_evidence
+            )
+            effective = dict(requested)
+            for axis, command in commands.items():
+                if isinstance(command, Mapping):
+                    effective[axis] = command.get("motor_effective_target", command.get("target_position_steps"))
+            receipt["effective_target"] = effective
+            if child_evidence and all(not row["command_required"] for row in child_evidence):
+                after_rows = {axis: self.tester.motor_get_position(board, motor=0)
+                              for axis, board in (("x", 5), ("y", 4))}
+                noop_verified = terminal and all(
+                    type(effective[axis]) is int
+                    and self._x_readback_verified(before_rows[axis], effective[axis])
+                    and self._x_readback_verified(after_rows[axis], effective[axis])
+                    for axis in ("x", "y")
+                )
+                receipt.update(source_noop=True, source_noop_verified=noop_verified,
+                    effective_target=effective, after={axis: self._x_value(row) for axis, row in after_rows.items()})
             receipt.update({
                 "ok": source_calls_completed,
                 "branch": "near_axis_sequential",
                 "launch_order": list(commands),
-                "commands": _json_safe(commands),
+                "commands": dict(commands),
                 "source_calls_completed": source_calls_completed,
+                "controller_terminal_state_verified": terminal,
                 "command_issued": any(
                     isinstance(command, Mapping) and command.get("command_issued") is True
                     for command in commands.values()
@@ -2995,7 +3649,7 @@ class Serial206ProductionPrimitiveAdapter:
                     isinstance(command, Mapping) and command.get("physical_motion_commanded") is True
                     for command in commands.values()
                 ),
-                "controller_command_acknowledged": all(
+                "controller_command_acknowledged": any(row["command_required"] for row in child_evidence) and all(
                     not isinstance(command, Mapping)
                     or command.get("command_issued") is not True
                     or command.get("controller_command_acknowledged") is True
@@ -3008,53 +3662,71 @@ class Serial206ProductionPrimitiveAdapter:
         x_acc = 400 if distances["x"] > 10000 else 350
         y_acc = 750 if distances["y"] > 10000 else 400
         acceleration_set = {"x": self.tester.motor_set_axis_param(5, 5, x_acc, motor=0), "y": self.tester.motor_set_axis_param(4, 5, y_acc, motor=0)}
-        setup_ok = all(isinstance(acceleration_set[axis], Mapping) and acceleration_set[axis].get("ok") is True and isinstance(acceleration_set[axis].get("readback"), Mapping) and acceleration_set[axis]["readback"].get("value") == expected for axis, expected in (("x", x_acc), ("y", y_acc)))
+        # setMaxAcc is a source void call; SAP replies have no readback.
+        setup_ok = all(isinstance(row, Mapping) and self._x_tmcl_success(row.get("ack")) for row in acceleration_set.values())
+        receipt["acceleration_evidence_kind"] = "controller_ack_not_parameter_readback"
         event_window = self.tester.begin_bus_event_window()
         commands: dict[str, Any] = {}
         launch_order: list[str] = []
         stagger_ms = 0
-        if distances["x"] > distances["y"]:
-            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_x_first", event_window=event_window)
-            launch_order.append("x")
-            if distances["y"] > 4000:
-                stagger_ms = 50 * distances["x"] // distances["y"]
-                time.sleep(stagger_ms / 1000.0)
-            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
-            launch_order.append("y")
-        else:
-            commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
-            launch_order.append("y")
-            if distances["x"] > 4000:
-                stagger_ms = 50 * distances["y"] // distances["x"]
-                time.sleep(stagger_ms / 1000.0)
-            commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_y_first", event_window=event_window)
-            launch_order.append("x")
-        shared_event_window = dict(event_window)
-        shared_cursors: dict[str, float] = {}
-        for command in commands.values():
-            command_window = command.get("event_window") if isinstance(command, Mapping) else None
-            cursors = command_window.get("dispatch_cursors") if isinstance(command_window, Mapping) else None
-            if isinstance(cursors, Mapping):
-                for key, value in cursors.items():
-                    if isinstance(key, str) and isinstance(value, (int, float)):
-                        shared_cursors[key] = float(value)
-        if shared_cursors:
-            shared_event_window["dispatch_cursors"] = shared_cursors
-        time.sleep(0.005)
-        many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
-        pair_wait: Any = None
-        if callable(many_wait):
-            pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=False)
-            waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
-            if not waits:
-                waits = {"x": pair_wait, "y": pair_wait}
-        else:
-            wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
-            waits = {"x": wait_fn(5, motor=0, timeout_s=5.0, event_window=shared_event_window), "y": wait_fn(4, motor=0, timeout_s=5.0, event_window=shared_event_window)}
-        restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
-        after = {axis: self._read_axis_position(axis) for axis in ("x", "y")}
-        receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
-        return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
+        waits: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        pair_wait = None
+        try:
+            if distances["x"] > distances["y"]:
+                commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_x_first", event_window=event_window)
+                launch_order.append("x")
+                if distances["y"] > 4000:
+                    stagger_ms = 50 * distances["x"] // distances["y"]
+                    time.sleep(stagger_ms / 1000.0)
+                commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+                launch_order.append("y")
+            else:
+                commands["y"] = self._move_xy_y_issue_absolute(requested["y"], event_window=event_window)
+                launch_order.append("y")
+                if distances["x"] > 4000:
+                    stagger_ms = 50 * distances["y"] // distances["x"]
+                    time.sleep(stagger_ms / 1000.0)
+                commands["x"] = self._x_issue_absolute(requested["x"], source_mode="moveXY.parallel_y_first", event_window=event_window)
+                launch_order.append("x")
+            shared_event_window = dict(event_window)
+            shared_cursors: dict[str, float] = {}
+            for command in commands.values():
+                command_window = command.get("event_window") if isinstance(command, Mapping) else None
+                cursors = command_window.get("dispatch_cursors") if isinstance(command_window, Mapping) else None
+                if isinstance(cursors, Mapping):
+                    for key, value in cursors.items():
+                        if isinstance(key, str) and isinstance(value, (int, float)):
+                            shared_cursors[key] = float(value)
+            if shared_cursors:
+                shared_event_window["dispatch_cursors"] = shared_cursors
+            time.sleep(0.005)
+            many_wait = getattr(self.tester, "motor_wait_target_reached_many", None)
+            pair_wait: Any = None
+            if callable(many_wait):
+                pair_wait = many_wait(((5, 0), (4, 0)), event_window=shared_event_window, timeout_s=5.0, sta_sequential=sta_sequential)
+                waits = dict(pair_wait.get("per_axis") or {}) if isinstance(pair_wait, Mapping) else {}
+                if not waits:
+                    waits = {"x": pair_wait, "y": pair_wait}
+            else:
+                wait_fn = getattr(self.tester, "motor_wait_target_reached", None) or getattr(self.tester, "motor_oem_wait_target_reached")
+                for axis, board in (("x", 5), ("y", 4)):
+                    waits[axis] = wait_fn(board, motor=0, timeout_s=5.0, event_window=shared_event_window)
+            restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
+            for axis in ("x", "y"):
+                after[axis] = self._read_axis_position(axis)
+            receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
+            return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
+        except Exception as exc:
+            exc.motion_evidence = {
+                **receipt, "branch": "parallel", "commands": commands,
+                "launch_order": launch_order, "waits": waits, "after": after,
+                "pair_wait": pair_wait,
+                "controller_failure": copy.deepcopy(getattr(exc, "motion_evidence", None)),
+                "physical_effect_verified": False,
+            }
+            raise
+
 
 
     def parallel(
@@ -3254,6 +3926,29 @@ class Serial206ProductionPrimitiveAdapter:
         )
         acknowledged = bool(g_move.get("ok") is True and z_move.get("ok") is True)
         terminal = bool(isinstance(wait, Mapping) and wait.get("ok") is True)
+        # Source handle consumption can succeed from construction alone.
+        # Only the actual consumed receives prove both controller targets;
+        # bind their historical ownership without another wait or cursor.
+        reached = wait.get("reached") if isinstance(wait, Mapping) else None
+        controller_terminal = terminal and isinstance(reached, Mapping)
+        for profile in (g_profile, z_profile):
+            board = int(profile["board"])
+            motor = int(profile.get("motor", 0))
+            event = reached.get(f"{board}:{motor}") if isinstance(reached, Mapping) else None
+            controller_terminal = bool(
+                controller_terminal and isinstance(event, Mapping)
+                and event.get("source") == "novo_router_async"
+                and event.get("latch_disposition") == "consumed"
+                and event.get("board") == board and event.get("motor") == motor
+                and event.get("status") == 128
+                and type(event.get("event_sequence")) is int
+                and isinstance(event.get("receive_owner"), str)
+                and type(event.get("owner_generation")) is int
+                and (not isinstance(event_window, Mapping) or all(
+                    event.get(key) == event_window[key]
+                    for key in ("receive_owner", "owner_generation") if key in event_window
+                ))
+            )
         return {
             "ok": bool(acknowledged and terminal),
             "intent": "move_gz",
@@ -3263,7 +3958,7 @@ class Serial206ProductionPrimitiveAdapter:
             "commands": {"g": _json_safe(g_move), "z": _json_safe(z_move)},
             "wait": _json_safe(wait),
             "controller_command_acknowledged": acknowledged,
-            "controller_terminal_state_verified": terminal,
+            "controller_terminal_state_verified": controller_terminal,
             "physical_effect_verified": False,
             "failure": None if acknowledged and terminal else "move_gz_controller_evidence_unverified",
         }
@@ -3471,6 +4166,7 @@ class Serial206ProductionPrimitiveAdapter:
         tip_dirty: bool,
         timeout_s: float,
         pseudo_home_steps: int = 65000,
+        gripper_confirmed: bool = False,
         plate_on_gantry: int | str | None = None,
         location19_y: int | None = None,
     ) -> dict[str, Any]:
@@ -3494,7 +4190,7 @@ class Serial206ProductionPrimitiveAdapter:
             tip_location=-1,
             clean_path=False,
             device_type="BIOXP",
-            gripper_confirmed=False,
+            gripper_confirmed=gripper_confirmed,
             pseudo_z_home=int(pseudo_home_steps),
             plate_on_gantry=plate_on_gantry,
             location19_y=location19_y,
@@ -3521,8 +4217,13 @@ class Serial206ProductionPrimitiveAdapter:
             acc=None,
             pseudo_z_home_steps=int(pseudo_home_steps),
         )
+        controller_evidence = _aggregate_executed_controller_evidence(execution)
+        acknowledged = controller_evidence["controller_command_acknowledged"]
+        completed = controller_evidence["controller_completion_verified"]
+        postcondition = controller_evidence["hardware_postcondition_verified"]
         return {
-            "ok": execution.get("ok") is True,
+            "ok": execution.get("ok") is True and acknowledged and completed,
+            **controller_evidence,
             "plan": _json_safe(plan),
             "execution": _json_safe(execution),
             "position_table_source": table.source,
@@ -3530,9 +4231,194 @@ class Serial206ProductionPrimitiveAdapter:
             "source_anchor": "ClassControlInterface.scriptmoveTo:3734-4014; ControlLib.initializeMotion:8812",
         }
 
+    def oem_preview_scriptmove_to(
+        self,
+        *,
+        current_location: int,
+        target_location: int,
+        column: int = 0,
+        row: int = 0,
+        well: int | None = None,
+        position_flag: int = 0,
+        run_in_parallel: bool = True,
+        tip_loaded: bool,
+        tip_dirty: bool,
+        tip_location: int,
+        clean_path: bool,
+        pseudo_home_steps: int,
+        plate_on_gantry: int | str | None,
+        gripper_confirmed: bool | None = None,
+        location19_y: int | None = None,
+    ) -> dict[str, Any]:
+        observed_gripper = Serial206OemInitializationProvider._observed_gripper_confirmation(self.tester)
+        if gripper_confirmed is not None and gripper_confirmed is not observed_gripper:
+            raise RuntimeError("scriptmoveTo_gripper_authority_changed")
+        gripper_confirmed = observed_gripper
+        table = load_bound_oem_position_table()
+        parity = load_oem_parity_config(None)
+        if parity.blockers:
+            raise RuntimeError("immutable_oem_machine_snapshot_not_bound")
+        state = OemMachineState.from_query(
+            current_location_id=str(int(current_location)),
+            current_well_id="0",
+            current_x=self._read_axis_position("x"),
+            current_y=self._read_axis_position("y"),
+            current_z=self._read_axis_position("z"),
+            tip_loaded=bool(tip_loaded),
+            tip_dirty=bool(tip_dirty),
+            tip_location=int(tip_location),
+            clean_path=bool(clean_path),
+            device_type="BIOXP",
+            gripper_confirmed=gripper_confirmed,
+            pseudo_z_home=int(pseudo_home_steps),
+            plate_on_gantry=plate_on_gantry,
+            location19_y=location19_y,
+        )
+        planner = OemPathPlanner(
+            table,
+            x_high_limit=int(parity.values.get("XHigh", 90263)),
+            y_high_limit=int(parity.values.get("YHigh", 102956)),
+        )
+        plan = planner.plan_script_move_to(
+            current_loc=int(current_location),
+            location_id=int(target_location),
+            column=int(column),
+            row=int(row),
+            well=None if well is None else int(well),
+            positionflag=int(position_flag),
+            state=state,
+            run_in_parallel=bool(run_in_parallel),
+        )
+        return {
+            "plan": _json_safe(plan),
+            "machine_state": state.to_payload(),
+            "position_table_source": table.source,
+        }
+
+    def oem_scriptmove_to(self, *, timeout_s: float = 60.0, expected_plan_digest: str | None = None, source_plan: Mapping[str, Any] | None = None, **arguments: Any) -> dict[str, Any]:
+        preview = self.oem_preview_scriptmove_to(**arguments)
+        plan = dict(preview["plan"])
+        plan_digest = hashlib.sha256(
+            json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        if expected_plan_digest is not None and plan_digest != str(expected_plan_digest):
+            raise RuntimeError("scriptmoveTo_plan_authority_changed_before_first_tx")
+        if source_plan is not None:
+            supplied_digest = hashlib.sha256(
+                json.dumps(dict(source_plan), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest()
+            if supplied_digest != plan_digest:
+                raise RuntimeError("scriptmoveTo_persisted_plan_mismatch")
+        execution = _execute_oem_steps_live(
+            list(plan.get("steps") or []), self, wait_timeout_s=float(timeout_s), speed=None,
+            acc=None, pseudo_z_home_steps=int(arguments["pseudo_home_steps"]),
+        )
+        evidence = _aggregate_executed_controller_evidence(execution)
+        return {
+            "ok": execution.get("ok") is True
+            and evidence["controller_command_acknowledged"]
+            and evidence["controller_completion_verified"],
+            **evidence,
+            "delivery_attempted": True,
+            "plan_digest": plan_digest,
+            "plan": plan,
+            "execution": _json_safe(execution),
+            "source_anchor": "ClassControlInterface.scriptmoveTo:3734-4014",
+        }
+
 
 class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
+
+    _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceMoveTo": "wp8_source_move_to",
+        "sourceImageGantryLoad": "wp8_source_image_gantry_load",
+        "sourceMoveX": "wp8_source_move_x",
+        "sourceMoveZ": "wp8_source_move_z",
+        "sourceSetZAcc": "wp8_source_set_z_acc",
+        "sourceRestoreZAcc": "wp8_source_restore_z_acc",
+        "sourceLowerPipette": "wp8_source_lower_pipette",
+        "CloseGripper": "wp8_close_gripper",
+        "HomeAxisD": "wp8_home_axis_d",
+        "LoadGantry": "wp8_load_gantry",
+        "LoadGantryNull": "wp8_load_gantry",
+        "LockGripperOperation": "wp8_lock_gripper",
+        "MoveZHome": "wp8_move_z_home",
+        "OpenGripper": "wp8_open_gripper",
+        "OpenGripperWide": "wp8_open_gripper",
+        "ReleaseLockGripperOperation": "wp8_release_gripper_lock",
+        "Sleep": "wp8_sleep",
+        "SnapshotImage": "wp8_snapshot_image",
+        "StopCloseGripper": "wp8_stop_close_gripper",
+        "backgroundGripperHomeAndUnlock": "wp8_start_gripper_home_and_unlock",
+        "catchPlate": "wp8_catch_plate",
+        "checkDoorStatus": "wp8_check_door_status",
+        "cleanupWastePrelude": "wp8_cleanup_waste_prelude",
+        "clearTipLoaded": "wp8_clear_tip_loaded",
+        "doorOpen": "wp8_door_open",
+        "ejectAllTipsCleanup": "wp8_eject_all_tips_cleanup",
+        "getG": "wp8_get_g",
+        "led2Off": "wp8_led2",
+        "led2On": "wp8_led2",
+        "moveDoorClosed": "wp8_move_door",
+        "moveDoorOpen": "wp8_move_door",
+        "moveGClosedPlus3000": "wp8_move_g_closed_plus",
+        "moveStepsYMinus800": "wp8_move_y_steps",
+        "moveStepsYPlus1600": "wp8_move_y_steps",
+        "moveStepsZMinus6000": "wp8_move_z_steps",
+        "moveX79000": "wp8_move_axis_absolute",
+        "moveZ": "wp8_move_z_to_location",
+        "moveZ80000": "wp8_move_axis_absolute",
+        "moveZLow": "wp8_move_z_to_location",
+        "moveZPress": "wp8_move_z_to_location",
+        "moveZPressApproach": "wp8_move_z_to_location",
+        "moveZPseudoHome": "wp8_move_z_pseudo_home",
+        "parkGantry": "wp8_park_gantry",
+        "queryTipStatus": "wp8_query_tip_status",
+        "readDoorSensors": "wp8_read_door_sensors",
+        "releasePlate": "wp8_release_plate",
+        "scriptmoveTo": "wp8_scriptmove_to",
+        "scriptmoveToWaste": "wp8_scriptmove_to_waste",
+        "sendGripperHome": "wp8_send_gripper_home",
+        "sendZandGripperHome": "wp8_send_z_and_gripper_home",
+        "setDoorMaxCurrent": "wp8_set_door_max_current",
+        "setDoorStallThreshold": "wp8_set_door_stall_threshold",
+        "setDoorStallThresholdPlus2": "wp8_set_door_stall_threshold",
+        "setGripperCurrent": "wp8_set_gripper_current",
+        "setGripperVMax": "wp8_set_gripper_vmax",
+        "setZCurrent31": "wp8_set_z_current",
+        "setZaxisCurrentmax100": "wp8_restore_z_current",
+        "startGripperHomeAndUnlock": "wp8_start_gripper_home_and_unlock",
+        "startMoveZPseudoHome": "wp8_start_move_z_pseudo_home",
+        "updateLocation": "wp8_update_location",
+        "updatePlateLocation": "wp8_update_plate_location",
+        "updateThermalDoorOpen": "wp8_update_thermal_door_open",
+        "waitMoveZOnly": "wp8_wait_move_z_only",
+        "waitStop": "wp8_wait_stop",
+        "waitZ": "wp8_wait_z",
+        "sourceTipState": "wp8_pipette_source_leaf",
+        "sourceTipTransition": "wp8_pipette_source_leaf",
+        "sourceWellPierced": "wp8_pipette_source_leaf",
+        "sourceLiftTo": "wp8_pipette_source_leaf",
+        "sourceLowerTo": "wp8_pipette_source_leaf",
+        "sourceMoveXY": "wp8_pipette_source_leaf",
+        "sourcePosition": "wp8_pipette_source_leaf",
+        "sourceHomeZ": "wp8_pipette_source_leaf",
+        "sourceZCurrent": "wp8_pipette_source_leaf",
+        "sourceZStall": "wp8_pipette_source_leaf",
+        "sourceLiftPipette": "wp8_pipette_source_leaf",
+        "sourceColor": "wp8_pipette_source_leaf",
+        "sourceWellMoveTo": "wp8_pipette_source_leaf",
+        "sourceUnlatch": "wp8_pipette_source_leaf",
+        "sourceConfirmGripper": "wp8_pipette_source_leaf",
+        "sourceHomeGripper": "wp8_pipette_source_leaf",
+        "sourceRelativeX": "wp8_pipette_source_leaf",
+        "sourceRelativeY": "wp8_pipette_source_leaf",
+    }
+
+    @classmethod
+    def wp8_child_binding_inventory(cls) -> tuple[str, ...]:
+        return tuple(sorted(cls._WP8_CHILD_BINDINGS))
 
     source_mode = "ClassControlInterface.initializeMotors:3348-3421"
     schema = "bioxp.serial206_oem_initialization.v2"
@@ -3562,12 +4448,32 @@ class Serial206OemInitializationProvider:
             sleep = time.sleep
         self.sleep = sleep
         self._lock = _MutationPriorityRLock()
+        self._deck_movement_lock = threading.Lock()
+        self._wp8_gripper_lock = threading.Lock()
+        self._wp8_gripper_lock_owner: Wp8GripperLockToken | None = None
+        self._wp8_task_lock = threading.Lock()
+        self._wp8_tasks: dict[str, dict[str, Any]] = {}
+        self._wp8_background_task_settler: Callable[..., None] | None = None
+        self._oem_source_rgb: tuple[int, ...] | None = None
+        self._wp8_stop_event = threading.Event()
+        self._wp8_stop_event.set()
+        self._wp8_source_script_owner: str | None = None
+        self._wp8_source_script_returned = False
+        self._deck_owner_id = "serial206-oem-initialization-provider"
+        self._home_recovery_owner_id = uuid.uuid4().hex
+        self._deck_semantic_state_reader: Callable[[], Mapping[str, Any]] | None = None
+        self._tip_tray_state_reader: Callable[[int], Mapping[str, Any]] | None = None
+        self._tip_tray_state_publisher: Callable[..., Mapping[str, Any]] | None = None
         self._x_interrupt_state_lock = threading.Lock()
-        self._x_interrupt_dispatch_lock = threading.Lock()
+        self._x_interrupt_dispatch_lock = threading.RLock()
+        self._x_interrupt_count = 0
+        self._x_interrupt_recovery_required = False
         self._x_interrupt_epoch = 0
         self._x_interrupt_active = False
         self._z_interrupt_state_lock = threading.Lock()
-        self._z_interrupt_dispatch_lock = threading.Lock()
+        self._z_interrupt_dispatch_lock = threading.RLock()
+        self._z_interrupt_count = 0
+        self._z_interrupt_recovery_required = False
         self._z_interrupt_epoch = 0
         self._z_interrupt_active = False
         self._memory_state: dict[str, Any] | None = None
@@ -3579,6 +4485,699 @@ class Serial206OemInitializationProvider:
         """Give one Z command priority over status readers for its full composition."""
         with self._lock.mutation():
             yield
+
+    @contextmanager
+    def movement_lease(self):
+        """Own the single source-ordered OEM deck movement stream."""
+        with self._deck_movement_lock:
+            yield
+
+    def bind_deck_semantic_state_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
+        if not callable(reader):
+            raise TypeError("deck semantic state reader must be callable")
+        self.invalidate_deck_authority_cache(reason="semantic_owner_bound")
+        self._deck_semantic_state_reader = reader
+
+    def bind_tip_tray_state_reader(self, reader: Callable[[int], Mapping[str, Any]]) -> None:
+        if not callable(reader):
+            raise TypeError("tip tray state reader must be callable")
+        self._tip_tray_state_reader = reader
+
+    def bind_tip_tray_state_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        if not callable(publisher):
+            raise TypeError("tip tray state publisher must be callable")
+        self._tip_tray_state_publisher = publisher
+        owner = getattr(publisher, "__self__", None)
+        binder = getattr(owner, "bind_tip_tray_constructor_reader", None)
+        if callable(binder):
+            # Software construction belongs to the persisted machine object;
+            # board-stamped transitions remain in the existing tray ledger.
+            binder(self._read_constructed_tip_tray)
+
+    def _read_constructed_tip_tray(self, tray_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            machine = self._load_state().get("machine_status") or {}
+            identity = machine.get("construction_id")
+            trays = machine.get("constructed_tip_trays")
+            if not identity or not isinstance(trays, list) or len(trays) != 5:
+                return None
+            tray = copy.deepcopy(trays[tray_id])
+        occupancy = tray.get("occupancy")
+        if (not isinstance(occupancy, list) or len(occupancy) != 96
+                or any(type(value) is not bool for value in occupancy)):
+            raise RuntimeError("durable OEM constructor tray occupancy is corrupt")
+        return {**tray, "construction_id": identity}
+
+    def publish_tip_tray_transition(
+        self,
+        *,
+        tray_id: int,
+        transition: str,
+        operation_id: str,
+        command_id: str,
+        provenance: Mapping[str, Any],
+        well_ids: list[int] | None = None,
+        group_index: int | None = None,
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_tip_tray_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError("tip_tray_state_publisher_not_bound")
+        # Translate source callbacks to the existing canonical transitions.
+        # Source wellIDs are row-major; tipLocation groups use alternate rows.
+        if transition == "remove":
+            from .oem_compat.position_table import tip_group_well_ids
+            selected = list(well_ids or [])
+            if any(type(well) is not int or well not in range(96) for well in selected):
+                raise ValueError("source tip removal requires canonical well IDs")
+            if group_index is not None:
+                raise ValueError("source tip removal derives its group from source wells")
+            if len(selected) == 1:
+                transition = "remove_well"
+            elif len(selected) == 4 and selected[0] in range(24):
+                group_index = (selected[0] % 12) * 2 + selected[0] // 12
+                if selected != list(tip_group_well_ids(group_index)):
+                    raise ValueError("source tip removal requires one complete OEM group")
+                transition = "remove_group"
+            else:
+                raise ValueError("source tip removal requires one well or one OEM group")
+        self.invalidate_deck_authority_cache(reason="tray_owner_publication")
+        # Source restoration does not reset the source tray-empty latch.
+        published = publisher(
+            tray_id=tray_id,
+            transition="retip" if transition == "restore" else transition,
+            operation_id=operation_id,
+            command_id=command_id,
+            provenance=provenance,
+            well_ids=well_ids,
+            group_index=group_index,
+            **self.deck_owner_authority_stamps(),
+        )
+        if not isinstance(published, Mapping):
+            raise RuntimeError("tip tray publisher returned malformed state")
+        return dict(published)
+
+    def bind_deck_semantic_state_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        if not callable(publisher):
+            raise TypeError("deck semantic state publisher must be callable")
+        self._deck_semantic_state_publisher = publisher
+        owner = getattr(publisher, "__self__", None)
+        binder = getattr(owner, "bind_deck_owner_authority_reader", None)
+        if callable(binder):
+            binder(self.deck_owner_authority_stamps, scope=self.deck_owner_authority_scope)
+        bootstrap = getattr(owner, "bootstrap_deck_semantic_state", None)
+        if callable(bootstrap):
+            self.bind_deck_semantic_bootstrap_publisher(bootstrap)
+
+    def bind_deck_semantic_bootstrap_publisher(self, publisher: Callable[..., Mapping[str, Any]]) -> None:
+        """Bind migration independently of provider identity or first catalog read."""
+        if not callable(publisher):
+            raise TypeError("deck semantic bootstrap publisher must be callable")
+        self._deck_semantic_bootstrap_publisher = publisher
+
+    def _publish_constructed_tip_trays(self) -> None:
+        """Project the persisted constructor, never reconstruct a retained tray.
+
+        Board stamps describe publication ownership, not a physical observation.
+        The source constructor itself was persisted before any hardware binding.
+        """
+        with self._lock:
+            machine = dict(self._load_state().get("machine_status") or {})
+        construction_id = machine.get("construction_id")
+        trays = machine.get("constructed_tip_trays")
+        if not construction_id or not isinstance(trays, list):
+            return  # Legacy state is not evidence of a new construction.
+        publisher = self._tip_tray_state_publisher
+        if not callable(publisher):
+            raise RuntimeError("tip_tray_state_publisher_not_bound")
+        stamps = self.deck_owner_authority_stamps()
+        for tray in trays:
+            # Bootstrap precedes the first canonical semantic revision. There
+            # is no accepted cached movement snapshot to invalidate here. Keep
+            # the active sampler's token so concurrent external invalidations
+            # cannot be accidentally acknowledged as our own publication.
+            publisher(
+                tray_id=tray["tray_id"], transition="construct",
+                operation_id=f"{construction_id}:tray:{tray['tray_id']}",
+                command_id=construction_id,
+                provenance={"source_operation": "ClassMachineStatus.constructor",
+                            "physical_observation": False, "constructor": tray},
+                **stamps,
+            )
+
+    def refresh_deck_semantic_bootstrap(self, *, expected_generation: int, latch_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Retry only an untouched canonical row, from complete predecessor facts.
+
+        This is host-state migration, never a position/reference/tray observation.
+        Failed prerequisites remain visible and retryable on the SAME provider.
+        Existing revisions (including recovery/partial rows) are never replaced.
+        """
+        try:
+            reader = getattr(self, "_deck_semantic_state_reader", None)
+            publisher = getattr(self, "_deck_semantic_bootstrap_publisher", None)
+            if not callable(reader) or not callable(publisher):
+                raise RuntimeError("deck_semantic_bootstrap_not_bound")
+            current = reader()
+            if not isinstance(current, Mapping):
+                raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+            if current.get("semantic_state_revision") != 0:
+                result = {"status": "retained", "semantic_state_revision": current.get("semantic_state_revision")}
+                self._deck_semantic_bootstrap_diagnostic = dict(result)
+                return result
+            if current.get("ambiguity_state") != "none":
+                raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+            self._publish_constructed_tip_trays()
+            snapshot = self.deck_semantic_bootstrap_snapshot(expected_generation=expected_generation, latch_observation=latch_observation)
+            published = publisher(snapshot)
+            if not isinstance(published, Mapping):
+                raise RuntimeError("deck semantic bootstrap publisher returned malformed state")
+            result = {"status": "published", "semantic_state_revision": published["semantic_state_revision"]}
+        except Exception as exc:
+            # Persistence failure must remain distinct from the OEM source
+            # startup return; retain the error rather than turning it into success.
+            result = {"status": "blocked", "reason": str(exc), "error_type": type(exc).__name__}
+        self._deck_semantic_bootstrap_diagnostic = dict(result)
+        return result
+
+    def deck_semantic_bootstrap_diagnostic(self) -> dict[str, Any]:
+        """Cached producer result; no hardware or SQLite access for diagnostics."""
+        return dict(getattr(self, "_deck_semantic_bootstrap_diagnostic", {"status": "not_attempted"}))
+
+    @contextmanager
+    def deck_owner_authority_scope(self):
+        # SQL authority callbacks must reenter provider before runtime writer.
+        # Unlike projection_scope, this does not memoize authority reads.
+        with self._lock:
+            yield
+
+    def deck_owner_authority_stamps(self) -> dict[str, int]:
+        ownership_generation = int(self.generation_provider())
+        with self._lock:
+            state = self._load_state()
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board = projection.get("board") if isinstance(projection, Mapping) else None
+        board_epoch_4 = board.get("active_board_epoch") if isinstance(board, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_board_epochs_not_authoritative")
+        return {
+            "ownership_generation": ownership_generation,
+            "board_epoch_4": board_epoch_4,
+            "board_epoch_5": board_epoch_5,
+        }
+
+    def _publish_deck_owner_state(
+        self, *, source_operation: str, source_command_id: str, updates: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError("deck_semantic_state_publisher_not_bound")
+        self.invalidate_deck_authority_cache(reason="semantic_owner_publication")
+        authority = self.deck_owner_authority_stamps()
+        result = publisher(
+            source_operation=source_operation,
+            source_command_id=source_command_id,
+            updates=dict(updates),
+            **authority,
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("deck semantic state publisher returned malformed state")
+        return {str(key): value for key, value in result.items()}
+
+    def publish_pipette_owner_state(
+        self, *, tip_loaded: bool, tip_dirty: bool | None, tip_location: int | None, source_command_id: str
+    ) -> dict[str, Any]:
+        return self._publish_deck_owner_state(
+            source_operation="pipette_owner", source_command_id=source_command_id,
+            updates={"tip_loaded": tip_loaded, "tip_dirty": tip_dirty, "tip_location": tip_location},
+        )
+
+    def query_and_publish_pipette_state(self, *, source_command_id: str) -> dict[str, Any]:
+        query = getattr(self.primitives, "query_all_pipette_tip_states", None)
+        if not callable(query):
+            raise RuntimeError("pipette owner query is unavailable")
+        observed = query(
+            lifecycle_stage_id=f"serial206.state_owner.{source_command_id}",
+        )
+        if not isinstance(observed, Mapping) or observed.get("ok") is not True:
+            raise RuntimeError("pipette owner query failed")
+        return {"ok": True, "observation": dict(observed),
+                "semantic_state": self._publish_observed_tip_presence(
+                    observed.get("tip_exists"), source_command_id=source_command_id)}
+
+    def publish_pipette_query_observation(
+        self, observed: Mapping[str, Any], *, expected_authority: Mapping[str, int],
+        query_started_at: float, receipt_unavailable: bool = False,
+    ) -> dict[str, Any]:
+        """Consume a newly audited query under the query owner's serialization."""
+        from .pipette.transport import FourPipetteTransport
+
+        with self.deck_owner_authority_scope():
+            if dict(expected_authority) != self.deck_owner_authority_stamps():
+                raise RuntimeError("pipette_query_owner_changed")
+            identity = observed.get("source_identity")
+            partial = (observed.get("partial_query") is True
+                and observed.get("ok") is False
+                and observed.get("hardware_query_verified") is False
+                and observed.get("semantic_query_response_verified") is False)
+            if ((not partial and (observed.get("ok") is not True
+                or observed.get("semantic_query_response_verified") is not True
+                or observed.get("hardware_query_verified") is not True))
+                or observed.get("hardware_truth_level") != "hardware_query"
+                or observed.get("replayed")
+                or any(not isinstance(observed.get(key), str) or not observed[key].strip()
+                       for key in (("command_id",) if receipt_unavailable else ("receipt_id", "command_id")))
+                or not isinstance(identity, Mapping)
+                or identity.get("authority_verified") is not True
+                or not isinstance(identity.get("release_identity"), Mapping)
+                or identity["release_identity"].get("verified") is not True):
+                raise RuntimeError("pipette_query_not_authoritative")
+            rows = observed.get("channels")
+            if not isinstance(rows, list) or (not partial and len(rows) != 4):
+                raise RuntimeError("pipette_query_channels_malformed")
+            if partial and (not 0 < len(rows) <= 4
+                    or not any(row.get("tip_loaded") is True for row in rows if isinstance(row, Mapping))):
+                raise RuntimeError("pipette_partial_query_has_no_verified_presence")
+            transactions: set[str] = set()
+            reader_generations: set[int] = set()
+            verified_rows = []
+            for channel, row in enumerate(rows):
+                result = row.get("result") if isinstance(row, Mapping) else None
+                if not isinstance(result, Mapping) or type(row.get("channel")) is not int or row["channel"] != channel:
+                    raise RuntimeError("pipette_query_channels_malformed")
+                # Invalid proof is not absence. A different valid positive is
+                # independently sufficient for existence, never all-tip absence.
+                if partial and (result.get("ok") is not True or result.get("semantic_ok") is not True
+                        or type(result.get("tip_loaded")) is not bool):
+                    continue
+                if (not isinstance(result, Mapping) or type(row.get("channel")) is not int
+                    or row.get("channel") != channel
+                    or type(row.get("tip_loaded")) is not bool
+                    or result.get("tip_loaded") is not row["tip_loaded"]
+                    or result.get("query_response_correlated") is not True
+                    or result.get("semantic_ok") is not True
+                    or result.get("ok") is not True
+                    or result.get("hardware_truth_level") != "hardware_query"
+                    or type(result.get("observed_at")) not in (int, float)
+                    or not 0 <= time.time() - result["observed_at"] <= FourPipetteTransport.TIP_STATUS_FRESHNESS_S):
+                    raise RuntimeError("pipette_query_channels_not_authoritative")
+                provenance = result.get("provenance")
+                if (not isinstance(provenance, Mapping)
+                    or provenance.get("channel") != channel
+                    or type(result.get("reader_generation")) is not int
+                    or provenance.get("owner_generation") != result["reader_generation"]
+                    or not isinstance(provenance.get("transaction_id"), str)
+                    or not provenance["transaction_id"]
+                    or type(provenance.get("tx_timestamp")) not in (int, float)
+                    or type(provenance.get("receive_timestamp")) not in (int, float)
+                    or not query_started_at <= provenance["tx_timestamp"]
+                        <= provenance["receive_timestamp"] <= time.monotonic()):
+                    raise RuntimeError("pipette_query_response_identity_not_current")
+                transactions.add(provenance["transaction_id"])
+                reader_generations.add(result["reader_generation"])
+                verified_rows.append(row)
+            if len(transactions) != len(verified_rows) or len(reader_generations) != 1:
+                raise RuntimeError("pipette_query_response_identity_not_current")
+            if partial and not any(row["tip_loaded"] for row in verified_rows):
+                raise RuntimeError("pipette_partial_query_has_no_verified_presence")
+            try:
+                if receipt_unavailable:
+                    raise RuntimeError("pipette_query_receipt_unavailable")
+                return self._publish_observed_tip_presence(
+                    any(row["tip_loaded"] for row in verified_rows),
+                    source_command_id=str(observed["command_id"]),
+                )
+            except Exception:
+                # Recording failure is not OEM motor desynchronization or a Home request.
+                if any(row["tip_loaded"] for row in rows):
+                    self.invalidate_deck_authority_cache(reason="pipette_observation_persistence_failed")
+                raise
+
+    def _publish_observed_tip_presence(self, loaded: Any, *, source_command_id: str) -> dict[str, Any]:
+        reader = getattr(self, "_deck_semantic_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        semantic = reader()
+        if not isinstance(semantic, Mapping):
+            raise RuntimeError("deck semantic state is malformed")
+        if type(loaded) is not bool:
+            raise RuntimeError("pipette owner query is malformed")
+        # Presence alone says nothing about newly loaded tips' condition/location.
+        # Reuse ancillary facts only from the same current, unambiguous loaded owner.
+        known_loaded = (semantic.get("tip_loaded") is True
+            and semantic.get("ambiguity_state") == "none"
+            and all(semantic.get(key) == value
+                    for key, value in self.deck_owner_authority_stamps().items()))
+        tip_location = semantic.get("tip_location") if known_loaded else None
+        tip_dirty = semantic.get("tip_dirty") if known_loaded else None
+        if type(tip_location) is not int or tip_location not in {-1, 0, 1, 2, 3}:
+            tip_location = None
+        if type(tip_dirty) is not bool:
+            tip_dirty = None
+        return self.publish_pipette_owner_state(
+            tip_loaded=loaded, tip_dirty=tip_dirty if loaded else False,
+            tip_location=tip_location if loaded else -1,
+            source_command_id=source_command_id,
+        )
+
+    def _clean_path_from_tip_tray_authority(
+        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
+    ) -> bool:
+        reader = getattr(self, "_tip_tray_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        tray_zero = reader(0)
+        if not isinstance(tray_zero, Mapping):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        if (
+            type(tray_zero.get("tip_available")) is not bool
+            or type(tray_zero.get("operation_id")) is not str
+            or not tray_zero["operation_id"].strip()
+            or type(tray_zero.get("command_id")) is not str
+            or not tray_zero["command_id"].strip()
+        ):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        authority = {
+            "ownership_generation": ownership_generation,
+            "board_epoch_4": board_epoch_4,
+            "board_epoch_5": board_epoch_5,
+        }
+        if any(tray_zero.get(key) != value for key, value in authority.items()):
+            raise RuntimeError("tray_0_tip_availability_unavailable")
+        return not tray_zero["tip_available"]
+
+    def _derived_clean_path_from_tray_zero(self, *, expected_clean_path: bool) -> bool:
+        if type(expected_clean_path) is not bool:
+            raise TypeError("clean_path expectation must be boolean")
+        authority = self.deck_owner_authority_stamps()
+        clean_path = self._clean_path_from_tip_tray_authority(**authority)
+        if expected_clean_path is not clean_path:
+            raise ValueError("clean_path expectation does not match OEM tray-0 authority")
+        return clean_path
+
+    def publish_clean_path_state(
+        self, *, expected_clean_path: bool, source_command_id: str
+    ) -> dict[str, Any]:
+        """Publish OEM ``!tipAvailable(0)``; caller input is expectation only.
+
+        ControlLib.cleanPath:413-423 reads ClassMachineStatus.tipAvailable(0).
+        The tray observation must be a current-generation source-owner record;
+        no request Boolean can create or overwrite that authority.
+        """
+        clean_path = self._derived_clean_path_from_tray_zero(
+            expected_clean_path=expected_clean_path
+        )
+        return self._publish_deck_owner_state(
+            source_operation="clean_path_calculation", source_command_id=source_command_id,
+            updates={"clean_path": clean_path},
+        )
+
+    def publish_plate_operation_state(
+        self, *, current_tray: Any, plate_on_gantry: Any,
+        movable_plate_locations: Mapping[str, Any], source_command_id: str,
+    ) -> dict[str, Any]:
+        return self._publish_deck_owner_state(
+            source_operation="plate_operation", source_command_id=source_command_id,
+            updates={
+                "current_tray": current_tray, "plate_on_gantry": plate_on_gantry,
+                "movable_plate_locations": dict(movable_plate_locations),
+            },
+        )
+
+    def deck_semantic_bootstrap_snapshot(self, *, expected_generation: int, latch_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Project one complete predecessor SQLite state for canonical migration."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        observed_generation = int(self.generation_provider())
+        if int(expected_generation) != observed_generation:
+            raise RuntimeError("ownership_generation_changed")
+        with self._lock:
+            state = self._load_state()
+            machine = dict(state.get("machine_status") or {})
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        location = machine.get("current_location")
+        if type(location) is int:
+            location = LOCATION_ID_TO_NAME.get(location)
+        if type(location) is not str or type(machine.get("current_well")) is not int:
+            raise RuntimeError("deck_bootstrap_semantic_location_unavailable")
+        board4_projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
+        board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_bootstrap_board_epochs_unavailable")
+        tip_loaded = machine.get("tip_loaded")
+        tip_dirty = machine.get("tip_dirty")
+        clean_path = machine.get("clean_path")
+        if type(tip_loaded) is not bool or type(tip_dirty) is not bool or type(clean_path) is not bool:
+            raise RuntimeError("deck_bootstrap_branch_state_unavailable")
+        tip_location = machine.get("tip_location", -1 if tip_loaded is False else None)
+        if latch_observation is not None:
+            machine.update(latch_observation)
+        latch_status = machine.get("latch_status")
+        machine_latch_closed = machine.get("latch_closed", machine.get("machine_latch_closed"))
+        latch_observation_id = machine.get("latch_observation_id")
+        if (
+            type(tip_location) is not int
+            or type(latch_status) is not bool
+            or type(machine_latch_closed) is not bool
+            or type(latch_observation_id) is not str
+            or not latch_observation_id.strip()
+        ):
+            raise RuntimeError("deck_bootstrap_latch_or_tip_state_unavailable")
+        pseudo_z_home = machine.get("psudo_z_home_steps", machine.get("pseudo_z_home", 65000))
+        predecessor = {
+            "current_location": location, "current_well": int(machine["current_well"]),
+            "current_tray": machine.get("current_tray"), "tip_loaded": tip_loaded,
+            "tip_dirty": tip_dirty, "tip_location": tip_location, "clean_path": clean_path,
+            "plate_on_gantry": machine.get("plate_on_gantry"),
+            "movable_plate_locations": canonical_movable_object_locations(
+                machine.get("movable_plate_locations")
+            ),
+            "pseudo_z_home": pseudo_z_home, "ownership_generation": observed_generation,
+            "board_epoch_4": board_epoch_4, "board_epoch_5": board_epoch_5,
+            "latch_status": latch_status, "machine_latch_closed": machine_latch_closed,
+        }
+        predecessor_digest = hashlib.sha256(
+            json.dumps(predecessor, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        predecessor.update({
+            "latch_observation_id": latch_observation_id,
+            "source_operation": "migrate_oem_runtime_machine_status",
+            "source_command_id": f"legacy-runtime-state:{predecessor_digest}",
+        })
+        return predecessor
+
+    deck_scoped_authority_version = 1
+
+    @staticmethod
+    def _deck_dependency_scope(target: str | None) -> str:
+        if target is None:
+            return "full"
+        from .oem_deck_catalog import DeckCatalog
+        destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(target)
+        return "park.full" if destination.branch == "park" else "offset.v1"
+
+    def _deck_gripper_confirmed(self) -> bool:
+        return self._observed_gripper_confirmation(getattr(self.primitives, "tester", None))
+
+    @staticmethod
+    def _observed_gripper_confirmation(tester: Any) -> bool:
+        """O-CCI2736-2747; observations, never reference tokens or writes."""
+        query = getattr(tester, "motor_query_home_switch", None)
+        if not callable(query):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        home = query(4, motor=2)
+        if (not isinstance(home, Mapping) or home.get("reply_valid") is not True
+                or type(home.get("home")) is not bool):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        if home["home"]:
+            return True
+        position_reader = getattr(tester, "motor_get_position", None)
+        position = position_reader(4, motor=2) if callable(position_reader) else None
+        ack = position.get("ack") if isinstance(position, Mapping) else None
+        if (not isinstance(position, Mapping) or position.get("ok") is not True
+                or type(position.get("position")) is not int
+                or not isinstance(ack, Mapping) or ack.get("status") != 100
+                or type(ack.get("value")) is not int):
+            raise RuntimeError("deck_gripper_observation_not_authoritative")
+        return position["position"] < 50
+
+    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False) -> dict[str, Any]:
+        """Read only facts consumed by the offset overload; no bootstrap writes.
+
+        The retained machine object remains its source owner for facts that have
+        not yet been published to the canonical row. This projection neither
+        reconstructs that object nor treats revision>0 as completeness.
+        """
+        reader = self._deck_semantic_state_reader
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        raw = reader()
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+        semantic = dict(raw)
+        revision = semantic.get("semantic_state_revision")
+        if type(revision) is not int or revision < 0:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
+        if semantic.get("ambiguity_state") != "none" and not (
+            allow_recovery and semantic.get("ambiguity_state") in {"ambiguous", "recovery_required"}
+        ):
+            raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+        provenance = semantic.get("transition_provenance")
+        if not isinstance(provenance, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:provenance")
+        if revision and (not provenance.get("source_operation") or not provenance.get("command_id")
+                or semantic.get("producer_operation") != provenance.get("source_operation")
+                or semantic.get("producer_command_id") != provenance.get("command_id")):
+            raise RuntimeError("deck_semantic_state_not_authoritative:producer_provenance")
+        with self._lock:
+            machine = dict(self._load_state().get("machine_status") or {})
+        sources = {}
+        for field, legacy_key in (("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps")):
+            sources[field] = "canonical"
+            if semantic.get(field) is None:
+                semantic[field] = machine.get(legacy_key)
+                sources[field] = "retained_machine_status"
+        if type(semantic.get("tip_loaded")) is not bool:
+            raise RuntimeError("deck_semantic_state_not_authoritative:tip_loaded")
+        if type(semantic.get("pseudo_z_home")) is not int or semantic["pseudo_z_home"] not in {500, 65000}:
+            raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
+        required = ["tip_loaded", "pseudo_z_home"]
+        # Confirmed/no-tip moveXY never reads PlateOnGantry. Other routes do.
+        if not (gripper_confirmed and semantic["tip_loaded"] is False):
+            required.append("plate_on_gantry")
+            if semantic.get("plate_on_gantry") is None:
+                if "plate_on_gantry" not in machine:
+                    raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry")
+                semantic["plate_on_gantry"] = machine["plate_on_gantry"]
+                sources["plate_on_gantry"] = "retained_machine_status"
+            else:
+                sources["plate_on_gantry"] = "canonical"
+            try:
+                semantic["plate_on_gantry"] = canonical_plate_name(semantic["plate_on_gantry"])
+            except ValueError as exc:
+                raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry") from exc
+        semantic["required_facts"] = tuple(required)
+        semantic["consumed_state_digest"] = hashlib.sha256(json.dumps(
+            {key: {"value": semantic[key], "owner": sources.get(key, "canonical")} for key in required},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        semantic["transition_provenance_digest"] = hashlib.sha256(json.dumps(
+            dict(provenance), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return semantic
+
+    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False) -> dict[str, Any]:
+        reader = self._deck_semantic_state_reader
+        if not callable(reader):
+            raise RuntimeError("deck_semantic_state_reader_not_bound")
+        try:
+            semantic = reader()
+        except Exception as exc:
+            raise RuntimeError(f"deck_semantic_state_reader_failed:{type(exc).__name__}") from exc
+        if not isinstance(semantic, Mapping):
+            raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
+        if semantic.get("semantic_state_revision") == 0 and callable(
+            getattr(self, "_deck_semantic_bootstrap_publisher", None)
+        ):
+            refresh = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
+            if refresh["status"] == "blocked":
+                raise RuntimeError(str(refresh["reason"]))
+            semantic = reader()
+        ambiguity_state = semantic.get("ambiguity_state")
+        if ambiguity_state != "none" and not (
+            allow_recovery and ambiguity_state in {"ambiguous", "recovery_required"}
+        ):
+            raise RuntimeError("deck_semantic_state_not_authoritative:ambiguity")
+        location = semantic.get("current_location")
+        well = semantic.get("current_well")
+        revision = semantic.get("semantic_state_revision")
+        provenance = semantic.get("transition_provenance")
+        if type(location) is not str or type(well) is not int or not 0 <= well <= 95 or type(revision) is not int or revision < 1:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
+        if not isinstance(provenance, Mapping) or not str(provenance.get("source_operation") or "") or not str(provenance.get("command_id") or ""):
+            raise RuntimeError("deck_semantic_state_not_authoritative:provenance")
+        if (
+            semantic.get("producer_operation") != provenance.get("source_operation")
+            or semantic.get("producer_command_id") != provenance.get("command_id")
+        ):
+            raise RuntimeError("deck_semantic_state_not_authoritative:producer_provenance")
+        branch_types = {
+            "tip_loaded": bool,
+            "tip_dirty": bool,
+            "tip_location": int,
+            "clean_path": bool,
+            "pseudo_z_home": int,
+            "ownership_generation": int,
+            "board_epoch_4": int,
+            "board_epoch_5": int,
+            "latch_status": bool,
+            "machine_latch_closed": bool,
+            "latch_observation_id": str,
+        }
+        # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
+        # verified absence skips tip cleanup and never consults tray CleanPath.
+        # Keep absence explicit and all other full-state/owner fences intact.
+        collection = self._park_collection_state() if no_tip_park and location != "LOC_PARK" else None
+        clean_path_not_applicable = no_tip_park and (
+            location == "LOC_PARK" or collection["tip_exists"] is False)
+        if clean_path_not_applicable:
+            branch_types.pop("clean_path")
+        for key, expected_type in branch_types.items():
+            if type(semantic.get(key)) is not expected_type:
+                raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
+        if not semantic["latch_observation_id"].strip():
+            raise RuntimeError("deck_semantic_state_not_authoritative:latch_observation_id")
+        tip_location = int(semantic["tip_location"])
+        if tip_location not in {-1, 0, 1, 2, 3}:
+            raise RuntimeError("deck_semantic_state_not_authoritative:tip_location")
+        if int(semantic["pseudo_z_home"]) not in {500, 65000}:
+            raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
+        if any(int(semantic[key]) < 0 for key in ("ownership_generation", "board_epoch_4", "board_epoch_5")):
+            raise RuntimeError("deck_semantic_state_not_authoritative:generation_epochs")
+        try:
+            plate = canonical_plate_name(semantic.get("plate_on_gantry"))
+        except ValueError as exc:
+            raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry")
+        try:
+            load_bound_oem_position_table().resolve(location_id=location)
+        except Exception as exc:
+            raise RuntimeError("deck_semantic_state_not_authoritative:location") from exc
+        provenance_digest = hashlib.sha256(
+            json.dumps(dict(provenance), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "current_location": location,
+            "current_well": well,
+            "semantic_state_revision": revision,
+            "transition_provenance": dict(provenance),
+            "transition_provenance_digest": provenance_digest,
+            "tip_loaded": bool(semantic["tip_loaded"]),
+            "tip_dirty": bool(semantic["tip_dirty"]),
+            "tip_location": tip_location,
+            "collection_tip_state": collection,
+            "clean_path": None if clean_path_not_applicable else semantic["clean_path"],
+            "required_facts": tuple(branch_types),
+            "plate_on_gantry": plate,
+            "movable_plate_locations": dict(semantic.get("movable_plate_locations") or {}),
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "ownership_generation": int(semantic["ownership_generation"]),
+            "board_epoch_4": int(semantic["board_epoch_4"]),
+            "board_epoch_5": int(semantic["board_epoch_5"]),
+            "latch_status": bool(semantic["latch_status"]),
+            "machine_latch_closed": bool(semantic["machine_latch_closed"]),
+            "latch_observation_id": str(semantic["latch_observation_id"]),
+            "ambiguity_state": str(ambiguity_state),
+        }
 
     @staticmethod
     def _new_z_lifecycle() -> dict[str, Any]:
@@ -3627,18 +5226,29 @@ class Serial206OemInitializationProvider:
                 },
             },
             "machine_status": {
+                "construction_id": str(uuid.uuid4()),
+                "constructed_tip_trays": [
+                    {"tray_id": tray_id, "tip_type": "T200" if tray_id == 3 else "T50",
+                     "location": (7, 8, 9, 10, 15)[tray_id],
+                     "plate_name": "TIP_HOTEL" if tray_id == 4 else "TIP_TRAY",
+                     "occupancy": [tray_id != 4] * 96, "tip_available": True}
+                    for tray_id in range(5)
+                ],
                 "stop_scripts": None,
                 "forceabort": None,
                 "pause_scripts": None,
                 "thermal_door_open": None,
-                "tip_loaded": None,
-                "tip_dirty": None,
+                # ClassMachineStatus fields: software defaults, not observations.
+                "tip_loaded": False,
+                "tip_dirty": False,
                 "tip_location": -1,
                 "clean_path": False,
                 "plate_on_gantry": None,
+                "current_tray": None,
+                "movable_plate_locations": copy.deepcopy(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS),
                 "psudo_z_home_steps": 65000,
-                "current_location": None,
-                "current_well": None,
+                "current_location": 0,  # OEM enum default LOC_MS, not Park.
+                "current_well": 0,  # OEM wellID default.
                 "system_status": None,
                 "initialization_complete": False,
                 "calibrated_ui_positions": {"x": None, "y": None, "z": None},
@@ -3715,11 +5325,20 @@ class Serial206OemInitializationProvider:
                     "reference_state": "desynced",
                     "last_failure": "legacy_x_state_missing_board_lifecycle_generation",
                 })
-        upgraded.setdefault("machine_status", copy.deepcopy(defaults["machine_status"]))
+        # Migration is not a new OEM object construction. Missing legacy facts
+        # remain unknown and never receive a fresh tray-construction identity.
+        legacy_defaults = copy.deepcopy(defaults["machine_status"])
+        legacy_defaults.pop("construction_id", None)
+        legacy_defaults.pop("constructed_tip_trays", None)
+        for key in ("tip_loaded", "tip_dirty", "current_location", "current_well"):
+            legacy_defaults[key] = None
+        upgraded.setdefault("machine_status", copy.deepcopy(legacy_defaults))
         machine = upgraded.get("machine_status")
         if isinstance(machine, dict):
+            machine.pop("source_tip_trays", None)
+            machine.pop("tip_tray_availability", None)
             pseudo_home_missing = "psudo_z_home_steps" not in machine
-            for key, value in defaults["machine_status"].items():
+            for key, value in legacy_defaults.items():
                 machine.setdefault(key, copy.deepcopy(value))
             if pseudo_home_missing:
                 machine["psudo_z_home_steps"] = 500 if machine.get("tip_loaded") is True else 65000
@@ -3876,13 +5495,27 @@ class Serial206OemInitializationProvider:
                 raise ValueError("executed row lacks command identity")
 
         json.dumps(state, allow_nan=False)
-        return copy.deepcopy(state)
+        # Every caller supplies the private copy returned by _upgrade_state.
+        # Validation need not copy the populated ledgers again under the lock.
+        return state
+
+    @contextmanager
+    def projection_scope(self):
+        # Preserve the existing provider -> runtime lock order. Mutation-priority
+        # admission remains with this lock; the memo is only for this read pass.
+        with self._lock:
+            scope = getattr(self.state_store, "serial206_projection_scope", None)
+            manager: Any = scope() if callable(scope) else nullcontext()
+            with manager:
+                yield
 
     def _load_state(self) -> dict[str, Any]:
         if self.state_store is not None and hasattr(self.state_store, "read_oem_serial206_initialization_state"):
             stored = self.state_store.read_oem_serial206_initialization_state()
             if stored is None:
-                return self._new_state()
+                # Persist actual construction once; a later read must not
+                # reconstruct trays or generate a new construction identity.
+                return self._save_state(self._new_state())
             stored_z = stored.get("z_lifecycle") if isinstance(stored, Mapping) else None
             stored_z_mapping = dict(stored_z) if isinstance(stored_z, Mapping) else {}
             board_generation_missing = (
@@ -3995,7 +5628,15 @@ class Serial206OemInitializationProvider:
                 x_lifecycle.get("state") == "awaiting_operator_observation"
                 and completed_awaiting_x_home is not None
                 and self.reference_store is not None
+                # Loading old receipts is not fresh board authority. Without
+                # this guard, polling publishes a reference only to invalidate
+                # it immediately in x_projection(), indefinitely.
+                and x_lifecycle.get("generation") == int(self.generation_provider())
+                and type(x_lifecycle.get("board_lifecycle_generation")) is int
+                and callable(getattr(self.preparation_provider, "current_board_lifecycle_generation", None))
+                and x_lifecycle["board_lifecycle_generation"] == self.preparation_provider.current_board_lifecycle_generation()
             ):
+                reference_before = self.reference_store.snapshot(("x",))["rows"]["x"]["state_version"]
                 reference = self.reference_store.mark_referenced(
                     MarkAxisReferencedCommand(
                         axis="x",
@@ -4015,6 +5656,11 @@ class Serial206OemInitializationProvider:
                     "awaiting_observation_receipt_id": None,
                     "last_failure": None if reference_ok else _json_safe(reference),
                 })
+                recovery_home = completed_awaiting_x_home.get("recovery_home")
+                if (reference_ok and isinstance(recovery_home, dict)
+                    and recovery_home.get("owner_id") == self._home_recovery_owner_id
+                    and recovery_home.get("reference_version_before") == reference_before):
+                    recovery_home["reference_version"] = reference["state_version"]
                 payload = self._save_state(payload)
             if x_lifecycle.get("state") == "executing":
                 if self.reference_store is not None:
@@ -4038,10 +5684,14 @@ class Serial206OemInitializationProvider:
             self._memory_state = self._new_state()
         return self._validate_state(self._upgrade_state(self._memory_state))
 
-    def _save_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
-        payload = self._validate_state(self._upgrade_state(copy.deepcopy(dict(state))))
+    def _save_state(self, state: Mapping[str, Any], *, expected_current=None) -> dict[str, Any]:
+        self.invalidate_deck_authority_cache(reason="provider_state_changed")
+        payload = self._validate_state(self._upgrade_state(dict(state)))
         if self.state_store is not None and hasattr(self.state_store, "write_oem_serial206_initialization_state"):
-            self.state_store.write_oem_serial206_initialization_state(payload)
+            if expected_current is None:
+                self.state_store.write_oem_serial206_initialization_state(payload)
+            else:
+                self.state_store.write_oem_serial206_initialization_state(payload, expected_current=expected_current)
         elif self.state_store is not None:
             raise RuntimeError("unified atomic serial-206 state store is not available")
         self._memory_state = copy.deepcopy(payload)
@@ -4174,7 +5824,7 @@ class Serial206OemInitializationProvider:
             return None
         return receipt
 
-    def x_projection(self) -> dict[str, Any]:
+    def x_projection(self, *, observe_controller: bool = False) -> dict[str, Any]:
         with self._lock:
             try:
                 state = self._load_state()
@@ -4366,14 +6016,132 @@ class Serial206OemInitializationProvider:
                     },
                 })
                 reference = self.reference_store.snapshot(("x",)) if self.reference_store is not None else {"ok": False, "authority_untrusted": True}
-                live_status_fn = getattr(self.primitives, "x_terminal_status", None)
-                try:
-                    live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
-                except Exception as exc:
-                    live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
-                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": 0, "source_max_steps": 90263, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_contract_safe(live_status), "switch_masks": {"observed": live_status.get("switch_mask_tuple") if isinstance(live_status, Mapping) else None, "policy": "observed_only_oem_source_omits_x_writes"}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
+                # A projection is not an explicit terminal observation. The
+                # command/observe paths still perform x_terminal_status and its
+                # full controller checks. Polling uses canonical snapshot
+                # telemetry without granting fresh terminal authority.
+                live_status = {"ok": False, "available": False,
+                               "authority": "passive_projection",
+                               "failure": "explicit_terminal_readback_required"}
+                if observe_controller:
+                    live_status_fn = getattr(self.primitives, "x_terminal_status", None)
+                    try:
+                        live_status = live_status_fn() if callable(live_status_fn) else {"ok": False, "failure": "x_terminal_status_not_bound"}
+                    except Exception as exc:
+                        live_status = {"ok": False, "failure": f"x_terminal_status_failed:{type(exc).__name__}:{exc}"}
+                source_profile_fn = getattr(self.primitives, "_x_profile", None)
+                source_profile = source_profile_fn() if callable(source_profile_fn) else {}
+                source_min_steps = source_profile.get("axis_min_steps") if isinstance(source_profile, Mapping) else None
+                source_max_steps = source_profile.get("axis_max_steps") if isinstance(source_profile, Mapping) else None
+                return {"authority": type(self).__name__, "axis": "x", "board": 5, "motor": 0, "source_min_steps": int(source_min_steps) if type(source_min_steps) is int else None, "source_max_steps": int(source_max_steps) if type(source_max_steps) is int else None, "source_limit_authority": source_profile.get("axis_max_source") if isinstance(source_profile, Mapping) else None, "effective_absolute_min_steps": 60, "relative_limit_margin_steps": 20, "current_generation": current_generation, "current_board_lifecycle_generation": current_board_generation, "board_generation_fresh": type(prepared_board_generation) is int and prepared_board_generation == current_board_generation, "lifecycle": lifecycle, "live_status": _json_contract_safe(live_status), "switch_masks": {"observed": live_status.get("switch_mask_tuple") if isinstance(live_status, Mapping) else None, "policy": "observed_only_oem_source_omits_x_writes"}, "profile": {"expected": {"4": 1700, "5": 350, "6": 31, "205": 16}, "verified": isinstance(live_status, Mapping) and live_status.get("profile_verified") is True}, "reference": _json_safe(reference)}
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
+
+    def _begin_aggregate_software_abort(self, *, include_z: bool = True) -> dict[str, int]:
+        # Only volatile owner fences here. Never acquire _lock, the DB writer
+        # lock, or the other axis's dispatch lease before releasing waiters.
+        if include_z:
+            with self._z_interrupt_state_lock:
+                self._z_interrupt_epoch += 1
+                self._z_interrupt_count += 1
+                self._z_interrupt_active = True
+        axes = {}
+        begin = getattr(self.state_store, "begin_axis_interrupt", None)
+        if callable(begin):
+            for axis in ("y", "z", "gripper"):
+                axes[axis] = begin(axis)
+        return axes
+
+    def _reconcile_aggregate_software_abort(
+        self, command_id: str, *, invalidate_x: bool = False,
+    ) -> dict[str, Any]:
+        recovery_owner = object()
+        with self._x_interrupt_state_lock:
+            covered_x_epoch = self._x_interrupt_epoch
+            if invalidate_x:
+                self._x_interrupt_recovery_owner = recovery_owner
+        with self._z_interrupt_state_lock:
+            covered_z_epoch = self._z_interrupt_epoch
+            self._z_interrupt_recovery_owner = recovery_owner
+        errors = {}
+        runtime_epochs = {}
+        begin = getattr(self.state_store, "begin_axis_interrupt", None)
+        if callable(begin):
+            for axis in ("y", "z", "gripper"):
+                runtime_epochs[axis] = begin(axis)
+        reconcile = getattr(self.state_store, "require_axis_reconciliation", None)
+        if callable(reconcile):
+            for axis in ("y", "z", "gripper"):
+                try:
+                    reconciled = reconcile(
+                        axis, receipt_id=command_id, expected_interrupt_epoch=runtime_epochs.get(axis))
+                    if not isinstance(reconciled, Mapping) or reconciled.get("ok") is not True:
+                        raise RuntimeError("axis reconciliation not verified")
+                except Exception as exc:
+                    errors[axis] = f"{type(exc).__name__}: {exc}"
+        try:
+            with self._lock:
+                state = self._load_state()
+                if invalidate_x:
+                    state["x_lifecycle"].update(
+                        state="failed_latched", active_receipt=None, pending_ticket=None,
+                        reference_state="desynced",
+                        last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                    )
+                state["z_lifecycle"].update(
+                    state="failed_latched", active_receipt=None,
+                    prepared_receipt=None, board_lifecycle_generation=None,
+                    awaiting_observation_receipt_id=None, reference_state="desynced",
+                    last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                )
+                self._save_state(state)
+                if self.reference_store is not None:
+                    self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
+                                          "serial206.aggregate.software_abort")
+                    if invalidate_x:
+                        invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                            axis="x", reason="Aggregate software Abort invalidated X authority.",
+                            source="serial206.aggregate.software_abort",
+                        ))
+                        if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
+                            raise RuntimeError("durable X reference invalidation unverified")
+                    for axis in ("y", "g"):
+                        invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                            axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
+                            source="serial206.aggregate.software_abort",
+                        ))
+                        if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                            raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
+        except Exception as exc:
+            errors["z_lifecycle"] = f"{type(exc).__name__}: {exc}"
+        # Keep retry admission fenced until the complete persistence attempt
+        # (including lifecycle/reference invalidation) has a result. Every
+        # member uses the generation captured before this attempt did any work.
+        with self._z_interrupt_state_lock:
+            current_owner = (covered_z_epoch == self._z_interrupt_epoch
+                             and self._z_interrupt_recovery_owner is recovery_owner)
+        if invalidate_x:
+            with self._x_interrupt_state_lock:
+                current_owner = current_owner and (covered_x_epoch == self._x_interrupt_epoch
+                    and self._x_interrupt_recovery_owner is recovery_owner)
+        for axis, epoch in runtime_epochs.items():
+            self.state_store.end_axis_interrupt(
+                axis, reconciled=not errors if current_owner else True,
+                expected_epoch=epoch, persistence_owner=current_owner)
+        if invalidate_x:
+            with self._x_interrupt_state_lock:
+                if (covered_x_epoch == self._x_interrupt_epoch
+                        and self._x_interrupt_recovery_owner is recovery_owner):
+                    self._x_interrupt_recovery_required = bool(errors)
+                self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
+        # The same owner method can retry only persistence after a failure;
+        # it never repeats software Abort (or any controller command).
+        with self._z_interrupt_state_lock:
+            if (covered_z_epoch == self._z_interrupt_epoch
+                    and self._z_interrupt_recovery_owner is recovery_owner):
+                self._z_interrupt_recovery_required = bool(errors)
+            self._z_interrupt_active = bool(self._z_interrupt_count or self._z_interrupt_recovery_required)
+        return {"ok": not errors, "errors": errors, "controller_dispatches": 0}
 
     def execute_x_stop_interrupt(
         self,
@@ -4392,17 +6160,27 @@ class Serial206OemInitializationProvider:
         idempotency_key = values.get("idempotency_key")
         idempotency_key = idempotency_key if isinstance(idempotency_key, str) and idempotency_key else None
         safe_inputs = _json_safe(values)
-        with self._x_interrupt_dispatch_lock:
+        # Software Abort has no controller sequence to serialize. In particular,
+        # another invocation must not wait behind persistence or a reentrant
+        # provider owner. Addressed Stop retains its existing dispatch lease.
+        with nullcontext() if abort else self._x_interrupt_dispatch_lock:
             with self._x_interrupt_state_lock:
                 self._x_interrupt_epoch += 1
                 interrupt_epoch = self._x_interrupt_epoch
+                self._x_interrupt_count += 1
                 self._x_interrupt_active = True
             started_at = time.time()
+            aggregate_axes = self._begin_aggregate_software_abort() if abort else {}
+            aggregate_reconciled = False
             try:
                 snapshot_active: Mapping[str, Any] | None = None
+                snapshot_lifecycle: dict[str, Any] = {}
                 try:
                     memory_snapshot = self._memory_state if isinstance(self._memory_state, Mapping) else {}
-                    candidate = memory_snapshot.get("x_lifecycle", {}).get("active_receipt")
+                    lifecycle_candidate = memory_snapshot.get("x_lifecycle", {})
+                    if isinstance(lifecycle_candidate, Mapping):
+                        snapshot_lifecycle = copy.deepcopy(dict(lifecycle_candidate))
+                    candidate = snapshot_lifecycle.get("active_receipt")
                     if isinstance(candidate, Mapping):
                         snapshot_active = copy.deepcopy(candidate)
                 except Exception:
@@ -4419,6 +6197,12 @@ class Serial206OemInitializationProvider:
                     "ok": False,
                     "failure": f"x_{selected}_result_not_mapping",
                 }
+                if abort:
+                    reconciliation = self._reconcile_aggregate_software_abort(str(command_id))
+                    aggregate_reconciled = reconciliation["ok"] is True
+                    result["aggregate_authority_invalidation"] = reconciliation
+                    if not aggregate_reconciled:
+                        result.update(ok=False, recovery_hold=True, persistence_state="recovery_required")
                 try:
                     with self._lock:
                         state = self._load_state()
@@ -4449,17 +6233,73 @@ class Serial206OemInitializationProvider:
                             "interrupted_command_ids": sorted(interrupted_ids),
                             "result": _json_safe(result),
                         }
-                        lifecycle.update({
-                            "state": "failed_latched",
-                            "generation": generation,
-                            "active_receipt": None,
-                            "pending_ticket": None,
-                            "reference_state": "desynced",
-                            "last_failure": {
-                                "reason": f"x_safety_{selected}_dispatched",
+                        with self._x_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._x_interrupt_epoch
+                        if superseded:
+                            # A later Abort may finish while addressed Stop is in
+                            # flight. Its lifecycle, failure and receipts own the
+                            # current epoch; the old snapshot is not authority.
+                            state = self._load_state()
+                            lifecycle = state["x_lifecycle"]
+                            snapshot_lifecycle = copy.deepcopy(lifecycle)
+                            if not abort:
+                                result.update(ok=False, failure="x_interrupt_superseded_by_safety_command")
+                                receipt.update(status="failed", result=_json_safe(result))
+                        prior_state = str(snapshot_lifecycle.get("state") or "unprepared")
+                        prior_reference = str(snapshot_lifecycle.get("reference_state") or "unknown")
+                        prior_board_generation = snapshot_lifecycle.get("board_lifecycle_generation")
+                        stop_acknowledged = bool(
+                            not abort
+                            and result.get("ok") is True
+                            and result.get("controller_command_acknowledged") is True
+                        )
+                        if superseded:
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = lifecycle.get("last_failure")
+                        elif abort:
+                            next_state = "failed_latched"
+                            next_reference = "desynced"
+                            next_failure = {
+                                "reason": "x_safety_abort_dispatched",
                                 "receipt": _json_safe(receipt),
-                            },
-                        })
+                            }
+                        elif not stop_acknowledged:
+                            next_state = "failed_latched"
+                            next_reference = prior_reference
+                            next_failure = {
+                                "reason": "x_stop_controller_acknowledgement_missing",
+                                "receipt": _json_safe(receipt),
+                            }
+                        elif prior_state == "failed_latched":
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = snapshot_lifecycle.get("last_failure")
+                        elif prior_state != "executing":
+                            next_state = prior_state
+                            next_reference = prior_reference
+                            next_failure = None
+                        elif prior_reference == "referenced":
+                            next_state = "referenced_ready"
+                            next_reference = prior_reference
+                            next_failure = None
+                        elif type(prior_board_generation) is int:
+                            next_state = "prepared_unreferenced"
+                            next_reference = prior_reference
+                            next_failure = None
+                        else:
+                            next_state = "unprepared"
+                            next_reference = prior_reference
+                            next_failure = None
+                        if not superseded:
+                            lifecycle.update({
+                                "state": next_state,
+                                "generation": generation,
+                                "active_receipt": None,
+                                "pending_ticket": None,
+                                "reference_state": next_reference,
+                                "last_failure": next_failure,
+                            })
                         lifecycle["receipts"].append(receipt)
                         lifecycle["receipts"] = lifecycle["receipts"][-8:]
                         self._save_state(state)
@@ -4471,7 +6311,7 @@ class Serial206OemInitializationProvider:
                             "ok": result.get("ok") is True,
                             "axis": "x",
                             "intent": selected,
-                            "state": "failed_latched",
+                            "state": next_state,
                             "source_call_completed": result.get("source_call_completed") is True,
                             "source_return_ok": result.get("source_return_ok") is True,
                             "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
@@ -4482,7 +6322,7 @@ class Serial206OemInitializationProvider:
                         }
                 except Exception as persistence_exc:
                     return {
-                        "ok": result.get("ok") is True,
+                        "ok": False,
                         "axis": "x",
                         "intent": selected,
                         "source_call_completed": True,
@@ -4497,8 +6337,214 @@ class Serial206OemInitializationProvider:
                         "error": f"interrupt_persistence_failed:{type(persistence_exc).__name__}",
                     }
             finally:
+                if abort:
+                    if self.state_store is not None:
+                        for axis, epoch in aggregate_axes.items():
+                            self.state_store.end_axis_interrupt(
+                                axis, reconciled=aggregate_reconciled, expected_epoch=epoch)
+                    with self._z_interrupt_state_lock:
+                        self._z_interrupt_count -= 1
+                        # The helper owns publication (including retry). This
+                        # finalizer only releases its count, even after failure.
+                        self._z_interrupt_active = bool(
+                            self._z_interrupt_count or self._z_interrupt_recovery_required
+                        )
                 with self._x_interrupt_state_lock:
-                    self._x_interrupt_active = False
+                    self._x_interrupt_count -= 1
+                    self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
+
+    def prepare_global_motion_without_motion(
+        self, tester: Any, *, authority: Serial206MotionAuthority,
+    ) -> dict[str, Any]:
+        """Publish axis preparation from this verified global transaction.
+
+        ControlLib:983 calls initializeMotorsWithoutMotion, whose X setup is
+        ClassControlInterface:3187-3195. That setup supplies preparation, not
+        a home/reference. Keep the existing all-component call exactly once.
+        """
+        with self._lock:
+            generation = int(self.generation_provider())
+            with self._x_interrupt_state_lock:
+                interrupt_epoch = self._x_interrupt_epoch
+                if self._x_interrupt_active:
+                    return {"ok": False, "failure": "x_safety_interrupt_in_progress",
+                            "physical_motion_commanded": False}
+            with self._z_interrupt_state_lock:
+                z_interrupt_epoch = self._z_interrupt_epoch
+                if self._z_interrupt_active:
+                    return {"ok": False, "failure": "z_safety_interrupt_in_progress",
+                            "physical_motion_commanded": False}
+            interrupt_reader = getattr(self.state_store, "axis_interrupt_snapshot", None)
+            axis_interrupts: dict[str, Any] = {
+                axis: interrupt_reader(axis) for axis in ("y", "z", "gripper")
+            } if callable(interrupt_reader) else {}
+            if any(row.get("active") for row in axis_interrupts.values()):
+                return {"ok": False, "failure": "board4_safety_interrupt_in_progress",
+                        "physical_motion_commanded": False}
+            raw = prepare_motion_without_motion(tester, authority=authority)
+            if not isinstance(raw, Mapping) or raw.get("ok") is not True:
+                return dict(raw) if isinstance(raw, Mapping) else {
+                    "ok": False, "failure": "global_motion_preparation_result_invalid",
+                    "physical_motion_commanded": False,
+                }
+            result = dict(raw)
+            board_generation = result.get("board_lifecycle_generation")
+            current_board_generation = self.preparation_provider.current_board_lifecycle_generation()
+            # Bind publication to X commands from this transaction's initializer,
+            # not to a previous verified profile or to aggregate success alone.
+            stages = result.get("stage_ledger") or []
+            initializer = next((
+                row.get("controller_evidence") for row in stages
+                if isinstance(row, Mapping)
+                and row.get("stage_id") == "initializeMotorsWithoutMotion"
+                and row.get("status") == "passed"
+            ), None)
+            transcript = initializer.get("transcript", []) if isinstance(initializer, Mapping) else []
+            x_rows = [row for row in transcript if isinstance(row, Mapping)
+                      and row.get("board") == 5 and row.get("motor") == 0
+                      and str(row.get("label", "")).startswith("x.")]
+            x_component_present = {
+                row.get("label") for row in x_rows if row.get("ok") is True
+            }.issuperset({"x.setMaxSpeed", "x.setMaxAcc", "x.setMaxCurrent", "x.setStallGuardThreshold"})
+            # Reuse this transaction's exact GAP receipts and generation-bound
+            # cache. Calling per-axis prepare here would repeat controller setup.
+            readback_evidence = next((
+                row.get("controller_evidence") for row in stages
+                if isinstance(row, Mapping) and row.get("stage_id") == "parameter_readback"
+                and row.get("status") == "passed"
+            ), {})
+            readbacks = readback_evidence.get("readbacks", []) if isinstance(readback_evidence, Mapping) else []
+            fingerprints = getattr(tester, "_oem_no_motion_profile_fingerprints", {})
+            profile_generations = getattr(tester, "_oem_no_motion_profile_generations", {})
+            ready = getattr(tester, "_oem_no_motion_profiles_ready", set())
+            component_receipts: dict[str, Any] = {}
+            for axis, component, motor, parameters in (
+                ("y", "y", 0, {4, 5, 6, 205, 12}),
+                ("z", "z", 1, {4, 5, 6, 205}),
+                ("gripper", "g", 2, {4, 5, 6, 205, 153, 154}),
+            ):
+                rows = [row for row in readbacks if isinstance(row, Mapping)
+                        and row.get("board") == 4 and row.get("motor") == motor
+                        and str(row.get("label", "")).startswith(f"{component}.")]
+                fingerprint = fingerprints.get(component)
+                if not (
+                    component in ready and profile_generations.get(component) == board_generation
+                    and isinstance(fingerprint, Mapping)
+                    and fingerprint.get("board") == 4 and fingerprint.get("motor") == motor
+                    and {row.get("parameter") for row in rows if row.get("matched") is True}.issuperset(parameters)
+                    and all(row.get("matched") is True for row in rows)
+                ):
+                    return {**result, "ok": False,
+                            "failure": f"global_preparation_{axis}_component_receipt_missing"}
+                component_receipts[axis] = {
+                    "ok": True, "axis": axis, "board": 4, "motor": motor,
+                    "observed_generation": generation,
+                    "board_lifecycle_generation": board_generation,
+                    "board_preparation_verified": True,
+                    "initialize_without_motion_verified": True,
+                    "physical_motion": False, "homing_performed": False,
+                    "reference_state": "desynced",
+                    "profile_fingerprint": hashlib.sha256(json.dumps(
+                        dict(fingerprint), sort_keys=True, separators=(",", ":"),
+                        allow_nan=False).encode()).hexdigest(),
+                    "readbacks": _json_safe(rows),
+                }
+            with self._x_interrupt_state_lock, self._z_interrupt_state_lock:
+                failure = None
+                if self._z_interrupt_active or z_interrupt_epoch != self._z_interrupt_epoch:
+                    failure = "global_preparation_interrupted_by_z_safety_command"
+                elif self._x_interrupt_active or interrupt_epoch != self._x_interrupt_epoch:
+                    failure = "global_preparation_interrupted_by_x_safety_command"
+                elif generation != int(self.generation_provider()):
+                    failure = "ownership_generation_changed_during_global_preparation"
+                elif type(board_generation) is not int or board_generation != current_board_generation:
+                    failure = "board_generation_changed_during_global_preparation"
+                elif result.get("physical_motion") is not False or result.get("homing_performed") is not False:
+                    failure = "global_preparation_non_motion_evidence_missing"
+                elif not x_component_present:
+                    failure = "global_preparation_x_component_receipt_missing"
+                if failure is not None:
+                    return {**result, "ok": False, "failure": failure}
+                receipt = {
+                    "ok": True,
+                    "axis": "x",
+                    "source_method": "ClassControlInterface.initializeMotorsWithoutMotion",
+                    "source_anchor": "ClassControlInterface.initializeMotorsWithoutMotion:3187-3195",
+                    "source_exact": False,
+                    "initializer_source_exact": True,
+                    "literal_switch_mask_writes": [],
+                    "reference_state": "desynced",
+                    "observed_generation": generation,
+                    "board_lifecycle_generation": board_generation,
+                    "board_preparation_verified": True,
+                    "initialize_without_motion_verified": True,
+                    "board_lifecycle_reused": any(
+                        isinstance(row, Mapping)
+                        and row.get("stage_id") == "boardLifecycleGeneration"
+                        and isinstance(row.get("controller_evidence"), Mapping)
+                        and row["controller_evidence"].get("reused") is True
+                        for row in stages
+                    ),
+                    "physical_motion": False,
+                    "motor_output_state": "unknown",
+                    "motor_torque_verified": False,
+                    "receipt": _json_safe(raw),
+                }
+                try:
+                    # Reload after the board callbacks have invalidated authority;
+                    # do not overwrite their changes to the other axis lifecycles.
+                    state = self._load_state()
+                    if self.state_store is not None:
+                        board4 = self.state_store.board4_authority_projection()
+                        if (board4["board"].get("state") != "active"
+                                or type(board4["board"].get("active_board_epoch")) is not int):
+                            raise RuntimeError("global_preparation_board4_epoch_not_current")
+                        for axis, component_receipt in component_receipts.items():
+                            published = self.state_store.prepare_axis_authority(
+                                axis, ownership_generation=generation,
+                                profile_fingerprint=component_receipt["profile_fingerprint"],
+                                expected_interrupt_epoch=board4["axes"][axis]["interrupt_epoch"],
+                                expected_software_interrupt_epoch=axis_interrupts[axis]["epoch"],
+                            )
+                            if not isinstance(published, Mapping) or published.get("ok") is not True:
+                                raise RuntimeError(f"global_preparation_{axis}_authority_publication_failed")
+                            component_receipt["authority"] = _json_safe(published)
+                        if self.state_store.board4_authority_projection()["board"] != board4["board"]:
+                            raise RuntimeError("global_preparation_board4_changed_during_publication")
+                    if (generation != int(self.generation_provider())
+                            or board_generation != self.preparation_provider.current_board_lifecycle_generation()
+                            or (callable(interrupt_reader) and any(interrupt_reader(axis) != snapshot
+                                    for axis, snapshot in axis_interrupts.items()))):
+                        raise RuntimeError("global_preparation_authority_changed_during_publication")
+                    state["z_lifecycle"].update({
+                        "state": "prepared_unreferenced",
+                        "generation": generation,
+                        "board_lifecycle_generation": board_generation,
+                        "prepared_receipt": _json_safe(component_receipts["z"]),
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "awaiting_observation_receipt_id": None,
+                        "last_failure": None,
+                    })
+                    state["x_lifecycle"].update({
+                        "state": "prepared_unreferenced",
+                        "generation": generation,
+                        "board_lifecycle_generation": board_generation,
+                        "prepared_receipt": _json_safe(receipt),
+                        "reference_state": "desynced",
+                        "active_receipt": None,
+                        "pending_ticket": None,
+                        "awaiting_observation_receipt_id": None,
+                        "last_failure": None,
+                    })
+                    self._save_state(state)
+                except Exception as exc:
+                    return {**result, "ok": False,
+                            "failure": "global_preparation_publication_failed",
+                            "error": f"{type(exc).__name__}: {exc}"}
+            return {**result, "generation": generation,
+                    "x_prepare_receipt": _json_safe(receipt),
+                    "component_prepare_receipts": _json_safe(component_receipts)}
 
     def execute_x_intent(self, intent: str, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -4523,10 +6569,51 @@ class Serial206OemInitializationProvider:
             admitted_interrupt_epoch = self._x_interrupt_epoch
             if self._x_interrupt_active:
                 return {"ok": False, "axis": "x", "failure": "x_safety_interrupt_in_progress"}
+        admitted_z_interrupt_epoch: int | None = None
+        if selected == "move_to":
+            with self._z_interrupt_state_lock:
+                admitted_z_interrupt_epoch = self._z_interrupt_epoch
+                if self._z_interrupt_active:
+                    return {"ok": False, "axis": "xyz", "failure": "z_safety_interrupt_in_progress"}
+
+        def stale_x_result() -> dict[str, Any] | None:
+            # Used by early returns as well as dispatch/completion. Never carry
+            # an old whole-provider snapshot across a reentrant owner callback.
+            with self._x_interrupt_state_lock:
+                stale = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
+            if not stale:
+                return None
+            return {"ok": False, "axis": "x", "intent": selected,
+                    "state": self._load_state()["x_lifecycle"]["state"],
+                    "result": {"ok": False, "failure": "x_intent_interrupted_by_safety_command"},
+                    "failure": "x_intent_interrupted_by_safety_command"}
+
+        def move_to_interrupt_reason() -> str | None:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
+                    return "x_intent_interrupted_by_safety_command"
+            with self._z_interrupt_state_lock:
+                if (
+                    admitted_z_interrupt_epoch is not None
+                    and (
+                        self._z_interrupt_active
+                        or admitted_z_interrupt_epoch != self._z_interrupt_epoch
+                    )
+                ):
+                    return "z_intent_interrupted_by_safety_command"
+            return None
+
         with self._lock:
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
                     return {"ok": False, "axis": "x", "failure": "x_intent_superseded_by_safety_interrupt"}
+            if selected == "move_to":
+                with self._z_interrupt_state_lock:
+                    if (
+                        self._z_interrupt_active
+                        or admitted_z_interrupt_epoch != self._z_interrupt_epoch
+                    ):
+                        return {"ok": False, "axis": "xyz", "failure": "z_intent_superseded_by_safety_interrupt"}
             try:
                 state = self._load_state()
             except Exception as exc:
@@ -4561,6 +6648,9 @@ class Serial206OemInitializationProvider:
                     existing = self._durable_serial206_receipt("x", command_id)
                 if existing is None and idempotency_key is not None:
                     existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 if isinstance(existing, Mapping):
                     if (
                         existing.get("intent") != selected
@@ -4598,6 +6688,9 @@ class Serial206OemInitializationProvider:
                 else lifecycle.get("board_lifecycle_generation")
             )
             automatic_prerequisites: list[dict[str, Any]] = []
+            stale = stale_x_result()
+            if stale is not None:
+                return stale
             if selected == "observe_home":
                 expected_receipt = lifecycle.get("awaiting_observation_receipt_id")
                 observed_receipt = values.get("receipt_id")
@@ -4607,12 +6700,25 @@ class Serial206OemInitializationProvider:
                 if not confirmed:
                     desync = getattr(self.primitives, "_x_desync", None)
                     invalidation = desync("Operator rejected serial-206 X home observation.", "operator_observation") if callable(desync) else None
+                    state = self._load_state()
+                    lifecycle = state["x_lifecycle"]
+                    stale = stale_x_result()
+                    if stale is not None:
+                        return stale
                     lifecycle.update({"state": "failed_latched", "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": "operator_rejected_x_home"})
                     self._save_state(state)
                     return {"ok": False, "axis": "x", "state": "failed_latched", "failure": "operator_rejected_x_home", "reference_invalidation": _json_safe(invalidation)}
                 if self.reference_store is None:
                     return {"ok": False, "axis": "x", "state": prior_state, "failure": "x_reference_store_not_bound"}
                 reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(axis="x", position_steps=int(values.get("position_steps", 0)), source="serial206.x.operator_observation", motion_kind="home"))
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                stale = stale_x_result()
+                if stale is not None:
+                    self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis="x", reason="X observation crossed a safety interrupt.",
+                        source="serial206.x.operator_observation", motion_kind="home"))
+                    return stale
                 accepted = bool(isinstance(reference, Mapping) and reference.get("ok") is True and reference.get("durable_clean") is True)
                 lifecycle.update({"state": "referenced_ready" if accepted else "failed_latched", "reference_state": "referenced" if accepted else "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if accepted else _json_safe(reference)})
                 observation = {"ok": accepted, "axis": "x", "intent": "observe_home", "observed_receipt_id": observed_receipt, "confirmed": True, "reference_state": _json_safe(reference), "physical_motion_commanded": False, "physical_effect_verified": True, "failure": None if accepted else "x_reference_publication_failed"}
@@ -4635,6 +6741,13 @@ class Serial206OemInitializationProvider:
                     else None
                 )
                 ok = bool(ok and type(prepared_board_generation) is int)
+                # Preparation/board callbacks may update other axis owners even
+                # without an X interrupt. Publish into their latest full state.
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 lifecycle.update({"state": "prepared_unreferenced" if ok else "failed_latched", "generation": generation, "board_lifecycle_generation": prepared_board_generation if ok else None, "prepared_receipt": _json_safe(result), "reference_state": "desynced" if ok else "unknown", "last_failure": None if ok else _json_safe(result)})
                 self._save_state(state)
                 return {"ok": ok, "axis": "x", "intent": selected, "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "board_lifecycle_generation": prepared_board_generation}
@@ -4644,6 +6757,9 @@ class Serial206OemInitializationProvider:
                 "enable_xy_current", "enable_xyz_current",
             }
             motion_intents = {"move_absolute", "move_steps", "wait_for_motor", "move_to"}
+            home_started_at = time.time()
+            home_reference_before = (self.reference_store.snapshot(("x",))["rows"]["x"]["state_version"]
+                                     if selected == "manual_panel_home" and self.reference_store is not None else None)
             home_intents = {"startup_home", "home_axis", "manual_panel_home", "move_to_origin_home", "caught_plate_recovery_home", "set_home"}
             move_to_all_zero = bool(
                 selected == "move_to"
@@ -4669,9 +6785,12 @@ class Serial206OemInitializationProvider:
                     }
                     z_lifecycle.update({"state": "executing", "active_receipt": z_active_receipt})
                 self._save_state(state)
+                stale = stale_x_result()
+                if stale is not None:
+                    return stale
                 try:
                     if selected == "move_absolute":
-                        result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "provider.x.move_absolute"))
+                        result = self.primitives.x_move_absolute(position_steps=int(values["position_steps"]), acceleration=None if values.get("acceleration") is None else int(values["acceleration"]), wait_for_stop=bool(values.get("wait_for_stop", True)), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)), source_mode=str(values.get("source_mode") or "ClassControlInterface.moveX"))
                     elif selected == "move_steps":
                         result = self.primitives.x_move_steps(steps=int(values["steps"]), wait_timeout_s=float(values.get("wait_timeout_s", 20.0)))
                     elif selected == "move_to":
@@ -4684,6 +6803,7 @@ class Serial206OemInitializationProvider:
                             plate_on_gantry=(None if values.get("plate_on_gantry") is None else int(values["plate_on_gantry"])),
                             location19_y=int(values.get("location19_y", 0)),
                             wait_timeout_s=float(values.get("wait_timeout_s", 30.0)),
+                            interrupt_reason=move_to_interrupt_reason,
                         )
                     elif selected == "set_max_speed":
                         result = self.primitives.x_set_max_speed(value=int(values.get("value", 0)))
@@ -4718,19 +6838,43 @@ class Serial206OemInitializationProvider:
             result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "x_result_not_mapping"}
             if automatic_prerequisites:
                 result["automatic_prerequisites"] = automatic_prerequisites
-            if selected in home_intents and not (
+            home_evidence = result.get("home")
+            cached_home_noop = bool(
+                selected in {"manual_panel_home", "move_to_origin_home", "caught_plate_recovery_home"}
+                and result.get("ok") is True
+                and result.get("physical_motion_commanded") is False
+                and isinstance(home_evidence, Mapping)
+                and home_evidence.get("ok") is True
+                and home_evidence.get("source_noop") is True
+                and home_evidence.get("source_return_ok") is True
+                and home_evidence.get("completion_class") == "source_cached_noop"
+            )
+            # goHome returns 0 without searching when cached MotorHome and
+            # CurrentPosition==0. That source success is not new home evidence.
+            if selected in home_intents and not cached_home_noop and not (
                 result.get("home_predicate_confirmed") is True
                 and result.get("controller_terminal_state_verified") is True
             ) and result.get("reference_publication_required") is not True:
                 result.update({"ok": False, "failure": "x_home_evidence_not_verified"})
-            with self._x_interrupt_state_lock:
-                if admitted_interrupt_epoch != self._x_interrupt_epoch:
+            if selected == "move_to":
+                interruption = move_to_interrupt_reason()
+                if interruption is not None:
                     result = {
                         "ok": False,
-                        "failure": "x_intent_interrupted_by_safety_command",
+                        "failure": interruption,
                         "command_issued": result.get("command_issued", True),
-                        "interrupt_epoch": self._x_interrupt_epoch,
+                        "x_interrupt_epoch": self._x_interrupt_epoch,
+                        "z_interrupt_epoch": self._z_interrupt_epoch,
                     }
+            else:
+                with self._x_interrupt_state_lock:
+                    if admitted_interrupt_epoch != self._x_interrupt_epoch:
+                        result = {
+                            "ok": False,
+                            "failure": "x_intent_interrupted_by_safety_command",
+                            "command_issued": result.get("command_issued", True),
+                            "interrupt_epoch": self._x_interrupt_epoch,
+                        }
             current_generation = int(self.generation_provider())
             if current_generation != generation:
                 result = {
@@ -4775,7 +6919,12 @@ class Serial206OemInitializationProvider:
                         )
                     )
                 )
-                if home_requires_observation:
+                if cached_home_noop:
+                    # Do not promote cached driver state into reference authority
+                    # or discard an earlier observation/failure obligation.
+                    next_state = prior_state
+                    next_reference = prior_reference_state
+                elif home_requires_observation:
                     next_state = "awaiting_operator_observation"
                     next_reference = "desynced"
                 elif selected in passive_intents or selected in profile_intents:
@@ -4784,7 +6933,7 @@ class Serial206OemInitializationProvider:
                 else:
                     next_state = "referenced_ready"
                     next_reference = "referenced"
-                lifecycle.update({"state": next_state, "active_receipt": None, "pending_ticket": None, "reference_state": next_reference, "awaiting_observation_receipt_id": receipt_id if home_requires_observation else None, "last_failure": None})
+                lifecycle.update({"state": next_state, "active_receipt": None, "pending_ticket": None, "reference_state": next_reference, "awaiting_observation_receipt_id": lifecycle.get("awaiting_observation_receipt_id") if cached_home_noop else receipt_id if home_requires_observation else None, "last_failure": lifecycle.get("last_failure") if cached_home_noop else None})
                 receipt = {"command_id": command_id, "receipt_id": receipt_id, "intent": selected, "motion_kind": "home_xy" if move_to_all_zero else "home" if selected in home_intents else "motion", "idempotency_key": idempotency_key, "idempotency_replay_enabled": not interrupt, "generation": generation, "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"), "inputs": safe_inputs, "status": "completed", "result": _json_safe(result)}
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
@@ -4838,6 +6987,56 @@ class Serial206OemInitializationProvider:
                     z_receipts = list(z_lifecycle.get("receipts") or [])
                     z_receipts.append(z_receipt)
                     z_lifecycle["receipts"] = z_receipts[-8:]
+            # This owner saved its executing snapshot before dispatch. Reentrant
+            # owners publish through _save_state too. Read their latest snapshot
+            # without invoking _load_state's restart recovery on our live command.
+            latest = copy.deepcopy(self._memory_state) if self._memory_state is not None else state
+            with self._x_interrupt_state_lock:
+                superseded = admitted_interrupt_epoch != self._x_interrupt_epoch
+            if superseded:
+                # Append only this stale attempt's failed receipts to the newer
+                # owner state. Do not replace its failure, preparation or history.
+                state = latest
+                lifecycle = state["x_lifecycle"]
+                z_lifecycle = state["z_lifecycle"]
+                result.update(ok=False, failure="x_intent_interrupted_by_safety_command", pending_motion=False)
+                if receipt is None:
+                    # A pending result can be invalidated by the completion
+                    # generation callback, after the earlier primitive check.
+                    receipt = {"command_id": command_id, "receipt_id": command_id,
+                               "intent": selected, "idempotency_key": idempotency_key,
+                               "idempotency_replay_enabled": True, "generation": generation,
+                               "inputs": safe_inputs, "status": "failed", "result": _json_safe(result)}
+                if selected == "enable_xyz_current" and z_receipt is None:
+                    z_receipt = {**copy.deepcopy(receipt), "stream": "z",
+                                 "x_generation": generation, "z_generation": z_lifecycle.get("generation"),
+                                 "z_board_lifecycle_generation": z_lifecycle.get("board_lifecycle_generation"),
+                                 "z_state": z_lifecycle.get("state"),
+                                 "z_reference_state": z_lifecycle.get("reference_state")}
+                for row, owner in ((receipt, lifecycle), (z_receipt, z_lifecycle)):
+                    if row is not None:
+                        row.update(status="failed", result=_json_safe(result))
+                        owner["receipts"].append(row)
+                        owner["receipts"] = owner["receipts"][-8:]
+            else:
+                latest["x_lifecycle"] = lifecycle
+                if selected == "enable_xyz_current":
+                    latest["z_lifecycle"] = z_lifecycle
+                state = latest
+            if (receipt is not None and selected == "manual_panel_home"
+                and receipt.get("status") == "completed" and not cached_home_noop
+                and result.get("controller_home_proof_verified") is True
+                and result.get("controller_command_acknowledged") is True
+                and result.get("controller_terminal_state_verified") is True
+                and type(home_reference_before) is int and self.state_store is not None):
+                receipt["recovery_home"] = {
+                    "ownership_generation": generation,
+                    "board_epoch_4": self.state_store.board4_authority_projection()["board"]["active_board_epoch"],
+                    "board_epoch_5": lifecycle["board_lifecycle_generation"],
+                    "owner_id": self._home_recovery_owner_id,
+                    "command_id": command_id, "started_at": home_started_at, "finished_at": time.time(),
+                    "reference_version_before": home_reference_before, "interrupt_epoch": admitted_interrupt_epoch,
+                }
             self._save_state(state)
             if (
                 receipt is not None
@@ -4887,6 +7086,10 @@ class Serial206OemInitializationProvider:
         )
         if any(type(value) is not bool for value in flags):
             raise ValueError("X observation fields must be strict booleans")
+        with self._x_interrupt_state_lock:
+            admitted_interrupt_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "axis": "x", "failure": "x_safety_interrupt_in_progress"}
         with self._lock:
             state = self._load_state()
             lifecycle = state["x_lifecycle"]
@@ -4900,7 +7103,11 @@ class Serial206OemInitializationProvider:
             )
             if receipt is None:
                 receipt = self._durable_serial206_receipt("x", command_id)
+            with self._x_interrupt_state_lock:
+                interrupted = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
             current = bool(
+                not interrupted
+                and
                 isinstance(receipt, Mapping)
                 and receipt.get("status") == "completed"
                 and lifecycle.get("state") == "awaiting_operator_observation"
@@ -4933,8 +7140,8 @@ class Serial206OemInitializationProvider:
                 "reference_eligible": eligible,
                 "idempotency_replay_enabled": True,
             }
+            reference = None
             if eligible:
-                reference = None
                 if self.reference_store is not None:
                     observed_home_xy = isinstance(receipt, Mapping) and receipt.get("motion_kind") == "home_xy"
                     if observed_home_xy:
@@ -4970,6 +7177,26 @@ class Serial206OemInitializationProvider:
                     "awaiting_observation_receipt_id": None,
                     "last_failure": "x_observation_not_reference_eligible",
                 })
+            latest = self._load_state()
+            with self._x_interrupt_state_lock:
+                superseded = self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch
+            if superseded:
+                eligible = False
+                if reference is not None and self.reference_store is not None:
+                    axes = ("x", "y") if isinstance(receipt, Mapping) and receipt.get("motion_kind") == "home_xy" else ("x",)
+                    self.reference_store.mark_desynced_many([
+                        MarkAxisDesyncedCommand(axis=axis,
+                            reason="X observation publication crossed a safety interrupt.",
+                            source="serial206.x.operator_observation", motion_kind="home")
+                        for axis in axes
+                    ])
+                state = self._load_state()
+                lifecycle = state["x_lifecycle"]
+                observation["failure"] = "x_intent_interrupted_by_safety_command"
+            else:
+                latest["x_lifecycle"] = lifecycle
+                state = latest
+            observation.update(status="completed" if eligible else "failed", reference_eligible=eligible)
             lifecycle["receipts"].append(observation)
             lifecycle["receipts"] = lifecycle["receipts"][-8:]
             self._save_state(state)
@@ -4982,6 +7209,378 @@ class Serial206OemInitializationProvider:
                 "observation_receipt": _json_safe(observation),
                 "state": lifecycle.get("state"),
             }
+
+    def _xy_authority_snapshot(
+        self,
+        lifecycle: Mapping[str, Any],
+        *,
+        validate: bool = True,
+    ) -> dict[str, Any]:
+        generation = int(self.generation_provider())
+        board_generation_fn = getattr(
+            self.preparation_provider, "current_board_lifecycle_generation", None
+        )
+        current_x_board_generation = (
+            board_generation_fn()
+            if callable(board_generation_fn)
+            else lifecycle.get("board_lifecycle_generation")
+        )
+        y_authority_fn = getattr(self.y_provider, "_authority", None)
+        y_authority = y_authority_fn() if callable(y_authority_fn) else None
+        y_board = y_authority.get("board") if isinstance(y_authority, Mapping) else None
+        y_axes = y_authority.get("axes") if isinstance(y_authority, Mapping) else None
+        y_axis = y_axes.get("y") if isinstance(y_axes, Mapping) else None
+        with self._x_interrupt_state_lock:
+            x_interrupt_epoch = int(self._x_interrupt_epoch)
+            x_interrupt_active = bool(self._x_interrupt_active)
+        snapshot = {
+            "generation": generation,
+            "x": {
+                "lifecycle_state": lifecycle.get("state"),
+                "generation": lifecycle.get("generation"),
+                "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"),
+                "current_board_lifecycle_generation": current_x_board_generation,
+                "pending_ticket": _json_safe(lifecycle.get("pending_ticket")),
+                "active_receipt": _json_safe(lifecycle.get("active_receipt")),
+                "interrupt_epoch": x_interrupt_epoch,
+                "interrupt_active": x_interrupt_active,
+            },
+            "y": {
+                "lifecycle_state": y_axis.get("lifecycle_state") if isinstance(y_axis, Mapping) else None,
+                "ownership_generation": y_axis.get("ownership_generation") if isinstance(y_axis, Mapping) else None,
+                "prepared_board_epoch": y_axis.get("prepared_board_epoch") if isinstance(y_axis, Mapping) else None,
+                "active_board_epoch": y_board.get("active_board_epoch") if isinstance(y_board, Mapping) else None,
+                "board_state": y_board.get("state") if isinstance(y_board, Mapping) else None,
+                "pending_ticket": _json_safe(y_axis.get("pending_ticket")) if isinstance(y_axis, Mapping) else None,
+                "interrupt_epoch": y_axis.get("interrupt_epoch") if isinstance(y_axis, Mapping) else None,
+                "software_interrupt_epoch": y_axis.get("software_interrupt_epoch") if isinstance(y_axis, Mapping) else None,
+                "software_interrupt_active": y_axis.get("software_interrupt_active") if isinstance(y_axis, Mapping) else None,
+            },
+        }
+        if not validate:
+            return snapshot
+        # OEM XY calls use controller coordinates, not a human-observation ledger.
+        # Retain preparation/ownership, outstanding-command and interrupt fences.
+        allowed_x_states = {"prepared_unreferenced", "referenced_ready", "awaiting_operator_observation"}
+        allowed_y_states = {"prepared_unreferenced", "referenced_ready"}
+        valid = bool(
+            snapshot["x"]["lifecycle_state"] in allowed_x_states
+            and snapshot["x"]["generation"] == generation
+            and snapshot["x"]["board_lifecycle_generation"] == current_x_board_generation
+            and snapshot["x"]["pending_ticket"] is None
+            and snapshot["x"]["active_receipt"] is None
+            and snapshot["x"]["interrupt_active"] is False
+            and snapshot["y"]["lifecycle_state"] in allowed_y_states
+            and snapshot["y"]["ownership_generation"] == generation
+            and snapshot["y"]["board_state"] == "active"
+            and snapshot["y"]["prepared_board_epoch"] == snapshot["y"]["active_board_epoch"]
+            and snapshot["y"]["pending_ticket"] is None
+            and type(snapshot["y"]["interrupt_epoch"]) is int
+        )
+        return {**snapshot, "ok": valid}
+
+    @staticmethod
+    def _xy_authority_fence_matches(
+        admitted: Mapping[str, Any], current: Mapping[str, Any]
+    ) -> bool:
+        admitted_x = admitted.get("x") if isinstance(admitted.get("x"), Mapping) else {}
+        current_x = current.get("x") if isinstance(current.get("x"), Mapping) else {}
+        admitted_y = admitted.get("y") if isinstance(admitted.get("y"), Mapping) else {}
+        current_y = current.get("y") if isinstance(current.get("y"), Mapping) else {}
+        return bool(
+            admitted.get("generation") == current.get("generation")
+            and admitted_x.get("generation") == current_x.get("generation")
+            and admitted_x.get("board_lifecycle_generation") == current_x.get("board_lifecycle_generation")
+            and admitted_x.get("current_board_lifecycle_generation") == current_x.get("current_board_lifecycle_generation")
+            and admitted_x.get("interrupt_epoch") == current_x.get("interrupt_epoch")
+            and current_x.get("interrupt_active") is False
+            and admitted_y == current_y
+        )
+
+    def _persist_xy_child_receipts(self, receipt: Mapping[str, Any]) -> None:
+        if self.state_store is None or not hasattr(self.state_store, "append_serial206_receipt"):
+            return
+        append_atomic = getattr(self.state_store, "append_serial206_receipts_atomic", None)
+        if not callable(append_atomic):
+            raise RuntimeError("atomic_xy_child_receipt_store_required")
+        command_id = receipt.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            raise RuntimeError("xy_child_receipt_command_id_required")
+        missing: list[tuple[str, dict[str, Any]]] = []
+        if self._durable_serial206_receipt("x", command_id) is None:
+            missing.append(("x", copy.deepcopy(dict(receipt))))
+        if self._durable_serial206_receipt("y", command_id) is None:
+            child = {
+                **copy.deepcopy(dict(receipt)),
+                "stream": "y",
+                "child_axis": "y",
+            }
+            home = receipt.get("child_receipts", {}).get("y", {}).get("recovery_home")
+            if isinstance(home, Mapping):
+                child["recovery_home"] = copy.deepcopy(home)
+            missing.append(("y", child))
+        if missing:
+            append_atomic(tuple(missing))
+
+
+    def _handoff_homexy_recovery(self, receipt, result, context):
+        """Publish controller-proven XY origins after, never inside, native Home.
+
+        Completion stays a source fact. Separate query-only observations and
+        the existing reference/runtime owners establish coordinate authority.
+        A recording retry reuses retained source evidence; it never runs Home.
+        """
+        if not context or receipt.get("status") != "completed" or receipt.get("source_noop"):
+            return None
+        proof_fields = ("controller_command_acknowledged", "controller_terminal_state_verified",
+                        "controller_home_proof_verified")
+        children = result.get("home")
+        if (not isinstance(children, Mapping) or any(result.get(k) is not True for k in proof_fields)
+            or any(not isinstance(children.get(a), Mapping) or children[a].get("source_noop")
+                   or any(children[a].get(k) is not True for k in proof_fields) for a in ("x", "y"))):
+            return None
+        admitted = receipt["composite_authority"]["admitted"]
+        command_id = receipt["command_id"]
+        observed_at = time.monotonic()
+        def verify():
+            with self._x_interrupt_state_lock:
+                x_current = (self._x_interrupt_epoch, self._x_interrupt_active)
+            if (int(self.generation_provider()) != admitted["generation"]
+                or self.preparation_provider.current_board_lifecycle_generation() != admitted["x"]["current_board_lifecycle_generation"]
+                or x_current != (admitted["x"]["interrupt_epoch"], False)
+                or self.state_store.axis_interrupt_snapshot("y") != context["y_interrupt"]
+                or context["y_interrupt"]["active"]
+                or not all(context["owners"].values())
+                or self._home_recovery_owner_id != context["owners"]["x"]
+                or getattr(self.y_provider, "_home_recovery_owner_id", None) != context["owners"]["y"]
+                or time.monotonic() - observed_at > 5):
+                raise RuntimeError("homexy_reference_authority_changed")
+        try:
+            verify()
+            observations = {}
+            for axis, board in (("x", 5), ("y", 4)):
+                observations[axis] = {
+                    "position": self.primitives.tester.motor_get_position(board, motor=0),
+                    "speed": self.primitives.tester.motor_get_speed(board, motor=0)}
+                proof = self.y_provider._home_proof(children[axis], {},
+                    reference_observation=observations[axis])
+                if not all(proof[k] for k in ("home_predicate_active", "stop_complete", "speed_zero", "set_home_valid", "zero_readback")):
+                    receipt["reference_publication"] = {"ok": False, "failure": "homexy_post_home_proof_unavailable:" + axis}
+                    return None
+            verify()
+            def prepare(current):
+                verify()
+                lifecycle = current["x_lifecycle"]
+                active = lifecycle.get("active_receipt") or {}
+                latest = (lifecycle.get("receipts") or [{}])[-1]
+                if lifecycle.get("pending_ticket") is not None or not (
+                    (lifecycle.get("state") == "executing" and active.get("command_id") == command_id and active.get("intent") == "home_xy")
+                    or (lifecycle.get("state") == "prepared_unreferenced" and not active
+                        and latest.get("command_id") == command_id and latest.get("reference_publication_pending"))):
+                    raise RuntimeError("homexy_reference_command_replaced")
+                if not self._xy_authority_fence_matches(admitted, self._xy_authority_snapshot(lifecycle, validate=False)):
+                    raise RuntimeError("homexy_reference_authority_changed_at_writer")
+            def finish(current, references):
+                verify()
+                state = copy.deepcopy(current)
+                published = copy.deepcopy(receipt)
+                published.pop("reference_publication_pending", None)
+                published["reference_publication"] = {"ok": True, "reference_observation": observations}
+                finished_at = time.time()
+                for axis in ("x", "y"):
+                    published["child_receipts"][axis]["recovery_home"] = {
+                        "ownership_generation": admitted["generation"],
+                        "board_epoch_4": admitted["y"]["active_board_epoch"],
+                        "board_epoch_5": admitted["x"]["current_board_lifecycle_generation"],
+                        "owner_id": context["owners"][axis], "command_id": command_id,
+                        "started_at": context["started_at"], "finished_at": finished_at,
+                        "reference_version": references[axis]["state_version"],
+                        "interrupt_epoch": (admitted["x"]["interrupt_epoch"] if axis == "x" else context["y_interrupt"]["epoch"])}
+                published["recovery_home"] = copy.deepcopy(published["child_receipts"]["x"]["recovery_home"])
+                lifecycle = state["x_lifecycle"]
+                lifecycle.update(state="referenced_ready", reference_state="referenced", active_receipt=None,
+                    pending_ticket=None, awaiting_observation_receipt_id=None, last_failure=None)
+                published["composite_authority"]["terminal"] = self._xy_authority_snapshot(lifecycle, validate=False)
+                lifecycle["receipts"] = [r for r in lifecycle.get("receipts", []) if r.get("command_id") != command_id]
+                lifecycle["receipts"].append(published)
+                state = self._validate_state(self._upgrade_state(state))
+                return state, published
+            return self.reference_store.publish_referenced_many_atomic(
+                [MarkAxisReferencedCommand(axis=a, position_steps=0,
+                    source="serial206.xy.controller_verified_home", motion_kind="home_xy") for a in ("x", "y")],
+                expected_rows=context["references"],
+                transaction=lambda write: self.state_store.finalize_homexy_reference(
+                    write, prepare, finish, verify=verify, command_id=command_id))
+        except Exception as exc:
+            # Retain native source evidence for a publication-only retry. Never
+            # fall back to unverified references or replay the physical command.
+            receipt["reference_publication"] = {"ok": False, "failure": f"{type(exc).__name__}:{exc}"}
+            receipt["reference_publication_pending"] = copy.deepcopy(context)
+            return None
+
+    def _xy_exception_receipt(self, exc, *, lifecycle, values, intent, command_id, persist=True, generation=None):
+        """Retain failed command facts separately from coordinate authority."""
+        from .critical_logging import critical_receipt
+        evidence = critical_receipt(getattr(exc, "motion_evidence", None))
+        result = {
+            "ok": False, "axis": "xy", "state": lifecycle.get("state", "reconciliation_required"),
+            "failure": f"{'xy' if intent == 'move_xy' else 'homexy'}_intent_exception:{type(exc).__name__}:{exc}",
+            "critical_evidence": copy.deepcopy(dict(evidence)) if isinstance(evidence, Mapping) else None,
+        }
+        if command_id is None:
+            raise RuntimeError("xy_failure_command_identity_unresolved")
+        receipt = {
+            "command_id": command_id,
+            "intent": intent, "status": "failed",
+            "generation": int(self.generation_provider()) if generation is None else generation,
+            "idempotency_key": values.get("idempotency_key"),
+            "result": copy.deepcopy(result),
+            "critical_evidence": result["critical_evidence"],
+        }
+        # The current-authority document is not the wire-evidence store. Keep
+        # its bounded receipt index small; durable child rows own exact facts.
+        lifecycle["receipts"].append({key: value for key, value in receipt.items()
+                                      if key not in {"result", "critical_evidence"}})
+        lifecycle["receipts"] = lifecycle["receipts"][-8:]
+        if persist:
+            self._persist_xy_child_receipts(receipt)
+        return {**result, "authority_receipt": receipt}
+
+    def _xy_y_only_failure(self, exc, *, admitted, prior_state, prior_reference,
+                           command_id, values):
+        """Classify only the source Y-only absolute nonarrival (Y spec 8.2/9.1).
+
+        Readbacks are command-local, never dashboard observations. They establish
+        stopped coordinates, not arrival or home. No recovery command is issued.
+        Other source branches deliberately retain their existing failure path.
+        """
+        from .usb_driver import OemMotionCompletionError
+        evidence = getattr(exc, "motion_evidence", None)
+        if not (isinstance(exc, OemMotionCompletionError)
+                and isinstance(evidence, Mapping)
+                and evidence.get("branch") == "near_axis_sequential"
+                and evidence.get("failed_axis") == "y"
+                and evidence.get("commands") == {}
+                and (evidence.get("distances") or {}).get("x") == 0):
+            return None
+        store = self.state_store
+        if store is None:
+            return None  # No durable owner exists to publish coherent truth.
+        tester = self.primitives.tester
+        leaf = evidence.get("controller_failure") or {}
+        terminal = {"classification": "reconciliation_required", "readbacks": {}}
+        exc.motion_evidence = {**evidence, "terminal_classification": terminal}
+
+        def finalize(prepare, **kwargs):
+            # Preserve _save_state's local bookkeeping at the same writer
+            # boundary, without a second write or a post-commit stale reload.
+            # A later local Stop owner cannot publish before this completes.
+            with store._lock:
+                result, published = store.finalize_xy_failure(
+                    prepare, command_id=command_id, **kwargs)
+                self._memory_state = copy.deepcopy(published)
+                self.invalidate_deck_authority_cache(reason="provider_state_changed")
+                return result
+
+        def current(state=None):
+            # Inside publication the store supplies a post-BEGIN canonical read.
+            if state is None:
+                state = store.read_oem_serial206_initialization_state()
+            state = self._validate_state(self._upgrade_state(state))
+            lifecycle = state["x_lifecycle"]
+            active = lifecycle.get("active_receipt") or {}
+            snapshot = self._xy_authority_snapshot(lifecycle, validate=False)
+            cursor = tester.novo_router.receive_cursor()
+            window = leaf.get("event_window") or {}
+            receive_current = (isinstance(window.get("receive_owner"), str)
+                               and type(window.get("owner_generation")) is int
+                               and all(cursor.get(k) == window[k] for k in ("receive_owner", "owner_generation")))
+            owned = (active.get("command_id") == command_id
+                     and active.get("generation") == admitted.get("generation")
+                     and lifecycle.get("state") == "executing")
+            valid = (receive_current and owned
+                     and self._xy_authority_fence_matches(admitted, snapshot)
+                     and admitted["y"].get("software_interrupt_active") is False
+                     and type(admitted["y"].get("software_interrupt_epoch")) is int
+                     and tester.oem_no24v_state() is False
+                     and all(tester.motor_oem_axis_board_initialized(a) is True for a in ("x", "y")))
+            return state, lifecycle, valid
+
+        try:
+            _, _, valid = current()
+            if not valid:
+                raise RuntimeError("xy_failure_authority_changed")
+            if not (isinstance(leaf, Mapping) and leaf.get("board") == 4
+                    and leaf.get("motor") == 0 and leaf.get("command_sent") is True
+                    and leaf.get("oem_wait_for_stop") is True
+                    and isinstance(leaf.get("ack"), Mapping)
+                    and leaf["ack"].get("status") == 100
+                    and isinstance(leaf.get("wait"), Mapping)
+                    and leaf["wait"].get("ok") is False
+                    and leaf["wait"].get("failure") == "oem_moveToAbs_target_event_timeout"
+                    and leaf["wait"].get("no24v") is False
+                    and type(leaf.get("requested_position")) is int
+                    and leaf.get("wire_position") == leaf["requested_position"]):
+                raise RuntimeError("xy_failure_not_acknowledged_absolute_nonarrival")
+            for axis, board in (("x", 5), ("y", 4)):
+                position = tester.motor_get_position(board, motor=0)
+                speed = tester.motor_get_speed(board, motor=0)
+                terminal["readbacks"][axis] = {"position": position, "speed": speed}
+                if not (isinstance(position, Mapping) and position.get("ok") is True
+                        and type(position.get("position")) is int
+                        and isinstance(speed, Mapping) and speed.get("ok") is True
+                        and type(speed.get("speed")) is int and speed["speed"] == 0):
+                    raise RuntimeError("xy_failure_stopped_coordinates_unverified")
+            if terminal["readbacks"]["x"]["position"]["position"] != evidence["before"]["x"]:
+                raise RuntimeError("xy_failure_uncommanded_x_changed")
+            def publish(state, observed):
+                state, lifecycle, valid = current(state)
+                if not valid:
+                    raise RuntimeError("xy_failure_authority_changed_before_publication")
+                terminal.update(classification="failed_with_coherent_stopped_coordinates",
+                    observation=observed, authority_unchanged=True,
+                    authority_scope="classified_terminal_epoch_not_current_admission",
+                    admitted_authority=copy.deepcopy(admitted))
+                lifecycle.update(state=prior_state, reference_state=prior_reference,
+                    active_receipt=None, pending_ticket=None,
+                    last_failure=f"xy_intent_exception:{type(exc).__name__}:{exc}")
+                failed = self._xy_exception_receipt(exc, lifecycle=lifecycle,
+                    values=values, intent="move_xy", command_id=command_id, persist=False,
+                    generation=admitted.get("generation"))
+                return state, failed["authority_receipt"]
+
+            return finalize(publish,
+                requested=leaf["requested_position"],
+                observed=terminal["readbacks"]["y"]["position"]["position"])
+        except Exception as classification_exc:
+            terminal.update(classification="reconciliation_required",
+                            classification_failure=f"{type(classification_exc).__name__}:{classification_exc}")
+            for key in ("observation", "authority_unchanged", "authority_scope", "admitted_authority"):
+                terminal.pop(key, None)  # The attempted transaction was rolled back.
+            try:
+                def blocked(state, observed):
+                    state = self._validate_state(self._upgrade_state(state))
+                    lifecycle = state["x_lifecycle"]
+                    active = lifecycle.get("active_receipt") or {}
+                    owns_active = (lifecycle.get("state") == "executing"
+                        and lifecycle.get("generation") == admitted.get("generation")
+                        and lifecycle.get("board_lifecycle_generation") == admitted.get("x", {}).get("board_lifecycle_generation")
+                        and active.get("command_id") == command_id
+                        and active.get("generation") == admitted.get("generation"))
+                    # Never restore or latch a newer owner, even a ready Stop.
+                    receipt_lifecycle = lifecycle if owns_active else copy.deepcopy(lifecycle)
+                    receipt_lifecycle.update(state="failed_latched", active_receipt=None,
+                        pending_ticket=None, last_failure=str(classification_exc))
+                    failed = self._xy_exception_receipt(exc, lifecycle=receipt_lifecycle,
+                        values=values, intent="move_xy", command_id=command_id, persist=False,
+                        generation=admitted.get("generation"))
+                    return state if owns_active else None, failed["authority_receipt"]
+                return finalize(blocked)
+            except Exception as record_exc:
+                return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": str(record_exc),
+                        "critical_evidence": copy.deepcopy(exc.motion_evidence)}
 
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -4996,6 +7595,9 @@ class Serial206OemInitializationProvider:
             terminal_authority_saved = False
             state: dict[str, Any] = {}
             lifecycle: dict[str, Any] = {}
+            admitted_authority: dict[str, Any] = {}
+            prior_state, prior_reference_state = "unprepared", "unknown"
+            command_id: str | None = None
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
@@ -5040,15 +7642,32 @@ class Serial206OemInitializationProvider:
                         and existing_receipt.get("target_y") == int(y)
                         and existing_receipt.get("inputs") == safe_inputs
                     )
-                    authority_valid = True
-                    if not request_matches or (
-                        existing_receipt.get("status") == "completed" and not authority_valid
-                    ):
+                    composite = existing_receipt.get("composite_authority")
+                    terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
+                    current_authority = self._xy_authority_snapshot(
+                        lifecycle, validate=False
+                    )
+                    authority_valid = bool(
+                        isinstance(terminal_authority, Mapping)
+                        and dict(terminal_authority) == current_authority
+                    )
+                    if not request_matches or not authority_valid:
                         return {
                             "ok": False,
                             "axis": "xy",
                             "state": lifecycle.get("state"),
                             "failure": "xy_replay_current_authority_or_request_invalid",
+                            "replayed": True,
+                            "authority_receipt": _json_safe(existing_receipt),
+                        }
+                    try:
+                        self._persist_xy_child_receipts(existing_receipt)
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": f"xy_receipt_reconciliation_exception:{type(exc).__name__}:{exc}",
                             "replayed": True,
                             "authority_receipt": _json_safe(existing_receipt),
                         }
@@ -5058,17 +7677,30 @@ class Serial206OemInitializationProvider:
                     return replayed_result
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
-                active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None}
+                admitted_authority = self._xy_authority_snapshot(
+                    lifecycle
+                )
+                if admitted_authority.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state"),
+                        "failure": "xy_composite_authority_not_current",
+                        "composite_authority": _json_safe(admitted_authority),
+                    }
+                admitted_authority.pop("ok", None)
+                active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
-                with self._x_interrupt_state_lock:
-                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
-                if interrupted:
+                current_authority = self._xy_authority_snapshot(
+                    lifecycle, validate=False
+                )
+                if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
                         "ok": False,
-                        "failure": "xy_interrupted",
+                        "failure": "xy_authority_changed_during_command",
                         "primitive_result": _json_safe(result),
                     }
                 source_completed = result.get("ok") is True
@@ -5078,6 +7710,18 @@ class Serial206OemInitializationProvider:
                     "reference_state": prior_reference_state,
                     "last_failure": None if source_completed else _json_safe(result),
                 })
+                terminal_authority = self._xy_authority_snapshot(
+                    lifecycle, validate=False
+                )
+                child_receipts = {
+                    axis: {
+                        "axis": axis,
+                        "command_id": command_id,
+                        "parent_intent": "move_xy",
+                        "status": "completed" if result.get("ok") is True else "failed",
+                    }
+                    for axis in ("x", "y")
+                }
                 receipt = {
                     "command_id": command_id,
                     "intent": "move_xy",
@@ -5090,14 +7734,18 @@ class Serial206OemInitializationProvider:
                     "inputs": safe_inputs,
                     "status": "completed" if result.get("ok") is True else "failed",
                     "result": _json_safe(result),
+                    "composite_authority": {
+                        "admitted": _json_safe(admitted_authority),
+                        "terminal": _json_safe(terminal_authority),
+                    },
+                    "child_receipts": child_receipts,
                 }
                 lifecycle["receipts"].append(receipt)
                 lifecycle["receipts"] = lifecycle["receipts"][-8:]
                 self._save_state(state)
                 terminal_authority_saved = True
-                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
-                    self.state_store.append_serial206_receipt("x", receipt)
-                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+                self._persist_xy_child_receipts(receipt)
+                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "move_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation, "authority_receipt": _json_safe(receipt)}
             except Exception as exc:
                 if terminal_authority_saved:
                     return {
@@ -5114,6 +7762,11 @@ class Serial206OemInitializationProvider:
                         "failure": f"xy_authority_load_exception:{type(exc).__name__}:{exc}",
                     }
                 try:
+                    classified = self._xy_y_only_failure(exc, admitted=admitted_authority,
+                        prior_state=prior_state, prior_reference=prior_reference_state,
+                        command_id=command_id, values=values)
+                    if classified is not None:
+                        return classified
                     lifecycle.update({
                         "state": "failed_latched",
                         "reference_state": "desynced",
@@ -5129,7 +7782,15 @@ class Serial206OemInitializationProvider:
                         "state": "reconciliation_required",
                         "failure": f"xy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
                     }
-                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}"}
+                try:
+                    failed = self._xy_exception_receipt(exc, lifecycle=lifecycle, values=values, intent="move_xy", command_id=command_id)
+                    self._save_state(state)
+                    return failed
+                except Exception as record_exc:
+                    return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"xy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": f"xy_failure_receipt_exception:{type(record_exc).__name__}:{record_exc}",
+                        "critical_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
 
     def execute_homexy_intent(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -5144,6 +7805,7 @@ class Serial206OemInitializationProvider:
             terminal_authority_saved = False
             state: dict[str, Any] = {}
             lifecycle: dict[str, Any] = {}
+            command_id: str | None = None
             try:
                 state = self._load_state()
                 lifecycle = state["x_lifecycle"]
@@ -5184,10 +7846,17 @@ class Serial206OemInitializationProvider:
                 if existing is None and idempotency_key is not None:
                     existing = self._durable_serial206_receipt_by_idempotency("x", idempotency_key)
                 if isinstance(existing, Mapping):
+                    composite = existing.get("composite_authority")
+                    terminal_authority = composite.get("terminal") if isinstance(composite, Mapping) else None
+                    current_authority = self._xy_authority_snapshot(
+                        lifecycle, validate=False
+                    )
                     if (
                         existing.get("intent") != "home_xy"
                         or existing.get("inputs") != safe_inputs
                         or existing.get("generation") != generation
+                        or not isinstance(terminal_authority, Mapping)
+                        or dict(terminal_authority) != current_authority
                     ):
                         return {
                             "ok": False,
@@ -5195,33 +7864,82 @@ class Serial206OemInitializationProvider:
                             "state": lifecycle.get("state"),
                             "failure": "homexy_replay_authority_or_request_mismatch",
                             "replayed": True,
-                            "authority_receipt": _json_safe(existing),
+                            "authority_receipt": copy.deepcopy(existing),
                         }
 
+                    if existing.get("reference_publication_pending"):
+                        draft = copy.deepcopy(existing)
+                        published = self._handoff_homexy_recovery(draft, draft["result"],
+                            draft["reference_publication_pending"])
+                        if published is None:
+                            return {"ok": False, "axis": "xy", "replayed": True,
+                                "failure": "homexy_reference_publication_pending",
+                                "reference_publication": draft.get("reference_publication"),
+                                "authority_receipt": copy.deepcopy(existing)}
+                        state, existing = published
+                        self._memory_state = copy.deepcopy(state)
+                        self.invalidate_deck_authority_cache(reason="homexy_reference_published")
+                    try:
+                        self._persist_xy_child_receipts(existing)
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "axis": "xy",
+                            "state": lifecycle.get("state"),
+                            "failure": f"homexy_receipt_reconciliation_exception:{type(exc).__name__}:{exc}",
+                            "replayed": True,
+                            "authority_receipt": copy.deepcopy(existing),
+                        }
                     replayed_result = dict(existing.get("result") or {})
                     replayed_result.setdefault("ok", existing.get("status") == "completed")
-                    replayed_result.update({"replayed": True, "authority_receipt": _json_safe(existing)})
+                    replayed_result.update({"replayed": True, "authority_receipt": copy.deepcopy(existing)})
                     return replayed_result
                 prior_state = str(lifecycle.get("state") or "unprepared")
                 prior_reference_state = str(lifecycle.get("reference_state") or "unknown")
+                admitted_authority = self._xy_authority_snapshot(
+                    lifecycle
+                )
+                if admitted_authority.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "axis": "xy",
+                        "state": lifecycle.get("state"),
+                        "failure": "homexy_composite_authority_not_current",
+                        "composite_authority": _json_safe(admitted_authority),
+                    }
+                admitted_authority.pop("ok", None)
                 live_preflight = {
                     "skipped": True,
                     "reason": "recovered_oem_homexy_has_no_profile_or_reference_preflight",
                     "source_exact": True,
                 }
-                active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None}
+                home_context = {}
+                try:
+                    if self.y_provider is not None:
+                        self.y_provider.__dict__.setdefault("_home_recovery_owner_id", uuid.uuid4().hex)
+                    home_context = {
+                        "references": self.reference_store.snapshot(("x", "y"))["rows"],
+                        "owners": {"x": self._home_recovery_owner_id,
+                                   "y": getattr(self.y_provider, "_home_recovery_owner_id", None)},
+                        "y_interrupt": self.state_store.axis_interrupt_snapshot("y"),
+                        "started_at": time.time(),
+                    }
+                except Exception:
+                    pass  # Do not add a reference-store precondition to native HomeXY.
+                active = {"command_id": command_id, "intent": "home_xy", "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
                 result = self.primitives.home_xy()
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "homexy_result_not_mapping"}
                 result["live_preflight"] = _json_safe(live_preflight)
-                with self._x_interrupt_state_lock:
-                    interrupted = self._x_interrupt_epoch != admitted_interrupt_epoch
-                if interrupted or int(self.generation_provider()) != generation:
+                current_authority = self._xy_authority_snapshot(
+                    lifecycle, validate=False
+                )
+                if not self._xy_authority_fence_matches(admitted_authority, current_authority):
                     result = {
                         "ok": False,
-                        "failure": "homexy_interrupted_or_generation_changed",
-                        "primitive_result": _json_safe(result),
+                        "failure": "homexy_authority_changed_during_command",
+                        "primitive_result": copy.deepcopy(result),
                     }
                 source_noop = bool(
                     result.get("ok") is True
@@ -5238,7 +7956,21 @@ class Serial206OemInitializationProvider:
                         "last_failure": None,
                     })
                 else:
-                    lifecycle.update({"state": "awaiting_operator_observation" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": command_id if verified_success else None, "last_failure": None if verified_success else _json_safe(result)})
+                    # Source completion is neither a physical attestation nor a
+                    # fresh post-setHome readback. Neither gates the next OEM call.
+                    lifecycle.update({"state": "prepared_unreferenced" if verified_success else "failed_latched", "active_receipt": None, "reference_state": "desynced", "awaiting_observation_receipt_id": None, "last_failure": None if verified_success else copy.deepcopy(result)})
+                terminal_authority = self._xy_authority_snapshot(
+                    lifecycle, validate=False
+                )
+                child_receipts = {
+                    axis: {
+                        "axis": axis,
+                        "command_id": command_id,
+                        "parent_intent": "home_xy",
+                        "status": "completed" if result.get("ok") is True else "failed",
+                    }
+                    for axis in ("x", "y")
+                }
                 receipt = {
                     "command_id": command_id,
                     "intent": "home_xy",
@@ -5250,15 +7982,43 @@ class Serial206OemInitializationProvider:
                     "board_lifecycle_generation": lifecycle.get("board_lifecycle_generation"),
                     "inputs": safe_inputs,
                     "status": "completed" if result.get("ok") is True else "failed",
-                    "result": _json_safe(result),
+                    "result": copy.deepcopy(result),
+                    "composite_authority": {
+                        "admitted": _json_safe(admitted_authority),
+                        "terminal": _json_safe(terminal_authority),
+                    },
+                    "child_receipts": child_receipts,
                 }
-                lifecycle["receipts"].append(receipt)
-                lifecycle["receipts"] = lifecycle["receipts"][-8:]
-                self._save_state(state)
+                published = self._handoff_homexy_recovery(receipt, result, home_context)
+                if published is not None:
+                    state, receipt = published
+                    lifecycle = state["x_lifecycle"]
+                    self._memory_state = copy.deepcopy(state)
+                    self.invalidate_deck_authority_cache(reason="homexy_reference_published")
+                else:
+                    current = self.state_store.read_oem_serial206_initialization_state()
+                    current_x = current["x_lifecycle"]
+                    if ((current_x.get("active_receipt") or {}).get("command_id") != command_id
+                        or not self._xy_authority_fence_matches(admitted_authority, self._xy_authority_snapshot(current_x, validate=False))):
+                        receipt.pop("reference_publication_pending", None)
+                        terminal_authority_saved = True
+                        self._persist_xy_child_receipts(receipt)
+                        return {"ok": False, "axis": "xy", "intent": "home_xy",
+                            "failure": "homexy_authority_changed_during_reference_publication",
+                            "result": copy.deepcopy(result), "authority_receipt": copy.deepcopy(receipt)}
+                    lifecycle["receipts"].append(receipt)
+                    lifecycle["receipts"] = lifecycle["receipts"][-8:]
+                    state = {**current, "x_lifecycle": lifecycle}
+                    terminal_authority_saved = True
+                    self._save_state(state, expected_current=current)
                 terminal_authority_saved = True
-                if self.state_store is not None and hasattr(self.state_store, "append_serial206_receipt"):
-                    self.state_store.append_serial206_receipt("x", receipt)
-                return {"ok": result.get("ok") is True, "axis": "xy", "intent": "home_xy", "state": lifecycle["state"], "result": _json_safe(result), "generation": generation}
+                pending = bool(receipt.get("reference_publication_pending"))
+                if not pending:
+                    self._persist_xy_child_receipts(receipt)
+                return {"ok": result.get("ok") is True and not pending, "axis": "xy", "intent": "home_xy",
+                    "state": lifecycle["state"], "result": copy.deepcopy(result), "generation": generation,
+                    "failure": "homexy_reference_publication_pending" if pending else None,
+                    "authority_receipt": copy.deepcopy(receipt)}
             except Exception as exc:
                 if terminal_authority_saved:
                     return {
@@ -5290,7 +8050,15 @@ class Serial206OemInitializationProvider:
                         "state": "reconciliation_required",
                         "failure": f"homexy_authority_save_exception:{type(save_exc).__name__}:{save_exc}",
                     }
-                return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}"}
+                try:
+                    failed = self._xy_exception_receipt(exc, lifecycle=lifecycle, values=values, intent="home_xy", command_id=command_id)
+                    self._save_state(state)
+                    return failed
+                except Exception as record_exc:
+                    return {"ok": False, "axis": "xy", "state": "reconciliation_required",
+                        "failure": f"homexy_intent_exception:{type(exc).__name__}:{exc}",
+                        "recording_failure": f"homexy_failure_receipt_exception:{type(record_exc).__name__}:{record_exc}",
+                        "critical_evidence": copy.deepcopy(getattr(exc, "motion_evidence", None))}
     def notify_board_activation(self, board_id: int, ack: Any, *, active: bool | None = None) -> dict[str, Any]:
         """Invalidate axis authority on external board lifecycle changes."""
         if int(board_id) == 5:
@@ -5315,15 +8083,6 @@ class Serial206OemInitializationProvider:
             state = self._load_state()
             z = state["z_lifecycle"]
             active_receipt = z.get("active_receipt") if isinstance(z.get("active_receipt"), Mapping) else {}
-            existing_authority = bool(
-                str(z.get("state") or "unprepared") != "unprepared"
-                or z.get("generation") is not None
-                or z.get("board_lifecycle_generation") is not None
-                or z.get("prepared_receipt") is not None
-                or z.get("active_receipt") is not None
-                or z.get("awaiting_observation_receipt_id") is not None
-                or z.get("reference_state") == "referenced"
-            )
             scope = self._board_transition_scope
             expected_transition = None
             remaining_expected_transitions: list[Any] = []
@@ -5357,7 +8116,7 @@ class Serial206OemInitializationProvider:
                     ack=ack,
                     transition_id=str(active_receipt.get("command_id") or f"board4-{time.time_ns()}"),
                     ownership_generation=int(self.generation_provider()),
-                    invalidate_axes=bool(existing_authority and not provider_owned),
+                    invalidate_axes=not provider_owned,
                     continuity_proven=bool(
                         isinstance(ack, Mapping)
                         and type(ack.get("status")) is int
@@ -5422,6 +8181,11 @@ class Serial206OemInitializationProvider:
             )
             self._save_state(state)
             return {"z_affected": True, "board": 4, "invalidation": invalidation}
+
+    @staticmethod
+    def z_absolute_target(requested: int, minimum: int) -> int:
+        """Recovered moveZ minimum; driver travel limits remain independent."""
+        return max(minimum, requested)
 
     def z_projection(self) -> dict[str, Any]:
         with self._lock:
@@ -5503,6 +8267,7 @@ class Serial206OemInitializationProvider:
                     "coordinate_contract": "oem_source_nonnegative_z",
                     "source_min_steps": 0,
                     "source_max_steps": 160000,
+                    "current_minimum_steps": (state.get("machine_status") or {}).get("psudo_z_home_steps"),
                     "terminal_state": self._sanitize_z_terminal_state(
                         copy.deepcopy(z.get("terminal_state"))
                         if isinstance(z.get("terminal_state"), Mapping)
@@ -5653,89 +8418,534 @@ class Serial206OemInitializationProvider:
             "authority": "provider_receipt_terminal_state",
         }
 
-    def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
-        """Return provider-owned live ``scriptmoveTo`` branch authority."""
-        observed_generation = int(self.generation_provider())
-        if int(expected_generation) != observed_generation:
-            return {
-                "ok": False,
-                "blockers": ["ownership_generation_changed"],
-                "expected_generation": int(expected_generation),
-                "observed_generation": observed_generation,
-            }
-        with self._lock:
-            state = self._load_state()
-            z = state["z_lifecycle"]
-            machine = dict(state.get("machine_status") or {})
-        if z.get("state") != "referenced_ready" or z.get("reference_state") != "referenced":
-            return {"ok": False, "blockers": ["z_reference_not_ready"]}
-        machine = self._establish_machine_status_baseline(machine)
-        if type(machine.get("tip_loaded")) is not bool or type(machine.get("tip_dirty")) is not bool:
-            return {"ok": False, "blockers": ["tip_state_not_authoritative"]}
-        if type(machine.get("clean_path")) is not bool:
-            return {"ok": False, "blockers": ["clean_path_not_authoritative"]}
-        if machine.get("current_location") is None or machine.get("current_well") is None:
-            return {"ok": False, "blockers": ["current_location_not_authoritative"]}
-        pseudo = machine.get("psudo_z_home_steps")
-        if type(pseudo) is not int or pseudo not in {500, 65000}:
-            return {"ok": False, "blockers": ["pseudo_z_home_not_authoritative"]}
-        tip_location = machine.get("tip_location", -1)
-        if type(tip_location) is not int:
-            return {"ok": False, "blockers": ["tip_location_not_authoritative"]}
-        if machine["tip_loaded"] is True and tip_location < 0:
-            return {"ok": False, "blockers": ["loaded_tip_location_not_authoritative"]}
-        read_position = getattr(self.primitives, "_read_axis_position", None)
-        if not callable(read_position):
-            return {"ok": False, "blockers": ["controller_position_reader_not_bound"]}
-        try:
-            coordinates = {axis: read_position(axis) for axis in ("x", "y", "z")}
-        except Exception as exc:
-            return {"ok": False, "blockers": [f"controller_position_read_failed:{type(exc).__name__}:{exc}"]}
-        if any(type(value) is not int for value in coordinates.values()):
-            return {"ok": False, "blockers": ["controller_position_not_strict_integer"]}
-        if self.reference_store is None:
-            return {"ok": False, "blockers": ["reference_store_not_bound"]}
-        references = self.reference_store.snapshot(("g",))
-        g_row = (references.get("rows") or {}).get("g") if isinstance(references, Mapping) else None
-        gripper_confirmed = bool(
-            isinstance(references, Mapping)
-            and references.get("ok") is True
-            and isinstance(g_row, Mapping)
-            and g_row.get("state") == "referenced"
+    def _fresh_deck_latch_observation(self) -> dict[str, Any]:
+        """Read independent host m_latchStatus and fresh type-3 sensor evidence."""
+        query = getattr(self.primitives, "deck_io_query_type", None)
+        if not callable(query):
+            query = getattr(self.primitives, "query_latch", None)
+        if not callable(query):
+            raise RuntimeError("deck_latch_observation_reader_not_bound")
+        observed = query(3) if getattr(query, "__name__", "") == "deck_io_query_type" else query()
+        if not isinstance(observed, Mapping) or observed.get("ok") is not True:
+            raise RuntimeError("deck_latch_observation_failed")
+        value = observed.get("value")
+        if type(value) is not int or value not in {0, 1}:
+            raise RuntimeError("deck_latch_observation_malformed")
+        host_reader = getattr(self.primitives, "read_oem_latch_status", None)
+        if not callable(host_reader):
+            raise RuntimeError("oem_host_latch_status_reader_not_bound")
+        host = host_reader()
+        host_value = host.get("value") if isinstance(host, Mapping) else None
+        host_observation_id = host.get("observation_id") if isinstance(host, Mapping) else None
+        if (
+            not isinstance(host, Mapping) or host.get("ok") is not True
+            or type(host_value) is not bool
+            or type(host_observation_id) is not str or not host_observation_id.strip()
+        ):
+            raise RuntimeError("oem_host_latch_status_observation_failed")
+        sensor_canonical = json.dumps(
+            dict(observed), sort_keys=True, separators=(",", ":"), default=str
+        )
+        sensor_observation_id = "type3:" + hashlib.sha256(
+            sensor_canonical.encode("utf-8")
+        ).hexdigest()
+        compound = json.dumps(
+            {"host": host_observation_id, "sensor": sensor_observation_id},
+            sort_keys=True, separators=(",", ":"),
         )
         return {
+            "latch_status": host_value,
+            "machine_latch_closed": value == 1,
+            "latch_observation_id": (
+                f"deck-latch:host={host_observation_id};sensor={sensor_observation_id};compound="
+                + hashlib.sha256(compound.encode("utf-8")).hexdigest()
+            ),
+        }
+
+    def invalidate_deck_authority_cache(self, *, reason: str = "authority_changed") -> None:
+        """Owner-event hook: no hardware, SQLite, or motion-held mutex."""
+        self._deck_authority_cache_epoch = object()
+        self._deck_authority_cache = None
+        self._deck_authority_scoped_cache = {}
+        self._deck_authority_cache_reason = str(reason)
+
+    def deck_observation_freshness(self, *, expected_generation: int) -> dict[str, Any]:
+        """Passive ordinary-scope scheduling evidence, not command permission.
+
+        A current failed observation has fresh negative evidence; a Park-only
+        failure must not make the ordinary scope look unobserved.
+        """
+        cached = getattr(self, "_deck_authority_scoped_cache", {}).get("offset.v1")
+        state, age, available, outcome = "missing", None, False, "missing"
+        if cached is not None:
+            started, epoch, snapshot = cached
+            if epoch is getattr(self, "_deck_authority_cache_epoch", None):
+                age = max(0.0, time.monotonic() - started)
+                state = "stale" if age >= 15.0 else "fresh"
+                outcome = "failed" if isinstance(snapshot, Exception) else "observed"
+                if not isinstance(snapshot, Exception):
+                    stamps = self.deck_owner_authority_stamps()
+                    if self.reference_store is None or not callable(self._deck_semantic_state_reader):
+                        return {"available": False, "outcome": "missing",
+                                "freshness": {"state": "missing", "age_s": None, "fresh_for_s": 15.0}}
+                    refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+                    semantic = self._deck_semantic_state_reader()
+                    changed = (
+                        snapshot["ownership_generation"] != expected_generation
+                        or any(stamps.get(key) != snapshot.get(key) for key in
+                               ("ownership_generation", "board_epoch_4", "board_epoch_5"))
+                        or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                               or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                               for axis, version in snapshot["reference_versions"].items())
+                        or semantic.get("semantic_state_revision") != snapshot["machine_state_revision"]
+                        or hashlib.sha256(json.dumps(semantic.get("transition_provenance"),
+                            sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                           != snapshot["semantic_state_provenance_digest"]
+                        or epoch is not self._deck_authority_cache_epoch
+                    )
+                    if changed:
+                        state, age, outcome = "missing", None, "invalidated"
+                    else:
+                        available = state == "fresh" and snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True
+        return {"available": available, "outcome": outcome,
+                "freshness": {"state": state, "age_s": age, "fresh_for_s": 15.0}}
+
+    def deck_authority_cached_snapshot(self, *, expected_generation: int, target: str | None = None) -> dict[str, Any]:
+        """Passive availability projection of an actual successful active sample.
+
+        The existing operator freshness window is 15 seconds, not a controller
+        timeout. This read never renews captured_at and cannot authorize execution;
+        execution must still use deck_authority_snapshot under its admission lease.
+        External reference/board/semantic owners must invalidate on mutations.
+        """
+        scope = self._deck_dependency_scope(target)
+        cached = getattr(self, "_deck_authority_scoped_cache", {}).get(scope)
+        if cached is None:
+            raise RuntimeError("deck_authority_cache_unavailable")
+        sampled_at, epoch, snapshot = cached
+        if epoch is not getattr(self, "_deck_authority_cache_epoch", None):
+            raise RuntimeError("deck_authority_cache_unavailable")
+        if isinstance(snapshot, Exception):
+            if time.monotonic() - sampled_at >= 15.0:
+                raise RuntimeError("deck_authority_cache_stale")
+            raise snapshot
+        if snapshot["ownership_generation"] != expected_generation:
+            raise RuntimeError("ownership_generation_changed")
+        if time.monotonic() - sampled_at >= 15.0:
+            raise RuntimeError("deck_authority_cache_stale")
+        if scope == "park.full" and snapshot.get("current_location_id") != "LOC_PARK":
+            if self._park_collection_state() != snapshot.get("collection_tip_state"):
+                raise RuntimeError("pipette_collection_owner_changed_after_collection")
+        return copy.deepcopy(snapshot)
+
+    def deck_authority_snapshot(
+        self, *, expected_generation: int, _allow_recovery: bool = False, target: str | None = None,
+        before_query=None, _shared_observations=None,
+    ) -> dict[str, Any]:
+        scope = self._deck_dependency_scope(target)
+        if not hasattr(self, "_deck_authority_cache_epoch"):
+            self.invalidate_deck_authority_cache(reason="first_collection")
+        epoch = self._deck_authority_cache_epoch
+        started = time.monotonic()
+        try:
+            result = self._collect_deck_authority(
+                expected_generation=expected_generation, _allow_recovery=_allow_recovery, scope=scope,
+                before_query=before_query, _shared_observations=_shared_observations)
+        except Exception as exc:
+            from .hardware_status import HardwareCollectionPreempted
+            if isinstance(exc, HardwareCollectionPreempted):
+                raise
+            if not _allow_recovery and epoch is self._deck_authority_cache_epoch:
+                self._deck_authority_scoped_cache[scope] = (started, epoch, exc)
+            raise
+        return result
+
+    def deck_authority_snapshots(self, *, expected_generation: int, before_query=None) -> dict[str, Any]:
+        """One leased readiness collection, independently validated finite scopes.
+
+        The caller holds movement_lease. Shared physical observations live only
+        for this call; neither a command pre-TX sample nor an older cache is used.
+        """
+        from .hardware_status import HardwareCollectionPreempted
+        shared: dict[str, Any] = {}
+        snapshots: dict[str, Any] = {}
+        # Park may publish the existing eligible semantic bootstrap. Collect it
+        # first so ordinary readiness is bound to that resulting owner epoch.
+        for target in ("LOC_PARK", "LOC_MS"):
+            if before_query is not None:
+                before_query()
+            try:
+                snapshots[target] = self.deck_authority_snapshot(
+                    expected_generation=expected_generation, target=target,
+                    before_query=before_query, _shared_observations=shared)
+            except HardwareCollectionPreempted:
+                raise
+            except Exception as exc:
+                snapshots[target] = exc
+        return snapshots
+
+    def _collect_deck_authority(
+        self, *, expected_generation: int, _allow_recovery: bool, scope: str,
+        before_query=None, _shared_observations=None,
+    ) -> dict[str, Any]:
+        """Explicit active sample; a finite target selects dependencies, not fences."""
+        cache_epoch = self._deck_authority_cache_epoch
+        sample_started = time.monotonic()
+        captured_at = time.time()
+        observed_generation = int(self.generation_provider())
+        if int(expected_generation) != observed_generation:
+            raise RuntimeError("ownership_generation_changed")
+        initial_latch = None
+        reader = self._deck_semantic_state_reader
+        current = reader() if callable(reader) else {}
+        shared = (_shared_observations or {}).get("snapshot")
+        if shared is not None:
+            stamps = self.deck_owner_authority_stamps()
+            refs = self.reference_store.snapshot(("x", "y", "z", "g")) if self.reference_store else {}
+            safety = shared["safety_epochs"]
+            if (
+                _shared_observations["epoch"] is not cache_epoch
+                or any(stamps[key] != shared[key] for key in stamps)
+                or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                       or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                       for axis, version in shared["reference_versions"].items())
+                or current.get("semantic_state_revision") != shared["machine_state_revision"]
+                or hashlib.sha256(json.dumps(current.get("transition_provenance"),
+                    sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                   != shared["semantic_state_provenance_digest"]
+                or safety["x"] != self._x_interrupt_epoch
+                or safety["y"] != int(getattr(self.y_provider, "interrupt_epoch", 0) or 0)
+                or safety["z"] != self._z_interrupt_epoch
+            ):
+                shared = None
+        if scope != "offset.v1" and current.get("semantic_state_revision") == 0 and current.get("ambiguity_state") == "none":
+            if before_query is not None:
+                before_query()
+            initial_latch = self._fresh_deck_latch_observation()
+            if cache_epoch is not self._deck_authority_cache_epoch:
+                raise RuntimeError("deck_authority_changed_during_collection")
+            self.refresh_deck_semantic_bootstrap(
+                expected_generation=expected_generation, latch_observation=initial_latch)
+            # Eligible bootstrap is itself an owner mutation; bind the new epoch.
+            cache_epoch = self._deck_authority_cache_epoch
+            shared = None
+        if before_query is not None:
+            before_query()
+        gripper_confirmed = shared["gripper_confirmed"] if shared is not None else self._deck_gripper_confirmed()
+        semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
+                    if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
+        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["clean_path"] is None) else self._clean_path_from_tip_tray_authority(
+            ownership_generation=int(semantic["ownership_generation"]),
+            board_epoch_4=int(semantic["board_epoch_4"]),
+            board_epoch_5=int(semantic["board_epoch_5"]),
+        )
+        table = load_bound_oem_position_table()
+        with self._lock:
+            state = self._load_state()
+            x_lifecycle = dict(state.get("x_lifecycle") or {})
+        board4_projection = (
+            self.state_store.board4_authority_projection()
+            if self.state_store is not None
+            and callable(getattr(self.state_store, "board4_authority_projection", None))
+            else {}
+        )
+        board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
+        board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
+        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
+            raise RuntimeError("deck_board_epochs_not_authoritative")
+        if not isinstance(board4, Mapping) or board4.get("state") != "active":
+            raise RuntimeError("deck_board4_not_active")
+
+        if self.reference_store is None:
+            raise RuntimeError("deck_reference_store_not_bound")
+        references = self.reference_store.snapshot(("x", "y", "z", "g"))
+        rows = references.get("rows") if isinstance(references, Mapping) else None
+        if not isinstance(rows, Mapping):
+            raise RuntimeError("deck_reference_snapshot_not_authoritative")
+        reference_versions: dict[str, int] = {}
+        for axis in ("x", "y", "z", "g"):
+            row = rows.get(axis)
+            version = row.get("state_version") if isinstance(row, Mapping) else None
+            if not isinstance(row, Mapping) or row.get("state") != "referenced" or type(version) is not int:
+                raise RuntimeError(f"deck_reference_not_authoritative:{axis}")
+            reference_versions[axis] = int(version)
+
+        coordinates = {}
+        for axis in ("x", "y", "z"):
+            if before_query is not None:
+                before_query()
+            coordinates[axis] = shared["current_" + axis] if shared is not None else self.primitives._read_axis_position(axis)
+        if any(type(value) is not int for value in coordinates.values()):
+            raise RuntimeError("deck_controller_positions_not_authoritative")
+        if before_query is not None:
+            before_query()
+        latch = (shared if shared is not None else initial_latch if initial_latch is not None
+                 else self._fresh_deck_latch_observation())
+        if shared is not None:
+            captured_at = shared["captured_at"]
+            sample_started = _shared_observations["started"]
+        if scope != "offset.v1" and (
+            semantic["ownership_generation"] != observed_generation
+            or semantic["board_epoch_4"] != board_epoch_4
+            or semantic["board_epoch_5"] != board_epoch_5
+        ):
+            raise RuntimeError("deck_semantic_generation_epochs_stale")
+        position_observation_id = hashlib.sha256(
+            json.dumps(coordinates, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        y_interrupt_epoch = int(getattr(self.y_provider, "interrupt_epoch", 0) or 0)
+        safety_epochs = {
+            "global": max(self._x_interrupt_epoch, y_interrupt_epoch, self._z_interrupt_epoch),
+            "x": int(self._x_interrupt_epoch),
+            "y": y_interrupt_epoch,
+            "z": int(self._z_interrupt_epoch),
+        }
+        snapshot = {
+            "ownership_generation": observed_generation,
+            "provider_owner_id": self._deck_owner_id,
+            "board_epoch_4": int(board_epoch_4),
+            "board_epoch_5": int(board_epoch_5),
+            "position_table_sha256": table.digest,
+            "machine_state_revision": int(semantic["semantic_state_revision"]),
+            "semantic_state_provenance_digest": str(semantic["transition_provenance_digest"]),
+            "reference_versions": reference_versions,
+            "safety_epochs": safety_epochs,
+            "latch_observation_id": str(latch["latch_observation_id"]),
+            "controller_position_observation_id": position_observation_id,
+            "captured_at": captured_at,
+            "current_x": int(coordinates["x"]),
+            "current_y": int(coordinates["y"]),
+            "current_z": int(coordinates["z"]),
+            "current_location_id": semantic["current_location"],
+            "current_well_id": semantic["current_well"],
+            "tip_loaded": semantic["tip_loaded"],
+            "collection_tip_state": semantic.get("collection_tip_state"),
+            "tip_dirty": semantic["tip_dirty"],
+            "tip_location": semantic["tip_location"],
+            "clean_path": clean_path,
+            "plate_on_gantry": semantic["plate_on_gantry"],
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "device_type": "BIOXP",
+            "latch_status": bool(latch["latch_status"]),
+            "machine_latch_closed": bool(latch["machine_latch_closed"]),
+        }
+        snapshot.update(dependency_scope="full" if scope == "park.full" else scope, gripper_confirmed=gripper_confirmed,
+                        required_facts=semantic.get("required_facts", ()),
+                        consumed_state_digest=semantic.get("consumed_state_digest"))
+        final_stamps = self.deck_owner_authority_stamps()
+        final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+        final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
+                          if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
+        if (
+            (shared is not None and any(snapshot[key] != shared[key] for key in (
+                "ownership_generation", "provider_owner_id", "board_epoch_4", "board_epoch_5",
+                "reference_versions", "safety_epochs", "machine_state_revision", "semantic_state_provenance_digest"))) or
+            final_semantic.get("collection_tip_state") != semantic.get("collection_tip_state") or
+            final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
+            cache_epoch is not self._deck_authority_cache_epoch
+            or any(final_stamps[key] != snapshot[key] for key in final_stamps)
+            or any(
+                (final_refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                or (final_refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                for axis, version in reference_versions.items()
+            )
+            or final_semantic["semantic_state_revision"] != semantic["semantic_state_revision"]
+            or final_semantic["transition_provenance_digest"] != semantic["transition_provenance_digest"]
+        ):
+            raise RuntimeError("deck_authority_changed_during_observation")
+        if not _allow_recovery:
+            # Publish the epoch actually validated above, including an eligible
+            # bootstrap's owner change. Never restamp at the caller's return.
+            cached = (sample_started, cache_epoch, copy.deepcopy(snapshot))
+            self._deck_authority_cache = cached
+            self._deck_authority_scoped_cache[scope] = cached
+            if _shared_observations is not None:
+                _shared_observations.update(snapshot=snapshot, epoch=cache_epoch, started=sample_started)
+        return snapshot
+
+    def deck_home_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Read native, current-owner home receipts; never home or infer a location."""
+        if self.reference_store is None or self.state_store is None or not callable(self._deck_semantic_state_reader):
+            raise RuntimeError("deck_home_authority_unavailable")
+        sample_started = time.time()
+        stamps = self.deck_owner_authority_stamps()
+        if stamps["ownership_generation"] != expected_generation:
+            raise RuntimeError("deck_home_generation_changed")
+        state = self._load_state()
+        semantic = dict(self._deck_semantic_state_reader())
+        references = self.reference_store.snapshot(("x", "y", "z", "g"))["rows"]
+        versions = {}
+        for axis, row in references.items():
+            if row.get("state") != "referenced" or type(row.get("state_version")) is not int:
+                raise RuntimeError("deck_home_reference_unavailable:" + axis)
+            versions[axis] = row["state_version"]
+        board4 = self.state_store.board4_authority_projection()
+        y_axis = board4.get("axes", {}).get("y", {})
+        if (board4.get("board", {}).get("state") != "active"
+            or y_axis.get("lifecycle_state") != "referenced_ready"
+            or y_axis.get("prepared_board_epoch") != stamps["board_epoch_4"]):
+            raise RuntimeError("deck_home_y_authority_unavailable")
+        homes = {}
+        x_home = next((r for r in reversed(state["x_lifecycle"].get("receipts", []))
+                       if isinstance(r, Mapping) and isinstance(r.get("recovery_home"), Mapping)), {})
+        paired_y = None
+        if x_home.get("intent") == "home_xy":
+            # Both committed children must exist. Source success or an in-memory
+            # handoff alone cannot qualify a partial receipt write.
+            paired_y = self._durable_serial206_receipt("y", str(x_home.get("command_id")))
+            paired_x = self._durable_serial206_receipt("x", str(x_home.get("command_id")))
+            if (not isinstance(paired_x, Mapping) or not isinstance(paired_y, Mapping)
+                or paired_x.get("recovery_home") != x_home.get("recovery_home")
+                or paired_y.get("status") != "completed" or paired_y.get("intent") != "home_xy"
+                or not isinstance(paired_y.get("recovery_home"), Mapping)
+                or paired_y["recovery_home"] != x_home.get("child_receipts", {}).get("y", {}).get("recovery_home")):
+                raise RuntimeError("deck_home_paired_receipts_unavailable")
+        for axis in ("x", "y", "z"):
+            if axis == "y":
+                receipt = self._durable_serial206_receipt("y", str(y_axis.get("last_receipt_id"))) or {}
+                if paired_y is not None and paired_y["recovery_home"].get("reference_version") == versions["y"]:
+                    receipt = paired_y
+                owner = getattr(self.y_provider, "_home_recovery_owner_id", None)
+                interrupt = self.state_store.axis_interrupt_snapshot("y")
+                epoch = interrupt["epoch"]
+                active = interrupt["active"]
+            else:
+                lifecycle = state[axis + "_lifecycle"]
+                paired_home = axis == "x" and paired_y is not None
+                allowed_states = {"referenced_ready", "prepared_unreferenced"} if paired_home else {"referenced_ready"}
+                if (lifecycle.get("state") not in allowed_states
+                    or lifecycle.get("generation") != expected_generation
+                    or lifecycle.get("board_lifecycle_generation") != stamps["board_epoch_5"]):
+                    raise RuntimeError("deck_home_lifecycle_unavailable:" + axis)
+                receipt = next((r for r in reversed(lifecycle.get("receipts", []))
+                                if isinstance(r, Mapping) and isinstance(r.get("recovery_home"), Mapping)), {})
+                owner = self._home_recovery_owner_id
+                epoch = getattr(self, "_" + axis + "_interrupt_epoch")
+                active = getattr(self, "_" + axis + "_interrupt_active")
+            evidence = receipt.get("recovery_home")
+            if (not isinstance(evidence, Mapping) or receipt.get("status") != "completed"
+                or not owner or evidence.get("owner_id") != owner or active
+                or evidence.get("interrupt_epoch") != epoch
+                or evidence.get("ownership_generation") != expected_generation
+                or evidence.get("board_epoch_4") != stamps["board_epoch_4"]
+                or (axis != "y" and evidence.get("board_epoch_5") != stamps["board_epoch_5"])
+                or evidence.get("reference_version") != versions.get(axis)
+                or references[axis].get("origin_position_steps") != 0):
+                raise RuntimeError("deck_home_receipt_not_current:" + axis)
+            homes[axis] = dict(evidence)
+        tester = getattr(self.primitives, "tester", None)
+        for axis, board, motor in (("x", 5, 0), ("y", 4, 0), ("z", 4, 1)):
+            for method, field, expected in (("motor_get_position", "position", 0),
+                                             ("motor_get_speed", "speed", 0),
+                                             ("motor_query_home_switch", "home", True)):
+                value = getattr(tester, method)(board, motor=motor)
+                if (not isinstance(value, Mapping) or value.get("ok") is not True
+                    or type(value.get(field)) is not type(expected) or value[field] != expected
+                    or not isinstance(value.get("ack"), Mapping)
+                    or type(value["ack"].get("status")) is not int or value["ack"]["status"] != 100
+                    or (field == "home" and value.get("reply_valid") is not True)):
+                    raise RuntimeError("deck_home_current_readback_unverified:" + axis + ":" + field)
+        latch = self._fresh_deck_latch_observation()
+        if (time.time() - sample_started > 5
+            or self._home_recovery_owner_id != homes["x"]["owner_id"]
+            or getattr(self.y_provider, "_home_recovery_owner_id", None) != homes["y"]["owner_id"]
+            or any(getattr(self, "_" + a + "_interrupt_active")
+                   or getattr(self, "_" + a + "_interrupt_epoch") != homes[a]["interrupt_epoch"] for a in ("x", "z"))
+            or self.state_store.axis_interrupt_snapshot("y") != interrupt
+            or any(self._load_state()[a + "_lifecycle"] != state[a + "_lifecycle"] for a in ("x", "z"))
+            or self.state_store.board4_authority_projection() != board4
+            or self.deck_owner_authority_stamps() != stamps
+            or self.reference_store.snapshot(("x", "y", "z", "g"))["rows"] != references
+            or dict(self._deck_semantic_state_reader()) != semantic):
+            raise RuntimeError("deck_home_authority_changed_during_observation")
+        return {**stamps, "provider_owner_id": self._home_recovery_owner_id,
+            "position_table_sha256": load_bound_oem_position_table().digest,
+            "machine_state_revision": semantic["semantic_state_revision"],
+            "reference_versions": versions, "recovery_home_evidence": homes,
+            "latch_status": latch["latch_status"], "machine_latch_closed": latch["machine_latch_closed"],
+            "latch_observation_id": latch["latch_observation_id"],
+            "current_x": 0, "current_y": 0, "current_z": 0,
+            "observed_location_id": None, "observed_well_id": None,
+            "controller_position_observation_id": hashlib.sha256(b'{"x":0,"y":0,"z":0}').hexdigest(),
+            "captured_at": time.time()}
+
+    def deck_reconciliation_snapshot(self, *, expected_generation: int) -> dict[str, Any]:
+        """Bind exact semantic observation to current controller coordinates; never infer nearest."""
+        reader = getattr(self.primitives, "read_deck_semantic_observation", None)
+        if not callable(reader):
+            raise RuntimeError("deck_reconciliation_semantic_observation_unavailable")
+        observed = reader()
+        if not isinstance(observed, Mapping):
+            raise RuntimeError("deck_reconciliation_semantic_observation_malformed")
+        location = observed.get("location_id")
+        well = observed.get("well_id")
+        if type(location) is not str:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable")
+        try:
+            load_bound_oem_position_table().resolve(location_id=location)
+        except Exception as exc:
+            raise RuntimeError("deck_reconciliation_semantic_location_unavailable") from exc
+        if type(well) is not int or not 0 <= well <= 95:
+            raise RuntimeError("deck_reconciliation_semantic_well_unavailable")
+        # Recovery observes the exact current calibrated target; it does not
+        # execute a move or require the predecessor location to exist. The
+        # target selects the same dependency scope as normal admission. All
+        # independent reference, generation, epoch, latch and CAS fences remain.
+        snapshot = self.deck_authority_snapshot(
+            expected_generation=expected_generation, _allow_recovery=True, target=location
+        )
+        if (
+            observed.get("controller_position_observation_id")
+            != snapshot["controller_position_observation_id"]
+            or any(observed.get(axis) != snapshot[f"current_{axis}"] for axis in ("x", "y", "z"))
+        ):
+            raise RuntimeError("deck_reconciliation_semantic_observation_not_bound_to_current_coordinates")
+        return {
+            **snapshot,
+            "observed_location_id": location,
+            "observed_well_id": well,
+        }
+
+    def path_planning_authority(self, *, expected_generation: int) -> dict[str, Any]:
+        """Return branch authority derived from one canonical deck snapshot."""
+        try:
+            snapshot = self.deck_authority_snapshot(expected_generation=expected_generation)
+        except RuntimeError as exc:
+            return {"ok": False, "blockers": [str(exc)]}
+        return {
             "ok": True,
-            "generation": observed_generation,
-            "board_lifecycle_generation": z.get("board_lifecycle_generation"),
-            "current_x": coordinates["x"],
-            "current_y": coordinates["y"],
-            "current_z": coordinates["z"],
-            "current_loc": machine["current_location"],
-            "current_well": machine["current_well"],
-            "tip_loaded": machine["tip_loaded"],
-            "tip_dirty": machine["tip_dirty"],
-            "clean_path": machine["clean_path"],
-            "tip_location": tip_location,
-            "gripper_confirmed": gripper_confirmed,
-            "plate_on_gantry": machine.get("plate_on_gantry"),
-            "pseudo_z_home": pseudo,
-            "source": "provider_controller_reference_store",
+            "generation": int(snapshot["ownership_generation"]),
+            "board_lifecycle_generation": int(snapshot["board_epoch_5"]),
+            "current_x": int(snapshot["current_x"]),
+            "current_y": int(snapshot["current_y"]),
+            "current_z": int(snapshot["current_z"]),
+            "current_loc": str(snapshot["current_location_id"]),
+            "current_well": int(snapshot["current_well_id"]),
+            "tip_loaded": bool(snapshot["tip_loaded"]),
+            "tip_dirty": bool(snapshot["tip_dirty"]),
+            "clean_path": bool(snapshot["clean_path"]),
+            "tip_location": int(snapshot["tip_location"]),
+            "gripper_confirmed": True,
+            "plate_on_gantry": snapshot["plate_on_gantry"],
+            "pseudo_z_home": int(snapshot["pseudo_z_home"]),
+            "authority_snapshot_digest": hashlib.sha256(
+                json.dumps(
+                    {key: value for key, value in snapshot.items() if key != "captured_at"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source": "lease_bound_canonical_deck_authority_snapshot",
         }
 
     def _establish_machine_status_baseline(self, machine: Mapping[str, Any]) -> dict[str, Any]:
-        """Resolve operator-plane machine status from controller truth.
+        """Fill non-semantic observations without inventing machine authority.
 
-        The OEM full startup pipeline is the only OEM writer of
-        ``tip_loaded``/``tip_dirty``/``current_location``/``current_well``, and
-        that pipeline is gated behind physical pipette stages. The operator
-        activate/prepare flow never runs it, so the path authority could never
-        be satisfied. Mirror the OEM MachineStatus.updateLocation semantics:
-        derive the current location from live controller positions against the
-        immutable OEM position table, and query the pipette transport for tip
-        state. Fail-closed: unresolved or unqueryable fields stay unset and the
-        authority gate remains closed. Authoritative fields already present
-        (written by the startup pipeline or a prior path execution) are never
-        overwritten.
+        Tip state may be established by the pipette owner.  Semantic location and
+        well may only come from the durable deck semantic-state contract or an
+        already persisted exact producer; controller coordinates are telemetry
+        and must never be converted to a nearest authoritative location.
         """
         resolved = dict(machine)
         # Tip state from the pipette transport (OEM queryTipStatus equivalent).
@@ -5743,7 +8953,9 @@ class Serial206OemInitializationProvider:
             tip_query = getattr(self.primitives, "query_all_pipette_tip_states", None)
             if callable(tip_query):
                 try:
-                    tip = tip_query()
+                    tip = tip_query(
+                        lifecycle_stage_id="serial206.initialize_motion.tip_baseline",
+                    )
                 except Exception:
                     tip = None
                 if (
@@ -5757,23 +8969,20 @@ class Serial206OemInitializationProvider:
                         resolved["tip_dirty"] = False
                     # A loaded tip with unknown dirty state stays unset and the
                     # authority gate remains closed (fail-closed).
-        # Current location from live controller position + immutable table
-        # (OEM updateLocation-equivalent for the operator plane).
         if resolved.get("current_location") is None or resolved.get("current_well") is None:
             read_position = getattr(self.primitives, "_read_axis_position", None)
             if callable(read_position):
                 try:
-                    x = read_position("x")
-                    y = read_position("y")
-                    if type(x) is int and type(y) is int:
-                        table = load_bound_oem_position_table()
-                        location_id, well_id = table.resolve_nearest(x=x, y=y)
-                        resolved["current_location"] = location_id
-                        resolved["current_well"] = well_id
+                    coordinates = {axis: read_position(axis) for axis in ("x", "y", "z")}
                 except Exception:
-                    # Position readback or table resolution failure keeps the
-                    # location unset; the authority gate stays closed.
-                    pass
+                    coordinates = {}
+                if all(type(coordinates.get(axis)) is int for axis in ("x", "y", "z")):
+                    resolved["controller_position_observation"] = {
+                        "x": coordinates["x"],
+                        "y": coordinates["y"],
+                        "z": coordinates["z"],
+                        "source": "controller_register_readback_telemetry_only",
+                    }
         if resolved != dict(machine):
             with self._lock:
                 state = self._load_state()
@@ -5784,13 +8993,13 @@ class Serial206OemInitializationProvider:
     def _append_z_receipt(self, z: dict[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
         receipts = list(z.get("receipts") or [])
         bounded = _json_safe(dict(receipt))
+        if isinstance(receipt.get("recovery_home"), Mapping):
+            bounded["recovery_home"] = copy.deepcopy(dict(receipt["recovery_home"]))
         # Preserve decision-grade evidence outside the deeply bounded result.
         # A large TMCL trace must not consume the global item budget before the
         # failure, endpoint, or controller-event fields are serialized.
         bounded["result_summary"] = _json_safe(receipt.get("result_summary"))
-        bounded["critical_evidence"] = Serial206OemInitializationProvider._critical_z_result_evidence(
-            receipt.get("result")
-        )
+        bounded["critical_evidence"] = dict(receipt["critical_evidence"]) if isinstance(receipt.get("critical_evidence"), Mapping) else Serial206OemInitializationProvider._critical_z_result_evidence(receipt.get("result"))
         for key in (
             "command_id", "intent", "idempotency_key", "idempotency_replay_enabled",
             "expected_generation",
@@ -5840,6 +9049,15 @@ class Serial206OemInitializationProvider:
 
         return {
             "failure": row.get("failure"),
+            **{key: row.get(key) for key in (
+                "requested_position_steps", "effective_position_steps", "pseudo_home_steps",
+                "coordinate_mode", "target_clamped", "source_return_ok", "source_return_code",
+                "source_noop", "completion_class", "controller_command_acknowledged",
+                "controller_terminal_state_verified", "physical_effect_verified", "command_issued",
+            )},
+            "terminal_z_state": {key: row["terminal_z_state"].get(key) for key in (
+                "ok", "position_steps", "speed_steps_s", "authority",
+            )} if isinstance(row.get("terminal_z_state"), Mapping) else None,
             "before_position_steps": row.get("before_position_steps"),
             "target_position_steps": row.get("target_position_steps"),
             "after_position_steps": row.get("after_position_steps"),
@@ -5957,7 +9175,13 @@ class Serial206OemInitializationProvider:
             raise RuntimeError(f"durable Z reference invalidation failed: {result}")
         return dict(result)
 
-    def _z_mark_referenced(self, *, source: str, motion_kind: str) -> dict[str, Any]:
+    def _z_mark_referenced(
+        self, *, source: str, motion_kind: str, expected_interrupt_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        with self._z_interrupt_state_lock:
+            epoch = self._z_interrupt_epoch if expected_interrupt_epoch is None else expected_interrupt_epoch
+            if self._z_interrupt_active or epoch != self._z_interrupt_epoch:
+                raise RuntimeError("Z reference superseded by safety interrupt")
         if self.reference_store is None:
             raise RuntimeError("durable Z reference publication unavailable: reference store not bound")
         try:
@@ -5973,18 +9197,43 @@ class Serial206OemInitializationProvider:
             raise RuntimeError(
                 f"durable Z reference publication failed: {type(exc).__name__}: {exc}"
             ) from exc
+        with self._z_interrupt_state_lock:
+            interrupted = self._z_interrupt_active or epoch != self._z_interrupt_epoch
+        if interrupted:
+            self._z_mark_desynced("Z publication crossed a safety interrupt.", source)
+            raise RuntimeError("Z reference superseded by safety interrupt")
         if not self._z_reference_commit_verified(result, expected_state="referenced"):
             raise RuntimeError(f"durable Z reference publication failed: {result}")
         return dict(result)
 
     def execute_z_stop_interrupt(
+        self, *, inputs: Mapping[str, Any] | None = None,
+        expected_generation: int, idempotency_key: str, abort: bool = False,
+        defer_reconciliation: bool = False,
+    ):
+        steps = self._z_stop_interrupt_steps(inputs=inputs,
+            expected_generation=expected_generation, idempotency_key=idempotency_key, abort=abort)
+        # The sole yield is after all OEM physical calls and release of the
+        # addressed delivery lease. Keep epoch/count custody until reconciliation.
+        next(steps)
+
+        def reconcile():
+            try:
+                next(steps)
+            except StopIteration as completed:
+                return completed.value
+            raise RuntimeError("unexpected Z Stop reconciliation boundary")
+
+        return reconcile if defer_reconciliation and not abort else reconcile()
+
+    def _z_stop_interrupt_steps(
         self,
         *,
         inputs: Mapping[str, Any] | None = None,
         expected_generation: int,
         idempotency_key: str,
         abort: bool = False,
-    ) -> dict[str, Any]:
+    ):
         """Deliver Z STOP before waiting for the provider lifecycle lock.
 
         A normal Z intent owns ``self._lock`` across controller execution. STOP
@@ -6003,12 +9252,26 @@ class Serial206OemInitializationProvider:
             else f"z_{interrupt_intent}_{int(time.time() * 1000)}"
         )
         safe_inputs = _json_safe(values)
-        with self._z_interrupt_dispatch_lock:
+        # Software Abort has no controller sequence to serialize. In particular,
+        # another invocation must not wait behind persistence or a reentrant
+        # provider owner. Addressed Stop retains its existing dispatch lease.
+        with ExitStack() as delivery_lease:
+            if not abort:
+                delivery_lease.enter_context(self._z_interrupt_dispatch_lock)
             with self._z_interrupt_state_lock:
                 self._z_interrupt_epoch += 1
                 interrupt_epoch = self._z_interrupt_epoch
+                self._z_interrupt_count += 1
                 self._z_interrupt_active = True
             dispatch_started_at = time.time()
+            aggregate_axes = {}
+            aggregate_reconciled = False
+            if abort:
+                with self._x_interrupt_state_lock:
+                    self._x_interrupt_epoch += 1
+                    self._x_interrupt_count += 1
+                    self._x_interrupt_active = True
+                aggregate_axes = self._begin_aggregate_software_abort(include_z=False)
             try:
                 snapshot_active: Mapping[str, Any] | None = None
                 try:
@@ -6032,6 +9295,18 @@ class Serial206OemInitializationProvider:
                     "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
+                # Serialize only the addressed OEM sequence. SQLite/lifecycle
+                # reconciliation must not fence the next explicit Stop delivery.
+                delivery_lease.close()
+                # Resume only persistence/reference reconciliation, never
+                # controller calls, outside the API's physical-delivery worker.
+                yield
+                if abort:
+                    reconciliation = self._reconcile_aggregate_software_abort(
+                        str(command_id), invalidate_x=True,
+                    )
+                    aggregate_reconciled = reconciliation["ok"] is True
+                    result["aggregate_authority_invalidation"] = reconciliation
 
                 try:
                     with self._lock:
@@ -6094,9 +9369,32 @@ class Serial206OemInitializationProvider:
                             and controller_acknowledged
                             and terminal_verified
                         )
+                        # Head.stopMotor returns void after its second MST ACK;
+                        # it does not observe terminal speed. Complete that source
+                        # command without claiming that the motor stopped. An
+                        # explicit observation failure is not this no-wait case.
+                        source_delivery_completed = bool(
+                            not abort
+                            and result.get("ok") is True
+                            and result.get("source_call_completed") is True
+                            and result.get("source_return_ok") is True
+                            and controller_acknowledged
+                            and result.get("controller_terminal_state_verified") is False
+                            and "wait" in result and result["wait"] is None
+                            and not result.get("failure")
+                        )
+                        with self._z_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._z_interrupt_epoch
+                        command_completed = bool(
+                            (stop_verified or source_delivery_completed)
+                            and generation_match and not superseded
+                        )
+                        if superseded:
+                            stop_verified = False
+                            result["failure"] = "z_interrupt_superseded_by_safety_command"
                         result.update(
                             {
-                                "ok": stop_verified,
+                                "ok": command_completed,
                                 "interrupt_epoch": interrupt_epoch,
                                 "interrupted_command_ids": sorted(interrupted_ids),
                                 "ownership_generation_match": generation_match,
@@ -6112,7 +9410,7 @@ class Serial206OemInitializationProvider:
                             "observed_generation": observed_generation,
                             "board_lifecycle_generation": z.get("board_lifecycle_generation"),
                             "inputs": safe_inputs,
-                            "status": "completed" if stop_verified else "failed",
+                            "status": "completed" if command_completed else "failed",
                             "started_at": dispatch_started_at,
                             "finished_at": time.time(),
                             "robot_http_acknowledged": True,
@@ -6126,7 +9424,7 @@ class Serial206OemInitializationProvider:
                         }
                         must_desync = bool(abort or interrupted_ids or not stop_verified or not generation_match)
                         authority_state_verified = True
-                        if must_desync:
+                        if must_desync and not superseded:
                             z.update(
                                 {
                                     "state": "failed_latched",
@@ -6166,12 +9464,23 @@ class Serial206OemInitializationProvider:
                                 receipt["status"] = "failed"
                             receipt["authority_state_verified"] = authority_state_verified
                             receipt["result"] = _json_safe(result)
+                        with self._z_interrupt_state_lock:
+                            superseded = interrupt_epoch != self._z_interrupt_epoch
+                        if superseded:
+                            # Reference callbacks can reenter the aggregate owner
+                            # too. Keep its full state and only append this receipt.
+                            state = self._load_state()
+                            z = state["z_lifecycle"]
+                            stop_verified = False
+                            command_completed = False
+                            result.update(ok=False, failure="z_interrupt_superseded_by_safety_command")
+                            receipt.update(status="failed", result=_json_safe(result))
                         durable_receipt = self._append_z_receipt(z, receipt)
                         state = self._save_state(state)
                         self._persist_z_receipt(durable_receipt)
                         final_z = state["z_lifecycle"]
                         return {
-                            "ok": bool(stop_verified and authority_state_verified),
+                            "ok": bool(command_completed and authority_state_verified),
                             "result": _json_safe(result),
                             "authority_receipt": _json_safe(receipt),
                             "z_state": final_z.get("state"),
@@ -6179,11 +9488,11 @@ class Serial206OemInitializationProvider:
                         }
                 except Exception as persistence_exc:
                     return {
-                        "ok": result.get("ok") is True,
+                        "ok": False,
                         "axis": "z",
                         "intent": interrupt_intent,
-                        "source_call_completed": True,
-                        "source_return_ok": result.get("ok") is True,
+                        "source_call_completed": result.get("source_call_completed") is True,
+                        "source_return_ok": result.get("source_return_ok", result.get("ok")) is True,
                         "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
                         "controller_terminal_state_verified": result.get("controller_terminal_state_verified") is True,
                         "physical_effect_verified": False,
@@ -6195,8 +9504,20 @@ class Serial206OemInitializationProvider:
                     }
 
             finally:
+                if abort:
+                    if self.state_store is not None:
+                        for axis, epoch in aggregate_axes.items():
+                            self.state_store.end_axis_interrupt(
+                                axis, reconciled=aggregate_reconciled, expected_epoch=epoch)
+                    with self._x_interrupt_state_lock:
+                        self._x_interrupt_count -= 1
+                        self._x_interrupt_active = bool(self._x_interrupt_count or self._x_interrupt_recovery_required)
+                # The helper owns hold publication; release only our count.
                 with self._z_interrupt_state_lock:
-                    self._z_interrupt_active = False
+                    self._z_interrupt_count -= 1
+                    self._z_interrupt_active = bool(
+                        self._z_interrupt_count or self._z_interrupt_recovery_required
+                    )
 
     def execute_z_intent(
         self,
@@ -6222,6 +9543,8 @@ class Serial206OemInitializationProvider:
                     "ok": False,
                     "blockers": ["z_safety_interrupt_in_progress"],
                 }
+        with self._x_interrupt_state_lock:
+            admitted_x_interrupt_epoch = self._x_interrupt_epoch
         with self._lock:
             with self._z_interrupt_state_lock:
                 if (
@@ -6288,6 +9611,17 @@ class Serial206OemInitializationProvider:
                         "serial206.z.board_generation_invalidation",
                     )
                     self._save_state(state)
+            derived_clean_path: bool | None = None
+            if intent == "set_clean_path":
+                clean_path_expectation = values.get("enabled")
+                if type(clean_path_expectation) is not bool:
+                    return {"ok": False, "blockers": ["clean_path expectation must be boolean"]}
+                try:
+                    derived_clean_path = self._derived_clean_path_from_tray_zero(
+                        expected_clean_path=clean_path_expectation
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    return {"ok": False, "blockers": [str(exc)]}
             safe_inputs = _json_safe(values)
             existing = next(
                 (
@@ -6338,9 +9672,9 @@ class Serial206OemInitializationProvider:
             allowed_by_state = {
                 "prepare": {"unprepared", "failed_latched"},
 
-                "manual_home": {"prepared_unreferenced", "referenced_ready"},
-                "move_z_home": {"prepared_unreferenced", "referenced_ready"},
-                "diagnostic_home_axis": {"prepared_unreferenced", "referenced_ready"},
+                "manual_home": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
+                "move_z_home": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
+                "diagnostic_home_axis": {"unprepared", "failed_latched", "prepared_unreferenced", "awaiting_operator_observation", "referenced_ready"},
                 "set_max_speed": {"prepared_unreferenced", "referenced_ready"},
                 "set_max_acc": {"prepared_unreferenced", "referenced_ready"},
                 "set_vmax": {"prepared_unreferenced", "referenced_ready"},
@@ -6458,6 +9792,9 @@ class Serial206OemInitializationProvider:
             expected_noop_pseudo_home: int | None = None
             expected_noop_effective_target: int | None = None
             try:
+                with self._z_interrupt_state_lock:
+                    if self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch:
+                        raise RuntimeError("Z admission superseded before controller dispatch")
                 if intent == "prepare":
                     preparer = self.preparation_provider
                     if preparer is None:
@@ -6587,10 +9924,11 @@ class Serial206OemInitializationProvider:
                 elif intent == "restore_original_speed":
                     result = self.primitives.z_restore_original_speed()
                 elif intent == "set_clean_path":
+                    assert derived_clean_path is not None
                     result = {
                         "ok": True,
                         "source_state": "m_controlLib.cleanPath",
-                        "clean_path": bool(values["enabled"]),
+                        "clean_path": derived_clean_path,
                         "controller_command_acknowledged": True,
                         "controller_terminal_state_verified": True,
                         "motion_commanded": False,
@@ -6599,6 +9937,9 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_stop()
             except Exception as exc:
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                critical = getattr(exc, "critical_z_evidence", None)
+                if intent == "move_absolute" and isinstance(critical, Mapping):
+                    result.update(critical)
 
             result = dict(result) if isinstance(result, Mapping) else {
                 "ok": False,
@@ -6693,7 +10034,7 @@ class Serial206OemInitializationProvider:
                 else:
                     result["board_lifecycle_generation"] = int(board_generation)
             if ok and intent in {
-                "diagnostic_home_axis", "set_home", "move_steps", "move_absolute", "clear", "path_execute",
+                "diagnostic_home_axis", "set_home", "move_steps", "clear", "path_execute",
                 "move_gz", "home_gz", "lower_pipette", "lift_pipette", "stop",
                 "self_test", "resume_after_abort",
                 "set_max_speed", "set_max_acc", "set_vmax", "set_current_max",
@@ -6701,7 +10042,7 @@ class Serial206OemInitializationProvider:
             }:
                 noop_effective = result.get("effective_position_steps")
                 verified_no_command_noop = bool(
-                    intent in {"move_absolute", "clear"}
+                    intent == "clear"
                     and type(expected_noop_requested) is int
                     and type(expected_noop_pseudo_home) is int
                     and type(expected_noop_effective_target) is int
@@ -6736,13 +10077,13 @@ class Serial206OemInitializationProvider:
                     isinstance(summary, Mapping)
                     and summary.get("short_circuit") == "MotorHome_and_CurrentPosition_zero"
                 )
-                evidence_verified = bool(
+                evidence_verified = source_short_circuit or bool(
                     result.get("controller_terminal_state_verified") is True
+                    and isinstance(summary, Mapping)
+                    and summary.get("controller_home_proof_verified") is True
                     and (
                         (
                             source_short_circuit
-                            and isinstance(summary, Mapping)
-                            and summary.get("controller_home_proof_verified") is True
                         )
                         or (
                             not source_short_circuit
@@ -6844,7 +10185,12 @@ class Serial206OemInitializationProvider:
                 try:
                     reference = self._z_mark_referenced(
                         source=f"serial206.z.{intent}",
-                        motion_kind="manual_set_home" if intent == "set_home" else "controller_proven_home",
+                        expected_interrupt_epoch=admitted_interrupt_epoch,
+                        motion_kind=(
+                            "manual_set_home" if intent == "set_home"
+                            else "source_cached_noop" if result.get("completion_class") == "source_cached_noop"
+                            else "controller_proven_home"
+                        ),
                     )
                 except Exception as exc:
                     result["reference_persistence_ok"] = False
@@ -6853,7 +10199,14 @@ class Serial206OemInitializationProvider:
                     reference_published = True
                     result["reference_persistence_ok"] = True
                     result["reference_persistence"] = _json_safe(reference)
+            with self._z_interrupt_state_lock:
+                interrupted_by_safety = bool(
+                    self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+                )
             if interrupted_by_safety:
+                ok = False
+                reference_published = False
+                result.update(ok=False, failure="z_intent_interrupted_by_safety_stop")
                 result = {
                     **dict(result),
                     "failure_stop": {
@@ -6865,12 +10218,18 @@ class Serial206OemInitializationProvider:
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
                 "failure": result.get("failure") if isinstance(result, Mapping) else None,
                 "source_return_code": result.get("source_return_code") if isinstance(result, Mapping) else None,
+                "source_return_ok": result.get("source_return_ok"),
+                "source_noop": result.get("source_noop") is True,
+                "completion_class": result.get("completion_class"),
+                "search_stop_set_home_inapplicable": result.get("search_stop_set_home_inapplicable") is True,
                 "travel_error_steps": result.get("travel_error_steps") if isinstance(result, Mapping) else None,
                 "self_test_pass": result.get("self_test_pass") if isinstance(result, Mapping) else None,
                 "initial_home_ok": bool(isinstance(result, Mapping) and isinstance(result.get("initial_move_z_home"), Mapping) and result["initial_move_z_home"].get("ok") is True),
                 "move_ok": bool(isinstance(result, Mapping) and isinstance(result.get("move"), Mapping) and result["move"].get("ok") is True),
                 "final_home_ok": bool(isinstance(result, Mapping) and isinstance(result.get("home"), Mapping) and result["home"].get("ok") is True),
             }
+            critical_z_evidence = self._critical_z_result_evidence(result)
+            receipt["critical_evidence"] = critical_z_evidence
             receipt.update({
                 "status": "completed" if ok else "failed",
                 "finished_at": time.time(),
@@ -6945,7 +10304,7 @@ class Serial206OemInitializationProvider:
                     z.update({"state": "referenced_ready", "reference_state": "referenced", "last_failure": None})
             elif ok and intent == "set_clean_path":
                 machine_status = state.setdefault("machine_status", {})
-                machine_status["clean_path"] = bool(values["enabled"])
+                machine_status["clean_path"] = result["clean_path"]
                 result["clean_path_persisted"] = True
                 z.update({"state": previous_state, "last_failure": None})
             elif ok and intent in {
@@ -6962,6 +10321,31 @@ class Serial206OemInitializationProvider:
                     "last_failure": _json_safe(receipt),
                 })
                 self._z_mark_desynced(f"Failed serial-206 Z intent {intent}.", f"serial206.z.{intent}")
+            with self._x_interrupt_state_lock:
+                x_interrupted = admitted_x_interrupt_epoch != self._x_interrupt_epoch
+            if x_interrupted:
+                # A reentrant aggregate Abort may already have committed X. Do
+                # not overwrite it with this Z operation's earlier snapshot.
+                state["x_lifecycle"] = self._load_state()["x_lifecycle"]
+                x_recovery_receipt = None
+            if (intent == "manual_home" and ok and reference_published
+                and result.get("controller_command_acknowledged") is True
+                and result.get("controller_terminal_state_verified") is True
+                and isinstance(result.get("home_summary"), Mapping)
+                and result["home_summary"].get("controller_home_proof_verified") is True
+                and result.get("completion_class") != "source_cached_noop"
+                and result.get("source_noop") is not True
+                and self.reference_store is not None and self.state_store is not None):
+                receipt["recovery_home"] = {
+                    "ownership_generation": observed_generation,
+                    "board_epoch_4": self.state_store.board4_authority_projection()["board"]["active_board_epoch"],
+                    "board_epoch_5": state["x_lifecycle"]["board_lifecycle_generation"],
+                    "owner_id": self._home_recovery_owner_id,
+                    "command_id": command_id, "started_at": receipt["started_at"],
+                    "finished_at": receipt["finished_at"],
+                    "reference_version": reference["state_version"],
+                    "interrupt_epoch": admitted_interrupt_epoch,
+                }
             durable_receipt = self._append_z_receipt(z, receipt)
             try:
                 state = self._save_state(state)
@@ -6972,15 +10356,42 @@ class Serial206OemInitializationProvider:
                         "serial206.z.reference_commit_compensation",
                     )
                 raise
-            self._persist_z_receipt(durable_receipt)
+            if ok and intent == "set_clean_path" and callable(
+                getattr(self, "_deck_semantic_state_publisher", None)
+            ):
+                self.publish_clean_path_state(
+                    expected_clean_path=bool(values["enabled"]),
+                    source_command_id=str(
+                        receipt.get("command_id")
+                        or receipt.get("receipt_id")
+                        or f"cleanPath:{time.time_ns()}"
+                    ),
+                )
             if (
                 x_recovery_receipt is not None
                 and self.state_store is not None
                 and hasattr(self.state_store, "append_serial206_receipt")
             ):
                 self.state_store.append_serial206_receipt("x", x_recovery_receipt)
+            with self._z_interrupt_state_lock:
+                interrupted_by_safety = bool(
+                    self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+                )
+            if interrupted_by_safety:
+                ok = False
+                result.update(ok=False, failure="z_intent_interrupted_by_safety_stop")
+                result_summary.update(ok=False, failure=result["failure"])
+                receipt.update(status="failed", result=_json_safe(result), result_summary=result_summary)
+                z = state["z_lifecycle"]
+                z.update(state="failed_latched", reference_state="desynced",
+                         prepared_receipt=None, board_lifecycle_generation=None,
+                         awaiting_observation_receipt_id=None, last_failure=_json_safe(receipt))
+                self._z_mark_desynced("Z completion crossed a safety interrupt.", "serial206.z.completion")
+                durable_receipt = self._append_z_receipt(z, receipt)
+                state = self._save_state(state)
+            self._persist_z_receipt(durable_receipt)
             z = state["z_lifecycle"]
-            return {"ok": ok, "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
+            return {"ok": ok, "critical_evidence": self._critical_z_result_evidence(result), "result_summary": result_summary, "result": _json_safe(result), "authority_receipt": _json_safe(receipt), "z_state": z.get("state"), "z_lifecycle": self._z_lifecycle_projection(z)}
 
     def record_z_observation(
         self,
@@ -6995,6 +10406,12 @@ class Serial206OemInitializationProvider:
         note: str,
         expected_generation: int,
     ) -> dict[str, Any]:
+        with self._z_interrupt_state_lock:
+            admitted_interrupt_epoch = self._z_interrupt_epoch
+            if self._z_interrupt_active:
+                raise ValueError("Z observation superseded by safety interrupt")
+        with self._x_interrupt_state_lock:
+            admitted_x_interrupt_epoch = self._x_interrupt_epoch
         if verdict not in {"pass", "fail"}:
             raise ValueError("Z observation verdict must be pass or fail")
         for name, value in (
@@ -7085,6 +10502,17 @@ class Serial206OemInitializationProvider:
                 "controller_terminal_state_verified": False,
             }
 
+            with self._z_interrupt_state_lock:
+                interrupted = self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+            if interrupted:
+                authority_current = False
+                state = self._load_state()
+                z = state["z_lifecycle"]
+                receipts = list(z.get("receipts") or [])
+                observation.update(authority_current=False, reference_eligible=False,
+                                   error="z_observation_interrupted_by_safety_command")
+                observation_receipt.update(observation, status="failed")
+
             # A movement-only observation of a failed/obsolete command is useful
             # historical evidence but can never publish reference authority.
             if not authority_current:
@@ -7101,7 +10529,7 @@ class Serial206OemInitializationProvider:
                 ):
                     self.state_store.append_serial206_receipt("z", match)
                 return {
-                    "ok": True,
+                    "ok": not interrupted,
                     "annotation_only": True,
                     "observation": observation,
                     "observation_receipt": _json_safe(observation_receipt),
@@ -7150,6 +10578,7 @@ class Serial206OemInitializationProvider:
                         reference = self._z_mark_referenced(
                             source="serial206.z.operator_observation",
                             motion_kind="home",
+                            expected_interrupt_epoch=admitted_interrupt_epoch,
                         )
                     except Exception as exc:
                         publication_error = f"{type(exc).__name__}: {exc}"
@@ -7199,6 +10628,25 @@ class Serial206OemInitializationProvider:
                     }
                 )
 
+            with self._z_interrupt_state_lock:
+                interrupted = self._z_interrupt_active or admitted_interrupt_epoch != self._z_interrupt_epoch
+            if interrupted:
+                operation_ok = False
+                error = "z_observation_interrupted_by_safety_command"
+                self._z_mark_desynced("Z observation crossed a safety interrupt.", "serial206.z.observation")
+                state = self._load_state()
+                z = state["z_lifecycle"]
+                receipts = list(z.get("receipts") or [])
+                z.update(state="failed_latched", reference_state="desynced",
+                         prepared_receipt=None, board_lifecycle_generation=None,
+                         awaiting_observation_receipt_id=None)
+            with self._x_interrupt_state_lock:
+                x_interrupted = admitted_x_interrupt_epoch != self._x_interrupt_epoch
+            if x_interrupted:
+                state["x_lifecycle"] = self._load_state()["x_lifecycle"]
+            if not operation_ok:
+                observation.update(reference_eligible=False, error=error)
+                observation_receipt.update(status="failed", reference_eligible=False, error=error)
             match["operator_assessment"] = _json_safe(observation)
             match["physical_effect_verified"] = bool(physical_motion_observed)
             match["observation_receipt_id"] = observation_id
@@ -7390,15 +10838,21 @@ class Serial206OemInitializationProvider:
             "initialize_motion_missing_primitives": list(primitive_status.get("initialize_motion_missing_primitives") or []),
         }
 
-    def gantry_load(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
+    def gantry_load(
+        self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None,
+        source_operation: str = "GantryLoad",
+    ) -> dict[str, Any]:
         """Persist the exact DefaultParameters.GantryLoad-derived pseudo-home state."""
+        if source_operation not in {"GantryLoad", "LoadGantry"}:
+            raise ValueError("unsupported gantry-load source operation")
         if tip_loaded is not None and type(tip_loaded) is not bool:
             raise ValueError("tip_loaded must be bool or None")
+        canonical_plate = canonical_plate_name(plate_on_gantry)
         if tip_loaded is True:
             pseudo_home = 500
-        elif plate_on_gantry is None or plate_on_gantry == "":
+        elif canonical_plate is None:
             pseudo_home = 65000
-        elif str(plate_on_gantry).upper() == "BIO_SECURITY_COVER":
+        elif canonical_plate == 3:
             pseudo_home = 65000
         else:
             pseudo_home = 500
@@ -7406,18 +10860,2524 @@ class Serial206OemInitializationProvider:
             state = self._load_state()
             machine = state["machine_status"]
             machine["tip_loaded"] = tip_loaded
-            machine["plate_on_gantry"] = plate_on_gantry
+            machine["plate_on_gantry"] = canonical_plate
             machine["psudo_z_home_steps"] = pseudo_home
             self._save_state(state)
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if callable(publisher):
+            updates = {"plate_on_gantry": canonical_plate, "pseudo_z_home": pseudo_home}
+            if tip_loaded is not None:
+                updates["tip_loaded"] = tip_loaded
+            self._publish_deck_owner_state(
+                source_operation=source_operation,
+                source_command_id=f"{source_operation}:{time.time_ns()}",
+                updates=updates,
+            )
         return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
 
-    def force_to_high_home(self) -> dict[str, Any]:
-        """Persist DefaultParameters.ForceToHighHome()."""
+    def load_gantry(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
+        return self.gantry_load(
+            tip_loaded=tip_loaded, plate_on_gantry=plate_on_gantry,
+            source_operation="LoadGantry",
+        )
+
+    def force_to_high_home(self, *, command_id: str | None = None) -> dict[str, Any]:
+        """Persist DefaultParameters.ForceToHighHome() before latch evaluation."""
         with self._lock:
             state = self._load_state()
             state["machine_status"]["psudo_z_home_steps"] = 500
+            if command_id is not None:
+                state["machine_status"]["pseudo_home_command_id"] = str(command_id)
             self._save_state(state)
-        return {"ok": True, "psudo_z_home_steps": 500, "source_anchor": "DefaultParameters.ForceToHighHome:81-84"}
+        return {
+            "ok": True,
+            "psudo_z_home_steps": 500,
+            "command_id": command_id,
+            "source_anchor": "DefaultParameters.ForceToHighHome:81-84",
+        }
+
+    def assert_deck_observation_current(self, authority: Mapping[str, Any]) -> None:
+        """Recheck independent owner/reference and semantic CAS at source seams.
+
+        Positions are not compared after a successful motion; reference versions
+        and consumed host-state ownership must not silently change underneath it.
+        """
+        stamps = self.deck_owner_authority_stamps()
+        if any(stamps[key] != authority.get(key) for key in stamps):
+            raise RuntimeError("deck_execution_owner_authority_changed")
+        if authority.get("dependency_scope") == "offset.v1":
+            refs = self.reference_store.snapshot(("x", "y", "z", "g"))
+            if any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
+                   or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
+                   for axis, version in authority["reference_versions"].items()):
+                raise RuntimeError("deck_execution_reference_authority_changed")
+            current = self._offset_deck_semantic_state(gripper_confirmed=authority["gripper_confirmed"])
+            if (current["semantic_state_revision"] != authority["machine_state_revision"]
+                    or current["transition_provenance_digest"] != authority["semantic_state_provenance_digest"]
+                    or current["consumed_state_digest"] != authority["consumed_state_digest"]):
+                raise RuntimeError("deck_execution_semantic_authority_changed")
+
+    def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None, *, no_tip_park: bool = False) -> dict[str, Any]:
+        self.invalidate_deck_authority_cache(reason="deck_execution_started")
+        if authority_snapshot is None:
+            result = self._canonical_deck_semantic_state(no_tip_park=no_tip_park)
+            # Both the fresh and admitted branches expose the same execution keys.
+            result["current_location_id"] = result.pop("current_location")
+            result["current_well_id"] = result.pop("current_well")
+            result["gripper_confirmed"] = self._deck_gripper_confirmed()
+            return result
+        if not isinstance(authority_snapshot, Mapping):
+            raise RuntimeError("deck_execution_authority_not_authoritative")
+        required_types = {
+            "tip_loaded": bool,
+            "tip_dirty": bool,
+            "tip_location": int,
+            "clean_path": bool,
+            "pseudo_z_home": int,
+            "ownership_generation": int,
+            "board_epoch_4": int,
+            "board_epoch_5": int,
+            "current_location_id": str,
+            "current_well_id": int,
+            "machine_state_revision": int,
+            "semantic_state_provenance_digest": str,
+        }
+        if authority_snapshot.get("dependency_scope", "full") == "offset.v1":
+            for key in ("tip_dirty", "tip_location", "clean_path", "current_location_id", "current_well_id"):
+                required_types.pop(key)
+            required_types["gripper_confirmed"] = bool
+            current = self._offset_deck_semantic_state(gripper_confirmed=authority_snapshot.get("gripper_confirmed"))
+            if (current["semantic_state_revision"] != authority_snapshot.get("machine_state_revision")
+                    or current["transition_provenance_digest"] != authority_snapshot.get("semantic_state_provenance_digest")
+                    or current["consumed_state_digest"] != authority_snapshot.get("consumed_state_digest")):
+                raise RuntimeError("deck_authority_changed_before_first_tx")
+        elif authority_snapshot.get("dependency_scope", "full") != "full":
+            raise RuntimeError("deck_dependency_scope_mismatch")
+        if no_tip_park:
+            collection = (self._park_collection_state()
+                          if authority_snapshot.get("current_location_id") != "LOC_PARK" else None)
+            if collection != authority_snapshot.get("collection_tip_state"):
+                raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
+            if collection is None or collection["tip_exists"] is False:
+                required_types.pop("clean_path")
+        for key, expected_type in required_types.items():
+            if type(authority_snapshot.get(key)) is not expected_type:
+                raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
+        pseudo_home = int(authority_snapshot["pseudo_z_home"])
+        if pseudo_home not in {500, 65000}:
+            raise RuntimeError("deck_execution_authority_not_authoritative:pseudo_z_home")
+        result = dict(authority_snapshot)
+        try:
+            result["plate_on_gantry"] = canonical_plate_name(authority_snapshot.get("plate_on_gantry"))
+        except ValueError as exc:
+            raise RuntimeError("deck_execution_authority_not_authoritative:plate_on_gantry") from exc
+        return result
+
+    def moveTo(
+        self,
+        *,
+        location_id: int,
+        camera_offset: bool = False,
+        barcode: bool = False,
+        authority_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute the finite diagnostic offset overload through OEM primitives."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        if type(location_id) is not int or location_id not in LOCATION_ID_TO_NAME:
+            raise ValueError("unknown finite OEM location ordinal")
+        if type(camera_offset) is not bool:
+            raise ValueError("camera_offset must be bool")
+        # btnLOC1_Click IL_065e..075c: ordinary checkbox and barcode are
+        # distinct callers of the offset overload, not synonyms for TC/RC.
+        if type(barcode) is not bool or (barcode and (location_id not in {2, 3} or not camera_offset)):
+            raise ValueError("barcode requires TC/RC with camera offsets")
+        table = load_bound_oem_position_table()
+        target_name = LOCATION_ID_TO_NAME[location_id]
+        target = table.resolve(location_id=target_name)
+        camera = table.resolve(location_id="CAMERA_OFFSET") if camera_offset else None
+        if barcode:
+            assert camera is not None
+            source_x = {2: -11847, 3: -23930}[location_id]
+            offset_x = source_x + int(camera.base_coordinates["x"])
+            offset_y = 7582 + int(camera.base_coordinates["y"])
+        else:
+            offset_x = int(camera.base_coordinates["x"]) if camera is not None else 0
+            offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
+        semantics = self._deck_execution_semantics(authority_snapshot)
+        pseudo_home = int(semantics["pseudo_z_home"])
+        gripper_confirmed = self._deck_gripper_confirmed()
+        if (semantics.get("gripper_confirmed") is not None
+                and semantics["gripper_confirmed"] is not gripper_confirmed):
+            raise RuntimeError("deck_authority_changed_before_first_tx")
+        location19 = table.resolve(location_id="LOC_RC_COVER")
+        coordinates = target.oem_offset_move_coordinates(
+            offset_x=offset_x,
+            offset_y=offset_y,
+            x_high_limit=90263,
+            y_high_limit=102956,
+        )
+        primitive = getattr(self.primitives, "oem_move_to", None)
+        if not callable(primitive):
+            raise RuntimeError("source_authority_missing:oem_move_to")
+        result = primitive(
+            coordinates["x"], coordinates["y"], int(pseudo_home),
+            pseudo_home_steps=int(pseudo_home), run_in_parallel=True,
+            gripper_confirmed=gripper_confirmed,
+            tip_loaded=bool(semantics["tip_loaded"]),
+            plate_on_gantry=semantics.get("plate_on_gantry"),
+            location19_y=int(location19.base_coordinates["y"]),
+            source_context="ClassControlInterface.btnLOC1_Click",
+        )
+        ok = isinstance(result, Mapping) and result.get("ok") is True
+        source_noop = bool(ok and result.get("source_noop") is True
+                           and result.get("controller_completion_verified") is True)
+        effective = result.get("effective_xy_target") if isinstance(result, Mapping) else None
+        effective = effective if isinstance(effective, Mapping) else {}
+        return {
+            # Critical coordinate facts survive bounded nested diagnostics.
+            "raw_requested_x_steps": int(target.base_coordinates["x"]) + offset_x,
+            "raw_requested_y_steps": int(target.base_coordinates["y"]) + offset_y,
+            "oem_requested_x_steps": coordinates["x"],
+            "oem_requested_y_steps": coordinates["y"],
+            "oem_effective_x_steps": effective.get("x"),
+            "oem_effective_y_steps": effective.get("y"),
+            "ok": ok,
+            "source_noop": source_noop,
+            "delivery_attempted": not source_noop,
+            "provider_command_id": result.get("command_id") if isinstance(result, Mapping) else None,
+            "controller_command_acknowledged": bool(
+                isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True
+            ),
+            "controller_completion_verified": bool(
+                isinstance(result, Mapping)
+                and (result.get("controller_completion_verified") is True
+                     or result.get("controller_terminal_state_verified") is True)
+            ),
+            "hardware_postcondition_verified": bool(
+                isinstance(result, Mapping) and result.get("hardware_postcondition_verified") is True
+            ),
+            "source_anchor": "ClassControlInterface.btnLOC1_Click:1932-1959->moveTo:3691-3716",
+            "primitive_result": result,
+        }
+
+    @staticmethod
+    def _deck_primitive_receipt(result: Any, *, source_anchor: str) -> dict[str, Any]:
+        row = result if isinstance(result, Mapping) else {}
+        return {
+            "ok": row.get("ok") is True,
+            "provider_command_id": row.get("command_id"),
+            "controller_command_acknowledged": row.get("controller_command_acknowledged") is True,
+            "controller_completion_verified": (
+                row.get("controller_completion_verified") is True
+                or row.get("controller_terminal_state_verified") is True
+            ),
+            "hardware_postcondition_verified": row.get("hardware_postcondition_verified") is True,
+            "source_anchor": source_anchor,
+            "primitive_result": _json_safe(result),
+        }
+
+    def moveZCamera(
+        self,
+        *,
+        location_id: int,
+        authority_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute the source-owned barcode Z continuation; callers provide no coordinates."""
+        if location_id not in {2, 3}:
+            raise ValueError("barcode Z is only defined for LOC_TC or LOC_RC")
+        table = load_bound_oem_position_table()
+        camera = table.resolve(location_id="CAMERA_OFFSET")
+        camera_z = int(camera.z_low if camera.z_low is not None else camera.base_coordinates.get("z", 0))
+        target_z = int(-1350.5511600000034 + camera_z) if location_id == 2 else camera_z
+        semantics = self._deck_execution_semantics(authority_snapshot)
+        pseudo_home = int(semantics["pseudo_z_home"])
+        primitive = getattr(self.primitives, "oem_move_z", None)
+        if not callable(primitive):
+            raise RuntimeError("source_authority_missing:oem_move_z")
+        result = primitive(target_z, pseudo_home_steps=pseudo_home, motor_current=31, wait_for_stop=True)
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.btnLOC1_Click:1932-1945->moveZ:4254-4266"
+        )
+
+    def mov_execution_machine_state(self) -> dict[str, Any]:
+        """Return server-owned ClassMoveTo state without caller aliases."""
+        from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        semantic = self._canonical_deck_semantic_state()
+        name_to_location = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+        current_name = str(semantic["current_location"])
+        if current_name not in name_to_location:
+            raise RuntimeError("mov_execution_current_location_unavailable")
+        plate_locations: dict[int, int] = {}
+        for name, location_name in dict(semantic.get("movable_plate_locations") or {}).items():
+            ordinal = OEM_PLATE_NAME_ORDINALS.get(str(name))
+            location_id = name_to_location.get(str(location_name))
+            if ordinal is not None and location_id is not None:
+                plate_locations[int(ordinal)] = int(location_id)
+        table = load_bound_oem_position_table()
+        table_rows: dict[str, Any] = {}
+        for row in table.rows():
+            name = str(row.get("location_id") or "")
+            location_id = name_to_location.get(name)
+            if location_id is not None:
+                table_rows[str(location_id)] = row
+        with self._lock:
+            legacy = dict(self._load_state().get("machine_status") or {})
+        authority = {
+            "semantic_state_revision": int(semantic["semantic_state_revision"]),
+            "ownership_generation": int(semantic["ownership_generation"]),
+            "board_epoch_4": int(semantic["board_epoch_4"]),
+            "board_epoch_5": int(semantic["board_epoch_5"]),
+            "position_table_revision": table.digest,
+        }
+        return {
+            **authority,
+            "authority_digest": hashlib.sha256(
+                json.dumps(authority, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest(),
+            "current_location": int(name_to_location[current_name]),
+            "current_well": int(semantic["current_well"]),
+            "plate_locations": plate_locations,
+            "tip_loaded": bool(semantic["tip_loaded"]),
+            "tip_dirty": bool(semantic["tip_dirty"]),
+            "tip_location": int(semantic["tip_location"]),
+            "clean_path": bool(semantic["clean_path"]),
+            "pseudo_z_home": int(semantic["pseudo_z_home"]),
+            "plate_on_gantry": semantic.get("plate_on_gantry"),
+            "thermal_door_open": legacy.get("thermal_door_open"),
+            "gripper_version": legacy.get("GripperVersion", legacy.get("gripper_version")),
+            "board_test_mode": legacy.get("BoardTestMode", legacy.get("board_test_mode")),
+            "save_tip": bool(semantic.get("save_tip", legacy.get("m_savetip", False))),
+            "old_well": bool(semantic.get("old_well", legacy.get("m_oldWell", False))),
+            "old_well_text": str(semantic.get("old_well_text", legacy.get("m_oldWellText", ""))),
+            "old_location": (
+                int(semantic["old_location"])
+                if type(semantic.get("old_location")) is int
+                else int(name_to_location[current_name])
+            ),
+            "plate_pierced": dict(semantic.get("plate_pierced") or {}),
+            "well_pierced": dict(semantic.get("well_pierced") or {}),
+            "strip_pierced": dict(semantic.get("well_pierced") or {}),
+            "trough_version": int(legacy.get("TroughVersion", legacy.get("trough_version", 0))),
+            "position_table_by_location": table_rows,
+            "scriptmove_parallel_children": (),
+        }
+
+    def wp8_operation_machine_state(
+        self, operation: str, intent_inputs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build finite-operation branch inputs only from robot-owned state/config."""
+        from .oem_initialization import build_machine_calibration_manifest
+
+        if operation not in WP8_OPERATION_INTENT_KEYS:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        from .oem_deck_movement import OEM_PIPETTE_LEAVES
+        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}:
+            # These literal leaves resolve only their selected source facts at
+            # native entry. Do not introduce a gripper GAP into every leaf.
+            return {}
+        state = dict(self.mov_execution_machine_state())
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        if manifest.get("ok") is not True:
+            raise RuntimeError("wp8_machine_calibration_unavailable")
+
+        def calibrated(section: str, name: str) -> int:
+            row = dict(dict(manifest.get(section) or {}).get(name) or {})
+            value = row.get("value")
+            if type(value) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(value)
+
+        position_reply = self.primitives.tester.motor_get_position(4, motor=2)
+        gripper_position = None
+        if isinstance(position_reply, Mapping):
+            for key in ("position", "value", "actual_position"):
+                if type(position_reply.get(key)) is int:
+                    gripper_position = int(position_reply[key])
+                    break
+        if gripper_position is None:
+            raise RuntimeError("wp8_gripper_position_unavailable")
+
+        plate_locations = {
+            int(key): int(value) for key, value in dict(state.get("plate_locations") or {}).items()
+            if type(key) is int and type(value) is int
+        }
+        plate = intent_inputs.get("plate")
+        thermal_door_open = state.get("thermal_door_open")
+        if type(thermal_door_open) is not bool:
+            thermal_door_open = None
+        snapshot: dict[str, Any] = {
+            "gripper_position": gripper_position,
+            "closed_position": calibrated("gripper", "GripperClosePOS"),
+            "plate_on_gantry": state.get("plate_on_gantry"),
+            "tip_exists": bool(state.get("tip_loaded")),
+            "door_is_open": thermal_door_open,
+            "thermal_door_open": thermal_door_open,
+            "cover_locations": {key: plate_locations[key] for key in (4, 5) if key in plate_locations},
+            "plate_locations": plate_locations,
+            "current_tray": state.get("plate_on_gantry"),
+            "output_plate_location": plate_locations.get(1),
+            "gripper_version": int(state.get("gripper_version", 1)),
+            "door_open_position": calibrated("thermal_door", "TCDoorOpen"),
+            "door_threshold": calibrated("thermal_door", "TCDoorStallGuardThreshold"),
+            "door_max_current": calibrated("thermal_door", "TC_DOOR_MAX_CURRENT"),
+            "board_test_mode": bool(state.get("board_test_mode", False)),
+            "position_table_by_location": state.get("position_table_by_location"),
+        }
+        if type(plate) is int:
+            snapshot["plate_location"] = plate_locations.get(int(plate))
+        return snapshot
+
+    def get_next_well(self, plate_name: int, material: str, offset: float) -> int:
+        method = getattr(self.primitives, "getNextWell", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:getNextWell")
+        result = method(int(plate_name), str(material), float(offset))
+        if type(result) is not int:
+            raise RuntimeError("source_authority_missing:getNextWell_return")
+        return int(result)
+
+    @staticmethod
+    def _scriptmove_argument_names(
+        arguments: Mapping[str, Any],
+    ) -> tuple[int, int, int | None, int, int, bool, str | None, Mapping[str, Any] | None]:
+        row = dict(arguments)
+        destination = int(row.pop("destination"))
+        column = int(row.pop("column", 0))
+        well = row.pop("well", None)
+        if well is not None:
+            well = int(well)
+        line = int(row.pop("row", 0))
+        position_flag = int(row.pop("positionflag", row.pop("position_flag", 0)))
+        run_parallel = bool(row.pop("runInParallel", row.pop("run_in_parallel", True)))
+        expected_digest = row.pop("expected_script_plan_digest", None)
+        source_plan = row.pop("source_plan", None)
+        if row:
+            raise ValueError(f"unexpected scriptmoveTo provider arguments: {sorted(row)}")
+        return destination, column, well, line, position_flag, run_parallel, expected_digest, source_plan
+
+    def preview_scriptmove_to(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        destination, column, well, row, position_flag, run_parallel, _expected, _source = self._scriptmove_argument_names(arguments)
+        state = self.mov_execution_machine_state()
+        return self.primitives.oem_preview_scriptmove_to(
+            current_location=int(state["current_location"]), target_location=destination,
+            column=column, row=row, well=well, position_flag=position_flag,
+            run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
+            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
+            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            gripper_confirmed=self._deck_gripper_confirmed(),
+        )
+
+    def scriptmoveTo(self, **arguments: Any) -> dict[str, Any]:
+        destination, column, well, row, position_flag, run_parallel, expected_digest, source_plan = self._scriptmove_argument_names(arguments)
+        state = self.mov_execution_machine_state()
+        return self.primitives.oem_scriptmove_to(
+            current_location=int(state["current_location"]), target_location=destination,
+            column=column, row=row, well=well, position_flag=position_flag,
+            run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
+            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
+            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            gripper_confirmed=self._deck_gripper_confirmed(),
+            expected_plan_digest=None if expected_digest is None else str(expected_digest),
+            source_plan=source_plan if isinstance(source_plan, Mapping) else None,
+        )
+
+    def updateLocation(self, *, location_id: int, well_id: int) -> dict[str, Any]:
+        return {
+            "ok": True, "delivery_attempted": False, "semantic_update_ready": True,
+            "location_id": int(location_id), "well_id": int(well_id),
+            "source_anchor": "ClassMachineStatus.updateLocation:565-653",
+        }
+
+    def updatePlateLocation(self, *, plate_name: int, location_id: int) -> dict[str, Any]:
+        return {
+            "ok": True, "delivery_attempted": False, "semantic_update_ready": True,
+            "plate_name": int(plate_name), "location_id": int(location_id),
+            "source_anchor": "ClassMachineStatus.updatePlateLocation",
+        }
+
+    def _mov_named_leaf(self, operation: str, **arguments: Any) -> dict[str, Any]:
+        method = getattr(self.primitives, operation, None)
+        if not callable(method):
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        return self._deck_primitive_receipt(
+            method(**arguments), source_anchor=f"ControlLib.movExecution:{operation}",
+        )
+
+    def rPunchFoil(self, *, plate_name: int, location_id: int) -> dict[str, Any]:
+        return self._mov_named_leaf(
+            "rPunchFoil", plate_name=int(plate_name), location_id=int(location_id),
+        )
+
+    def hokeypokey(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
+        return self._mov_named_leaf("hokeypokey", destination=int(destination), column=int(column), row=int(row))
+
+    def CirclePunch(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
+        return self._mov_named_leaf(
+            "CirclePunch", destination=int(destination), column=int(column), row=int(row),
+        )
+
+    def _mov_axis_leaf(self, operation: str, value: int) -> dict[str, Any]:
+        key = "y" if operation == "moveY" else "z"
+        state = self.mov_execution_machine_state()
+        execution = _execute_oem_steps_live(
+            [{"op": operation, key: int(value)}], self.primitives, wait_timeout_s=60.0,
+            speed=None, acc=None, pseudo_z_home_steps=int(state["pseudo_z_home"]),
+        )
+        evidence = _aggregate_executed_controller_evidence(execution)
+        return {
+            "ok": execution.get("ok") is True
+            and evidence["controller_command_acknowledged"]
+            and evidence["controller_completion_verified"],
+            **evidence, "delivery_attempted": True, "execution": _json_safe(execution),
+        }
+
+    def moveY(self, value: int) -> dict[str, Any]:
+        return self._mov_axis_leaf("moveY", int(value))
+
+    def moveZ(self, value: int) -> dict[str, Any]:
+        return self._mov_axis_leaf("moveZ", int(value))
+
+    def MoveZHome(self) -> dict[str, Any]:
+        method = getattr(self.primitives, "z_move_z_home", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:MoveZHome")
+        return self._deck_primitive_receipt(
+            method(timeout_s=30.0), source_anchor="ControlLib.movExecution:w:MoveZHome",
+        )
+
+    @staticmethod
+    def _wp8_scalar(result: Any) -> int | None:
+        if not isinstance(result, Mapping):
+            return None
+        for key in ("position", "value", "actual_position"):
+            if type(result.get(key)) is int:
+                return int(result[key])
+        return None
+
+    @staticmethod
+    def _wp8_identity(command_id: str, child_order: int, plan_digest: str) -> str:
+        return f"{command_id}:{child_order}:{plan_digest}"
+
+    def _wp8_calibration(self) -> tuple[int, dict[str, int]]:
+        from .oem_initialization import build_machine_calibration_manifest
+
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        if manifest.get("ok") is not True:
+            raise RuntimeError("wp8_machine_calibration_unavailable")
+
+        def value(section: str, name: str) -> int:
+            row = dict(dict(manifest.get(section) or {}).get(name) or {})
+            raw = row.get("value")
+            if type(raw) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(raw)
+
+        state = self.mov_execution_machine_state()
+        version = int(state.get("gripper_version", 1))
+        origin = value("gripper", "originOffsetG")
+        if version == 0:
+            positions = {
+                "stop": 53000 + origin,
+                "close": 54500 + origin,
+                "open": 58500 + origin,
+                "wide": 59500 + origin,
+            }
+        else:
+            positions = {
+                "stop": value("gripper", "GripperClosePOS"),
+                "close": value("gripper", "GripperClosePOS"),
+                "open": value("gripper", "GripperOpenPOS"),
+                "wide": value("gripper", "GripperOpenWide"),
+            }
+        return version, positions
+
+    def _wp8_set_axis_parameter(
+        self, *, board: int, motor: int, parameter: int, value: int, source_anchor: str,
+    ) -> dict[str, Any]:
+        write = self.primitives.tester.motor_set_axis_param(
+            int(board), int(parameter), int(value), motor=int(motor),
+        )
+        readback = self.primitives.tester.motor_get_axis_param(
+            int(board), int(parameter), motor=int(motor),
+        )
+        acknowledged = bool(isinstance(write, Mapping) and write.get("ok") is True)
+        verified = acknowledged and self._wp8_scalar(readback) == int(value)
+        return {
+            "ok": verified,
+            "delivery_attempted": True,
+            "controller_command_acknowledged": acknowledged,
+            "controller_completion_verified": verified,
+            "board": int(board),
+            "motor": int(motor),
+            "parameter": int(parameter),
+            "value": int(value),
+            "write": _json_safe(write),
+            "readback": _json_safe(readback),
+            "source_anchor": source_anchor,
+        }
+
+    def _wp8_move_gripper(self, target: int, *, source_anchor: str) -> dict[str, Any]:
+        result = self.primitives.tester.motor_oem_move_absolute(
+            4, int(target), motor=2, wait_for_stop=True,
+        )
+        receipt = self._deck_primitive_receipt(result, source_anchor=source_anchor)
+        return {**receipt, "delivery_attempted": True, "target": int(target)}
+
+    def wp8_sleep(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation
+        return self.primitives.sleep(int(arguments["milliseconds"]))
+
+    def wp8_load_gantry(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        plate = None if operation == "LoadGantryNull" else arguments.get("plate")
+        return self.load_gantry(plate_on_gantry=plate)
+
+    def wp8_move_z_home(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation, arguments
+        return self.MoveZHome()
+
+    def wp8_park_gantry(self, operation: str, arguments: Mapping[str, Any], **context: Any) -> Any:
+        del operation
+        rehome = bool(arguments.get("rehome", False))
+        checker = None
+        if rehome:
+            checker = self._wp8_execution_fence_checker
+            command_id = context["command_id"]
+            def before_entry(boundary: str) -> None:
+                checker(command_id, boundary=boundary)
+            return self.parkGantry(rehome=True, before_native_entry=before_entry)
+        return self.parkGantry(rehome=False)
+
+    def wp8_scriptmove_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
+        del operation
+        return self.scriptmoveTo(**dict(arguments))
+
+    def wp8_get_g(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        del operation, arguments
+        raw = self.primitives.tester.motor_get_position(4, motor=2)
+        position = self._wp8_scalar(raw)
+        if position is None:
+            raise RuntimeError("wp8_gripper_position_unavailable")
+        return {
+            "ok": True,
+            "delivery_attempted": False,
+            "position": position,
+            "controller_command_acknowledged": False,
+            "controller_completion_verified": True,
+            "readback": _json_safe(raw),
+            "source_anchor": "ClassControlInterface.getG",
+        }
+
+    def wp8_set_gripper_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_set_axis_parameter(
+            board=4, motor=2, parameter=6, value=int(arguments["current"]),
+            source_anchor="ClassControlInterface.setGripperCurrent",
+        )
+
+    def wp8_set_gripper_vmax(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_set_axis_parameter(
+            board=4, motor=2, parameter=4, value=int(arguments["vmax"]),
+            source_anchor="ClassControlInterface.setGripperVMax",
+        )
+
+    def wp8_open_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = self.wp8_set_gripper_vmax(
+            operation, {"vmax": 100 if version == 0 else 1500},
+        )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.OpenGripper:setStallGuardThreshold",
+            )
+        target = positions["wide" if operation == "OpenGripperWide" else "open"]
+        move = self._wp8_move_gripper(
+            target,
+            source_anchor="ClassControlInterface.OpenGripper",
+        )
+        ok = current["ok"] and speed["ok"] and (stall is None or stall["ok"]) and move["ok"]
+        return {
+            **move, "ok": ok, "recover": bool(arguments.get("recover", False)),
+            "wide": operation == "OpenGripperWide", "current": current,
+            "speed": speed, "stall": stall,
+        }
+
+    def wp8_close_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = self.wp8_set_gripper_vmax(
+            operation, {"vmax": 100 if version == 0 else 1500},
+        )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.CloseGripper:setStallGuardThreshold",
+            )
+        move = self._wp8_move_gripper(
+            positions["close"], source_anchor="ClassControlInterface.CloseGripper",
+        )
+        return {
+            **move,
+            "ok": current["ok"] and speed["ok"] and (stall is None or stall["ok"]) and move["ok"],
+            "current": current, "speed": speed, "stall": stall,
+        }
+
+    def wp8_stop_close_gripper(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        version, positions = self._wp8_calibration()
+        current = self.wp8_set_gripper_current(operation, {"current": 31})
+        speed = None
+        if bool(arguments.get("reset_speed", True)) or version != 0:
+            speed = self.wp8_set_gripper_vmax(
+                operation, {"vmax": 100 if version == 0 else 1500},
+            )
+        stall = None
+        if version == 0:
+            stall = self._wp8_set_axis_parameter(
+                board=4, motor=2, parameter=205, value=5,
+                source_anchor="ClassControlInterface.StopCloseGripper:setStallGuardThreshold",
+            )
+        move = self._wp8_move_gripper(
+            positions["stop"], source_anchor="ClassControlInterface.StopCloseGripper",
+        )
+        idle = self.wp8_set_gripper_current(operation, {"current": 10}) if version == 1 else None
+        return {
+            **move,
+            "ok": current["ok"] and (speed is None or speed["ok"])
+            and (stall is None or stall["ok"]) and move["ok"]
+            and (idle is None or idle["ok"]),
+            "current": current, "speed": speed, "stall": stall, "idle_current": idle,
+        }
+
+    def wp8_move_g_closed_plus(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        _version, positions = self._wp8_calibration()
+        method = getattr(self.primitives, "oem_move_axis_absolute", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:oem_move_axis_absolute")
+        result = method(
+            "g", positions["close"] + int(arguments["offset"]), wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveG",
+        )
+
+    def wp8_send_gripper_home(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        version, _positions = self._wp8_calibration()
+        result = self.primitives.tester.motor_oem_home_axis(
+            "g", speed=600 if version == 0 else 200, timeout_s=30.0,
+            startup=False, restore_idle_current=version == 1, oem_exact_current=True,
+        )
+        receipt = self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.sendGripperHome",
+        )
+        # sendGripperHome is void: it ignores goHome/setMaxCurrent numerical
+        # returns. Adapt only this native composite, not arbitrary missing-ok
+        # primitives. Raised exceptions still escape unchanged; a represented
+        # source exception is not a normal void return either.
+        row = result if isinstance(result, Mapping) else {}
+        home = row.get("home")
+        board_null = row.get("source_noop") == "board_null"
+        source_completed = bool(
+            row.get("axis") == "g" and isinstance(home, Mapping)
+            and not home.get("source_exception")
+            and (
+                (board_null and home.get("source_noop") is True and home.get("ok") is True)
+                or (
+                    row.get("startup") is False
+                    and isinstance(row.get("prepare"), Mapping)
+                    and (isinstance(row.get("restore_current"), Mapping) if version == 1
+                         else row.get("restore_current") is None)
+                    and type(home.get("source_return_code")) is int
+                )
+            )
+        )
+        return {
+            **receipt,
+            "ok": source_completed,
+            "source_call_completed": source_completed,
+            "source_return_kind": "void",
+            # This is operational source evidence, not a bounded diagnostic.
+            "primitive_result": result,
+            "physical_effect_verified": False,
+            "independent_physical_motion_verified": False,
+        }
+
+    def wp8_lock_gripper(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, dispatch_attempt_id: str,
+        ownership_generation: int, board_epoch_4: int, board_epoch_5: int,
+        acquiring_identity: str | None = None, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        token = Wp8GripperLockToken(
+            command_id=str(command_id),
+            acquiring_identity=(
+                str(acquiring_identity)
+                if acquiring_identity is not None
+                else f"child:{int(child_order)}:{str(operation)}"
+            ),
+            plan_digest=str(plan_digest), dispatch_attempt_id=str(dispatch_attempt_id),
+            ownership_generation=int(ownership_generation),
+            board_epoch_4=int(board_epoch_4), board_epoch_5=int(board_epoch_5),
+        )
+        self._wp8_gripper_lock.acquire()
+        with self._wp8_task_lock:
+            self._wp8_gripper_lock_owner = token
+        return {"ok": True, "delivery_attempted": False, "lock_token": token.receipt()}
+
+    def wp8_release_gripper_lock(
+        self, operation: str, arguments: Mapping[str, Any], *, lock_token: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        supplied = Wp8GripperLockToken.from_receipt(lock_token)
+        with self._wp8_task_lock:
+            owner = self._wp8_gripper_lock_owner
+            if owner is None:
+                return {"ok": True, "delivery_attempted": False, "source_noop": True}
+            if owner != supplied:
+                raise RuntimeError("wp8_gripper_lock_wrong_owner")
+            self._wp8_gripper_lock_owner = None
+        self._wp8_gripper_lock.release()
+        return {"ok": True, "delivery_attempted": False, "released_lock_token": supplied.receipt()}
+
+    def bind_wp8_background_task_settler(self, settler: Callable[..., None]) -> None:
+        if not callable(settler):
+            raise TypeError("WP8 background task settler must be callable")
+        self._wp8_background_task_settler = settler
+
+    def bind_wp8_execution_fence_checker(self, checker: Callable[..., None]) -> None:
+        if not callable(checker):
+            raise TypeError("WP8 execution fence checker must be callable")
+        self._wp8_execution_fence_checker = checker
+
+    def bind_wp8_background_worker_starter(
+        self, starter: Callable[[threading.Thread, str], None],
+    ) -> None:
+        if not callable(starter):
+            raise TypeError("WP8 background worker starter must be callable")
+        self._wp8_background_worker_starter = starter
+
+    def _wp8_start_task(
+        self, *, task_id: str, target: Callable[[], Any], task_kind: str,
+        command_id: str, child_order: int, plan_digest: str,
+    ) -> dict[str, Any]:
+        worker_starter = getattr(self, "_wp8_background_worker_starter", None)
+        if not callable(worker_starter):
+            raise RuntimeError("wp8_background_worker_starter_missing")
+        fence_checker = getattr(self, "_wp8_execution_fence_checker", None)
+        if not callable(fence_checker):
+            raise RuntimeError("wp8_execution_fence_checker_missing")
+        authority = self.deck_owner_authority_stamps()
+        row: dict[str, Any] = {
+            "state": "created", "kind": task_kind, "result": None, "error": None,
+            "command_id": command_id, "child_order": int(child_order),
+            "plan_digest": plan_digest,
+            "ownership_generation": authority.get("ownership_generation"),
+            "board_epoch_4": authority.get("board_epoch_4"),
+            "board_epoch_5": authority.get("board_epoch_5"),
+        }
+
+        def run() -> None:
+            row["state"] = "running"
+            try:
+                fence_checker(
+                    command_id,
+                    boundary=f"before_background_child_{int(child_order)}",
+                )
+                row["result"] = target()
+                if isinstance(row["result"], Mapping) and row["result"].get("ok") is False:
+                    row["error"] = {"type": "NestedOperationFailure", "message": "background operation returned ok=false"}
+                    row["state"] = "failed"
+                else:
+                    row["state"] = "completed"
+            except Exception as exc:
+                row["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                row["state"] = "failed"
+            finally:
+                settler = getattr(self, "_wp8_background_task_settler", None)
+                if callable(settler):
+                    settler(
+                        task_id,
+                        state=str(row["state"]),
+                        evidence={"result": row["result"], "error": row["error"]},
+                    )
+
+        thread = threading.Thread(target=run, name=task_id, daemon=True)
+        row["thread"] = thread
+        with self._wp8_task_lock:
+            if task_id in self._wp8_tasks:
+                raise RuntimeError("wp8_background_task_identity_conflict")
+            self._wp8_tasks[task_id] = row
+        worker_starter(thread, command_id)
+        return {
+            "ok": True, "delivery_attempted": False,
+            "background_task_id": task_id,
+            "background_task_state": "running_unawaited",
+        }
+
+    def wp8_start_move_z_pseudo_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":z-home"
+        return self._wp8_start_task(
+            task_id=task_id,
+            task_kind="move_z_pseudo_home",
+            target=lambda: self.wp8_move_z_pseudo_home(operation, {}),
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_start_gripper_home_and_unlock(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":gripper-home"
+        with self._wp8_task_lock:
+            lock_token = self._wp8_gripper_lock_owner
+        if lock_token is None:
+            raise RuntimeError("wp8_gripper_lock_owner_missing")
+
+        def work() -> dict[str, Any]:
+            home: Mapping[str, Any] | None = None
+            try:
+                home = self.wp8_send_gripper_home(operation, {})
+            finally:
+                released = self.wp8_release_gripper_lock(
+                    operation, {}, lock_token=lock_token.receipt(),
+                )
+            return {"ok": home.get("ok") is True and released.get("ok") is True, "home": home, "released": released}
+
+        return self._wp8_start_task(
+            task_id=task_id, task_kind="gripper_home_and_unlock", target=work,
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_wait_move_z_only(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        with self._wp8_task_lock:
+            matches = [
+                (task_id, row) for task_id, row in self._wp8_tasks.items()
+                if row.get("kind") == "move_z_pseudo_home"
+                and row.get("command_id") == command_id
+                and row.get("plan_digest") == plan_digest
+            ]
+        if len(matches) != 1:
+            raise RuntimeError("wp8_z_background_task_unavailable")
+        task_id, row = matches[0]
+        if row is None or not isinstance(row.get("thread"), threading.Thread):
+            raise RuntimeError("wp8_z_background_task_unavailable")
+        timeout_ms = int(arguments.get("timeout_ms", 30000))
+        if timeout_ms <= 0 or timeout_ms > 500000:
+            raise ValueError("wp8_z_background_task_timeout_invalid")
+        row["thread"].join(timeout=float(timeout_ms) / 1000.0)
+        if row["thread"].is_alive():
+            raise RuntimeError("wp8_z_background_task_timeout")
+        if row.get("state") != "completed":
+            raise RuntimeError(f"wp8_z_background_task_failed:{row.get('error')}")
+        return {"ok": True, "delivery_attempted": False, "background_task_id": task_id, "result": row.get("result")}
+
+    @staticmethod
+    def _oem_int32(value: Any) -> int:
+        if not isinstance(value, str) or not value.strip() or any(c not in "+-0123456789" for c in value.strip()):
+            raise ValueError("oem_int32_invalid")
+        result = int(value)
+        if not -(2 ** 31) <= result < 2 ** 31:
+            raise ValueError("oem_int32_overflow")
+        return result
+
+    @classmethod
+    def _oem_enum(cls, value: str, names: Mapping[str, int], *, ignore_case: bool = True) -> int | None:
+        # Enum.TryParse accepts numeric (including undefined) enum values.
+        text = value.strip()
+        for name, ordinal in names.items():
+            if text.casefold() == name.casefold() if ignore_case else text == name:
+                return ordinal
+        try:
+            return cls._oem_int32(text)
+        except ValueError:
+            return None
+
+    def build_oem_pipette_source_callbacks(
+        self, *, execute_plan: Callable, start_child: Callable, stopped: Callable,
+        rgb_writer: Callable | None = None, source_error_event: Callable | None = None,
+        settings: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Bind D's finite source bodies to canonical WP8 execution, not RAM prep.
+
+        The caller carries a distinct trusted occurrence through execute_plan
+        for every invocation (including repeated identical plans). Child task
+        creation and stop disposition stay with the existing executor owner.
+        """
+        from .services.pipette_service import OemPipetteSourceBindings
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        from .oem_compat.position_table import well_id_from_label
+        from .oem_deck_movement import _pierced
+
+        captured = copy.deepcopy(dict(settings or {}))
+        if rgb_writer is not None:
+            self._oem_pipette_rgb_writer = rgb_writer
+
+        def run(operation, action, state, **inputs):
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True, **inputs)
+            return execute_plan(plan, action, state)
+
+        def leaf(operation, keys):
+            def call(*args):
+                *values, action, state = args
+                if len(values) != len(keys):
+                    raise TypeError(f"{operation}: wrong source arguments")
+                return run(operation, action, state, **dict(zip(keys, values)))
+            return call
+
+        def facts(action, state):
+            machine = self.mov_execution_machine_state()
+            semantic = self._canonical_deck_semantic_state()
+            status = self.primitives.pipette_transport.get_status()  # cached source values only
+            channel = status["channels"][0]  # ClassPipetteCollection.Speed/FluidLevel
+            location = machine["current_location"]
+            name = LOCATION_ID_TO_NAME[location]
+            row = load_bound_oem_position_table().resolve(location_id=name)
+            return {"current_location": location, "current_well": machine["current_well"],
+                    "current_tray": semantic["current_tray"], "tip_type": status["tip_type"],
+                    "tip_location": machine["tip_location"], "fluid_level": channel["liquid_level_ul"],
+                    "speed": channel["top_speed"], "current_location_name": name, "z_high": row.z_high}
+
+        def script_move(location, column, row, action, state, *, flag=0, parallel=True):
+            return run("pipette_script_move", action, state, destination=location, column=column,
+                       row=row, position_flag=flag, run_in_parallel=parallel)
+
+        def transition(tray, wells, change, label, zone, action, state):
+            # Labels and zones are D/B source inventory; occupancy has one owner.
+            return run("pipette_tip_transition", action, state, tray_id=int(tray),
+                       well_ids=list(wells), transition=change)
+
+        def lift_air(action, state):
+            location = facts(action, state)["current_location"]
+            height = 64503 if location == 16 else 54425 if location == 3 else 38299 if location in (11, 12, 13, 14) else 28220
+            return run("pipette_lift", action, state, location=location, height=height)
+
+        def is_pierced(plate, well, single, action, state):
+            return _pierced({**self.mov_execution_machine_state(), "tip_location": 0 if single else -1}, plate, well)
+
+        def remove_tip(tray, well, action, state):
+            first = well_id_from_label(well)
+            return transition(tray, [first + 24 * i for i in range(4)], "remove", None, None, action, state)
+
+        def move_waste(action, state):
+            return run("pipette_waste", action, state, location=6, offset_x=0, offset_y=0,
+                       run_in_parallel=False)
+
+        def hotel(action, state):
+            return run("pipette_hotel", action, state, location=15, column=0, row=1,
+                       high_pos=True, run_in_parallel=False)
+
+        native = OemPipetteSourceBindings(
+            facts=facts, lift_to=leaf("pipette_lift", ("location", "height")),
+            lower_to=leaf("pipette_lower", ("location",)), move_xy=leaf("pipette_move_xy", ("x", "y")),
+            position=leaf("pipette_position", ()), home=leaf("pipette_home", ("rehome",)),
+            tip_state=leaf("pipette_tip_state", ("changes",)), is_pierced=is_pierced,
+            pierce=leaf("pipette_pierce", ("plate", "well", "single")),
+            z_low=lambda location, action, state: load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[location]).z_low,
+            set_color=leaf("pipette_color", ("r", "g", "b")), stall_guard=leaf("pipette_stall", ("value",)),
+            lower_pipette=leaf("pipette_lower_pipette", ("location",)),
+            lift_pipette=leaf("pipette_lift_pipette", ("location",)), snapshot=leaf("pipette_snapshot", ("name",)),
+            shift_camera=leaf("pipette_shift_camera", ()), unlock=leaf("pipette_unlock", ()),
+            hotel_move=hotel, tip_transition=transition,
+            tip_exists=lambda action, state: self._park_collection_state()["tip_exists"],
+            start_child=lambda name, call, action, state: start_child(name, call),
+            stopped=lambda action, state: stopped(), script_move=script_move,
+            publish_location=leaf("pipette_location", ("destination", "well")),
+            move_z=leaf("pipette_move_z", ("value",)), move_x=leaf("pipette_move_x", ("value",)),
+            set_z_current_max=leaf("pipette_current", ("value",)), source_error_event=source_error_event,
+            led2_on=leaf("pipette_led2", ()), take_aspirate_image=leaf("script_snapshot", ()),
+            source_capabilities=frozenset(name for name, method in (
+                ("aspirate_pressure_stream", "aspirate_for_oem_script"),
+                ("dispense_pressure_stream", "dispense_for_oem_script"),
+                ("query_tip_status_single", "query_tip_status_for_oem_script"))
+                if callable(getattr(self.primitives.pipette_transport, method, None))),
+            sleep=self.sleep,
+        )
+        return dict(source_bindings=native, settings=captured,
+            script_move=lambda location, row, action, state: script_move(location, 0, row, action, state),
+            publish_location=native.publish_location,
+            publish_tip_transition=lambda tray, wells, action, state: transition(tray, wells, "restore", None, None, action, state),
+            lift_for_air=lift_air, move_to_waste=move_waste, move_z=native.move_z, move_x=native.move_x,
+            tip_load_move=lambda location, column, row, action, state: script_move(location, column, row, action, state, flag=2, parallel=False),
+            move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
+            remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
+
+    def wp8_pipette_source_leaf(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """Literal finite source adapters; native policy and returns stay native."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        def publish(name, updates):
+            return self._wp8_publish_semantic(operation=name, command_id=command_id,
+                child_order=child_order, plan_digest=plan_digest, updates=updates)
+
+        if operation == "sourceTipState":
+            changes = dict(arguments["changes"])
+            if not changes or set(changes) - {"tip_loaded", "tip_dirty", "tip_location"}:
+                raise ValueError("invalid source tip-state fields")
+            return publish("pipette_owner", changes)
+        if operation == "sourceWellPierced":
+            marker = "strip" if arguments["plate"] in (7, 8, 9, 10) else int(arguments["single"])
+            return publish(operation, {"well_pierced": [arguments["plate"], arguments["well"], marker]})
+        if operation == "sourceTipTransition":
+            identity = self._wp8_identity(command_id, child_order, plan_digest)
+            result = self.publish_tip_tray_transition(tray_id=arguments["tray_id"],
+                transition=arguments["transition"], operation_id=identity, command_id=command_id,
+                provenance={"source_operation": operation, "source_child": identity}, well_ids=list(arguments["well_ids"]))
+            return {"ok": True, "delivery_attempted": False, "published": result}
+        if operation in {"sourceLiftTo", "sourceLowerTo"}:
+            row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+            height = arguments.get("height")
+            target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
+            if type(target) is not int:
+                raise RuntimeError("source_pipette_z_calibration_missing")
+            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0}
+        if operation == "sourceMoveXY":
+            return self.primitives.oem_move_xy(arguments["x"], arguments["y"])
+        if operation == "sourcePosition":
+            positions = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
+            return {"ok": True, "delivery_attempted": True, **positions}
+        if operation == "sourceHomeZ":
+            rehome = arguments["rehome"]
+            result = self.primitives.tester.motor_oem_move_z_home(rehome=True if rehome is None else rehome, timeout_s=30.0)
+            if isinstance(result.get("set_z_current_param6"), Mapping) and result["set_z_current_param6"].get("ok") is True:
+                self.primitives._z_profile_overrides[6] = 31
+            source_return = result.get("source_return_code")
+            if source_return is None and isinstance(result.get("home"), Mapping):
+                source_return = result["home"].get("source_return_code")
+            return {**dict(result), "source_return": source_return, "delivery_attempted": not bool(result.get("source_noop"))}
+        if operation == "sourceZCurrent":
+            return self.primitives.z_set_current_max(arguments["value"])
+        if operation == "sourceZStall":
+            value = arguments["value"]
+            if value in (None, 0):
+                value = self.primitives.tester._motion_oem_axis_profile("z")["stall_guard"]
+            return self.primitives._z_set_profile_parameter(param=205, value=value,
+                intent="source_set_stall_guard", source_method="ClassControlInterface.setStallGuard:4869-4907")
+        if operation == "sourceLiftPipette":
+            return self.primitives.z_pipette_position(location_id=LOCATION_ID_TO_NAME[arguments["location"]], operation="lift_pipette")
+        if operation in {"sourceRelativeX", "sourceRelativeY"}:
+            axis = "x" if operation == "sourceRelativeX" else "y"
+            board, motor = (5, 0) if axis == "x" else (4, 0)
+            return self.primitives.tester.motor_oem_board_move_steps(board, arguments["steps"], motor=motor, axis=axis)
+        if operation == "sourceWellMoveTo":
+            table = load_bound_oem_position_table()
+            row = table.resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+            xyz = row.oem_move_to_coordinates(column=arguments["column"], row=arguments["row"], high_pos=arguments["high_pos"])
+            state = self.mov_execution_machine_state()
+            return self.primitives.oem_move_to(xyz["x"], xyz["y"], xyz["z"],
+                pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments["run_in_parallel"],
+                gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+                plate_on_gantry=state.get("plate_on_gantry"),
+                location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]))
+        if operation == "sourceConfirmGripper":
+            return {"ok": True, "source_return": self._deck_gripper_confirmed(), "delivery_attempted": True}
+        if operation == "sourceHomeGripper":
+            return self.primitives.tester.motor_oem_home_axis_board_test("g", timeout_s=30.0)
+        if operation == "sourceUnlatch":
+            result = self.primitives.tester.deck_io_set_type(2, 0)
+            if not isinstance(result, Mapping) or result.get("ok") is not True:
+                return {"ok": False, "delivery_attempted": True, "primitive_result": result}
+            return {**publish(operation, {"latch_closed": False}), "delivery_attempted": True, "primitive_result": result}
+        if operation == "sourceColor":
+            writer = getattr(self, "_oem_pipette_rgb_writer", None)
+            if not callable(writer):
+                raise RuntimeError("source_authority_missing:RGB")
+            rgb = tuple(max(0, min(255, arguments[key])) for key in ("r", "g", "b"))
+            if self._oem_source_rgb == rgb:
+                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            result = writer(*rgb)
+            self._oem_source_rgb = rgb
+            if not isinstance(result, Mapping):
+                raise RuntimeError("source_authority_invalid:RGB")
+            return dict(result)
+        raise RuntimeError(f"source_authority_missing:{operation}")
+
+    def build_oem_native_handlers(
+        self, *, settings: Mapping[str, Any], execute_plan: Callable[..., Any],
+        execute_mov: Callable[..., Any] | None = None,
+        rgb_writer: Callable[..., Any] | None = None,
+        rgb_board_present: bool = True,
+        barcode_reader: Callable[[], str] | None = None,
+        execute_thermal: Callable[..., Any] | None = None,
+    ) -> dict[str, Callable[..., Any]]:
+        """Finite source bindings; execute_plan is the existing canonical WP8 owner.
+
+        It receives (compiled_plan, action, runtime_state), owns admitted native
+        children and returns their explicit outcome/owned_children unchanged.
+        No public method selection, default handler or independent worker exists.
+        """
+        from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        captured = copy.deepcopy(dict(settings))
+        location_names = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+
+        def plan(operation: str, inputs: Mapping[str, Any], action: Any, state: Any) -> Any:
+            machine = self.wp8_operation_machine_state(operation, inputs)
+            if operation == "cut_seal":
+                row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[24])
+                if row.z_low is None:
+                    raise RuntimeError("source_authority_missing:cut_zLow")
+                machine.update(cut_x=int(row.base_coordinates["x"]), cut_z=int(row.z_low) - captured["CutZ_Offset"])
+            if operation == "shakeoff":
+                machine["current_location"] = self.mov_execution_machine_state()["current_location"]
+                reply = self.primitives.motor_get_position(4, motor=1)
+                if not isinstance(reply, Mapping):
+                    raise RuntimeError("source_authority_missing:getZPosition")
+                machine["z_position"] = self.primitives._position_value(reply)
+            compiled = compile_finite_plate_operation(operation, source_leaf_available=True, **{**machine, **dict(inputs)})
+            return execute_plan(compiled, action, state)
+
+        def raw(action: Any) -> tuple[str, ...]:
+            args = action.params["arguments"]
+            if not isinstance(args, (list, tuple)) or not all(isinstance(v, str) for v in args):
+                raise ValueError("oem_raw_arguments_required")
+            return tuple(args)
+
+        def park(action: Any, state: Any) -> Any:
+            return plan("park_gantry", {"rehome": True}, action, state)
+
+        def catch(action: Any, state: Any) -> Any:
+            plate = self._oem_enum(raw(action)[0], OEM_PLATE_NAME_ORDINALS)
+            if plate is None:
+                raise ValueError("Need to specify plate name to catch it")
+            state.source_model.allow_to_stop = False
+            result = plan("catch_plate", {"plate": plate, "run_in_parallel": True}, action, state)
+            if "plate_on_gantry" in result.get("residual_state", {}):
+                state.source_model.carried_plate_present = result["residual_state"]["plate_on_gantry"] is not None
+            return {**result, "source_allow_to_stop": False}
+
+        def release(action: Any, state: Any) -> Any:
+            args = raw(action)
+            plate = self._oem_enum(args[0], OEM_PLATE_NAME_ORDINALS)
+            if plate is not None:
+                location = self.mov_execution_machine_state()["plate_locations"][plate]
+            else:
+                location = self._oem_enum(args[0], location_names, ignore_case=False)
+                if location is None:
+                    raise ValueError("oem_location_enum_invalid")
+            result = plan("release_plate", {"destination": location, "press_plate": len(args) > 1 and args[1] == "pressplate", "run_in_parallel": True}, action, state)
+            state.source_model.allow_to_stop = True
+            if "plate_on_gantry" in result.get("residual_state", {}):
+                state.source_model.carried_plate_present = result["residual_state"]["plate_on_gantry"] is not None
+            return {**result, "source_allow_to_stop": True}
+
+        def press(action: Any, state: Any) -> Any:
+            # Ignored TryParse failure writes the enum default, not omission.
+            plates = [self._oem_enum(v, OEM_PLATE_NAME_ORDINALS) for v in raw(action)]
+            return plan("press_plates", {"plates": [0 if p is None else p for p in plates], "run_in_parallel": True}, action, state)
+
+        def cutseal(action: Any, state: Any) -> Any:
+            args = raw(action)
+            return plan("cut_seal", {"count": self._oem_int32(args[0]) if args else 4}, action, state)
+
+        def shakeoff(action: Any, state: Any) -> Any:
+            return plan("shakeoff", {"count": self._oem_int32(raw(action)[0])}, action, state)
+
+        def door(action: Any, state: Any, opening: bool) -> Any:
+            inspect = opening and captured["DeckInspection"] and captured["StartMode"] in (1, 2)
+            if inspect and barcode_reader is None:
+                raise RuntimeError("source_authority_missing:ReadBarcode")
+            result = dict(plan("thermal_door", {"open": opening, "script_running": True}, action, state))
+            if type(result.get("source_return")) is not bool:
+                raise RuntimeError("source_authority_missing:doorOpen_return")
+            if not result["source_return"]:
+                result.update(source_stop_scripts=True, source_board_error_event="Could not verify door open sensor" if opening else "Could not verify door close sensor")
+            if inspect:
+                assert barcode_reader is not None
+                barcode = barcode_reader()
+                if barcode in ("", "BLACK"):
+                    barcode = barcode_reader()
+                    if barcode == "" or barcode != "BLACK":
+                        result.update(source_error_hold=True, source_error_event="Barcode read error during TC door open")
+            return result
+
+        def snapshot(action: Any, state: Any) -> Any:
+            if not captured["CheckSnapTips"]:
+                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            return plan("script_snapshot", {}, action, state)
+
+        def led(action: Any, state: Any) -> Any:
+            args = raw(action)
+            rgb = tuple(max(0, min(255, self._oem_int32(v))) for v in args[:3])
+            if len(rgb) != 3:
+                raise ValueError("oem_rgb_arguments_required")
+            self._oem_source_rgb = rgb  # Source cache changes before the native call.
+            if not rgb_board_present:
+                return {"ok": True, "source_noop": "m_board_null", "rgb": rgb, "delivery_attempted": False}
+            assert rgb_writer is not None
+            result = rgb_writer(*rgb)
+            if not isinstance(result, Mapping) or type(result.get("ok")) is not bool:
+                raise RuntimeError("source_authority_missing:setColor_return")
+            return {**result, "rgb": rgb}
+
+        handlers = {"park": park, "catchPlate": catch, "catch": catch,
+                    "releasePlate": release, "release": release, "pressp": press,
+                    "cutseal": cutseal, "so": shakeoff,
+                    "dopen": lambda a, s: door(a, s, True),
+                    "dclose": lambda a, s: door(a, s, False), "snapshot": snapshot}
+        if execute_thermal is not None:
+            def thermal(action: Any, state: Any, opcode: str) -> Any:
+                if captured.get("MotionOnly", False):
+                    return {"ok": True, "source_noop": "MotionOnly", "delivery_attempted": False}
+                args = raw(action)
+                if opcode == "cc":
+                    try:
+                        temperature = self._oem_int32(args[1])
+                    except (ValueError, OverflowError):
+                        return {"ok": True, "source_noop": "Int32.TryParse", "delivery_attempted": False}
+                    if args[0] not in ("OC", "RC"):
+                        return {"ok": True, "source_noop": "chiller_selector", "delivery_attempted": False}
+                    result = dict(execute_thermal("set_chiller_temperature", {
+                        "bank": 1 if args[0] == "OC" else 0, "temp_c": float(temperature)}, action, state))
+                    if result.get("source_noop") != "m_board_null" and result.get("source_body_returned", True):
+                        result["source_module_updates"] = {args[0]: True}
+                    return result
+                values = {"temp_c": float(args[0]), "duration": self._oem_int32(args[1]),
+                          "rate_c_s": float(args[2])}
+                if opcode == "splid":
+                    values["wait"] = not (len(args) > 3 and args[3] in ("F", "FALSE"))
+                return execute_thermal("set_tc_temperature" if opcode == "sp" else "set_lid_temperature",
+                                       values, action, state)
+            handlers.update({name: (lambda a, s, op=name: thermal(a, s, op))
+                             for name in ("sp", "splid", "cc")})
+        if rgb_writer is not None or not rgb_board_present:
+            handlers["led"] = led
+        if execute_mov is not None:
+            def mov(action: Any, state: Any) -> Any:
+                from .oem_deck_movement import prepared_class_move_to_intent
+                # Displayed source line is not occurrence/custody identity.
+                key = action.source_key
+                line = key if type(key) is int else self._oem_int32(key) if isinstance(key, str) else 0
+                intent = prepared_class_move_to_intent(action.params["arguments"], script_line=line)
+                return execute_mov(intent, action, state)
+            handlers["mov"] = mov
+        return handlers
+
+    def build_oem_lifecycle_handlers(
+        self, *, execute_plan: Callable[..., Any],
+        settings: Mapping[str, Any] | None = None,
+        unlatch: Callable[..., Any] | None = None,
+        initial_check: Callable[..., Any] | None = None,
+        initialize_motors: Callable[..., Any] | None = None,
+        restore_door_model: Callable[..., Any] | None = None,
+        resume_temperature: Callable[..., Any] | None = None,
+        run_job_tip_prefix: Callable[..., Any] | None = None,
+        confirm_gripper: Callable[..., Any] | None = None,
+        home_gripper: Callable[..., Any] | None = None,
+        pressure_baseline: Callable[..., Any] | None = None,
+        collect_critical_images: Callable[..., Any] | None = None,
+        safe_stop_tip_exit: Callable[..., Any] | None = None,
+        cancel_source: Callable[..., Any] | None = None,
+        shutdown_temperature: Callable[..., Any] | None = None,
+        wake_prepare: Callable[..., Any] | None = None,
+    ) -> dict[str, Callable[..., Any]]:
+        """Source mechanical lifecycle sequences, conditional on exact leaves.
+
+        Leaf callbacks take runtime_state (restore_door_model also takes the
+        boolean value). They must be canonically admitted/fenced by F/C and
+        return explicit native outcomes. Thermal and CV leaves are NOT supplied
+        by this provider. Missing leaves omit the affected hook at preflight.
+        """
+        def finite(name: str, operation: str, inputs: Mapping[str, Any], state: Any) -> Any:
+            machine = self.wp8_operation_machine_state(operation, inputs)
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True, **{**machine, **dict(inputs)})
+            return execute_plan(plan, "lifecycle:" + name, state)
+
+        def outcome(value: Any) -> dict[str, Any]:
+            if not isinstance(value, Mapping) or type(value.get("ok")) is not bool:
+                raise RuntimeError("oem_lifecycle_explicit_outcome_required")
+            return dict(value)
+
+        def combined(rows: list[dict[str, Any]], **facts: Any) -> dict[str, Any]:
+            owned: list[Any] = []
+            uncertain = False
+
+            def retain(value: Any) -> None:
+                nonlocal uncertain
+                if isinstance(value, Mapping):
+                    for child in value.get("owned_children", ()):
+                        if not any(child is prior for prior in owned):
+                            owned.append(child)
+                    uncertain = uncertain or value.get("uncertain") is True or value.get("outcome_unknown") is True or value.get("status") == "ambiguous"
+                    for key in ("source_children", "oem_partial_results", "native_results", "provider_results", "result", "detail"):
+                        retain(value.get(key))
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        retain(item)
+
+            retain(rows)
+            return {"ok": all(row["ok"] for row in rows), "source_children": rows,
+                    "owned_children": tuple(owned), **({"uncertain": True} if uncertain else {}), **facts}
+
+        def park(state: Any) -> Any:
+            return finite("epilogue_park", "park_gantry", {"rehome": False}, state)
+
+        def ordinary_prepare(state: Any) -> Any:
+            return finite("ordinary_pause_prepare", "ordinary_pause_prepare", {}, state)
+
+        def cleanup(state: Any) -> Any:
+            parent = getattr(getattr(state, "workflow", None), "command_id", None)
+            # The initial set event is not an entered script's return. Only the
+            # paired host callbacks can qualify this attempt for cleanup.
+            with self._lock:
+                if (not parent or parent != getattr(self, "_wp8_source_script_owner", None)
+                        or not getattr(self, "_wp8_source_script_returned", False)
+                        or not self._wp8_stop_event.is_set()):
+                    raise RuntimeError("cleanup_source_script_not_returned")
+            return finite("cleanup", "cleanup", {}, state)
+
+        handlers = {"epilogue_park": park, "ordinary_pause_prepare": ordinary_prepare,
+                    "cleanup": cleanup}
+
+        def failure(exc: Exception) -> dict[str, Any]:
+            row: dict[str, Any] = {"ok": False, "error_type": type(exc).__name__,
+                                   "error": str(exc)}
+            for key in ("oem_partial_results", "owned_children", "detail", "provider_results",
+                        "delivery_attempted", "controller_command_acknowledged",
+                        "controller_completion_verified", "hardware_postcondition_verified"):
+                if hasattr(exc, key):
+                    row[key] = getattr(exc, key)
+            return row
+
+        if all(leaf is not None for leaf in (safe_stop_tip_exit, cancel_source, home_gripper)):
+            def safe_exit(state: Any) -> Any:
+                assert safe_stop_tip_exit is not None and cancel_source is not None and home_gripper is not None
+                rows: list[dict[str, Any]] = []
+                try:
+                    rows.append(outcome(safe_stop_tip_exit(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                    rows.append(outcome(cancel_source(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                    stopped = rows[-1].get("source_stop_scripts")
+                    if type(stopped) is not bool:
+                        raise RuntimeError("source_authority_missing:source_stop_scripts")
+                    if stopped:
+                        rows.append(outcome(home_gripper(state)))
+                except Exception as exc:
+                    rows.append(failure(exc))
+                # Only the executor's actual wrapper-return callback signals.
+                return combined(rows)
+            handlers["safe_stop_exit"] = safe_exit
+
+        if shutdown_temperature is not None and unlatch is not None:
+            def source_error(state: Any) -> Any:
+                assert shutdown_temperature is not None and unlatch is not None
+                parent = getattr(getattr(state, "workflow", None), "command_id", None)
+                # stopScript's request/wait belongs to the source owner. Consume
+                # its matching return once, before any physical tail/collection.
+                with self._lock:
+                    if (not parent or parent != getattr(self, "_wp8_source_script_owner", None)
+                            or not getattr(self, "_wp8_source_script_returned", False)
+                            or not self._wp8_stop_event.is_set()):
+                        raise RuntimeError("source_error_source_script_not_returned")
+                    self._wp8_stop_event.clear()
+                rows: list[dict[str, Any]] = []
+                unlocked = False
+
+                def append(value: Any) -> bool:
+                    rows.append(outcome(value))
+                    return rows[-1]["ok"]
+
+                def failed(exc: Exception) -> None:
+                    rows.append(failure(exc))
+
+                def open_door() -> Any:
+                    # stopScript ignores doorOpen's source bool. It is not the
+                    # script dopen opcode and must not manufacture board error.
+                    return finite("source_error", "thermal_door", {"open": True, "script_running": False}, state)
+
+                def body() -> None:
+                    if not append(shutdown_temperature(state)):
+                        return
+                    if not append(finite("source_error", "lifecycle_check_door", {}, state)):
+                        return
+                    door_ok = rows[-1].get("door_ok")
+                    if type(door_ok) is not bool:
+                        raise RuntimeError("source_authority_missing:checkDoorStatus")
+                    if door_ok and not append(finite("source_error", "home_gripper", {}, state)):
+                        return
+                    if not append(open_door()):
+                        return
+                    append(finite("source_error", "park_gantry", {"rehome": False}, state))
+
+                try:
+                    body()
+                except Exception as exc:
+                    # Source suppresses the entire try, but failed native/claim
+                    # evidence remains failed in the canonical parent result.
+                    failed(exc)
+                finally:
+                    try:
+                        # unlockDoor calls doorOpen again. Failure of that call
+                        # or unlatch prevents LED; no independent LED finally.
+                        if append(open_door()) and append(unlatch(state)):
+                            unlocked = True
+                            append(finite("source_error", "pipette_color", {"r": 255, "g": 255, "b": 255}, state))
+                    except Exception as exc:
+                        failed(exc)
+                return combined(rows, source_stop_scripts=unlocked,
+                                source_unlock_completed=unlocked)
+            handlers["source_error"] = source_error
+
+        if unlatch is not None:
+            def deferred_enter(state: Any) -> Any:
+                parked = outcome(finite("deferred_pause_enter", "park_gantry", {"rehome": False}, state))
+                if not parked["ok"]:
+                    return parked
+                return combined([parked, outcome(unlatch(state))], source_user_pause_action="Open Door")
+            handlers["deferred_pause_enter"] = deferred_enter
+
+        if (restore_door_model is not None and resume_temperature is not None
+                and (wake_prepare is not None or (initial_check is not None and initialize_motors is not None))):
+            def wake(state: Any) -> Any:
+                assert restore_door_model is not None and resume_temperature is not None
+                if wake_prepare is not None:
+                    # One canonical child owns initialCheck -> capture door ->
+                    # initializeMotors and its proven board-generation change.
+                    # Its claim is released before any following finite leaf.
+                    rows = [outcome(wake_prepare(state))]
+                    was_open = rows[-1].get("source_prior_door_open")
+                else:
+                    assert initial_check is not None and initialize_motors is not None
+                    # App:2104-2129 ignores initialCheck's source bool, not a
+                    # failed native/claim outcome. Retain legacy injected seam.
+                    checked = outcome(initial_check(state))
+                    if not checked["ok"]:
+                        return checked
+                    was_open = self.mov_execution_machine_state()["thermal_door_open"]
+                    if type(was_open) is not bool:
+                        raise RuntimeError("source_authority_missing:ThermalDoorOpen")
+                    rows = [checked, outcome(initialize_motors(state))]
+                if not rows[-1]["ok"]:
+                    return combined(rows)
+                if type(was_open) is not bool:
+                    raise RuntimeError("source_authority_missing:ThermalDoorOpen")
+                self.sleep(0.040)
+                if was_open:
+                    rows.append(outcome(restore_door_model(False, state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(finite("wake", "thermal_door", {"open": was_open}, state)))
+                if not rows[-1]["ok"]:
+                    return combined(rows)
+                rows.append(outcome(resume_temperature(state)))
+                return combined(rows, source_wake_ready=rows[-1]["ok"])
+            handlers["wake"] = wake
+
+        if all(leaf is not None for leaf in (run_job_tip_prefix, confirm_gripper, home_gripper)):
+            def run_job(state: Any) -> Any:
+                assert run_job_tip_prefix is not None and confirm_gripper is not None and home_gripper is not None
+                rows = [outcome(run_job_tip_prefix(state))]
+                if not rows[-1]["ok"] or rows[-1].get("source_pause_scripts"):
+                    return rows[-1]
+                confirmed = outcome(confirm_gripper(state))
+                rows.append(confirmed)
+                if not confirmed["ok"]:
+                    return combined(rows)
+                if type(confirmed.get("source_return")) is not bool:
+                    raise RuntimeError("source_authority_missing:confirmAxis_gripper")
+                if not confirmed["source_return"]:
+                    rows.append(outcome(home_gripper(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(finite("run_job", "thermal_door", {"open": True}, state)))
+                return combined(rows)
+            handlers["run_job"] = run_job
+
+        if collect_critical_images is None and settings is not None and "JobName" in settings:
+            captured = copy.deepcopy(dict(settings))
+            def source_critical_images(state: Any) -> Any:
+                inputs = {"job_name": captured["JobName"]}
+                if captured["JobName"] is not None:
+                    inputs.update(camera_x_offset=captured["CameraXOffset"],
+                                  camera_y_offset=captured["CameraYOffset"], camera_z_offset=captured["CameraZOffset"])
+                return finite("script_prologue", "critical_item_images", inputs, state)
+            collect_critical_images = source_critical_images
+
+        if pressure_baseline is not None and collect_critical_images is not None:
+            def script_prologue(state: Any) -> Any:
+                rows = []
+                # Core:5252-5253,5306-5307,5313-5314: three reads and
+                # source addPressureBase calls, not one cached observation.
+                for _ in range(3):
+                    rows.append(outcome(pressure_baseline(state)))
+                    if not rows[-1]["ok"]:
+                        return combined(rows)
+                rows.append(outcome(collect_critical_images(state)))
+                return combined(rows)
+            handlers["script_prologue"] = script_prologue
+        return handlers
+
+    def wp8_source_image_gantry_load(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        # DefaultParameters.GantryLoad(null, REAGENT_PLATE) changes only
+        # pseudo-home; it is not MachineStatus.LoadGantry/plate custody.
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"pseudo_z_home": 500},
+        )
+
+    def wp8_source_move_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        table = load_bound_oem_position_table()
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+        coordinates = row.oem_offset_move_coordinates(
+            offset_x=arguments["offset_x"], offset_y=arguments["offset_y"],
+            x_high_limit=90263, y_high_limit=102956,
+        )
+        state = self.mov_execution_machine_state()
+        return self._deck_primitive_receipt(self.primitives.oem_move_to(
+            coordinates["x"], coordinates["y"], state["pseudo_z_home"],
+            pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments.get("run_in_parallel", True),
+            gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+            plate_on_gantry=state.get("plate_on_gantry"),
+            location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+        ), source_anchor="ClassControlInterface.moveTo:3691-3715")
+
+    def wp8_source_move_x(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self._deck_primitive_receipt(
+            self.primitives.x_move_absolute(position_steps=arguments["value"]),
+            source_anchor="ControlLib.cut:8532-8539",
+        )
+
+    def wp8_source_move_z(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.moveZ(arguments["value"])
+
+    def wp8_source_set_z_acc(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.primitives.z_set_max_acc(arguments["value"])
+
+    def wp8_source_restore_z_acc(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        return self.primitives.z_set_max_acc()
+
+    def wp8_source_lower_pipette(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        return self.primitives.z_pipette_position(
+            location_id=LOCATION_ID_TO_NAME[arguments["location"]], operation="lower_pipette",
+        )
+
+    def wp8_move_z_to_location(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        table = load_bound_oem_position_table()
+        location = int(arguments.get("location", arguments.get("pressure_target")))
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        if location not in LOCATION_ID_TO_NAME:
+            raise RuntimeError(f"source_authority_missing:location:{location}")
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[location])
+        if row.z_low is None:
+            raise RuntimeError(f"source_authority_missing:zLow:{location}")
+        target = int(row.z_low) + int(arguments.get("z_low_offset", arguments.get("offset", 0)))
+        state = self.mov_execution_machine_state()
+        wait = bool(arguments.get("wait", True))
+        result = self.primitives.oem_move_z(
+            target, pseudo_home_steps=int(state["pseudo_z_home"]),
+            motor_current=31, wait_for_stop=wait,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.{operation}",
+        )
+
+    def wp8_move_z_pseudo_home(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        state = self.mov_execution_machine_state()
+        target = int(state["pseudo_z_home"])
+        result = self.primitives.oem_move_z(
+            target, pseudo_home_steps=target, motor_current=31, wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.{operation}",
+        )
+
+    def wp8_move_z_steps(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        result = self.primitives.z_move_steps(
+            steps=int(arguments["steps"]), wait_timeout_s=20.0,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveSteps:z",
+        )
+
+    def wp8_move_y_steps(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        owner = getattr(self.primitives, "y_provider", None)
+        method = getattr(owner, "move_steps", None)
+        if not callable(method):
+            raise RuntimeError("source_authority_missing:y_move_steps")
+        result = method(
+            int(arguments["steps"]), wait_timeout_s=20.0,
+            command_id=self._wp8_identity(command_id, child_order, plan_digest),
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.moveSteps:y",
+        )
+
+    def wp8_move_axis_absolute(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        axis, target, timeout = ("x", 79000, 45.0) if operation == "moveX79000" else ("z", 80000, 30.0)
+        state = self.mov_execution_machine_state()
+        result = self.primitives.oem_initialize_motion_move_absolute(
+            axis, target, timeout_s=timeout,
+            pseudo_home_steps=int(state["pseudo_z_home"]),
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ControlLib.cleanup:{operation}",
+        )
+
+    def wp8_wait_z(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        result = self.primitives.motor_wait_stopped(
+            4, motor=1, timeout_s=float(arguments["timeout_ms"]) / 1000.0,
+        )
+        stopped = bool(isinstance(result, Mapping) and (result.get("stopped") is True or result.get("ok") is True))
+        return {
+            "ok": stopped, "delivery_attempted": False,
+            "controller_command_acknowledged": False,
+            "controller_completion_verified": stopped,
+            "wait": _json_safe(result),
+            "source_anchor": "ClassControlInterface.waitForMotor",
+        }
+
+    def wp8_set_z_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._deck_primitive_receipt(
+            self.primitives.z_set_current_max(int(arguments["current"])),
+            source_anchor="ClassControlInterface.setZaxisCurrentmax",
+        )
+
+    def wp8_restore_z_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self._deck_primitive_receipt(
+            self.primitives.z_set_current_max(None),
+            source_anchor="ClassControlInterface.setZaxisCurrentmax:100",
+        )
+
+    def _wp8_publish_semantic(
+        self, *, operation: str, command_id: str, child_order: int,
+        plan_digest: str, updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        publisher = getattr(self, "_deck_semantic_state_publisher", None)
+        if not callable(publisher):
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        result = publisher(
+            source_operation=operation,
+            source_command_id=self._wp8_identity(command_id, child_order, plan_digest),
+            updates=dict(updates),
+            **self.deck_owner_authority_stamps(),
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError(f"source_authority_invalid:{operation}")
+        return {"ok": True, "delivery_attempted": False, "published": dict(result)}
+
+    def wp8_update_location(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        destination = int(arguments["destination"])
+        if destination not in LOCATION_ID_TO_NAME:
+            raise RuntimeError("source_authority_missing:updateLocation")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={
+                "current_location": LOCATION_ID_TO_NAME[destination],
+                "current_well": int(arguments.get("well", 0)),
+            },
+        )
+
+    def wp8_update_plate_location(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        plate = canonical_plate_name(arguments.get("plate"))
+        location = int(arguments["location"])
+        name = plate_name_for_storage(plate) if plate is not None else None
+        if name is None or location not in LOCATION_ID_TO_NAME:
+            raise RuntimeError("source_authority_missing:updatePlateLocation")
+        state = self._canonical_deck_semantic_state()
+        movable = dict(state.get("movable_plate_locations") or {})
+        movable[name] = LOCATION_ID_TO_NAME[location]
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={"movable_plate_locations": movable},
+        )
+
+    def wp8_update_thermal_door_open(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        if type(arguments.get("value")) is not bool:
+            raise RuntimeError("source_authority_missing:updateThermalDoorOpen:value")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+            updates={"thermal_door_open": bool(arguments["value"])},
+        )
+
+    def wp8_clear_tip_loaded(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"tip_loaded": False},
+        )
+
+    def _wp8_door_config(self) -> dict[str, int]:
+        from .oem_initialization import build_machine_calibration_manifest
+
+        manifest = build_machine_calibration_manifest(serial_number=206)
+        rows = dict(manifest.get("thermal_door") or {})
+
+        def value(name: str) -> int:
+            raw = dict(rows.get(name) or {}).get("value")
+            if type(raw) is not int:
+                raise RuntimeError(f"wp8_machine_calibration_unavailable:{name}")
+            return int(raw)
+
+        return {
+            "open": value("TCDoorOpen"),
+            "threshold": value("TCDoorStallGuardThreshold"),
+            "max_current": value("TC_DOOR_MAX_CURRENT"),
+        }
+
+    def wp8_set_door_stall_threshold(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        config = self._wp8_door_config()
+        value = config["threshold"] + (2 if operation == "setDoorStallThresholdPlus2" else 0)
+        return self._wp8_set_axis_parameter(
+            board=6, motor=0, parameter=205, value=value,
+            source_anchor="ClassControlInterface.open/closeThermalDoor:setStallGuardThreshold",
+        )
+
+    def wp8_set_door_max_current(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self._wp8_set_axis_parameter(
+            board=6, motor=0, parameter=6,
+            value=self._wp8_door_config()["max_current"],
+            source_anchor="ClassControlInterface.open/closeThermalDoor:setMaxCurrent",
+        )
+
+    def wp8_move_door(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        target = self._wp8_door_config()["open"] if operation == "moveDoorOpen" else 0
+        result = self.primitives.tester.motor_oem_move_absolute(
+            6, target, motor=0, wait_for_stop=True,
+        )
+        return self._deck_primitive_receipt(
+            result, source_anchor=f"ClassControlInterface.{operation}",
+        )
+
+    def wp8_read_door_sensors(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        raw = self.primitives.motor_thermal_door_status()
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("thermal_door_sensor_result_malformed")
+        opened = raw.get("opened")
+        closed = raw.get("closed")
+        if type(opened) is not bool or type(closed) is not bool:
+            raise RuntimeError("thermal_door_sensor_result_incomplete")
+        return {
+            "ok": True, "delivery_attempted": False,
+            "door_open": opened and not closed,
+            "door_closed": closed and not opened,
+            "opened_sensor": opened, "closed_sensor": closed,
+            "sensor_result": _json_safe(raw),
+            "source_anchor": "ClassControlInterface.confirmAxis:tcDoorOpened/tcDoorClosed",
+        }
+
+    def wp8_home_axis_d(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        result = self.primitives.motor_oem_door_search_home(startup=False, timeout_s=30.0)
+        return self._deck_primitive_receipt(
+            result, source_anchor="ClassControlInterface.HomeAxis:d",
+        )
+
+    @staticmethod
+    def _wp8_io_value(result: Any) -> int:
+        if not isinstance(result, Mapping) or type(result.get("value")) is not int:
+            raise RuntimeError("deck_io_observation_invalid")
+        return int(result["value"])
+
+    def wp8_check_door_status(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        self.sleep(0.5)
+        door = self.primitives.deck_io_query_type(1)
+        latch = self.primitives.deck_io_query_type(3)
+        door_value = self._wp8_io_value(door)
+        latch_value = self._wp8_io_value(latch)
+        solenoid_on = None
+        if latch_value == 1:
+            solenoid_on = self.primitives.tester.deck_io_set_type(2, 1)
+            self.sleep(0.8)
+            door = self.primitives.deck_io_query_type(1)
+            latch = self.primitives.deck_io_query_type(3)
+            door_value = self._wp8_io_value(door)
+            latch_value = self._wp8_io_value(latch)
+        voltage = self.primitives.deck_io_query_type(0)
+        voltage_value = self._wp8_io_value(voltage)
+        solenoid_off = None
+        door_ok = voltage_value == 0
+        if voltage_value != 0:
+            solenoid_off = self.primitives.tester.deck_io_set_type(2, 0)
+            self.sleep(0.3)
+        return {
+            "ok": True, "door_ok": door_ok,
+            "delivery_attempted": solenoid_on is not None or solenoid_off is not None,
+            "door_sensor": door_value, "latch_sensor": latch_value,
+            "voltage_24v": voltage_value,
+            "enclosure_door_closed": door_value == 1 if door_ok else False,
+            "latch_closed": latch_value == 1,
+            "solenoid_on": _json_safe(solenoid_on),
+            "solenoid_off": _json_safe(solenoid_off),
+            "source_anchor": "ControlLib.checkDoorStatus:8670-8726",
+        }
+
+    def wp8_led2(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del arguments
+        owner = getattr(self.primitives, "wp8_led2_set", None)
+        if not callable(owner):
+            return {
+                "ok": True, "delivery_attempted": False,
+                "source_noop": "m_ledControl_null",
+                "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
+            }
+        result = owner(operation == "led2On")
+        row = dict(result) if isinstance(result, Mapping) else {}
+        return {
+            **row, "ok": row.get("ok") is True, "delivery_attempted": True,
+            "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
+        }
+
+    def wp8_snapshot_image(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        condition = str(arguments.get("name") or "")
+        owner = getattr(self.primitives, "wp8_snapshot_image", None)
+        if not callable(owner):
+            return {
+                "ok": True, "delivery_attempted": False,
+                "source_noop": "m_frameGrabber_null", "condition": condition,
+                "source_anchor": "ControlLib.SnapshotImage:8951-8994",
+            }
+        try:
+            result = owner(
+                condition=condition,
+                artifact_id=self._wp8_identity(command_id, child_order, plan_digest),
+            )
+        except Exception as exc:
+            return {
+                "ok": True, "delivery_attempted": True,
+                "exception_suppressed": True,
+                "exception_type": type(exc).__name__, "exception": str(exc),
+                "source_anchor": "ControlLib.SnapshotImage:8979-8993",
+            }
+        return {
+            "ok": True, "delivery_attempted": True,
+            "result": _json_safe(result),
+            "source_anchor": "ControlLib.SnapshotImage:8951-8994",
+        }
+
+    def _wp8_run_pipette(
+        self, *, operation_name: str, operation: Callable[[Any], Any],
+        requested_inputs: Mapping[str, Any], command_id: str, child_order: int,
+        plan_digest: str,
+    ) -> Any:
+        runner = getattr(self.primitives, "pipette_audit_runner", None)
+        if not callable(runner):
+            raise RuntimeError("pipette_audit_runner_not_bound")
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        return runner(
+            operation_name, operation,
+            requested_inputs=dict(requested_inputs),
+            lifecycle_stage_id=f"serial206.wp8.{operation_name}",
+            lifecycle_attempt_id=command_id,
+            lifecycle_idempotency_key=identity,
+        )
+
+    def wp8_query_tip_status(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        raw = self._wp8_run_pipette(
+            operation_name="query_all_pipette_tip_states",
+            operation=lambda transport: transport.query_tip_status_all(),
+            requested_inputs={}, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest,
+        )
+        rows = raw.get("channels") if isinstance(raw, Mapping) else None
+        if not isinstance(rows, list) or len(rows) != 4:
+            raise RuntimeError("wp8_tip_status_invalid")
+        loaded = [
+            index for index, row in enumerate(rows)
+            if isinstance(row, Mapping) and row.get("tip_loaded") is True
+        ]
+        if any(not isinstance(row, Mapping) or type(row.get("tip_loaded")) is not bool for row in rows):
+            raise RuntimeError("wp8_tip_status_invalid")
+        return {
+            "ok": True, "delivery_attempted": True,
+            "tip_exists": bool(loaded), "channels_with_tips": loaded,
+            "controller_evidence": _json_safe(raw),
+        }
+
+    def wp8_eject_all_tips_cleanup(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        if arguments.get("first") is not False or arguments.get("second") is not True:
+            raise RuntimeError("wp8_cleanup_eject_arguments_invalid")
+        raw = self._wp8_run_pipette(
+            operation_name="eject_all_tips_cleanup",
+            operation=lambda transport: transport.eject_all_tips(
+                check_missing_tip=False, wait=True, channels=None,
+            ),
+            requested_inputs={"check_missing_tip": False, "wait": True, "channels": None},
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+        return {
+            "ok": bool(isinstance(raw, Mapping) and raw.get("ok") is True),
+            "delivery_attempted": True, "controller_evidence": _json_safe(raw),
+        }
+
+    def wp8_scriptmove_to_waste(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        return self.scriptmoveTo(
+            destination=6, well=0, position_flag=1, run_in_parallel=True,
+        )
+
+    def wp8_source_script_begin(self, *, command_id: str) -> dict[str, Any]:
+        """Host source entry, not native admission or child settlement."""
+        if not isinstance(command_id, str) or not command_id:
+            raise ValueError("Source script requires canonical parent identity")
+        with self._lock:
+            owner = self._wp8_source_script_owner
+            if owner == command_id:
+                if self._wp8_source_script_returned:
+                    raise RuntimeError("source_script_attempt_already_returned")
+            elif owner is not None and not self._wp8_source_script_returned:
+                raise RuntimeError("source_script_owner_overlap")
+            else:
+                self._wp8_source_script_owner = command_id
+                self._wp8_source_script_returned = False
+                self._wp8_stop_event.clear()
+        return {"ok": True, "delivery_attempted": False}
+
+    def wp8_source_script_returned(self, *, command_id: str) -> dict[str, Any]:
+        """Signal once for this parent; waitStop may already have consumed it."""
+        with self._lock:
+            if not command_id or command_id != self._wp8_source_script_owner:
+                raise RuntimeError("source_script_owner_mismatch")
+            if not self._wp8_source_script_returned:
+                self._wp8_source_script_returned = True
+                self._wp8_stop_event.set()
+        return {"ok": True, "delivery_attempted": False, "source_script_returned": True}
+
+    def wp8_wait_stop(
+        self, operation: str, arguments: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        signaled = self._wp8_stop_event.wait(500.0)
+        if signaled:
+            self._wp8_stop_event.clear()
+        return {
+            "ok": True, "delivery_attempted": False, "signaled": signaled,
+            "timeout_ms": 500000,
+            "source_anchor": "ControlLib.cleanup:oStopEvent.WaitOne(500000)",
+        }
+
+    def _wp8_execute_nested_plan(
+        self, *, plan: Mapping[str, Any], command_id: str,
+        owner_identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        digest = str(plan["plan_digest"])
+        fence_checker = getattr(self, "_wp8_execution_fence_checker", None)
+        if not callable(fence_checker):
+            raise RuntimeError("wp8_execution_fence_checker_missing")
+
+        def invoke(child: Mapping[str, Any]) -> Any:
+            fence_checker(
+                command_id,
+                boundary=f"before_nested_child_{int(child['order'])}",
+            )
+            result = self.execute_wp8_child(
+                {**dict(child), "_delivery_identity": dict(owner_identity)},
+                command_id=command_id,
+                child_order=int(child["order"]), plan_digest=digest,
+            )
+            if isinstance(result, Mapping) and result.get("ok") is not True:
+                raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
+            return result
+
+        result = execute_finite_plate_operation(plan, invoke)
+        return {
+            **dict(result),
+            "source_children": list(result.get("completed_children") or []),
+            "source_plan_digest": digest,
+        }
+
+    def _wp8_compile_and_execute(
+        self, *, operation: str, inputs: Mapping[str, Any], command_id: str,
+        owner_identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        machine = self.wp8_operation_machine_state(operation, inputs)
+        plan = compile_finite_plate_operation(
+            operation, source_leaf_available=True,
+            **{**machine, **dict(inputs)},
+        )
+        return self._wp8_execute_nested_plan(
+            plan=plan, command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def wp8_catch_plate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="catch_plate", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_release_plate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="release_plate", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_send_z_and_gripper_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="send_z_and_gripper_home", inputs=arguments,
+            command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def wp8_door_open(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation
+        return self._wp8_compile_and_execute(
+            operation="thermal_door", inputs=arguments, command_id=command_id,
+            owner_identity=owner_identity,
+        )
+
+    def wp8_cleanup_waste_prelude(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        del operation, arguments
+        plan = compile_cleanup_waste_prelude()
+        return self._wp8_execute_nested_plan(
+            plan=plan, command_id=command_id, owner_identity=owner_identity,
+        )
+
+    def execute_wp8_child(
+        self,
+        child: Mapping[str, Any],
+        *,
+        command_id: str,
+        child_order: int,
+        plan_digest: str,
+    ) -> Any:
+        """Execute one pre-persisted finite WP8 child through source-owned primitives."""
+        operation = str(child.get("operation") or "")
+        arguments = dict(child.get("arguments") or {})
+        delivery_identity = dict(child.get("_delivery_identity") or {})
+        if not operation:
+            raise ValueError("wp8 child operation is required")
+        if not command_id or child_order != int(child.get("order", -1)) or not plan_digest:
+            raise ValueError("wp8 child durable identity is invalid")
+        from .oem_deck_movement import (
+            compiled_wp8_machine_targets,
+            validate_compiled_wp8_machine_targets,
+        )
+        if compiled_wp8_machine_targets(child):
+            validate_compiled_wp8_machine_targets(child, load_bound_oem_position_table())
+        if operation not in WP8_COMPILED_CHILD_OPERATIONS:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        binding_name = self._WP8_CHILD_BINDINGS.get(operation)
+        if binding_name is None:
+            raise RuntimeError(f"source_authority_missing:{operation}")
+        handler = getattr(self, binding_name, None)
+        if not callable(handler):
+            raise RuntimeError(f"source_authority_missing:{operation}:{binding_name}")
+        handler_identity = {
+            "dispatch_attempt_id": str(delivery_identity.get("dispatch_attempt_id") or ""),
+            "ownership_generation": int(delivery_identity.get("ownership_generation", -1)),
+            "board_epoch_4": int(delivery_identity.get("board_epoch_4", -1)),
+            "board_epoch_5": int(delivery_identity.get("board_epoch_5", -1)),
+        }
+        owner_identity = {
+            **handler_identity,
+            "work_identity": str(
+                delivery_identity.get("work_identity")
+                or f"child:{int(child_order)}:{operation}"
+            ),
+            "plan_digest": str(delivery_identity.get("plan_digest") or plan_digest),
+        }
+        handler_identity["acquiring_identity"] = owner_identity["work_identity"]
+        handler_identity["owner_identity"] = owner_identity
+        owner_plan_digest = owner_identity["plan_digest"]
+        if operation == "ReleaseLockGripperOperation":
+            with self._wp8_task_lock:
+                owner = self._wp8_gripper_lock_owner
+            if owner is None:
+                return {"ok": True, "delivery_attempted": False, "source_noop": True}
+            if (
+                owner.command_id != str(command_id)
+                or owner.acquiring_identity != owner_identity["work_identity"]
+                or owner.plan_digest != owner_plan_digest
+                or owner.dispatch_attempt_id != handler_identity["dispatch_attempt_id"]
+                or owner.ownership_generation != handler_identity["ownership_generation"]
+                or owner.board_epoch_4 != handler_identity["board_epoch_4"]
+                or owner.board_epoch_5 != handler_identity["board_epoch_5"]
+            ):
+                raise RuntimeError("wp8_gripper_lock_wrong_owner")
+            handler_identity["lock_token"] = owner.receipt()
+        return handler(
+            operation,
+            arguments,
+            command_id=command_id,
+            child_order=child_order,
+            plan_digest=owner_plan_digest,
+            **handler_identity,
+        )
+
+    def bind_pipette_collection_state_reader(self, reader) -> None:
+        self._pipette_collection_state_reader = reader
+
+    def _park_collection_state(self) -> dict[str, Any]:
+        reader = getattr(self, "_pipette_collection_state_reader", None)
+        if not callable(reader):
+            raise RuntimeError("pipette_collection_owner_not_bound")
+        state = reader()
+        if not isinstance(state, Mapping) or type(state.get("tip_exists")) is not bool:
+            raise RuntimeError("pipette_collection_state_not_authoritative")
+        return dict(state)
+
+    def parkGantry(
+        self,
+        *,
+        rehome: bool = False,
+        authority_snapshot: Mapping[str, Any] | None = None,
+        before_native_entry: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Source Park variants; manual false and governed early return retained."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
+            raise RuntimeError("deck_dependency_scope_mismatch")
+        semantics = self._deck_execution_semantics(authority_snapshot, no_tip_park=True)
+        current_location_name = str(semantics["current_location_id"])
+        if current_location_name == "LOC_PARK":
+            return {
+                "ok": True,
+                "source_noop": True,
+                "delivery_attempted": False,
+                "controller_command_acknowledged": False,
+                "controller_completion_verified": False,
+                "hardware_postcondition_verified": False,
+                "source_children": [],
+                "source_anchor": "ControlLib.parkGantry:7073-7076",
+            }
+        name_to_id = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
+        if current_location_name not in name_to_id:
+            raise RuntimeError("park_current_location_not_authoritative")
+
+        table = load_bound_oem_position_table()
+        pseudo_home = int(semantics["pseudo_z_home"])
+        source_children: list[dict[str, Any]] = []
+        controller_rows: list[Mapping[str, Any]] = []
+
+        def record(operation: str, result: Any, *, discarded_return: bool) -> Mapping[str, Any]:
+            row = result if isinstance(result, Mapping) else {}
+            source_children.append({
+                "operation": operation,
+                "discarded_return": discarded_return,
+                "result": _json_safe(result),
+            })
+            if row.get("ok") is not True:
+                raise RuntimeError(f"park_source_child_failed:{operation}")
+            return row
+
+        collection = self._park_collection_state()
+        if authority_snapshot is not None and authority_snapshot.get("collection_tip_state") != collection:
+            raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
+        if collection["tip_exists"] is True:
+            waste = table.resolve(location_id="WASTE_BIN")
+            waste_coordinates = waste.oem_offset_move_coordinates(
+                x_high_limit=90263,
+                y_high_limit=102956,
+            )
+            move_to = getattr(self.primitives, "oem_move_to", None)
+            eject = getattr(self.primitives, "eject_all_tips_for_oem_park", None)
+            query = getattr(self.primitives, "query_all_pipette_tip_states", None)
+            move_axis = getattr(self.primitives, "oem_initialize_motion_move_absolute", None)
+            if not all(callable(method) for method in (move_to, eject, query, move_axis)):
+                raise RuntimeError("source_authority_missing:park_tip_cleanup")
+            moved = record(
+                "moveTo(6,0,0,false)",
+                move_to(
+                    waste_coordinates["x"], waste_coordinates["y"], pseudo_home,
+                    pseudo_home_steps=pseudo_home,
+                    run_in_parallel=False,
+                    gripper_confirmed=True,
+                    tip_loaded=True,
+                    plate_on_gantry=semantics.get("plate_on_gantry"),
+                    location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                ),
+                discarded_return=True,
+            )
+            controller_rows.append(moved)
+            record("ejectAllTips(true,true)", eject(), discarded_return=False)
+            assert callable(query)
+            queried = record(
+                "queryTipStatus(-1)",
+                query(lifecycle_stage_id="serial206.park_gantry.query_tip_status"),
+                discarded_return=True,
+            )
+            self.sleep(0.100)
+            source_children.append({
+                "operation": "Thread.Sleep(100)", "discarded_return": False,
+                "result": {"ok": True, "milliseconds": 100},
+            })
+            post_query_collection = self._park_collection_state()
+            if post_query_collection["tip_exists"] is True:
+                return {
+                    "ok": False,
+                    "delivery_attempted": True,
+                    "controller_command_acknowledged": all(
+                        row.get("controller_command_acknowledged") is True for row in controller_rows
+                    ),
+                    "controller_completion_verified": False,
+                    "hardware_postcondition_verified": False,
+                    "governance_outcome": "manual_tip_removal_required",
+                    "source_pause_scripts": True,
+                    "source_error_event": "Please manually remove tips on Pipettes",
+                    "semantic_location_commit_allowed": False,
+                    "source_children": source_children,
+                    "source_anchor": "ControlLib.parkGantry:7077-7092",
+                }
+            z_row = record(
+                "moveZ(80000,31,true,true)",
+                move_axis("z", 80000, timeout_s=45.0, pseudo_home_steps=pseudo_home),
+                discarded_return=False,
+            )
+            controller_rows.append(z_row)
+            x_row = record(
+                "moveX(79000,true,true)",
+                move_axis("x", 79000, timeout_s=45.0),
+                discarded_return=False,
+            )
+            controller_rows.append(x_row)
+            cleanup_rows = (z_row, x_row)
+            cleanup_acknowledged = all(
+                row.get("controller_command_acknowledged") is True for row in cleanup_rows
+            )
+            cleanup_completed = all(
+                row.get("controller_completion_verified") is True
+                or row.get("controller_terminal_state_verified") is True
+                for row in cleanup_rows
+            )
+            if not cleanup_acknowledged or not cleanup_completed:
+                return {
+                    "ok": False,
+                    "delivery_attempted": True,
+                    "controller_command_acknowledged": cleanup_acknowledged,
+                    "controller_completion_verified": cleanup_completed,
+                    "hardware_postcondition_verified": False,
+                    "governance_outcome": "park_tip_cleanup_terminal_proof_missing",
+                    "semantic_location_commit_allowed": False,
+                    "source_children": source_children,
+                    "source_anchor": "ControlLib.parkGantry:7093-7112",
+                }
+            # The independently receipted final query already owns this
+            # no-tip transition. Do not mint a second, unlinked clock-named
+            # publication that defeats the parent command's revision fence.
+            published_tip_state = self._deck_semantic_state_reader()
+            if (not isinstance(published_tip_state, Mapping)
+                    or published_tip_state.get("tip_loaded") is not False
+                    or published_tip_state.get("tip_dirty") is not False
+                    or published_tip_state.get("tip_location") != -1):
+                raise RuntimeError("park_tip_query_semantic_publication_unavailable")
+
+        script_move = getattr(self.primitives, "oem_initialize_motion_scriptmove_to_waste", None)
+        if not callable(script_move):
+            raise RuntimeError("source_authority_missing:scriptmoveTo")
+        if rehome:
+            # ControlLib.parkGantry:7099-7119. The first move omits the
+            # position flag (source default 0); HomeXY returns lost steps,
+            # not position-after-home and not a physical-success boolean.
+            if before_native_entry is not None:
+                before_native_entry("script_park_approach")
+            approach = record(
+                "scriptmoveTo(current,well,28,0,0)",
+                script_move(
+                    current_location=name_to_id[current_location_name],
+                    current_well=int(semantics["current_well_id"]),
+                    target_location=28, target_well=0, position_flag=0,
+                    gripper_confirmed=self._deck_gripper_confirmed(),
+                    tip_loaded=False, tip_dirty=False, timeout_s=60.0,
+                    pseudo_home_steps=pseudo_home,
+                    plate_on_gantry=semantics.get("plate_on_gantry"),
+                    location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                ),
+                discarded_return=True,
+            )
+            controller_rows.append(approach)
+            if before_native_entry is not None:
+                before_native_entry("script_park_home_xy")
+            home = record("HomeXY()", self.primitives.home_xy(), discarded_return=False)
+            controller_rows.append(home)
+            lost_steps = home.get("source_return")
+            if not isinstance(lost_steps, Mapping) or any(
+                type(lost_steps.get(axis)) is not int for axis in ("x", "y")
+            ):
+                raise RuntimeError("park_homexy_source_return_unavailable")
+            for axis in ("x", "y"):
+                if abs(lost_steps[axis]) > 100:
+                    return {
+                        "ok": False, "delivery_attempted": True,
+                        "source_pause_scripts": True,
+                        "source_error_event": f"Axis {axis} lost steps exceeded 100",
+                        "semantic_location_commit_allowed": False,
+                        "source_children": source_children,
+                        "source_anchor": "ControlLib.parkGantry:7099-7119",
+                    }
+
+        if before_native_entry is not None:
+            before_native_entry("script_park_final_move")
+        final_row = record(
+            "scriptmoveTo(current,well,28,0,0,2,true)",
+            script_move(
+                current_location=name_to_id[current_location_name],
+                current_well=int(semantics["current_well_id"]),
+                target_location=28,
+                target_well=0,
+                position_flag=2,
+                gripper_confirmed=self._deck_gripper_confirmed(),
+                tip_loaded=False,
+                tip_dirty=False,
+                timeout_s=60.0,
+                pseudo_home_steps=pseudo_home,
+                plate_on_gantry=semantics.get("plate_on_gantry"),
+                location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+            ),
+            discarded_return=True,
+        )
+        controller_rows.append(final_row)
+        acknowledged = bool(controller_rows) and all(
+            row.get("controller_command_acknowledged") is True for row in controller_rows
+        )
+        completed = bool(controller_rows) and all(
+            row.get("controller_completion_verified") is True
+            or row.get("controller_terminal_state_verified") is True
+            for row in controller_rows
+        )
+        postcondition = completed and all(
+            row.get("hardware_postcondition_verified") is True for row in controller_rows
+        )
+        return {
+            "ok": acknowledged and completed,
+            "provider_command_id": final_row.get("command_id"),
+            "controller_command_acknowledged": acknowledged,
+            "controller_completion_verified": completed,
+            "hardware_postcondition_verified": postcondition,
+            "source_noop": False,
+            "source_children": source_children,
+            "source_location_update": {"current_location": 28, "current_well": 0},
+            "source_anchor": "ControlLib.parkGantry:7071-7122; MethodDef=0x06000351",
+        }
 
     @staticmethod
     def _commissioning_blockers(
@@ -7478,6 +13438,152 @@ class Serial206OemInitializationProvider:
             blockers.append(f"idempotency_key_required:{spec.key}")
         return blockers
 
+    def _aggregate_reference_fence(self, state: Mapping[str, Any], axis: str) -> dict[str, Any]:
+        """Current home execution authority, independent of constructor setup."""
+        generation = int(self.generation_provider())
+        board_generation = self.preparation_provider.current_board_lifecycle_generation()
+        if type(board_generation) is not int:
+            raise RuntimeError("aggregate_reference_board_generation_unavailable")
+        with self._x_interrupt_state_lock, self._z_interrupt_state_lock:
+            if (self._x_interrupt_active or self._z_interrupt_active
+                    or self._x_interrupt_recovery_required or self._z_interrupt_recovery_required):
+                raise RuntimeError("aggregate_reference_interrupted")
+            tester = getattr(self.primitives, "tester", None)
+            if tester is not None and tester.oem_no24v_state():
+                raise RuntimeError("aggregate_reference_no24v")
+            fence = {"generation": generation, "board_generation": board_generation,
+                     "x_interrupt": self._x_interrupt_epoch, "z_interrupt": self._z_interrupt_epoch,
+                     "native_owner": id(tester),
+                     "transport_generation": getattr(tester, "_oem_transport_generation", None),
+                     "abort_generation": getattr(tester, "_oem_abort_generation", None)}
+        if axis in {"x", "z"}:
+            lifecycle = state[f"{axis}_lifecycle"]
+            if (lifecycle.get("active_receipt") is not None
+                    or lifecycle.get("pending_ticket") is not None):
+                raise RuntimeError(f"aggregate_reference_lifecycle_not_current:{axis}")
+        if axis != "x":
+            if self.state_store is None:
+                raise RuntimeError("aggregate_reference_board_authority_unavailable")
+            authority = self.state_store.board4_authority_projection()
+            board, row = authority["board"], authority["axes"]["gripper" if axis == "g" else axis]
+            if (board.get("state") != "active" or type(board.get("active_board_epoch")) is not int
+                    or row.get("ownership_generation") != generation
+                    or row.get("pending_ticket") is not None
+                    or row.get("software_interrupt_active") is not False
+                    or type(row.get("interrupt_epoch")) is not int
+                    or type(row.get("software_interrupt_epoch")) is not int):
+                raise RuntimeError(f"aggregate_reference_board_authority_not_current:{axis}")
+            fence.update(board_epoch=board["active_board_epoch"],
+                         interrupt_epoch=row["interrupt_epoch"],
+                         software_interrupt_epoch=row["software_interrupt_epoch"])
+        return fence
+
+    def _publish_aggregate_reference(
+        self, state: dict[str, Any], receipt: dict[str, Any], home: Any,
+        fence: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Publish controller-only evidence, without changing the OEM source return."""
+        axis = receipt["component"]
+        publication: dict[str, Any] = {"published": False, "physical_effect_verified": False,
+                                       "operator_observation": None, "controller_position_observation": None}
+        receipt["reference_publication"] = publication
+        attempted = False
+        try:
+            if self.reference_store is None or self.state_store is None or fence is None:
+                raise RuntimeError("aggregate_reference_current_durable_authority_unavailable")
+            if "blocker" in fence:
+                raise RuntimeError(str(fence["blocker"]))
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            # X/Y wrap axisSearchHome; G/Z return it directly. Do not recursively
+            # hunt for any convenient True flag in a diagnostic receipt.
+            search = home.get("home") if axis in {"x", "y"} and isinstance(home, Mapping) else home
+            leaf = search.get("go_home") if isinstance(search, Mapping) else None
+            if not (isinstance(search, Mapping) and isinstance(leaf, Mapping) and leaf.get("ok") is True
+                    and leaf.get("axis") == axis
+                    and all(leaf.get(key) is True for key in (
+                        "controller_command_acknowledged", "controller_terminal_state_verified",
+                        "controller_home_proof_verified"))
+                    and not leaf.get("source_noop") and not search.get("source_noop")):
+                raise RuntimeError("aggregate_reference_controller_home_not_verified")
+            zero = receipt["raw_result"] if axis in {"x", "y"} else leaf.get("set_home")
+            ack = zero.get("ack") if isinstance(zero, Mapping) else None
+            if not (isinstance(ack, Mapping) and type(ack.get("status")) is int and ack["status"] == 100):
+                raise RuntimeError("aggregate_reference_zero_write_not_acknowledged")
+            publication["controller_home_evidence"] = {
+                key: _json_safe(leaf.get(key)) for key in (
+                    "axis", "board", "motor", "controller_command_acknowledged",
+                    "controller_terminal_state_verified", "controller_home_proof_verified",
+                )
+            }
+            publication["zero_write_ack"] = _json_safe(ack)
+            board, motor = {"x": (5, 0), "y": (4, 0), "z": (4, 1), "g": (4, 2)}[axis]
+            position = self.primitives.motor_get_position(board, motor=motor)
+            publication["controller_position_observation"] = {
+                "source": "post_source_stage_controller_GAP1", "stage": receipt["stage"],
+                "board": board, "motor": motor, "result": _json_safe(position),
+                "observed_at": time.time(), "not_oem_source_receipt": True,
+            }
+            ack = position.get("ack") if isinstance(position, Mapping) else None
+            if not (isinstance(position, Mapping)
+                    and type(position.get("position")) is int and position["position"] == 0
+                    and isinstance(ack, Mapping) and type(ack.get("status")) is int and ack["status"] == 100):
+                raise RuntimeError("aggregate_reference_current_zero_not_verified")
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            # Persist evidence and the existing lifecycle/board authority BEFORE
+            # the reference row (the deck gate). Compensate every partial commit.
+            attempted = True
+            if axis != "x":
+                authority = self.state_store.publish_axis_reference(
+                    "gripper" if axis == "g" else axis, position_steps=position["position"], ownership_generation=fence["generation"],
+                    receipt_id=receipt["command_id"], expected_interrupt_epoch=fence["interrupt_epoch"],
+                    expected_software_interrupt_epoch=fence["software_interrupt_epoch"],
+                    expected_home_board_epoch=fence["board_epoch"],
+                )
+                if not isinstance(authority, Mapping) or authority.get("ok") is not True:
+                    raise RuntimeError("aggregate_reference_board_publication_failed")
+            if axis in {"x", "z"}:
+                state[f"{axis}_lifecycle"].update(
+                    state="referenced_ready", reference_state="referenced", last_failure=None,
+                    awaiting_observation_receipt_id=None,
+                    generation=fence["generation"], board_lifecycle_generation=fence["board_generation"],
+                )
+            publication["fence"] = dict(fence)
+            state["movement_ledger"]["stages"][receipt["stage"]]["result"] = _json_safe(receipt)
+            self._save_state(state)
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            reference = self.reference_store.mark_referenced(MarkAxisReferencedCommand(
+                axis=axis, position_steps=position["position"],
+                source="serial206.initializeMotors.controller_verified_home",
+                note=f"Returned home/zero evidence plus separate current GAP1 at {receipt['stage']}; no physical observation.",
+                motion_kind="oem_initialize_motors_home",
+            ))
+            if not self._z_reference_commit_verified(reference, expected_state="referenced"):
+                raise RuntimeError("aggregate_reference_persistence_failed")
+            if dict(fence) != self._aggregate_reference_fence(state, axis):
+                raise RuntimeError("aggregate_reference_fence_changed")
+            publication["published"] = True
+        except Exception as exc:
+            publication["blocker"] = str(exc)
+            if attempted:
+                assert self.reference_store is not None and self.state_store is not None
+                # Reference recovery fails closed globally if a targeted durable
+                # invalidation cannot be confirmed. Board recovery also latches.
+                try:
+                    invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis=axis, reason=str(exc), source="serial206.initializeMotors.publication_failure"))
+                    if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                        raise RuntimeError("aggregate_reference_invalidation_failed")
+                except Exception:
+                    self.reference_store.recover_untrusted_authority(str(exc))
+                if axis != "x":
+                    self.state_store.require_axis_reconciliation("gripper" if axis == "g" else axis, receipt_id=receipt["command_id"])
+                if axis in {"x", "z"}:
+                    state[f"{axis}_lifecycle"].update(state="failed_latched", reference_state="desynced", last_failure=str(exc))
+        return publication
+
     def initialize_motors(
         self,
         *,
@@ -7522,6 +13628,25 @@ class Serial206OemInitializationProvider:
             stage_receipts: list[dict[str, Any]] = []
             motion_commanded = False
             run_id = f"initialize-motors-{time.time_ns()}"
+            home_results: dict[str, Any] = {}
+            reference_fences: dict[str, Any] = {}
+            reference_publications: dict[str, Any] = {}
+            # A new home may partially zero/move before throwing. Old reference
+            # rows must not survive as usable evidence of this run.
+            if self.reference_store is not None:
+                invalidation = self.reference_store.mark_desynced_many([
+                    MarkAxisDesyncedCommand(axis=axis, reason="initializeMotors new source run",
+                                            source="serial206.initializeMotors")
+                    for axis in ("x", "y", "z", "g")
+                ])
+                if invalidation.get("ok") is not True or invalidation.get("durable_clean") is not True:
+                    self.reference_store.recover_untrusted_authority("initializeMotors invalidation failed")
+                    return self._failure("failed_closed", ["aggregate_reference_invalidation_failed"])
+            for axis in ("x", "y", "z", "g"):
+                try:
+                    reference_fences[axis] = self._aggregate_reference_fence(state, axis)
+                except Exception as exc:
+                    reference_fences[axis] = {"blocker": str(exc)}
 
             for spec in SERIAL206_INITIALIZE_MOTORS_STAGE_SPECS:
                 row = ledger["stages"][spec.key]
@@ -7578,6 +13703,12 @@ class Serial206OemInitializationProvider:
                     "physical_effect_verified": False,
                     "raw_result": _json_safe(raw_mapping),
                 }
+                if stage_ok and spec.key in {"z-home", "gripper-home", "x-home", "y-home"}:
+                    home_results[spec.component] = raw_mapping
+                if stage_ok and spec.key in {"z-home", "gripper-home", "x-set-home", "y-set-home"}:
+                    reference_publications[spec.component] = self._publish_aggregate_reference(
+                        state, receipt, home_results.get(spec.component), reference_fences.get(spec.component),
+                    )
                 row["result"] = _json_safe(receipt)
                 row["state"] = "completed" if stage_ok else "failed"
                 stage_receipts.append(receipt)
@@ -7587,9 +13718,15 @@ class Serial206OemInitializationProvider:
                     advance_initialize_motors_ledger(ledger, spec.key)
                 else:
                     ledger["terminal_state"] = "failed"
+                    if self.reference_store is not None:
+                        # A thrown source move (including X park) has no trusted
+                        # terminal result; do not retain aggregate motion authority.
+                        self.reference_store.recover_untrusted_authority("initializeMotors source exception")
                 try:
                     self._save_state(state)
                 except Exception:
+                    if self.reference_store is not None:
+                        self.reference_store.recover_untrusted_authority("initializeMotors result persistence failed")
                     return self._failure(
                         "failed_closed",
                         ["durable_stage_result_persistence_failed"],
@@ -7602,7 +13739,7 @@ class Serial206OemInitializationProvider:
                     if source_exception is not None:
                         raise source_exception
 
-            return self._result_from_state(
+            result = self._result_from_state(
                 state,
                 ok=True,
                 blockers=[],
@@ -7610,6 +13747,31 @@ class Serial206OemInitializationProvider:
                 stage_receipts=stage_receipts,
                 physical_motion_commanded=motion_commanded,
             )
+            for axis, publication in reference_publications.items():
+                if publication.get("published") is True:
+                    try:
+                        if reference_fences[axis] != self._aggregate_reference_fence(state, axis):
+                            raise RuntimeError("aggregate_reference_fence_changed")
+                    except Exception as exc:
+                        publication.update(published=False, blocker=str(exc))
+                        if self.reference_store is not None:
+                            self.reference_store.recover_untrusted_authority("initializeMotors completion fence changed")
+            if self.reference_store is not None:
+                current_references = self.reference_store.snapshot(("x", "y", "z", "g"))
+                for axis, publication in reference_publications.items():
+                    if (publication.get("published") is True
+                            and (current_references.get("durable_clean") is not True
+                                 or current_references.get("rows", {}).get(axis, {}).get("state") != "referenced")):
+                        publication.update(published=False, blocker="aggregate_reference_no_longer_current")
+            result["reference_publications"] = reference_publications
+            result["reference_blockers"] = [
+                f"{axis}:{reference_publications.get(axis, {}).get('blocker', 'not_published')}"
+                for axis in ("x", "y", "z", "g")
+                if reference_publications.get(axis, {}).get("published") is not True
+            ]
+            result["door_reference_blocker"] = "aggregate_door_board_lifecycle_publication_not_bound"
+            result["ready"] = result["ready"] and not result["reference_blockers"]
+            return result
 
     def record_observation(
         self,
@@ -7748,13 +13910,30 @@ class Serial206OemInitializationProvider:
                         physical_motion_commanded=physical_motion_commanded,
                     )
 
+                source_call_completed = True
                 try:
                     if stage_key == "initializeMotion.initializeMotors":
                         preserved_motion = copy.deepcopy(motion)
                         stop_scripts = state["machine_status"].get("stop_scripts")
                         forceabort = state["machine_status"].get("forceabort")
-                        raw = self.initialize_motors(mode="live", timeout_s=float(timeout_s))
-                        refreshed = self._load_state()
+                        prior_commands = {row.get("command_id") for row in state["movement_ledger"]["stages"].values()}
+                        try:
+                            raw = self.initialize_motors(mode="live", timeout_s=float(timeout_s))
+                        except Exception as exc:
+                            raw = {"ok": False, "failure": str(exc)}
+                            source_call_completed = False
+                        # A motor-stage exception follows durable partial progress.
+                        # Never overwrite it with the caller's pre-motor snapshot.
+                        try:
+                            refreshed = self._load_state()
+                        except Exception as exc:
+                            return {
+                                "ok": False, "ready": False, "state": "ambiguous",
+                                "failure": f"initializeMotors_state_reload_failed:{exc}",
+                                "physical_motion_commanded": None,
+                                "physical_effect_verified": False,
+                                "physical_outcome": "unknown", "recovery_hold": True,
+                            }
                         refreshed["initialize_motion_ledger"] = preserved_motion
                         refreshed["machine_status"]["stop_scripts"] = stop_scripts
                         refreshed["machine_status"]["forceabort"] = forceabort
@@ -7762,22 +13941,36 @@ class Serial206OemInitializationProvider:
                         motion = state["initialize_motion_ledger"]
                         receipts = motion["stage_receipts"]
                         receipt = receipts[-1]
+                        if not source_call_completed:
+                            raw["physical_motion_commanded"] = any(
+                                row.get("command_id") not in prior_commands
+                                and _SPEC_BY_KEY[key].movement
+                                and row.get("state") != "pending"
+                                for key, row in state["movement_ledger"]["stages"].items()
+                            )
                     else:
-                        raw = self._execute_initialize_motion_stage(
-                            state,
-                            spec,
-                            timeout_s=float(timeout_s),
-                        )
+                        # The stage command is persisted above before pipette dispatch.
+                        previous_attempt = getattr(self.primitives, "_lifecycle_pipette_attempt", None)
+                        self.primitives._lifecycle_pipette_attempt = {
+                            "command_id": command_id, "idempotency_key": command_id,
+                        }
+                        try:
+                            raw = self._execute_initialize_motion_stage(
+                                state, spec, timeout_s=float(timeout_s),
+                            )
+                        finally:
+                            self.primitives._lifecycle_pipette_attempt = previous_attempt
                     raw_result = dict(raw) if isinstance(raw, Mapping) else {"value": raw}
                     stage_ok = bool(raw_result.get("ok") is True)
                 except Exception as exc:
                     raw_result = {"ok": False, "failure": str(exc)}
                     stage_ok = False
+                    source_call_completed = False
 
                 receipt.update({
                     "status": "completed" if stage_ok else "failed",
                     "ok": stage_ok,
-                    "source_call_completed": True,
+                    "source_call_completed": source_call_completed,
                     "source_return_ok": stage_ok,
                     "failure": None if stage_ok else str(raw_result.get("failure") or "initializeMotion_source_call_failed"),
                     "raw_result": _json_safe(raw_result),
@@ -7824,15 +14017,22 @@ class Serial206OemInitializationProvider:
         motion = state.get("initialize_motion_ledger") if isinstance(state, Mapping) else None
         machine = state.get("machine_status") if isinstance(state, Mapping) else None
         terminal = motion.get("terminal_state") if isinstance(motion, Mapping) else "failed_closed"
+        bootstrap = None
+        if terminal == "initializeMotion_complete" and callable(
+            getattr(self, "_deck_semantic_bootstrap_publisher", None)
+        ):
+            bootstrap = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
         return {
             "ok": bool(ok),
             "ready": bool(terminal == "initializeMotion_complete"),
+            "deck_semantic_bootstrap": bootstrap,
             "state": terminal,
             "schema": "bioxp.serial206_initializeMotion.v2",
             "mode": "live",
             "opened_usb": bool(physical_motion_commanded),
             "physical_motion_commanded": bool(physical_motion_commanded),
             "physical_effect_verified": False,
+            "failure": blockers[0] if blockers else None,
             "blockers": list(blockers),
             "initialize_motion_ledger": _json_safe(motion),
             "movement_ledger": _json_safe(state.get("movement_ledger") if isinstance(state, Mapping) else None),
@@ -7901,7 +14101,7 @@ class Serial206OemInitializationProvider:
         if stage == "initializeMotion.thermal_door_closed":
             return {"ok": True, "value": False, "source_anchor": "ControlLib.initializeMotion:8804"}
         if stage == "initializeMotion.queryTipStatus.initial":
-            result = p.query_all_pipette_tip_states()
+            result = p.query_all_pipette_tip_states(lifecycle_stage_id=stage)
             return {
                 **dict(result),
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True and type(result.get("tip_exists")) is bool),
@@ -7964,7 +14164,7 @@ class Serial206OemInitializationProvider:
         if stage == "initializeMotion.moveX.tip_exists":
             return p.oem_initialize_motion_move_absolute("x", 79000, timeout_s=min(bounded, 45.0))
         if stage == "initializeMotion.queryTipStatus.after_eject":
-            result = p.query_all_pipette_tip_states()
+            result = p.query_all_pipette_tip_states(lifecycle_stage_id=stage)
             return {
                 **dict(result),
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True and type(result.get("tip_exists")) is bool),
@@ -7981,7 +14181,10 @@ class Serial206OemInitializationProvider:
             self.sleep(0.002)
             return {"ok": True, "slept_ms": 2, "source_anchor": "ControlLib.initializeMotion:8831"}
         if stage == "initializeMotion.initiateGroup.initial":
-            result = p.initiate_pipette_group_for_oem_initialize_motion(cycle="initializeMotion.initial")
+            result = p.initiate_pipette_group_for_oem_initialize_motion(
+                cycle="initializeMotion.initial",
+                lifecycle_stage_id=stage,
+            )
             return {
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
                 "group_reported_ok": result.get("ok") if isinstance(result, Mapping) else False,
@@ -7989,7 +14192,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8832",
             }
         if stage == "initializeMotion.checkedPipetteStatus.initial":
-            result = p.checked_pipette_status_for_oem_initialize_motion(attempt="initial")
+            result = p.checked_pipette_status_for_oem_initialize_motion(
+                attempt="initial",
+                lifecycle_stage_id=stage,
+            )
             host_forceabort = state["machine_status"].get("forceabort")
             return {
                 "ok": isinstance(result, Mapping),
@@ -7999,7 +14205,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8833",
             }
         if stage == "initializeMotion.initiateGroup.retry":
-            result = p.initiate_pipette_group_for_oem_initialize_motion(cycle="initializeMotion.retry")
+            result = p.initiate_pipette_group_for_oem_initialize_motion(
+                cycle="initializeMotion.retry",
+                lifecycle_stage_id=stage,
+            )
             return {
                 "ok": bool(isinstance(result, Mapping) and result.get("ok") is True),
                 "group_reported_ok": result.get("ok") if isinstance(result, Mapping) else False,
@@ -8007,7 +14216,10 @@ class Serial206OemInitializationProvider:
                 "source_anchor": "ControlLib.initializeMotion:8835",
             }
         if stage == "initializeMotion.checkedPipetteStatus.retry":
-            result = p.checked_pipette_status_for_oem_initialize_motion(attempt="retry")
+            result = p.checked_pipette_status_for_oem_initialize_motion(
+                attempt="retry",
+                lifecycle_stage_id=stage,
+            )
             host_forceabort = state["machine_status"].get("forceabort")
             return {
                 "ok": isinstance(result, Mapping),
@@ -8180,10 +14392,7 @@ class Serial206OemInitializationProvider:
         if stage == "gripper-current-31":
             return p.motor_set_axis_param(4, 6, 31, motor=2)
         if stage == "gripper-clear-10000":
-            return self._merge_move_wait(
-                p.motor_move_relative(4, 10000, motor=2),
-                p.motor_wait_stopped(4, motor=2, timeout_s=min(bounded, 20.0), require_seen_nonzero=True),
-            )
+            return p.motor_oem_board_move_steps(4, 10000, motor=2, axis="g", timeout_s=20.0)
         if stage == "gripper-home":
             return p.motor_oem_axis_search_home(
                 "g",
@@ -8213,54 +14422,30 @@ class Serial206OemInitializationProvider:
         if stage == "y-home":
             return p.motor_oem_home_axis("y", startup=True, speed=250, timeout_s=min(bounded, 45.0))
         if stage == "door-home":
-            result = p.motor_oem_door_search_home(startup=True, timeout_s=min(bounded, 45.0))
-            status_after = result.get("status_after") if isinstance(result, Mapping) else None
-            predicates = status_after.get("oem_predicates") if isinstance(status_after, Mapping) else None
-            closed = predicates.get("tcDoorClosed") if isinstance(predicates, Mapping) else None
-            binding = p.oem_initialize_motors_branch_binding()
-            serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
-            if type(serial_number) is int and serial_number > 9 and closed is False and camera_calibrated is True:
-                p.motor_oem_open_thermal_door(timeout_s=min(bounded, 20.0))
-                raise RuntimeError("Cannot close thermal cycler door!")
-            return dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "door_search_home_result_invalid"}
+            return p.motor_oem_door_search_home(startup=True, timeout_s=min(bounded, 45.0))
         if stage == "door-closed-predicate":
-            status = p.motor_thermal_door_status()
-            predicates = status.get("oem_predicates") if isinstance(status, Mapping) else None
-            closed = predicates.get("tcDoorClosed") if isinstance(predicates, Mapping) else None
-            source = predicates.get("closed_source") if isinstance(predicates, Mapping) else None
             binding = p.oem_initialize_motors_branch_binding()
             serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
-            if type(serial_number) is not int or type(camera_calibrated) is not bool:
-                return {
-                    **(dict(status) if isinstance(status, Mapping) else {}),
-                    "ok": False,
-                    "failure": "initializeMotors_serial_camera_branch_authority_not_bound",
-                    "branch_binding": _json_safe(binding),
-                }
-            if type(closed) is not bool or source != "queryHome(ThermalDoor)":
-                return {
-                    **(dict(status) if isinstance(status, Mapping) else {}),
-                    "ok": False,
-                    "failure": "tcDoorClosed_source_predicate_required",
-                    "branch_binding": _json_safe(binding),
-                }
-            source_condition_active = serial_number > 9 and closed is False and camera_calibrated is True
-            opened = None
-            if source_condition_active:
+            if type(serial_number) is not int:
+                raise RuntimeError("initializeMotors_serial_camera_branch_authority_not_bound")
+            status = {}
+            condition = False
+            if serial_number > 9:
+                status = p.motor_oem_confirm_thermal_door_closed()
+                closed = status["oem_predicates"]["tcDoorClosed"]
+                if closed is False:
+                    camera_calibrated = binding.get("camera_calibrated")
+                    if type(camera_calibrated) is not bool:
+                        raise RuntimeError("initializeMotors_serial_camera_branch_authority_not_bound")
+                    condition = camera_calibrated
+            if condition:
                 p.motor_oem_open_thermal_door(timeout_s=min(bounded, 20.0))
                 raise RuntimeError("Cannot close thermal cycler door!")
-            return {
-                **dict(status),
-                "ok": True,
-                "failure": None,
-                "source_condition": "SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated",
-                "source_condition_active": False,
-                "branch_binding": _json_safe(binding),
-                "openThermalDoor": None,
-                "open_attempted_before_throw": False,
-            }
+            return {**status, "ok": True, "source_condition_active": False,
+                    "branch_binding": dict(binding), "source_condition_evaluated": True,
+                    "confirm_axis_evaluated": serial_number > 9,
+                    "source_condition": "SerialNumber>9 && !confirmAxis(tcDoorClosed) && CameraCalibrated",
+                    "open_attempted_before_throw": False}
         if stage == "y-set-home":
             return p.motor_set_home(4, motor=0)
         if stage == "ui-zero-calibrated":
@@ -8314,6 +14499,14 @@ class Serial206OemInitializationProvider:
                 return False
             readback = value.get("readback")
             return isinstance(readback, Mapping) and ack_ok(readback.get("ack")) and readback.get("value") == expected
+
+        def source_write_ok(value: Any, expected: int) -> bool:
+            return bool(
+                isinstance(value, Mapping)
+                and value.get("source_call_completed") is True
+                and value.get("source_return_code") == 0
+                and value.get("set_value") == expected
+            )
 
         def wait_ok(value: Any) -> bool:
             return (
@@ -8387,14 +14580,60 @@ class Serial206OemInitializationProvider:
                 )
             return bool(motion_ok and switch_ok and restore_ok), before, final, home_after, home.get("move_home", {}).get("ack")
 
+        def deck_home_evidence(
+            value: Any,
+        ) -> tuple[bool, bool, int | None, int | None, Any, Any]:
+            if not isinstance(value, Mapping) or value.get("startup") is not True:
+                return False, False, None, None, None, None
+            prepare = value.get("prepare")
+            home = value.get("home")
+            if (
+                not isinstance(prepare, Mapping)
+                or prepare.get("ok") is not True
+                or not isinstance(home, Mapping)
+            ):
+                return False, False, None, None, None, None
+            go_home = home.get("go_home")
+            source_ok = bool(
+                home.get("ok") is True
+                and type(home.get("source_return_code")) is int
+            )
+            before = None
+            after = None
+            switch = home.get("home_after")
+            ack = None
+            controller_reference = False
+            if isinstance(go_home, Mapping):
+                before = position(go_home.get("position_before"))
+                after = position(go_home.get("position_after_sethome"))
+                move_home = go_home.get("move_home")
+                ack = move_home.get("ack") if isinstance(move_home, Mapping) else None
+                controller_reference = bool(
+                    go_home.get("controller_home_proof_verified") is True
+                    and after == 0
+                )
+            return source_ok, controller_reference, before, after, switch, ack
+
         before: int | None = None
         after: int | None = None
         switch: Any = None
         ack: Any = None
         controller_reference_agrees = False
         ok = False
-        if spec.key in {"z-home", "x-home", "y-home", "gripper-home"}:
-            ok, before, after, switch, ack = home_evidence(result, gripper=spec.key == "gripper-home")
+        if spec.key in {"x-home", "y-home"}:
+            (
+                ok,
+                controller_reference_agrees,
+                before,
+                after,
+                switch,
+                ack,
+            ) = deck_home_evidence(result)
+        elif spec.key in {"z-home", "gripper-home"}:
+            ok, before, after, switch, ack = home_evidence(
+                result,
+                gripper=spec.key == "gripper-home",
+            )
             controller_reference_agrees = ok
         elif spec.key == "door-home":
             status_before = result.get("status_before") if isinstance(result, Mapping) else None
@@ -8426,62 +14665,54 @@ class Serial206OemInitializationProvider:
                 and write_ok(result.get("set_home"), 0)
             )
             controller_reference_agrees = ok
-        elif spec.key in {"gripper-clear-10000", "x-park-6000"}:
-            move = result.get("move")
-            positions = result.get("position")
-            before = position(positions.get("before")) if isinstance(positions, Mapping) else None
-            after = position(positions.get("after")) if isinstance(positions, Mapping) else None
-            ack = move.get("ack") if isinstance(move, Mapping) else None
-            ok = bool(
-                isinstance(move, Mapping)
-                and move.get("ok") is True
-                and ack_ok(ack)
-                and wait_ok(result.get("wait"))
-                and before is not None
-                and after is not None
-                and after != before
-                and abs(after - before) <= spec.bound
+        elif spec.key == "x-park-6000":
+            before = position(result.get("before"))
+            ack = (
+                result.get("retry_ack")
+                if result.get("ack") is None
+                else result.get("ack")
             )
+            wait = result.get("wait")
+            ok = bool(
+                result.get("ok") is True
+                and type(result.get("source_return_code")) is int
+                and (
+                    result.get("source_noop") is True
+                    or (
+                        isinstance(wait, Mapping)
+                        and wait.get("ok") is True
+                        and wait.get("target_reached") is True
+                    )
+                )
+            )
+        elif spec.key == "gripper-clear-10000":
+            # initializeMotors ignores board moveSteps' numeric return. A
+            # nonthrowing timeout/no-op is not a measured-motion assertion.
+            ack = result.get("ack")
+            ok = result.get("source_call_completed") is True and type(result.get("board_wrapper_return")) is int
         elif spec.key in {"gripper-current-31", "x-speed-1700", "gripper-idle-current-10"}:
             expected = {"gripper-current-31": 31, "x-speed-1700": 1700, "gripper-idle-current-10": 10}[spec.key]
-            ok = write_ok(result, expected)
+            ok = source_write_ok(result, expected)
             ack = result.get("ack")
         elif spec.key in {"x-set-home", "y-set-home"}:
-            ok = write_ok(result, 0)
+            ok = source_write_ok(result, 0)
             ack = result.get("ack")
-            controller_reference_agrees = ok
+            controller_reference_agrees = ack_ok(ack)
         elif spec.key in {"x-home-settle", "x-speed-settle"}:
             expected = 20 if spec.key == "x-home-settle" else 40
             ok = result.get("settled") is True and result.get("settle_ms") == expected
         elif spec.key == "door-closed-predicate":
             predicate = result.get("oem_predicates")
-            pos = result.get("position")
-            speed = result.get("speed")
-            binding = result.get("branch_binding")
-            after = position(pos)
-            serial_number = binding.get("serial_number") if isinstance(binding, Mapping) else None
-            camera_calibrated = binding.get("camera_calibrated") if isinstance(binding, Mapping) else None
+            binding = result.get("branch_binding") or {}
+            serial_number = binding.get("serial_number")
             closed = predicate.get("tcDoorClosed") if isinstance(predicate, Mapping) else None
-            expected_condition = bool(
-                type(serial_number) is int
-                and type(camera_calibrated) is bool
-                and serial_number > 9
-                and closed is False
-                and camera_calibrated is True
-            )
-            ok = bool(
-                result.get("ok") is True
-                and result.get("source_condition_active") is False
-                and expected_condition is False
-                and isinstance(predicate, Mapping)
-                and type(closed) is bool
-                and predicate.get("closed_source") == "queryHome(ThermalDoor)"
-                and after is not None
-                and isinstance(speed, Mapping)
-                and type(speed.get("speed")) is int
-                and speed.get("speed") == 0
-                and ack_ok(speed.get("ack"))
-            )
+            ok = bool(result.get("ok") is True
+                      and result.get("source_condition_evaluated") is True
+                      and result.get("source_condition_active") is False
+                      and type(serial_number) is int
+                      and (serial_number <= 9 or
+                           (type(closed) is bool and
+                            (closed or binding.get("camera_calibrated") is False))))
             switch = predicate
         elif spec.key == "ui-zero-calibrated":
             writes = result.get("writes")
@@ -8528,6 +14759,9 @@ class Serial206OemInitializationProvider:
             "status": "controller_acknowledged" if ok else "failed",
             "ok": bool(ok),
             "failure": None if ok else "controller_stage_evidence_not_accepted",
+            "source_call_completed": isinstance(raw, Mapping),
+            "source_return_ok": bool(ok),
+            "controller_command_acknowledged": ack_ok(ack),
             "component": spec.component,
             "direction": spec.direction,
             "bound": spec.bound,

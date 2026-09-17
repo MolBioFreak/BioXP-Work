@@ -4,25 +4,29 @@ import copy
 import hashlib
 import json
 import os
+import re
 import signal
 import shutil
 import sqlite3
+
 import subprocess
 import tarfile
 import tempfile
 import threading
 import time
+import logging
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Literal, Mapping, Optional, Protocol, cast
+from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, Optional, Protocol, cast
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from anyio import from_thread as anyio_from_thread
 
 from .camera_provider import CameraError, CameraFrame, CameraProvider
 from .oem_config import harmonized_motion_config
@@ -39,6 +43,8 @@ from .oem_gripper import (
     gripper_open,
     gripper_open_wide,
     gripper_status,
+    gripper_current_status,
+    gripper_current_observation,
     restore_gripper_idle_current,
 )
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
@@ -49,10 +55,24 @@ from .oem_serial206_initialization import (
     Serial206StageApproval,
 )
 from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
-from .runtime_audit_store import runtime_state_root
+from .runtime_audit_store import (
+    open_runtime_connection,
+    record_runtime_release_start,
+    runtime_state_root,
+    runtime_write_coordinator,
+)
+from .release_identity import (
+    ReleaseIdentityError,
+    configure_release_identity,
+    current_release_identity,
+    public_release_identity,
+    publish_runtime_release_receipt,
+)
 from .serial206_y_provider import Serial206YProvider
 from .operator_controls import current_operator_dispatch_context, install_operator_control_plane
-from .operator_reports import create_operator_reports_router
+from .operator_command_plane import COMMAND_TERMINAL
+from .oem_compat.position_table import load_bound_oem_position_table
+from .operator_reports import create_operator_reports_router, reconcile_operator_report_exports
 
 # Camera evidence belongs only to explicit camera routes. A generic snapshot
 # must neither activate a camera nor present an unqueried cache as observation.
@@ -78,7 +98,7 @@ from pydantic import (
 )
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .domain.capabilities import CapabilityRegistry
 from .domain.deck import load_deck_layout
@@ -109,6 +129,8 @@ from .services.motion_service import (
     run_relative_motion_command,
 )
 from .services.pipette_service import (
+    READ_ONLY_PIPETTE_OPERATIONS,
+    _DIRECT_PIPETTE_IDEMPOTENCY,
     run_pipette_aspirate_command,
     run_pipette_dispense_command,
     run_pipette_init_command,
@@ -116,9 +138,13 @@ from .services.pipette_service import (
     run_pipette_operation,
     run_pipette_status,
     run_pipette_tip_command,
+    reset_direct_pipette_idempotency_key,
+    set_direct_pipette_idempotency_key,
 )
 from .services.protocol_service import (
     ProtocolLiveContractError,
+    bind_protocol_dispatcher,
+    control_protocol_job,
     create_protocol_job,
     get_protocol_job,
     list_protocol_jobs,
@@ -218,12 +244,24 @@ def _default_reference_state_path() -> str:
 _reference_state_store = ReferenceStateStore(
     state_path=os.environ.get("BIOXP_REFERENCE_STATE_PATH") or _default_reference_state_path()
 )
+# Release authority is established before the first runtime audit store opens.
+# Canonical release mode fails closed; local source use remains explicitly unverified.
+_process_release_identity = configure_release_identity()
 _pipette_transport = None
-_pipette_receipts = PipetteReceiptStore()
+_pipette_receipts: PipetteReceiptStore = None  # type: ignore[assignment]
+_operator_reports_installed = False
 _serial206_oem_initialization_provider: Serial206OemInitializationProvider | None = None
 _serial206_y_provider: Serial206YProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 _operator_control_plane_installed = False
+
+
+def _persist_pipette_runtime_error(channel: int, error_code: int) -> None:
+    from .receiver_audit_buffer import ReceiverAuditBuffer
+    ReceiverAuditBuffer.from_environment().offer("pipette_error", {
+        "channel": int(channel), "error_code": int(error_code),
+        "owner_generation": int(hardware_state.ownership_epoch),
+    })
 
 
 def _pipette_application_dependencies() -> dict[str, dict[str, Any]]:
@@ -355,6 +393,14 @@ def bind_serial206_oem_initialization_provider(
 
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
+    scope = getattr(provider, "projection_scope", None)
+    manager: Any = scope() if callable(scope) else nullcontext()
+    with manager:
+        return _serial206_oem_initialization_provider_status_snapshot()
+
+
+def _serial206_oem_initialization_provider_status_snapshot() -> dict[str, Any]:
+    provider = _serial206_oem_initialization_provider
     capabilities = provider.capability_status() if provider is not None else {
         "initialize_motors_live_available": False,
         "initialize_motion_live_available": False,
@@ -432,19 +478,35 @@ def _require_serial206_oem_initialization_provider(
 
 
 def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    provider = _serial206_oem_initialization_provider
-    if provider is None:
-        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
     context = current_operator_dispatch_context()
     if context is None:
+        canonical_replacements = {
+            "move_xy": "oem.xy.move_absolute",
+            "home_xy": "oem.xy.home",
+            "move_to": "oem.xyz.move_to",
+        }
+        canonical_method_id = canonical_replacements.get(intent)
+        if canonical_method_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical_xz_method_requires_v2_route",
+                    "replacement_method_action_id": canonical_method_id,
+                    "replacement_route": "/operator/v2/methods",
+                    "required_schema": "bioxp.operator_method_request.v1",
+                    "physical_motion_commanded": False,
+                },
+            )
         raise HTTPException(
             status_code=410,
             detail={
                 "error": "direct_serial206_composite_mutation_retired",
-                "replacement": "/operator/actions/{semantic_action_id}",
                 "physical_motion_commanded": False,
             },
         )
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_motion_provider_unavailable", "physical_motion_commanded": False})
     payload = dict(inputs or {})
     payload.update({
         "command_id": str(context["operator_command_id"]),
@@ -457,6 +519,28 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
         result = provider.execute_xy_intent(int(payload.pop("x")), int(payload.pop("y")), payload)
     else:
         result = provider.execute_x_intent(intent, payload)
+    if (intent == "move_xy" and context.get("caller_class") == "manual_operator"
+            and isinstance(result, Mapping) and result.get("ok") is False):
+        evidence = result.get("critical_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        terminal = evidence.get("terminal_classification")
+        terminal = terminal if isinstance(terminal, Mapping) else {}
+        leaf = evidence.get("controller_failure")
+        leaf = leaf if isinstance(leaf, Mapping) else {}
+        wait = leaf.get("wait")
+        wait = wait if isinstance(wait, Mapping) else {}
+        if (terminal.get("classification") == "failed_with_coherent_stopped_coordinates"
+                and wait.get("failure") == "oem_moveToAbs_target_event_timeout"
+                and wait.get("no24v") is False):
+            # CI.btnLOC1_Click catches the moveTo -> moveXY exception and
+            # reports it, then returns to the operator. The primitive/child
+            # receipt stays failed; only this manual caller returned normally.
+            # Automated methods retain the throwing/fail-fast path below.
+            return {**dict(result), "ok": True,
+                    "completion_class": "oem_manual_timeout_report",
+                    "source_call_completed": False, "source_return_ok": False,
+                    "controller_completion_verified": False,
+                    "physical_effect_verified": False}
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=dict(result) if isinstance(result, Mapping) else {"error": "serial206_motion_intent_failed"})
     return dict(result)
@@ -468,30 +552,43 @@ def _run_serial206_pipette_audit(
     *,
     requested_inputs: Mapping[str, Any],
     lifecycle_stage_id: str,
+    lifecycle_attempt_id: str,
+    lifecycle_idempotency_key: str,
 ) -> dict[str, Any]:
     async def inline_run(_label: str, callback, *, timeout_s: float):
         del _label, timeout_s
         return callback()
 
-    return asyncio.run(
-        run_pipette_operation(
-            operation_name,
-            operation,
-            get_transport=_get_pipette_transport,
-            run_blocking=inline_run,
-            timeout_s=1800.0,
-            receipt_store=_pipette_receipts,
-            requested_inputs=dict(requested_inputs),
-            runtime_binding={
-                "owner": "shared_bioxp_tester_pipette",
-                "transport_owner_bound": True,
-                "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
-                "caller_class": "lifecycle",
-                "control_class": "pipette_state_command",
-                "lifecycle_stage_id": lifecycle_stage_id,
-            },
+    def audited_query():
+        return asyncio.run(
+            run_pipette_operation(
+                operation_name,
+                operation,
+                get_transport=_get_pipette_transport,
+                run_blocking=inline_run,
+                timeout_s=1800.0,
+                receipt_store=_pipette_receipts,
+                requested_inputs=dict(requested_inputs),
+                runtime_binding={
+                    "owner": "shared_bioxp_tester_pipette",
+                    "transport_owner_bound": True,
+                    "entrypoint_id": f"lifecycle.{lifecycle_stage_id}",
+                    "caller_class": "lifecycle",
+                    "control_class": (
+                        "hardware_query"
+                        if str(operation_name).lower() in READ_ONLY_PIPETTE_OPERATIONS
+                        else "pipette_state_command"
+                    ),
+                    "lifecycle_stage_id": lifecycle_stage_id,
+                    "lifecycle_attempt_id": lifecycle_attempt_id,
+                    "idempotency_key": lifecycle_idempotency_key,
+                },
+            )
         )
-    )
+
+    if operation_name in {"tip_status", "query_tip_status", "query_all_pipette_tip_states"}:
+        return _run_pipette_tip_query_with_deck_owner(audited_query, _get_pipette_transport())
+    return audited_query()
 
 
 def _build_serial206_oem_initialization_provider() -> Serial206OemInitializationProvider:
@@ -818,10 +915,22 @@ def _require_motion_not_blocked_by_maintenance() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _operator_control_plane_installed
+    global _tester, _tester_quarantine, _startup_error, _pipette_transport, _pipette_receipts
+    global _operator_control_plane_installed, _operator_reports_installed
+    global _receiver_audit_shutdown
+    _receiver_audit_shutdown = None
+    try:
+        app.state.release_identity = configure_release_identity()
+    except ReleaseIdentityError as exc:
+        _startup_error = f"Canonical release identity unavailable: {exc}"
+        raise RuntimeError(_startup_error) from exc
+    app.state.release_start_receipt = None
+    app.state.release_start_error = None
+    app.state.release_start_ready = asyncio.Event()
     runtime_root = runtime_state_root()
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     migration_connection = sqlite3.connect(runtime_root / "bioxp_runtime.db", isolation_level=None)
+    migration_connection.row_factory = sqlite3.Row
     migration_authorized = False
     migration_connection.create_function("authority_write_allowed", 0, lambda: 1 if migration_authorized else 0)
     migration_connection.create_function(
@@ -839,10 +948,25 @@ async def lifespan(app: FastAPI):
     finally:
         migration_authorized = False
         migration_connection.close()
+    if _pipette_receipts is None:
+        _pipette_receipts = PipetteReceiptStore(root=runtime_root)
+    elif _pipette_receipts.root != runtime_root:
+        raise RuntimeError("pipette receipt store is already bound to a different canonical runtime root")
+    if not _operator_reports_installed:
+        app.include_router(
+            create_operator_reports_router(
+                _pipette_receipts,
+                writer_health_provider=runtime_write_coordinator(_pipette_receipts.root).snapshot,
+            )
+        )
+        _operator_reports_installed = True
+    app.state.report_export_reconciliation = reconcile_operator_report_exports(_pipette_receipts)
     try:
+        _pipette_receipts.attest_first_install_absence()
         app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
+        app.state.runtime_reconciliation = _pipette_receipts.reconcile_nonterminal_claims()
     except Exception as exc:
-        _startup_error = f"Pipette JSONL migration/readiness failed: {exc}"
+        _startup_error = f"Pipette migration/runtime reconciliation readiness failed: {exc}"
         app.state.pipette_migration = {"status": "failed", "error": str(exc)}
         raise RuntimeError(_startup_error) from exc
     try:
@@ -882,19 +1006,68 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
-    if not _operator_control_plane_installed:
-        install_operator_control_plane(
-            app,
-            maintenance_state_provider=_maintenance_state_payload,
-            reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
-            lifecycle_state_provider=lifecycle_state.projection,
-            serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
-            pipette_status_provider=_operator_pipette_status,
+    def start_operator_control_plane() -> None:
+        global _operator_control_plane_installed
+        command_plane_to_start = None
+        if not _operator_control_plane_installed and app.state.release_start_error is None:
+            install_operator_control_plane(
+                app,
+                maintenance_state_provider=_maintenance_state_payload,
+                reference_state_provider=lambda: _reference_state_store.snapshot(list(AxisName)),
+                lifecycle_state_provider=lifecycle_state.projection,
+                serial206_initialization_state_provider=serial206_oem_initialization_provider_status,
+                pipette_status_provider=_operator_pipette_status,
+                oem_deck_provider=lambda: _serial206_oem_initialization_provider,
+                oem_deck_position_table_provider=load_bound_oem_position_table,
+                motion_snapshot_collector=hardware_snapshot_collect,
+            )
+            operator_store = app.state.operator_receipt_store
+            command_plane_to_start = app.state.operator_command_plane
+            operator_store.converge_startup_state()
+        if command_plane_to_start is not None and app.state.release_start_error is None:
+            command_plane_to_start.start()
+            _operator_control_plane_installed = True
+
+    release_start_task = None
+    if app.state.release_identity.get("verified") is True:
+        async def commit_release_start_receipt() -> None:
+            global _startup_error
+            try:
+                # ASGI startup must yield before the server opens its listener.
+                # Keep the writer owned until it finishes, even on shutdown.
+                writer_task = asyncio.create_task(asyncio.to_thread(
+                    record_runtime_release_start,
+                    runtime_root,
+                    app.state.release_identity,
+                    timeout_s=45.0,
+                ))
+                try:
+                    receipt = await asyncio.shield(writer_task)
+                except asyncio.CancelledError:
+                    await asyncio.gather(writer_task, return_exceptions=True)
+                    raise
+                app.state.release_start_receipt = receipt
+                app.state.release_identity = publish_runtime_release_receipt(receipt)
+                start_operator_control_plane()
+            except Exception as exc:
+                app.state.release_start_error = f"{type(exc).__name__}: {exc}"
+                _startup_error = f"Canonical runtime release-start receipt failed: {app.state.release_start_error}"
+            finally:
+                app.state.release_start_ready.set()
+
+        release_start_task = asyncio.create_task(
+            commit_release_start_receipt(),
+            name="bioxp-runtime-release-start-receipt",
         )
-        _operator_control_plane_installed = True
+    else:
+        start_operator_control_plane()
+        app.state.release_start_ready.set()
     try:
         yield
     finally:
+        if release_start_task is not None and not release_start_task.done():
+            release_start_task.cancel()
+            await asyncio.gather(release_start_task, return_exceptions=True)
         # Close admission immediately, then drain the same ownership leases used
         # by reconnect. A shielded constructor may outlive its cancelled HTTP
         # waiter, but it cannot publish an owner after this shutdown completes.
@@ -905,12 +1078,29 @@ async def lifespan(app: FastAPI):
                     await _stop_owned_camera_session(reason="lifespan shutdown")
                 except Exception as exc:
                     shutdown_errors.append(f"camera shutdown: {exc}")
+                history_reader = getattr(app.state, "operator_history_reader", None)
+                if history_reader is not None:
+                    try:
+                        history_reader.close()
+                    except Exception as exc:
+                        shutdown_errors.append(f"operator history reader shutdown: {exc}")
                 command_plane = getattr(app.state, "operator_command_plane", None)
+                command_plane_failure: Exception | None = None
                 if command_plane is not None:
                     try:
                         command_plane.stop()
                     except Exception as exc:
+                        command_plane_failure = exc
                         shutdown_errors.append(f"operator command plane shutdown: {exc}")
+                if command_plane_failure is not None:
+                    _receiver_audit_shutdown = {"state": "skipped", "reason": "command_workers_active",
+                                                "durable_ownership_claimed": False}
+                    app.state.receiver_audit_shutdown = _receiver_audit_shutdown
+                    _startup_error = (
+                        "BioXP lifespan shutdown blocked transport teardown because operator "
+                        f"command workers remain active: {command_plane_failure}"
+                    )
+                    raise RuntimeError(_startup_error) from command_plane_failure
                 cleanup_errors = list(shutdown_errors)
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
@@ -920,6 +1110,7 @@ async def lifespan(app: FastAPI):
                     except Exception as exc:
                         cleanup_errors.append(f"pipette transport close: {exc}")
                 owners = (_tester,) if _tester_quarantine is _tester else (_tester, _tester_quarantine)
+                audit_buffers = _receiver_audit_buffers(owners)
                 for owner in owners:
                     if owner is None:
                         continue
@@ -956,6 +1147,20 @@ async def lifespan(app: FastAPI):
                     )
                     if cleanup_errors:
                         _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
+        # No transport/controller ownership lock may cover this storage wait.
+        # If teardown could not prove producer shutdown, do not close its audit
+        # admission. USB quarantine truth remains independent of logging truth.
+        if failed_owner is not None:
+            _receiver_audit_shutdown = {"state": "skipped", "reason": "usb_teardown_incomplete",
+                                        "durable_ownership_claimed": False}
+        else:
+            _receiver_audit_shutdown = {"state": "draining", "durable_ownership_claimed": False}
+            _receiver_audit_shutdown = await asyncio.to_thread(_drain_receiver_audits, audit_buffers)
+        app.state.receiver_audit_shutdown = _receiver_audit_shutdown
+        if _receiver_audit_shutdown["state"] != "complete":
+            logging.getLogger(__name__).warning(
+                "Receiver audit shutdown %s; buffered evidence is not confirmed durable; "
+                "USB teardown status is separate", _receiver_audit_shutdown)
 
 
 app = FastAPI(
@@ -966,18 +1171,66 @@ app = FastAPI(
 )
 app.include_router(oem_compat_router)
 app.include_router(oem_homing_router)
-app.include_router(create_operator_reports_router(_pipette_receipts))
 
 
-def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+
+@app.middleware("http")
+async def bind_direct_pipette_idempotency(request: Request, call_next):
+    if request.method == "POST" and request.url.path.startswith("/liquid/"):
+        dispatch_context = current_operator_dispatch_context() or {}
+        trusted_key = dispatch_context.get("idempotency_key")
+        key = str(trusted_key or request.headers.get("idempotency-key", "")).strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,199}", key) is None:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "valid Idempotency-Key header is required"},
+            )
+        token = set_direct_pipette_idempotency_key(key)
+        try:
+            return await call_next(request)
+        finally:
+            reset_direct_pipette_idempotency_key(token)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def require_durable_release_start_before_readiness(request: Request, call_next):
+    identity = getattr(request.app.state, "release_identity", {})
+    if isinstance(identity, Mapping) and identity.get("verified") is True:
+        ready = getattr(request.app.state, "release_start_ready", None)
+        if isinstance(ready, asyncio.Event):
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=46.0)
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "not_ready", "error": "runtime_release_start_receipt_timeout"},
+                )
+        error = getattr(request.app.state, "release_start_error", None)
+        receipt = getattr(request.app.state, "release_start_receipt", None)
+        if error is not None or not isinstance(receipt, Mapping):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "error": "runtime_release_start_receipt_unavailable",
+                    "reason_code": "release_start_failed" if error is not None else "release_start_receipt_missing",
+                },
+            )
+    return await call_next(request)
+
+
+def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = None, *, defer_reconciliation: bool = False):
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
-            status_code=410,
+            status_code=409,
             detail={
                 "error": "direct_z_mutation_retired",
                 "authority": "Serial206OemInitializationProvider",
-                "replacement": "/operator/actions/{semantic_z_action_id}",
+                "replacement": "/operator/v2/actions/{canonical_action_id}",
+                "required_schema": "bioxp.operator_action_request.v2",
+                "physical_motion_commanded": False,
             },
         )
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
@@ -987,97 +1240,56 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
     operator_command_id = str(context["operator_command_id"])
     expected_generation = int(context["expected_ownership_generation"])
     idempotency_key = str(context["idempotency_key"])
-    automatic_prerequisites: list[dict[str, Any]] = []
-
-    def execute_stage(stage: str, stage_inputs: Mapping[str, Any], key_suffix: str) -> dict[str, Any]:
-        payload = dict(stage_inputs)
-        payload["command_id"] = f"{operator_command_id}:{key_suffix}"
-        stage_result = execute(
-            stage,
-            inputs=payload,
-            expected_generation=expected_generation,
-            idempotency_key=f"{idempotency_key}:{key_suffix}",
-        )
-        return stage_result if isinstance(stage_result, dict) else {
-            "ok": False,
-            "failure": "serial206_z_provider_returned_non_object",
-        }
-
-    # Exact manual moves preserve the OEM button contract. They must fail closed
-    # in an invalid Z state instead of inserting an unrequested prepare or home.
-    auto_prepare_intents = {
-        "manual_home", "move_z_home", "diagnostic_home_axis",
-        "clear", "path_execute",
-        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
-    }
-    auto_home_intents = {
-        "clear", "path_execute",
-        "move_gz", "home_gz", "lower_pipette", "lift_pipette", "self_test",
-    }
-    command_lease = getattr(provider, "z_command_lease", None)
-    if not callable(command_lease):
-        raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
-    with command_lease():
-        projection_reader = getattr(provider, "z_projection", None)
-        projection = projection_reader() if callable(projection_reader) else {}
-        z_state = str(projection.get("state") or "unknown") if isinstance(projection, Mapping) else "unknown"
-
-        if intent in auto_prepare_intents and z_state in {"unprepared", "failed_latched"}:
-            preparation = execute_stage("prepare", {}, "auto_prepare")
-            automatic_prerequisites.append({"stage": "auto_prepare", "result": preparation})
-            if preparation.get("ok") is not True:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "z_automatic_prerequisite_failed",
-                        "failed_stage": "auto_prepare",
-                        "requested_intent": intent,
-                        "requested_motion_dispatched": False,
-                        "prerequisite": preparation,
-                    },
-                )
-            z_state = str(preparation.get("z_state") or "prepared_unreferenced")
-
-        if intent in auto_home_intents and z_state == "prepared_unreferenced":
-            homing = execute_stage("manual_home", {"timeout_s": 8.0}, "auto_home")
-            automatic_prerequisites.append({"stage": "auto_home", "result": homing})
-            if homing.get("ok") is not True:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "z_automatic_prerequisite_failed",
-                        "failed_stage": "auto_home",
-                        "requested_intent": intent,
-                        "requested_motion_dispatched": False,
-                        "prerequisite": homing,
-                    },
-                )
-
+    # Match the provider's interrupt classification before taking the ordinary
+    # motion lease. Its existing interrupt path delivers first and only then
+    # acquires the lifecycle lock to reconcile durable state.
+    is_interrupt = str(intent).strip() in {"stop", "abort"}
+    if is_interrupt:
+        lease: Any = nullcontext()
+    else:
+        command_lease = getattr(provider, "z_command_lease", None)
+        if not callable(command_lease):
+            raise HTTPException(status_code=503, detail={"error": "serial206_z_command_lease_unavailable"})
+        lease = command_lease()
+    with lease:
         provider_inputs = dict(inputs or {})
         provider_inputs["command_id"] = operator_command_id
-        result = execute(
-            intent,
-            inputs=provider_inputs,
-            expected_generation=expected_generation,
-            idempotency_key=idempotency_key,
-        )
+        if intent == "stop" and defer_reconciliation:
+            reconcile = provider.execute_z_stop_interrupt(
+                inputs=provider_inputs,
+                expected_generation=expected_generation,
+                idempotency_key=idempotency_key,
+                defer_reconciliation=True,
+            )
+            def finish_stop():
+                result = reconcile()
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise HTTPException(status_code=409, detail=result)
+                return result
+            return finish_stop
+        else:
+            result = execute(
+                intent,
+                inputs=provider_inputs,
+                expected_generation=expected_generation,
+                idempotency_key=idempotency_key,
+            )
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise HTTPException(status_code=409, detail=result)
-        if automatic_prerequisites:
-            result = {**result, "automatic_prerequisites": automatic_prerequisites}
         return result
 
 
 def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Dispatch one typed X intent under the operator-owned generation context."""
+    """Dispatch one typed X intent through the retained OEM provider."""
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
-            status_code=410,
+            status_code=409,
             detail={
                 "error": "direct_x_mutation_retired",
                 "authority": "Serial206OemInitializationProvider",
-                "replacement": "/operator/actions/{semantic_x_action_id}",
+                "replacement": "/operator/v2/actions/{canonical_action_id}",
+                "required_schema": "bioxp.operator_action_request.v2",
                 "physical_motion_commanded": False,
             },
         )
@@ -1296,9 +1508,29 @@ class _LifecycleHardware:
         acks = self.tester.activate_boards(expect_reply=True, fail_fast=True)
         return {"ok": self.tester._oem_board_activation_map_success(acks), "acks": acks}
 
+    def oem_begin_board_lifecycle_generation(self, *, deactivation, activation):
+        # The native owner validates raw board ACK maps, not adapter wrappers.
+        begin = getattr(self.tester, "oem_begin_board_lifecycle_generation", None)
+        if not callable(begin):
+            raise RuntimeError("initial_check_generation_unavailable")
+        return begin(deactivation=deactivation["acks"], activation=activation["acks"])
+
 
 def _can_ready_observation() -> bool | None:
     return (hardware_state.ownership_projection().get("ownership") or {}).get("CAN_READY")
+
+
+def _active_lifecycle_attempt_id(stage_id: str) -> str:
+    stage = (
+        lifecycle_state.projection()
+        .get("startup", {})
+        .get("stages", {})
+        .get(str(stage_id), {})
+    )
+    attempt_id = stage.get("attempt_id") if isinstance(stage, Mapping) else None
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise LifecycleStateError(f"{stage_id} has no active lifecycle attempt identity")
+    return attempt_id
 
 
 def _constructor_pipette_action() -> dict[str, Any]:
@@ -1306,11 +1538,14 @@ def _constructor_pipette_action() -> dict[str, Any]:
     if owner.__class__.__name__ != "FourPipetteTransport":
         return {"ok": False, "error": "exact_four_pipette_owner_required"}
     command = PipetteInitCommand()
+    attempt_id = _active_lifecycle_attempt_id("constructor_pipette_stage")
     result = _run_serial206_pipette_audit(
         "initialize",
         lambda transport: transport.initialize(command),
         requested_inputs=command.to_payload(),
         lifecycle_stage_id="constructor_pipette_stage",
+        lifecycle_attempt_id=attempt_id,
+        lifecycle_idempotency_key=f"constructor_pipette_stage:{attempt_id}",
     )
     return {
         **result,
@@ -1411,7 +1646,6 @@ def _operator_pipette_status() -> dict[str, Any]:
         "group_status_spacing_ms": 30,
         "live_query_performed": False,
         "last_group_transaction": None,
-        "liquid_mutation_enabled": False,
         "tip_type": 201,
         "tip_location": -1,
         "allow_to_stop": True,
@@ -1755,7 +1989,7 @@ class OemXMoveAbsoluteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     position_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
-    acceleration: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
+    acceleration: StrictInt | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
 
 
 class OemXReconcileRequest(BaseModel):
@@ -1773,7 +2007,7 @@ class OemXSetHomeRequest(BaseModel):
 class OemXProfileValueRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    value: StrictInt = Field(default=0, ge=0, le=2_147_483_647)
+    value: StrictInt = Field(default=0, ge=-(2**31), le=2**31 - 1)
 
 
 class OemXCurrentModeRequest(BaseModel):
@@ -2354,7 +2588,15 @@ class PipetteAspirateRequest(BaseModel):
     tip_id: Optional[str] = Field(None, max_length=120)
     air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
     operator: Optional[str] = Field(None, max_length=120)
+    channels: Optional[list[int]] = None
+    speed: Optional[float] = Field(None, gt=0.0, le=10000.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_explicit_overload(self):
+        if (self.channels is None) != (self.speed is None):
+            raise ValueError("explicit-channel Aspirate requires both channels and speed")
+        return self
 
 
 class PipetteDispenseRequest(BaseModel):
@@ -2367,7 +2609,16 @@ class PipetteDispenseRequest(BaseModel):
     tip_id: Optional[str] = Field(None, max_length=120)
     air_gap_ul: Optional[float] = Field(None, ge=0.0, le=1000.0)
     operator: Optional[str] = Field(None, max_length=120)
+    dispense_type: int = Field(0, ge=0, le=0)
+    channels: Optional[list[int]] = None
+    speed: Optional[float] = Field(None, gt=0.0, le=10000.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_explicit_overload(self):
+        if (self.channels is None) != (self.speed is None):
+            raise ValueError("explicit-channel Dispense requires both channels and speed")
+        return self
 
 
 class PipetteMixRequest(BaseModel):
@@ -2519,8 +2770,12 @@ class CameraStatusResponse(BaseModel):
         )
         if self.available and any(value is None for value in frame_values):
             raise ValueError("available camera status requires complete frame metadata")
-        if not self.available and any(value is not None for value in frame_values):
-            raise ValueError("unavailable camera status cannot claim frame metadata")
+        stale_frame = (
+            all(value is not None for value in frame_values)
+            and self.frame_age_seconds > self.freshness_budget_seconds
+        )
+        if not self.available and any(value is not None for value in frame_values) and not stale_frame:
+            raise ValueError("unavailable camera status cannot claim fresh or incomplete frame metadata")
         return self
 
 
@@ -2555,6 +2810,7 @@ class BarcodeReadRequest(BaseModel):
 
 
 class ProtocolCompileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     source_type: str = Field("native", pattern=r"^(native|oem_xml)$")
     document: Optional[dict[str, Any]] = None
     xml_path: Optional[str] = None
@@ -2562,6 +2818,12 @@ class ProtocolCompileRequest(BaseModel):
 
 class ProtocolExecuteRequest(ProtocolCompileRequest):
     dry_run: bool = True
+    idempotency_key: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Caller-stable execution identity required for dry_run=false; raw value is not persisted.",
+    )
     live_execution: Optional[dict[str, Any]] = Field(
         None,
         description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
@@ -2575,9 +2837,55 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     snapshot_refs: list[str] = Field(default_factory=list)
 
 
-class ProtocolReviewRequest(BaseModel):
+class ProtocolControlTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    idempotency_key: StrictStr = Field(..., min_length=1, max_length=256)
+    command_id: StrictStr = Field(..., min_length=1)
+    expected_ownership_generation: StrictInt = Field(..., ge=0)
+
+    @field_validator("idempotency_key", "command_id")
+    @classmethod
+    def nonblank_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("identity must not be blank")
+        return value
+
+
+class ProtocolPauseRequest(ProtocolControlTarget):
+    action: Literal["pause"]
+    mode: Literal["ordinary", "deferred"]
+
+
+class ProtocolWakeRequest(ProtocolControlTarget):
+    action: Literal["wake"]
+    gate_id: StrictStr = Field(..., min_length=1)
+
+
+class ProtocolContinueRequest(ProtocolControlTarget):
+    action: Literal["continue"]
+    gate: Literal["ordinary_pause", "deferred_pause", "delaypoint"]
+    gate_id: StrictStr = Field(..., min_length=1)
+
+
+class ProtocolSafeStopRequest(ProtocolControlTarget):
+    action: Literal["safe_stop"]
+
+
+class ProtocolAbortRequest(ProtocolControlTarget):
+    action: Literal["abort"]
+
+
+ProtocolControlRequest = Annotated[
+    ProtocolPauseRequest | ProtocolWakeRequest | ProtocolContinueRequest | ProtocolSafeStopRequest | ProtocolAbortRequest,
+    Field(discriminator="action"),
+]
+
+
+class ProtocolReviewRequest(ProtocolControlTarget):
     reviewer: str = Field("operator", min_length=1, max_length=120)
     note: Optional[str] = Field(None, max_length=4000)
+    stage_id: StrictStr = Field(..., min_length=1)
+    action_id: StrictStr | None = None
 
 
 class LedRgbRequest(BaseModel):
@@ -2704,18 +3012,10 @@ def _axis_status_payload(tester: BioXpTester, axis: AxisName, *, include_current
         status["standby_current"] = tester.motor_get_axis_param(board, 7, motor=motor)
     current_safety = None
     if axis == AxisName.GRIPPER and include_current:
-        speed_value = status.get("speed", {}).get("speed") if isinstance(status.get("speed"), dict) else None
-        run_value = status.get("max_current", {}).get("value") if isinstance(status.get("max_current"), dict) else None
-        standby_value = status.get("standby_current", {}).get("value") if isinstance(status.get("standby_current"), dict) else None
-        unsafe_hot_idle = bool(speed_value == 0 and ((isinstance(run_value, int) and run_value > OEM_IDLE_STANDBY_CURRENT) or (isinstance(standby_value, int) and standby_value > OEM_IDLE_STANDBY_CURRENT)))
-        current_safety = {
-            "classification": "G_CURRENT_UNSAFE_HOT_IDLE" if unsafe_hot_idle else "G_CURRENT_IDLE_SAFE",
-            "speed": speed_value,
-            "run_current_param6": run_value,
-            "standby_current_param7": standby_value,
-            "safe_idle_max": OEM_IDLE_STANDBY_CURRENT,
-            "motion_commanded": False,
-        }
+        speed_value = gripper_current_observation(status.get("speed"), "speed")
+        run_value = gripper_current_observation(status.get("max_current"), "value")
+        standby_value = gripper_current_observation(status.get("standby_current"), "value")
+        current_safety = gripper_current_status(run_value, standby_value, speed_value)
     return {
         "axis": axis.value,
         "preset": preset,
@@ -3727,11 +4027,7 @@ def _execute_relative_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if axis is AxisName.Z
-            else tester.motor_prepare_motion_interlock(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             raise HTTPException(status_code=409, detail={
                 "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
@@ -3744,7 +4040,7 @@ def _execute_relative_move(
             "source_anchor": "ClassControlInterface.cs:4165-4204",
             "axis_profile_rewritten": False,
             "standby_current_param7_written": False,
-            "note": "OEM moveSteps does not rewrite speed, acceleration, current, or switch masks; only the OEM XYZ wake/interlock path ran.",
+            "note": "OEM moveSteps does not rewrite speed, acceleration, current, or switch masks; the prepared profile is preserved and the interlock is freshly observed.",
         }
         prep_policy = {
             "mode": "oem_exact",
@@ -3752,6 +4048,17 @@ def _execute_relative_move(
             "reuse_used": False,
             "fresh_oem_interlock": True,
         }
+        if axis is AxisName.GRIPPER:
+            # CCI4194-4203 owns a board moveSteps followed by getCurrentPosition;
+            # do not replace Head's limits/event/normal -1 return with leaf MVP
+            # plus the legacy guardrail/equality loop below.
+            result = tester._motor_oem_move_steps_source(
+                board=preset["board"], motor=preset["motor"], axis="g",
+                steps=int(steps), timeout_s=float(wait_timeout_s),
+            )
+            result.update({"interlock": interlock, "prep": prep,
+                           "physical_effect_verified": False})
+            return result
     else:
         preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(
             tester,
@@ -3925,11 +4232,7 @@ def _execute_absolute_move(
             "policy": "no_reactivation_after_oem_profile",
             "profile": profile,
         }
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if axis is AxisName.Z
-            else tester.motor_prepare_motion_interlock(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             raise HTTPException(status_code=409, detail={
                 "error": "oem_z_interlock_not_verified" if axis is AxisName.Z else "oem_interlock_not_verified",
@@ -3942,6 +4245,28 @@ def _execute_absolute_move(
             "standby_current_param7_written": False,
         }
         prep_policy = {"mode": "oem_exact", "fresh_oem_interlock": True}
+        if axis is AxisName.GRIPPER:
+            # CCI4268-4273 delegates to Head.moveToAbs(false,false).
+            # The native board owner retains clamp/cache/no-op/event semantics.
+            if not tester._oem_board_present(preset["board"]):
+                result = {"ok": True, "source_noop": "board_null", "command_sent": False}
+            else:
+                result = tester.motor_oem_move_absolute(
+                    preset["board"], int(position_steps), motor=preset["motor"],
+                    wait_for_stop=True, gripper_recover=False,
+                )
+            # moveG is void: a normal Head return1 is discarded, not thrown.
+            # Preserve that scalar and its non-motion failure evidence intact.
+            normal_uninitialized = (result.get("source_return_code") == 1
+                                    and result.get("failure") == "board_not_initialized")
+            if normal_uninitialized:
+                result.update({"ok": True, "source_noop": "board_not_initialized",
+                               "command_sent": False})
+            result.update({"interlock": interlock, "prep": prep,
+                           "source_call_completed": result.get("ok") is True,
+                           "public_wrapper_return": None,
+                           "physical_effect_verified": False})
+            return result
     else:
         preset, board_status, interlock, prep, prep_policy = _prepare_motion_axis(tester, axis, speed=speed, acc=acc)
     position_before = tester.motor_get_position(preset["board"], motor=preset["motor"])
@@ -4481,6 +4806,64 @@ def _domain_observation(projection: dict[str, Any], domain: str) -> Any:
     return row.get("observation") if isinstance(row, dict) and row.get("status") == "observed" else None
 
 
+# One application-wide logging join budget, not a USB teardown timeout.
+# A timed-out daemon writer is retained; no commit cancellation/retry is implied.
+_RECEIVER_AUDIT_DRAIN_TIMEOUT_S = 2.0
+_receiver_audit_shutdown = None
+
+
+def _receiver_audit_buffers(owners):
+    from .receiver_audit_buffer import current_receiver_audit_buffer
+    buffers = []
+    for audit in [current_receiver_audit_buffer(),
+                  *(getattr(owner, "_receiver_audit", None) for owner in owners)]:
+        if audit is not None and all(audit is not other for other in buffers):
+            buffers.append(audit)
+    return buffers
+
+
+def _public_receiver_audit_buffer(audit):
+    status = audit.status()
+    # Storage exceptions may contain filesystem paths; expose a stable reason,
+    # not exception text, on the unauthenticated compatibility status surface.
+    status["writer_error"] = "writer_failed" if status["writer_error"] else None
+    return status
+
+
+def _receiver_audit_health():
+    owners = tuple(owner for owner in (_tester, _tester_quarantine) if owner is not None)
+    buffers = _receiver_audit_buffers(owners)
+    statuses = [_public_receiver_audit_buffer(audit) for audit in buffers]
+    setup_failed = any(getattr(owner, "_receiver_audit_setup_error", None) for owner in owners)
+    hook_failures = sum(getattr(getattr(owner, "novo_router", None), "_audit_hook_failures", 0)
+                        for owner in {id(owner): owner for owner in owners}.values())
+    return {"mode": "critical_only", "routine_capture_enabled": False,
+            "available": bool(statuses), "healthy": bool(statuses) and not setup_failed
+            and not hook_failures and all(row["healthy"] for row in statuses),
+            "setup_error": "setup_failed" if setup_failed else None,
+            "hook_failures": hook_failures, "buffers": statuses,
+            "shutdown": _receiver_audit_shutdown, "durable_ownership_claimed": False}
+
+
+def _drain_receiver_audits(buffers):
+    """Worker-thread only; caller has stopped producers and released ownership."""
+    deadline = time.monotonic() + _RECEIVER_AUDIT_DRAIN_TIMEOUT_S
+    results = []
+    for audit in buffers:
+        try:
+            status = audit.close(timeout_s=max(0.0, deadline - time.monotonic()))
+            results.append({"session": status["session"],
+                            "timed_out": not status["finished"],
+                            "clean_drain_committed": status["clean_drain_committed"],
+                            "writer_failed": bool(status["writer_error"])})
+        except Exception:
+            results.append({"error": "drain_failed", "clean_drain_committed": False})
+    return {"state": "complete" if all(row["clean_drain_committed"] and
+            not row.get("timed_out") and not row.get("writer_failed") for row in results)
+            else "incomplete", "budget_s": _RECEIVER_AUDIT_DRAIN_TIMEOUT_S,
+            "buffers": results, "durable_ownership_claimed": False}
+
+
 def _status_payload() -> dict:
     """Compatibility envelope projected from canonical state only."""
     projection = hardware_state.project("transport", "boards", "latch", "chiller")
@@ -4501,23 +4884,28 @@ def _status_payload() -> dict:
     )
     lifecycle = lifecycle_state.projection()
     serial206_initialization = serial206_oem_initialization_provider_status()
+    admission = hardware_state.project("transport", "boards", "power", "interlock", "latch", "axes", "gripper")
+    deck_freshness = getattr(_serial206_oem_initialization_provider, "deck_observation_freshness", None)
+    deck_observation = {"available": False, "freshness": {"state": "missing", "age_s": None}}
+    if callable(deck_freshness):
+        try:
+            deck_observation = deck_freshness(expected_generation=int(hardware_state.ownership_epoch))
+        except Exception:
+            # An unavailable passive owner must not blank the status envelope.
+            pass
     return {
         **projection,
-        "runtime_identity": {
-            "release_sha": os.environ.get("BIOXP_RELEASE_SHA"),
-            "release_tree": os.environ.get("BIOXP_RELEASE_TREE"),
-            "source_mount": os.environ.get("BIOXP_RELEASE_SOURCE_MOUNT"),
-            "runtime_owner": os.environ.get("BIOXP_RUNTIME_OWNER"),
-            "service_unit": "bioxp-api.service",
-            "listener_port": 8123,
-        },
+        "admission_observation": {key: admission.get(key) for key in ("available", "cache_state", "freshness")},
+        "deck_authority": deck_observation,
+        "runtime_identity": public_release_identity(current_release_identity()),
+        "receiver_audit": _receiver_audit_health(),
         "capabilities": list(BMS_COMMISSIONING_CAPABILITIES),
         "status": "ok" if can_ready is True and projection["cache_state"] == "fresh" else "degraded",
         "transport": "usb",
         "runtime_available": runtime_available,
         "hardware_connected": can_ready,
         "hardware_connected_deprecated": "maps only to OEM CAN_READY",
-        "startup_error": _startup_error,
+        "startup_error": None if _startup_error is None else "startup_failed",
         "status_error": None if projection.get("available") else "canonical hardware snapshot unavailable",
         "board_status": boards,
         "chiller_status": chiller,
@@ -4561,10 +4949,14 @@ def _query_motor(tester: BioXpTester, board: int, command: int, cmd_type: int, m
     return {"ack": ack, "value": None if ack is None else ack.get("value")}
 
 
-def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, Any]:
+def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName, *, before_query=None) -> dict[str, Any]:
     preset = _axis_preset(tester, axis)
     board, motor = int(preset["board"]), int(preset["motor"])
-    params = {param: _query_motor(tester, board, 6, param, motor) for param in (1, 3, 6, 7, 9, 10, 12, 13)}
+    params = {}
+    for param in (1, 3, 6, 7, 9, 10, 12, 13):
+        if before_query is not None:
+            before_query()
+        params[param] = _query_motor(tester, board, 6, param, motor)
     left, right = params[9]["value"], params[10]["value"]
     left_state = int(left) if type(left) is int else None
     right_state = int(right) if type(right) is int else None
@@ -4598,11 +4990,16 @@ def _query_axis_for_snapshot(tester: BioXpTester, axis: AxisName) -> dict[str, A
     }
 
 
-def _query_io_snapshot(tester: BioXpTester) -> dict[int, Any]:
-    return {channel: _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"] for channel in (0, 1, 2, 3)}
+def _query_io_snapshot(tester: BioXpTester, *, before_query=None) -> dict[int, Any]:
+    rows = {}
+    for channel in (0, 1, 2, 3):
+        if before_query is not None:
+            before_query()
+        rows[channel] = _query_motor(tester, tester.BOARD_DECK, 15, channel)["value"]
+    return rows
 
 
-def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
+def _query_aux_snapshot(tester: BioXpTester, kind: str, *, before_query=None) -> dict[str, Any]:
     if kind == "thermal":
         banks = (tester.THERMAL_BANK_NEST, tester.THERMAL_BANK_LID)
         gp_params_by_bank = {
@@ -4614,6 +5011,8 @@ def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
         gp_params_by_bank = {bank: (4, 7, 8, 21) for bank in banks}
 
     def query(command: int, cmd_type: int, motor: int) -> dict[str, Any]:
+        if before_query is not None:
+            before_query()
         ack = tester.query_only_tmcl(
             tester.BOARD_THERMAL if kind == "thermal" else tester.BOARD_CHILLER,
             command,
@@ -4642,20 +5041,20 @@ def _query_aux_snapshot(tester: BioXpTester, kind: str) -> dict[str, Any]:
     return {"activation_attempted": False, "firmware": firmware, "temps": temperatures, "gp": gp, "alive": bool(firmware["ok"] or any(row["ok"] for row in temperatures.values()))}
 
 
-def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
+def _hardware_collectors(tester: BioXpTester, *, before_query=None) -> dict[str, Any]:
     axes_cache: dict[str, Any] | None = None
     io_cache: dict[int, Any] | None = None
 
     def axes(_: CollectionContext) -> dict[str, Any]:
         nonlocal axes_cache
         if axes_cache is None:
-            axes_cache = {axis.value: _query_axis_for_snapshot(tester, axis) for axis in AxisName}
+            axes_cache = {axis.value: _query_axis_for_snapshot(tester, axis, before_query=before_query) for axis in AxisName}
         return {"axes": [axis.value for axis in AxisName], "rows": axes_cache}
 
     def io() -> dict[int, Any]:
         nonlocal io_cache
         if io_cache is None:
-            io_cache = _query_io_snapshot(tester)
+            io_cache = _query_io_snapshot(tester, before_query=before_query)
         return io_cache
 
     def transport(_: CollectionContext) -> dict[str, Any]:
@@ -4671,12 +5070,11 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
     def boards(_: CollectionContext) -> dict[int, Any]:
         rows = {}
         for board in tester.BOARDS:
-            if int(board) == int(tester.BOARD_THERMAL):
-                rows[int(board)] = _query_aux_snapshot(tester, "thermal")["firmware"]
-            elif int(board) == int(tester.BOARD_CHILLER):
-                rows[int(board)] = _query_aux_snapshot(tester, "chiller")["firmware"]
-            else:
-                rows[int(board)] = _query_motor(tester, int(board), 173, 0)
+            if before_query is not None:
+                before_query()
+            # Board presence requires the firmware query, not every auxiliary
+            # temperature/configuration read (which its own domain collects).
+            rows[int(board)] = _query_motor(tester, int(board), 173, 0)
         return rows
 
     def range_projection(context: CollectionContext) -> dict[str, Any]:
@@ -4748,8 +5146,8 @@ def _hardware_collectors(tester: BioXpTester) -> dict[str, Any]:
         "interlock": interlock,
         "latch": latch,
         "gripper": gripper,
-        "thermal": lambda _: _query_aux_snapshot(tester, "thermal"),
-        "chiller": lambda _: _query_aux_snapshot(tester, "chiller"),
+        "thermal": lambda _: _query_aux_snapshot(tester, "thermal", before_query=before_query),
+        "chiller": lambda _: _query_aux_snapshot(tester, "chiller", before_query=before_query),
         "pipette": pipette,
         "camera": camera,
         "shadow_readback": shadow,
@@ -5278,10 +5676,42 @@ class UsbSniffManager:
 _usb_sniff_manager = UsbSniffManager()
 
 
-async def _run_blocking(label: str, func, timeout_s: float = 30.0):
+_PROTOCOL_NORMAL_MUTATIONS = {
+    "Thermal baseline": ("thermal",), "Thermal setpoint": ("thermal",),
+    "Thermal pedestal setpoint": ("thermal",), "Thermal fan": ("thermal",),
+    "Thermal PWM": ("thermal",), "Thermal rates": ("thermal",),
+    "Thermal fast profile": ("thermal",), "Thermal hard reset": ("thermal",),
+    "Chiller baseline": ("thermal",), "Chiller setpoint": ("thermal",),
+    "Chiller fan": ("thermal",), "Chiller PWM": ("thermal",),
+    "Chiller rates": ("thermal",), "Chiller hard reset": ("thermal",),
+}
+
+
+@contextmanager
+def _protocol_mutation_scope(label):
+    resources = _PROTOCOL_NORMAL_MUTATIONS.get(label)
+    with ExitStack() as stack:
+        if resources is not None:
+            try:
+                stack.enter_context(_protocol_command_store().normal_mutation_scope(resources=resources))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail={"error": "workflow_mutation_refused", "reason": str(exc)}) from exc
+        yield
+
+
+async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
+    def invoke():
+        from bioxp.operator_controls import current_operator_dispatch_context
+        context = current_operator_dispatch_context() or {}
+        precheck = context.get("motion_snapshot_precheck")
+        if callable(precheck):
+            precheck()
+        return func()
+
     async def leased_operation():
-        async with _tester_lock:
-            return await run_in_threadpool(func)
+        with _protocol_mutation_scope(label):
+            async with _tester_lock:
+                return await run_in_threadpool(invoke)
 
     worker = asyncio.create_task(leased_operation(), name=f"bioxp-tester:{label}")
     try:
@@ -5290,6 +5720,8 @@ async def _run_blocking(label: str, func, timeout_s: float = 30.0):
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise
     except asyncio.TimeoutError as exc:
+        if timeout_s is None:
+            raise  # The source raised; no wrapper deadline was installed.
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise HTTPException(
             status_code=504,
@@ -5297,20 +5729,27 @@ async def _run_blocking(label: str, func, timeout_s: float = 30.0):
                 "error": "tester_operation_completion_ambiguous",
                 "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
                 "completion_ambiguous": True,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
                 "connection_transition_blocked_until_worker_exit": True,
             },
         ) from exc
 
 
-async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0):
-    """Run a tester-bound interrupt while retaining connection ownership.
+async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *, delivery_only_lease: bool = False):
+    """Retain connection ownership through the complete physical sequence.
 
-    The inner task owns the transition lease. Shielding it is intentional:
-    timing out or cancelling the HTTP waiter must not let release/rebind race a
-    worker thread that cannot itself be cancelled.
+    Only Z Stop can explicitly signal the delivery boundary; its remaining
+    provider work is lifecycle/SQLite reconciliation, with generation checks.
+    Other callers retain the full lease. Timeout/cancellation never cancel the
+    underlying worker or release ownership before delivery actually finishes.
     """
 
+    ownership_lease_released = False
+
     async def leased_interrupt():
+        nonlocal ownership_lease_released
         async with _tester_transition_lock:
             tester = _get_tester()
             loop = asyncio.get_running_loop()
@@ -5319,10 +5758,15 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             def invoke_interrupt():
                 return interrupt_context.run(func, tester)
 
-            return await loop.run_in_executor(
-                _safety_interrupt_executor,
-                invoke_interrupt,
-            )
+            result = await loop.run_in_executor(_safety_interrupt_executor, invoke_interrupt)
+            if not delivery_only_lease:
+                return result
+        ownership_lease_released = True
+        # Only the Z Stop route opts in and returns its no-controller
+        # continuation. Free BOTH the ownership lease and single safety worker
+        # before waiting for ordinary lifecycle/SQLite recording.
+        reconciliation_context = interrupt_context.copy()
+        return await loop.run_in_executor(None, reconciliation_context.run, result)
 
     worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
     try:
@@ -5331,8 +5775,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise
     except asyncio.TimeoutError as exc:
-        # Retrieve a later exception without cancelling the task. The worker
-        # retains the transition lease until its non-cancellable thread exits.
+        # Retrieve a later exception without cancelling delivery or recording.
         worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         raise HTTPException(
             status_code=504,
@@ -5340,7 +5783,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                 "error": "safety_interrupt_completion_ambiguous",
                 "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
                 "completion_ambiguous": True,
-                "connection_transition_blocked_until_worker_exit": True,
+                "connection_transition_blocked_until_worker_exit": not ownership_lease_released,
             },
         ) from exc
 
@@ -5349,9 +5792,10 @@ async def _run_tester_transition(label: str, operation, timeout_s: float | None 
     """Run one complete tester ownership transition under cancellation-safe leases."""
 
     async def leased_transition():
-        async with _tester_lock:
-            async with _tester_transition_lock:
-                return await operation()
+        with _protocol_mutation_scope(label):
+            async with _tester_lock:
+                async with _tester_transition_lock:
+                    return await operation()
 
     worker = asyncio.create_task(leased_transition(), name=f"bioxp-transition:{label}")
     try:
@@ -5429,7 +5873,7 @@ def _camera_missing_dependency_payload(dependency: str, device: str | None = Non
         "output": "",
         "error": f"missing required camera runtime dependency: {dependency}",
         "missing_dependency": dependency,
-        "runtime_owner": os.getenv("BIOXP_RUNTIME_OWNER"),
+        "runtime_identity": current_release_identity(),
         "failure_class": "camera_runtime_contract_failed",
         **extra,
     }
@@ -5879,48 +6323,125 @@ def _camera_process_active() -> bool:
         return bool(process is not None and process.returncode is None)
 
 
-async def _stop_owned_camera_session(*, reason: str) -> dict[str, Any]:
+_camera_owner_lock = asyncio.Lock()
+
+
+async def _reap_camera_session(session: dict[str, Any]) -> None:
+    """One cleanup task per process; cancellation never releases a live device."""
+    async def cleanup():
+        proc = session["process"]
+        provider = session["provider"]
+        provider.invalidate_stream(session["session_id"])
+
+        async def discard(pipe):
+            if pipe is not None:
+                while await pipe.read(16384):
+                    pass
+
+        # Reap can otherwise hang on paused pipe transports after reader cancel.
+        stdout_task = asyncio.create_task(discard(proc.stdout))
+        if session.get("stderr_task") is None:
+            session["stderr_task"] = asyncio.create_task(discard(proc.stderr))
+        try:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            else:
+                await proc.wait()
+        finally:
+            if not stdout_task.done():
+                stdout_task.cancel()
+            await asyncio.gather(stdout_task, return_exceptions=True)
+            stderr_task = session.get("stderr_task")
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+        provider.end_stream(session["session_id"])
+
+    task = session.get("cleanup_task")
+    if task is None:
+        task = asyncio.create_task(cleanup())
+        session["cleanup_task"] = task
+    await asyncio.shield(task)
+
+
+def _camera_finish_queue(queue) -> None:
+    while not queue.empty():
+        queue.get_nowait()
+    queue.put_nowait(None)
+
+
+async def _stop_owned_camera_session(*, reason: str, expected_session_id: str | None = None) -> dict[str, Any]:
+    async with _camera_owner_lock:
+        if expected_session_id is not None and (
+            _camera_session is None or _camera_session.get("session_id") != expected_session_id
+            or int(_camera_session.get("viewers") or 0) > 0
+        ):
+            return {**_camera_stream_control_payload(_camera_session, state=_camera_stream_phase(_camera_session), idempotent=True), "ok": True}
+        task = asyncio.create_task(_stop_owned_camera_session_locked(reason=reason))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+
+async def _stop_owned_camera_session_locked(*, reason: str) -> dict[str, Any]:
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
     with _camera_projection_lock:
         session = _camera_session
         _camera_session = None
         _camera_projection_epoch += 1
         _camera_probe_cache = None
-        epoch = _camera_projection_epoch
-    hardware_state.invalidate(reason=f"camera ownership changed: {reason}")
-    lifecycle_state.record_camera_evidence(None)
+        _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
+    hardware_state.invalidate_domains("camera", reason=f"camera ownership changed: {reason}")
     if session is not None:
-        proc = session.get("process")
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        queue = session.get("queue")
-        if queue is not None:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(None)
-                except asyncio.QueueEmpty:
-                    pass
+        session["provider"].invalidate_stream(session["session_id"])
         viewer_shutdown = session.get("viewer_shutdown_task")
-        if viewer_shutdown is not None and viewer_shutdown is not asyncio.current_task() and not viewer_shutdown.done():
+        # The grace task can itself be waiting for this stop: do not cancel it.
+        if viewer_shutdown is not None and reason != "viewer grace expired" and not viewer_shutdown.done():
             viewer_shutdown.cancel()
-        task = session.get("reader_task")
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-    _camera_stream_state.update({"active": False, "last_error": reason, "last_frame_at": None})
+            await asyncio.gather(viewer_shutdown, return_exceptions=True)
+        reader = session.get("reader_task")
+        if reader is not None and not reader.done():
+            reader.cancel()
+        if reader is not None:
+            await asyncio.gather(reader, return_exceptions=True)
+        await _reap_camera_session(session)
+        for queue in tuple(session["queues"]):
+            _camera_finish_queue(queue)
+    lifecycle_state.record_camera_evidence(None)
     return {
         **_camera_stream_control_payload(session, state="off", error=reason),
         "ok": True,
         "stopped_session_id": None if session is None else session.get("session_id"),
         "replacement": reason == "replacement",
     }
+
+
+def _camera_stream_phase(session: dict[str, Any] | None) -> str:
+    if (session is None or session is not _camera_session
+            or session.get("camera_ownership_epoch") != _camera_projection_epoch
+            or session["provider"] is not _camera_provider
+            or not _camera_stream_state.get("active")
+            or session["process"].returncode is not None):
+        return "off"
+    status = session["provider"].status()
+    if (session.get("frames_emitted", 0) >= 2 and status.available
+            and status.provider_generation == session["provider_generation"]):
+        return "live"
+    return "starting"
 
 
 def _camera_stream_control_payload(
@@ -5953,102 +6474,145 @@ def _camera_stream_control_payload(
 
 
 async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]:
+    async with _camera_owner_lock:
+        previous = _camera_session
+        task = asyncio.create_task(_start_owned_camera_session_locked(payload))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                if _camera_session is not previous:
+                    await _stop_owned_camera_session_locked(reason="start cancelled")
+            raise
+        except Exception:
+            if _camera_session is not previous:
+                await _stop_owned_camera_session_locked(reason="start failed")
+            raise
+
+
+async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[str, Any]:
+    from .camera_provider import CameraJpegBuffer
+
     del payload
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
-    with _camera_projection_lock:
-        existing = _camera_session
-        existing_active = bool(
-            existing is not None
-            and _camera_stream_state.get("active")
-            and existing.get("process") is not None
-            and existing["process"].returncode is None
-        )
-        if existing_active:
-            return _camera_stream_control_payload(existing, state="live", idempotent=True)
+    existing = _camera_session
+    phase = _camera_stream_phase(existing)
+    if phase != "off":
+        return _camera_stream_control_payload(existing, state=phase, idempotent=True)
     replacement = existing is not None
     if replacement:
-        await _stop_owned_camera_session(reason="replacement")
-    device = "/dev/video0"
-    fps = 8
-    quality = 7
-    width = 640
-    height = 480
-    pick = _pick_stream_device(device)
-    if not pick.get("ok"):
-        raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
-    device = str(pick["device"])
+        await _stop_owned_camera_session_locked(reason="replacement")
     if shutil.which("ffmpeg") is None:
-        raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg", device=device))
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-vf", f"fps={fps}", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    if proc.stdout is None:
-        proc.terminate()
-        raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
+        raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg"))
+    provider = _camera_provider
     session_id = uuid.uuid4().hex
+    # Fence camera-only facts before begin_stream/spawn can yield to a
+    # concurrent snapshot collector. Failed starts never renew older evidence.
     with _camera_projection_lock:
         _camera_projection_epoch += 1
         _camera_probe_cache = None
         epoch = _camera_projection_epoch
-        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queue": queue, "process": proc, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
-        _camera_session = session
-    hardware_state.invalidate(reason="camera ownership changed: stream started")
-    _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
+    hardware_state.invalidate_domains("camera", reason="camera ownership changed: stream starting")
+    try:
+        # Fixed card + USB VID/PID + capture-capability admission, off-loop.
+        identity = await run_in_threadpool(provider.begin_stream, session_id)
+    except CameraError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    device = identity.device
+    fps, quality, width, height = 30, 7, 640, 480
+    # The V4L2 request sets capture cadence. An output fps filter duplicates
+    # delayed captures, falsely advancing provider sequence/freshness with old pixels.
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except BaseException:
+        provider.end_stream(session_id)
+        raise
+    queues: set[asyncio.Queue[bytes | None]] = set()
+    with _camera_projection_lock:
+        session = {"session_id": session_id, "camera_ownership_epoch": epoch, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "queues": queues, "queue_max_frames": 2, "process": proc, "provider": provider, "provider_generation": provider.generation, "reader_task": None, "viewer_shutdown_task": None, "viewers": 0, "started_at": time.time(), "frames_emitted": 0, "error": None}
+        owner_current = provider is _camera_provider and epoch == _camera_projection_epoch
+        if owner_current:
+            _camera_session = session
+    if not owner_current:
+        await _reap_camera_session(session)
+        raise HTTPException(status_code=503, detail="camera owner changed during stream start")
+    if proc.stdout is None:
+        await _reap_camera_session(session)
+        raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
+    _camera_stream_state.update({"active": True, "device": device, "fps": fps, "quality": quality, "width": width, "height": height, "frames_emitted": 0, "dropped_frames": provider.status().dropped_frames, "started_at": session["started_at"], "last_frame_at": None, "last_error": None, "session_id": session_id, "camera_ownership_epoch": epoch})
 
-    async def reader() -> None:
-        buffer = bytearray()
-        try:
-            while proc.returncode is None:
-                chunk = await proc.stdout.read(16384)
+    def current():
+        return (_camera_session is session and _camera_projection_epoch == epoch
+                and _camera_provider is provider and provider.generation == session["provider_generation"])
+
+    async def drain_stderr():
+        if proc.stderr is not None:
+            while True:
+                chunk = await proc.stderr.read(4096)
                 if not chunk:
                     break
-                buffer.extend(chunk)
-                while True:
-                    start = buffer.find(b"\xff\xd8")
-                    if start < 0:
-                        if len(buffer) > 65536:
-                            buffer.clear()
-                        break
-                    if start:
-                        del buffer[:start]
-                    end = buffer.find(b"\xff\xd9", 2)
-                    if end < 0:
-                        break
-                    frame = bytes(buffer[: end + 2])
-                    del buffer[: end + 2]
-                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii") + frame + b"\r\n"
-                    if queue.full():
-                        try:
+                session["stderr_tail"] = (session.get("stderr_tail", "") + chunk.decode("utf-8", errors="replace"))[-4096:]
+
+    session["stderr_task"] = asyncio.create_task(drain_stderr())
+
+    async def reader() -> None:
+        parser = CameraJpegBuffer()
+        try:
+            while proc.returncode is None and current():
+                chunk = await proc.stdout.read(16384)
+                if not chunk:
+                    session["error"] = "camera stream ended"
+                    break
+                for content in parser.feed(chunk):
+                    if not current():
+                        return
+                    try:
+                        frame = await run_in_threadpool(provider.publish_stream_frame, session_id, content)
+                    except CameraError as exc:
+                        session["error"] = str(exc)
+                        if current():
+                            _camera_stream_state.update({"last_error": str(exc), "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
+                        continue
+                    if not current():
+                        return
+                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame.content)}\r\n\r\n".encode("ascii") + frame.content + b"\r\n"
+                    if not queues:
+                        provider.drop_stream_frame(session_id)
+                    for queue in tuple(queues):
+                        if queue.full():
                             queue.get_nowait()
-                            _camera_stream_state["dropped_frames"] = int(_camera_stream_state.get("dropped_frames") or 0) + 1
-                        except asyncio.QueueEmpty:
-                            pass
-                    queue.put_nowait(part)
-                    session["frames_emitted"] = int(session.get("frames_emitted") or 0) + 1
-                    _camera_stream_state["frames_emitted"] = session["frames_emitted"]
-                    _camera_stream_state["last_frame_at"] = time.time()
+                            provider.drop_stream_frame(session_id)
+                        queue.put_nowait(part)
+                    session["frames_emitted"] += 1
+                    session["error"] = None
+                    _camera_stream_state.update({"frames_emitted": session["frames_emitted"], "last_frame_at": frame.captured_at.timestamp(), "last_error": None, "dropped_frames": provider.status().dropped_frames})
+                if parser.dropped and current():
+                    provider.drop_stream_frame(session_id, invalid=True, count=parser.dropped)
+                    parser.dropped = 0
+                    session["error"] = "camera JPEG exceeded bounded frame size"
+                    _camera_stream_state.update({"last_error": session["error"], "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             session["error"] = str(exc)
-            _camera_stream_state["last_error"] = str(exc)
         finally:
-            _camera_stream_state["active"] = False
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(None)
-                except asyncio.QueueEmpty:
-                    pass
+            was_current = current()
+            if was_current:
+                _camera_stream_state.update({"active": False, "last_error": session["error"], "last_frame_at": None})
+            await _reap_camera_session(session)
+            for queue in tuple(queues):
+                _camera_finish_queue(queue)
+            if was_current and _camera_session is session:
+                lifecycle_state.record_camera_evidence(None)
 
-    task = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
-    session["reader_task"] = task
+    session["reader_task"] = asyncio.create_task(reader(), name=f"bioxp-camera-session-{session_id}")
     return {
         **_camera_stream_control_payload(session, state="starting"),
         "replacement": replacement,
-        "queue_max_frames": queue.maxsize,
+        "queue_max_frames": session["queue_max_frames"],
         "mjpeg_url": "/camera/mjpeg",
     }
 
@@ -6059,20 +6623,23 @@ def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]
         session = _camera_session
         if session is None or session.get("camera_ownership_epoch") != epoch:
             return None, {"available": False, "cache_state": "missing", "camera_ownership_epoch": epoch, "freshness": {"state": "missing", "age_s": None}, "provenance": "POST /camera/stream/start"}
-        projection = {key: value for key, value in session.items() if key not in {"queue", "process", "reader_task"}}
-    age = max(0.0, time.time() - float(projection["started_at"]))
-    active = bool(_camera_stream_state.get("active"))
-    state = "fresh" if active else "stale"
-    return session, {"available": active, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": round(age, 3)}, "provenance": "POST /camera/stream/start", "session": projection}
-
+        projection = {key: session[key] for key in ("session_id", "camera_ownership_epoch", "device", "fps", "quality", "width", "height", "viewers", "started_at", "frames_emitted", "error")}
+    status = session["provider"].status()
+    active = _camera_stream_phase(session) != "off"
+    state = "fresh" if active and status.available else "stale"
+    return session, {"available": active, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": status.frame_age_seconds}, "provenance": "POST /camera/stream/start", "session": projection}
 
 @app.get("/status")
 async def get_status():
-    return _status_payload()
+    return await run_in_threadpool(_status_payload)
 
 
 def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
-    """Require same-snapshot live transport ownership and every board reply."""
+    """Require newly collected transport ownership and every board reply."""
+    # Domain-preserving publication can include older observations. They are
+    # useful display evidence, not a new transport-readiness promotion.
+    if not {"transport", "boards"}.issubset(snapshot.get("requested_domains") or ()):
+        return False
     domains = snapshot.get("domains")
     if not isinstance(domains, Mapping):
         return False
@@ -6094,13 +6661,86 @@ def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
     return True
 
 
+def _pipette_collection_state():
+    if _pipette_transport is None or _pipette_receipts is None:
+        raise RuntimeError("pipette_collection_owner_not_bound")
+    identity = _pipette_transport.collection_source_identity()
+    result = _pipette_receipts.collection_state(identity=identity,
+        ownership_generation=int(hardware_state.ownership_epoch))
+    if _pipette_transport.collection_source_identity() != identity:
+        raise RuntimeError("pipette_collection_owner_changed_during_read")
+    return result
+
+
 def _collect_and_publish_hardware_snapshot(
     requested: list[str],
     *,
     reason: str,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     tester = _get_tester()
-    result = hardware_state.collect(requested, _hardware_collectors(tester))
+    def yield_requested():
+        active = getattr(app.state, "operator_normal_action_active", None)
+        return bool(automatic and callable(active) and active())
+    # Admission/dispatch can start after the HTTP precheck but before this
+    # worker runs. Yield before starting any further device observation.
+    if yield_requested():
+        return {"ok": False, "published": False, "reason": "operator_action_pending"}
+    def before_query():
+        if yield_requested():
+            from .hardware_status import HardwareCollectionPreempted
+            raise HardwareCollectionPreempted("operator_action_pending")
+    deck_requested = {"axes", "latch"}.issubset(requested)
+    # Starting a query is not an owner mutation. Keep the preceding sample
+    # under its original expiry/fences while its replacement is collected.
+    provider = getattr(app.state, "oem_deck_provider", None)
+    if automatic:
+        result = hardware_state.collect(requested, _hardware_collectors(tester, before_query=before_query),
+                                        yield_requested=yield_requested)
+    else:
+        result = hardware_state.collect(requested, _hardware_collectors(tester))
+    # A failed observation withdraws prior authority; preemption alone does
+    # not. Domain errors can coexist with an atomically published ok result.
+    snapshot = result.get("snapshot") or {}
+    rows = snapshot.get("domains") or {}
+    failed = (not result.get("ok") and result.get("reason") != "operator_action_pending") or any(
+        isinstance(rows.get(domain), Mapping) and rows[domain].get("status") == "error"
+        for domain in ("axes", "latch", "gripper")
+    )
+    if deck_requested and failed:
+        invalidate = getattr(provider, "invalidate_deck_authority_cache", None)
+        if callable(invalidate):
+            invalidate(reason="hardware_observation_failed")
+    # Only the existing explicit query collection path may warm deck readiness.
+    # Never attach this to GET/status, and never turn a failed collection into
+    # fresh authority. The source reader performs its own current-owner checks.
+    deck_collect = getattr(app.state, "oem_deck_authority_collector", None)
+    if yield_requested():
+        # The base collector may already have atomically published. Do not
+        # deny that publication; only defer further deck-authority queries.
+        result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+        return result
+    if deck_requested and result.get("ok") and callable(deck_collect):
+        if _pipette_transport is not None and _pipette_receipts is not None:
+            try:
+                with provider.deck_owner_authority_scope(), _pipette_transport._transaction_lock:
+                    # Full readiness includes the pipette domain; axes/latch-only
+                    # diagnostics must not silently acquire additional devices.
+                    if "pipette" in requested:
+                        before_query()
+                        result["park_tip_observation"] = _observe_park_tip_prerequisite(provider)
+                    result["pipette_collection"] = _pipette_receipts.publish_collection_source(
+                        _pipette_transport, ownership_generation=int(hardware_state.ownership_epoch))
+            except Exception as exc:
+                result["pipette_collection"] = {"available": False, "reason": str(exc)}
+        if yield_requested():
+            result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+            return result
+        result["deck_authority"] = (deck_collect(yield_requested=yield_requested)
+                                    if automatic else deck_collect())
+        if result["deck_authority"].get("disabled_reason") == "operator_action_pending":
+            result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
+            return result
     snapshot = result.get("snapshot") if isinstance(result, Mapping) else None
     if not result.get("ok") or not isinstance(snapshot, Mapping) or not _snapshot_proves_can_ready(snapshot):
         return result
@@ -6117,7 +6757,20 @@ def _collect_and_publish_hardware_snapshot(
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
-    requested = (payload or {}).get("domains") or list(DEFAULT_HARDWARE_SNAPSHOT_DOMAINS)
+    automatic = (payload or {}).get("automatic", False)
+    if type(automatic) is not bool:
+        raise HTTPException(status_code=400, detail="automatic must be a boolean")
+    active = getattr(app.state, "operator_normal_action_active", None)
+    if automatic and (_tester_lock.locked() or (callable(active) and active())):
+        return {"ok": False, "published": False, "reason": "operator_action_pending"}
+    # Deck readiness need not reacquire still-fresh auxiliary diagnostics.
+    # Cold/expired diagnostics keep the normal full observation path: status
+    # consumers still require their own evidence, not invented empty rows.
+    # Subset publication preserves their original timestamps and expiry.
+    auxiliary_fresh = automatic and hardware_state.project("thermal", "chiller").get("cache_state") == "fresh"
+    default_domains = [domain for domain in DEFAULT_HARDWARE_SNAPSHOT_DOMAINS
+                       if not auxiliary_fresh or domain not in {"thermal", "chiller"}]
+    requested = (payload or {}).get("domains") or default_domains
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
     try:
@@ -6126,11 +6779,17 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
             lambda: _collect_and_publish_hardware_snapshot(
                 requested,
                 reason="explicit_hardware_snapshot_collect",
+                automatic=automatic,
             ),
             timeout_s=max(30.0, 15.0 * float(len(requested))),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _pipette_forceabort_latched(tester: Any) -> bool:
+    retained_oem_latch = getattr(tester, "oem_no24v_state", None)
+    return bool(retained_oem_latch()) if callable(retained_oem_latch) else False
 
 
 async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) -> dict[str, Any]:
@@ -6152,7 +6811,11 @@ async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) 
     try:
         alt = int(os.environ.get("BIOXP_USB_ALT", "1"))
         candidate = await run_in_threadpool(lambda: BioXpTester(alt=alt))
-        transport = build_default_pipette_transport(shared_usb=candidate)
+        transport = build_default_pipette_transport(
+            shared_usb=candidate,
+            error_callback=_persist_pipette_runtime_error,
+            forceabort=lambda owner=candidate: _pipette_forceabort_latched(owner),
+        )
         _tester = candidate
         _pipette_transport = transport
         _startup_error = None
@@ -6228,7 +6891,11 @@ async def reconnect_runtime():
                 close_fn()
             reconnect_fn = getattr(tester, "reconnect")
             reconnect_fn()
-            return build_default_pipette_transport(shared_usb=tester)
+            return build_default_pipette_transport(
+                shared_usb=tester,
+                error_callback=_persist_pipette_runtime_error,
+                forceabort=lambda owner=tester: _pipette_forceabort_latched(owner),
+            )
 
         try:
             _pipette_transport = await run_in_threadpool(reconnect_and_rebuild)
@@ -6455,23 +7122,25 @@ async def motion_oem_prepare_without_motion():
     tester = _get_tester()
 
     def prepare_operator_motion_state() -> dict[str, Any]:
-        global_result = prepare_motion_without_motion(tester, authority=authority)
+        provider = _serial206_oem_initialization_provider
+        if provider is None:
+            return {"ok": False, "failure": "serial206_motion_provider_unavailable",
+                    "physical_motion_commanded": False}
+        global_result = provider.prepare_global_motion_without_motion(tester, authority=authority)
         if not isinstance(global_result, Mapping) or global_result.get("ok") is not True:
             return dict(global_result) if isinstance(global_result, Mapping) else {
                 "ok": False,
                 "failure": "global_motion_preparation_result_invalid",
             }
-        # Z preparation is now owned by the first explicit Z action. The
-        # retired direct provider mutation must not block global non-motion
-        # preparation or claim a Z reference before the required Z home.
-        z_receipt = {
+        # Forward preparation evidence; preparation is not a Z home/reference.
+        z_receipt = (global_result.get("component_prepare_receipts") or {}).get("z") or {
             "ok": True,
             "physical_motion_commanded": False,
             "state": "deferred_to_explicit_z_action",
             "next_required_action": "home_z",
         }
         can_ready = hardware_state.publish_can_ready_from_preparation(
-            expected_ownership_epoch=hardware_state.ownership_epoch,
+            expected_ownership_epoch=global_result["generation"],
             reason="oem_prepare_without_motion_completed",
         )
         ready = bool(can_ready.get("published") is True)
@@ -6502,7 +7171,11 @@ async def motion_oem_prepare_without_motion():
     response = {
         **result,
         "ownership_bootstrap": ownership_bootstrap,
-        "next_required_action": "Home Z from the normal cockpit to establish the operator reference.",
+        "next_required_action": (
+            "Home Z from the normal cockpit to establish the operator reference."
+            if result.get("ok") is True
+            else result.get("error") or result.get("failure") or "Inspect the failed preparation receipt before another activation attempt."
+        ),
     }
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=response)
@@ -6520,23 +7193,6 @@ async def motion_oem_prepare_without_motion():
         else _maintenance_state_payload()
     )
     return response
-
-
-@app.post("/motion/emergency_stop")
-async def motion_emergency_stop():
-    """Compatibility alias for the canonical SQLite-backed OEM abort lane."""
-    command_plane = getattr(app.state, "operator_command_plane", None)
-    if command_plane is None:
-        raise HTTPException(status_code=503, detail={"error": "operator_command_plane_unavailable"})
-    return await command_plane.compat_invoke(
-        "oem.abort_all",
-        {
-            "idempotency_key": f"legacy-emergency-stop-{uuid.uuid4().hex}",
-            "reason": "legacy_motion_emergency_stop_alias",
-            "observed_ownership_generation": None,
-            "observed_board_epoch_by_board": {},
-        },
-    )
 
 
 @app.get("/motion/power/status")
@@ -6843,12 +7499,49 @@ async def motion_diagnostics_catalog():
     return diagnostic_catalog()
 
 
+def _read_axis_profile_registers(tester: BioXpTester, axes: tuple[str, ...]) -> dict[str, Any]:
+    """Explicit diagnostic only: observed raw TMCL values, not configured profiles."""
+    rows = {}
+    for axis in axes:
+        if axis not in {"g", "door"}:
+            raise ValueError("Profile register readback supports only g and door")
+        profile = tester._motion_oem_axis_profile(axis, startup=False)
+        board, motor = int(profile["board"]), int(profile["motor"])
+        registers = {}
+        for param in (4, 5, 140, 153, 154):
+            reply = tester.motor_get_axis_param(board, param, motor=motor)
+            ack = reply.get("ack") if isinstance(reply, dict) else None
+            value = reply.get("value") if isinstance(reply, dict) else None
+            valid = bool(isinstance(ack, dict) and ack.get("status") == 100 and type(value) is int)
+            registers[str(param)] = {
+                "param": param, "ack": ack, "reply_valid": valid,
+                "value": value if valid else None,
+            }
+        rows[axis] = {
+            "board": board, "motor": motor, "units": "raw_tmcl_register",
+            "ok": all(row["reply_valid"] for row in registers.values()),
+            "registers": registers,
+        }
+    return rows
+
+
 @app.get("/motion/diagnostics/status")
-async def motion_diagnostics_status():
+async def motion_diagnostics_status(profile_registers: Literal["g", "door", "gd"] | None = None):
     tester = _get_tester()
+
+    def collect():
+        result = _collect_axis_diagnostic_status(tester)
+        if profile_registers is not None:
+            axes = ("g", "door") if profile_registers == "gd" else (profile_registers,)
+            result["profile_registers"] = _read_axis_profile_registers(tester, axes)
+            result["ok"] = bool(result.get("ok") and all(
+                row["ok"] for row in result["profile_registers"].values()
+            ))
+        return result
+
     return await _run_blocking(
         "OEM axis diagnostic live status",
-        lambda: _collect_axis_diagnostic_status(tester),
+        collect,
         timeout_s=45.0,
     )
 
@@ -7048,7 +7741,10 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
                 else None
             )
             idle_verified = None
-        verified_stopped = speed == 0
+        speed_row = (row.get("speed") if req.axis == "g" else (row.get("status") or {}).get("speed")) or {}
+        speed_ack = speed_row.get("ack") or {}
+        verified_stopped = bool(type(speed) is int and speed == 0
+            and speed_row.get("speed_reply_valid") is True and speed_ack.get("status") == 100)
         payload = {
             "ok": bool(verified_stopped and (idle_verified is not False)),
             "schema": "bioxp.oem_axis_diagnostic_stop.v1",
@@ -7156,7 +7852,7 @@ async def motion_oem_manual_relative(req: OemManualRelativeRequest):
             reuse_prepared=False,
             oem_exact=True,
         ),
-        timeout_s=30.0,
+        timeout_s=None if axis is AxisName.GRIPPER else 30.0,
     )
     if isinstance(result, dict):
         result["oem_method"] = "ClassControlInterface.moveSteps"
@@ -7256,7 +7952,7 @@ async def motion_oem_manual_absolute(req: OemManualAbsoluteRequest):
     result = await _run_blocking(
         f"OEM manual absolute {req.axis} to {effective}",
         execute,
-        timeout_s=max(30.0, float(req.wait_timeout_s) + 10.0),
+        timeout_s=None if axis is AxisName.GRIPPER else max(30.0, float(req.wait_timeout_s) + 10.0),
     )
     if axis is AxisName.Z and isinstance(result, dict):
         result = _record_z_motion_outcome(
@@ -7329,15 +8025,35 @@ def _execute_serial206_y_call(method_name: str, *args: Any, **kwargs: Any) -> di
             kwargs.setdefault("command_id", str(context["operator_command_id"]))
     provider = _require_serial206_y_provider()
     method = getattr(provider, method_name)
+    from .command_exchange_observer import current_exchange_owner
+    owner = current_exchange_owner()
+    prior_exchanges = {row.get("exchange_id") for row in owner.snapshot().get("transport_exchanges", [])} if owner is not None else set()
     try:
         result = method(*args, **kwargs)
     except Exception as exc:
+        exchanges = owner.snapshot().get("transport_exchanges", []) if owner is not None else []
+        moves = [row for row in exchanges
+                 if row.get("exchange_id") not in prior_exchanges
+                 and row.get("expected_board") == 4
+                 and row.get("expected_command") in {1, 2, 4}
+                 and row.get("write_attempted") is True]
+        # An exception cannot undo an acknowledged controller write. Unknown
+        # observer coverage stays unknown, never a fabricated no-motion claim.
+        evidence = getattr(exc, "motion_evidence", None)
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        ack = evidence.get("retry_ack") or evidence.get("ack") or {}
+        attempted = True if moves or evidence.get("command_sent") is True else None
         return {
             "ok": False,
             "schema": provider.schema,
             "axis": "y",
             "failure": f"{type(exc).__name__}: {exc}",
-            "physical_motion_commanded": False,
+            "physical_motion_commanded": attempted,
+            "controller_command_acknowledged": any(row.get("observed_status") == 100 for row in moves) or ack.get("status") == 100,
+            "source_call_completed": False,
+            "physical_effect_verified": False,
+            "source_failure_evidence": evidence or None,
+            "automatic_retry": False,
         }
     return dict(result) if isinstance(result, Mapping) else {
         "ok": False,
@@ -7367,6 +8083,8 @@ async def motion_oem_y_move_steps(req: OemYMoveStepsRequest):
 async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
     return await _run_blocking(
         "serial-206 Y moveY absolute",
+        # Manual panel btnMoveYTo_Click passes false,false (installed IL
+        # 29681–29745). Do not apply this policy to Board Test/Home/relative.
         lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
         timeout_s=30.0,
     )
@@ -7444,7 +8162,7 @@ async def motion_oem_x_status():
     projection = getattr(provider, "x_projection", None)
     if not callable(projection):
         raise HTTPException(status_code=409, detail={"error": "serial206_x_authority_not_bound"})
-    return projection()
+    return await _run_blocking("Explicit X controller status", lambda: projection(observe_controller=True))
 
 
 
@@ -7609,20 +8327,26 @@ async def motion_oem_x_abort():
     result = await _run_safety_interrupt_blocking(
         "aggregate OEM abort from X controls",
         lambda _tester: _execute_provider_x_intent(
-            "abort", {"timeout_s": 3.0, "physical_scope": "all_present_motion_boards"}
+            "abort", {"timeout_s": 3.0, "physical_scope": "none_software_flags_and_waiters"}
         ),
         timeout_s=10.0,
     )
     return {
         **result,
-        "aggregate_abort": True,
-        "physical_scope": "all_present_motion_boards",
+        "aggregate_abort": True, "software_abort": True,
+        "invocation_attempted": True, "stop_delivery_attempted": False,
+        "physical_scope": "none_software_flags_and_waiters",
         "x_only": False,
     }
 
 
 @app.post("/motion/oem/x/observation")
 async def motion_oem_x_observation(req: OemXObservationRequest):
+    if current_operator_dispatch_context() is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "legacy_x_observation_requires_canonical_action", "canonical_action_id": "oem.x.observe", "replacement": "/operator/v2/actions/oem.x.observe"},
+        )
     return await _run_blocking(
         "serial-206 X physical observation reconciliation",
         lambda: _execute_provider_x_intent(
@@ -7690,19 +8414,20 @@ async def motion_oem_z_diagnostic_home_axis():
 async def motion_oem_z_stop():
     return await _run_safety_interrupt_blocking(
         "serial-206 Z stop",
-        lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}),
+        lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}, defer_reconciliation=True),
         timeout_s=10.0,
+        delivery_only_lease=True,
     )
 
 
 @app.post("/motion/oem/z/abort")
 async def motion_oem_z_abort():
-    return await _run_safety_interrupt_blocking(
-        "serial-206 Z abort",
-        lambda _tester: _execute_provider_z_intent(
-            "abort", {"timeout_s": 3.0}
-        ),
-        timeout_s=10.0,
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "retired_duplicate_abort_identity",
+            "replacement_action_id": "oem.abort_all",
+        },
     )
 
 
@@ -7723,7 +8448,10 @@ async def motion_oem_z_resume_after_abort(req: OemZResumeRequest | None = None):
 async def motion_oem_z_observation(req: OemZObservationRequest):
     context = current_operator_dispatch_context()
     if context is None:
-        raise HTTPException(status_code=410, detail={"error": "direct_z_observation_retired"})
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "legacy_z_observation_requires_canonical_action", "canonical_action_id": "oem.z.observe", "replacement": "/operator/v2/actions/oem.z.observe"},
+        )
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
     record = getattr(provider, "record_z_observation", None)
     if not callable(record):
@@ -7868,11 +8596,7 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     _require_oem_no_motion_profile_or_409(tester, req.axis)
 
     def execute() -> dict[str, Any]:
-        interlock = (
-            tester.motor_oem_verify_motion_interlock()
-            if req.axis == "z"
-            else getattr(tester, "motor_prepare_motion_interlock")(force_lock=True)
-        )
+        interlock = tester.motor_oem_verify_motion_interlock()
         if not isinstance(interlock, dict) or interlock.get("ok") is not True:
             return {
                 "ok": False,
@@ -7880,7 +8604,19 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
                 "physical_motion_commanded": False,
                 "interlock": interlock,
             }
-        result = tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0)
+        # HomeAxis(D) is the cockpit's Home handler. Publish its proven
+        # controller reference to the same store consumed by door admission;
+        # a normal source return/no-op alone must never unlock Open/Close.
+        ownership_epoch = hardware_state.ownership_epoch
+        board_epoch = tester.oem_current_board_lifecycle_generation() if req.axis == "door" else None
+        result = (_thermal_door_source_call(lambda: tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0))
+                  if req.axis == "door" else tester.motor_oem_home_axis_board_test(req.axis, timeout_s=30.0))
+        if req.axis == "door":
+            _record_thermal_door_home_reference(
+                result, result.get("home") if isinstance(result, dict) else None,
+                tester=tester, ownership_epoch=ownership_epoch, board_epoch=board_epoch,
+                source="ClassControlInterface.HomeAxis.D", motion_kind="home_axis_board_test",
+            )
         if isinstance(result, dict):
             result["interlock"] = interlock
             result["oem_method"] = "ClassControlInterface.HomeAxis"
@@ -7891,7 +8627,7 @@ async def motion_oem_manual_home(req: OemManualHomeRequest):
     result = await _run_blocking(
         f"OEM manual home {req.axis}",
         execute,
-        timeout_s=45.0,
+        timeout_s=None if req.axis in {"g", "door"} else 45.0,
     )
     if req.axis == "z" and isinstance(result, dict):
         result = _record_z_home_outcome(
@@ -8012,7 +8748,7 @@ async def motion_gripper_clear():
             reason="oem_manual_gripper_clear",
             timeout_s=15.0,
         ),
-        timeout_s=25.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
 
@@ -8028,7 +8764,7 @@ async def motion_gripper_home():
             reason="oem_manual_gripper_home",
             timeout_s=15.0,
         ),
-        timeout_s=25.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
 
@@ -8047,7 +8783,9 @@ async def motion_gripper_open():
         lambda: _gripper_success_or_409(
             gripper_open(tester, operator_ack="GRIPPER_OPEN", reason="oem_manual_gripper_open", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        # Source moveToAbs owns its wait; the catalog owns the caller deadline.
+        # OpenGripper's recover flag is stallRecover, not G/Y home recovery.
+        timeout_s=None,
     )
 
 
@@ -8060,7 +8798,7 @@ async def motion_gripper_open_wide():
         lambda: _gripper_success_or_409(
             gripper_open_wide(tester, operator_ack="GRIPPER_OPEN_WIDE", reason="oem_manual_gripper_open_wide", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 
@@ -8073,8 +8811,22 @@ async def motion_gripper_close():
         lambda: _gripper_success_or_409(
             gripper_close(tester, operator_ack="GRIPPER_CLOSE", reason="oem_manual_gripper_close", timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
+
+
+def _thermal_door_source_call(operation):
+    """Keep native issued-stage evidence through the manual HTTP report path."""
+    try:
+        return operation()
+    except Exception as exc:
+        evidence = getattr(exc, "motion_evidence", None)
+        if not isinstance(evidence, dict):
+            raise
+        raise HTTPException(status_code=409, detail={
+            **evidence, "ok": False, "failure": str(exc),
+            "physical_effect_verified": False,
+        }) from exc
 
 
 def _thermal_door_success_or_409(result: dict) -> dict:
@@ -8083,17 +8835,47 @@ def _thermal_door_success_or_409(result: dict) -> dict:
     raise HTTPException(status_code=409, detail=result)
 
 
+def _record_thermal_door_home_reference(
+    result, home, *, tester, ownership_epoch, board_epoch, source, motion_kind,
+):
+    """Publish source SAP1 origin assignment to the existing admission owner.
+
+    Thermal.doorSearchHome ends with Stop/queryHome/setHome, not a zero-position
+    readback. The origin is zero; subsequent actual position is separate state.
+    Neither source assignment nor durable reference claims stopped/physical proof.
+    """
+    if not isinstance(result, dict):
+        return result
+    result["physical_effect_verified"] = False
+    if (result.get("ok") is True and isinstance(home, dict)
+            and home.get("controller_home_proof_verified") is True
+            and hardware_state.ownership_epoch == ownership_epoch
+            and tester.oem_current_board_lifecycle_generation() == board_epoch):
+        reference = _reference_state_store.mark_referenced(MarkAxisReferencedCommand(
+            axis="door", position_steps=0, source=source, motion_kind=motion_kind,
+        ))
+        result["reference_state"] = reference
+        if reference.get("ok") is not True or reference.get("durable_clean") is not True:
+            result.update(ok=False, failure="door_home_reference_persistence_failed")
+    return result
+
+
 @app.post("/motion/thermal_door/home")
 async def motion_thermal_door_home():
     _require_motion_route_ready()
     tester = _get_tester()
-    return await _run_blocking(
-        "OEM thermal door home",
-        lambda: _thermal_door_success_or_409(
-            tester.motor_oem_door_search_home(timeout_s=20.0, startup=False)
-        ),
-        timeout_s=30.0,
-    )
+
+    def execute():
+        ownership_epoch = hardware_state.ownership_epoch
+        board_epoch = tester.oem_current_board_lifecycle_generation()
+        result = _thermal_door_source_call(lambda: tester.motor_oem_door_search_home(timeout_s=20.0, startup=False))
+        return _thermal_door_success_or_409(_record_thermal_door_home_reference(
+            result, result, tester=tester,
+            ownership_epoch=ownership_epoch, board_epoch=board_epoch,
+            source="ClassControlInterface.btnDHome_Click", motion_kind="manual_door_home",
+        ))
+
+    return await _run_blocking("OEM thermal door home", execute, timeout_s=None)
 
 
 @app.post("/motion/thermal_door/open")
@@ -8103,9 +8885,9 @@ async def motion_thermal_door_open():
     return await _run_blocking(
         "OEM thermal door open",
         lambda: _thermal_door_success_or_409(
-            tester.motor_oem_open_thermal_door(timeout_s=20.0)
+            _thermal_door_source_call(lambda: tester.motor_oem_open_thermal_door(timeout_s=20.0))
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 
@@ -8118,7 +8900,7 @@ async def motion_thermal_door_close():
         lambda: _thermal_door_success_or_409(
             tester.motor_oem_close_thermal_door(timeout_s=20.0)
         ),
-        timeout_s=30.0,
+        timeout_s=None,
     )
 
 
@@ -8140,6 +8922,16 @@ async def motion_oem_move_xy(req: OemMoveXYRequest):
 
 @app.post("/motion/oem/home_xy")
 async def motion_oem_home_xy(req: OemHomeXYRequest):
+    if current_operator_dispatch_context() is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "homexy_requires_canonical_action",
+                "replacement_action_id": "oem.xy.home",
+                "replacement_route": "/operator/v2/actions/oem.xy.home",
+                "physical_motion_commanded": False,
+            },
+        )
     if req.operator_ack != "HOMEXY":
         raise HTTPException(status_code=409, detail="operator_ack HOMEXY required for direct OEM HomeXY mode")
     if _serial206_oem_initialization_provider is None:
@@ -8159,18 +8951,17 @@ async def motion_oem_home_xy(req: OemHomeXYRequest):
 
 @app.post("/motion/oem/move_to")
 async def motion_oem_move_to(req: OemMoveToRequest):
-    _require_motion_route_ready()
-    return await _run_blocking(
-        "serial-206 provider moveTo",
-        lambda: _execute_serial206_motion_intent(
-            "move_to",
-            {
-                **req.model_dump(exclude={"operator_ack", "timeout_s"}),
-                "wait_timeout_s": float(req.timeout_s),
-            },
-        ),
-        timeout_s=min(max(float(req.timeout_s) + 30.0, 45.0), 180.0),
-    )
+    """Preview-only legacy raw move route; canonical deck worker owns execution."""
+    return {
+        "ok": True,
+        "schema_version": "bioxp.oem_move_to_preview.v1",
+        "executor_status": "preview_only",
+        "requested": req.model_dump(exclude={"operator_ack"}),
+        "opened_usb": False,
+        "motion_commanded": False,
+        "physical_motion": False,
+        "legacy_live_execution_retired": True,
+    }
 
 
 def _serial206_stage_approvals(
@@ -8251,15 +9042,16 @@ def _run_idempotent_serial206_initialization(
         else:
             result = provider.initialize_motion(mode="live", timeout_s=float(timeout_s))
     except Exception as exc:
-        result = {"ok": False, "state": "failed", "failure": f"initialization_source_exception:{type(exc).__name__}", "physical_motion_commanded": False}
+        result = {"ok": False, "state": "ambiguous", "failure": f"initialization_source_exception:{type(exc).__name__}:{exc}", "physical_motion_commanded": None, "physical_outcome": "unknown", "recovery_hold": True}
     result_payload = dict(result) if isinstance(result, Mapping) else {"ok": False, "state": "failed", "failure": "initialization_source_return_not_mapping", "source_return": _json_safe(result)}
-    final_status = "completed" if result_payload.get("ok") is True else "failed"
+    recovery_hold = result_payload.get("recovery_hold") is True
+    final_status = "ambiguous" if recovery_hold else ("completed" if result_payload.get("ok") is True else "failed")
     finished = {**admission, "status": final_status, "finished_at": time.time(), "response": _json_safe(result_payload)}
     try:
         store.append_serial206_receipt(initialization_kind, finished)
     except Exception as exc:
         return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "recovery_required", "recovery_hold": True, "persistence_error": f"initialization_terminal_persistence_failed:{type(exc).__name__}"}
-    return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "committed", "recovery_hold": False}
+    return {**result_payload, "run_id": run_id, "idempotent_replay": False, "persistence_state": "committed", "recovery_hold": recovery_hold}
 
 
 @app.get("/motion/oem/initialization/provider-status")
@@ -8790,7 +9582,7 @@ async def camera_stream_start(
         raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     del req
     result = await _start_owned_camera_session({})
-    lifecycle_state.record_camera_evidence({**result, "available": bool(result.get("active")), "provenance": "POST /camera/stream/start"})
+    lifecycle_state.record_camera_evidence({**result, "available": result.get("state") == "live", "provenance": "POST /camera/stream/start"})
     return result
 
 
@@ -8828,14 +9620,20 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
 
 @app.get("/camera/status", response_model=CameraStatusResponse)
 async def camera_status():
-    status = await run_in_threadpool(_camera_provider.status)
+    provider = _camera_provider
+    status = await run_in_threadpool(provider.status)
+    if provider is not _camera_provider or getattr(provider, "generation", None) != getattr(status, "provider_generation", None):
+        raise HTTPException(status_code=503, detail="camera owner changed during status read")
     return status.to_payload()
 
 
 @app.get("/camera/frame/latest")
 async def camera_frame_latest():
     try:
-        frame = await run_in_threadpool(_camera_provider.latest)
+        provider = _camera_provider
+        frame = await run_in_threadpool(provider.latest)
+        if provider is not _camera_provider or getattr(provider, "generation", frame.provider_generation) != frame.provider_generation:
+            raise CameraError("camera owner changed during frame read")
     except CameraError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _camera_jpeg_response(frame)
@@ -8846,7 +9644,10 @@ async def camera_snapshot(req: CameraSnapshotRequest = CameraSnapshotRequest()):
     """Capture through the fixed provider identity/capability admission boundary."""
     del req
     try:
-        frame = await run_in_threadpool(_camera_provider.capture)
+        provider = _camera_provider
+        frame = await run_in_threadpool(provider.capture)
+        if provider is not _camera_provider or getattr(provider, "generation", frame.provider_generation) != frame.provider_generation:
+            raise CameraError("camera owner changed during frame read")
     except CameraError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _camera_jpeg_response(frame)
@@ -8923,7 +9724,7 @@ async def camera_stream_state(request: Request):
     if request.query_params:
         raise HTTPException(status_code=422, detail="Camera stream tuning is server-owned")
     session, projection = _camera_session_projection()
-    state = "live" if projection.get("available") and _camera_stream_state.get("last_frame_at") else "starting" if projection.get("available") else "off"
+    state = await run_in_threadpool(_camera_stream_phase, session)
     return {
         **_camera_stream_control_payload(session, state=state),
         "session": projection.get("session"),
@@ -8939,8 +9740,9 @@ async def camera_mjpeg(request: Request):
     session, projection = _camera_session_projection()
     if session is None or not projection.get("available"):
         raise HTTPException(status_code=503, detail={**projection, "error": "no active POST-started camera session"})
-    queue = session["queue"]
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=session["queue_max_frames"])
     with _camera_projection_lock:
+        session["queues"].add(queue)
         session["viewers"] = int(session.get("viewers") or 0) + 1
         pending_shutdown = session.get("viewer_shutdown_task")
         if pending_shutdown is not None and not pending_shutdown.done():
@@ -8955,7 +9757,7 @@ async def camera_mjpeg(request: Request):
                 viewers = 0 if current is None else int(current.get("viewers") or 0)
                 should_stop = current is not None and current.get("session_id") == session_id and viewers == 0
             if should_stop:
-                await _stop_owned_camera_session(reason="viewer grace expired")
+                await _stop_owned_camera_session(reason="viewer grace expired", expected_session_id=session_id)
         except asyncio.CancelledError:
             return
 
@@ -8968,6 +9770,7 @@ async def camera_mjpeg(request: Request):
                 yield part
         finally:
             with _camera_projection_lock:
+                session["queues"].discard(queue)
                 current = _camera_session
                 if current is not None and current.get("session_id") == session["session_id"]:
                     current["viewers"] = max(0, int(current.get("viewers") or 0) - 1)
@@ -8984,7 +9787,7 @@ async def camera_mjpeg(request: Request):
 
 @app.get("/liquid/application/status")
 async def liquid_application_status():
-    return _pipette_application.status()
+    return await run_in_threadpool(_pipette_application.status)
 
 
 @app.post("/liquid/application/plan")
@@ -9015,11 +9818,14 @@ async def liquid_application_plan(req: PipetteApplicationPlanRequest):
         runtime_binding={
             "owner": "PipetteApplicationPlanner",
             "mode": "plan_only",
-            "dependencies": plan.get("dependencies", {}),
+            "idempotency_key": _DIRECT_PIPETTE_IDEMPOTENCY.get(),
+            # Provider observations belong to the stored result, not request identity.
         },
     )
     return {
-        **plan,
+        # Planning is no-motion receipt creation, not a hardware readback.
+        # Same-key recovery returns the persisted plan, even if providers changed.
+        **receipt["result"],
         "receipt_id": receipt["receipt_id"],
         "receipt_truth": receipt["truth"],
     }
@@ -9038,6 +9844,33 @@ async def liquid_status():
         "latest_receipt": _pipette_receipts.latest(),
         "application": _pipette_application.status(),
     }
+
+
+@app.get("/liquid/requests")
+async def liquid_request_lookup(request: Request):
+    # Observation only: use the already-owned journal, never construct an owner.
+    from .pipette.direct_requests import lookup_envelope
+
+    headers = request.headers.getlist("idempotency-key")
+    key = headers[0].strip() if len(headers) == 1 else ""
+    query = list(request.query_params.multi_items())
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,199}", key) is None
+        or len(query) != 1
+        or query[0][0] != "request_kind"
+        or query[0][1] not in {"readback", "application_plan"}
+    ):
+        return JSONResponse(status_code=422, content={"detail": "invalid direct-liquid lookup identity"}, headers={"Cache-Control": "no-store"})
+    async for chunk in request.stream():
+        if chunk:
+            return JSONResponse(status_code=422, content={"detail": "lookup body is forbidden"}, headers={"Cache-Control": "no-store"})
+    kind = query[0][1]
+    if _pipette_receipts is None:
+        result = lookup_envelope(kind, key, "unavailable", "store_unavailable")
+    else:
+        result = _pipette_receipts.lookup_direct_request(request_kind=kind, idempotency_key=key)
+    code = {"conflict": 409, "unavailable": 503}.get(result["lookup_state"], 200)
+    return JSONResponse(status_code=code, content=result, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/liquid/readback")
@@ -9086,6 +9919,7 @@ async def liquid_init(req: PipetteInitRequest):
         return operation()
 
     def action() -> dict[str, Any]:
+        attempt_id = _active_lifecycle_attempt_id("constructor_pipette_stage")
         result = asyncio.run(
             run_pipette_init_command(
                 command,
@@ -9100,6 +9934,8 @@ async def liquid_init(req: PipetteInitRequest):
                     "caller_class": "lifecycle",
                     "control_class": "pipette_state_command",
                     "lifecycle_stage_id": "constructor_pipette_stage",
+                    "lifecycle_attempt_id": attempt_id,
+                    "idempotency_key": f"constructor_pipette_stage:{attempt_id}",
                 },
             )
         )
@@ -9137,7 +9973,7 @@ async def liquid_tip(req: PipetteTipRequest):
 async def liquid_eject_all(req: PipetteEjectAllRequest):
     return await run_pipette_operation(
         "eject_all_tips",
-        lambda transport: getattr(transport, "eject_all_tips")(
+        lambda transport: transport.eject_all_tips(
             check_missing_tip=req.check_missing_tip,
             wait=req.wait,
             channels=req.channels,
@@ -9154,7 +9990,7 @@ async def liquid_eject_all(req: PipetteEjectAllRequest):
 async def liquid_keep_tip(req: PipetteKeepTipRequest):
     return await run_pipette_operation(
         "keep_tip",
-        lambda transport: getattr(transport, "KeepTip")(req.tip),
+        lambda transport: transport.KeepTip(req.tip),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9328,24 +10164,135 @@ async def liquid_error_log(req: PipetteErrorLogRequest):
     )
 
 
+def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        return audited_query()
+    # One tester worker owns query, durable audit and handoff. Provider-before-
+    # writer order and the existing transport lock exclude intervening owners.
+    with provider.deck_owner_authority_scope(), transport._transaction_lock:
+        try:
+            authority = provider.deck_owner_authority_stamps()
+        except RuntimeError:
+            authority = None
+        interrupt_epoch = transport._interrupt_epoch
+        semantic_revision = provider._deck_semantic_state_reader()["semantic_state_revision"]
+        # Capture the live reader object/generation, not cached tip status.
+        readers = tuple(getattr(getattr(channel._get_driver(), "bus", None), "router", None)
+                        for channel in transport._transports)
+        reader_generations = tuple(getattr(reader, "reader_generation", None) for reader in readers)
+        query_started_at = time.monotonic()
+        receipt_error = None
+        try:
+            result = audited_query()
+        except HTTPException as exc:
+            observation = exc.detail.get("query_observation") if isinstance(exc.detail, dict) else None
+            if not isinstance(observation, dict):
+                raise
+            receipt_error, result = exc, observation
+        if result.get("replayed"):
+            if result.get("ok") is False:
+                raise HTTPException(status_code=502, detail=result)
+            return result  # A retained query is never a new observation.
+        try:
+            current_readers = tuple(getattr(getattr(channel._get_driver(), "bus", None), "router", None)
+                                    for channel in transport._transports)
+            if (authority is None or transport._interrupt_epoch != interrupt_epoch
+                    or semantic_revision != provider._deck_semantic_state_reader()["semantic_state_revision"]
+                    or any(current is not prior for current, prior in zip(current_readers, readers))
+                    or reader_generations != tuple(getattr(reader, "reader_generation", None) for reader in current_readers)
+                    or any(type(generation) is not int for generation in reader_generations)
+                    or any(row.get("result", {}).get("reader_generation") != reader_generations[row["channel"]]
+                           for row in result.get("channels", [])
+                           if row.get("result", {}).get("semantic_ok") is True)):
+                raise RuntimeError("pipette_query_owner_changed")
+            published = provider.publish_pipette_query_observation(
+                result, expected_authority=authority, query_started_at=query_started_at,
+                receipt_unavailable=receipt_error is not None,
+            )
+            result["deck_state_publication"] = {"status": "published",
+                "semantic_state_revision": published["semantic_state_revision"]}
+        except Exception as exc:
+            # Query truth/receipt remains intact; failed publication grants no authority.
+            result["deck_state_publication"] = {"status": "blocked", "reason": str(exc)}
+        if receipt_error is not None:
+            raise receipt_error
+        if result.get("ok") is False:
+            raise HTTPException(status_code=502, detail=result)
+        return result
+
+
+def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
+    """Shared query owner; called only inside the existing tester worker."""
+    transport = _get_pipette_transport()
+
+    async def inline_run(_label, callback, *, timeout_s):
+        return callback()
+
+    def audited_query():
+        return asyncio.run(run_pipette_operation(
+            "tip_status", lambda owned: owned.query_tip_status_all(),
+            get_transport=lambda: transport, run_blocking=inline_run,
+            timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
+            runtime_binding=runtime_binding,
+        ))
+
+    return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
+
+
+def _observe_park_tip_prerequisite(provider):
+    """Fill missing source observations, never infer MachineStatus from TipExist.
+
+    Caller owns provider-before-transport serialization. Valid committed source
+    observations are reused by their existing identities, not a new TTL/cache.
+    A changed reader/interrupt/source owner or unknown presence requires one
+    audited query. Loaded tips' unknown ancillary facts cannot be queried here.
+    """
+    try:
+        collection = _pipette_collection_state()
+        semantic = provider._deck_semantic_state_reader()
+        if (type(collection.get("tip_exists")) is bool
+                and type(semantic.get("tip_loaded")) is bool
+                and collection["tip_exists"] == semantic["tip_loaded"]
+                and all(semantic.get(key) == value
+                        for key, value in provider.deck_owner_authority_stamps().items())):
+            return {"available": True, "queried": False, "reason": "committed_source_observation_current"}
+    except Exception as exc:
+        # A pending source operation is not permission to interleave a query.
+        if str(exc) == "pipette_collection_receipt_pending":
+            return {"available": False, "queried": False, "reason": "pipette_collection_receipt_pending"}
+    try:
+        # Reuse lifecycle child binding: a Refresh/admission parent must not be
+        # overwritten by the pipette receipt, or replayed as a fresh observation.
+        return _query_and_publish_pipette_tip_status(runtime_binding={
+            "caller_class": "lifecycle", "entrypoint_id": "hardware.snapshot.park_tip_observation",
+            "idempotency_key": "readiness-tip-query:" + uuid.uuid4().hex,
+        })
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+        return {"available": False, "queried": True, "reason": "park_tip_query_unavailable",
+                "status_code": exc.status_code, "receipt_id": detail.get("receipt_id"),
+                "command_id": detail.get("command_id")}
+
+
 @app.post("/liquid/tip-status")
 async def liquid_tip_status():
-    return await run_pipette_operation(
-        "tip_status",
-        lambda transport: getattr(transport, "query_tip_status_all")(),
-        get_transport=_get_pipette_transport,
-        run_blocking=_run_blocking,
-        timeout_s=120.0,
-        receipt_store=_pipette_receipts,
-        requested_inputs={},
+    return await _run_blocking("Pipette tip status", _query_and_publish_pipette_tip_status, timeout_s=120.0)
+
+
+@app.get("/liquid/data", include_in_schema=False)
+async def liquid_data_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/data", "provider_called": False, "receipt_written": False},
     )
 
 
-@app.get("/liquid/data")
+@app.post("/liquid/data")
 async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")):
     return await run_pipette_operation(
         "data",
-        lambda transport: getattr(transport, "get_data")(query),
+        lambda transport: transport.get_data(query),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9354,11 +10301,20 @@ async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3
     )
 
 
-@app.get("/liquid/fluid-detection/{channel}/timestamp")
+@app.get("/liquid/fluid-detection/{channel}/timestamp", include_in_schema=False)
+async def liquid_fluid_timestamp_get_retired(channel: int):
+    del channel
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "receipt_producing_get_retired", "replacement": "POST /liquid/fluid-detection/{channel}/timestamp", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/fluid-detection/{channel}/timestamp")
 async def liquid_fluid_timestamp(channel: int):
     return await run_pipette_operation(
         "fluid_timestamp",
-        lambda transport: {"ok": True, "channel": channel, "timestamp": getattr(transport, "get_fluid_timestamp")(channel), "hardware_truth_level": "cached_oem_event"},
+        lambda transport: {"ok": True, "channel": channel, "timestamp": transport.get_fluid_timestamp(channel), "hardware_truth_level": "cached_oem_event"},
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=20.0,
@@ -9380,11 +10336,19 @@ async def liquid_set_top_speed(req: PipetteSpeedRequest):
     )
 
 
-@app.get("/liquid/pressure")
+@app.get("/liquid/pressure", include_in_schema=False)
+async def liquid_pressure_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/pressure", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/pressure")
 async def liquid_pressure():
     return await run_pipette_operation(
         "pressure",
-        lambda transport: getattr(transport, "read_pressure")(),
+        lambda transport: transport.read_pressure(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9410,7 +10374,7 @@ async def liquid_firmware(req: PipetteFirmwareRequest):
 async def liquid_reinitialize():
     return await run_pipette_operation(
         "reinitialize",
-        lambda transport: getattr(transport, "reinitialize_pipette")(),
+        lambda transport: transport.reinitialize_pipette(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=180.0,
@@ -9419,11 +10383,19 @@ async def liquid_reinitialize():
     )
 
 
-@app.get("/liquid/condition")
+@app.get("/liquid/condition", include_in_schema=False)
+async def liquid_condition_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/condition", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/condition")
 async def liquid_condition():
     return await run_pipette_operation(
         "condition",
-        lambda transport: getattr(transport, "checked_pipette_condition")(),
+        lambda transport: transport.checked_pipette_condition(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9432,11 +10404,19 @@ async def liquid_condition():
     )
 
 
-@app.get("/liquid/status/readback")
+@app.get("/liquid/status/readback", include_in_schema=False)
+async def liquid_status_readback_get_retired():
+    raise HTTPException(
+        status_code=410,
+        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/status/readback", "provider_called": False, "receipt_written": False},
+    )
+
+
+@app.post("/liquid/status/readback")
 async def liquid_status_readback():
     return await run_pipette_operation(
         "status_readback",
-        lambda transport: getattr(transport, "checked_pipette_status")(),
+        lambda transport: transport.checked_pipette_status(),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -9460,53 +10440,48 @@ def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
 
 
 def _protocol_live_move_handler(action, state):
+    from .oem_deck_movement import ClassMoveToIntent
+
     _require_motion_route_ready()
     params = dict(action.params or {})
-    raw_axis = params.get("axis") or params.get("axis_name")
-    if raw_axis is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' is missing params.axis")
-    axis = AxisName(str(raw_axis).strip().lower())
-    wait_timeout_s = float(params.get("wait_timeout_s") or params.get("timeout_s") or 30.0)
-    acc = _optional_int_payload(params, "acc", "acceleration", "max_acc")
-    provider = _serial206_oem_initialization_provider
-    if provider is None:
-        raise RuntimeError("serial206 OEM provider unavailable")
-    command_id = f"protocol-{axis.value}-{uuid.uuid4().hex}"
-    position_steps = _optional_int_payload(params, "position_steps", "target_position", "target_steps", "position")
-    steps = _optional_int_payload(params, "steps", "delta_steps", "relative_steps")
-    if position_steps is None and steps is None:
-        raise ValueError(f"Protocol move action '{action.action_id}' needs absolute position_steps/target_position or relative steps/delta_steps")
-    is_absolute = position_steps is not None
-    move_value = int(position_steps) if position_steps is not None else int(steps)  # type: ignore[arg-type]
-    if axis.value == "x":
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True, "source_mode": "protocol.x.move_absolute"})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_x_intent(selected, values)
-    elif axis.value == "y":
-        y_provider = provider.y_provider
-        if y_provider is None:
-            raise RuntimeError("serial206 Y provider unavailable")
-        result = y_provider.move_absolute(move_value, wait_for_stop=True, wait_timeout_s=wait_timeout_s, command_id=command_id) if is_absolute else y_provider.move_steps(move_value, wait_timeout_s=wait_timeout_s, command_id=command_id)
-    else:
-        selected = "move_absolute" if position_steps is not None else "move_steps"
-        values = {"command_id": command_id, "wait_timeout_s": wait_timeout_s}
-        if position_steps is not None:
-            values.update({"position_steps": move_value, "acceleration": acc, "wait_for_stop": True})
-        else:
-            values["steps"] = move_value
-        result = provider.execute_z_intent(
-            selected,
-            inputs=values,
-            expected_generation=int(provider.generation_provider()),
-            idempotency_key=command_id,
-        )
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
-        raise RuntimeError(f"Protocol move failed: {result}")
-    return {"ok": True, "protocol_action_id": action.action_id, "move_mode": "absolute" if position_steps is not None else "relative", "move": dict(result)}
+    allowed_fields = {
+        "script_line",
+        "plate_name",
+        "location_id",
+        "well",
+        "material",
+        "continuation",
+    }
+    try:
+        if not set(params).issubset(allowed_fields):
+            raise ValueError("unsupported ClassMoveTo field")
+        location_id = params.get("location_id")
+        if location_id is not None and type(location_id) is not int:
+            raise ValueError("location_id must be an integer")
+        well = params.get("well")
+        if well is not None and type(well) not in {str, int}:
+            raise ValueError("well must be text or an integer")
+        intent = ClassMoveToIntent(**params)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "canonical_deck_queue_required",
+                "hardware_motion_commanded": False,
+            },
+        ) from None
+    admitter = getattr(app.state, "oem_mov_execution_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
 
 
 def _protocol_live_pipette_handler(action, state):
@@ -9608,9 +10583,126 @@ def _protocol_live_pipette_handler(action, state):
     }
 
 
+def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) -> dict[str, Any]:
+    plane = getattr(app.state, "operator_command_plane", None)
+    store = getattr(plane, "store", None)
+    getter = getattr(store, "get_command", None)
+    if not callable(getter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = getter(command_id)
+        if isinstance(row, Mapping):
+            status = str(row.get("status") or "")
+            if status == "completed":
+                return dict(row)
+            if status in COMMAND_TERMINAL:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "canonical_deck_command_failed", "command": dict(row)},
+                )
+        time.sleep(0.05)
+    raise HTTPException(
+        status_code=504,
+        detail={"error": "canonical_deck_command_timeout", "command_id": command_id},
+    )
+
+
+def _protocol_live_plate_move_handler(action, state):
+    from .oem_deck_movement import require_serial206_machine_target, translate_oem_plate_move
+
+    params = dict(action.params or {})
+    plate_token = params.get("plate_id", params.get("cover_id"))
+    intent = translate_oem_plate_move(
+        str(plate_token), str(params.get("target_location")), params.get("move_mode"),
+    )
+    position_table_provider = getattr(app.state, "oem_deck_position_table_provider", None)
+    if not callable(position_table_provider):
+        raise HTTPException(status_code=503, detail={"error": "serial206_position_table_unavailable"})
+    require_serial206_machine_target(int(intent["destination"]), position_table_provider())
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "move_plate",
+        inputs=intent,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_plate_prepare_handler(action, state):
+    from .oem_deck_movement import OEM_SCRIPT_PLATE_TOKENS
+
+    tokens = list((action.params or {}).get("plate_ids") or [])
+    allowed = {"PL_POOL", "PL_OUTPUT", "PL_REAGENT"}
+    plates = [OEM_SCRIPT_PLATE_TOKENS[token] for token in tokens if token in allowed]
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "press_plates", inputs={"plates": plates},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _wait_protocol_deck_command(command_id)
+
+
+def _protocol_live_thermal_door_handler(action, state):
+    mode = str((action.params or {}).get("door_command") or "")
+    if mode not in {"DO", "DC"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "unsupported_oem_thermal_door_command", "hardware_motion_commanded": False},
+        )
+    opening = mode == "DO"
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "thermal_door", inputs={"open": opening},
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    door = _wait_protocol_deck_command(command_id)
+    pipette = None
+    if str(door.get("status") or "") != "completed":
+        return {"ok": False, "door": door, "pipette": pipette}
+    if opening:
+        pipette_action = action.__class__(
+            action_id=f"{action.action_id}-pipette-init",
+            stage_id=action.stage_id,
+            kind=ProtocolActionKind.PIPETTE_INIT,
+            params={},
+            description="OEM TCD DO pipette initialization",
+            required_capability=action.required_capability,
+            metadata=dict(action.metadata or {}),
+        )
+        pipette = _protocol_live_pipette_handler(pipette_action, state)
+    return {
+        "ok": not opening or (isinstance(pipette, Mapping) and pipette.get("ok") is True),
+        "door": door,
+        "pipette": pipette,
+    }
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
+        ProtocolActionKind.PLATE_MOVE: _protocol_live_plate_move_handler,
+        ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
+        ProtocolActionKind.PLATE_PREPARE: _protocol_live_plate_prepare_handler,
+        ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
@@ -9620,15 +10712,357 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     }
 
 
+def _protocol_command_store():
+    plane = getattr(app.state, "operator_command_plane", None)
+    if plane is None:
+        raise HTTPException(status_code=503, detail={"error": "canonical_workflow_owner_unavailable"})
+    return plane.store
+
+
+def _protocol_authority(document):
+    from .operator_command_plane import _active_board_epochs
+    from .services.protocol_service import _workflow_resources
+    resources = _workflow_resources(document)
+    epochs = {}
+    if any(resource.startswith("axis:") for resource in resources):
+        epochs = _active_board_epochs(app.state.operator_command_plane._state(), "oem.deck._finite_operation")
+        if set(epochs) != {"4", "5"}:
+            raise ProtocolLiveContractError("Selected workflow board epochs are unavailable.")
+    return int(hardware_state.ownership_epoch), epochs
+
+
+def _protocol_source_pipette_call(operation_name, operation, action, state, step_id):
+    from .services.pipette_service import run_pipette_operation, _OemLifecycleContext
+    from .protocols.models import _payload
+    lifecycle = isinstance(action, _OemLifecycleContext)
+    action_id = action.source_occurrence_id if lifecycle else action.action_id
+    stage_id = action.source_occurrence_id if lifecycle else action.stage_id
+    opcode = "lifecycle" if lifecycle else action.oem_opcode
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=step_id):
+        store.assert_workflow_current(state.job_id)
+        async def run_inline(label, call, *, timeout_s):
+            store.assert_workflow_current(state.job_id)
+            return call()
+        # Source method spelling differs from the existing audited query
+        # vocabulary. Keep its read-only/source-affecting finalizer semantics.
+        receipt_operation = {"query_tip_status_all": "query_all_pipette_tip_states",
+                             "query_tip_status_for_oem_script": "query_tip_status"}.get(operation_name, operation_name)
+        return asyncio.run(run_pipette_operation(
+            receipt_operation, operation, get_transport=_get_pipette_transport,
+            run_blocking=run_inline, receipt_store=_pipette_receipts,
+            requested_inputs={"source_occurrence_id": step_id, "oem_opcode": opcode,
+                              "arguments": _payload(action.params["arguments"])},
+            runtime_binding={"idempotency_key": f"protocol:{state.job_id}:{step_id}",
+                             "entrypoint_id": "protocol.oem_operation", "caller_class": "lifecycle",
+                             "protocol_job_id": state.job_id, "protocol_action_id": action_id,
+                             "lifecycle_stage_id": stage_id},
+        ))
+
+
+def _protocol_source_mov(intent, action, state):
+    """Prepared ClassMoveTo uses the existing canonical mov owner, unchanged."""
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=action.source_occurrence_id):
+        store.assert_workflow_current(state.job_id)
+        admitted = app.state.oem_mov_execution_admitter(
+            intent, idempotency_key=f"protocol:{state.job_id}:{action.source_occurrence_id}:mov",
+        )
+        command_id = admitted["command_id"]
+        if state.workflow is not None and command_id not in state.workflow.child_command_ids:
+            state.workflow.child_command_ids.append(command_id)
+        while True:
+            receipt = store.get_command(command_id)
+            if receipt["status"] in COMMAND_TERMINAL:
+                response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
+                return {**response, "ok": receipt["status"] == "completed",
+                        "command_id": command_id, "receipt": receipt}
+            if store._stop.wait(0.02):
+                raise RuntimeError("workflow_child_owner_lost")
+
+
+def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[str, Any]:
+    """Actual initialCheck body, admitted only by the canonical wake child."""
+    tester = _get_tester()
+    begin_generation = getattr(tester, "oem_begin_board_lifecycle_generation", None)
+    if not callable(begin_generation):
+        raise RuntimeError("workflow_initial_check_generation_unavailable")
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise RuntimeError("workflow_initial_check_provider_unavailable")
+    return lifecycle_state.run_workflow_wake_initial_check(
+        _LifecycleHardware(tester), validate_current=validate_current,
+        can_ready=_can_ready_observation, sleep=provider.sleep,
+    )
+
+
+app.state.oem_workflow_initial_check = _protocol_workflow_initial_check
+
+
+def _protocol_bindings(bundle, *, source_executor=None):
+    from contextvars import ContextVar
+    from threading import Lock
+    from .protocols.models import ProtocolDocument
+    from .protocols.validators import validate_oem_selected_dependencies
+    from .pipette.transport import FourPipetteTransport
+    from dataclasses import replace
+    from .services.pipette_service import build_oem_pipette_handlers, build_oem_pipette_lifecycle_helpers
+    store = _protocol_command_store()
+    metadata = bundle["protocol"]["document"].get("metadata", {})
+    native = {}
+    lifecycle = {}
+    if metadata.get("input_mode") != "oem_prepared":
+        return _protocol_live_handlers(), {}, {}
+    capabilities = set()
+    if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
+        capabilities.add("dispense_air_for_oem_script")
+    if callable(getattr(FourPipetteTransport, "aspirate_for_oem_script", None)):
+        capabilities.add("aspirate_pressure_stream")
+    if callable(getattr(FourPipetteTransport, "dispense_for_oem_script", None)):
+        capabilities.add("dispense_pressure_stream")
+    if callable(getattr(FourPipetteTransport, "query_tip_status_for_oem_script", None)):
+        capabilities.add("query_tip_status_single")
+    validate_oem_selected_dependencies(
+        ProtocolDocument.from_payload(bundle["protocol"]["document"]), capabilities=capabilities,
+    )
+    provider = _serial206_oem_initialization_provider
+    canonical_plan = getattr(app.state, "oem_workflow_plan_executor", None)
+    canonical_control = getattr(app.state, "oem_workflow_lifecycle_control_executor", None)
+    # Per-source-call counters are child identity, not scheduling or custody.
+    # Identical repeated plans must never reconcile to an earlier physical leaf.
+    counts, count_lock = {}, Lock()
+    source_step = ContextVar("protocol_source_step", default=None)
+    def before_entry(identity, state):
+        store.assert_workflow_current(state.job_id)
+        source_step.set(identity)
+    def execute_plan(plan, action, state):
+        occurrence = action if isinstance(action, str) else action.source_occurrence_id
+        step = source_step.get()
+        if not isinstance(step, str) or not step.startswith(occurrence + ":"):
+            step = occurrence
+        with count_lock:
+            ordinal = counts.get(step, 0)
+            counts[step] = ordinal + 1
+        with store.workflow_context(state.job_id, source_occurrence_id=f"{step}:native:{ordinal}"):
+            store.assert_workflow_current(state.job_id)
+            result = canonical_plan(plan, action, state)
+            # Preserve the finite native source callback flags carried by a
+            # failed child; its canonical status remains failed/ambiguous.
+            if isinstance(result, dict):
+                for row in result.get("provider_results", ()):
+                    for field in ("source_pause_scripts", "source_error_event", "source_error_hold",
+                                  "source_stop_scripts", "source_board_error_event"):
+                        if field in row:
+                            result[field] = row[field]
+            return result
+    def execute_thermal(operation, arguments, action, state):
+        """Finite native thermal/control child on the existing claim owner."""
+        from .runtime_audit_store import workflow_claim_context
+        if not callable(canonical_control):
+            raise RuntimeError("workflow_lifecycle_control_executor_unavailable")
+        binding = workflow_claim_context()
+        occurrence = (action if isinstance(action, str) else
+                      action.source_occurrence_id if action is not None else
+                      (binding or {}).get("source_occurrence_id", "lifecycle:" + operation))
+        step = source_step.get()
+        if not isinstance(step, str) or not step.startswith(occurrence + ":"):
+            step = occurrence
+        with count_lock:
+            ordinal = counts.get(step, 0)
+            counts[step] = ordinal + 1
+        identity = f"{step}:native:{ordinal}"
+        owner = executor()
+        control_hooks = {
+            "lifecycle:safe_stop_request", "lifecycle:safe_stop_exit",
+            "lifecycle:abort_true_prefix", "lifecycle:abort_true_finish",
+            "lifecycle:deferred_pause_request", "lifecycle:wake",
+        }
+        parent_occurrence = (binding or {}).get("source_occurrence_id")
+        control_id = (state.workflow.last_control_id
+                      if action is None and parent_occurrence in control_hooks
+                      and state.workflow is not None else None)
+        with store.workflow_context(state.job_id, source_occurrence_id=identity):
+            store.assert_workflow_current(state.job_id)
+            return canonical_control(
+                operation, state, source_occurrence_id=identity,
+                arguments=dict(arguments), control_id=control_id,
+                source_error_callback=lambda message: owner.source_error(false_abort=True),
+            )
+    callbacks = {}
+    settings = metadata.get("source_settings", {})
+    def executor():
+        if source_executor is None:
+            raise RuntimeError("workflow_source_executor_unavailable")
+        return source_executor()
+    def start_child(name, operation):
+        from .runtime_audit_store import workflow_claim_context
+        domains = {"ejt.ejection": ("Tip",), "ejt.motion": ("General", "Gripper")}[name]
+        binding = workflow_claim_context()
+        if binding is None:
+            raise RuntimeError("workflow_source_child_requires_context")
+        identity = f"{binding['source_occurrence_id']}:{name}"
+        return executor().start_child(identity, operation, domains=domains)
+    def pipette_plan(plan, action, state):
+        result = execute_plan(plan, action, state)
+        if result.get("ok") is not True:
+            from .oem_deck_movement import DeckExecutionFailure
+            raise DeckExecutionFailure(
+                "OEM pipette native child failed", delivery_attempted=bool(result.get("delivery_attempted")),
+                controller_command_acknowledged=bool(result.get("controller_command_acknowledged")),
+                controller_completion_verified=bool(result.get("controller_completion_verified")),
+                provider_results=[result],
+            )
+        return result
+    if provider is not None and canonical_plan is not None:
+        callbacks = provider.build_oem_pipette_source_callbacks(
+            execute_plan=pipette_plan, start_child=start_child,
+            stopped=lambda: executor().source_stopped(), settings=settings,
+            rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+        )
+        callbacks.pop("settings")  # The same captured mapping is passed below.
+        # D's sweep uses source MoveZHome() (default), while the full native
+        # binding also represents explicit rehome=False/True calls.
+        callbacks["move_z_home"] = lambda action, state: callbacks["source_bindings"].home(None, action, state)
+        callbacks["source_bindings"] = replace(callbacks["source_bindings"],
+            source_capabilities=callbacks["source_bindings"].source_capabilities.intersection(capabilities))
+        native = provider.build_oem_native_handlers(
+            settings=settings, execute_plan=execute_plan,
+            execute_thermal=execute_thermal if callable(canonical_control) else None,
+            execute_mov=_protocol_source_mov if callable(getattr(app.state, "oem_mov_execution_admitter", None)) else None,
+            rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+        )
+    def publish_tip_transition(tray_id, well_ids, action, state):
+        if not well_ids:
+            # Source ReTip only writes selected empty Reuse wells.
+            return {"ok": True, "source_noop": True, "delivery_attempted": False}
+        identity = source_step.get()
+        if not identity:
+            raise RuntimeError("source_publication_requires_step_identity")
+        with store.workflow_context(state.job_id, source_occurrence_id=identity):
+            store.assert_workflow_current(state.job_id)
+            with store.normal_mutation_scope(resources=("pipette",)) as command_id:
+                store.assert_workflow_current(state.job_id)
+                published = provider.publish_tip_tray_transition(
+                    tray_id=int(tray_id), transition="retip", well_ids=list(well_ids),
+                    operation_id=f"{state.job_id}:{identity}", command_id=command_id,
+                    provenance={"source_occurrence_id": identity, "source_operation": "retip"},
+                )
+                if state.workflow is not None and command_id not in state.workflow.child_command_ids:
+                    state.workflow.child_command_ids.append(command_id)
+                return {"ok": True, "command_id": command_id, "published_tip_tray": published,
+                        "delivery_attempted": False, "physical_effect_verified": False}
+    # A source-only retip remains available without a motion binding; with
+    # R3 connected, its finite canonical publisher is the sole callback.
+    if not callbacks and provider is not None:
+        callbacks["publish_tip_transition"] = publish_tip_transition
+    pipette = build_oem_pipette_handlers(
+        before_native_entry=before_entry, pipette_call=_protocol_source_pipette_call,
+        settings=settings, **callbacks,
+    )
+    if "source_bindings" in callbacks:
+        helpers = build_oem_pipette_lifecycle_helpers(
+            before_native_entry=before_entry, pipette_call=_protocol_source_pipette_call,
+            source_bindings=callbacks["source_bindings"], settings=settings,
+            move_to_waste=callbacks["move_to_waste"], sweep_handler=pipette["sweep"],
+        )
+        def lifecycle_pipette(name, state):
+            occurrence = "lifecycle:" + name
+            with count_lock:
+                ordinal = counts.get(occurrence, 0)
+                counts[occurrence] = ordinal + 1
+            return helpers[name](state, source_occurrence_id=f"{occurrence}:{ordinal}")
+        def lifecycle_plan(operation, state):
+            from .oem_deck_movement import compile_finite_plate_operation
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True)
+            return execute_plan(plan, "lifecycle:" + operation, state)
+        thermal_lifecycle = {}
+        if callable(canonical_control):
+            def control(operation, state, arguments=None):
+                return execute_thermal(operation, arguments or {}, None, state)
+            def shutdown_temperature(state):
+                return control("shutdown_temperature", state)
+            def safe_stop_request(state):
+                # ControlLib.safeStopScripts: one source Sleep(1), then shutdown.
+                provider.sleep(0.001)
+                return shutdown_temperature(state)
+            def abort_false(state):
+                rows = []
+                for callback in (shutdown_temperature, executor().cancel_source,
+                                 lambda value: control("software_abort", value)):
+                    result = dict(callback(state))
+                    rows.append(result)
+                    if result.get("ok") is not True:
+                        return {**result, "source_children": rows}
+                return {"ok": True, "source_children": rows}
+            def abort_true_finish(state):
+                allowed = state.source_model.allow_to_stop
+                if type(allowed) is not bool:
+                    raise RuntimeError("source_authority_missing:AllowToStop")
+                if allowed:
+                    return control("software_abort", state)
+                return {"ok": True, "source_allow_to_stop": False,
+                        "source_software_abort_called": False}
+            thermal_lifecycle = {
+                "safe_stop_tip_exit": lambda state: lifecycle_pipette("safe_stop_tip_exit", state),
+                "cancel_source": lambda state: executor().cancel_source(state),
+                "shutdown_temperature": shutdown_temperature,
+                "wake_prepare": lambda state: control("wake_prepare", state),
+                "restore_door_model": lambda value, state: control("restore_door_model", state, {"value": value}),
+                "resume_temperature": lambda state: control("resume_temperature", state),
+            }
+        lifecycle = provider.build_oem_lifecycle_handlers(
+            settings=settings, execute_plan=execute_plan,
+            pressure_baseline=lambda state: lifecycle_pipette("pressure_baseline", state),
+            run_job_tip_prefix=lambda state: lifecycle_pipette("run_job_tip_prefix", state),
+            unlatch=lambda state: lifecycle_plan("unlatch", state),
+            confirm_gripper=lambda state: lifecycle_plan("confirm_gripper", state),
+            home_gripper=lambda state: lifecycle_plan("home_gripper", state),
+            **thermal_lifecycle,
+        )
+        lifecycle["script_finally"] = lambda state: executor().finalize_source_host(state)
+        lifecycle["source_error_request"] = lambda state: executor().cancel_source(state)
+        if callable(canonical_control):
+            lifecycle.update({
+                "safe_stop_request": safe_stop_request,
+                "abort_false": abort_false,
+                "abort_true_prefix": shutdown_temperature,
+                "abort_true_finish": abort_true_finish,
+                "deferred_pause_request": lambda state: control("thermal_bailout", state),
+                "epilogue_lid": lambda state: control("epilogue_lid", state),
+            })
+        lifecycle["epilogue_sweep"] = lambda state: lifecycle_pipette("epilogue_sweep", state)
+        # Cleanup remains the full mechanical plan, consuming this attempt's
+        # actual source-return event, never only a pipette prefix.
+    if set(native).intersection(pipette):
+        raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
+    from .services.protocol_service import ProtocolBindings
+    lifetime = {}
+    if provider is not None:
+        begin = getattr(provider, "wp8_source_script_begin", None)
+        returned = getattr(provider, "wp8_source_script_returned", None)
+        if callable(begin) and callable(returned):
+            lifetime = {
+                "source_script_begin": lambda state: begin(command_id=state.workflow.command_id),
+                "source_script_returned": lambda state: returned(command_id=state.workflow.command_id),
+            }
+    return ProtocolBindings(_protocol_live_handlers(), {**native, **pipette}, lifecycle, **lifetime)
+
+
 @app.post("/protocol/execute")
 async def protocol_execute(req: ProtocolExecuteRequest):
     try:
-        return await run_in_threadpool(
+        command_store = None if req.dry_run else _protocol_command_store()
+        if command_store is not None:
+            bind_protocol_dispatcher(command_store, binding_factory=_protocol_bindings)
+        result = await run_in_threadpool(
             create_protocol_job,
             req.model_dump(exclude_none=True),
-            dry_run=bool(req.dry_run),
-            handlers=None if req.dry_run else _protocol_live_handlers(),
+            dry_run=bool(req.dry_run), command_store=command_store,
+            binding_factory=None if req.dry_run else _protocol_bindings,
+            authority_factory=None if req.dry_run else _protocol_authority,
         )
+        status = 200 if req.dry_run or result["command"]["terminal"] else 202
+        return JSONResponse(status_code=status, content=result)
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
@@ -9638,16 +11072,27 @@ async def protocol_execute(req: ProtocolExecuteRequest):
 @app.get("/protocol/jobs")
 async def protocol_jobs(limit: int = Query(20, ge=1, le=100)):
     return {
-        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit),
+        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, command_store=_protocol_command_store()),
     }
 
 
 @app.get("/protocol/jobs/{job_id}")
 async def protocol_job_detail(job_id: str):
     try:
-        return await run_in_threadpool(get_protocol_job, job_id)
+        return await run_in_threadpool(get_protocol_job, job_id, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/protocol/jobs/{job_id}/control")
+async def protocol_job_control(job_id: str, req: ProtocolControlRequest):
+    try:
+        return await run_in_threadpool(control_protocol_job, job_id,
+                                       req.model_dump(exclude_none=True), command_store=_protocol_command_store())
+    except ProtocolLiveContractError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": "workflow_control_refused", "reason": str(exc)}) from exc
 
 
 @app.post("/protocol/jobs/{job_id}/review")
@@ -9658,7 +11103,11 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
             job_id,
             reviewer=req.reviewer,
             note=req.note,
+            command_store=_protocol_command_store(),
+            request=req.model_dump(exclude_none=True),
         )
+    except ProtocolLiveContractError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

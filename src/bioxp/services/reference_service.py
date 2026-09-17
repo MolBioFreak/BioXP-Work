@@ -33,6 +33,7 @@ class AxisReferenceRecord:
     note: str | None = None
     updated_at: str | None = None
     last_motion_kind: str | None = None
+    state_version: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -43,6 +44,7 @@ class AxisReferenceRecord:
             "note": self.note,
             "updated_at": self.updated_at,
             "last_motion_kind": self.last_motion_kind,
+            "state_version": self.state_version,
         }
 
 
@@ -99,39 +101,7 @@ class ReferenceStateStore:
             "canonical_json", 1, lambda value: json.dumps(json.loads(str(value)), sort_keys=True, separators=(",", ":")), deterministic=True
         )
         connection.execute("PRAGMA busy_timeout=2000")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS reference_state_authority (
-                authority_key TEXT PRIMARY KEY CHECK(authority_key='reference_state'),
-                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-                payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
-                updated_at REAL NOT NULL
-            ) WITHOUT ROWID;
-            DROP TRIGGER IF EXISTS reference_state_authority_coherence_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_authorized_insert_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_authorized_update_v1;
-            DROP TRIGGER IF EXISTS reference_state_authority_no_delete_v1;
-            CREATE TRIGGER reference_state_authority_coherence_v1
-            BEFORE INSERT ON reference_state_authority
-            WHEN NEW.payload_json<>canonical_json(NEW.payload_json)
-              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
-            BEGIN SELECT RAISE(ABORT,'reference authority bytes are incoherent'); END;
-            CREATE TRIGGER reference_state_authority_authorized_insert_v1
-            BEFORE INSERT ON reference_state_authority
-            WHEN reference_write_allowed()<>1
-            BEGIN SELECT RAISE(ABORT,'reference authority writer is not authoritative'); END;
-            CREATE TRIGGER reference_state_authority_authorized_update_v1
-            BEFORE UPDATE ON reference_state_authority
-            WHEN reference_write_allowed()<>1
-              OR NEW.authority_key IS NOT OLD.authority_key
-              OR NEW.payload_json<>canonical_json(NEW.payload_json)
-              OR NEW.payload_sha256<>sha256_utf8(NEW.payload_json)
-            BEGIN SELECT RAISE(ABORT,'reference authority update is not authoritative'); END;
-            CREATE TRIGGER reference_state_authority_no_delete_v1
-            BEFORE DELETE ON reference_state_authority
-            BEGIN SELECT RAISE(ABORT,'reference authority cannot be deleted'); END;
-            """
-        )
+
         expected_columns = (
             ("authority_key", "TEXT", 1, 1),
             ("payload_json", "TEXT", 1, 0),
@@ -202,7 +172,15 @@ class ReferenceStateStore:
                         return self._failure([], "reference_state_disk_unreadable")
                     previous = dict(self._rows)
                     self._rows = dict(loaded)
-                    return self._commit_candidate_locked({}, previous)
+                    # Keep unknown tombstones so reset cannot reuse an old version.
+                    candidate = {
+                        axis: AxisReferenceRecord(
+                            axis=axis, state=ReferenceState.UNKNOWN,
+                            state_version=record.state_version + 1,
+                        )
+                        for axis, record in loaded.items()
+                    }
+                    return self._commit_candidate_locked(candidate, previous)
             except ReferenceStateAuthorityError as exc:
                 self._authority_untrusted = True
                 return self._failure([], str(exc))
@@ -261,25 +239,86 @@ class ReferenceStateStore:
 
     def mark_referenced_many(self, commands: Iterable[MarkAxisReferencedCommand]) -> dict[str, Any]:
         commands = list(commands)
+        return self._run_mutation([command.axis for command in commands],
+            lambda candidate: self._referenced_candidate(candidate, commands))
 
-        def apply(candidate: dict[str, AxisReferenceRecord]) -> list[AxisReferenceRecord]:
-            proposed: list[AxisReferenceRecord] = []
-            for command in commands:
-                axis = _axis_value(command.axis)
-                record = AxisReferenceRecord(
-                    axis=axis,
-                    state=ReferenceState.REFERENCED,
-                    origin_position_steps=int(command.position_steps),
-                    source=_normalize_text(command.source, fallback="manual"),
-                    note=_normalize_optional_text(command.note),
-                    updated_at=_utc_now(),
-                    last_motion_kind=_normalize_optional_text(command.motion_kind),
-                )
-                candidate[axis] = record
-                proposed.append(record)
-            return proposed
+    @staticmethod
+    def _referenced_candidate(candidate, commands):
+        proposed = []
+        for command in commands:
+            axis = _axis_value(command.axis)
+            previous = candidate.get(axis)
+            record = AxisReferenceRecord(
+                axis=axis, state=ReferenceState.REFERENCED,
+                state_version=1 if previous is None else previous.state_version + 1,
+                origin_position_steps=int(command.position_steps),
+                source=_normalize_text(command.source, fallback="manual"),
+                note=_normalize_optional_text(command.note), updated_at=_utc_now(),
+                last_motion_kind=_normalize_optional_text(command.motion_kind))
+            candidate[axis] = record
+            proposed.append(record)
+        return proposed
 
-        return self._run_mutation([command.axis for command in commands], apply)
+    def publish_referenced_many_atomic(self, commands, *, expected_rows, transaction):
+        """Join a canonical runtime transaction without a second SQLite writer.
+
+        This owner retains its normal lock, serializer, versioning and write
+        authorization. The runtime owner must commit/rollback the entire unit.
+        Its callbacks must not re-enter this store while the scope is held.
+        """
+        commands = list(commands)
+        with self._lock, self._state_file_lock(fcntl.LOCK_EX):
+            if self._database_path is None or self._disk_state_dirty or self._authority_untrusted:
+                raise ReferenceStateAuthorityError("reference_state_authority_untrusted")
+            loaded = self._read_rows_from_disk_locked()
+            if loaded is None:
+                raise ReferenceStateAuthorityError("reference_state_disk_unreadable")
+            if {a: loaded.get(a, AxisReferenceRecord(axis=a, state=ReferenceState.UNKNOWN)).to_payload()
+                for a in expected_rows} != expected_rows:
+                raise ReferenceStateAuthorityError("reference_state_changed_before_publication")
+            connection = self._open_database()
+            try:
+                before = connection.execute("SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key='reference_state'").fetchone()
+            finally:
+                connection.close()
+            candidate = dict(loaded)
+            proposed = self._referenced_candidate(candidate, commands)
+            rows = {r.axis: r.to_payload() for r in proposed}
+            encoded = json.dumps({"version": 1, "rows": {a: r.to_payload() for a, r in candidate.items()}},
+                                 sort_keys=True, separators=(",", ":"))
+            def write_reference(db):
+                if not db.in_transaction:
+                    raise ReferenceStateAuthorityError("reference_publication_requires_transaction")
+                database = next(r[2] for r in db.execute("PRAGMA database_list") if r[1] == "main")
+                if Path(database).resolve() != self._database_path.resolve():
+                    raise ReferenceStateAuthorityError("reference_publication_database_mismatch")
+                current = db.execute("SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key='reference_state'").fetchone()
+                if (tuple(current) if current is not None else None) != (tuple(before) if before is not None else None):
+                    raise ReferenceStateAuthorityError("reference_state_changed_at_writer")
+                allowed = [True]
+                db.create_function("reference_write_allowed", 0, lambda: int(allowed[0]))
+                self._authority_write_depth += 1
+                try:
+                    self._write_reference_payload(db, encoded)
+                finally:
+                    allowed[0] = False
+                    self._authority_write_depth -= 1
+                return rows
+            # A rejected/rolled-back coordinated write leaves existing authority
+            # intact. Unlike an uncertain standalone write it need not poison it.
+            result = transaction(write_reference)
+            verified = self._read_rows_from_disk_locked()
+            if verified is None or not self._records_equal(candidate, verified):
+                self._disk_state_dirty = self._authority_untrusted = True
+                raise ReferenceStateAuthorityError("reference_state_durable_reread_mismatch")
+            self._rows = verified
+            return result
+
+    @staticmethod
+    def _write_reference_payload(connection, encoded):
+        connection.execute(
+            "INSERT INTO reference_state_authority(authority_key,payload_json,payload_sha256,updated_at) VALUES(?,?,?,?) ON CONFLICT(authority_key) DO UPDATE SET payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256,updated_at=excluded.updated_at",
+            ("reference_state", encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()))
 
     def mark_desynced(self, command: MarkAxisDesyncedCommand) -> dict[str, Any]:
         result = self.mark_desynced_many([command])
@@ -296,6 +335,7 @@ class ReferenceStateStore:
                 record = AxisReferenceRecord(
                     axis=axis,
                     state=ReferenceState.DESYNCED,
+                    state_version=1 if previous is None else previous.state_version + 1,
                     origin_position_steps=None if previous is None else previous.origin_position_steps,
                     source=_normalize_text(command.source, fallback="manual"),
                     note=_normalize_text(command.reason, fallback="desynced"),
@@ -326,6 +366,7 @@ class ReferenceStateStore:
                     record = AxisReferenceRecord(
                         axis=axis_key,
                         state=ReferenceState.UNKNOWN,
+                        state_version=1,
                         updated_at=_utc_now(),
                         last_motion_kind=normalized_kind,
                     )
@@ -333,6 +374,10 @@ class ReferenceStateStore:
                     record = AxisReferenceRecord(
                         axis=previous.axis,
                         state=previous.state,
+                        # Motion bookkeeping does not replace reference authority.
+                        # Keep the version fenced by admitted deck commands; only
+                        # reference/desync/recovery transitions advance it.
+                        state_version=previous.state_version,
                         origin_position_steps=previous.origin_position_steps,
                         source=previous.source,
                         note=previous.note,
@@ -366,6 +411,7 @@ class ReferenceStateStore:
                         replacement = AxisReferenceRecord(
                             axis=record.axis,
                             state=ReferenceState.DESYNCED,
+                            state_version=record.state_version + 1,
                             origin_position_steps=record.origin_position_steps,
                             source="reference_recovery",
                             note=_normalize_text(reason, fallback="reference authority recovery"),
@@ -514,9 +560,15 @@ class ReferenceStateStore:
             state = _normalize_reference_state(row.get("state"))
             if state is None:
                 continue
+            # Missing versions are legacy baseline metadata, not reference proof.
+            state_version = row.get("state_version", 0)
+            if type(state_version) is not int or state_version < 0:
+                logger.warning("Invalid reference state version for axis %s", axis)
+                return None
             loaded[str(axis)] = AxisReferenceRecord(
                 axis=str(row.get("axis", axis)),
                 state=state,
+                state_version=state_version,
                 origin_position_steps=_normalize_optional_int(row.get("origin_position_steps")),
                 source=_normalize_optional_text(row.get("source")),
                 note=_normalize_optional_text(row.get("note")),
@@ -540,10 +592,7 @@ class ReferenceStateStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 self._authority_write_depth += 1
-                connection.execute(
-                    "INSERT INTO reference_state_authority(authority_key,payload_json,payload_sha256,updated_at) VALUES(?,?,?,?) ON CONFLICT(authority_key) DO UPDATE SET payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256,updated_at=excluded.updated_at",
-                    ("reference_state", encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-                )
+                self._write_reference_payload(connection, encoded)
                 connection.execute("COMMIT")
             finally:
                 self._authority_write_depth = max(0, self._authority_write_depth - 1)
@@ -614,14 +663,6 @@ def _normalize_reference_state(value: Any) -> ReferenceState | None:
         return ReferenceState(str(value).strip())
     except Exception:
         return None
-
-
-def _record_is_newer_or_equal(local_record: AxisReferenceRecord, disk_record: AxisReferenceRecord | None) -> bool:
-    if disk_record is None:
-        return True
-    local_updated_at = _normalize_optional_text(local_record.updated_at) or ""
-    disk_updated_at = _normalize_optional_text(disk_record.updated_at) or ""
-    return local_updated_at >= disk_updated_at
 
 
 def _utc_now() -> str:

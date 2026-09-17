@@ -14,11 +14,12 @@ from typing import Any, Callable, Mapping
 
 
 PUBLIC_OPERATION_STATES = frozenset({"waiting", "running", "paused", "stopped", "emergency", "error"})
-STARTUP_STAGES = ("constructor_pipette_stage", "initial_check", "initialization_without_motion")
+# ControlLib constructs/configures motors before BioXPMainWindow.initialCheck.
+STARTUP_STAGES = ("constructor_pipette_stage", "initialization_without_motion", "initial_check")
 _PREDECESSOR = {
     "constructor_pipette_stage": None,
-    "initial_check": "constructor_pipette_stage",
-    "initialization_without_motion": "initial_check",
+    "initialization_without_motion": "constructor_pipette_stage",
+    "initial_check": "initialization_without_motion",
 }
 
 
@@ -153,28 +154,8 @@ class CanonicalLifecycleOwner:
                     "evidence": copy.deepcopy(row.get("evidence")),
                     "error": row.get("error"),
                 })
-                successor = self._stages["initialization_without_motion"]
-                if successor.get("state") == "passed":
-                    successor.setdefault("history", []).append(
-                        {
-                            "attempt_id": successor.get("attempt_id"),
-                            "started_at": successor.get("started_at"),
-                            "completed_at": successor.get("completed_at"),
-                            "state": successor.get("state"),
-                            "evidence": copy.deepcopy(successor.get("evidence")),
-                            "error": "invalidated_by_repeat_initial_check",
-                        }
-                    )
-                    successor.update(
-                        {
-                            "state": "blocked",
-                            "attempt_id": None,
-                            "started_at": None,
-                            "completed_at": None,
-                            "evidence": None,
-                            "error": "invalidated_by_repeat_initial_check",
-                        }
-                    )
+                # A repeated initialCheck does not replay/invalidate constructor
+                # configuration. Native cmd64 owns current-generation readiness.
             attempt_id = uuid.uuid4().hex
             row.update({
                 "state": "running",
@@ -232,130 +213,190 @@ class CanonicalLifecycleOwner:
     ) -> dict[str, Any]:
         """Execute exact commissioned initialCheck semantics behind one stage gate."""
 
-        def action() -> Mapping[str, Any]:
-            started = clock()
-            trace: list[dict[str, Any]] = []
-            sleeps: list[int] = []
+        return self.run_stage("initial_check", lambda: self._initial_check_body(
+            hardware, can_ready=can_ready, sleep=sleep, clock=clock,
+        ))
 
-            def fail(error: str, **evidence: Any) -> dict[str, Any]:
-                return {
-                    "ok": False,
-                    "error": error,
-                    "can_ready_attempts": len([value for value in sleeps if value == 200]),
-                    "sleep_count": len(sleeps),
-                    "sleeps_ms": list(sleeps),
-                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                    "trace": list(trace),
-                    **evidence,
-                }
+    def run_workflow_wake_initial_check(
+        self, hardware: Any, *, validate_current: Callable[[str], bool],
+        can_ready: Callable[[], bool | None],
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
+        """Source wake entry, authorized by the current canonical child owner.
 
-            num = 0
-            while can_ready() is not True:
-                sleep(0.200)
-                sleeps.append(200)
-                trace.append({"step": "CAN_READY_wait", "counter_before_test": num, "sleep_ms": 200})
-                if num > 10:
-                    return {
-                        "ok": False,
-                        "error": "CAN_READY_timeout",
-                        "can_ready_attempts": len(sleeps),
-                        "sleep_count": len(sleeps),
-                        "sleeps_ms": sleeps,
-                        "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                        "trace": trace,
-                    }
-                num += 1
+        The trusted callback must validate parent/attempt/reached gate/control and
+        child identity, including only producer-authorized generation changes.
+        Startup history is not wake admission or new readiness evidence.
+        """
+        def validate(phase: str) -> None:
+            if not callable(validate_current) or validate_current(phase) is not True:
+                raise LifecycleStateError(f"workflow wake authority rejected: {phase}")
+            with self._lock:
+                if self._operation_state == "emergency":
+                    raise LifecycleStateError("workflow wake cannot run during emergency")
 
-            if self._board_test_mode:
-                # Exact ControlLib.initialCheck BoardTestMode branch:
-                # result=true; activateBoard().  It does not run LED, door/latch,
-                # or 24 V sampling and it does not synthesize a voltage value.
-                activate = hardware.activate_boards()
-                trace.append({"step": "BoardTestMode.activateBoard", "result": activate})
-                can_waits = len([value for value in sleeps if value == 200])
-                return {
-                    "ok": _result_ok(activate),
-                    "board_test_mode": True,
-                    "can_ready_attempts": can_waits,
-                    "sleep_count": len(sleeps),
-                    "sleeps_ms": list(sleeps),
-                    "power": None,
-                    "led_write_performed": False,
-                    "latch_write_performed": False,
-                    "live_voltage_sample_performed": False,
-                    "activate_boards": activate,
-                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                    "trace": trace,
-                }
+        class GuardedHardware:
+            def __getattr__(self, name: str) -> Any:
+                leaf = getattr(hardware, name)
+                def invoke(*args: Any, **kwargs: Any) -> Any:
+                    validate(name)
+                    return leaf(*args, **kwargs)
+                return invoke
 
-            led = hardware.set_led_rgb(255, 255, 255)
-            trace.append({"step": "LED_white", "rgb": [255, 255, 255], "result": led})
-            if not _result_ok(led):
-                return fail("LED_white_failed", led=led)
-            sleep(0.050)
-            sleeps.append(50)
-            trace.append({"step": "LED_white_wait", "sleep_ms": 50})
-            door = self._check_door_status(hardware, sleep=sleep, sleeps=sleeps, trace=trace)
-            if not door["ok"]:
-                return {
-                    "ok": False,
-                    "error": door.get("error") or "checkDoorStatus_failed",
-                    "can_ready_attempts": len([value for value in sleeps if value == 200]),
-                    "sleep_count": len(sleeps),
-                    "sleeps_ms": sleeps,
-                    "door_latch": door,
-                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
-                    "trace": trace,
-                }
-            deactivate = hardware.deactivate_boards()
-            trace.append({"step": "deactivate_boards", "result": deactivate})
-            if not _result_ok(deactivate):
-                return fail(
-                    "deactivate_boards_failed",
-                    door_latch=door,
-                    deactivate_boards=deactivate,
-                )
-            activate = hardware.activate_boards()
-            trace.append({"step": "activate_boards", "result": activate})
-            if not _result_ok(activate):
-                return fail(
-                    "activate_boards_failed",
-                    door_latch=door,
-                    deactivate_boards=deactivate,
-                    activate_boards=activate,
-                )
-            begin_generation = getattr(hardware, "oem_begin_board_lifecycle_generation", None)
-            lifecycle_generation = (
-                begin_generation(deactivation=deactivate, activation=activate)
-                if callable(begin_generation)
-                else {"ok": True, "legacy_harness_without_generation_binding": True}
+        def ready() -> bool | None:
+            validate("can_ready")
+            return can_ready()
+
+        with self._stage_lock:
+            validate("admission")
+            if not callable(getattr(hardware, "oem_begin_board_lifecycle_generation", None)):
+                raise LifecycleStateError("workflow wake requires board lifecycle generation producer")
+            # Exceptions (including admission loss) must not become ignored bools.
+            result = dict(self._initial_check_body(
+                GuardedHardware(), can_ready=ready, sleep=sleep, clock=clock,
+            ))
+            validate("completion")
+            source_false = result.get("error") == "CAN_READY_timeout"
+            door = result.get("door_latch") or {}
+            power = door.get("power") or {}
+            source_false = source_false or (
+                door.get("error") == "OEM_24V_scalar_or_reply_validity_gate_failed"
+                and power.get("sample_valid") is True
+                and power.get("oem_no24v") is True
             )
-            trace.append({"step": "board_lifecycle_generation", "result": lifecycle_generation})
-            if not _result_ok(lifecycle_generation):
-                return fail(
-                    "board_lifecycle_generation_failed",
-                    door_latch=door,
-                    deactivate_boards=deactivate,
-                    activate_boards=activate,
-                    board_lifecycle_generation=lifecycle_generation,
-                )
-            ok = True
+            native_ok = result.get("ok") is True or source_false
             return {
-                "ok": ok,
-                "error": None if ok else "initialCheck_side_effect_failed",
-                "board_test_mode": False,
+                "ok": native_ok,
+                "source_return": bool(result.get("ok")) if native_ok else None,
+                "initial_check": result,
+            }
+
+    def _initial_check_body(
+        self, hardware: Any, *, can_ready: Callable[[], bool | None],
+        sleep: Callable[[float], None], clock: Callable[[], float],
+    ) -> Mapping[str, Any]:
+        started = clock()
+        trace: list[dict[str, Any]] = []
+        sleeps: list[int] = []
+
+        def fail(error: str, **evidence: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "error": error,
                 "can_ready_attempts": len([value for value in sleeps if value == 200]),
                 "sleep_count": len(sleeps),
-                "sleeps_ms": sleeps,
-                "door_latch": door,
-                "deactivate_boards": deactivate,
+                "sleeps_ms": list(sleeps),
+                "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                "trace": list(trace),
+                **evidence,
+            }
+
+        num = 0
+        while can_ready() is not True:
+            sleep(0.200)
+            sleeps.append(200)
+            trace.append({"step": "CAN_READY_wait", "counter_before_test": num, "sleep_ms": 200})
+            if num > 10:
+                return {
+                    "ok": False,
+                    "error": "CAN_READY_timeout",
+                    "can_ready_attempts": len(sleeps),
+                    "sleep_count": len(sleeps),
+                    "sleeps_ms": sleeps,
+                    "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                    "trace": trace,
+                }
+            num += 1
+
+        if self._board_test_mode:
+            # Exact ControlLib.initialCheck BoardTestMode branch:
+            # result=true; activateBoard().  It does not run LED, door/latch,
+            # or 24 V sampling and it does not synthesize a voltage value.
+            activate = hardware.activate_boards()
+            trace.append({"step": "BoardTestMode.activateBoard", "result": activate})
+            can_waits = len([value for value in sleeps if value == 200])
+            return {
+                "ok": _result_ok(activate),
+                "board_test_mode": True,
+                "can_ready_attempts": can_waits,
+                "sleep_count": len(sleeps),
+                "sleeps_ms": list(sleeps),
+                "power": None,
+                "led_write_performed": False,
+                "latch_write_performed": False,
+                "live_voltage_sample_performed": False,
                 "activate_boards": activate,
-                "board_lifecycle_generation": lifecycle_generation,
                 "elapsed_ms": int(round((clock() - started) * 1000.0)),
                 "trace": trace,
             }
 
-        return self.run_stage("initial_check", action)
+        led = hardware.set_led_rgb(255, 255, 255)
+        trace.append({"step": "LED_white", "rgb": [255, 255, 255], "result": led})
+        if not _result_ok(led):
+            return fail("LED_white_failed", led=led)
+        sleep(0.050)
+        sleeps.append(50)
+        trace.append({"step": "LED_white_wait", "sleep_ms": 50})
+        door = self._check_door_status(hardware, sleep=sleep, sleeps=sleeps, trace=trace)
+        if not door["ok"]:
+            return {
+                "ok": False,
+                "error": door.get("error") or "checkDoorStatus_failed",
+                "can_ready_attempts": len([value for value in sleeps if value == 200]),
+                "sleep_count": len(sleeps),
+                "sleeps_ms": sleeps,
+                "door_latch": door,
+                "elapsed_ms": int(round((clock() - started) * 1000.0)),
+                "trace": trace,
+            }
+        deactivate = hardware.deactivate_boards()
+        trace.append({"step": "deactivate_boards", "result": deactivate})
+        if not _result_ok(deactivate):
+            return fail(
+                "deactivate_boards_failed",
+                door_latch=door,
+                deactivate_boards=deactivate,
+            )
+        activate = hardware.activate_boards()
+        trace.append({"step": "activate_boards", "result": activate})
+        if not _result_ok(activate):
+            return fail(
+                "activate_boards_failed",
+                door_latch=door,
+                deactivate_boards=deactivate,
+                activate_boards=activate,
+            )
+        begin_generation = getattr(hardware, "oem_begin_board_lifecycle_generation", None)
+        lifecycle_generation = (
+            begin_generation(deactivation=deactivate, activation=activate)
+            if callable(begin_generation)
+            else {"ok": True, "legacy_harness_without_generation_binding": True}
+        )
+        trace.append({"step": "board_lifecycle_generation", "result": lifecycle_generation})
+        if not _result_ok(lifecycle_generation):
+            return fail(
+                "board_lifecycle_generation_failed",
+                door_latch=door,
+                deactivate_boards=deactivate,
+                activate_boards=activate,
+                board_lifecycle_generation=lifecycle_generation,
+            )
+        ok = True
+        return {
+            "ok": ok,
+            "error": None if ok else "initialCheck_side_effect_failed",
+            "board_test_mode": False,
+            "can_ready_attempts": len([value for value in sleeps if value == 200]),
+            "sleep_count": len(sleeps),
+            "sleeps_ms": sleeps,
+            "door_latch": door,
+            "deactivate_boards": deactivate,
+            "activate_boards": activate,
+            "board_lifecycle_generation": lifecycle_generation,
+            "elapsed_ms": int(round((clock() - started) * 1000.0)),
+            "trace": trace,
+        }
 
     def initialize_system_camera_dependency(self) -> dict[str, Any]:
         """Evaluate the OEM camera gate at its initializeSystem boundary."""

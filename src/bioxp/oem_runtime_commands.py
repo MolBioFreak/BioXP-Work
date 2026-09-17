@@ -25,7 +25,6 @@ PREPARE_TO_RUN_JOB_READINESS_STEPS = [
     ("inspect_trough", "BioXPMainWindow.cs:1664; ControlLib.cs:3981-4015"),
     ("inspect_strip_handle", "BioXPMainWindow.cs:1688; ControlLib.cs:4139-4190"),
     ("inspect_strip_wells", "BioXPMainWindow.cs:1712; ControlLib.cs:4234-4346"),
-    ("inspect_tip_trays", "BioXPMainWindow.cs:1622; ControlLib.cs:4468-4739"),
     ("park_gantry", "BioXPMainWindow.cs:1760"),
 ]
 
@@ -120,29 +119,12 @@ class OEMRuntimeCommandHandlers:
                 "state": "abortjob_dry_run_complete",
                 "command": command.name,
                 "warning_situation": action,
-                "safe_action_taken": "would_execute_provider_owned_z_abort",
+                "safe_action_taken": "none_preview_only_use_canonical_workflow_abort",
                 "physical_motion_commanded": False,
             }
-        if self.z_abort_provider is None:
-            return {
-                "ok": False,
-                "ready": False,
-                "state": "failed_closed",
-                "command": command.name,
-                "blockers": ["live_z_abort_provider_not_bound"],
-            }
-        result = self.z_abort_provider(command)
-        ok = bool(isinstance(result, dict) and result.get("ok") is True)
-        return {
-            "ok": ok,
-            "ready": False,
-            "state": "aborting_job" if ok else "recovery_required",
-            "command": command.name,
-            "warning_situation": action,
-            "safe_action_taken": "provider_owned_z_abort_executed",
-            "z_abort": result,
-            "physical_effect_verified": False,
-        }
+        return {"ok": False, "ready": False, "command": command.name,
+                "blockers": ["legacy_runtime_execution_retired"],
+                "replacement": "/protocol/jobs/{job_id}/control"}
 
     def handle_wakefrompause(self, command: OEMRuntimeCommand) -> dict[str, Any]:
         if command.mode != "live":
@@ -154,33 +136,6 @@ class OEMRuntimeCommandHandlers:
                 "source_order": ["initialCheck", "rehome", "status_update", "dresumeJob"],
                 "physical_motion_commanded": False,
             }
-        if self.z_resume_provider is None:
-            return {
-                "ok": False,
-                "ready": False,
-                "state": "failed_closed",
-                "command": command.name,
-                "blockers": ["live_z_resume_provider_not_bound"],
-            }
-        result = self.z_resume_provider(command)
-        z_recovered = bool(
-            isinstance(result, dict)
-            and result.get("ok") is True
-            and result.get("z_state") == "referenced_ready"
-        )
-        return {
-            "ok": z_recovered,
-            "ready": False,
-            "state": "z_recovered_full_wake_required" if z_recovered else "recovery_required",
-            "command": command.name,
-            "source_order": ["initialCheck", "z_rehome"],
-            "z_recovery": result,
-            "omitted_non_z_source_work": ["full_rehome", "status_update", "dresumeJob"],
-            "blockers": (
-                ["full_oem_wakefrompause_not_implemented"]
-                if z_recovered
-                else ["z_rehome_failed_or_ambiguous"]
-            ),
-            "truth_level": "z_bearing_projection_only_not_full_wakefrompause",
-            "physical_effect_verified": False,
-        }
+        return {"ok": False, "ready": False, "command": command.name,
+                "blockers": ["legacy_runtime_execution_retired"],
+                "replacement": "/protocol/jobs/{job_id}/control"}

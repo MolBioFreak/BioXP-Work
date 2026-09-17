@@ -17,6 +17,9 @@ __pycache__/
 .venv/
 .pytest_cache/
 
+# Test code is retained outside release commits; local execution remains possible.
+/tests/
+
 # Exclude large snapshot images from vision system
 scripts/snapshots/
 scripts/Local Served Jobs/

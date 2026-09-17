@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioxp.local/schemas/image-inspection.v1.json",
+  "title": "BioXP external robot image inspection receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "inspected_at", "verifier", "requested_image_id", "resolved_local_image_id", "oci_labels", "embedded_source_manifest", "source_bytes_verified"],
+  "properties": {
+    "schema": {"const": "bioxp.release.image_inspection.v1"},
+    "status": {"const": "verified"},
+    "inspected_at": {"type": "string", "minLength": 1},
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"const": "/usr/local/libexec/bioxp-udocker-image-inspector"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "requested_image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "resolved_local_image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "oci_labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["org.opencontainers.image.revision", "com.bioxp.source.tree", "com.bioxp.source.manifest.sha256"],
+      "properties": {
+        "org.opencontainers.image.revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "com.bioxp.source.tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "com.bioxp.source.manifest.sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "embedded_source_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "aggregate_sha256"],
+      "properties": {
+        "path": {"const": "/usr/share/bioxp-release/source-manifest.json"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "aggregate_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "source_bytes_verified": {"const": true}
+  }
+}

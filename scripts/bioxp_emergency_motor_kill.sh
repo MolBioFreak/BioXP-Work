@@ -16,9 +16,10 @@ while [[ $# -gt 0 ]]; do
 Usage: bioxp_emergency_motor_kill.sh [--no-restart-api] [--no-preempt-api]
 
 Best-effort software emergency stop for BioXP motion. By default it first
-preempts the uvicorn BioXP API process so a hung motion request cannot keep the
+stops the canonical bioxp-api.service so a hung motion request cannot keep the
 USB handle busy, then opens USB directly, sends MST stops, zeros run/standby
-currents, deactivates boards 4/5/6, and restarts the API in a disarmed state.
+currents, deactivates boards 4/5/6, and asks the same canonical unit to restart
+in a disarmed state. It never creates a host-venv or user recovery listener.
 Physical power/E-stop/unplug still wins if motion is unsafe.
 EOF
       exit 0 ;;
@@ -26,49 +27,22 @@ EOF
   esac
 done
 
-API_PID_FILE=/tmp/bioxp_api_8123.pid
-API_LOG=/tmp/bioxp_api_8123.log
-find_api_pids() {
-  pgrep -f '[u]vicorn bioxp\.api:app' || true
-}
 preempt_api() {
   [[ "$PREEMPT_API" -eq 1 ]] || return 0
-  local pids
-  pids="$(find_api_pids | tr '\n' ' ')"
-  if [[ -n "${pids// }" ]]; then
-    echo "preempt_api_pids=${pids}"
-    kill ${pids} 2>/dev/null || true
-    sleep 0.8
-    pids="$(find_api_pids | tr '\n' ' ')"
-    if [[ -n "${pids// }" ]]; then
-      echo "force_kill_api_pids=${pids}"
-      kill -9 ${pids} 2>/dev/null || true
-      sleep 0.5
-    fi
+  echo "preempt_api=canonical_unit_stop"
+  if systemctl stop bioxp-api.service; then
+    :
   else
-    echo "preempt_api_pids=none"
+    stop_rc=$?
+    echo "preempt_api_warning=canonical_unit_stop_failed rc=${stop_rc}; continuing_physical_usb_stop=true" >&2
   fi
+  return 0
 }
 restart_api() {
   [[ "$RESTART_API" -eq 1 ]] || return 0
-  local pids
-  pids="$(find_api_pids | tr '\n' ' ')"
-  if [[ -n "${pids// }" ]]; then
-    echo "restart_api_kill_existing=${pids}"
-    kill ${pids} 2>/dev/null || true
-    sleep 0.8
-    pids="$(find_api_pids | tr '\n' ' ')"
-    if [[ -n "${pids// }" ]]; then
-      echo "restart_api_force_kill_existing=${pids}"
-      kill -9 ${pids} 2>/dev/null || true
-      sleep 0.5
-    fi
-  fi
-  echo "restart_api=true"
-  nohup env PYTHONPATH=src .venv/bin/uvicorn bioxp.api:app --host 0.0.0.0 --port 8123 >"$API_LOG" 2>&1 &
-  echo $! > "$API_PID_FILE"
-  sleep 1.5
-  echo "restart_api_pid=$(cat "$API_PID_FILE" 2>/dev/null || true)"
+  echo "restart_api=canonical_unit_restart"
+  systemctl reset-failed bioxp-api.service
+  systemctl restart bioxp-api.service
 }
 {
   echo "BioXP emergency motor kill"

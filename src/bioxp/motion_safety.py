@@ -114,8 +114,19 @@ def _preparation_result(authority: Serial206MotionAuthority, ledger: list[dict[s
         if isinstance(lifecycle_evidence, Mapping)
         else None
     )
+    failed = next((row for row in ledger if row["status"] not in {"passed", "not_applicable"}), None)
+    failure_stage = failed["stage_id"] if failed else None
+    error = None
+    if failed:
+        error = (
+            "Activation stopped: the 24 V check failed after the door/latch checks. Inspect the retained controller evidence."
+            if failure_stage == "rail_24v_readback"
+            else f"Activation stopped at {failure_stage}. Inspect the retained controller evidence."
+        )
     return {
         "schema_version": PREPARE_SCHEMA,
+        "failure_stage": failure_stage,
+        "error": error,
         "ok": ok,
         "state": "completed" if ok else "failed_closed",
         "machine_serial": authority.machine_serial,
@@ -167,9 +178,60 @@ def prepare_motion_without_motion(
     if not authority_ok:
         return _preparation_result(authority, ledger)
 
-    # Recovered ControlLib.initialCheck evaluates the machine environment before
-    # its ESM(false) -> ESM(true) command-64 transition. Keep these reads fresh;
-    # they are controller/interlock evidence, never torque or movement proof.
+    # ControlLib.checkDoorStatus:8670-8725 precedes initialCheck's board cycle.
+    # A component refresh reuses the existing lifecycle and must not actuate
+    # the enclosure latch again. Fresh global preparation owns that sequence.
+    import time
+
+    def read_door_latch(suffix: str = "") -> tuple[bool, int | None]:
+        latch_value = None
+        for stage_id, io_type, label in (("door_readback", 1, "door"), ("latch_readback", 3, "latch")):
+            try:
+                observation = driver.deck_io_query_type(io_type)
+            except Exception as exc:
+                observation = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
+            value = observation.get("value") if isinstance(observation, Mapping) else None
+            valid = bool(_ack_status(observation) == 100 and type(value) is int and value in {0, 1})
+            ledger.append(_stage(
+                stage_id + suffix, "passed" if valid else "failed",
+                f"ClassIOControl query {label} sensor; ControlLib.checkDoorStatus:8674-8681",
+                observation,
+            ))
+            if not valid:
+                return False, None
+            if io_type == 3:
+                latch_value = value
+        return True, latch_value
+
+    def set_solenoid(value: int) -> bool:
+        try:
+            result = driver.deck_io_set_type(2, value)
+        except Exception as exc:
+            ledger.append(_stage("latch_solenoid", "failed", "ControlLib.checkDoorStatus:8678,8701",
+                                 {"value": value, "error": f"{type(exc).__name__}: {exc}"}))
+            return False
+        # OEM ignores the returned scalar. Preserve its evidence and continue
+        # to the sensor checks; command completion does not prove latch state.
+        ledger.append(_stage(
+            "latch_solenoid", "passed", "ControlLib.checkDoorStatus:8678,8701",
+            {"value": value, "source_call_completed": True, "return_value_ignored": True,
+             "controller_acknowledged": _ack_status(result) == 100, "result": result},
+        ))
+        return True
+
+    if not reuse_current_board_lifecycle:
+        time.sleep(0.500)
+    observed_ok, latch_value = read_door_latch()
+    if not observed_ok:
+        return _preparation_result(authority, ledger)
+    if not reuse_current_board_lifecycle and latch_value == 1:
+        if not set_solenoid(1):
+            return _preparation_result(authority, ledger)
+        time.sleep(0.800)
+        observed_ok, _ = read_door_latch("_after_latch")
+        if not observed_ok:
+            return _preparation_result(authority, ledger)
+
     try:
         rail = driver.motor_query_24v_sensor()
     except Exception as exc:
@@ -183,34 +245,15 @@ def prepare_motion_without_motion(
         and rail.get("oem_scalar") == 0
     )
     ledger.append(_stage(
-        "rail_24v_readback",
-        "passed" if rail_ok else "failed",
-        "ClassIOControl.query24VSensor lines 92-110",
-        rail,
+        "rail_24v_readback", "passed" if rail_ok else "failed",
+        "ClassIOControl.query24VSensor:92-110; ControlLib.checkDoorStatus:8683-8725", rail,
     ))
     if not rail_ok:
+        scalar = rail.get("oem_scalar") if isinstance(rail, Mapping) else None
+        if not reuse_current_board_lifecycle and type(scalar) is int and scalar != 0:
+            if set_solenoid(0):
+                time.sleep(0.300)
         return _preparation_result(authority, ledger)
-
-    for stage_id, io_type, label in (("door_readback", 1, "door"), ("latch_readback", 3, "latch")):
-        try:
-            observation = driver.deck_io_query_type(io_type)
-        except Exception as exc:
-            observation = {"ack": None, "value": None, "error": f"{type(exc).__name__}: {exc}"}
-        observed_value = observation.get("value") if isinstance(observation, Mapping) else None
-        observed_ok = bool(
-            isinstance(observation, Mapping)
-            and _ack_status(observation) == 100
-            and type(observed_value) is int
-            and observed_value in {0, 1}
-        )
-        ledger.append(_stage(
-            stage_id,
-            "passed" if observed_ok else "failed",
-            f"ClassIOControl query {label} sensor read-only; value is source observation, not an invented equality gate",
-            observation,
-        ))
-        if not observed_ok:
-            return _preparation_result(authority, ledger)
 
     # A component refresh inside an already established lifecycle must not run
     # initialCheck's machine-wide cmd64 cycle. In particular, X is on board 5
@@ -435,7 +478,19 @@ def physical_aggregate_stop(
     # ClassMotor.StopMotor must run before forceAbortMotion latches No24V.
     # The source StopMotor path rejects delivery after that latch is active.
     latch = getattr(driver, "motor_oem_force_abort_motion", None)
-    force_abort_latch = latch(reason="forceAbortMotion") if callable(latch) else None
+    try:
+        force_abort_latch = (
+            latch(reason="forceAbortMotion")
+            if callable(latch)
+            else {"ok": False, "error": "forceAbortMotion is unavailable"}
+        )
+    except Exception as exc:
+        force_abort_latch = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    latch_completed = bool(
+        isinstance(force_abort_latch, Mapping)
+        and force_abort_latch.get("ok") is True
+        and force_abort_latch.get("latched") is True
+    )
 
     # Complete the fan-out before polling so one slow component cannot delay a
     # StopMotor command to another component that may still be moving.
@@ -456,6 +511,10 @@ def physical_aggregate_stop(
             speed = terminal.get("last_speed")
         terminal_completion_verified = bool(
             isinstance(terminal, Mapping)
+            and terminal.get("controller_terminal_state_verified") is True
+            and terminal.get("speed_reply_valid") is True
+            and isinstance(terminal.get("last_ack"), Mapping)
+            and terminal["last_ack"].get("status") == 100
             and (
                 terminal.get("stopped") is True
                 if "stopped" in terminal
@@ -472,16 +531,18 @@ def physical_aggregate_stop(
         })
 
     all_stopped = all(row["status"] in {"stopped", "not_present_by_authority"} for row in components)
+    complete = all_stopped and latch_completed
     return {
         "schema_version": STOP_SCHEMA,
-        "ok": all_stopped,
-        "state": "stopped" if all_stopped else "failed_ambiguous",
+        "ok": complete,
+        "state": "stopped" if complete else "failed_ambiguous",
         "machine_serial": authority.machine_serial,
         "controller_evidence": authority.controller_evidence(),
         "components": components,
         "stage_receipts": components,
         "delivery_attempted": any(row["delivery_attempted"] for row in components),
         "oem_24v_latch": force_abort_latch,
+        "abort_latch_completed": latch_completed,
         "controller_terminal_state_verified": all_stopped,
         "physical_effect_verified": False,
         "physical_effect_verification_required": True,

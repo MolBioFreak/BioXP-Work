@@ -10,6 +10,7 @@ import pytest
 
 _SESSION_RUNTIME_ROOT = Path(tempfile.mkdtemp(prefix="bioxp-pytest-runtime-"))
 os.environ["BIOXP_OEM_RUNTIME_STATE_ROOT"] = str(_SESSION_RUNTIME_ROOT)
+os.environ["BIOXP_REFERENCE_STATE_PATH"] = str(_SESSION_RUNTIME_ROOT / "reference.db")
 os.environ.pop("BIOXP_OEM_RUNTIME_ROOT", None)
 for _module_name in (
     "src.bioxp.runtime_audit_store",

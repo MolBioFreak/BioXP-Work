@@ -74,13 +74,15 @@ def test_z_stop_route_uses_the_safety_interrupt_lane(monkeypatch):
     calls = []
     tester_sentinel = object()
 
-    async def run_safety_interrupt(label, fn, *, timeout_s):
+    async def run_safety_interrupt(label, fn, *, timeout_s, delivery_only_lease=False):
+        assert delivery_only_lease is True
         calls.append(("lane", label, timeout_s))
-        return fn(tester_sentinel)
+        return fn(tester_sentinel)()
 
-    def execute(intent, values=None):
+    def execute(intent, values=None, *, defer_reconciliation=False):
+        assert defer_reconciliation is True
         calls.append((intent, dict(values or {})))
-        return {"ok": True, "interrupt": True}
+        return lambda: {"ok": True, "interrupt": True}
 
     monkeypatch.setattr(api, "_run_safety_interrupt_blocking", run_safety_interrupt)
     monkeypatch.setattr(api, "_execute_provider_z_intent", execute)

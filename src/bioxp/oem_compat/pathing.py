@@ -17,9 +17,12 @@ LOCATION_ID_TO_NAME = {
 LOCATION_NAME_TO_ID = {v: k for k, v in LOCATION_ID_TO_NAME.items()}
 TECAN_RACK_IDS = {7, 8, 9, 10}
 TECAN_RACK_OR_STRIP4_IDS = {7, 8, 9, 10, 15}
+TECAN_DIRECT_DESTINATION_IDS = frozenset({11, 12, 13, 14, 16})
 WASTE_BIN_ID = 6
 SOURCE_LINES = "ClassControlInterface.cs:3734-4014"
 MIDPOINT_LINES = "ClassControlInterface.cs:5254-5366"
+SCRIPTMOVE_TO_METHOD_TOKEN = "0x06000120"
+SCRIPTMOVE_TO_IL_SHA256 = "3e94ea68ac09edbbeb021907285e9e47206c07d118e5f3a9f5611cd03c491ce3"
 XY_MM_TO_STEPS = 236.94
 
 
@@ -123,8 +126,23 @@ class OemPathPlanner:
             "location19_y": state.location19_y,
         }
 
-    def plan_script_move_to(self, *, current_loc: str | int | None, location_id: str | int, column: int = 0, row: int = 0, positionflag: int = 0, state: OemMachineState, run_in_parallel: bool = True) -> dict[str, Any]:
+    def plan_script_move_to(self, *, current_loc: str | int | None, location_id: str | int, column: int = 0, row: int = 0, well: int | None = None, positionflag: int = 0, state: OemMachineState, run_in_parallel: bool = True) -> dict[str, Any]:
         loc_id = _loc_id(location_id); current_id = _loc_id(current_loc)
+        if loc_id == 32:
+            raise ValueError("Wrong destination!")
+        well_overload: dict[str, Any] | None = None
+        if well is not None:
+            signed_well = int(well)
+            row = abs(signed_well) // 12 * (-1 if signed_well < 0 else 1)
+            column = signed_well - row * 12
+            run_in_parallel = True
+            well_overload = {
+                "well": signed_well,
+                "signed_divisor": 12,
+                "column_remainder": column,
+                "row_quotient": row,
+                "run_in_parallel": True,
+            }
         target = self._target(location_id)
         target_xyz = self._xy_z_for_script_target(location_id, column=column, row=row, positionflag=positionflag, state=state)
         x, y, num = target_xyz["x"], target_xyz["y"], target_xyz["z"]
@@ -168,14 +186,14 @@ class OemPathPlanner:
             elif abs(x - x2) < 3000 or (abs(y - y2) < 3000 and loc_id != WASTE_BIN_ID):
                 branch = "tip_loaded_near_axis"
                 if run_in_parallel:
-                    steps.append(_step("parallel", steps=[_step("moveX", x=x), _step("moveY", y=y)], source_lines="ClassControlInterface.cs:3916-3928"))
+                    steps.append(_step("parallel", steps=[_step("moveX", x=x), _step("moveY", y=y)], parallel_semantics="source_task_wait_all_move_x_move_y", join="Task.WaitAll", source_lines="ClassControlInterface.cs:3916-3928"))
                     if num > pseudo:
                         steps.append(_step("moveZ", z=num, source_lines="ClassControlInterface.cs:3929-3932"))
                 else:
                     steps += [_step("moveXY", x=x, y=y, source_lines="ClassControlInterface.cs:3934-3937"), _step("moveZ", z=num)]
             elif current_id in TECAN_RACK_IDS and loc_id != WASTE_BIN_ID:
                 branch = "tip_loaded_from_tecan_rack_to_non_waste"
-                if loc_id in {11, 12, 13, 14, 16, 6}:
+                if loc_id in TECAN_DIRECT_DESTINATION_IDS:
                     steps += [_step("moveX", x=x, source_lines="ClassControlInterface.cs:3940-3945"), _step("moveY", y=y)]
                 else:
                     steps += [_step("moveX", x=27750, source_lines="ClassControlInterface.cs:3948-3951"), _step("moveY", y=y), _step("moveX", x=x)]
@@ -207,26 +225,40 @@ class OemPathPlanner:
             branch = "dirty_tip_default_moveTo"
             steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:4009-4011"))
 
-        return {
+        plan = {
             "ok": True,
             "schema_version": "bioxp.oem_scriptmove_path_plan.v1",
             "semantic_action": "scriptmoveTo",
             "branch": branch,
             "source_formula": SOURCE_LINES,
             "midpoint_source_formula": MIDPOINT_LINES,
+            "source_method_token": SCRIPTMOVE_TO_METHOD_TOKEN,
+            "source_il_sha256": SCRIPTMOVE_TO_IL_SHA256,
             "current_location_id": _loc_name(current_loc),
             "target_location_id": _loc_name(location_id),
             "column": int(column),
             "row": int(row),
+            "well_overload": well_overload,
             "positionflag": int(positionflag),
             "target": target.to_payload(),
             "target_coordinates": target_xyz,
             "state": state.to_payload(),
             "steps": steps,
             "step_count": len(steps),
-            "show_gantry": {"x_mm": x / XY_MM_TO_STEPS, "y_mm": y / XY_MM_TO_STEPS, "source_lines": "ClassControlInterface.cs:4013"},
+            "source_hazards": (
+                ["confirmed_oem_cover_storage_tautology"]
+                if state.tip_loaded and loc_id in {18, 20}
+                else []
+            ),
             "opened_usb": False,
             "physical_motion": False,
             "motion_commanded": False,
             "controller_command_planned": False,
         }
+        if branch != "same_xy_move_z":
+            plan["show_gantry"] = {
+                "x_mm": x / XY_MM_TO_STEPS,
+                "y_mm": y / XY_MM_TO_STEPS,
+                "source_lines": "ClassControlInterface.cs:4013",
+            }
+        return plan

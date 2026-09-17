@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import Any, Mapping
 
 
@@ -135,6 +136,28 @@ def _normalize_optional_int(value: Any, *, field_name: str) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise PipetteValidationError(f"{field_name} must be an integer") from exc
+
+
+def _normalize_optional_channels(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise PipetteValidationError("channels must be a list or tuple")
+    channels = tuple(value)
+    if not channels or any(type(channel) is not int or channel not in (0, 1, 2, 3) for channel in channels):
+        raise PipetteValidationError("channels must be a non-empty subset of 0..3")
+    if len(set(channels)) != len(channels):
+        raise PipetteValidationError("channels must not contain duplicates")
+    return channels
+
+
+def _normalize_optional_speed(value: Any) -> float | None:
+    if value is None:
+        return None
+    speed = float(value)
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise PipetteValidationError("speed must be a finite value greater than 0")
+    return speed
 
 
 def _normalize_metadata(value: Any) -> dict[str, Any]:
@@ -309,6 +332,8 @@ class PipetteAspirateCommand:
     tip_id: str | None = None
     air_gap_ul: float | None = None
     operator: str | None = None
+    channels: tuple[int, ...] | list[int] | None = None
+    speed: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -327,6 +352,10 @@ class PipetteAspirateCommand:
         object.__setattr__(self, "tip_id", context.tip_id)
         object.__setattr__(self, "air_gap_ul", context.air_gap_ul)
         object.__setattr__(self, "operator", context.operator)
+        object.__setattr__(self, "channels", _normalize_optional_channels(self.channels))
+        object.__setattr__(self, "speed", _normalize_optional_speed(self.speed))
+        if (self.channels is None) != (self.speed is None):
+            raise PipetteValidationError("explicit-channel Aspirate requires both channels and speed")
         object.__setattr__(self, "metadata", context.metadata)
 
     @classmethod
@@ -339,6 +368,8 @@ class PipetteAspirateCommand:
             tip_id=_mapping_get(req, "tip_id"),
             air_gap_ul=_mapping_get(req, "air_gap_ul"),
             operator=_mapping_get(req, "operator"),
+            channels=_mapping_get(req, "channels"),
+            speed=_mapping_get(req, "speed"),
             metadata=_mapping_get(req, "metadata", {}),
         )
 
@@ -351,6 +382,8 @@ class PipetteAspirateCommand:
             "tip_id": self.tip_id,
             "air_gap_ul": self.air_gap_ul,
             "operator": self.operator,
+            "channels": None if self.channels is None else list(self.channels),
+            "speed": self.speed,
             "metadata": dict(self.metadata),
         }
 
@@ -365,6 +398,9 @@ class PipetteDispenseCommand:
     tip_id: str | None = None
     air_gap_ul: float | None = None
     operator: str | None = None
+    dispense_type: int = 0
+    channels: tuple[int, ...] | list[int] | None = None
+    speed: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -384,6 +420,14 @@ class PipetteDispenseCommand:
         object.__setattr__(self, "tip_id", context.tip_id)
         object.__setattr__(self, "air_gap_ul", context.air_gap_ul)
         object.__setattr__(self, "operator", context.operator)
+        dispense_type = int(self.dispense_type)
+        if dispense_type != 0:
+            raise PipetteValidationError("liquid Dispense host-accounting type is fixed to OEM type 0")
+        object.__setattr__(self, "dispense_type", 0)
+        object.__setattr__(self, "channels", _normalize_optional_channels(self.channels))
+        object.__setattr__(self, "speed", _normalize_optional_speed(self.speed))
+        if (self.channels is None) != (self.speed is None):
+            raise PipetteValidationError("explicit-channel Dispense requires both channels and speed")
         object.__setattr__(self, "metadata", context.metadata)
 
     @classmethod
@@ -400,6 +444,9 @@ class PipetteDispenseCommand:
             tip_id=_mapping_get(req, "tip_id"),
             air_gap_ul=_mapping_get(req, "air_gap_ul"),
             operator=_mapping_get(req, "operator"),
+            dispense_type=_mapping_get(req, "dispense_type", 0),
+            channels=_mapping_get(req, "channels"),
+            speed=_mapping_get(req, "speed"),
             metadata=_mapping_get(req, "metadata", {}),
         )
 
@@ -413,6 +460,9 @@ class PipetteDispenseCommand:
             "tip_id": self.tip_id,
             "air_gap_ul": self.air_gap_ul,
             "operator": self.operator,
+            "dispense_type": int(self.dispense_type),
+            "channels": None if self.channels is None else list(self.channels),
+            "speed": self.speed,
             "metadata": dict(self.metadata),
         }
 

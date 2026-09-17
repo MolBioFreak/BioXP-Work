@@ -4,9 +4,11 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Callable
+
+
 
 
 PIPETTE_FUNCTIONS = (0, 1, 3, 4, 6)
@@ -27,6 +29,9 @@ class NovoFrame:
     raw: bytes
     received_at: float
     classification: str
+    receive_sequence: int | None = None
+    receive_owner: str | None = None
+    owner_generation: int | None = None
 
     def message(self) -> Any:
         return SimpleNamespace(
@@ -47,6 +52,9 @@ class NovoFrame:
             "data": list(self.data),
             "raw": list(self.raw),
             "received_at": self.received_at,
+            "receive_sequence": self.receive_sequence,
+            "receive_owner": self.receive_owner,
+            "owner_generation": self.owner_generation,
         }
 
 
@@ -108,12 +116,15 @@ class NovoRouter:
         read_timeout_ms: int = 100,
         queue_size: int = 256,
         clock: Callable[[], float] = time.monotonic,
+        audit_buffer: Any = None,
     ) -> None:
         if ep_in is None or ep_out is None:
             raise NovoRouterError("Novo router requires connected IN and OUT endpoints")
         self.ep_in = ep_in
         self.ep_out = ep_out
         self._decode = decode
+        self._audit_buffer = audit_buffer
+        self._audit_hook_failures = 0
         self.read_size = int(read_size)
         self.read_timeout_ms = int(read_timeout_ms)
         self._clock = clock
@@ -122,6 +133,7 @@ class NovoRouter:
         self._pending: _PendingTransaction | None = None
         self._completion_lock = threading.Lock()
         self._pipette_completions: dict[int, _PipetteCompletion] = {}
+        self._interrupted_pipette_completions: dict[tuple[int, str], _PipetteCompletion] = {}
         self._pipette_completion_taints: dict[int, dict[str, Any]] = {}
         self._stop = threading.Event()
         self._reader: threading.Thread | None = None
@@ -136,6 +148,124 @@ class NovoRouter:
         self._pressure_epoch = 0
         self._pressure_epoch_started_at: float | None = None
         self._reader_generation = 0
+        self._receive_sequence = 0
+        self._receive_owner = uuid.uuid4().hex
+        self._motor_event_lock = threading.RLock()
+        self._motor_signals: dict[tuple[int, int], NovoFrame] = {}
+        self._motor_resets: dict[tuple[int, int], tuple[int, int]] = {}
+        self._motor_consumed: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def receive_cursor(self) -> dict[str, Any]:
+        with self._motor_event_lock:
+            return {"after_sequence": self._receive_sequence,
+                    "receive_owner": self._receive_owner,
+                    "owner_generation": self._reader_generation}
+
+    def audit_status(self) -> dict[str, Any]:
+        return {"hook_failures": self._audit_hook_failures,
+                "buffer": self._audit_buffer.status() if self._audit_buffer is not None else None}
+
+    def _audit(self, kind: str, payload: dict[str, Any]) -> None:
+        # Separate from decoding and routing: logging cannot classify a valid
+        # frame as malformed or interfere with a Stop response/pending waiter.
+        if kind != "reader_error":
+            return
+        if self._audit_buffer is not None:
+            try:
+                self._audit_buffer.offer(kind, {"receive_owner": self._receive_owner,
+                    "owner_generation": self._reader_generation, **payload})
+            except Exception:
+                self._audit_hook_failures += 1
+
+    @staticmethod
+    def _motor_key(frame: NovoFrame) -> tuple[int, int] | None:
+        if (frame.arbitration_id in (0, 99) and frame.dlc == 8
+                and 4 <= frame.data[0] <= 10
+                and frame.data[1] == 128 and frame.data[6] <= 2):
+            return (frame.data[0], frame.data[6])
+        return None
+
+    def set_motor_abort_event(self, board: int, motor: int) -> None:
+        """Board forceAbortMotion's AutoResetEvent.Set; not a received frame."""
+        key = (int(board), int(motor))
+        with self._motor_event_lock:
+            signals = getattr(self, "_motor_abort_signals", None)
+            if signals is None:
+                signals = self._motor_abort_signals = set()
+
+            signals.add(key)
+
+    def reset_motor_event(self, board: int, motor: int, *, reset: bool = True, initial_signals=None) -> None:
+        """ClassMotor.queryMotorStop: Reset only after a nonnull return."""
+        key = (int(board), int(motor))
+        with self._motor_event_lock:
+            if reset:
+                getattr(self, "_motor_abort_signals", set()).discard(key)
+                if initial_signals is not None:
+                    initial_signals.discard(key)
+                self._motor_signals.pop(key, None)
+                self._motor_resets[key] = (self._reader_generation, self._receive_sequence)
+            elif self._motor_resets.get(key, (None,))[0] != self._reader_generation:
+                # A null query does not reset, including in a shared XY window.
+                self._motor_resets[key] = (self._reader_generation, -1)
+
+    def take_motor_events(self, targets, event_window=None, *, initial_signals=None) -> list[NovoFrame | tuple[int, int] | dict[str, Any]]:
+        """Atomic AutoResetEvent consumption: WaitAll consumes none on timeout.
+
+        This is a host latch, NOT correlation to a device command. An unlabelled
+        late wire event can Set the current latch, exactly as in the OEM source.
+        """
+        keys = {(int(board), int(motor)) for board, motor in targets}
+        window = event_window if isinstance(event_window, dict) else {}
+        with self._motor_event_lock:
+            if (window.get("receive_owner", self._receive_owner) != self._receive_owner
+                    or window.get("owner_generation", self._reader_generation) != self._reader_generation):
+                return []
+            frames = []
+            for key in sorted(keys):
+                if key in getattr(self, "_motor_abort_signals", set()):
+                    frames.append({"board": key[0], "motor": key[1],
+                        "source": "board.forceAbortMotion", "latch_disposition": "consumed",
+                        "physical_effect_verified": False})
+                    continue
+                frame = self._motor_signals.get(key)
+                if frame is None or frame.owner_generation != self._reader_generation:
+                    if initial_signals is not None and key in initial_signals:
+                        frames.append(key)  # Source-initialized latch, NOT a wire frame.
+                        continue
+                    return []
+                reset = self._motor_resets.get(key)
+                after = (reset[1] if reset and reset[0] == self._reader_generation
+                         else window.get("after_sequence"))
+                if after is not None and frame.receive_sequence <= after:
+                    if initial_signals is not None and key in initial_signals:
+                        # Filtering receive proof does not Reset the independent
+                        # construction signal. Consume/coalesce both below.
+                        frames.append(key)
+                        continue
+                    return []
+                frames.append(frame)
+            for key in keys:
+                getattr(self, "_motor_abort_signals", set()).discard(key)
+                if initial_signals is not None:
+                    initial_signals.discard(key)
+                self._motor_signals.pop(key, None)
+                self._motor_consumed[key] = (self._reader_generation, self._receive_sequence)
+            return frames
+
+    def motor_event_disposition(self, frame: NovoFrame) -> str:
+        with self._motor_event_lock:
+            if frame.receive_owner != self._receive_owner or frame.owner_generation != self._reader_generation:
+                return "previous_receive_owner"
+            key = self._motor_key(frame)
+            if key is None:
+                return "not_target_event"
+            for marks, reason in ((self._motor_resets, "reset"), (self._motor_consumed, "consumed")):
+                mark = marks.get(key)
+                if mark and mark[0] == frame.owner_generation and frame.receive_sequence <= mark[1]:
+                    return reason
+            signal = self._motor_signals.get(key)
+            return "set" if signal is frame else "coalesced_set"
 
     @property
     def running(self) -> bool:
@@ -177,8 +307,12 @@ class NovoRouter:
             pending.outcome = "shutdown"
             pending.event.set()
         with self._completion_lock:
-            completions = list(self._pipette_completions.values())
+            completions = [
+                *self._pipette_completions.values(),
+                *self._interrupted_pipette_completions.values(),
+            ]
             self._pipette_completions.clear()
+            self._interrupted_pipette_completions.clear()
             self._pipette_completion_taints.clear()
         for completion in completions:
             completion.event.set()
@@ -201,7 +335,7 @@ class NovoRouter:
             classification = "pipette_multipart" if function in (3, 4) else "pipette"
         elif arbitration_id in UNPROVEN_ASYNC_IDS:
             classification = "unknown_async"
-        elif arbitration_id == 0 and dlc == 8:
+        elif arbitration_id in (0, 99) and dlc == 8:
             classification = "valid_async" if data[1] in (128, 129, 130, 132) else "tmcl"
         elif 0x500 <= arbitration_id <= 0x5FF:
             classification = "unknown"
@@ -221,6 +355,7 @@ class NovoRouter:
                 if exc.__class__.__name__ == "USBTimeoutError" or isinstance(exc, TimeoutError):
                     continue
                 self._diagnostics.append({"classification": "reader_error", "error": repr(exc), "at": self._clock()})
+                self._audit("reader_error", {"error": repr(exc)[:512], "at": self._clock()})
                 continue
             received_at = self._clock()
             try:
@@ -241,61 +376,20 @@ class NovoRouter:
                 pending.skipped.append(dict(row))
 
     def _dispatch(self, frame: NovoFrame) -> None:
-        completion_matched = False
-        if frame.arbitration_id in PIPETTE_RX_IDS:
-            channel = (frame.arbitration_id & 0x78) >> 3
-            function = frame.arbitration_id & 0x7
-            with self._completion_lock:
-                completion = self._pipette_completions.get(channel)
-                if (
-                    completion is not None
-                    and completion.owner_generation == self._reader_generation
-                    and completion.command_family == function
-                    and (
-                        completion.expected_rx_id is None
-                        or frame.arbitration_id == completion.expected_rx_id
-                    )
-                    and completion.transaction_id is not None
-                    and completion.tx_started_at is not None
-                    and frame.received_at >= completion.tx_started_at
-                    and self._clock() <= completion.deadline_at
-                ):
-                    if frame.dlc == 0:
-                        if completion.ack_frame is None:
-                            completion.ack_frame = frame
-                    elif frame.dlc == 2 and len(frame.data) == 2:
-                        if completion.ack_frame is None:
-                            completion.rejected_reason = "completion_before_ack"
-                            completion.frame = frame
-                            completion.event.set()
-                            self._pipette_completion_taints[channel] = {
-                                "channel": channel,
-                                "reason": "completion_before_ack",
-                                "owner_generation": completion.owner_generation,
-                                "owner_token": completion.owner_token,
-                                "transaction_id": completion.transaction_id,
-                                "command_family": completion.command_family,
-                                "command_name": completion.command_name,
-                                "tainted_at": self._clock(),
-                            }
-                            self._diagnostics.append({
-                                **frame.provenance(),
-                                "classification": "pipette_completion_before_ack",
-                                "owner_token": completion.owner_token,
-                            })
-                            completion_matched = True
-                        elif completion.frame is None:
-                            completion.frame = frame
-                            completion.event.set()
-                            completion_matched = True
-                        else:
-                            completion.duplicate_terminal_count += 1
-                            self._diagnostics.append({
-                                **frame.provenance(),
-                                "classification": "pipette_duplicate_terminal",
-                                "owner_token": completion.owner_token,
-                            })
-                            completion_matched = True
+        # Host receive identity, never a device command/transaction identifier.
+        with self._motor_event_lock:
+            if frame.receive_sequence is None:
+                self._receive_sequence += 1
+                frame = replace(frame, receive_sequence=self._receive_sequence,
+                                receive_owner=self._receive_owner,
+                                owner_generation=self._reader_generation)
+            else:
+                # Retained records cannot re-enter as fresh receives. New reads
+                # of identical wire bytes get distinct ingress identities.
+                self._diagnostics.append({**frame.provenance(), "classification":
+                    "duplicate_receive_record" if frame.receive_owner == self._receive_owner
+                    and frame.owner_generation == self._reader_generation else "previous_receive_owner"})
+                return
         matched = False
         with self._pending_lock:
             pending = self._pending
@@ -312,12 +406,74 @@ class NovoRouter:
                     if decision.terminal:
                         pending.outcome = decision.outcome or "completion"
                         pending.received_at = frame.received_at
+                        if self._pending is pending:
+                            self._pending = None
                         pending.event.set()
                 else:
                     pending.skipped_total += 1
                     pending.skipped.append(frame.provenance())
         if matched:
+            if frame.arbitration_id in PIPETTE_RX_IDS and frame.dlc == 0:
+                channel = (frame.arbitration_id & 0x78) >> 3
+                function = frame.arbitration_id & 0x7
+                with self._completion_lock:
+                    completion = self._pipette_completions.get(channel)
+                    if (
+                        completion is not None
+                        and completion.owner_generation == self._reader_generation
+                        and completion.command_family == function
+                        and (
+                            completion.expected_rx_id is None
+                            or frame.arbitration_id == completion.expected_rx_id
+                        )
+                    ):
+                        completion.ack_frame = frame
             return
+
+        # NovoCANUSB.ProcessReceivedTrafficPacket matches pending replies FIRST.
+        # Only unmatched module0/99 traffic passes filterMassage (board4..10)
+        # to ClassNovo / the board target latch. A pending query138 can consume
+        # status128; it must not also Set the asynchronous motor event.
+        with self._motor_event_lock:
+            key = self._motor_key(frame)
+            if key is not None:
+                if key in self._motor_signals and self._motor_signals[key].owner_generation == self._reader_generation:
+                    self._diagnostics.append({**frame.provenance(), "classification": "motor_coalesced_set"})
+                else:
+                    pass  # Routine transport logging retired.
+                self._motor_signals[key] = frame
+
+        completion_matched = False
+        if frame.arbitration_id in PIPETTE_RX_IDS:
+            channel = (frame.arbitration_id & 0x78) >> 3
+            function = frame.arbitration_id & 0x7
+            with self._completion_lock:
+                completion = self._pipette_completions.get(channel)
+                if (
+                    completion is not None
+                    and completion.owner_generation == self._reader_generation
+                    and completion.command_family == function
+                    and (
+                        completion.expected_rx_id is None
+                        or frame.arbitration_id == completion.expected_rx_id
+                    )
+                    and completion.transaction_id is not None
+                    and completion.tx_started_at is not None
+                ):
+                    if frame.dlc == 0:
+                        completion.ack_frame = frame
+                        completion_matched = True
+                    elif frame.dlc == 2 and len(frame.data) == 2:
+                        if completion.frame is None:
+                            completion.frame = frame
+                        else:
+                            completion.duplicate_terminal_count += 1
+                            self._diagnostics.append({
+                                **frame.provenance(),
+                                "classification": "pipette_duplicate_terminal",
+                            })
+                        completion.event.set()
+                        completion_matched = True
         if completion_matched:
             return
         queue_name = frame.classification
@@ -325,7 +481,10 @@ class NovoRouter:
             queue_name = "stale"
         if queue_name not in self._queues:
             queue_name = "unknown"
-        self._queues[queue_name].append(frame)
+        queue = self._queues[queue_name]
+        if len(queue) == queue.maxlen:
+            pass  # Routine transport logging retired.
+        queue.append(frame)
 
     def _bind_completion_owner_from_provenance(
         self,
@@ -347,6 +506,23 @@ class NovoRouter:
             tx_started_at=float(tx_started_at),
         )
 
+    def _clear_oem_pipette_receive_queue(self, provenance: dict[str, Any]) -> int:
+        """Mirror the OEM receive-queue clear before a pipette send."""
+        if type(provenance.get("channel")) is not int or type(provenance.get("command_family")) is not int:
+            return 0
+        cleared = 0
+        for name in ("pipette", "pipette_multipart", "stale"):
+            queue = self._queues[name]
+            retained = deque(maxlen=queue.maxlen)
+            while queue:
+                item = queue.popleft()
+                if isinstance(item, NovoFrame) and item.arbitration_id in PIPETTE_RX_IDS:
+                    cleared += 1
+                else:
+                    retained.append(item)
+            queue.extend(retained)
+        return cleared
+
     def transact_many(
         self,
         raw_txs: list[bytes] | tuple[bytes, ...],
@@ -363,6 +539,7 @@ class NovoRouter:
         if not self.running:
             raise NovoRouterError("Novo router is not running")
         with self.transaction_lock:
+            cleared_pipette_replies = self._clear_oem_pipette_receive_queue(provenance)
             transaction_id = uuid.uuid4().hex
             registered_at = self._clock()
             pending = None
@@ -375,8 +552,6 @@ class NovoRouter:
                     self._reader_generation,
                 )
                 with self._pending_lock:
-                    if self._pending is not None:
-                        raise NovoRouterError("a Novo transaction matcher is already registered")
                     self._pending = pending
             tx_at = self._clock()
             self._bind_completion_owner_from_provenance(
@@ -411,6 +586,7 @@ class NovoRouter:
                 "tx_write_completed_at": write_timestamps[-1] if write_timestamps else tx_at,
                 **provenance,
                 "tx_write_policy": "one_frame_per_oem_sendcommand",
+                "oem_receive_queue_cleared": cleared_pipette_replies,
             }
             if pending is None:
                 return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
@@ -452,14 +628,15 @@ class NovoRouter:
                 "multipart_received": bool(multipart_frames),
                 "multipart": multipart_projection,
                 "wait_policy": {
-                    "mode": "single_shared_deadline",
-                    "classification": "SAFETY-HARDENING",
-                    "apartment_equivalence": "unresolved",
+                    "mode": "oem_synchronous_send_wait",
+                    "classification": "OEM-DIRECT",
+                    "source_anchor": "ClassNovo.TransmitMessage; ClassNovoCANUSB.sendCommand",
                 },
                 "skipped_count": pending.skipped_total,
                 "skipped_frames": list(pending.skipped),
                 "skipped_frames_truncated": pending.skipped_total > len(pending.skipped),
             }
+
 
     def transact(
         self,
@@ -470,10 +647,12 @@ class NovoRouter:
         timeout_s: float,
         write_timeout_ms: int,
         provenance: dict[str, Any],
+        ordinary_motor_retry: bool = False,
     ) -> dict[str, Any]:
         if not self.running:
             raise NovoRouterError("Novo router is not running")
         with self.transaction_lock:
+            cleared_pipette_replies = self._clear_oem_pipette_receive_queue(provenance)
             transaction_id = uuid.uuid4().hex
             registered_at = self._clock()
             pending = None
@@ -486,8 +665,6 @@ class NovoRouter:
                     self._reader_generation,
                 )
                 with self._pending_lock:
-                    if self._pending is not None:
-                        raise NovoRouterError("a Novo transaction matcher is already registered")
                     self._pending = pending
             tx_at = self._clock()
             self._bind_completion_owner_from_provenance(
@@ -495,39 +672,96 @@ class NovoRouter:
                 transaction_id=transaction_id,
                 tx_started_at=tx_at,
             )
-            try:
-                self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
-                tx_write_completed_at = self._clock()
-            except Exception:
-                with self._pending_lock:
-                    if self._pending is pending:
-                        self._pending = None
-                raise
             base = {
                 "transaction_id": transaction_id,
-                "owner_generation": self._reader_generation,
+                "owner_generation": pending.owner_generation if pending is not None else self._reader_generation,
                 "matcher": matcher_name,
                 "registration_timestamp": registered_at,
                 "tx_timestamp": tx_at,
-                "tx_write_completed_at": tx_write_completed_at,
+                "tx_write_completed_at": None,
                 "timeout_ms": int(round(float(timeout_s) * 1000.0)),
                 "tx_raw": list(raw_tx),
                 **provenance,
+                "oem_receive_queue_cleared": cleared_pipette_replies,
             }
-            if pending is None:
-                return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
-            completed = pending.event.wait(max(0.0, float(timeout_s)))
+            # Only mapped source motor callers select ClassNovoCANUSB's first
+            # WaitOne(false) resend. One UUID/pending owner spans both writes.
+            selected = bool(ordinary_motor_retry and pending is not None
+                            and provenance.get("command_family") == "tmcl")
+            attempts = []
+            completed = False
+            outcome = None
+            observed = None
+            for ordinal in range(1, 3 if selected else 2):
+                attempt = {**base, "attempt_ordinal": ordinal,
+                           "tx_timestamp": tx_at if ordinal == 1 else self._clock(),
+                           "tx_write_completed_at": None,
+                           "response_attempt_attribution": "same_call_ambiguous" if ordinal == 2 else "single_write"}
+                try:
+                    if ordinal == 2:
+                        assert pending is not None  # selected waited calls only
+                        # _dispatch may already have collected a legitimate late
+                        # reply and removed this pending owner. Keep its event and
+                        # frames: the wire cannot identify which write it answers.
+                        # Never install a new pending owner/generation for a retry.
+                        with self._pending_lock:
+                            valid_owner = (
+                                self.running and not self._stop.is_set()
+                                and self._reader_generation == pending.owner_generation
+                                and (self._pending is pending or (
+                                    self._pending is None and bool(pending.frames)
+                                    and pending.event.is_set()))
+                            )
+                            if not valid_owner:
+                                outcome = "transport_rebound" if self._reader_generation != pending.owner_generation else "shutdown"
+                                break
+                            self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    else:
+                        self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    attempt["tx_write_completed_at"] = self._clock()
+                except Exception as exc:
+                    with self._pending_lock:
+                        if self._pending is pending:
+                            self._pending = None
+                    raise
+                if ordinal == 1:
+                    base["tx_write_completed_at"] = attempt["tx_write_completed_at"]
+                if pending is None:
+                    return {**base, "ok": True, "outcome": "tx_only", "receive_timestamp": None, "frames": [], "skipped_frames": []}
+                completed = pending.event.wait(max(0.0, float(timeout_s)))
+                with self._pending_lock:
+                    malformed_seen = any(row.get("classification") == "malformed" for row in pending.skipped)
+                    generation_changed = self._reader_generation != pending.owner_generation
+                    outcome = (
+                        "transport_rebound" if generation_changed else
+                        "shutdown" if selected and self._stop.is_set() else
+                        (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
+                    )
+                    observed = pending.frames[-1] if pending.frames else None
+                    # Preserve terminal/nonselected cleanup before observation;
+                    # only a selected first false wait keeps the owner open.
+                    if (not selected or ordinal == 2 or completed
+                            or outcome in {"shutdown", "transport_rebound"}):
+                        if self._pending is pending:
+                            self._pending = None
+                # Snapshot before the observer callback/next write. A later
+                # success must never overwrite the explicit first false wait.
+                attempts.append({
+                    "attempt_ordinal": ordinal, "tx_timestamp": attempt["tx_timestamp"],
+                    "tx_write_completed_at": attempt["tx_write_completed_at"],
+                    "wait_signaled": completed, "outcome": outcome,
+                    "response_present": observed is not None,
+                    "receive_sequence": observed.receive_sequence if observed is not None else None,
+                    "response_attempt_attribution": attempt["response_attempt_attribution"],
+                })
+                if completed or outcome in {"shutdown", "transport_rebound"}:
+                    break
             with self._pending_lock:
                 if self._pending is pending:
                     self._pending = None
-            malformed_seen = any(row.get("classification") == "malformed" for row in pending.skipped)
-            generation_changed = self._reader_generation != pending.owner_generation
-            outcome = (
-                "transport_rebound"
-                if generation_changed
-                else (pending.outcome if completed else ("malformed" if malformed_seen else "timeout"))
-            )
-            observed = pending.frames[-1] if pending.frames else None
+            if selected:
+                base["attempts"] = attempts
+            assert pending is not None  # tx-only returned inside the loop
             multipart_frames = [frame for frame in pending.frames if frame.classification == "pipette_multipart"]
             multipart_projection = {
                 "present": bool(multipart_frames),
@@ -554,9 +788,9 @@ class NovoRouter:
                 "multipart_received": bool(multipart_frames),
                 "multipart": multipart_projection,
                 "wait_policy": {
-                    "mode": "single_shared_deadline",
-                    "classification": "SAFETY-HARDENING",
-                    "apartment_equivalence": "unresolved",
+                    "mode": "oem_synchronous_send_wait",
+                    "classification": "OEM-DIRECT",
+                    "source_anchor": "ClassNovo.TransmitMessage; ClassNovoCANUSB.sendCommand",
                 },
                 "skipped_count": pending.skipped_total,
                 "skipped_frames": list(pending.skipped),
@@ -576,7 +810,7 @@ class NovoRouter:
         queue.clear()
         return cleared
 
-    def calculate_pressure_offsets(self) -> dict[int, float]:
+    def calculate_pressure_offset_evidence(self) -> dict[int, dict[str, Any]]:
         samples: dict[int, list[float]] = {channel: [] for channel in range(4)}
         for frame in self._queues["pressure"]:
             if self._pressure_epoch_started_at is not None and frame.received_at < self._pressure_epoch_started_at:
@@ -589,11 +823,25 @@ class NovoRouter:
             if len(data) != count * 2 + 1:
                 continue
             values = [int.from_bytes(data[1 + index * 2:3 + index * 2], "big", signed=True) for index in range(count)]
-            if values:
-                samples[channel].append(sum(values) / len(values))
+            samples[channel].extend(float(value) for value in values)
         return {
-            channel: (sum(values) / len(values) if values else 0.0)
+            channel: {
+                "offset": (sum(values) / len(values) if values else None),
+                "sample_count": len(values),
+                "samples": list(values),
+                "valid": bool(values),
+                "units": "controller_pressure_counts",
+                "pressure_epoch": self._pressure_epoch,
+                "pressure_epoch_started_at": self._pressure_epoch_started_at,
+            }
             for channel, values in samples.items()
+        }
+
+    def calculate_pressure_offsets(self) -> dict[int, float]:
+        return {
+            channel: float(row["offset"])
+            for channel, row in self.calculate_pressure_offset_evidence().items()
+            if row.get("valid") is True and row.get("offset") is not None
         }
 
     def begin_pressure_epoch(self) -> dict[str, Any]:
@@ -614,6 +862,8 @@ class NovoRouter:
         command_family: int | None = None,
         command_name: str | None = None,
         expected_rx_id: int | None = None,
+        replace_owner_token: str | None = None,
+        replacement_reason: str | None = None,
     ) -> str:
         channel = int(channel)
         if channel not in range(4):
@@ -637,11 +887,28 @@ class NovoRouter:
                     f"pipette {channel} completion lifecycle is tainted; router rebind is required"
                 )
             existing = self._pipette_completions.get(channel)
-            if existing is not None and not existing.event.is_set():
-                raise NovoRouterError(f"pipette {channel} completion is already registered")
+            if existing is not None:
+                replacement_authorized = bool(
+                    isinstance(replace_owner_token, str)
+                    and replace_owner_token
+                    and existing.owner_token == replace_owner_token
+                    and command_family == 0
+                    and existing.command_family == 1
+                    and replacement_reason == "interrupted_by_terminate"
+                    and not existing.event.is_set()
+                )
+                if replacement_authorized:
+                    existing.rejected_reason = "interrupted_by_terminate"
+                    existing.event.set()
+                    self._interrupted_pipette_completions[
+                        (channel, existing.owner_token)
+                    ] = existing
+                    self._pipette_completions.pop(channel, None)
+                else:
+                    raise NovoRouterError(f"pipette {channel} completion is already registered")
             registered_at = self._clock()
-            owner_token = uuid.uuid4().hex
             legacy_owner = command_family is None and command_name is None
+            owner_token = uuid.uuid4().hex
             self._pipette_completions[channel] = _PipetteCompletion(
                 registered_at=registered_at,
                 deadline_at=registered_at + max(0.0, float(timeout_s)),
@@ -653,13 +920,14 @@ class NovoRouter:
                 transaction_id="legacy-unbound-owner" if legacy_owner else None,
                 tx_started_at=registered_at if legacy_owner else None,
             )
-        return owner_token
+            return owner_token
+
 
     def bind_pipette_completion(
         self,
         channel: int,
         *,
-        owner_token: str,
+        owner_token: str | None = None,
         transaction_id: str,
         tx_started_at: float,
     ) -> None:
@@ -668,8 +936,8 @@ class NovoRouter:
             completion = self._pipette_completions.get(channel)
             if completion is None:
                 raise NovoRouterError(f"pipette {channel} completion is not registered")
-            if completion.owner_token != str(owner_token):
-                raise NovoRouterError(f"pipette {channel} completion owner token does not match")
+            if owner_token is not None and completion.owner_token != str(owner_token):
+                raise NovoRouterError(f"pipette {channel} completion owner mismatch")
             if completion.transaction_id is not None:
                 raise NovoRouterError(f"pipette {channel} completion is already bound")
             completion.transaction_id = str(transaction_id)
@@ -683,28 +951,43 @@ class NovoRouter:
         owner_token: str | None = None,
     ) -> dict[str, Any]:
         channel = int(channel)
+        requested_owner = str(owner_token) if owner_token is not None else None
+        owner_mismatch = False
         with self._completion_lock:
             completion = self._pipette_completions.get(channel)
+            archived = False
+            if (
+                requested_owner
+                and (completion is None or completion.owner_token != requested_owner)
+            ):
+                interrupted_completion = self._interrupted_pipette_completions.get(
+                    (channel, requested_owner)
+                )
+                if interrupted_completion is not None:
+                    completion = interrupted_completion
+                    archived = True
+                else:
+                    owner_mismatch = completion is not None
+        if owner_mismatch:
+            return {
+                "ok": False,
+                "channel": channel,
+                "outcome": "completion_owner_token_mismatch",
+                "requested_owner_token": requested_owner,
+                "owner_token": completion.owner_token if completion is not None else None,
+            }
         if completion is None:
             return {"ok": False, "channel": channel, "outcome": "completion_not_registered"}
-        if owner_token is None or not str(owner_token):
-            return {
-                "ok": False,
-                "channel": channel,
-                "outcome": "completion_token_required",
-                "owner_token": None,
-            }
-        if completion.owner_token != str(owner_token):
-            return {
-                "ok": False,
-                "channel": channel,
-                "outcome": "completion_owner_mismatch",
-                "owner_token": str(owner_token),
-            }
+
         remaining_contract = max(0.0, completion.deadline_at - self._clock())
         signaled = completion.event.wait(min(max(0.0, float(timeout_s)), remaining_contract))
         with self._completion_lock:
-            if self._pipette_completions.get(channel) is completion:
+            if archived:
+                self._interrupted_pipette_completions.pop(
+                    (channel, completion.owner_token),
+                    None,
+                )
+            elif self._pipette_completions.get(channel) is completion:
                 self._pipette_completions.pop(channel, None)
         frame = completion.frame
         generation_changed = completion.owner_generation != self._reader_generation
@@ -777,11 +1060,11 @@ class NovoRouter:
         require_command_echo: bool = True,
     ) -> Callable[[NovoFrame], MatchResult]:
         def match(frame: NovoFrame) -> MatchResult:
-            if frame.classification != "tmcl" or len(frame.data) != 8:
+            if frame.arbitration_id not in (0, 99) or frame.dlc != 8 or len(frame.data) != 8:
                 return MatchResult(False, classification=frame.classification)
             if strict and frame.data[0] != int(board_id):
                 return MatchResult(False, classification="tmcl_wrong_board_or_command")
-            if strict and require_command_echo and frame.data[2] != int(command):
+            if strict and require_command_echo and int(command) != 64 and frame.data[2] != int(command):
                 return MatchResult(False, classification="tmcl_wrong_board_or_command")
             return MatchResult(True, terminal=True, classification="tmcl", outcome="completion")
         return match
@@ -824,11 +1107,15 @@ class NovoRouter:
                 return MatchResult(True, terminal=False, classification="pipette_multipart", outcome="multipart")
             if function != expected_function:
                 return MatchResult(False, classification="pipette_wrong_function")
-            if initialization and frame.dlc == 0:
-                return MatchResult(True, terminal=True, classification="pipette_immediate_ack", outcome="ack")
+            if expected_function == 6 and frame.dlc <= 0:
+                return MatchResult(False, classification="pipette_empty_report")
             if initialization:
-                return MatchResult(False, classification="pipette_delayed_completion")
-            outcome = "completion" if not initialization else "delayed_completion"
-            return MatchResult(True, terminal=True, classification="pipette", outcome=outcome)
+                return MatchResult(
+                    True,
+                    terminal=True,
+                    classification="pipette_immediate_ack" if frame.dlc == 0 else "pipette",
+                    outcome="ack" if frame.dlc == 0 else "completion",
+                )
+            return MatchResult(True, terminal=True, classification="pipette", outcome="completion")
 
         return match

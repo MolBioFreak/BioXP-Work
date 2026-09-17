@@ -214,7 +214,7 @@ class NovoUsbCanBus:
                 **response,
                 "completion_received": False,
                 "completion_deferred": False,
-                "semantic_query_response_verified": query_verified,
+                "query_response_correlated": query_verified,
             }
         immediate_ack = bool(response.get("outcome") == "ack" and response.get("ack_received"))
         if not immediate_ack:
@@ -269,6 +269,8 @@ class NovoUsbCanBus:
         completion_timeout_s: float = 60.0,
         allow_multipart: bool = False,
         wait_for_completion: bool = True,
+        replace_completion_owner_token: str | None = None,
+        completion_replacement_reason: str | None = None,
     ) -> dict[str, Any]:
         router = self._current_router()
         tx_id = int(getattr(msg, "arbitration_id"))
@@ -294,6 +296,8 @@ class NovoUsbCanBus:
                 command_family=int(expected_function),
                 command_name=str(matcher_name),
                 expected_rx_id=expected_rx_id,
+                replace_owner_token=replace_completion_owner_token,
+                replacement_reason=completion_replacement_reason,
             )
         try:
             response = router.transact(
