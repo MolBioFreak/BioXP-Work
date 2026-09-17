@@ -156,3 +156,50 @@ def test_missing_canonical_disposition_remains_blocked(finite_home, monkeypatch,
     else:
         assert store.claim_next() is None
         assert store.get_workflow(request['command_id'])['status'] == 'queued'
+
+
+def test_reconciled_history_releases_real_queued_finite_child(finite_home):
+    from tests.test_protocol_workflow_connected import mount_protocol_routes, request_payload, await_job
+    app, provider, _, _, _, _, data = finite_home
+    store = app.state.operator_command_plane.store
+    ids = [data['parent_id'], data['command_id']]
+    before = raw_history(store, ids)
+    old_movement = dict(store.connection.execute(
+        'SELECT * FROM serial206_movement_commands WHERE command_id=?', (ids[1],)).fetchone())
+    mount_protocol_routes(app)
+    # Native Close on the fixture's already-closed door is a genuine finite
+    # source noop. It still must claim the same resources through the live
+    # handler, durable finite queue and dispatcher; host-only work cannot prove it.
+    payload = request_payload('independent-finite-after-recovery', actions=[
+        {'action_id': 'new-door', 'kind': 'thermal_door', 'params': {'door_command': 'DC'}}])
+    with TestClient(app) as client:
+        assert store.deck_recovery_blocker() == 'deck_recovery_hold'
+        assert store.claim_next() is None
+        response = client.post('/operator/recovery/deck/'+ids[1]+'/reconcile', json=home_body(provider))
+        assert response.status_code == 200, response.text
+        assert store.deck_recovery_blocker() is None
+        response = client.post('/protocol/execute', json=payload)
+        assert response.status_code == 202, response.text
+        job = response.json()
+        app.state.operator_command_plane.start()
+        done = await_job(client, job['job_id'], lambda value: value['command']['terminal'])
+        assert done is not None and done['command']['status'] == 'completed', done
+        children = store.connection.execute(
+            'SELECT c.command_id,c.status,c.action_id,m.state FROM operator_commands c '
+            'JOIN serial206_movement_commands m USING(command_id) WHERE c.parent_command_id=?',
+            (job['job_id'],)).fetchall()
+        assert len(children) == 1, [dict(row) for row in children]
+        child = children[0]
+        assert child['action_id'] == 'oem.deck._finite_operation'
+        assert child['status'] == child['state'] == 'completed'
+        states = [row[0] for row in store.connection.execute(
+            'SELECT state FROM operator_plane_transitions WHERE command_id=? ORDER BY transition_sequence',
+            (child['command_id'],))]
+        assert 'queued' in states and 'dispatched' in states and 'completed' in states, states
+        native = store.connection.execute(
+            'SELECT plan_json FROM operator_plane_wp8_operations WHERE command_id=?',
+            (child['command_id'],)).fetchone()
+        assert json.loads(native[0])['source_noop'] is True
+        assert raw_history(store, ids) == before
+        assert dict(store.connection.execute(
+            'SELECT * FROM serial206_movement_commands WHERE command_id=?', (ids[1],)).fetchone()) == old_movement

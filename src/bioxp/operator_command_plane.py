@@ -6724,6 +6724,9 @@ class OperatorCommandStore:
                     WHERE requested.command_id=?
                       AND active.command_id<>requested.command_id
                       AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous')
+                      AND NOT (active_movement.state='ambiguous' AND active.status IN ('ambiguous','interrupted')
+                        AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d
+                          WHERE d.command_id=active.command_id))
                     LIMIT 1
                     """,
                     (candidate["command_id"],),
