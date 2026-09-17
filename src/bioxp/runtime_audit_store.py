@@ -641,6 +641,7 @@ def request_digest(payload: Mapping[str, Any]) -> str:
             "lifecycle_attempt_id",
             "source_identity",
             "requested_inputs",
+            "expected_board_epoch_by_board",
         )
         if key in payload
     }
@@ -1809,6 +1810,8 @@ class RuntimeAuditDatabase:
                     "lifecycle_attempt_id": payload.get("lifecycle_attempt_id"),
                     "callback_session_id": payload.get("callback_session_id"),
                     "requested_inputs": requested_inputs,
+                    **({"expected_board_epoch_by_board": dict(payload["expected_board_epoch_by_board"])}
+                       if payload.get("expected_board_epoch_by_board") else {}),
                     "status": "reserved",
                 }
             )

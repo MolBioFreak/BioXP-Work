@@ -1503,6 +1503,8 @@ class OperatorReceiptStore:
             "idempotency_replay_enabled": row.get("idempotency_replay_enabled", True),
             "started_at": row.get("started_at"),
         }
+        if row.get("expected_board_epoch_by_board"):
+            payload["expected_board_epoch_by_board"] = dict(row["expected_board_epoch_by_board"])
         with self.lock:
             claimed, created = self._audit_database.claim(payload)
             stored = self.connection.execute(
