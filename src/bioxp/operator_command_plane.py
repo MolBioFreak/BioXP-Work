@@ -245,6 +245,9 @@ AXIS_BY_ACTION = {
     "oem.x.move_steps": "x",
     "oem.x.move_absolute": "x",
     "oem.y.stop": "y",
+    "oem.y.manual_panel_home": "y",
+    "oem.y.move_steps": "y",
+    "oem.y.move_absolute": "y",
     "oem.z.manual_home": "z",
     "oem.z.prepare": "z",
     "oem.z.diagnostic_home_axis": "z",
@@ -6011,7 +6014,11 @@ class OperatorCommandStore:
             axes = [str(item[0]) for item in conn.execute("SELECT action_id FROM operator_plane_commands WHERE method_id=?", (method_id,)).fetchall()]
             relevant_axis_epoch = max(
                 [int(safety["x_epoch"]) for action in axes if action.startswith("oem.x.")]
+                + [int(safety["y_epoch"]) for action in axes if action.startswith("oem.y.")]
                 + [int(safety["z_epoch"]) for action in axes if action.startswith("oem.z.")]
+                + [int(safety[f"{axis}_epoch"]) for action in axes
+                   if action in {"oem.xy.move_absolute", "oem.xy.home", "oem.z.scriptmove_to"}
+                   for axis in self._axes_for_action(action)]
                 + [0]
             )
             if int(safety["recovery_epoch"]) != int(request["expected_recovery_epoch"]) or int(safety["global_epoch"]) != int(request["expected_global_safety_epoch"]) or relevant_axis_epoch != int(request["expected_axis_safety_epoch"]):
@@ -7363,7 +7370,11 @@ class OperatorCommandStore:
 
     @staticmethod
     def _axes_for_action(action_id: str) -> set[str]:
-        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+        if action_id in {
+            "oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation",
+            "oem.z.scriptmove_to",
+        }:
+            # scriptmove_to is an XYZ source plan despite its historical Z name.
             return {"x", "y", "z"}
         if action_id in {"oem.xy.move_absolute", "oem.xy.home"}:
             return {"x", "y"}
