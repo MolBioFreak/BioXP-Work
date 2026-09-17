@@ -3218,8 +3218,16 @@ class OperatorCommandStore:
                 if existing["canonical_request_sha256"] != digest:
                     raise ValueError("idempotency key conflict")
                 return self.get_workflow(existing["command_id"])
-            if conn.execute("SELECT 1 FROM operator_commands WHERE command_kind='protocol_workflow' "
-                            "AND status IN ('queued','dispatched','interrupting','ambiguous') LIMIT 1").fetchone():
+            # Immutable ambiguous history is not current software custody.
+            # Only the canonical cancel_pending owner can attest abandonment;
+            # physical uncertainty remains fenced by recovery/resource owners.
+            if conn.execute("SELECT 1 FROM operator_plane_lane WHERE workflow_command_id IS NOT NULL").fetchone() or conn.execute(
+                    "SELECT 1 FROM operator_commands c WHERE c.command_kind='protocol_workflow' "
+                    "AND (c.status IN ('queued','dispatched','interrupting') OR (c.status='ambiguous' "
+                    "AND NOT EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
+                    "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
+                    "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
+                    "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id))) LIMIT 1").fetchone():
                 raise ValueError("workflow_busy")
             safety = dict(conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone())
             footprint = {"global_epoch": safety["global_epoch"],
@@ -6654,7 +6662,15 @@ class OperatorCommandStore:
                         return None
                     if conn.execute("SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                         "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
-                        "('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') LIMIT 1",
+                        "('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') "
+                        "AND NOT (c.command_kind='protocol_workflow' AND c.status='ambiguous' "
+                        "AND EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
+                        "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
+                        "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
+                        "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id)) "
+                        "AND NOT (m.state IS 'ambiguous' AND c.status IN ('ambiguous','interrupted') "
+                        "AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d "
+                        "WHERE d.command_id=c.command_id)) LIMIT 1",
                         (candidate["command_id"],)).fetchone():
                         return None
                     attempt = str(uuid.uuid4())
