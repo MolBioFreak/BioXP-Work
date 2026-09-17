@@ -11453,9 +11453,33 @@ class Serial206OemInitializationProvider:
             speed=None, acc=None, pseudo_z_home_steps=int(state["pseudo_z_home"]),
         )
         evidence = _aggregate_executed_controller_evidence(execution)
+        z_noop_verified = False
+        if operation == "moveZ" and execution.get("ok") is True:
+            # moveZ's OEM pseudo-home clamp precedes the board's exact-noop
+            # test. The wrapper request is not the board's effective target.
+            result = execution["execution_results"][0]["results"][0]["result"]
+            native = result.get("move") if isinstance(result, Mapping) else None
+            before = native.get("before") if isinstance(native, Mapping) else None
+            z_noop_verified = bool(
+                isinstance(result, Mapping)
+                and result.get("controller_terminal_state_verified") is True
+                and result.get("controller_command_required") is False
+                and isinstance(native, Mapping) and native.get("ok") is True
+                and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"
+                and native.get("command_sent") is False and native.get("ack") is None
+                and isinstance(before, Mapping) and before.get("ok") is True
+                and before.get("position_reply_valid") is True
+                and type(result.get("effective")) is int
+                and type(native.get("requested_position")) is int
+                and type(before.get("position")) is int
+                and before["position"] == native["requested_position"] == result["effective"]
+            )
+            if z_noop_verified:
+                evidence["hardware_postcondition_verified"] = True
         return {
             "ok": execution.get("ok") is True
-            and evidence["controller_command_acknowledged"]
+            and (evidence["controller_command_acknowledged"] or z_noop_verified)
             and evidence["controller_completion_verified"],
             **evidence, "delivery_attempted": True, "execution": _json_safe(execution),
         }
@@ -12159,13 +12183,12 @@ class Serial206OemInitializationProvider:
             if not callable(writer):
                 raise RuntimeError("source_authority_missing:RGB")
             rgb = tuple(max(0, min(255, arguments[key])) for key in ("r", "g", "b"))
-            if self._oem_source_rgb == rgb:
-                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            # OEM setColor writes all three channels on every occurrence.
             result = writer(*rgb)
             self._oem_source_rgb = rgb
             if not isinstance(result, Mapping):
                 raise RuntimeError("source_authority_invalid:RGB")
-            return dict(result)
+            return {**result, "delivery_attempted": True}
         raise RuntimeError(f"source_authority_missing:{operation}")
 
     def build_oem_native_handlers(
