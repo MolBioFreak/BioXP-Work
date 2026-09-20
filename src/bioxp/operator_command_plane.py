@@ -6275,14 +6275,15 @@ class OperatorCommandStore:
                 parent_id = command["parent_command_id"]
                 parent = conn.execute("SELECT a.status,a.command_kind,c.status AS plane_status FROM operator_commands a "
                     "JOIN operator_plane_commands c USING(command_id) WHERE a.command_id=?", (parent_id,)).fetchone()
-                if (command["action_id"] != "oem.deck._finite_operation" or command["target"] != "thermal_door"
+                critical_images = command["target"] == "critical_item_images"
+                if (command["action_id"] != "oem.deck._finite_operation" or command["target"] not in {"thermal_door", "critical_item_images"}
                     or command["status"] not in {"ambiguous", "interrupted"}
                     or command["audit_status"] != command["status"] or command["movement_state"] != command["status"]
                     or parent is None or parent["command_kind"] != "protocol_workflow"
                     or parent["status"] not in {"ambiguous", "interrupted"} or parent["plane_status"] != parent["status"]
                     or plan.get("schema_version") != "bioxp.oem_wp8_operation.v1"
-                    or plan.get("operation") != "thermal_door" or plan.get("source_owned") is not True
-                    or plan.get("script_running") is not False or plan.get("opening") is not True
+                    or plan.get("operation") != command["target"] or plan.get("source_owned") is not True
+                    or (not critical_images and (plan.get("script_running") is not False or plan.get("opening") is not True))
                     or plan.get("parent_return_allows_background_pending") is not False
                     or _json_load(command["effective_json"], {}).get("prepared_plan") != plan
                     or plan.get("plan_digest") != command["plan_digest"]
@@ -6291,6 +6292,20 @@ class OperatorCommandStore:
                     or stamps.get("ownership_generation") != command["ownership_generation"]
                     or {"4": stamps.get("board_epoch_4"), "5": stamps.get("board_epoch_5")} != _json_load(command["expected_board_epochs_json"], {})):
                     raise ValueError("finite first-Park immutable identity is not applicable")
+                if critical_images:
+                    # Historical input is authority, not today's camera settings.
+                    # In particular, an absent operation_inputs is not an empty one.
+                    requested = _json_load(command["requested_json"], {})
+                    effective = _json_load(command["effective_json"], {})
+                    claim = conn.execute("SELECT requested_inputs_json FROM operator_commands WHERE command_id=?",
+                        (str(command_id),)).fetchone()
+                    original_input = _json_load(claim[0], {}) if claim else {}
+                    if (requested != effective or requested.get("operation") != "critical_item_images"
+                        or requested.get("prepared_plan") != plan
+                        or not isinstance(requested.get("operation_inputs"), dict)
+                        or any(original_input.get(k) != requested.get(k) for k in ("operation", "operation_inputs", "prepared_plan"))
+                        or original_input.get("workflow_binding", {}).get("parent_command_id") != parent_id):
+                        raise ValueError("finite critical images original input identity mismatch")
                 prior_decision = conn.execute(
                     "SELECT decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE decision_id=?",
                     (str(reconciliation_decision["decision_id"]),)).fetchone()
@@ -6330,7 +6345,19 @@ class OperatorCommandStore:
                 children = conn.execute("SELECT * FROM operator_plane_wp8_children WHERE command_id=? ORDER BY child_order",
                     (str(command_id),)).fetchall()
                 planned = plan.get("children", [])
-                if (not children or len(children) != len(planned) or len(children) < 2
+                if not isinstance(planned, list) or not children or len(children) != len(planned):
+                    raise ValueError("finite child identity or source ordering mismatch")
+                failed_order = 0
+                if critical_images:
+                    ambiguous = [i for i, c in enumerate(children) if c["terminal_state"] == "ambiguous"]
+                    if len(ambiguous) != 1:
+                        raise ValueError("finite critical images requires one ambiguous child")
+                    failed_order = ambiguous[0]
+                    if (any(c["terminal_state"] != "completed" for c in children[:failed_order])
+                        or any(c["terminal_state"] != "planned" or c["terminal_evidence_json"] is not None
+                            for c in children[failed_order + 1:])):
+                        raise ValueError("finite critical images completed prefix or untouched tail mismatch")
+                elif (len(children) < 2
                     or planned[0].get("operation") != "parkGantry" or planned[0].get("arguments") != {"rehome": False}
                     or children[0]["terminal_state"] != "ambiguous"
                     or any(c["terminal_state"] != "planned" or c["terminal_evidence_json"] is not None for c in children[1:])):
@@ -6346,16 +6373,58 @@ class OperatorCommandStore:
                         or child["exception_policy"] != original.get("exception_policy")
                         or _json_load(child["state_mutation_json"], {}) != original.get("state_mutation")):
                         raise ValueError("finite child identity or source ordering mismatch")
+                    if critical_images:
+                        # These source children move/image only; no liquid, tips,
+                        # plates or background work may be reconciled by Home.
+                        mutations = {"sourceImageGantryLoad": {"pseudo_z_home"},
+                            "sourceMoveTo": set(), "sourceMoveZ": set(),
+                            "updateLocation": {"current_location", "current_well"}, "SnapshotImage": set()}
+                        if (original.get("operation") not in mutations
+                            or set(original.get("state_mutation", {})) != mutations[original["operation"]]
+                            or original.get("awaited") is not True or original.get("exception_policy") != "propagate"
+                            or original.get("source_condition") != {}):
+                            raise ValueError("finite critical images contains custody-changing or conditional work")
                 attempts = conn.execute("SELECT * FROM operator_plane_delivery_attempts WHERE command_id=? ORDER BY attempt_sequence",
                     (str(command_id),)).fetchall()
-                if (len(attempts) != 1 or attempts[0]["work_kind"] != "wp8_child"
-                    or attempts[0]["work_identity"] != "child:0:parkGantry"
-                    or attempts[0]["dispatch_attempt_id"] != command["dispatch_attempt_id"]
-                    or attempts[0]["plan_digest"] != command["plan_digest"]
-                    or any(attempts[0][k] != stamps.get(k) for k in ("ownership_generation", "board_epoch_4", "board_epoch_5"))
-                    or command["finished_at"] is None or not attempts[0]["created_at"] < command["finished_at"]
+                if (len(attempts) != failed_order + 1
+                    or command["finished_at"] is None
                     or conn.execute("SELECT 1 FROM operator_plane_wp8_background_tasks WHERE command_id=?", (str(command_id),)).fetchone()):
                     raise ValueError("finite first-Park issued delivery identity mismatch")
+                for i, attempt in enumerate(attempts):
+                    if (attempt["work_kind"] != "wp8_child"
+                        or attempt["work_identity"] != f"child:{i}:{planned[i]['operation']}"
+                        or attempt["dispatch_attempt_id"] != command["dispatch_attempt_id"]
+                        or attempt["plan_digest"] != command["plan_digest"]
+                        or any(attempt[k] != stamps.get(k) for k in ("ownership_generation", "board_epoch_4", "board_epoch_5"))
+                        or not attempt["created_at"] < command["finished_at"]):
+                        raise ValueError("finite first-Park issued delivery identity mismatch")
+                    if critical_images:
+                        evidence = _json_load(children[i]["terminal_evidence_json"], {})
+                        result = evidence.get("result", {})
+                        terminal_at = evidence.get("terminalized_at")
+                        if (not isinstance(result, dict) or not result
+                            or (i < failed_order and result.get("ok") is not True)
+                            or (i == failed_order and (result.get("delivery_attempted") is not True
+                                or not (result.get("ok") is False or (
+                                    isinstance(result.get("exception_type"), str) and bool(result["exception_type"])
+                                    and isinstance(result.get("exception"), str) and bool(result["exception"])
+                                    and "ok" not in result))))
+                            or type(terminal_at) not in {int, float}
+                            or not attempt["created_at"] <= terminal_at <= command["finished_at"]
+                            or (i < failed_order and terminal_at > attempts[i + 1]["created_at"])):
+                            raise ValueError("finite critical images terminal evidence mismatch")
+                        if i < failed_order and planned[i]["operation"] in {"sourceMoveTo", "sourceMoveZ"}:
+                            if (result.get("controller_completion_verified") is not True
+                                or not (result.get("controller_command_acknowledged") is True
+                                    or result.get("hardware_postcondition_verified") is True)):
+                                raise ValueError("finite critical images completed motion evidence mismatch")
+                        if i < failed_order and planned[i]["state_mutation"]:
+                            published = result.get("published", {})
+                            if (not isinstance(published, dict)
+                                or published.get("producer_operation") != planned[i]["operation"]
+                                or published.get("transition_provenance", {}).get("upstream_source_command_id")
+                                    != f"{command_id}:{i}:{command['plan_digest']}"):
+                                raise ValueError("finite critical images source publication evidence mismatch")
                 if not callable(current_collection_reader):
                     raise ValueError("finite recovery requires current native no-tip collection")
                 collection = dict(current_collection_reader())
@@ -6383,7 +6452,10 @@ class OperatorCommandStore:
                     or provenance.get("upstream_source_command_id") != collection.get("command_id")
                     or any(semantic[k] != authority[k] for k in ("ownership_generation", "board_epoch_4", "board_epoch_5"))):
                     raise ValueError("finite recovery requires linked current canonical no-tip publication")
-                finite = {"kind": "wp8_first_park_current_home_no_tip", "parent_command_id": parent_id,
+                finite = {"kind": "wp8_critical_images_current_home_no_tip" if critical_images else "wp8_first_park_current_home_no_tip", "parent_command_id": parent_id,
+                    **({"completed_prefix_orders": list(range(failed_order)), "ambiguous_child_order": failed_order,
+                        "unissued_tail_orders": list(range(failed_order + 1, len(children))),
+                        "attempt_sequences": [a["attempt_sequence"] for a in attempts]} if critical_images else {}),
                     "attempt_sequence": attempts[0]["attempt_sequence"], "collection": collection,
                     "no_tip_semantic_revision": semantic["semantic_state_revision"],
                     "historical_authority_stamps": stamps}
@@ -6478,6 +6550,9 @@ class OperatorCommandStore:
             if finite is not None and (not callable(current_collection_reader)
                 or dict(current_collection_reader()) != finite["collection"]):
                 raise ValueError("finite current collection changed before reconciliation commit")
+            if finite is not None and dict(conn.execute(
+                "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()) != dict(semantic):
+                raise ValueError("finite current canonical custody changed before reconciliation commit")
 
             before = int(semantic["semantic_state_revision"])
             after = before + 1
