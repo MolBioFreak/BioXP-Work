@@ -2891,7 +2891,7 @@ def install_operator_control_plane(
         domain_names = ("transport", "boards", "axes", "range", "power", "interlock", "latch", "gripper", "thermal", "chiller", "pipette")
         domains: dict[str, Any] = {}
         # One coherent observation, not eleven copies of the same snapshot.
-        projection = hardware_state.project(*domain_names, independent_domains=True)
+        projection = hardware_state.project(*domain_names, independent_domains=True, include_lifecycle=False)
         snapshot_id = projection.get("snapshot_id") or None
         projected_freshness = projection.get("freshness")
         freshness: dict[str, Any] = (
