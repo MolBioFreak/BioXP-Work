@@ -34,6 +34,10 @@ def test_machine_state_preserves_single_projection(installed_retained, monkeypat
     state = app.state.operator_command_plane.machine_state_provider()
     assert len(seen) == 1
     expected = seen[0]
+    # Lifecycle is acquired from the separately bound provider, not copied
+    # into an unused hardware attachment (including cold/changed owners).
+    assert 'lifecycle' not in expected
+    assert isinstance(state['lifecycle'], dict)
     assert state['snapshot_id'] == expected['snapshot_id']
     assert state['freshness'] == expected['freshness']
     assert state['freshness']['state'] == {
