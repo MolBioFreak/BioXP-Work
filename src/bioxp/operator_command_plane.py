@@ -5206,9 +5206,10 @@ class OperatorCommandStore:
         # A process can stop after durable native stage completion but before
         # final semantic publication. Project those motor facts without editing
         # failed history or treating source-only ForceToHighHome as motor I/O.
+        parsed_stages = [(stage, _json_load(stage["terminal_evidence_json"], None)) for stage in stages]
         motor_stages = [
-            (str(stage["terminal_state"]), _json_load(stage["terminal_evidence_json"], {}) or {})
-            for stage in stages
+            (str(stage["terminal_state"]), evidence or {})
+            for stage, evidence in parsed_stages
             if str(stage["operation"]) not in {
                 "ForceToHighHome", "check_latch_status", "check_machine_latch_closed"
             }
@@ -5267,13 +5268,13 @@ class OperatorCommandStore:
                     "arguments": _json_load(stage["arguments_json"], {}),
                     "dependencies": _json_load(stage["dependency_order_json"], []),
                     "terminal_state": str(stage["terminal_state"]),
-                    "terminal_evidence": _json_load(stage["terminal_evidence_json"], None),
+                    "terminal_evidence": evidence,
                 }
-                for stage in stages
+                for stage, evidence in parsed_stages
             ],
         }
 
-    def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None) -> dict[str, Any]:
+    def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None, compact: bool = False) -> dict[str, Any]:
         if transition_sequence is None:
             transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?", (str(row["command_id"]),)).fetchone()
             transition_sequence = transition_row[0] if transition_row and transition_row[0] is not None else None
@@ -5311,7 +5312,16 @@ class OperatorCommandStore:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
-        deck_detail = self._deck_command_detail(str(row["command_id"]))
+        if compact:
+            # Compact V2 receipts consume only the completion-class correction,
+            # never stage bodies. Keep the same historical recovery semantics.
+            deck_row = self.connection.execute(
+                "SELECT ambiguity_state FROM operator_plane_deck_commands WHERE command_id=?",
+                (str(row["command_id"]),),
+            ).fetchone()
+            deck_detail = None if deck_row is None else {"ambiguity_state": deck_row[0]}
+        else:
+            deck_detail = self._deck_command_detail(str(row["command_id"]))
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
@@ -5726,6 +5736,23 @@ class OperatorCommandStore:
         with self._lock:
             row = self.connection.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             return self._command_response(row) if row else None
+
+    def get_command_summary(self, command_id: str) -> dict[str, Any] | None:
+        """Internal input to the unchanged V2 compact serializer; not authority.
+
+        Avoid reading/decode-copying requested plans and large terminal/stage
+        evidence on every poll. Explicit detail and recovery keep full readers.
+        """
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT command_id,method_id,method_sequence,stream_sequence,action_id,status,"
+                "ownership_generation,queued_at,dispatched_at,finished_at,source_noop,"
+                "source_noop_reason,remote_acknowledged,controller_acknowledged,physical_effect_verified,version,"
+                "'{}' AS requested_json,'{}' AS effective_json,"
+                "json_object('completion_class',json_extract(terminal_json,'$.completion_class')) AS terminal_json "
+                "FROM operator_plane_commands WHERE command_id=?", (command_id,),
+            ).fetchone()
+            return self._command_response(row, compact=True) if row else None
 
     def list_commands(self, *, limit: int = 100, before_sequence: int | None = None) -> list[dict[str, Any]]:
         bounded = min(max(int(limit), 1), 200)

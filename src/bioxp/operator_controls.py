@@ -3872,14 +3872,14 @@ def install_operator_control_plane(
                 row = detailed_row
         if row is None:
             row = await asyncio.to_thread(
-                command_plane.store.command_detail_v2 if detail else command_plane.store.get_command,
+                command_plane.store.command_detail_v2 if detail else command_plane.store.get_command_summary,
                 command_id,
             )
             if detail:
                 source_receipt = await asyncio.to_thread(legacy_command_store.get_command, command_id)
         if row is None:
             row = await asyncio.to_thread(
-                legacy_command_store.command_detail_v2 if detail else legacy_command_store.get_command,
+                legacy_command_store.command_detail_v2 if detail else legacy_command_store.get_command_summary,
                 command_id,
             )
         if row is None:
