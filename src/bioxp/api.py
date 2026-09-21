@@ -1020,7 +1020,7 @@ async def lifespan(app: FastAPI):
                 pipette_status_provider=_operator_pipette_status,
                 oem_deck_provider=lambda: _serial206_oem_initialization_provider,
                 oem_deck_position_table_provider=load_bound_oem_position_table,
-                motion_snapshot_collector=hardware_snapshot_collect,
+                motion_snapshot_collector=_collect_motion_admission_snapshot,
             )
             operator_store = app.state.operator_receipt_store
             command_plane_to_start = app.state.operator_command_plane
@@ -5708,7 +5708,7 @@ def _protocol_mutation_scope(label):
         yield
 
 
-async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
+async def _run_blocking(label: str, func, timeout_s: float | None = 30.0, *, on_finished=None):
     def invoke():
         from bioxp.operator_controls import current_operator_dispatch_context
         context = current_operator_dispatch_context() or {}
@@ -5723,6 +5723,10 @@ async def _run_blocking(label: str, func, timeout_s: float | None = 30.0):
                 return await run_in_threadpool(invoke)
 
     worker = asyncio.create_task(leased_operation(), name=f"bioxp-tester:{label}")
+    if on_finished is not None:
+        # Tied to the ACTUAL retained worker, not a disconnected/timed-out HTTP
+        # waiter. Used only for the automatic collection admission slot.
+        worker.add_done_callback(lambda _: on_finished())
     try:
         return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
     except asyncio.CancelledError:
@@ -6686,6 +6690,7 @@ def _collect_and_publish_hardware_snapshot(
     *,
     reason: str,
     automatic: bool = False,
+    warm_deck_authority: bool = True,
 ) -> dict[str, Any]:
     tester = _get_tester()
     def yield_requested():
@@ -6729,7 +6734,7 @@ def _collect_and_publish_hardware_snapshot(
         # deny that publication; only defer further deck-authority queries.
         result["deck_authority"] = {"available": False, "reason": "operator_action_pending"}
         return result
-    if deck_requested and result.get("ok") and callable(deck_collect):
+    if warm_deck_authority and deck_requested and result.get("ok") and callable(deck_collect):
         if _pipette_transport is not None and _pipette_receipts is not None:
             try:
                 with provider.deck_owner_authority_scope(), _pipette_transport._transaction_lock:
@@ -6763,6 +6768,26 @@ def _collect_and_publish_hardware_snapshot(
     return result
 
 
+# At most one automatic sweep may be queued/running, including after its HTTP
+# waiter has disconnected. This is process-local admission, not hardware truth.
+_automatic_snapshot_pending = threading.Lock()
+MOTION_ADMISSION_DOMAINS = ("transport", "boards", "power", "interlock", "latch", "axes", "gripper")
+
+
+async def _collect_motion_admission_snapshot():
+    # Called inside an admitted direct action: not automatic (it would yield to
+    # itself). Named deck commands retain their separate current-authority seam.
+    # No thermal/chiller/pipette/camera survey or all-target deck warming here.
+    return await _run_blocking(
+        "Motion admission snapshot collection",
+        lambda: _collect_and_publish_hardware_snapshot(
+            list(MOTION_ADMISSION_DOMAINS), reason="motion_admission_snapshot_collect",
+            warm_deck_authority=False,
+        ),
+        timeout_s=105.0,
+    )
+
+
 @app.post("/hardware/snapshot/collect")
 async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     """Explicit serialized query-only collection; never recovers or activates."""
@@ -6782,6 +6807,8 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
     requested = (payload or {}).get("domains") or default_domains
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise HTTPException(status_code=400, detail="domains must be a list of canonical domain names")
+    if automatic and not _automatic_snapshot_pending.acquire(blocking=False):
+        return {"ok": False, "published": False, "reason": "hardware_collection_in_progress"}
     try:
         return await _run_blocking(
             "Canonical hardware snapshot collection",
@@ -6791,6 +6818,7 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
                 automatic=automatic,
             ),
             timeout_s=max(30.0, 15.0 * float(len(requested))),
+            **({"on_finished": _automatic_snapshot_pending.release} if automatic else {}),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
