@@ -49,6 +49,7 @@ from .oem_gripper import (
 )
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
 from .oem_serial206_initialization import (
+    ProviderAuthorityBusy,
     Serial206CommissioningEvidence,
     Serial206OemInitializationProvider,
     Serial206ProductionPrimitiveAdapter,
@@ -395,8 +396,39 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
     scope = getattr(provider, "projection_scope", None)
     manager: Any = scope() if callable(scope) else nullcontext()
-    with manager:
-        return _serial206_oem_initialization_provider_status_snapshot()
+    try:
+        with manager:
+            return _serial206_oem_initialization_provider_status_snapshot()
+    except ProviderAuthorityBusy:
+        # Passive polls never queue behind authority work; report busy
+        # explicitly so the caller serves its busy/stale projection instead
+        # of stalling (2026-09-20 warm-lock incident).
+        return _serial206_oem_initialization_provider_status_busy()
+
+
+def _serial206_oem_initialization_provider_status_busy() -> dict[str, Any]:
+    """Display-safe busy envelope; never an admission input."""
+    provider = _serial206_oem_initialization_provider
+    busy = ["provider_authority_busy"]
+    return {
+        "schema_version": "bioxp.serial206_oem_initialization_provider_status.v1",
+        "bound": provider is not None,
+        "authority_busy": True,
+        "initialize_motors_live_available": False,
+        "initialize_motion_live_available": False,
+        "initialize_motion_partial_primitives": [],
+        "initialize_motion_missing_primitives": [],
+        "initialize_motion_ledger": None,
+        "machine_status": None,
+        "initialize_motors": None,
+        "initialize_motors_admission": {"available": False, "blockers": busy, "expected_stage": None},
+        "z_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "x_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "y_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "physical_acceptance_required": True,
+        "provider": None if provider is None else type(provider).__name__,
+        "binding_error": _serial206_oem_initialization_provider_binding_error,
+    }
 
 
 def _serial206_oem_initialization_provider_status_snapshot() -> dict[str, Any]:
@@ -4892,7 +4924,23 @@ def _status_payload() -> dict:
         and ownership.get("router") == "running"
     )
     lifecycle = lifecycle_state.projection()
-    serial206_initialization = serial206_oem_initialization_provider_status()
+    # Display-only provider read: never queue behind authority-bearing work.
+    # /status is exactly what the operator Reconnect probe calls; a busy
+    # provider yields the explicit busy projection instead of a stall
+    # (2026-09-20 reconnect incident).
+    _passive_poll = None
+    token = None
+    try:
+        from .operator_controls import _PASSIVE_OPERATOR_POLL as _passive_poll
+        token = _passive_poll.set(True)
+    except Exception:
+        _passive_poll = None
+        token = None
+    try:
+        serial206_initialization = serial206_oem_initialization_provider_status()
+    finally:
+        if token is not None and _passive_poll is not None:
+            _passive_poll.reset(token)
     admission = hardware_state.project("transport", "boards", "power", "interlock", "latch", "axes", "gripper")
     deck_freshness = getattr(_serial206_oem_initialization_provider, "deck_observation_freshness", None)
     deck_observation = {"available": False, "freshness": {"state": "missing", "age_s": None}}
@@ -6644,7 +6692,19 @@ def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]
 
 @app.get("/status")
 async def get_status():
-    return await run_in_threadpool(_status_payload)
+    # The operator connect probe budgets 10 s for this envelope; never let it
+    # wait unbounded on authority work (2026-09-20 reconnect incident).
+    worker = asyncio.ensure_future(run_in_threadpool(_status_payload))
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=20.0)
+    except asyncio.TimeoutError:
+        worker.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return {
+            "status": "degraded",
+            "degraded": True,
+            "degraded_reason": "status_projection_timeout",
+            "startup_error": None if _startup_error is None else "startup_failed",
+        }
 
 
 def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
@@ -10259,8 +10319,19 @@ def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
         return result
 
 
-def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
-    """Shared query owner; called only inside the existing tester worker."""
+# The no-motion deck-readiness refresh must fail fast: a dead CAN bus must
+# not hold the provider authority lock for a full per-channel timeout x four
+# channels (2026-09-20 warm-lock incident: 240.2 s per sweep, five sweeps).
+_READINESS_TIP_PROBE_TIMEOUT_S = 3.0
+
+
+def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bounded: bool = False):
+    """Shared query owner; called only inside the existing tester worker.
+
+    ``readiness_bounded`` shortens the per-channel response timeout and stops
+    the sweep at the first ack timeout — readiness is a no-motion display
+    refresh, never authority-bearing work.
+    """
     transport = _get_pipette_transport()
 
     async def inline_run(_label, callback, *, timeout_s):
@@ -10268,7 +10339,11 @@ def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
 
     def audited_query():
         return asyncio.run(run_pipette_operation(
-            "tip_status", lambda owned: owned.query_tip_status_all(),
+            "tip_status",
+            lambda owned: owned.query_tip_status_all(
+                response_timeout_s=_READINESS_TIP_PROBE_TIMEOUT_S if readiness_bounded else None,
+                abort_after_first_ack_timeout=readiness_bounded,
+            ),
             get_transport=lambda: transport, run_blocking=inline_run,
             timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
             runtime_binding=runtime_binding,
@@ -10304,7 +10379,7 @@ def _observe_park_tip_prerequisite(provider):
         return _query_and_publish_pipette_tip_status(runtime_binding={
             "caller_class": "lifecycle", "entrypoint_id": "hardware.snapshot.park_tip_observation",
             "idempotency_key": "readiness-tip-query:" + uuid.uuid4().hex,
-        })
+        }, readiness_bounded=True)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, Mapping) else {}
         return {"available": False, "queried": True, "reason": "park_tip_query_unavailable",

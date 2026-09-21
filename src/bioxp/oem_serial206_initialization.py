@@ -204,6 +204,25 @@ _INITIALIZE_MOTION_MISSING = tuple(
 )
 
 
+class ProviderAuthorityBusy(RuntimeError):
+    """Display-only passive read found the provider authority lock held.
+
+    Passive operator polls never queue behind authority-bearing work; they
+    surface this state so the caller can serve a busy projection instead of
+    stalling the operator surface (2026-09-20 warm-lock incident).
+    """
+
+
+def _passive_provider_read() -> bool:
+    """True inside a read-only operator poll; imports lazily to avoid cycles."""
+    try:
+        from .operator_controls import _PASSIVE_OPERATOR_POLL
+
+        return bool(_PASSIVE_OPERATOR_POLL.get())
+    except Exception:
+        return False
+
+
 class _MutationPriorityRLock:
     """Reentrant mutex that admits queued mutations before later readers."""
 
@@ -4672,6 +4691,19 @@ class Serial206OemInitializationProvider:
             yield
 
     def deck_owner_authority_stamps(self) -> dict[str, int]:
+        # Passive operator polls must not stall on the provider lock (see
+        # projection_scope); they report busy instead of queueing.
+        if _passive_provider_read():
+            if not self._lock.acquire(blocking=False):
+                raise ProviderAuthorityBusy("provider_authority_busy")
+            try:
+                return self._deck_owner_authority_stamps_locked()
+            finally:
+                self._lock.release()
+        with self._lock:
+            return self._deck_owner_authority_stamps_locked()
+
+    def _deck_owner_authority_stamps_locked(self) -> dict[str, int]:
         ownership_generation = int(self.generation_provider())
         with self._lock:
             state = self._load_state()
@@ -5537,6 +5569,21 @@ class Serial206OemInitializationProvider:
     def projection_scope(self):
         # Preserve the existing provider -> runtime lock order. Mutation-priority
         # admission remains with this lock; the memo is only for this read pass.
+        # Passive operator polls are display-only reads: they never queue behind
+        # authority-bearing work. A held lock surfaces as ProviderAuthorityBusy
+        # so the caller serves a busy projection instead of stalling the
+        # operator surface (2026-09-20 warm-lock incident).
+        if _passive_provider_read():
+            if not self._lock.acquire(blocking=False):
+                raise ProviderAuthorityBusy("provider_authority_busy")
+            try:
+                scope = getattr(self.state_store, "serial206_projection_scope", None)
+                manager: Any = scope() if callable(scope) else nullcontext()
+                with manager:
+                    yield
+            finally:
+                self._lock.release()
+            return
         with self._lock:
             scope = getattr(self.state_store, "serial206_projection_scope", None)
             manager: Any = scope() if callable(scope) else nullcontext()

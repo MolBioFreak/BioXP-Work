@@ -29,6 +29,24 @@ from .models import (
 )
 
 
+def _result_has_ack_timeout(value: Any, depth: int = 0) -> bool:
+    """True when a driver result records a shared-bus ack timeout.
+
+    Readiness sweeps abort on the first timeout; the bounded recursive scan
+    keeps the check independent of driver-internal result nesting.
+    """
+    if depth > 6:
+        return False
+    if isinstance(value, Mapping):
+        error = value.get("error")
+        if isinstance(error, str) and "ack_timeout" in error:
+            return True
+        return any(_result_has_ack_timeout(child, depth + 1) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_result_has_ack_timeout(child, depth + 1) for child in value)
+    return False
+
+
 def _call_eject_tip(
     driver: Any,
     *,
@@ -310,6 +328,7 @@ class CanPipetteTransport:
 
     def _safe_query_tip_status(
         self, driver: Any, *, required: bool = False, source_continue: bool = False,
+        response_timeout_s: float | None = None,
     ) -> dict[str, Any] | None:
         query_fn = getattr(driver, "query_tip_status", None)
         if not callable(query_fn):
@@ -320,7 +339,18 @@ class CanPipetteTransport:
                 )
             return None
         try:
-            result = query_fn()
+            # Readiness probes pass a bounded timeout; drivers that do not
+            # accept the override keep the default response window.
+            parameters: Mapping[str, Any] = {}
+            if response_timeout_s is not None:
+                try:
+                    parameters = inspect.signature(query_fn).parameters
+                except (TypeError, ValueError):
+                    parameters = {}
+            if response_timeout_s is not None and "response_timeout_s" in parameters:
+                result = query_fn(response_timeout_s=float(response_timeout_s))
+            else:
+                result = query_fn()
         except Exception as exc:
             if required:
                 raise PipetteCommandError(
@@ -2555,15 +2585,31 @@ class FourPipetteTransport:
             "oem_source_anchor": "ClassPipetteCollection.verifyEjectTip:1265-1323",
         }
 
-    def query_tip_status_all(self) -> dict[str, Any]:
-        """Query in OEM order; strict readback rejection is not a source throw."""
+    def query_tip_status_all(
+        self,
+        *,
+        response_timeout_s: float | None = None,
+        abort_after_first_ack_timeout: bool = False,
+    ) -> dict[str, Any]:
+        """Query in OEM order; strict readback rejection is not a source throw.
+
+        ``abort_after_first_ack_timeout`` bounds the no-motion deck-readiness
+        probe: the pipette channels share one CAN bus, so once one channel
+        records an ack timeout the remaining channels cannot answer inside the
+        same window — the sweep stops instead of multiplying the hold on the
+        provider authority lock (2026-09-20 warm-lock incident).
+        """
         with self._transaction_lock:
             channels: list[dict[str, Any]] = []
             invalid_channels: list[int] = []
+            sweep_aborted_after_ack_timeout = False
             for channel, transport in enumerate(self._transports):
                 try:
                     driver = transport._get_driver()
-                    result = transport._safe_query_tip_status(driver, required=True, source_continue=True)
+                    result = transport._safe_query_tip_status(
+                        driver, required=True, source_continue=True,
+                        response_timeout_s=response_timeout_s,
+                    )
                 except Exception as exc:
                     # Earlier setters and observations survive an actual unwind.
                     details = {"observed_channels": channels, "failed_channel": channel,
@@ -2572,6 +2618,15 @@ class FourPipetteTransport:
                         exc.details.update(details)
                         raise
                     raise PipetteCommandError(str(exc), details={**details, "exception": repr(exc)}) from exc
+                if (
+                    abort_after_first_ack_timeout
+                    and isinstance(result, dict)
+                    and _result_has_ack_timeout(result)
+                ):
+                    invalid_channels.append(channel)
+                    channels.append({"channel": channel, "tip_loaded": None, "result": result})
+                    sweep_aborted_after_ack_timeout = True
+                    break
                 if (
                     not isinstance(result, dict)
                     or result.get("ok") is not True
@@ -2592,6 +2647,7 @@ class FourPipetteTransport:
                 raise PipetteCommandError(
                     "OEM tip query returned; strict hardware readback verification failed.",
                     details={"observed_channels": channels, "invalid_channels": invalid_channels,
+                        "sweep_aborted_after_first_ack_timeout": sweep_aborted_after_ack_timeout,
                         **source_result},
                 )
             loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]

@@ -2760,7 +2760,12 @@ class _OperatorPollCache:
                     self._pending = self._executor.submit(collect)
                     self._pending_key = refresh_key
                 pending = self._pending
-                if key in self._failures:
+                # A failed refresh must never turn an already-served view cold:
+                # sticky failures only gate views that have no cached body.
+                # (2026-09-20 warm-lock incident: the failure of one refresh —
+                # provider lock held by a readiness query — 503'd views that
+                # had just been served successfully.)
+                if cached is None and key in self._failures:
                     raise self._failures[key]
                 if cached is not None:
                     result, stored_at = cached
