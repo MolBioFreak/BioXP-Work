@@ -4991,6 +4991,17 @@ class OperatorCommandStore:
             "provider_evidence": _bounded_json(row, 131072), "reason": reason,
         }
 
+    @contextmanager
+    def deck_predicate_publication_scope(self):
+        """One commit for the two host-only latch predicate records.
+
+        No provider/motor operation belongs in this scope. Preserve the existing
+        provider-before-writer order and each stage's ordinary guarded writer.
+        Both records commit before any physical stage may be delivered.
+        """
+        with self._deck_owner_authority_scope(), self._transaction():
+            yield
+
     def terminalize_deck_stage(self, command_id: str, step: Any, *, state: str, result: Mapping[str, Any] | None = None, reason: str | None = None) -> None:
         if state not in {"completed", "failed", "ambiguous", "stopped", "aborted"}:
             raise ValueError(state)

@@ -2102,28 +2102,30 @@ def make_deck_command_executor(
                     "check_latch_status": authority.latch_status,
                     "check_machine_latch_closed": authority.machine_latch_closed,
                 }
-                for step in plan.steps[1:3]:
-                    value = latch_predicates[step.operation]
-                    assert_current(
-                        command_id,
-                        boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
-                    )
-                    terminalize_stage(
-                        command_id,
-                        step,
-                        state="completed" if value else "failed",
-                        result={
-                            "value": value,
-                            "observation_id": authority.latch_observation_id,
-                            "delivery_attempted": False,
-                            "physical_motion_commanded": False,
-                        },
-                        reason=(
-                            "source_predicate_satisfied"
-                            if value
-                            else "source_predicate_not_satisfied"
-                        ),
-                    )
+                publication_scope = getattr(command_store, "deck_predicate_publication_scope", None)
+                with publication_scope() if callable(publication_scope) else nullcontext():
+                    for step in plan.steps[1:3]:
+                        value = latch_predicates[step.operation]
+                        assert_current(
+                            command_id,
+                            boundary=f"before_terminalize_stage_{step.order}_{step.operation}",
+                        )
+                        terminalize_stage(
+                            command_id,
+                            step,
+                            state="completed" if value else "failed",
+                            result={
+                                "value": value,
+                                "observation_id": authority.latch_observation_id,
+                                "delivery_attempted": False,
+                                "physical_motion_commanded": False,
+                            },
+                            reason=(
+                                "source_predicate_satisfied"
+                                if value
+                                else "source_predicate_not_satisfied"
+                            ),
+                        )
             if plan.blocked_reason:
                 return {
                     "ok": False,

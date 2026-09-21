@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 from typing import Any
@@ -50,24 +51,45 @@ def public_target_keys() -> frozenset[str]:
     return frozenset(row[0] for row in _ROWS)
 
 
+@lru_cache(maxsize=16)
+def _catalog_entries(rows, aliases, locations):
+    aliases_by_target: dict[str, list[str]] = {}
+    for alias, target in aliases:
+        aliases_by_target.setdefault(target, []).append(alias)
+    by_name = dict(locations)
+    return tuple(DeckDestination(target, label, name, by_name[name], branch,
+                 tuple(aliases_by_target.get(target, ()))) for target, label, name, branch in rows)
+
+
+def _catalog_rows(entries, position_table_sha256):
+    return [{"target": row.target, "panel_label": row.panel_label, "location_name": row.location_name,
+             "location_id": row.location_id, "branch": row.branch, "aliases": list(row.aliases),
+             "position_table_sha256": position_table_sha256} for row in entries]
+
+
+@lru_cache(maxsize=16)
+def _catalog_revision(entries, position_table_sha256):
+    # Frozen entries + content revision only. No live authority, executable plan,
+    # position observation, reference version or mutable response is memoized.
+    canonical = {"schema_version": "bioxp.oem_deck_catalog.v1", "position_table_sha256": position_table_sha256,
+                 "rows": _catalog_rows(entries, position_table_sha256)}
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class DeckCatalog:
     def __init__(self, entries: tuple[DeckDestination, ...], position_table_sha256: str) -> None:
         self._entries = entries
         self.position_table_sha256 = position_table_sha256
         self._targets = {entry.target: entry for entry in entries}
         self._aliases = {alias.casefold(): target for alias, target in _ALIASES.items()}
-        canonical = {"schema_version": "bioxp.oem_deck_catalog.v1", "position_table_sha256": position_table_sha256, "rows": self.rows()}
-        self.revision = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.revision = _catalog_revision(entries, position_table_sha256)
 
     @classmethod
     def from_position_table(cls, table: PositionTable) -> "DeckCatalog":
         missing = [name for name in configured_location_names() if not cls._contains(table, name)]
         if missing:
             raise ValueError(f"catalog destination absent from Serial-206 PositionTable: {', '.join(missing)}")
-        aliases_by_target: dict[str, list[str]] = {}
-        for alias, target in _ALIASES.items():
-            aliases_by_target.setdefault(target, []).append(alias)
-        entries = tuple(DeckDestination(target, label, name, LOCATION_NAME_TO_ID[name], branch, tuple(aliases_by_target.get(target, ()))) for target, label, name, branch in _ROWS)
+        entries = _catalog_entries(_ROWS, tuple(_ALIASES.items()), tuple(LOCATION_NAME_TO_ID.items()))
         return cls(entries, table.digest)
 
     @staticmethod
@@ -91,4 +113,4 @@ class DeckCatalog:
         return self.resolve(target)
 
     def rows(self) -> list[dict[str, Any]]:
-        return [{"target": row.target, "panel_label": row.panel_label, "location_name": row.location_name, "location_id": row.location_id, "branch": row.branch, "aliases": list(row.aliases), "position_table_sha256": self.position_table_sha256} for row in self._entries]
+        return _catalog_rows(self._entries, self.position_table_sha256)
