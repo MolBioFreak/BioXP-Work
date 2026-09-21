@@ -2120,6 +2120,15 @@ class OperatorHistoryReader:
             ).fetchone()
             return None if row is None else self._command_projection(row)
 
+    def get_command_summary(self, command_id: str) -> dict[str, Any] | None:
+        """Summary entry point for compact (non-detail) receipt reads.
+
+        The legacy reader has no separate lightweight projection: a compact
+        poll consumes the same projected row as get_command. This method exists
+        so non-detail callers share one interface across stores.
+        """
+        return self.get_command(command_id)
+
 
     def list_commands(
         self, *, limit: int = 100, before_sequence: int | None = None,
