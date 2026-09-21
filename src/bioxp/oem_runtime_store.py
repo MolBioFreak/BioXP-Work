@@ -4033,6 +4033,10 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 class OEMRuntimeStore:
+    # Reader ownership contract: verified canonical JSON, freshly decoded for
+    # each caller. Providers may mutate this private result, never cached state.
+    serial206_reads_are_detached = True
+
     def __init__(self, root: str | Path | None = None):
         self._audit_database = RuntimeAuditDatabase(root=root, initialize_schema=False)
         self.root = self._audit_database.root
@@ -4043,6 +4047,7 @@ class OEMRuntimeStore:
         self._authority_write_depth = 0
         self._projection_read_depth = 0
         self._projection_verified_state = None
+        self._verified_serial206_bytes = None
         # Volatile admission fence belongs to this authority owner, not its DB
         # writer lock. Software cancellation must never wait for SQLite.
         self._axis_interrupt_lock = threading.RLock()
@@ -4139,6 +4144,7 @@ class OEMRuntimeStore:
         with self._lock:
             if not self._closed:
                 self._db.close()
+                self._projection_verified_state = self._verified_serial206_bytes = None
                 self._closed = True
 
     @staticmethod
@@ -4685,30 +4691,25 @@ class OEMRuntimeStore:
                     "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
                 ).fetchone()
             state_json = str(selected["state_json"])
-            canonical_state_json = json.dumps(
-                json.loads(state_json), sort_keys=True, separators=(",", ":"), allow_nan=False
-            )
-            if (
-                state_json != canonical_state_json
-                or str(selected["state_sha256"])
-                != hashlib.sha256(state_json.encode("utf-8")).hexdigest()
-            ):
-                raise RuntimeError("serial-206 authority snapshot state bytes or hash are incoherent")
-            stored_receipt_set_json = str(selected["receipt_set_json"])
-            canonical_receipt_set_json = json.dumps(
-                json.loads(stored_receipt_set_json),
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            if (
-                stored_receipt_set_json != canonical_receipt_set_json
-                or str(selected["receipt_set_sha256"])
-                != hashlib.sha256(stored_receipt_set_json.encode("utf-8")).hexdigest()
-            ):
-                raise RuntimeError("serial-206 authority snapshot receipt-set bytes or hash are incoherent")
-
+            # Select the current row on every unscoped read. Cache only integrity
+            # verification of EXACT bytes + hashes, not readiness or a mutable
+            # object. External writes/rollbacks/replacements cannot reuse a hit
+            # for changed bytes even when sequence or a claimed digest is reused.
+            key = (selected["sequence"], state_json, str(selected["state_sha256"]),
+                   str(selected["receipt_set_json"]), str(selected["receipt_set_sha256"]))
             payload = json.loads(state_json)
+            if key != self._verified_serial206_bytes:
+                if (state_json != json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                        or key[2] != hashlib.sha256(state_json.encode("utf-8")).hexdigest()):
+                    raise RuntimeError("serial-206 authority snapshot state bytes or hash are incoherent")
+                receipt_json = key[3]
+                if (receipt_json != json.dumps(json.loads(receipt_json), sort_keys=True,
+                                               separators=(",", ":"), allow_nan=False)
+                        or key[4] != hashlib.sha256(receipt_json.encode("utf-8")).hexdigest()):
+                    raise RuntimeError("serial-206 authority snapshot receipt-set bytes or hash are incoherent")
+                if not isinstance(payload, dict):
+                    raise ValueError("serial-206 initialization state must be an object")
+                self._verified_serial206_bytes = key
             if self._projection_read_depth:
                 self._projection_verified_state = (revision, state_json)
         if not isinstance(payload, dict):

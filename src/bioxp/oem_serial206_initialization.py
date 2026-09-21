@@ -17,6 +17,7 @@ import threading
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Mapping
 
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
@@ -5267,12 +5268,39 @@ class Serial206OemInitializationProvider:
         }
 
     @classmethod
-    def _upgrade_state(cls, state: Any) -> Any:
+    @lru_cache(maxsize=8)
+    def _upgrade_template(cls):
+        # Source defaults are a migration template, NOT a new machine authority.
+        # Never publish its constructor/trays; every inserted value is copied.
+        defaults = cls._new_state()
+        legacy = defaults["machine_status"]
+        legacy.pop("construction_id", None)
+        legacy.pop("constructed_tip_trays", None)
+        for key in ("tip_loaded", "tip_dirty", "current_location", "current_well"):
+            legacy[key] = None
+        return defaults
+
+    @classmethod
+    def _upgrade_state(cls, state: Any, *, detached: bool = False) -> Any:
         """Add exact initializeMotion host authority to pre-binding v2 records."""
         if not isinstance(state, dict) or state.get("schema_version") != _STATE_SCHEMA:
             return state
-        upgraded = copy.deepcopy(state)
-        defaults = cls._new_state()
+        upgraded = state if detached else copy.deepcopy(state)
+        defaults = cls._upgrade_template()
+        z, x = upgraded.get("z_lifecycle"), upgraded.get("x_lifecycle")
+        machine, motion = upgraded.get("machine_status"), upgraded.get("initialize_motion_ledger")
+        if ("used_motion_approvals" in upgraded
+                and isinstance(z, dict) and z.get("schema_version") == _Z_LIFECYCLE_SCHEMA
+                and defaults["z_lifecycle"].keys() <= z.keys()
+                and isinstance(x, dict) and x.get("schema_version") == _X_LIFECYCLE_SCHEMA
+                and defaults["x_lifecycle"].keys() <= x.keys()
+                and isinstance(machine, dict) and defaults["machine_status"].keys() <= machine.keys()
+                and not {"source_tip_trays", "tip_tray_availability"}.intersection(machine)
+                and isinstance(motion, dict) and {"stage_receipts", "expected_next_stage", "context"} <= motion.keys()
+                and isinstance(motion["context"], dict)
+                and defaults["initialize_motion_ledger"]["context"].keys() <= motion["context"].keys()
+                and not (motion.get("terminal_state") == "unavailable_partial_binding" and not motion["stage_receipts"])):
+            return upgraded  # Validation/restart/owner checks still run below.
         upgraded.setdefault("used_motion_approvals", {})
         upgraded.setdefault("z_lifecycle", copy.deepcopy(defaults["z_lifecycle"]))
         z_lifecycle = upgraded.get("z_lifecycle")
@@ -5362,7 +5390,7 @@ class Serial206OemInitializationProvider:
         return upgraded
 
     @staticmethod
-    def _validate_state(state: Any) -> dict[str, Any]:
+    def _validate_state(state: Any, *, json_verified: bool = False) -> dict[str, Any]:
         if not isinstance(state, dict) or state.get("schema_version") != _STATE_SCHEMA:
             raise ValueError("serial-206 state schema mismatch")
         used = state.get("used_approvals")
@@ -5499,7 +5527,8 @@ class Serial206OemInitializationProvider:
             if row.get("state") != "pending" and (not isinstance(command_id, str) or not command_id):
                 raise ValueError("executed row lacks command identity")
 
-        json.dumps(state, allow_nan=False)
+        if not json_verified:
+            json.dumps(state, allow_nan=False)
         # Every caller supplies the private copy returned by _upgrade_state.
         # Validation need not copy the populated ledgers again under the lock.
         return state
@@ -5539,7 +5568,9 @@ class Serial206OemInitializationProvider:
                 or stored_z_mapping.get("awaiting_observation_receipt_id") is not None
                 or stored_z_mapping.get("reference_state") == "referenced"
             )
-            payload = self._validate_state(self._upgrade_state(stored))
+            detached = getattr(self.state_store, "serial206_reads_are_detached", False) is True
+            payload = self._validate_state(self._upgrade_state(stored, detached=detached),
+                                           json_verified=detached)
             if migration_required:
                 if legacy_authority_present:
                     self._z_mark_desynced(
