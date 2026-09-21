@@ -12912,10 +12912,25 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         if type(arguments.get("value")) is not bool:
             raise RuntimeError("source_authority_missing:updateThermalDoorOpen:value")
+        value = bool(arguments["value"])
+        # ControlLib.doorOpen keeps ONE software door flag on the machine status
+        # and every door decision (plus every operation that branches on the
+        # door) reads it. The port had split that flag: the canonical SQLite
+        # transition recorded each update, but the provider working state
+        # (machine_status.thermal_door_open) never received it, so a later door
+        # command could no-op against a stale flag while the door was physically
+        # elsewhere. Mirror into the working state first so a failed publish can
+        # never leave the next decision on the stale value; the canonical
+        # publication remains the audit record.
+        state = self._load_state()
+        machine = dict(state.get("machine_status") or {})
+        machine["thermal_door_open"] = value
+        state["machine_status"] = machine
+        self._save_state(state)
         return self._wp8_publish_semantic(
             operation=operation, command_id=command_id, child_order=child_order,
             plan_digest=plan_digest,
-            updates={"thermal_door_open": bool(arguments["value"])},
+            updates={"thermal_door_open": value},
         )
 
     def wp8_clear_tip_loaded(

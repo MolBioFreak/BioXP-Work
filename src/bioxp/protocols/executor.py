@@ -572,6 +572,8 @@ class ProtocolExecutor:
                 value = owned.future.result()
             except Exception as exc:
                 value = {"ok": False, "error_type": type(exc).__name__, "error": "source_child_failed"}
+                if str(exc):
+                    value["message"] = str(exc)
                 if hasattr(exc, "oem_partial_results"):
                     value["oem_partial_results"] = exc.oem_partial_results
                 if isinstance(getattr(exc, "detail", None), Mapping):
