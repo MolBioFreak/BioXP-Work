@@ -48,7 +48,7 @@ def test_duplicate_automatic_reads_do_not_build_a_waiting_queue(monkeypatch):
             return {'ok': False, 'published': False}
         monkeypatch.setattr(api, '_run_blocking', blocking)
         first = asyncio.create_task(api.hardware_snapshot_collect({'automatic': True, 'domains': ['axes']}))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 2)
         try:
             results = await asyncio.gather(*(api.hardware_snapshot_collect(
                 {'automatic': True, 'domains': ['latch']}) for _ in range(20)))
@@ -79,7 +79,7 @@ def test_completion_slot_follows_actual_worker_not_http_waiter(monkeypatch, end)
         task = asyncio.create_task(api._run_blocking('offline', work,
             timeout_s=.03 if end == 'timeout' else None,
             on_finished=lambda: completions.append('done')))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 2)
         if end == 'cancel':
             task.cancel()
             with pytest.raises(asyncio.CancelledError): await task
