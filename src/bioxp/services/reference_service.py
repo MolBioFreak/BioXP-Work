@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -85,12 +86,36 @@ class ReferenceStateStore:
         self._authority_untrusted = self._state_path is None
         self._lock = Lock()
         self._authority_write_depth = 0
+        # All use is serialized by _lock (construction is single-threaded).
+        # This is a connection cache, not a cache of reference authority.
+        self._connection: sqlite3.Connection | None = None
+        self._connection_identity = None
+        self._connection_schema_version = None
         self._load_from_disk()
 
     def _open_database(self) -> sqlite3.Connection:
         if self._database_path is None:
             raise ReferenceStateAuthorityError("durable reference database path required")
-        connection = sqlite3.connect(self._database_path, timeout=2.0)
+        stat = self._database_path.stat()
+        identity = (os.getpid(), stat.st_dev, stat.st_ino)
+        connection = self._connection
+        if connection is not None:
+            if identity != self._connection_identity:
+                self._discard_connection()
+                raise ReferenceStateAuthorityError("reference database replaced; explicit recovery required")
+            try:
+                if connection.in_transaction:
+                    raise ReferenceStateAuthorityError("reference connection has an unfinished transaction")
+                version = connection.execute("PRAGMA schema_version").fetchone()[0]
+                if version == self._connection_schema_version:
+                    return connection
+            except Exception:
+                self._discard_connection()
+                raise
+            self._discard_connection()
+        # check_same_thread=False is safe only because every caller holds this
+        # store's lock. No read transaction survives a method boundary.
+        connection = sqlite3.connect(self._database_path, timeout=2.0, check_same_thread=False)
         connection.create_function(
             "reference_write_allowed", 0, lambda: 1 if self._authority_write_depth > 0 else 0
         )
@@ -134,7 +159,32 @@ class ReferenceStateStore:
         if actual != expected:
             connection.close()
             raise ReferenceStateAuthorityError("reference authority trigger set is not exact")
+        after = self._database_path.stat()
+        if identity != (os.getpid(), after.st_dev, after.st_ino):
+            connection.close()
+            raise ReferenceStateAuthorityError("reference database changed during connection setup")
+        self._connection = connection
+        self._connection_identity = identity
+        self._connection_schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
         return connection
+
+    def _discard_connection(self) -> None:
+        connection, self._connection = self._connection, None
+        self._connection_identity = self._connection_schema_version = None
+        if connection is not None:
+            connection.close()  # rolls back, never commits unfinished work
+
+    def _release_database(self, connection: sqlite3.Connection) -> None:
+        # Successful reads/writes retain the idle handle, never an open txn.
+        if connection.in_transaction:
+            self._discard_connection()
+        elif connection is not self._connection:
+            connection.close()
+
+    def close(self) -> None:
+        """Release the owned handle after users have quiesced; may reopen later."""
+        with self._lock:
+            self._discard_connection()
 
     @staticmethod
     def _unknown_row(axis: str) -> dict[str, Any]:
@@ -280,7 +330,7 @@ class ReferenceStateStore:
             try:
                 before = connection.execute("SELECT payload_json,payload_sha256 FROM reference_state_authority WHERE authority_key='reference_state'").fetchone()
             finally:
-                connection.close()
+                self._release_database(connection)
             candidate = dict(loaded)
             proposed = self._referenced_candidate(candidate, commands)
             rows = {r.axis: r.to_payload() for r in proposed}
@@ -546,8 +596,9 @@ class ReferenceStateStore:
                         raise ReferenceStateAuthorityError("reference authority digest mismatch")
                     payload = json.loads(encoded)
             finally:
-                connection.close()
+                self._release_database(connection)
         except Exception:
+            self._discard_connection()
             logger.warning("Failed to load reference state from SQLite %s", self._database_path, exc_info=True)
             return None
         rows = payload.get("rows", {}) if isinstance(payload, dict) else {}
@@ -596,7 +647,7 @@ class ReferenceStateStore:
                 connection.execute("COMMIT")
             finally:
                 self._authority_write_depth = max(0, self._authority_write_depth - 1)
-                connection.close()
+                self._release_database(connection)
             return True
         except Exception:
             self._disk_state_dirty = True

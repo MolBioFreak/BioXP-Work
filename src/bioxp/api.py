@@ -1161,6 +1161,7 @@ async def lifespan(app: FastAPI):
             _receiver_audit_shutdown = {"state": "skipped", "reason": "usb_teardown_incomplete",
                                         "durable_ownership_claimed": False}
         else:
+            await asyncio.to_thread(_reference_state_store.close)
             _receiver_audit_shutdown = {"state": "draining", "durable_ownership_claimed": False}
             _receiver_audit_shutdown = await asyncio.to_thread(_drain_receiver_audits, audit_buffers)
         app.state.receiver_audit_shutdown = _receiver_audit_shutdown
