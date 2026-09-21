@@ -3377,16 +3377,11 @@ class OperatorCommandStore:
                 if existing["canonical_request_sha256"] != digest:
                     raise ValueError("idempotency key conflict")
                 return self.get_workflow(existing["command_id"])
-            # Immutable ambiguous history is not current software custody.
-            # Only the canonical cancel_pending owner can attest abandonment;
-            # physical uncertainty remains fenced by recovery/resource owners.
-            if conn.execute("SELECT 1 FROM operator_plane_lane WHERE workflow_command_id IS NOT NULL").fetchone() or conn.execute(
-                    "SELECT 1 FROM operator_commands c WHERE c.command_kind='protocol_workflow' "
-                    "AND (c.status IN ('queued','dispatched','interrupting') OR (c.status='ambiguous' "
-                    "AND NOT EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
-                    "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
-                    "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
-                    "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id))) LIMIT 1").fetchone():
+            # 2026-09-21: only a live workflow blocks a new workflow. Ambiguous or
+            # unresolved history is retained as record and never refuses admission.
+            if conn.execute(
+                    "SELECT 1 FROM operator_commands WHERE command_kind='protocol_workflow' "
+                    "AND status IN ('queued','dispatched','interrupting') LIMIT 1").fetchone():
                 raise ValueError("workflow_busy")
             safety = dict(conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone())
             footprint = {"global_epoch": safety["global_epoch"],
@@ -5608,9 +5603,6 @@ class OperatorCommandStore:
                 replay_response["idempotent_replay"] = True
                 return replay_response
             if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
-                blocker = self._deck_recovery_blocker(conn)
-                if blocker is not None:
-                    raise HTTPException(status_code=409, detail={"error": blocker})
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
@@ -6924,10 +6916,19 @@ class OperatorCommandStore:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
             now = _now()
-            if self._deck_recovery_blocker(conn) is not None:
-                return None
             if lane["owner_id"] != self.owner_id or float(lane["owner_lease_until"] or 0.0) <= now:
                 return None
+            # 2026-09-21: stale custody is not a blocker. If the owning workflow is
+            # no longer live, release the lane instead of freezing dispatch.
+            if lane["workflow_command_id"]:
+                occupant = conn.execute(
+                    "SELECT status FROM operator_commands WHERE command_id=?",
+                    (lane["workflow_command_id"],)).fetchone()
+                if occupant is None or str(occupant["status"]) not in ("queued", "dispatched", "interrupting"):
+                    conn.execute(
+                        "UPDATE operator_plane_lane SET workflow_command_id=NULL WHERE singleton=1 AND workflow_command_id=?",
+                        (lane["workflow_command_id"],))
+                    lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
             queued_rows = conn.execute(
                 "SELECT * FROM operator_plane_commands WHERE status='queued' ORDER BY stream_sequence"
             ).fetchall()

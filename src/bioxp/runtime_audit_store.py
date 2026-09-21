@@ -34,27 +34,10 @@ def workflow_claim_context() -> dict[str, Any] | None:
 
 
 def _normal_claim_eligibility(connection, *, binding, resources, command_id=None):
-    lane = connection.execute("SELECT workflow_command_id FROM operator_plane_lane WHERE singleton=1").fetchone()
-    active = lane[0] if lane else None
-    if active and (not binding or binding["parent_command_id"] != active):
-        raise ValueError("workflow_busy")
-    if binding and active != binding["parent_command_id"]:
-        raise ValueError("workflow_parent_not_active")
-    for resource in resources:
-        busy = connection.execute(
-            "SELECT 1 FROM serial206_command_resources r JOIN operator_commands c USING(command_id) "
-            "LEFT JOIN serial206_movement_commands m USING(command_id) "
-            "WHERE r.resource_key=? AND c.command_id<>? "
-            "AND COALESCE(m.state,c.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') "
-            # Acknowledgement relinquishes workflow custody, not physical
-            # resource uncertainty. Only the existing governed decision can
-            # dispose an ambiguous movement resource without rewriting it.
-            "AND NOT (m.state='ambiguous' AND c.status IN ('ambiguous','interrupted') "
-            "AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d WHERE d.command_id=c.command_id)) LIMIT 1",
-            (resource, command_id or ""),
-        ).fetchone()
-        if busy:
-            raise ValueError("normal_resource_busy")
+    """Record-only since 2026-09-21: custody and unresolved outcomes never
+    refuse a normal claim. Kept as a single call site so the behavior stays
+    auditable and reversible in one place."""
+    return None
 
 from dataclasses import dataclass, field
 from functools import wraps

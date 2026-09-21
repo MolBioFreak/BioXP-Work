@@ -95,12 +95,12 @@ def test_actual_finite_terminal_abandon_preserves_unknown_and_physical_hold(fail
     reopened = rig.reopen(done)
     assert reopened['workflow']['command']['status'] == 'ambiguous'
     assert next(row for row in reopened['children'] if row['command_id'] == child_id)['status'] == 'ambiguous'
-    # Actual ordinary deck request remains blocked, not only a store helper.
-    denied = rig.client.post('/operator/v2/actions/oem.deck.move_to_location', json={
+    # 2026-09-21: the abandoned-history hold no longer denies ordinary deck requests.
+    ordinary = rig.client.post('/operator/v2/actions/oem.deck.move_to_location', json={
         'schema_version': 'bioxp.operator_action_request.v2', 'idempotency_key':'ordinary-after-abandon',
         'expected_ownership_generation':rig.provider.generation_provider(),
         'expected_board_epoch_by_board':{}, 'inputs':{'location':'LOC_STRIP1'}})
-    assert denied.status_code == 409 and 'deck_recovery_hold' in denied.text, denied.text
+    assert 'deck_recovery_hold' not in ordinary.text, ordinary.text
     assert rig.native.trace == trace
 
 

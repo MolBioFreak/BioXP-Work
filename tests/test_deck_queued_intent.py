@@ -353,7 +353,8 @@ def test_uncertain_native_result_holds_later_intent(installed_retained, retained
     before = list(leaf.moves)
     replay = client.post(URL, json=body)
     assert replay.status_code == 200 and replay.json()['command_id'] == first
-    refused = client.post(URL, json={**body, 'idempotency_key': 'uncertain-new'})
-    assert refused.status_code == 409 and refused.json()['detail']['error'] == 'deck_recovery_hold'
+    # 2026-09-21: an uncertain outcome no longer refuses new intents.
+    admitted = client.post(URL, json={**body, 'idempotency_key': 'uncertain-new'})
+    assert admitted.status_code == 200 and 'deck_recovery_hold' not in admitted.text, admitted.text
     assert leaf.moves == before
-    assert catalog_action(app)['enabled'] is False
+    assert catalog_action(app)['enabled'] is True

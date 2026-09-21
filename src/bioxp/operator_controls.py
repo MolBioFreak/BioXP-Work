@@ -3242,7 +3242,6 @@ def install_operator_control_plane(
 
     def deck_contract(state: Mapping[str, Any], *, target: str | None = None, intent_only: bool = False, snapshots: Mapping[str, Any] | None = None, before_query=None) -> dict[str, Any]:
         disabled_reason: str | None = None
-        recovery_disabled_reason: str | None = None
         raw_maintenance = state.get("maintenance")
         raw_lifecycle = state.get("lifecycle")
         maintenance = dict(raw_maintenance) if isinstance(raw_maintenance, Mapping) else {}
@@ -3266,10 +3265,6 @@ def install_operator_control_plane(
             disabled_reason = "emergency_operation_state"
         elif operation_state != "stopped":
             disabled_reason = "operation_state_not_ready"
-        try:
-            recovery_disabled_reason = command_plane.store.deck_recovery_blocker()
-        except Exception:
-            recovery_disabled_reason = "deck_recovery_state_inconsistent"
         if not callable(getattr(app.state, "oem_deck_command_executor", None)):
             disabled_reason = "canonical_deck_executor_unavailable"
         if disabled_reason is None and (oem_deck_provider is None or oem_deck_position_table_provider is None):
@@ -3409,11 +3404,10 @@ def install_operator_control_plane(
                 }
                 for row in catalog.rows()
             ]
-        disabled_reason = recovery_disabled_reason or disabled_reason
         options = [
             {**row, "enabled": reason is None, "disabled_reason": reason}
             for row in options
-            for reason in [recovery_disabled_reason or scope_reasons.get(
+            for reason in [scope_reasons.get(
                 "full" if row["branch_kind"] == "park" else "offset.v1", disabled_reason)]
         ]
         from .operator_command_plane import _active_board_epochs

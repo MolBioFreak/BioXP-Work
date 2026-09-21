@@ -38,14 +38,15 @@ def test_parent_without_movement_and_replay(store):
     assert store.connection.execute('SELECT workflow_command_id FROM operator_plane_lane').fetchone()[0] == 'parent'
 
 
-def test_second_parent_and_direct_excluded(store):
+def test_second_parent_excluded_and_direct_admitted(store):
     admit(store)
     with pytest.raises(ValueError, match='workflow_busy'):
         admit(store, 'second')
     store.claim_next()
     db, payload = direct(store)
-    with pytest.raises(ValueError, match='workflow_busy'):
-        db.claim(payload, pipette=True)
+    # 2026-09-21: custody never refuses a direct claim.
+    child, created = db.claim(payload, pipette=True)
+    assert created and child['parent_command_id'] is None
 
 
 def test_real_direct_child_and_unsettled_custody(store):
@@ -98,14 +99,15 @@ def test_control_same_key_reconciles_after_settlement(store):
     assert len(calls) == 1
 
 
-def test_direct_mutation_blocks_parent_activation_and_then_releases(store):
+def test_direct_mutation_defers_parent_activation_and_then_releases(store):
     with store.normal_mutation_scope(resources=('thermal',)):
         admit(store)
         assert store.claim_next() is None
     assert store.claim_next()['command_id'] == 'parent'
-    with pytest.raises(ValueError, match='workflow_busy'):
-        with store.normal_mutation_scope(resources=('thermal',)):
-            pytest.fail('unrelated setter must not enter')
+    # 2026-09-21: custody never refuses an unrelated setter.
+    with store.normal_mutation_scope(resources=('thermal',)) as unrelated:
+        assert store.connection.execute(
+            'SELECT parent_command_id FROM operator_commands WHERE command_id=?', (unrelated,)).fetchone()[0] is None
     with store.workflow_context('parent', source_occurrence_id='native-setter'):
         with store.normal_mutation_scope(resources=('thermal',)) as child:
             assert store.connection.execute('SELECT parent_command_id FROM operator_commands WHERE command_id=?', (child,)).fetchone()[0] == 'parent'
@@ -139,7 +141,7 @@ def test_original_stop_wakes_bound_wait_once_and_future_child_cannot_enter(store
             pass
 
 
-def test_restart_custody_is_ambiguous_without_replay(store):
+def test_restart_custody_is_ambiguous_and_non_blocking(store):
     admit(store)
     store.claim_next()
     store._startup_recover()
@@ -147,9 +149,9 @@ def test_restart_custody_is_ambiguous_without_replay(store):
     assert bundle['command']['status'] == bundle['status'] == 'ambiguous'
     assert bundle['execution']['runtime_state']['workflow']['phase'] == 'reconciling'
     assert store.claim_next() is None
-    with pytest.raises(ValueError, match='workflow_busy'):
-        with store.normal_mutation_scope(resources=('thermal',)):
-            pass
+    # 2026-09-21: ambiguous custody is recorded, never blocking.
+    with store.normal_mutation_scope(resources=('thermal',)) as admitted:
+        assert admitted
 
 
 def test_owner_loss_forbids_late_parent_publication_and_terminal_upgrade(store):
