@@ -52,7 +52,7 @@ def test_unabandoned_failed_workflow_no_longer_busy(failed_workflow):
     assert rig.store.get_workflow(request['command_id'])['status'] == 'queued'
 
 
-def test_abandoned_unreconciled_is_held_by_recovery_owner(failed_workflow):
+def test_abandoned_unreconciled_no_longer_holds_new_work(failed_workflow):
     rig, job, _, child = failed_workflow
     before = snapshot(rig, [job['job_id'], child])
     abandon(rig)
@@ -60,8 +60,10 @@ def test_abandoned_unreconciled_is_held_by_recovery_owner(failed_workflow):
     accepted = rig.store.admit_workflow(**request)
     assert accepted['status'] == 'queued'
     assert rig.store.deck_recovery_blocker() == 'deck_recovery_hold'
-    assert rig.store.claim_next() is None
-    assert rig.store.get_workflow(request['command_id'])['status'] == 'queued'
+    # 2026-09-21: the unresolved abandonment record no longer holds new work.
+    claimed = rig.store.claim_next()
+    assert claimed is not None and claimed['command_id'] == request['command_id']
+    assert rig.store.get_workflow(request['command_id'])['status'] == 'dispatched'
     assert snapshot(rig, [job['job_id'], child]) == before
 
 
@@ -156,8 +158,10 @@ def test_missing_canonical_disposition_no_longer_blocks(finite_home, monkeypatch
         accepted = store.admit_workflow(**request)
         assert accepted['status'] == 'queued'
     else:
-        assert store.claim_next() is None
-        assert store.get_workflow(request['command_id'])['status'] == 'queued'
+        # 2026-09-21: dispatch is not gated on the decision record.
+        claimed = store.claim_next()
+        assert claimed is not None and claimed['command_id'] == request['command_id']
+        assert store.get_workflow(request['command_id'])['status'] == 'dispatched'
 
 
 def test_reconciled_history_releases_real_queued_finite_child(finite_home):

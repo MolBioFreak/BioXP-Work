@@ -6945,17 +6945,12 @@ class OperatorCommandStore:
                 if identity and identity["command_kind"] == "protocol_workflow":
                     if self._workflow_dispatcher is None:
                         return None
+                    # 2026-09-21: ambiguous or unresolved history never blocks dispatch;
+                    # only genuinely live commands exclude a new workflow.
                     if conn.execute("SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                         "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
-                        "('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') "
-                        "AND NOT (c.command_kind='protocol_workflow' AND c.status='ambiguous' "
-                        "AND EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
-                        "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
-                        "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
-                        "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id)) "
-                        "AND NOT (m.state IS 'ambiguous' AND c.status IN ('ambiguous','interrupted') "
-                        "AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d "
-                        "WHERE d.command_id=c.command_id)) LIMIT 1",
+                        "('reserved','executing','dispatched','issued_pending','interrupting') "
+                        "LIMIT 1",
                         (candidate["command_id"],)).fetchone():
                         return None
                     attempt = str(uuid.uuid4())
@@ -7008,10 +7003,9 @@ class OperatorCommandStore:
                     LEFT JOIN serial206_movement_commands active_movement ON active_movement.command_id=active.command_id
                     WHERE requested.command_id=?
                       AND active.command_id<>requested.command_id
-                      AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous')
-                      AND NOT (active_movement.state='ambiguous' AND active.status IN ('ambiguous','interrupted')
-                        AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d
-                          WHERE d.command_id=active.command_id))
+                      -- 2026-09-21: unresolved (ambiguous) history is record-only and never
+                      -- blocks a new command; only genuinely live holders exclude.
+                      AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting')
                     LIMIT 1
                     """,
                     (candidate["command_id"],),

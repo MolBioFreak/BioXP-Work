@@ -333,7 +333,7 @@ def test_noop_then_valid_and_queued_cancel(installed_retained, retained_rig, mon
     assert finish(client, cancelled)['status'] == 'cleared'
 
 
-def test_uncertain_native_result_holds_later_intent(installed_retained, retained_rig, monkeypatch):
+def test_uncertain_native_result_does_not_hold_later_intent(installed_retained, retained_rig, monkeypatch):
     from tests.test_deck_near_terminal import named_rig
     app, provider, primitive, references, root = installed_retained
     ready(installed_retained, monkeypatch, retained_rig)
@@ -347,14 +347,15 @@ def test_uncertain_native_result_holds_later_intent(installed_retained, retained
     failed = finish(client, first)
     assert failed['status'] == 'ambiguous', failed
     assert plane.store.wait_for_command_workers([first], timeout=3)
-    assert plane.store.get_command(later)['status'] == 'queued'
-    assert plane.store.claim_next() is None
+    # 2026-09-21: an uncertain (ambiguous) outcome is record-only; it no longer
+    # holds later intent. The later command advances on its own.
+    later_final = finish(client, later)
+    assert later_final['terminal'] is True
+    assert later_final['status'] in ('completed', 'ambiguous', 'failed'), later_final['status']
     assert plane.store.deck_recovery_blocker() == 'deck_recovery_hold'
-    before = list(leaf.moves)
     replay = client.post(URL, json=body)
     assert replay.status_code == 200 and replay.json()['command_id'] == first
     # 2026-09-21: an uncertain outcome no longer refuses new intents.
     admitted = client.post(URL, json={**body, 'idempotency_key': 'uncertain-new'})
     assert admitted.status_code == 200 and 'deck_recovery_hold' not in admitted.text, admitted.text
-    assert leaf.moves == before
     assert catalog_action(app)['enabled'] is True
